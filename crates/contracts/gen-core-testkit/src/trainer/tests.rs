@@ -60,6 +60,7 @@ fn stub_desc(id: &'static str) -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -98,6 +99,7 @@ impl Trainer for StubTrainer {
         // Route through the shared capability floors (F-006), like a real family trainer.
         gen_core::train::validate_control_request(&self.desc, req)?;
         gen_core::train::validate_full_finetune_request(&self.desc, req)?;
+        gen_core::train::validate_edit_request(&self.desc, req)?;
         if req.items.is_empty() {
             return Err(Error::Msg("stub trainer: dataset is empty".to_owned()));
         }
@@ -201,6 +203,7 @@ fn item(name: &str) -> TrainingItem {
         caption: format!("a {name}"),
         control_image_path: None,
         model_options: Default::default(),
+        reference_image_paths: Vec::new(),
     }
 }
 

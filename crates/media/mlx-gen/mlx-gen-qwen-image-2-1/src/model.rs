@@ -19,10 +19,10 @@ use mlx_gen::{
 use crate::config::{SchedulerConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, PRESETS, SIZE_MULTIPLE};
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_layout, text_rows,
-    DenoiseInputs, ReferenceConditioning,
+    create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_branch,
+    prepare_conditioning_references, DenoiseInputs, ReferenceConditioning,
 };
-use crate::reference::{collect_references, prepare_references};
+use crate::reference::collect_references;
 use crate::scheduler;
 use crate::text_encoder::{system_prompt_drop_count, QwenImage21TextEncoder};
 use crate::transformer::QwenImage21Transformer;
@@ -425,21 +425,10 @@ impl QwenImage21 {
             on_progress,
             |te: &QwenImage21TextEncoder| {
                 // The ordered reference list, host-preprocessed against the snapshot's own
-                // Qwen3-VL processor geometry. Empty ⇒ the text-to-image route, unchanged.
+                // Qwen3-VL processor geometry. Empty ⇒ the text-to-image route, unchanged. The
+                // edit trainer (sc-24161) preprocesses its dataset references through this same fn.
                 let images = collect_references(req)?;
-                let references = if images.is_empty() {
-                    Vec::new()
-                } else {
-                    let vision = te.vision_config().ok_or_else(|| {
-                        Error::Unsupported(
-                            "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL \
-                             vision tower (`text_encoder/config.json` `vision_config` + \
-                             `model.visual.*`), which this snapshot does not carry"
-                                .into(),
-                        )
-                    })?;
-                    prepare_references(&images, vision)?
-                };
+                let references = prepare_conditioning_references(te, &images)?;
                 let pos =
                     te.encode_conditioning(&self.tokenizer, &req.prompt, drop, &references)?;
                 let neg = if params.use_negative {
@@ -465,24 +454,17 @@ impl QwenImage21 {
                 let channels = heavy.transformer.config().in_channels;
                 // The joint layout + the condition latents: both branches share one reference
                 // encode, but a different prompt is a different text length, hence two layouts.
+                // `joint_branch` is the one assembly the edit trainer (sc-24161) fits on too.
                 let reference_latents = encode_references(&heavy.vae, &references)?;
-                let pos_layout =
-                    joint_layout(&pos.image_pad_mask, &references, req.width, req.height)?;
-                let neg_layout = neg
+                let pos = joint_branch(&pos, &references, req.width, req.height)?;
+                let neg = neg
                     .as_ref()
-                    .map(|neg| {
-                        joint_layout(&neg.image_pad_mask, &references, req.width, req.height)
-                    })
-                    .transpose()?;
-                let pos_text = text_rows(&pos.hidden, &pos.image_pad_mask)?;
-                let neg_text = neg
-                    .as_ref()
-                    .map(|neg| text_rows(&neg.hidden, &neg.image_pad_mask))
+                    .map(|neg| joint_branch(neg, &references, req.width, req.height))
                     .transpose()?;
                 let conditioning = (!references.is_empty()).then(|| ReferenceConditioning {
                     latents: &reference_latents,
-                    layout: &pos_layout,
-                    negative_layout: neg_layout.as_ref(),
+                    layout: &pos.layout,
+                    negative_layout: neg.as_ref().map(|neg| &neg.layout),
                 });
                 // ONE decode per image either way — upstream always decodes four channels and
                 // has no transparency flag — so this branch chooses only whether the alpha is
@@ -500,8 +482,8 @@ impl QwenImage21 {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
                             latents,
-                            prompt_embeds: &pos_text,
-                            negative_embeds: neg_text.as_ref(),
+                            prompt_embeds: &pos.text,
+                            negative_embeds: neg.as_ref().map(|neg| &neg.text),
                             true_cfg_scale: params.true_cfg,
                             width: req.width,
                             height: req.height,

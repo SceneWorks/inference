@@ -10,17 +10,20 @@
 //! * checkpoints + resume: a run cancelled after its step-2 checkpoint resumes from that
 //!   checkpoint and finishes with the same adapter an uninterrupted run writes;
 //! * preview samples render through the crate's own render path during training;
-//! * a pre-quantized tier, or a quantize request, is a typed refusal ("install the BF16 tier").
+//! * a pre-quantized tier, or a quantize request, is a typed refusal ("install the BF16 tier");
+//! * edit mode (sc-24161): an edit-pair dataset trains an adapter that is marked as an edit
+//!   adapter, loads through the same host, and changes a reference/edit render.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use gen_core_testkit::trainer::{trainer_conformance, TrainerProfile};
 use mlx_gen::gen_core::weightsmeta::safetensors_file_metadata;
+use mlx_gen::gen_core::Conditioning;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::{
-    Error, LoadSpec, NetworkType, Quant, Trainer, TrainingConfig, TrainingItem, TrainingProgress,
-    TrainingRequest, WeightsSource,
+    Error, GenerationOutput, GenerationRequest, Image, LoadSpec, NetworkType, Quant, Trainer,
+    TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
 };
 use mlx_gen_qwen_image_2_1::convert::prequantize_turnkey;
 use mlx_gen_qwen_image_2_1::quant::Tier;
@@ -198,6 +201,11 @@ fn a_trained_adapter_loads_back_strictly_changes_the_velocity_and_is_stamped() {
         assert_eq!(
             meta.get("networkType").map(String::as_str),
             Some(expected_kind)
+        );
+        assert_eq!(
+            meta.get("trainingMode"),
+            None,
+            "a text-to-image adapter carries no edit marker"
         );
 
         let mut dit = load_transformer(&tiny_snapshot()).unwrap();
@@ -425,4 +433,191 @@ fn a_quantized_base_is_refused_with_the_bf16_instruction() {
             Ok(_) => panic!("a quantized base must not load as a trainer"),
         }
     }
+}
+
+// ── edit mode (sc-24161) ─────────────────────────────────────────────────────────────────────
+
+/// A deterministic `width × height` RGB image (a seeded ramp) as both a PNG under `dir` and the
+/// in-memory [`Image`] the render path's conditioning carries.
+fn reference(dir: &Path, name: &str, width: u32, height: u32, phase: u32) -> (PathBuf, Image) {
+    let img = image::RgbImage::from_fn(width, height, |x, y| {
+        image::Rgb([
+            ((x * 3 + phase) % 256) as u8,
+            ((y * 5 + phase) % 256) as u8,
+            ((x * y + 3 * phase) % 256) as u8,
+        ])
+    });
+    let path = dir.join(name);
+    img.save(&path).expect("write the reference image");
+    let image = Image {
+        width,
+        height,
+        pixels: img.into_raw(),
+    };
+    (path, image)
+}
+
+fn render(spec: &LoadSpec, req: &GenerationRequest) -> Image {
+    let generator = provider_registry()
+        .unwrap()
+        .load(TRAINER_ID, spec)
+        .expect("the snapshot loads as a generator");
+    match generator.generate(req, &mut |_| {}).expect("render") {
+        GenerationOutput::Images(mut images) => images.remove(0),
+        other => panic!("images expected, got {other:?}"),
+    }
+}
+
+/// AC: edit training end to end on the miniature snapshot. Two edit pairs (each: a target, an
+/// instruction, two ordered references) train a LoRA through the real staged lifecycle; the saved
+/// adapter carries the family/base/licence provenance plus the edit marker; and loaded through the
+/// sc-24156 host it changes a 2.1 **edit** render (same references, prompt and seed) against the
+/// bare base.
+#[test]
+fn an_edit_adapter_trains_is_marked_and_changes_the_edit_render() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (ref_a, image_a) = reference(dir, "ref_a.png", 64, 64, 11);
+    let (ref_b, image_b) = reference(dir, "ref_b.png", 64, 64, 97);
+    let instruction = "paint the first image in the colours of the second";
+    let items = vec![
+        TrainingItem::edit_pair(
+            write_image(dir, "target_1.png", 0),
+            instruction.into(),
+            vec![ref_a.clone(), ref_b.clone()],
+        ),
+        TrainingItem::edit_pair(
+            write_image(dir, "target_2.png", 40),
+            "swap the two images".into(),
+            vec![ref_b, ref_a],
+        ),
+    ];
+    let req = request(
+        items,
+        TrainingConfig {
+            learning_rate: 5e-2,
+            // Every DiT Linear, globals included, so the 4-step adapter moves a 2-step render.
+            lora_target_modules: vec![
+                "attn.to_q".into(),
+                "attn.to_k".into(),
+                "attn.to_v".into(),
+                "attn.to_out.0".into(),
+                "img_mlp.gate_layer".into(),
+                "img_mlp.proj".into(),
+                "img_mlp.out".into(),
+                "proj_out".into(),
+            ],
+            ..config(4)
+        },
+        &dir.join("out"),
+    );
+    let mut t = trainer();
+    t.validate(&req)
+        .expect("an edit dataset validates on the edit trainer");
+    let mut losses = Vec::new();
+    let mut cached = Vec::new();
+    let output = t
+        .train(&req, &mut |p| match p {
+            TrainingProgress::Training { loss, .. } => losses.push(loss),
+            TrainingProgress::Caching { current, total } => cached.push((current, total)),
+            _ => {}
+        })
+        .expect("edit training runs");
+    assert_eq!(output.steps, 4);
+    assert_eq!(cached, [(1, 2), (2, 2)]);
+    assert!(losses.iter().all(|l| l.is_finite()), "{losses:?}");
+    eprintln!("[sc-24161] edit training losses {losses:?}");
+
+    let meta = safetensors_file_metadata(output.adapter_path.as_path()).unwrap();
+    assert_eq!(meta.get("trainingMode").map(String::as_str), Some("edit"));
+    assert_eq!(
+        meta.get("family").map(String::as_str),
+        Some("qwen-image-2-1")
+    );
+    assert_eq!(
+        meta.get("baseModel").map(String::as_str),
+        Some("qwen_image_2_1")
+    );
+    assert!(
+        meta.get("license")
+            .is_some_and(|l| l.contains("Qwen Research License")),
+        "{meta:?}"
+    );
+
+    // The same edit render (references, prompt, seed) with and without the trained adapter.
+    let edit = GenerationRequest {
+        prompt: instruction.to_owned(),
+        width: 64,
+        height: 64,
+        steps: Some(2),
+        seed: Some(42),
+        conditioning: vec![
+            Conditioning::Reference {
+                image: image_a,
+                strength: None,
+            },
+            Conditioning::Reference {
+                image: image_b,
+                strength: None,
+            },
+        ],
+        ..Default::default()
+    };
+    let plain = render(&dense_spec(), &edit);
+    let adapted = render(
+        &dense_spec().with_adapters(vec![AdapterSpec::new(
+            output.adapter_path.clone(),
+            1.0,
+            AdapterKind::Lora,
+        )]),
+        &edit,
+    );
+    let changed = adapted
+        .pixels
+        .iter()
+        .zip(&plain.pixels)
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "[sc-24161] trained edit adapter changed {changed}/{} edit-render bytes",
+        plain.pixels.len()
+    );
+    assert!(
+        changed > 0,
+        "the trained edit adapter must change the edit render"
+    );
+}
+
+/// AC: an edit dataset on a snapshot-level edit trainer is held to the render path's reference
+/// cap (the descriptor's `max_reference_images`), refused before any weight loads.
+#[test]
+fn an_edit_item_over_the_reference_cap_is_refused_before_training() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = mlx_gen_qwen_image_2_1::MAX_REFERENCE_IMAGES;
+    let refs: Vec<PathBuf> = (0..=cap)
+        .map(|i| tmp.path().join(format!("ref{i}.png")))
+        .collect();
+    let req = request(
+        vec![TrainingItem::edit_pair(
+            tmp.path().join("target.png"),
+            "compose them".into(),
+            refs,
+        )],
+        config(2),
+        &tmp.path().join("out"),
+    );
+    let mut t = trainer();
+    assert_eq!(t.descriptor().max_reference_images as usize, cap);
+    let err = t.validate(&req).unwrap_err().to_string();
+    assert!(err.contains(&format!("at most {cap}")), "{err}");
+    let mut events = Vec::new();
+    let err = t
+        .train(&req, &mut |p| events.push(format!("{p:?}")))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&format!("at most {cap}")), "{err}");
+    assert!(
+        !events.iter().any(|e| e.starts_with("LoadingModel")),
+        "the refusal precedes every load: {events:?}"
+    );
 }

@@ -162,6 +162,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -276,6 +277,7 @@ impl Trainer for KreaRawTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would train zero
         // parameters yet "succeed". Catch it here, where the loaded DiT is available to match against.
@@ -978,6 +980,7 @@ mod tests {
                 caption: "a swatch".into(),
                 control_image_path: None,
                 model_options: Default::default(),
+                reference_image_paths: Vec::new(),
             }],
             config,
             output_dir: PathBuf::from("/tmp/krea_unused"),

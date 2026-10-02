@@ -1920,6 +1920,7 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -2133,6 +2134,8 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
         .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
     gen_core::train::validate_full_finetune_request(&descriptor, req)
         .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
+    gen_core::train::validate_edit_request(&descriptor, req)
+        .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
     validate_request(req, "ltx_2_5 trainer")?;
     validate_ltx25_adapter_scale(req.config.alpha)?;
     let plan = Ltx25TrainingPlan::from_request(req)?;
@@ -2164,6 +2167,7 @@ impl Trainer for LtxTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         // Single-use enforcement (F-055): `train` frees the Gemma text encoder + tokenizer (~24 GB)
         // after the embed cache, so a second `train` on the same instance can't re-encode. Fail here,
         // up front (validate runs before any progress is emitted), instead of with a late, confusing
@@ -4182,6 +4186,7 @@ mod validate_request_tests {
                     caption: "a cat".into(),
                     control_image_path: None,
                     model_options: serde_json::Map::new(),
+                    reference_image_paths: Vec::new(),
                 })
                 .collect(),
             config: TrainingConfig::default(),

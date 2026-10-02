@@ -62,6 +62,7 @@ fn short_train_produces_loadable_adapter() {
             caption: "a vivid abstract color swatch".into(),
             control_image_path: None,
             model_options: Default::default(),
+            reference_image_paths: Vec::new(),
         }],
         config: TrainingConfig {
             rank: 4,
@@ -144,6 +145,7 @@ fn short_train_checkpointed_produces_loadable_adapter() {
             caption: "a vivid abstract color swatch".into(),
             control_image_path: None,
             model_options: Default::default(),
+            reference_image_paths: Vec::new(),
         }],
         config: TrainingConfig {
             rank: 4,

@@ -53,6 +53,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_lokr: true,
         supports_control: false,
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -99,6 +100,7 @@ impl Trainer for KolorsTrainer {
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req).map_err(Into::into)
     }
 
@@ -476,6 +478,7 @@ mod tests {
                 caption: "caption".into(),
                 control_image_path,
                 model_options: Default::default(),
+                reference_image_paths: Vec::new(),
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),

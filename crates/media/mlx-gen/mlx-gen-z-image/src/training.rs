@@ -114,6 +114,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -236,6 +237,7 @@ impl Trainer for ZImageTurboTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would resolve
         // to an empty target set — a full-length run that trains zero parameters yet "succeeds"
@@ -1582,6 +1584,7 @@ mod validate_request_tests {
                     caption: "a cat".into(),
                     control_image_path: None,
                     model_options: Default::default(),
+                    reference_image_paths: Vec::new(),
                 })
                 .collect(),
             config: TrainingConfig {

@@ -164,6 +164,33 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
             ));
         }
     }
+
+    // Negative (sc-24161): instruction-edit datasets. A trainer that does NOT advertise
+    // `max_reference_images` must refuse an edit dataset — never silently train a text-to-image
+    // adapter on the edit targets (F-055). An edit-capable trainer must refuse an item carrying one
+    // reference more than its advertised cap. The shared `validate_edit_request` floor enforces
+    // both; assert the trainer routes through it. The reference paths are never read — the floor
+    // runs before any file I/O.
+    let cap = desc.max_reference_images as usize;
+    let mut edit = ok.clone();
+    let refs = if cap == 0 { 1 } else { cap + 1 };
+    for item in &mut edit.items {
+        item.reference_image_paths = vec![item.image_path.clone(); refs];
+    }
+    if t.validate(&edit).is_ok() {
+        return Err(if cap == 0 {
+            format!(
+                "validate-honesty[{id}]: an instruction-edit dataset (items with reference images) \
+                 was accepted by validate() despite max_reference_images == 0 — it must be \
+                 rejected, not silently trained as a text-to-image adapter (F-055)"
+            )
+        } else {
+            format!(
+                "validate-honesty[{id}]: an edit item with {refs} reference images was accepted by \
+                 validate() despite max_reference_images == {cap}"
+            )
+        });
+    }
     Ok(())
 }
 

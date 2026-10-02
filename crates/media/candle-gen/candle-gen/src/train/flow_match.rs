@@ -1155,6 +1155,7 @@ mod tests {
                         caption: "x".into(),
                         control_image_path: None,
                         model_options: Default::default(),
+                        reference_image_paths: Vec::new(),
                     }
                 })
                 .collect(),

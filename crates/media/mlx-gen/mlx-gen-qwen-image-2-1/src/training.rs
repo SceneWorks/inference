@@ -1,5 +1,6 @@
 //! LoRA/LoKr **training** on the Qwen-Image 2.1 DiT, in pure Rust on mlx-rs (sc-24159) — the MLX
-//! text-to-image trainer for `qwen_image_2_1`.
+//! trainer for `qwen_image_2_1`: text-to-image on captioned datasets, and (sc-24161)
+//! **instruction-edit** on edit-pair datasets ([`TrainingItem::edit_pair`]).
 //!
 //! [`QwenImage21Trainer`] realizes the core [`Trainer`] contract the way every MLX family trainer
 //! does (`mlx-gen-krea`, `mlx-gen-mage`): the DiT is a hand-rolled `&self` forward over raw
@@ -31,13 +32,29 @@
 //! 1. **Preflight** ([`training_footprint`] / [`check_training_footprint`]) — before any weight is
 //!    read, the run's peak is derived from *this snapshot's own* configs and safetensors headers
 //!    (never borrowed numbers) and refused with an actionable message if it exceeds the device.
-//! 2. **Captions** — the Qwen3-VL tower (language half only) encodes every caption and preview
-//!    prompt ONCE, then is dropped.
+//! 2. **Captions** — the Qwen3-VL tower (language half only; plus the vision half for an edit
+//!    run) encodes every caption and preview prompt ONCE, then is dropped.
 //! 3. **Latents** — the VAE encodes every image ONCE; the encoder half is then dropped (the decoder
 //!    stays only when preview samples are requested).
 //! 4. **Train** — the dense DiT loads last. With `gradient_checkpointing` each block runs inside an
 //!    `mlx::checkpoint` segment ([`QwenImage21Transformer::forward_checkpointed`]) for LoRA and
 //!    LoKr alike.
+//!
+//! ## Edit mode (sc-24161)
+//! A dataset whose items carry [`TrainingItem::reference_image_paths`] trains an **edit** adapter.
+//! The shared gen-core floor ([`gen_core::train::validate_edit_request`]) caps each item at
+//! [`MAX_REFERENCE_IMAGES`] — the render path's own cap, advertised through
+//! [`TrainerDescriptor::max_reference_images`] — and refuses mixed datasets. Each item's ordered
+//! references go through the **render path's own** assembly: host preprocessing
+//! ([`prepare_conditioning_references`]), the image-conditioned Qwen3-VL template with vision tokens
+//! ([`QwenImage21TextEncoder::encode_conditioning`]), the joint layout + text rows
+//! ([`joint_branch`]) and the reference VAE latents ([`encode_references`]) — all cached ONCE,
+//! like the target latents. Each step feeds the DiT the same image stream the denoise loop does
+//! ([`joint_images`]: references in order, then the noised target) over the same layout, so the
+//! positional ids and RoPE offsets are the render path's; the DiT returns the target block's
+//! velocity only, so the loss covers target tokens only. The preflight prices the reference
+//! latents, the longer joint sequence and the vision tower. Saved edit adapters additionally carry
+//! [`EDIT_ADAPTER_MARKER`].
 //!
 //! The trainer is **dense-bf16 only**: a pre-quantized (Q4/Q8) tier or a quantize request is a
 //! typed refusal — QLoRA is a non-goal.
@@ -64,8 +81,8 @@ use mlx_gen::train::lora::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::{
     CancelFlag, Error, Image, LoadSpec, Modality, NetworkType, Precision, Progress, Result,
-    TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    RgbaImage, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
+    TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
@@ -73,20 +90,28 @@ use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
-use crate::config::{SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig};
+use crate::config::{
+    SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
+    IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES, VAE_SCALE_FACTOR,
+};
 use crate::loader;
 use crate::memory_strategy::derived::{
     MLX_EVAL_SLACK_BYTES, MLX_MAX_ACTIVE_TASKS, VAE_PIPELINED_DECODE_MAPS,
 };
 use crate::model::{FAMILY, MODEL_ID};
 use crate::pipeline::{
-    create_noise, decode_rgb, denoise, latent_grid, pack_latents, DenoiseInputs, DECODE_OVERLAP,
-    DECODE_TILE_EDGE,
+    create_noise, decode_rgb, denoise, encode_references, joint_branch, joint_images,
+    missing_vision_tower, pack_latents, prepare_conditioning_references, DenoiseInputs,
+    JointBranch, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
 };
 use crate::quant::{installed_tier, Tier};
-use crate::text_encoder::{prompt_template, system_prompt_drop_count, QwenImage21TextEncoder};
+use crate::reference::{prepare_references, reference_target_size, PreparedReference};
+use crate::text_encoder::{
+    prompt_template, prompt_template_ti2i, system_prompt_drop_count, QwenImage21TextEncoder,
+};
 use crate::transformer::{
-    BlockTrainables, CheckpointedTrainables, QwenImage21Transformer, BLOCK_ADAPTER_TARGETS,
+    BlockTrainables, CheckpointedTrainables, JointLayout, QwenImage21Transformer,
+    BLOCK_ADAPTER_TARGETS,
 };
 use crate::vae::QwenImage21Vae;
 use crate::{UPSTREAM_LICENSE, UPSTREAM_LICENSE_NOTICE};
@@ -122,6 +147,13 @@ pub const ADAPTER_PROVENANCE: [(&str, &str); 6] = [
     ("modelspec.license", UPSTREAM_LICENSE),
     ("licenseNotice", UPSTREAM_LICENSE_NOTICE),
 ];
+
+/// The extra `__metadata__` entry an **edit** adapter (one trained on an edit-pair dataset,
+/// sc-24161) carries on top of [`ADAPTER_PROVENANCE`], so the product layer can tell an
+/// instruction-edit adapter from a text-to-image one without inspecting tensors. Text-to-image
+/// adapters do not carry the key at all (their metadata is unchanged by sc-24161). The adapter
+/// itself is the same PEFT/LyCORIS file either way and loads through the same host.
+pub const EDIT_ADAPTER_MARKER: (&str, &str) = ("trainingMode", "edit");
 
 /// Recognized `timestep_type` values [`sample_sigma`] branches on (plus the `sigmoid` default).
 const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
@@ -232,6 +264,11 @@ pub struct FootprintFacts {
     pub vae_decode_channels: u64,
     /// Pixels one latent token covers per side (`scale_factor_spatial`).
     pub pixels_per_token: u64,
+    /// Bytes of the Qwen3-VL **vision** tower (`model.visual.*`) — loaded only by an edit run,
+    /// which encodes its references as vision context (sc-24161). `0` when the snapshot ships none.
+    pub vision_tower_bytes: u64,
+    /// The vision tower's hidden width (`vision_config.hidden_size`); `0` without a tower.
+    pub vision_hidden: u64,
 }
 
 impl FootprintFacts {
@@ -245,14 +282,19 @@ impl FootprintFacts {
         for header in safetensors_path_tensor_headers(root.join("transformer"))? {
             dit_elements += header.element_count()?;
         }
-        let text_encoder_bytes: u64 = safetensors_path_tensor_headers(root.join("text_encoder"))?
-            .iter()
-            .filter(|h| {
-                h.name
-                    .starts_with(&format!("{}.", loader::TEXT_ENCODER_PREFIX))
-            })
-            .map(|h| h.data_bytes)
-            .sum();
+        let text_encoder_headers = safetensors_path_tensor_headers(root.join("text_encoder"))?;
+        let tower_bytes = |prefix: &str| -> u64 {
+            let prefix = format!("{prefix}.");
+            text_encoder_headers
+                .iter()
+                .filter(|h| h.name.starts_with(&prefix))
+                .map(|h| h.data_bytes)
+                .sum()
+        };
+        let text_encoder_bytes = tower_bytes(loader::TEXT_ENCODER_PREFIX);
+        let vision_tower_bytes = tower_bytes(loader::VISION_TOWER_PREFIX);
+        let vision_hidden = loader::load_vision_config(root)?
+            .map_or(0, |vision| vision.tower.hidden_size.max(0) as u64);
         let (mut vae_encoder_bytes, mut vae_decoder_bytes) = (0u64, 0u64);
         for header in safetensors_path_tensor_headers(root.join("vae"))? {
             if header.name.starts_with("encoder.") || header.name.starts_with("quant_conv.") {
@@ -275,6 +317,8 @@ impl FootprintFacts {
             vae_encode_channels: vae_cfg.base_dim as u64,
             vae_decode_channels: vae_cfg.decoder_base_dim as u64,
             pixels_per_token: vae_cfg.scale_factor_spatial as u64,
+            vision_tower_bytes,
+            vision_hidden,
         })
     }
 }
@@ -284,8 +328,17 @@ impl FootprintFacts {
 pub struct TrainingShape {
     /// Bucketed square training edge, in pixels.
     pub edge: u32,
-    /// The longest conditioning sequence (caption or preview prompt), in tokens.
+    /// The longest conditioning sequence (caption or preview prompt), in **text** tokens — the
+    /// vision slots of an edit prompt are counted by [`reference_tokens`](Self::reference_tokens).
     pub caption_tokens: u64,
+    /// Edit runs (sc-24161): the largest per-item sum of reference latent tokens — the condition
+    /// blocks the joint sequence carries ahead of the target. `0` for text-to-image.
+    pub reference_tokens: u64,
+    /// Edit runs: the latent tokens of the single largest reference (its VAE-encode and ViT
+    /// transients). `0` for text-to-image.
+    pub largest_reference_tokens: u64,
+    /// Edit runs: reference latent tokens cached across the whole dataset. `0` for text-to-image.
+    pub reference_cache_tokens: u64,
     /// Dataset items (each caches one caption feature and one latent).
     pub items: u64,
     /// Bytes per element of the DiT compute dtype (2 for bf16, 4 for f32).
@@ -342,16 +395,40 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
     let w = shape.compute_width;
     let side = shape.edge as u64 / facts.pixels_per_token.max(1);
     let image_tokens = side * side;
-    let seq = image_tokens + shape.caption_tokens;
-    let pixels = shape.edge as u64 * shape.edge as u64;
+    // The joint sequence: text, every condition block (edit), the target.
+    let seq = image_tokens + shape.caption_tokens + shape.reference_tokens;
+    let token_pixels = facts.pixels_per_token * facts.pixels_per_token;
+    // The largest single VAE encode: the target, or (edit) a reference fitted to the vision
+    // resolution, which can exceed the training edge.
+    let pixels =
+        (shape.edge as u64 * shape.edge as u64).max(shape.largest_reference_tokens * token_pixels);
 
-    // Caches (f32): caption features and packed latents, per item.
+    // Caches (f32): caption features and packed latents (targets + edit references), per item.
     let caption_cache = shape.items * shape.caption_tokens * facts.text_hidden * F32_WIDTH;
-    let latent_cache = shape.items * image_tokens * facts.latent_channels * F32_WIDTH;
+    let latent_cache = (shape.items * image_tokens + shape.reference_cache_tokens)
+        * facts.latent_channels
+        * F32_WIDTH;
 
-    // 1. captions: the language tower + one caption's per-layer live set (f32 stream).
+    // 1. captions: the language tower + one caption's per-layer live set (f32 stream). An edit
+    //    caption also runs the vision tower (resident, plus one reference's patch stream) and its
+    //    language sequence carries one vision slot per merged 2×2 latent group.
+    let edit = shape.reference_tokens > 0;
+    let vision_slots = shape.reference_tokens / IMAGE_TOKENS_PER_SLOT as u64;
+    let vision = if edit {
+        facts.vision_tower_bytes
+            + TEXT_ENCODER_LIVE_HIDDEN
+                * shape.largest_reference_tokens
+                * facts.vision_hidden
+                * F32_WIDTH
+    } else {
+        0
+    };
     let caption_phase = facts.text_encoder_bytes
-        + TEXT_ENCODER_LIVE_HIDDEN * shape.caption_tokens * facts.text_hidden * F32_WIDTH
+        + vision
+        + TEXT_ENCODER_LIVE_HIDDEN
+            * (shape.caption_tokens + vision_slots)
+            * facts.text_hidden
+            * F32_WIDTH
         + MLX_EVAL_SLACK_BYTES;
 
     // 2. latents: the whole VAE + one image's pipelined full-resolution encode maps (f32).
@@ -539,17 +616,21 @@ fn trainer_descriptor() -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,
-        // Text-to-image LoRA/LoKr only — no control-branch training path.
+        // LoRA/LoKr adapters only — no control-branch training path.
         supports_control: false,
         // Adapter-only: the shared `validate_full_finetune_request` floor rejects a full tune.
         supports_full_finetune: false,
+        // Instruction-edit datasets (sc-24161), capped at the render path's own reference limit —
+        // the one constant `collect_references`/`validate_reference_count` enforce.
+        max_reference_images: MAX_REFERENCE_IMAGES as u32,
     }
 }
 
 /// The production [`Trainer`] for `qwen_image_2_1`: a frozen dense-bf16 base that caches a
-/// captioned dataset to Qwen3-VL caption features + VAE latents (staged, one heavy component at a
-/// time), then runs the functional-autograd LoRA/LoKr loop with the core runtime glue (LR
-/// schedule, gradient accumulation, checkpoints + resume, cancel, previews, progress bands).
+/// captioned (or edit-pair, sc-24161) dataset to Qwen3-VL conditioning + VAE latents (staged, one
+/// heavy component at a time), then runs the functional-autograd LoRA/LoKr loop with the core
+/// runtime glue (LR schedule, gradient accumulation, checkpoints + resume, cancel, previews,
+/// progress bands).
 pub struct QwenImage21Trainer {
     descriptor: TrainerDescriptor,
     root: PathBuf,
@@ -557,6 +638,9 @@ pub struct QwenImage21Trainer {
     /// Tokens of the system-role prefix the conditioning drops.
     drop_count: usize,
     scheduler: SchedulerConfig,
+    /// The snapshot's Qwen3-VL vision geometry, when it ships a vision tower — required by an edit
+    /// run (its references are vision context, exactly as on the render path).
+    vision: Option<VisionConfig>,
     /// The DiT as an **unevaluated** graph — no weight is read. Resolves target modules and their
     /// base shapes for `validate` and the preflight; the train loop loads the real DiT itself.
     probe: QwenImage21Transformer,
@@ -625,6 +709,7 @@ impl QwenImage21Trainer {
         let tokenizer = loader::load_tokenizer(&root)?;
         let drop_count = system_prompt_drop_count(&tokenizer)?;
         let scheduler = loader::load_scheduler_config(&root)?;
+        let vision = loader::load_vision_config(&root)?;
         let facts = FootprintFacts::from_snapshot(&root)?;
         Ok(Self {
             descriptor: trainer_descriptor(),
@@ -632,6 +717,7 @@ impl QwenImage21Trainer {
             tokenizer,
             drop_count,
             scheduler,
+            vision,
             probe,
             facts,
             memory_budget_override: None,
@@ -815,6 +901,110 @@ fn decode_image(path: &Path) -> Result<Image> {
     })
 }
 
+/// Decode a reference image file as RGBA8 — upstream's `img.convert("RGBA")`: an RGB file is the
+/// opaque case (`A = 255`, exactly what the render path's `Conditioning::Reference` widening
+/// produces), a file with alpha keeps it (the `Conditioning::ReferenceRgba` case).
+fn decode_reference(path: &Path) -> Result<RgbaImage> {
+    let dynimg = image::open(path)
+        .map_err(|e| Error::Msg(format!("decode reference image {}: {e}", path.display())))?;
+    let rgba = dynimg.to_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    Ok(RgbaImage {
+        width,
+        height,
+        pixels: rgba.into_raw(),
+    })
+}
+
+/// An item's ordered references, decoded — empty for a captioned item.
+fn decode_references(item: &TrainingItem) -> Result<Vec<RgbaImage>> {
+    item.reference_image_paths
+        .iter()
+        .map(|path| decode_reference(path.as_path()))
+        .collect()
+}
+
+/// The token budget one edit prompt contributes, from the tokenizer and the reference **headers**
+/// alone (no pixel is decoded, no weight is read): `(text tokens, Σ reference latent tokens,
+/// largest single reference's latent tokens)`. Text tokens are the image-conditioned template's
+/// tokens minus the system prefix and the `count` `<|image_pad|>` placeholders — exactly the rows
+/// [`joint_branch`] keeps; each reference's latent tokens follow the render path's own fit
+/// ([`reference_target_size`] at the vision tower's `output_resolution`).
+fn edit_prompt_tokens(
+    tokenizer: &TextTokenizer,
+    drop: usize,
+    vision: &VisionConfig,
+    prompt: &str,
+    reference_paths: &[PathBuf],
+) -> Result<(u64, u64, u64)> {
+    let count = reference_paths.len();
+    let tokens = tokenizer.tokenize_preformatted(&prompt_template_ti2i(prompt, count))?;
+    let text = tokens.ids.len().saturating_sub(drop + count) as u64;
+    let (mut sum, mut largest) = (0u64, 0u64);
+    for path in reference_paths {
+        let size = image::image_dimensions(path).map_err(|e| {
+            Error::Msg(format!(
+                "{TRAINER_ID} trainer: read reference image {}: {e}",
+                path.display()
+            ))
+        })?;
+        let (rw, rh) = reference_target_size(size, vision.output_resolution())?;
+        let tokens = (rw / VAE_SCALE_FACTOR) as u64 * (rh / VAE_SCALE_FACTOR) as u64;
+        sum += tokens;
+        largest = largest.max(tokens);
+    }
+    Ok((text, sum, largest))
+}
+
+/// One prompt's [`JointBranch`] through the render path's own assembly — the tower's
+/// [`QwenImage21TextEncoder::encode_conditioning`] (the image-conditioned template with vision
+/// tokens when `references` is non-empty, the text-to-image template otherwise) then
+/// [`joint_branch`] at the square training `edge` — evaluated so it survives the tower's drop.
+fn encode_branch(
+    encoder: &QwenImage21TextEncoder,
+    tokenizer: &TextTokenizer,
+    drop: usize,
+    prompt: &str,
+    references: &[PreparedReference],
+    edge: u32,
+) -> Result<JointBranch> {
+    let conditioning = encoder.encode_conditioning(tokenizer, prompt, drop, references)?;
+    let branch = joint_branch(&conditioning, references, edge, edge)?;
+    eval([&branch.text])?;
+    Ok(branch)
+}
+
+/// An edit item's reference latents, in reference order, through the render path's own host
+/// preprocessing ([`prepare_references`]) and VAE encode ([`encode_references`]). Re-prepared from
+/// disk (host work only) so the caption phase keeps no pixel buffers alive. Empty for a captioned
+/// item, or when `vision` is `None` (a text-to-image run).
+fn encode_item_references(
+    vae: &QwenImage21Vae,
+    vision: Option<&VisionConfig>,
+    item: &TrainingItem,
+) -> Result<Vec<Array>> {
+    match vision {
+        Some(vision) if item.is_edit_pair() => {
+            encode_references(vae, &prepare_references(&decode_references(item)?, vision)?)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// One cached training example: the target latent and the joint-sequence pieces the step feeds
+/// the DiT — the conditioning rows and layout of [`joint_branch`] and (edit) the ordered reference
+/// latents of [`encode_references`].
+struct CachedItem {
+    /// Packed target latent `[1, h·w, C]` (f32).
+    x0: Array,
+    /// The branch's text rows `[1, text_len, hidden]` (f32).
+    text: Array,
+    /// The joint layout, target block last.
+    layout: JointLayout,
+    /// Packed reference latents, in reference order (empty for text-to-image).
+    references: Vec<Array>,
+}
+
 /// Encode a centre-cropped square image into the packed denoiser-space latent the DiT trains on:
 /// resize + `[−1, 1]` NCHW, widen to opaque RGBA (a constant `+1` alpha plane) when the VAE takes
 /// four channels, take the posterior **mode**, normalise `(z − mean)/std`, and flatten unpatched to
@@ -878,11 +1068,14 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
 /// The per-step inputs of one loss evaluation.
 struct StepInputs<'a> {
     x0: &'a Array,
-    context: &'a Array,
+    /// The conditioning text rows ([`JointBranch::text`]).
+    text: &'a Array,
+    /// The joint layout ([`JointBranch::layout`]): text and condition blocks, target last.
+    layout: &'a JointLayout,
+    /// Packed reference latents in reference order — empty for text-to-image.
+    references: &'a [Array],
     noise: &'a Array,
     t: f32,
-    /// The target's latent grid `(h, w)`.
-    grid: (usize, usize),
 }
 
 /// The fixed install/loss parameters of a run.
@@ -897,9 +1090,12 @@ struct LossSpec<'a> {
     checkpoint: Option<&'a [BlockTrainables]>,
 }
 
-/// One forward+backward over the trainable factors: install `params` (LoRA or LoKr), run the DiT,
-/// regress its velocity onto `noise − x0`, return `(loss, grads)`. The DiT graph runs at
-/// `spec.dtype`; the noising math, the loss and the grads stay f32 (master weights).
+/// One forward+backward over the trainable factors: install `params` (LoRA or LoKr), run the DiT
+/// over the joint sequence — the denoise loop's own image stream ([`joint_images`]: references in
+/// order, then the noised target) on the step's layout — regress the **target block's** velocity
+/// onto `noise − x0`, return `(loss, grads)`. The DiT returns the target block only, so the
+/// condition tokens never enter the loss. The graph runs at `spec.dtype`; the noising math, the
+/// loss and the grads stay f32 (master weights).
 fn compute_loss_grads(
     transformer: &mut QwenImage21Transformer,
     params: &LoraParams,
@@ -908,8 +1104,8 @@ fn compute_loss_grads(
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target) = build_batch(step.x0, step.noise, step.t)?;
     let x_t = x_t.as_dtype(spec.dtype)?;
-    let context = step.context.clone();
-    let (t, (h, w)) = (step.t, step.grid);
+    let context = step.text.clone();
+    let (t, layout, references) = (step.t, step.layout, step.references);
     let LossSpec {
         adapter,
         alpha,
@@ -926,13 +1122,13 @@ fn compute_loss_grads(
         // checkpointed path each block's adapters are rebuilt inside its segment from the
         // explicit-input factors.
         adapter.install_as(transformer, &p, alpha, rank, lora_dtype, LOKR_DTYPE)?;
+        let images = joint_images(references, &x_t);
         let v = match ckpt_blocks {
-            Some(blocks) => transformer.forward_checkpointed(
-                &x_t,
+            Some(blocks) => transformer.forward_checkpointed_joint(
                 &context,
+                &images,
                 t,
-                h,
-                w,
+                layout,
                 &CheckpointedTrainables {
                     params: &p,
                     blocks,
@@ -942,7 +1138,7 @@ fn compute_loss_grads(
                     lokr_dtype: LOKR_DTYPE,
                 },
             ),
-            None => transformer.forward(&x_t, &context, t, h, w),
+            None => transformer.forward_joint(&context, &images, t, layout),
         }
         .map_err(|e| Exception::custom(e.to_string()))?;
         let diff = subtract(&v, &target)?;
@@ -979,15 +1175,18 @@ fn check_resumed_params(built: &LoraParams, resumed: &LoraParams) -> Result<()> 
 /// Render a preview from the in-progress (already-installed, concrete — so the render is
 /// graph-free) adapter through the crate's own render path: seeded packed noise →
 /// resolution-shifted flow-match Euler denoise (true CFG against the empty prompt when
-/// `guidance > 1`) → RGBA decode composited over white. A best-effort nicety: failures are logged
-/// by the caller, never fatal.
+/// `guidance > 1`) → RGBA decode composited over white. An edit run (sc-24161) previews an
+/// **edit**: the prompt branches were assembled with the first dataset item's references and its
+/// cached reference latents condition the denoise, exactly as a reference render does. A
+/// best-effort nicety: failures are logged by the caller, never fatal.
 #[allow(clippy::too_many_arguments)]
 fn render_sample(
     dit: &QwenImage21Transformer,
     vae: &QwenImage21Vae,
     scheduler: &SchedulerConfig,
-    ctx_pos: &Array,
-    ctx_neg: Option<&Array>,
+    pos: &JointBranch,
+    neg: Option<&JointBranch>,
+    reference_latents: &[Array],
     seed: u64,
     edge: u32,
     steps: usize,
@@ -999,21 +1198,26 @@ fn render_sample(
     let sigmas =
         crate::scheduler::sigmas(scheduler, steps, crate::scheduler::image_tokens(edge, edge))?;
     let latents = create_noise(seed, edge, edge, dit.config().in_channels)?;
-    let negative = if guidance > 1.0 { ctx_neg } else { None };
+    let negative = if guidance > 1.0 { neg } else { None };
+    let references = (!reference_latents.is_empty()).then(|| ReferenceConditioning {
+        latents: reference_latents,
+        layout: &pos.layout,
+        negative_layout: negative.map(|neg| &neg.layout),
+    });
     let latents = denoise(
         DenoiseInputs {
             transformer: dit,
             sigmas: &sigmas,
             latents,
-            prompt_embeds: ctx_pos,
-            negative_embeds: negative,
+            prompt_embeds: &pos.text,
+            negative_embeds: negative.map(|neg| &neg.text),
             true_cfg_scale: guidance,
             width: edge,
             height: edge,
             sampler: None,
             seed,
             cancel,
-            references: None,
+            references,
         },
         &mut |_: Progress| {},
     )?;
@@ -1032,6 +1236,13 @@ impl Trainer for QwenImage21Trainer {
         // trainer is a typed `Unsupported`, never a silently trained plain adapter.
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        // Instruction-edit datasets (sc-24161): the shared floor caps references at this
+        // descriptor's `max_reference_images` (the render path's own cap) and refuses mixed or
+        // hybrid datasets; the snapshot must also carry the vision tower the references go through.
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        if req.items.iter().any(TrainingItem::is_edit_pair) && self.vision.is_none() {
+            return Err(missing_vision_tower().into());
+        }
         validate_request(req)?;
         if resolve_target_paths(&self.probe, &req.config).is_empty() {
             return Err(format!(
@@ -1062,6 +1273,15 @@ impl QwenImage21Trainer {
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<TrainingOutput> {
         validate_request(req)?;
+        // Edit mode is a different training input, so its floor is re-checked here rather than
+        // trusted to a prior `validate` call.
+        gen_core::train::validate_edit_request(&self.descriptor, req)?;
+        let edit = req.items.iter().any(TrainingItem::is_edit_pair);
+        let vision = if edit {
+            Some(self.vision.clone().ok_or_else(missing_vision_tower)?)
+        } else {
+            None
+        };
         let cfg = &req.config;
         let target_paths = resolve_target_paths(&self.probe, cfg);
         if target_paths.is_empty() {
@@ -1090,24 +1310,61 @@ impl QwenImage21Trainer {
 
         on_progress(TrainingProgress::Preparing);
         let edge = bucket_resolution(cfg.resolution);
-        let (grid_h, grid_w) = latent_grid(edge, edge);
-        let grid = (grid_h as usize, grid_w as usize);
 
         // --- preflight: the derived peak against this device, before any weight is read ---
+        // Edit previews condition on the first item's references (see `render_sample`).
+        let sample_reference_paths: &[PathBuf] = if edit {
+            &req.items[0].reference_image_paths
+        } else {
+            &[]
+        };
         let mut longest = 0u64;
-        for text in req
+        let (mut reference_tokens, mut largest_reference_tokens, mut reference_cache_tokens) =
+            (0u64, 0u64, 0u64);
+        let prompts = req
             .items
             .iter()
-            .map(|item| item.caption.as_str())
-            .chain(sample_prompts.iter().map(String::as_str))
-        {
-            longest = longest.max(caption_tokens(&self.tokenizer, self.drop_count, text)?);
+            .map(|item| {
+                (
+                    item.caption.as_str(),
+                    item.reference_image_paths.as_slice(),
+                    true,
+                )
+            })
+            .chain(
+                sample_prompts
+                    .iter()
+                    .map(|prompt| (prompt.as_str(), sample_reference_paths, false)),
+            );
+        for (text, reference_paths, cached) in prompts {
+            let tokens = match vision.as_ref() {
+                Some(vision) => {
+                    let (text_tokens, sum, largest) = edit_prompt_tokens(
+                        &self.tokenizer,
+                        self.drop_count,
+                        vision,
+                        text,
+                        reference_paths,
+                    )?;
+                    reference_tokens = reference_tokens.max(sum);
+                    largest_reference_tokens = largest_reference_tokens.max(largest);
+                    if cached {
+                        reference_cache_tokens += sum;
+                    }
+                    text_tokens
+                }
+                None => caption_tokens(&self.tokenizer, self.drop_count, text)?,
+            };
+            longest = longest.max(tokens);
         }
         let (trainable_params, lokr_delta_elements) =
             adapter_elements(&mut self.probe, &target_paths, cfg)?;
         let shape = TrainingShape {
             edge,
             caption_tokens: longest,
+            reference_tokens,
+            largest_reference_tokens,
+            reference_cache_tokens,
             items: req.items.len() as u64,
             compute_width: if compute_dtype == Dtype::Float32 {
                 4
@@ -1125,37 +1382,53 @@ impl QwenImage21Trainer {
             .unwrap_or_else(device_budget_bytes);
         check_training_footprint(&self.facts, &shape, budget)?;
 
-        // --- 1. captions: the Qwen3-VL language tower, encoded ONCE, then dropped ---
+        // --- 1. captions: the Qwen3-VL tower, encoded ONCE, then dropped ---
+        // Every prompt goes through the render path's own assembly: references preprocessed by
+        // `prepare_conditioning_references`, the (image-conditioned, for edit) template encoded by
+        // `encode_conditioning`, then `joint_branch` → the text rows + joint layout the DiT sees.
+        // A captioned item has no references, so this is the text-to-image conditioning exactly.
+        // An edit run loads the vision tower too (its references are vision context).
         on_progress(TrainingProgress::LoadingModel);
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let (captions, sample_caps, sample_neg) = {
+        let (branches, sample_caps, sample_neg) = {
             let encoder: QwenImage21TextEncoder =
-                loader::load_text_encoder_from(&self.root.join("text_encoder"), None)?;
-            let mut captions: Vec<Array> = Vec::with_capacity(req.items.len());
-            for item in &req.items {
+                loader::load_text_encoder_from(&self.root.join("text_encoder"), vision.as_ref())?;
+            let encode = |prompt: &str, references: &[PreparedReference]| {
+                encode_branch(
+                    &encoder,
+                    &self.tokenizer,
+                    self.drop_count,
+                    prompt,
+                    references,
+                    edge,
+                )
+            };
+            let mut branches: Vec<JointBranch> = Vec::with_capacity(req.items.len());
+            let mut sample_references = Vec::new();
+            for (i, item) in req.items.iter().enumerate() {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
-                let ctx = encoder.encode_prompt(&self.tokenizer, &item.caption, self.drop_count)?;
-                eval([&ctx])?;
-                captions.push(ctx);
+                let references =
+                    prepare_conditioning_references(&encoder, &decode_references(item)?)?;
+                branches.push(encode(&item.caption, &references)?);
+                if i == 0 && edit && sampling_requested {
+                    sample_references = references;
+                }
             }
-            let mut sample_caps: Vec<(String, Array)> = Vec::with_capacity(sample_prompts.len());
+            let mut sample_caps: Vec<(String, JointBranch)> =
+                Vec::with_capacity(sample_prompts.len());
             for prompt in &sample_prompts {
-                let ctx = encoder.encode_prompt(&self.tokenizer, prompt, self.drop_count)?;
-                eval([&ctx])?;
-                sample_caps.push((prompt.clone(), ctx));
+                sample_caps.push((prompt.clone(), encode(prompt, &sample_references)?));
             }
             let sample_neg = if sample_caps.is_empty() {
                 None
             } else {
-                let neg = encoder.encode_prompt(&self.tokenizer, "", self.drop_count)?;
-                eval([&neg])?;
-                Some(neg)
+                Some(encode("", &sample_references)?)
             };
-            (captions, sample_caps, sample_neg)
+            (branches, sample_caps, sample_neg)
             // `encoder` drops here: every caption is cached, the tower is idle from now on.
         };
         mlx_rs::memory::clear_cache();
@@ -1163,8 +1436,8 @@ impl QwenImage21Trainer {
         // --- 2. latents: the VAE encodes each image ONCE; the encoder half is then dropped ---
         let mut vae = loader::load_vae(&self.root)?;
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len());
-        for (i, (item, context)) in req.items.iter().zip(&captions).enumerate() {
+        let mut cache: Vec<CachedItem> = Vec::with_capacity(req.items.len());
+        for (i, (item, branch)) in req.items.iter().zip(branches).enumerate() {
             if req.cancel.is_cancelled() {
                 break;
             }
@@ -1174,10 +1447,15 @@ impl QwenImage21Trainer {
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
             let x0 = encode_latents(&vae, &img, edge)?;
-            eval([&x0])?;
-            cache.push((x0, context.clone()));
+            let references = encode_item_references(&vae, vision.as_ref(), item)?;
+            eval(std::iter::once(&x0).chain(references.iter()))?;
+            cache.push(CachedItem {
+                x0,
+                text: branch.text,
+                layout: branch.layout,
+                references,
+            });
         }
-        drop(captions);
         if cache.is_empty() {
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
@@ -1261,6 +1539,13 @@ impl QwenImage21Trainer {
             }
         }
 
+        // Provenance + licence on every saved adapter; an edit adapter is also marked as one.
+        let provenance: Vec<(&str, &str)> = ADAPTER_PROVENANCE
+            .iter()
+            .copied()
+            .chain(edit.then_some(EDIT_ADAPTER_MARKER))
+            .collect();
+
         let spec = LossSpec {
             adapter: &adapter,
             alpha,
@@ -1279,14 +1564,14 @@ impl QwenImage21Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, context) = &cache[((step - 1) as usize) % cache.len()];
+            let item = &cache[((step - 1) as usize) % cache.len()];
             let t = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
             )?;
             let noise = random::normal::<f32>(
-                x0.shape(),
+                item.x0.shape(),
                 None,
                 None,
                 Some(&random::key(
@@ -1298,11 +1583,12 @@ impl QwenImage21Trainer {
                 &params,
                 &spec,
                 &StepInputs {
-                    x0,
-                    context,
+                    x0: &item.x0,
+                    text: &item.text,
+                    layout: &item.layout,
+                    references: &item.references,
                     noise: &noise,
                     t,
-                    grid,
                 },
             )?;
             last_loss = loss;
@@ -1351,7 +1637,7 @@ impl QwenImage21Trainer {
                     rank,
                     cfg.decompose_factor,
                     "",
-                    &ADAPTER_PROVENANCE,
+                    &provenance,
                     &ckpt,
                 )?;
                 // The resume bundle holds the factors + optimizer state, not the in-flight
@@ -1386,7 +1672,10 @@ impl QwenImage21Trainer {
                     LOKR_DTYPE,
                 )?;
                 let total = sample_caps.len() as u32;
-                for (i, (prompt, ctx_pos)) in sample_caps.iter().enumerate() {
+                // Edit previews condition on the first item's cached reference latents.
+                let sample_reference_latents: &[Array] =
+                    if edit { &cache[0].references } else { &[] };
+                for (i, (prompt, pos)) in sample_caps.iter().enumerate() {
                     if req.cancel.is_cancelled() {
                         break;
                     }
@@ -1399,8 +1688,9 @@ impl QwenImage21Trainer {
                         &transformer,
                         vae,
                         &self.scheduler,
-                        ctx_pos,
+                        pos,
                         sample_neg.as_ref(),
+                        sample_reference_latents,
                         sample_seed,
                         edge,
                         cfg.sample_steps as usize,
@@ -1442,7 +1732,7 @@ impl QwenImage21Trainer {
             rank,
             cfg.decompose_factor,
             "",
-            &ADAPTER_PROVENANCE,
+            &provenance,
             &adapter_path,
         )?;
         Ok(TrainingOutput {
@@ -1456,7 +1746,9 @@ impl QwenImage21Trainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::{TrainingItem, WeightsSource};
+    use mlx_gen::WeightsSource;
+
+    use crate::transformer::Segment;
 
     fn tiny_snapshot() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot")
@@ -1494,6 +1786,9 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.supports_lora && d.supports_lokr);
         assert!(!d.supports_control && !d.supports_full_finetune);
+        // sc-24161: edit-capable, capped at the render path's own reference limit (one constant).
+        assert_eq!(d.max_reference_images as usize, MAX_REFERENCE_IMAGES);
+        assert_eq!(MAX_REFERENCE_IMAGES, 10);
     }
 
     #[test]
@@ -1668,6 +1963,8 @@ mod tests {
             vae_encode_channels: d::VAE_ENCODE_FULL_RES_CHANNELS,
             vae_decode_channels: d::VAE_FULL_RES_CHANNELS,
             pixels_per_token: d::PIXELS_PER_TOKEN,
+            vision_tower_bytes: 0,
+            vision_hidden: 1152,
         }
     }
 
@@ -1675,6 +1972,9 @@ mod tests {
         TrainingShape {
             edge,
             caption_tokens: 64,
+            reference_tokens: 0,
+            largest_reference_tokens: 0,
+            reference_cache_tokens: 0,
             items: 20,
             compute_width: 2,
             trainable_params: 40_000_000,
@@ -1933,6 +2233,53 @@ mod tests {
         (x0, ctx, noise)
     }
 
+    /// The text-to-image layout of [`fixed_batch`]: 5 text rows, a 4×4 target.
+    fn t2i_layout() -> JointLayout {
+        JointLayout::text_to_image(5, 4, 4)
+    }
+
+    /// A fixed synthetic **edit** batch: two references (2×2 and 2×4 latent grids) interleaved with
+    /// text exactly as `joint_layout` interleaves an image-conditioned prompt, and the 4×4 target
+    /// last.
+    struct EditBatch {
+        x0: Array,
+        text: Array,
+        noise: Array,
+        references: Vec<Array>,
+        layout: JointLayout,
+    }
+
+    fn fixed_edit_batch(dit: &QwenImage21Transformer) -> EditBatch {
+        let c = dit.config();
+        let channels = c.in_channels as i32;
+        let layout = JointLayout {
+            segments: vec![
+                Segment::Text { len: 3 },
+                Segment::Image {
+                    height: 2,
+                    width: 2,
+                },
+                Segment::Text { len: 1 },
+                Segment::Image {
+                    height: 2,
+                    width: 4,
+                },
+                Segment::Text { len: 4 },
+                Segment::Image {
+                    height: 4,
+                    width: 4,
+                },
+            ],
+        };
+        EditBatch {
+            x0: randn(&[1, 16, channels], 1),
+            text: randn(&[1, 8, c.context_in_dim as i32], 2),
+            noise: randn(&[1, 16, channels], 3),
+            references: vec![randn(&[1, 4, channels], 4), randn(&[1, 8, channels], 5)],
+            layout,
+        }
+    }
+
     struct Built {
         adapter: TrainAdapter,
         params: LoraParams,
@@ -1996,10 +2343,11 @@ mod tests {
                 &spec,
                 &StepInputs {
                     x0: &x0,
-                    context: &ctx,
+                    text: &ctx,
+                    layout: &t2i_layout(),
+                    references: &[],
                     noise: &noise,
                     t: 0.5,
-                    grid: (4, 4),
                 },
             )
             .unwrap();
@@ -2060,12 +2408,14 @@ mod tests {
                 .iter()
                 .all(|b| b.adapter.is_some() && !b.keys.is_empty()));
             let (x0, ctx, noise) = fixed_batch(&dit);
+            let layout = t2i_layout();
             let step = StepInputs {
                 x0: &x0,
-                context: &ctx,
+                text: &ctx,
+                layout: &layout,
+                references: &[],
                 noise: &noise,
                 t: 0.4,
-                grid: (4, 4),
             };
             let dense_spec = LossSpec {
                 adapter: &adapter,
@@ -2107,5 +2457,367 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("resume snapshot"), "{err}");
+    }
+
+    // ── edit mode (sc-24161) ─────────────────────────────────────────────────────────────────
+
+    /// AC: the reference cap comes from the descriptor (the render path's `MAX_REFERENCE_IMAGES`)
+    /// — exactly ten references validate, eleven are refused naming the cap — and a mixed dataset
+    /// is refused, all before any file is read.
+    #[test]
+    fn validate_caps_edit_references_at_the_render_paths_limit() {
+        let trainer =
+            QwenImage21Trainer::load(&LoadSpec::new(WeightsSource::Dir(tiny_snapshot()))).unwrap();
+        let edit_req = |count: usize| {
+            let mut req = req_with(base_config());
+            req.items = vec![TrainingItem::edit_pair(
+                PathBuf::from("/nonexistent/target.png"),
+                "make it blue".into(),
+                (0..count)
+                    .map(|i| PathBuf::from(format!("/nonexistent/ref{i}.png")))
+                    .collect(),
+            )];
+            req
+        };
+        assert!(trainer.validate(&edit_req(1)).is_ok());
+        assert!(trainer.validate(&edit_req(MAX_REFERENCE_IMAGES)).is_ok());
+        let err = trainer
+            .validate(&edit_req(MAX_REFERENCE_IMAGES + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most 10"), "{err}");
+
+        let mut mixed = edit_req(1);
+        mixed.items.push(TrainingItem::captioned(
+            PathBuf::from("/nonexistent/x.png"),
+            "a swatch".into(),
+        ));
+        let err = trainer.validate(&mixed).unwrap_err().to_string();
+        assert!(err.contains("item 1 has none"), "{err}");
+    }
+
+    /// A deterministic `width × height` RGB PNG under `dir`.
+    fn write_png(dir: &Path, name: &str, width: u32, height: u32, phase: u32) -> PathBuf {
+        let img = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([
+                ((x * 5 + phase) % 256) as u8,
+                ((y * 3 + 2 * phase) % 256) as u8,
+                (((x + y) * 7 + phase) % 256) as u8,
+            ])
+        });
+        let path = dir.join(name);
+        img.save(&path).unwrap();
+        path
+    }
+
+    fn assert_bit_equal(what: &str, got: &Array, want: &Array) {
+        assert_eq!(got.shape(), want.shape(), "{what}: shape");
+        assert!(
+            got.all_close(want, Some(0.0), Some(0.0), None)
+                .unwrap()
+                .item::<bool>(),
+            "{what}: the trainer's tensor differs from the render path's"
+        );
+    }
+
+    /// AC (E11): the edit trainer assembles **the same joint sequence as the render path**. One
+    /// edit item (a square and a 4:1 reference, in that order) is assembled through the trainer's
+    /// own caching path (files on disk → `decode_references` → `prepare_conditioning_references`
+    /// → `encode_branch`; `encode_item_references`), and the same references + prompt through the
+    /// render path's (`GenerationRequest` conditioning → `collect_references` →
+    /// `prepare_conditioning_references` → `encode_conditioning` → `joint_branch`;
+    /// `encode_references`). The layouts, the positional ids (hence the RoPE offsets), the text
+    /// rows and the reference latents must be identical — not just the same shapes — and the
+    /// layout must carry the references as distinct blocks in dataset order.
+    #[test]
+    fn edit_training_assembles_the_render_paths_joint_sequence() {
+        use mlx_gen::{Conditioning, GenerationRequest};
+
+        let root = tiny_snapshot();
+        let tmp = tempfile::tempdir().unwrap();
+        let square = write_png(tmp.path(), "square.png", 64, 64, 0);
+        let wide = write_png(tmp.path(), "wide.png", 256, 64, 90);
+        let prompt = "put the second image's colours onto the first";
+        let edge = 64u32;
+
+        let tokenizer = loader::load_tokenizer(&root).unwrap();
+        let drop = system_prompt_drop_count(&tokenizer).unwrap();
+        let encoder = loader::load_text_encoder(&root).unwrap();
+        let vision = loader::load_vision_config(&root).unwrap().unwrap();
+        let vae = loader::load_vae(&root).unwrap();
+
+        // The trainer's path, from the dataset item.
+        let item = TrainingItem::edit_pair(
+            PathBuf::from("/unused/target.png"),
+            prompt.into(),
+            vec![square.clone(), wide.clone()],
+        );
+        let prepared =
+            prepare_conditioning_references(&encoder, &decode_references(&item).unwrap()).unwrap();
+        let trained = encode_branch(&encoder, &tokenizer, drop, prompt, &prepared, edge).unwrap();
+        let trained_refs = encode_item_references(&vae, Some(&vision), &item).unwrap();
+
+        // The render path's, from a request carrying the same pictures as conditioning.
+        let rgb = |path: &Path| {
+            let img = image::open(path).unwrap().to_rgb8();
+            Image {
+                width: img.width(),
+                height: img.height(),
+                pixels: img.into_raw(),
+            }
+        };
+        let req = GenerationRequest {
+            prompt: prompt.into(),
+            width: edge,
+            height: edge,
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: rgb(&square),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: rgb(&wide),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let images = crate::reference::collect_references(&req).unwrap();
+        let references = prepare_conditioning_references(&encoder, &images).unwrap();
+        let conditioning = encoder
+            .encode_conditioning(&tokenizer, &req.prompt, drop, &references)
+            .unwrap();
+        let rendered = joint_branch(&conditioning, &references, req.width, req.height).unwrap();
+        let rendered_refs = encode_references(&vae, &references).unwrap();
+
+        assert_eq!(trained.layout, rendered.layout, "joint layout");
+        assert_eq!(
+            trained.layout.position_ids(),
+            rendered.layout.position_ids(),
+            "positional ids (RoPE offsets)"
+        );
+        assert_bit_equal("text rows", &trained.text, &rendered.text);
+        assert_eq!(trained_refs.len(), 2);
+        assert_eq!(rendered_refs.len(), 2);
+        for (i, (got, want)) in trained_refs.iter().zip(&rendered_refs).enumerate() {
+            assert_bit_equal(&format!("reference {i} latents"), got, want);
+        }
+
+        // The layout itself: the two references as two distinct blocks, in dataset order (the
+        // square's 4×4 grid, then the 4:1 reference's 2×8), and the 4×4 target last.
+        let blocks: Vec<(usize, usize)> = trained
+            .layout
+            .segments
+            .iter()
+            .filter_map(|s| match *s {
+                Segment::Image { height, width } => Some((height, width)),
+                Segment::Text { .. } => None,
+            })
+            .collect();
+        assert_eq!(blocks, [(4, 4), (2, 8), (4, 4)]);
+        assert_eq!(
+            trained_refs[1].shape()[1],
+            16,
+            "the 4:1 reference packs to 2·8 tokens"
+        );
+
+        // Order is semantic: the swapped item assembles a different sequence.
+        let swapped = TrainingItem::edit_pair(
+            PathBuf::from("/unused/target.png"),
+            prompt.into(),
+            vec![wide, square],
+        );
+        let prepared =
+            prepare_conditioning_references(&encoder, &decode_references(&swapped).unwrap())
+                .unwrap();
+        let swapped = encode_branch(&encoder, &tokenizer, drop, prompt, &prepared, edge).unwrap();
+        assert_ne!(
+            swapped.layout, trained.layout,
+            "reference order must be kept"
+        );
+    }
+
+    /// AC: edit training learns — on a fixed edit batch (two interleaved references, the target
+    /// last) the loss falls under the real step, and the references genuinely condition it:
+    /// different reference latents give a different loss at the same factors.
+    #[test]
+    fn edit_loss_decreases_over_steps_and_depends_on_the_references() {
+        let mut dit = tiny_dit();
+        let Built {
+            adapter,
+            mut params,
+            ..
+        } = build(&mut dit, NetworkType::Lora);
+        let EditBatch {
+            x0,
+            text,
+            noise,
+            references,
+            layout,
+        } = fixed_edit_batch(&dit);
+        let spec = LossSpec {
+            adapter: &adapter,
+            alpha: 4.0,
+            rank: 4.0,
+            mae: false,
+            dtype: Dtype::Float32,
+            lora_dtype: None,
+            checkpoint: None,
+        };
+        /// `(x0, text, noise, layout)` of the fixed batch.
+        type Batch<'a> = (&'a Array, &'a Array, &'a Array, &'a JointLayout);
+        fn step<'a>(batch: Batch<'a>, references: &'a [Array]) -> StepInputs<'a> {
+            let (x0, text, noise, layout) = batch;
+            StepInputs {
+                x0,
+                text,
+                layout,
+                references,
+                noise,
+                t: 0.5,
+            }
+        }
+        let batch: Batch<'_> = (&x0, &text, &noise, &layout);
+
+        let other: Vec<Array> = references
+            .iter()
+            .enumerate()
+            .map(|(i, r)| randn(r.shape(), 50 + i as u64))
+            .collect();
+        let (with_refs, _) =
+            compute_loss_grads(&mut dit, &params, &spec, &step(batch, &references)).unwrap();
+        let (with_other, _) =
+            compute_loss_grads(&mut dit, &params, &spec, &step(batch, &other)).unwrap();
+        assert!(
+            (with_refs - with_other).abs() > 1e-7,
+            "the reference latents must enter the forward: {with_refs} vs {with_other}"
+        );
+
+        let mut opt = TrainOptimizer::from_config("adamw", 1e-2, 0.0).unwrap();
+        let mut losses = Vec::new();
+        for _ in 0..30 {
+            let (loss, grads) =
+                compute_loss_grads(&mut dit, &params, &spec, &step(batch, &references)).unwrap();
+            assert!(loss.is_finite(), "non-finite loss {loss}");
+            losses.push(loss);
+            let (clipped, _) = clip_grad_norm(&grads, 1.0).unwrap();
+            let clipped: LoraParams = clipped
+                .into_iter()
+                .map(|(k, v)| (k, v.into_owned()))
+                .collect();
+            opt.step(&mut params, &clipped).unwrap();
+            eval(params.values()).unwrap();
+        }
+        let (first, last) = (losses[0], *losses.last().unwrap());
+        eprintln!("[sc-24161] fixed edit batch loss {first:.5} -> {last:.5}");
+        assert!(
+            last < 0.9 * first,
+            "the edit loss must fall on a fixed batch: {losses:?}"
+        );
+    }
+
+    /// The gradient-checkpointed joint forward is the dense joint forward on an **edit** layout
+    /// too: same loss, same grads.
+    #[test]
+    fn checkpointed_edit_grads_match_dense() {
+        let mut dit = tiny_dit();
+        let Built {
+            adapter,
+            params,
+            cfg,
+            paths,
+        } = build(&mut dit, NetworkType::Lora);
+        let params: LoraParams = params
+            .into_iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let p = multiply(randn(v.shape(), 200 + i as u64), Array::from_f32(0.05)).unwrap();
+                (k, p)
+            })
+            .collect();
+        let blocks = block_trainables(&mut dit, &paths, &params, &cfg).unwrap();
+        let EditBatch {
+            x0,
+            text,
+            noise,
+            references,
+            layout,
+        } = fixed_edit_batch(&dit);
+        let step = StepInputs {
+            x0: &x0,
+            text: &text,
+            layout: &layout,
+            references: &references,
+            noise: &noise,
+            t: 0.4,
+        };
+        let dense_spec = LossSpec {
+            adapter: &adapter,
+            alpha: 4.0,
+            rank: 4.0,
+            mae: false,
+            dtype: Dtype::Float32,
+            lora_dtype: None,
+            checkpoint: None,
+        };
+        let (l_dense, g_dense) = compute_loss_grads(&mut dit, &params, &dense_spec, &step).unwrap();
+        let ckpt_spec = LossSpec {
+            checkpoint: Some(blocks.as_slice()),
+            ..dense_spec
+        };
+        let (l_ckpt, g_ckpt) = compute_loss_grads(&mut dit, &params, &ckpt_spec, &step).unwrap();
+        eval(g_dense.values().chain(g_ckpt.values())).unwrap();
+        assert!(
+            (l_dense - l_ckpt).abs() <= 1e-5 * l_dense.abs().max(1.0),
+            "loss {l_dense} vs {l_ckpt}"
+        );
+        let rel = max_rel_diff(&g_dense, &g_ckpt);
+        assert!(rel < 1e-3, "max rel grad diff {rel:.2e}");
+    }
+
+    /// AC: the preflight prices an edit run's references — their cached latents (latent and train
+    /// stages), the longer joint sequence (train stage), and the vision tower plus the vision
+    /// slots of the image-conditioned prompt (caption stage).
+    ///
+    /// *Mutation that reds this:* dropping `shape.reference_tokens` from `seq`, or
+    /// `reference_cache_tokens` from the latent cache, or the vision term from the caption stage.
+    #[test]
+    fn the_preflight_prices_edit_references() {
+        let facts = FootprintFacts {
+            vision_tower_bytes: 1 << 30,
+            ..production_facts()
+        };
+        let t2i = shape(1024, true);
+        let edit = TrainingShape {
+            reference_tokens: 2 * 4096,
+            largest_reference_tokens: 4096,
+            reference_cache_tokens: 20 * 2 * 4096,
+            ..t2i
+        };
+        let (a, b) = (
+            training_footprint(&facts, &t2i),
+            training_footprint(&facts, &edit),
+        );
+        assert!(b.caption_phase >= a.caption_phase + facts.vision_tower_bytes);
+        assert_eq!(
+            b.latent_phase - a.latent_phase,
+            edit.reference_cache_tokens * facts.latent_channels * F32_WIDTH,
+            "the latent stage carries exactly the cached reference latents on top"
+        );
+        // The train stage carries the reference cache AND a longer joint sequence.
+        let cache_only = TrainingShape {
+            reference_tokens: 0,
+            largest_reference_tokens: 0,
+            ..edit
+        };
+        let cache_train = training_footprint(&facts, &cache_only).train_phase;
+        assert_eq!(
+            cache_train - a.train_phase,
+            edit.reference_cache_tokens * facts.latent_channels * F32_WIDTH
+        );
+        assert!(
+            b.train_phase > cache_train,
+            "the reference blocks lengthen the joint sequence the step attends over"
+        );
     }
 }

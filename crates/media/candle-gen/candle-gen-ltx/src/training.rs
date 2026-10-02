@@ -1312,6 +1312,7 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         supports_lokr: false,
         supports_control: false,
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -1410,6 +1411,7 @@ impl Trainer for LtxTrainer {
         }
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_ltx_request(req, self.label()).map_err(Into::into)
     }
 
@@ -1787,6 +1789,8 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     gen_core::train::validate_control_request(&descriptor, req)
         .map_err(|error| CandleError::Msg(error.to_string()))?;
     gen_core::train::validate_full_finetune_request(&descriptor, req)
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+    gen_core::train::validate_edit_request(&descriptor, req)
         .map_err(|error| CandleError::Msg(error.to_string()))?;
     validate_ltx_request(req, MODEL_25_ID)?;
     if !req.config.alpha.is_finite() || req.config.alpha <= 0.0 {
