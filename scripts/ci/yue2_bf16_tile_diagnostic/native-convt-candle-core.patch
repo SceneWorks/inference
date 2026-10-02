@@ -1,0 +1,158 @@
+--- a/candle-core/src/cuda_backend/mod.rs
++++ b/candle-core/src/cuda_backend/mod.rs
+@@ -10,3 +10,132 @@
+     CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
+ };
+ use half::{bf16, f16};
++use std::cell::RefCell;
++
++// Diagnostic-only observation of the actual native ConvTranspose1d GEMM result.
++// The request is scoped to the calling thread and has no effect when inactive.
++#[derive(Debug)]
++pub struct Yue2NativeConvtColumn {
++    pub bytes: Vec<u8>,
++    pub shape: [usize; 4],
++    pub gemm: [usize; 4],
++    pub kernel_layout_strides: [usize; 3],
++    pub dtype: DType,
++    pub math_mode_readback: u32,
++    pub branch: &'static str,
++}
++
++struct Yue2ColumnRequest {
++    expected_dtype: DType,
++    expected_shape: [usize; 4],
++    captured: Option<Yue2NativeConvtColumn>,
++}
++
++thread_local! {
++    static YUE2_COLUMN_REQUEST: RefCell<Option<Yue2ColumnRequest>> = const { RefCell::new(None) };
++}
++
++/// Observe exactly one native CUDA ConvTranspose1d column, without replacing its GEMM or Col2Im.
++/// A guard clears the request on errors and unwinding; an unobserved or duplicate request fails.
++pub fn with_yue2_native_convt_column<T>(
++    expected_dtype: DType,
++    expected_shape: [usize; 4],
++    run: impl FnOnce() -> Result<T>,
++) -> Result<(T, Yue2NativeConvtColumn)> {
++    struct Reset;
++    impl Drop for Reset {
++        fn drop(&mut self) {
++            YUE2_COLUMN_REQUEST.with(|slot| {
++                slot.borrow_mut().take();
++            });
++        }
++    }
++    let inserted = YUE2_COLUMN_REQUEST.with(|slot| {
++        let mut slot = slot.borrow_mut();
++        if slot.is_some() {
++            false
++        } else {
++            *slot = Some(Yue2ColumnRequest {
++                expected_dtype,
++                expected_shape,
++                captured: None,
++            });
++            true
++        }
++    });
++    if !inserted {
++        crate::bail!("nested YuE2 native column capture is forbidden")
++    }
++    let _reset = Reset;
++    let output = run()?;
++    let captured = YUE2_COLUMN_REQUEST.with(|slot| {
++        slot.borrow_mut()
++            .as_mut()
++            .and_then(|request| request.captured.take())
++    });
++    match captured {
++        Some(captured) => Ok((output, captured)),
++        None => crate::bail!("native ConvTranspose1d column was not captured"),
++    }
++}
++
++fn yue2_native_column_pending() -> bool {
++    YUE2_COLUMN_REQUEST.with(|slot| slot.borrow().is_some())
++}
++
++fn yue2_capture_native_column(
++    col: &CudaStorage,
++    device: &CudaDevice,
++    shape: [usize; 4],
++    gemm: [usize; 4],
++    kernel_layout_strides: [usize; 3],
++) -> Result<()> {
++    let requested = YUE2_COLUMN_REQUEST.with(|slot| {
++        slot.borrow().as_ref().map(|request| {
++            (
++                request.expected_dtype,
++                request.expected_shape,
++                request.captured.is_some(),
++            )
++        })
++    });
++    let Some((expected_dtype, expected_shape, already_captured)) = requested else {
++        return Ok(());
++    };
++    if already_captured || col.dtype() != expected_dtype || shape != expected_shape {
++        crate::bail!("native ConvTranspose1d column call, dtype, or shape changed")
++    }
++    device.synchronize()?;
++    let mut math_mode = cudarc::cublas::sys::cublasMath_t::CUBLAS_DEFAULT_MATH;
++    let status =
++        unsafe { cudarc::cublas::sys::cublasGetMathMode(*device.blas.handle(), &mut math_mode) };
++    if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
++        crate::bail!("native ConvTranspose1d cuBLAS math-mode readback failed: {status:?}")
++    }
++    let bytes = match &col.slice {
++        CudaStorageSlice::BF16(values) => device
++            .clone_dtoh(values)?
++            .into_iter()
++            .flat_map(|value| value.to_bits().to_le_bytes())
++            .collect(),
++        CudaStorageSlice::F32(values) => device
++            .clone_dtoh(values)?
++            .into_iter()
++            .flat_map(f32::to_le_bytes)
++            .collect(),
++        _ => crate::bail!("native ConvTranspose1d column has unsupported dtype"),
++    };
++    device.synchronize()?;
++    YUE2_COLUMN_REQUEST.with(|slot| {
++        slot.borrow_mut().as_mut().unwrap().captured = Some(Yue2NativeConvtColumn {
++            bytes,
++            shape,
++            gemm,
++            kernel_layout_strides,
++            dtype: expected_dtype,
++            math_mode_readback: math_mode as u32,
++            branch: "native_col2im",
++        });
++    });
++    Ok(())
++}
+@@ -1928,12 +2057,22 @@
+                     &kernel_l_mm,
+                 )?
+             };
++            yue2_capture_native_column(
++                &col,
++                &device,
++                [b_size, l_in, c_out, k_size],
++                [b_size, l_in, c_out * k_size, c_in],
++                [0, k_size * c_out, 1],
++            )?;
+             let col_l = Layout::contiguous((b_size, l_in, c_out, k_size));
+             Col2Im1D {
+                 stride: params.stride,
+             }
+             .map(&col.slice, &device, &col_l)?
+         } else {
++            if yue2_native_column_pending() {
++                crate::bail!("requested native ConvTranspose1d used the fallback kernel")
++            }
+             ConvTranspose1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?
+         };
+         Ok(Self { slice, device })

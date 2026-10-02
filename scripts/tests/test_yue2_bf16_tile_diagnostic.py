@@ -61,7 +61,8 @@ def synthetic_trace_build(root: Path) -> argparse.Namespace:
     kernel_id = f"path+file:///{kernel}#0.10.2"
     rows = [
         {"reason": "compiler-artifact", "target": {"name": "candle_core"},
-         "features": ["cuda", "cudarc", "default"]},
+         "features": ["cuda", "cudarc", "default"],
+         "package_id": "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#candle-core@0.10.2"},
         {"reason": "compiler-artifact", "target": {"name": "candle_kernels"},
          "package_id": kernel_id},
         {"reason": "compiler-artifact", "target": {"name": "yue2-bf16-tile-diagnostic"},
@@ -71,13 +72,16 @@ def synthetic_trace_build(root: Path) -> argparse.Namespace:
     build.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     identity = {"binary_sha256": diag.sha256(binary), "build_json_sha256": diag.sha256(build),
                 "candle_core_features": ["cuda", "cudarc", "default"],
-                "vendored_kernel_package_id": kernel_id, "derivative_source": str(overlay)}
+                "candle_core_package_id": rows[0]["package_id"],
+                "vendored_kernel_package_id": kernel_id, "derivative_source": str(overlay),
+                "native_candle_source": None}
     (evidence / "build-identity.json").write_text(json.dumps(identity), encoding="utf-8")
     def hashes(directory: Path) -> dict:
         return {str(path.relative_to(directory)): diag.sha256(path)
                 for path in directory.rglob("*") if path.is_file()}
     harness = {"engine_sha": diag.ENGINE_SHA, "control_sha": control_sha,
                "m3_dependency_tuples": 205,
+               "declared_core_source_exception": None, "native_candle_source": None,
                "overlay_sha256": diag.sha256(provenance_path),
                "standalone_lock_sha256": diag.sha256(template / "Cargo.lock.snapshot"),
                "template_files": hashes(template), "staged_files": hashes(staged)}
@@ -85,6 +89,51 @@ def synthetic_trace_build(root: Path) -> argparse.Namespace:
     return argparse.Namespace(binary=binary, reference=root / "reference", evidence=evidence,
                               engine_sha=diag.ENGINE_SHA, control_sha=control_sha,
                               diagnostic="decoder_trace", overlay_root=overlay)
+
+
+def synthetic_native_build(root: Path) -> argparse.Namespace:
+    args = synthetic_trace_build(root)
+    candle = root / "candle-overlay"
+    (candle / "candle-core/src/cuda_backend").mkdir(parents=True)
+    (candle / "candle-core/src/cuda_backend/mod.rs").write_text("// observed native GEMM column\n",
+                                                                encoding="utf-8")
+    (candle / "Cargo.toml").write_text("# pinned kernel path\n", encoding="utf-8")
+    old = (args.overlay_root / "Cargo.lock").read_text(encoding="utf-8")
+    old = old.replace('name="test-dependency-0"\nversion="1.0.0"',
+                      'name="candle-core"\nversion="0.10.2"\nsource="git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"')
+    (args.overlay_root / "Cargo.lock").write_text(old, encoding="utf-8")
+    new = old.replace('source="git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"', '')
+    template = root / "control/scripts/ci/yue2_bf16_tile_diagnostic"
+    (template / "Cargo.lock.native-convt.snapshot").write_text(new, encoding="utf-8")
+    (args.evidence / "harness/Cargo.lock").write_text(new, encoding="utf-8")
+    provenance = root / "native-provenance.json"
+    provenance.write_text('{}\n', encoding="utf-8")
+    build = args.evidence / "build.jsonl"
+    rows = [json.loads(line) for line in build.read_text(encoding="utf-8").splitlines()]
+    rows[0]["package_id"] = f"path+file:///{candle / 'candle-core'}#0.10.2"
+    build.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    identity_path = args.evidence / "build-identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity.update(build_json_sha256=diag.sha256(build),
+                    candle_core_package_id=rows[0]["package_id"], native_candle_source=str(candle))
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    harness_path = args.evidence / "harness-provenance.json"
+    harness = json.loads(harness_path.read_text(encoding="utf-8"))
+    harness.update(m3_dependency_tuples=204,
+                   declared_core_source_exception=["candle-core", None, "1.0.0", None],
+                   native_candle_source=str(candle), overlay_sha256=diag.sha256(provenance),
+                   standalone_lock_sha256=diag.sha256(template / "Cargo.lock.native-convt.snapshot"))
+    harness["declared_core_source_exception"] = ["candle-core", None, "0.10.2", None]
+    harness["standalone_lock_sha256"] = diag.sha256(template / "Cargo.lock.native-convt.snapshot")
+    def hashes(directory: Path) -> dict:
+        return {str(path.relative_to(directory)): diag.sha256(path)
+                for path in directory.rglob("*") if path.is_file()}
+    harness["template_files"] = hashes(template)
+    harness["staged_files"] = hashes(args.evidence / "harness")
+    harness_path.write_text(json.dumps(harness), encoding="utf-8")
+    args.diagnostic = "native_convt_columns"
+    args.native_candle_root = candle
+    return args
 
 
 def synthetic_math_report(root: Path, applicable: bool) -> tuple[Path, dict, dict]:
@@ -179,6 +228,25 @@ def synthetic_math_report(root: Path, applicable: bool) -> tuple[Path, dict, dic
 
 
 class DiagnosticGuards(unittest.TestCase):
+    def test_native_columns_compare_actual_blck_contributors_and_signed_zero(self):
+        full = bytes(75 * 1024 * 12 * 2)
+        tile = bytearray(32 * 1024 * 12 * 2)
+        tile[3 * 2:3 * 2 + 2] = (0x3f80).to_bytes(2, "little")  # j=3, current row 0, tap 3.
+        tile[4 * 2:4 * 2 + 2] = (0x8000).to_bytes(2, "little")  # signed-zero-only change.
+        result = diag.native_contributor_stats(full, bytes(tile), "BF16")
+        self.assertEqual(result["comparedContributors"], 347136)
+        self.assertEqual((result["bitDifferences"], result["positiveDifferences"],
+                          result["signedZeroOnly"], result["maxAbs"]), (2, 1, 1, 1.0))
+        self.assertEqual(result["firstDifferent"], {
+            "rawFrame": 3, "inputRow": 0, "kernelTap": 3, "channel": 0,
+            "full": 0.0, "tile": 1.0, "absError": 1.0})
+        with self.assertRaisesRegex(RuntimeError, "unexpected lengths"):
+            diag.native_contributor_stats(full, bytes(tile[:-2]), "BF16")
+        with self.assertRaisesRegex(RuntimeError, "first ConvT divergence"):
+            diag.verify_native_column_data(Path("/nonexistent"), {
+                "earliestBf16Stage": 1, "adaptive": {"status": "collected", "window": 0},
+                "nativeColumns": {"status": "collected", "stage": 2, "window": 0}})
+
     def test_decoder_trace_tree_hash_uses_case_sensitive_posix_utf8_order(self):
         windows_root = PureWindowsPath("C:/source")
         windows_entries = [windows_root / name for name in
@@ -265,6 +333,58 @@ class DiagnosticGuards(unittest.TestCase):
             finally:
                 os.chdir(old)
 
+    def test_native_column_build_allows_only_declared_core_source_and_exact_kernel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = synthetic_native_build(root)
+            old = Path.cwd()
+            try:
+                os.chdir(root / "engine")
+                provenance = root / "native-provenance.json"
+                diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance,
+                                                  args.native_candle_root)
+                build = args.evidence / "build.jsonl"
+                identity_path = args.evidence / "build-identity.json"
+                original = build.read_bytes()
+                rows = [json.loads(line) for line in original.decode("utf-8").splitlines()]
+                rows[0]["package_id"] = "git+https://github.com/huggingface/candle#other-core"
+                build.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                identity["build_json_sha256"] = diag.sha256(build)
+                identity["candle_core_package_id"] = rows[0]["package_id"]
+                identity_path.write_text(json.dumps(identity), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "derivative Candle backend"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance,
+                                                      args.native_candle_root)
+                build.write_bytes(original)
+                identity["build_json_sha256"] = diag.sha256(build)
+                identity["candle_core_package_id"] = json.loads(
+                    original.decode("utf-8").splitlines()[0])["package_id"]
+                identity_path.write_text(json.dumps(identity), encoding="utf-8")
+                args.binary.write_bytes(b"replaced after build")
+                with self.assertRaisesRegex(RuntimeError, "executable or saved build"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance,
+                                                      args.native_candle_root)
+            finally:
+                os.chdir(old)
+
+    def test_native_source_patches_and_workflow_preserve_only_bounded_selector(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("repository: huggingface/candle", workflow)
+        self.assertIn("ref: 1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", workflow)
+        self.assertIn('if: inputs.diagnostic == \'native_convt_columns\'', workflow)
+        self.assertIn("--features cuda,native_convt_columns", workflow)
+        self.assertIn("--native-candle-root", workflow)
+        self.assertIn("native-convt-candle-kernel-path.patch", workflow)
+        self.assertIn("--locked --offline --release", workflow)
+        source = (CI / "yue2_native_convt_overlay.py").read_text(encoding="utf-8")
+        for required in ("CANDLE_SHA", "CANDLE_TREE", "CANDLE_BACKEND_SHA",
+                         "apply_one_patch(candle_overlay, backend_patch, CANDLE_BACKEND)",
+                         'apply_one_patch(candle_overlay, kernel_path_patch, Path("Cargo.toml"))',
+                         "candle_derivative_tree_sha256"):
+            self.assertIn(required, source)
+        self.assertNotIn("cublasSetMathMode", source)
+
     def test_decoder_trace_binary_mismatch_reaches_neither_census_nor_child(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -322,9 +442,10 @@ class DiagnosticGuards(unittest.TestCase):
     def test_explicit_selector_keeps_waveform_default_and_forwards_to_child(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("default: waveform", workflow)
-        self.assertIn("options: [waveform, first_conv, first_conv_math, decoder_trace]", workflow)
+        self.assertIn("options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns]", workflow)
         self.assertIn('run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR"', workflow)
-        self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math", "decoder_trace"))
+        self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math",
+                                            "decoder_trace", "native_convt_columns"))
 
     def test_first_conv_math_conditional_arms_and_restore_receipt(self):
         for applicable in (False, True):
@@ -545,18 +666,20 @@ class DiagnosticGuards(unittest.TestCase):
         lines = [line.strip() for line in step.splitlines()]
         prepare = next(i for i, line in enumerate(lines) if "prepare-harness" in line)
         fetch = next(i for i, line in enumerate(lines) if line.startswith("cargo fetch "))
-        build = next(i for i, line in enumerate(lines) if line.startswith("cargo build "))
-        assert prepare < fetch < build
+        builds = [i for i, line in enumerate(lines) if line.startswith("cargo build ")]
+        assert len(builds) == 3 and prepare < fetch < min(builds)
         assert lines[fetch] == (
             'cargo fetch --locked --manifest-path "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\harness\\Cargo.toml" '
             '--target x86_64-pc-windows-msvc > "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\fetch.log" 2>&1')
         assert lines[fetch + 1] == (
             'if errorlevel 1 (type "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\fetch.log"& exit /b 1)')
-        assert lines[build] == (
-            'cargo build --locked --offline --release --manifest-path '
-            '"%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\harness\\Cargo.toml" --features cuda '
-            '--message-format=json > "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\build.jsonl" '
-            '2> "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\build.log"')
+        prefix = ('cargo build --locked --offline --release --manifest-path '
+                  '"%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\harness\\Cargo.toml" --features ')
+        suffix = (' --message-format=json > "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\build.jsonl" '
+                  '2> "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\build.log"')
+        assert {lines[i].removeprefix(prefix).removesuffix(suffix) for i in builds} == {
+            "cuda", "cuda,decoder_trace", "cuda,native_convt_columns"}
+        assert all(lines[i].startswith(prefix) and lines[i].endswith(suffix) for i in builds)
         assert 'path: ${{ runner.temp }}/yue2-bf16-tile-diagnostic' in workflow
 
     def test_locked_target_fetch_stages_before_unchanged_offline_build(self):
@@ -679,6 +802,87 @@ class DiagnosticGuards(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "vendored CUDA kernels"):
                 diag.resolve_binary(build, root / "binary.txt")
             self.assertFalse((root / "binary.txt").exists())
+
+
+class HistoricalStage2BindingTests(unittest.TestCase):
+    def test_consistent_new_replay_and_old_waveform_claim_cannot_replace_stage2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = json.loads(diag.HISTORICAL_STAGE2_PATH.read_text(encoding="utf-8"))
+            runs = {}
+            stage_runs = {}
+            for dtype in ("bf16", "f32"):
+                slots = {}
+                for slot in ("full", "window"):
+                    records = expected["records"][dtype][slot]
+                    for name, row in records.items():
+                        identity = ("input" if name in {"sourceInput", "replayInput"} else
+                                    "output" if name in {"originalOutput", "replayOutput", "biased"}
+                                    else name)
+                        content = f"{dtype}/{slot}/{identity}".encode()
+                        row.update(file=f"{dtype}-{slot}-{name}.bin", bytes=len(content),
+                                   sha256=hashlib.sha256(content).hexdigest(), shape=[1, 1, len(content)])
+                        (root / row["file"]).write_bytes(content)
+                    slots[slot] = {key: dict(records[key]) for key in
+                                   ("sourceInput", "replayInput", "originalOutput", "replayOutput")}
+                    slots[slot]["substeps"] = [
+                        {"name": key, "capture": dict(records[key])}
+                        for key in ("native_unpadded_conv_transpose", "cropped", "biased")]
+                    slots[slot]["inputBitExact"] = True
+                    slots[slot]["outputBitExact"] = True
+                runs[dtype] = slots
+                stage_runs[dtype] = {"stages": [{},
+                    {"full": dict(expected["records"][dtype]["full"]["sourceInput"]),
+                     "windows": [{"capture": dict(expected["records"][dtype]["window"]["sourceInput"])}]},
+                    {"full": dict(expected["records"][dtype]["full"]["originalOutput"]),
+                     "windows": [{"capture": dict(expected["records"][dtype]["window"]["originalOutput"])}]}]}
+            manifest = root / "historical.json"
+            manifest.write_text(json.dumps(expected), encoding="utf-8")
+            report = {"adaptive": {"runs": runs}, "runs": stage_runs, "waveformParity": True,
+                      "historicalStage2": {
+                          "sourceRunId": expected["source_run"],
+                          "sourceControlSha": expected["source_control"],
+                          "sourceReportSha256": expected["report_sha256"],
+                          "sourceMetricsZipSha256": expected["metrics_zip_sha256"],
+                          "expectedMapSha256": diag.sha256(manifest),
+                          "checks": {"bf16": {"full": True, "window": True},
+                                     "f32": {"full": True, "window": True}},
+                          "matchesHistorical": True}}
+            diag.verify_historical_stage2_data(root, report, manifest)
+            for dtype in ("bf16", "f32"):
+                for slot in ("full", "window"):
+                    for names in (("sourceInput", "replayInput"),
+                                  ("originalOutput", "replayOutput"),
+                                  ("native_unpadded_conv_transpose",), ("cropped",), ("biased",)):
+                        changed = json.loads(json.dumps(report))
+                        prior_bytes = {}
+                        for name in names:
+                            old = expected["records"][dtype][slot][name]
+                            file = root / old["file"]
+                            prior_bytes[name] = file.read_bytes()
+                            new_bytes = bytes([prior_bytes[name][0] ^ 1]) + prior_bytes[name][1:]
+                            file.write_bytes(new_bytes)
+                            new = dict(old, sha256=hashlib.sha256(new_bytes).hexdigest())
+                            if name in {"native_unpadded_conv_transpose", "cropped", "biased"}:
+                                step = next(row for row in changed["adaptive"]["runs"][dtype][slot]["substeps"]
+                                            if row["name"] == name)
+                                step["capture"] = new
+                            else:
+                                changed["adaptive"]["runs"][dtype][slot][name] = new
+                                if name in {"sourceInput", "originalOutput"}:
+                                    stage = 1 if name == "sourceInput" else 2
+                                    stage_record = changed["runs"][dtype]["stages"][stage]
+                                    if slot == "full":
+                                        stage_record["full"] = dict(new)
+                                    else:
+                                        stage_record["windows"][0]["capture"] = dict(new)
+                        if len(names) == 2:
+                            pair = changed["adaptive"]["runs"][dtype][slot]
+                            self.assertEqual(pair[names[0]]["sha256"], pair[names[1]]["sha256"])
+                        with self.assertRaisesRegex(RuntimeError, "historical stage-2 bytes"):
+                            diag.verify_historical_stage2_data(root, changed, manifest)
+                        for name, content in prior_bytes.items():
+                            (root / expected["records"][dtype][slot][name]["file"]).write_bytes(content)
 
 
 if __name__ == "__main__":

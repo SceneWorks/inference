@@ -23,4 +23,5 @@ native_convt_columns = ["decoder_trace"]
 opt-level = 3
 
 [patch."https://github.com/huggingface/candle"]
+candle-core = { path = "__CANDLE_ROOT__/candle-core" }
 candle-kernels = { path = "__ENGINE_ROOT__/crates/media/candle-gen/vendor/candle-kernels" }
