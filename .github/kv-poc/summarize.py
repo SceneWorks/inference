@@ -119,7 +119,8 @@ def noise_floor_markdown(rows: list[dict], summary: dict | None) -> str:
                      f"{thresholds.get('greedyTokenAgreement', '?')}, |perplexityDelta| <= {thresholds.get('perplexityDelta', '?')}):\n")
         for control, worst in sorted((summary.get("controls") or {}).items()):
             within = [name for name, key in (("greedy", "greedyThresholdWithinDenseFloor"),
-                                             ("perplexity", "perplexityThresholdWithinDenseFloor")) if worst.get(key)]
+                                             ("perplexity", "perplexityThresholdWithinDenseFloor"),
+                                             ("multi-turn", "multiTurnThresholdWithinDenseFloor")) if worst.get(key)]
             lines.append(f"- {control}: min agreement {worst.get('minAgreement')} (`{worst.get('minAgreementRow')}`), "
                          f"max |perplexityDelta| {worst.get('maxAbsPerplexityDelta')} (`{worst.get('maxAbsPerplexityDeltaRow')}`)"
                          + (f" -- the dense arm itself misses the {' and '.join(within)} threshold" if within else ""))

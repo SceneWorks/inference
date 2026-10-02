@@ -2606,6 +2606,44 @@ impl LlamaProvider {
         packed: Option<&crate::campaign::CompressedKvArm>,
         teacher_forced: Option<&[i32]>,
     ) -> CoreResult<(Vec<i32>, crate::campaign::MultiTurnPromptCacheTurns)> {
+        self.campaign_multi_turn_continuation(
+            turn1,
+            follow_up,
+            tokens,
+            packed,
+            teacher_forced,
+            false,
+        )
+        .map(|(scored, turns)| (scored.choices, turns))
+    }
+
+    /// [`Self::campaign_multi_turn_forced_continuation`], also scoring the session's probability
+    /// of every turn-2 stream token (the SC-20669 dense multi-turn noise-floor control).
+    pub(crate) fn campaign_multi_turn_scored_continuation(
+        &self,
+        turn1: &TextLlmRequest,
+        follow_up: &str,
+        tokens: usize,
+        teacher_forced: Option<&[i32]>,
+    ) -> CoreResult<(
+        crate::campaign::ScoredContinuation,
+        crate::campaign::MultiTurnPromptCacheTurns,
+    )> {
+        self.campaign_multi_turn_continuation(turn1, follow_up, tokens, None, teacher_forced, true)
+    }
+
+    fn campaign_multi_turn_continuation(
+        &self,
+        turn1: &TextLlmRequest,
+        follow_up: &str,
+        tokens: usize,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+        teacher_forced: Option<&[i32]>,
+        score: bool,
+    ) -> CoreResult<(
+        crate::campaign::ScoredContinuation,
+        crate::campaign::MultiTurnPromptCacheTurns,
+    )> {
         let Decoder::Causal(model) = &self.model else {
             return Err(CoreError::Unsupported(
                 "the multi-turn prompt-cache fixture requires the causal decoder's prefix cache"
@@ -2643,6 +2681,7 @@ impl LlamaProvider {
             length,
             &self.stop_tokens,
             teacher_forced,
+            score,
         );
         let turn2_cache = prompt_cache_turn(before, &store, &turn2_ids);
         drop(store);
@@ -2668,7 +2707,10 @@ impl LlamaProvider {
             }
         }
         Ok((
-            measured.decode.tokens,
+            crate::campaign::ScoredContinuation {
+                choices: measured.decode.tokens,
+                stream_probabilities: measured.decode.stream_probabilities,
+            },
             crate::campaign::MultiTurnPromptCacheTurns {
                 turn1: turn1_cache,
                 turn2: turn2_cache,
@@ -5322,6 +5364,21 @@ mod tests {
             .campaign_multi_turn_forced_continuation(&turn1, follow_up, 1024, None, None)
             .unwrap();
         assert_eq!(reference.len(), 1024, "every stop token is decoded through");
+        // SC-20669 dense multi-turn noise-floor control: the same flow scored. The dense reference
+        // reproduces the unscored stream, and a dense session teacher-forced on it through the
+        // same cache-hit path scores every turn-2 position.
+        let (scored, scored_turns) = provider
+            .campaign_multi_turn_scored_continuation(&turn1, follow_up, 1024, None)
+            .unwrap();
+        assert_eq!(scored.choices, reference);
+        assert_eq!(scored.stream_probabilities.len(), 1024);
+        assert_eq!(scored_turns, dense_turns);
+        let (forced, forced_turns) = provider
+            .campaign_multi_turn_scored_continuation(&turn1, follow_up, 1024, Some(&reference))
+            .unwrap();
+        assert_eq!(forced.choices, reference);
+        assert_eq!(forced.stream_probabilities, scored.stream_probabilities);
+        assert_eq!(forced_turns, dense_turns);
         let (choices, compressed_turns) = provider
             .campaign_multi_turn_forced_continuation(
                 &turn1,

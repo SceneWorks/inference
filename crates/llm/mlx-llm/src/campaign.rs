@@ -976,6 +976,35 @@ fn dense_kv_width_refusal(observed: u64) -> String {
 /// pre-spawn refusal (a row whose floor already exceeds the child cap cannot fit) and the
 /// estimate recorded in the receipt. Admission itself is runtime-guarded: see
 /// [`runtime_guarded_admission`].
+/// One dense K/V history of `total_live_tokens` for the pinned `spec` (the KV term of
+/// [`static_role_footprint_budget`]).
+fn static_role_dense_kv_bytes(
+    spec: &BenchmarkModelSpec,
+    snapshot: &Path,
+    total_live_tokens: u64,
+) -> Result<u64, String> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(snapshot.join("config.json")).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let positive = |key: &str| {
+        config
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("pinned model lacks positive {key} for footprint preflight"))
+    };
+    let layers = positive("num_hidden_layers")?;
+    let element_bytes = pinned_dense_kv_element_bytes(spec, snapshot, layers)?;
+    dense_kv_bytes(
+        1,
+        layers,
+        positive("num_key_value_heads")?,
+        total_live_tokens,
+        positive("head_dim")?,
+        element_bytes,
+    )
+}
+
 pub(crate) fn static_role_footprint_budget(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
@@ -1131,10 +1160,29 @@ fn static_row_requirements(
     Ok((total, max_request, known_footprint_budget))
 }
 
-/// The requirements of one noise-floor row: what its worker actually holds, a single dense session
-/// of the candidate (never the bf16 reference, which it does not load) over the row's live tokens.
-/// The chunked-prefill control's cache is sized once ([`crate::provider`]), so the one-shot dense
-/// budget of [`static_role_footprint_budget`] prices every pass of the row.
+/// The static footprint of one noise-floor worker: the one-shot dense session budget plus a
+/// second dense K/V history, because the dense multi-turn control holds turn 1's prefix in the
+/// prompt store while turn 2 grows its own copy out of it (the product cache-hit path A2 measures).
+fn noise_floor_footprint_budget(
+    spec: &BenchmarkModelSpec,
+    snapshot: &Path,
+    total_live_tokens: u64,
+    request_tokens: u64,
+) -> Result<u64, String> {
+    static_role_footprint_budget(spec, snapshot, total_live_tokens, request_tokens)?
+        .checked_add(static_role_dense_kv_bytes(
+            spec,
+            snapshot,
+            total_live_tokens,
+        )?)
+        .ok_or_else(|| "noise-floor footprint budget overflows".into())
+}
+
+/// The requirements of one noise-floor row: what its worker actually holds, one dense session of
+/// the candidate at a time (never the bf16 reference, which it does not load) over the row's live
+/// tokens. The chunked-prefill control's cache is sized once ([`crate::provider`]); the one-shot
+/// dense budget of [`static_role_footprint_budget`] plus one more dense K/V history (the
+/// multi-turn control's stored turn 1 beside its turn-2 cache) prices every pass of the row.
 fn noise_floor_row_requirements(
     coordinate: &Coordinate,
     snapshot: &Path,
@@ -1150,7 +1198,7 @@ fn noise_floor_row_requirements(
             coordinate_slug(coordinate)
         ));
     }
-    let budget = static_role_footprint_budget(spec, snapshot, total, max_request)?;
+    let budget = noise_floor_footprint_budget(spec, snapshot, total, max_request)?;
     if budget > policy.child_footprint_cap_bytes {
         return Err(format!(
             "{} needs at least {budget} bytes of one dense session; child footprint cap {} refuses before spawn",
@@ -7611,39 +7659,97 @@ pub fn dense_noise_floor(
     let chunked = provider
         .campaign_chunked_prefill_continuation(&kernel_prompt, stream, prefill_chunk)
         .map_err(|e| format!("dense chunked-prefill control: {e}"))?;
-    let control = |scored: &ScoredContinuation| -> Result<serde_json::Value, String> {
-        let agreement = forced_continuation_evidence(stream, &scored.choices)?;
-        let likelihood = StreamLikelihood::from_probabilities(
-            &reference.stream_probabilities,
-            &scored.stream_probabilities,
-        )?;
-        Ok(serde_json::json!({
-            "agreement": agreement.agreement,
-            "matches": agreement.matches,
-            "flipCount": agreement.flip_count,
-            "firstFlipPositions": agreement.first_flip_positions,
-            "referenceNegativeLogLikelihood": likelihood.reference,
-            "controlNegativeLogLikelihood": likelihood.candidate,
-            "perplexityDelta": likelihood.candidate - likelihood.reference,
-        }))
-    };
+    let snapshot_sha256 = session.inventory.sha256.clone();
+    let prompt_tokens = provider
+        .campaign_prompt_tokens(&kernel_prompt)
+        .map_err(|e| e.to_string())?;
+    // Dense multi-turn control: A2's multi-turn fixture exactly (turn 1 stored in the product
+    // prompt cache, turn 2 served by its cache hit). The reference turn-2 stream comes from this
+    // session, as A2's comes from its dense reference session; the control is teacher-forced on it
+    // from a fresh dense session, as A2's compressed arm is from its fresh forcing session. The
+    // first session is released before the second loads, so one session is ever resident.
+    let turn1 = fixture_request(
+        multi_turn_fixture_prompt(&session, &prompt, &coordinate).map_err(|e| e.to_string())?,
+        Vec::new(),
+    );
+    let (multi_turn_reference, reference_turns) = provider
+        .campaign_multi_turn_scored_continuation(
+            &turn1,
+            MULTI_TURN_FIXTURE_FOLLOW_UP,
+            FORCED_CONTINUATION_TOKENS as usize,
+            None,
+        )
+        .map_err(|e| format!("dense multi-turn reference: {e}"))?;
+    let baseline = session.load_start_sample.mlx_active_bytes;
+    drop(session);
+    quiesce_campaign_active_memory(baseline)
+        .map_err(|e| format!("noise-floor session release: {e}"))?;
+    let forcing = CampaignSession::load(snapshot).map_err(|e| e.to_string())?;
+    let (multi_turn_control, control_turns) = forcing
+        .provider
+        .campaign_multi_turn_scored_continuation(
+            &turn1,
+            MULTI_TURN_FIXTURE_FOLLOW_UP,
+            multi_turn_reference.choices.len(),
+            Some(&multi_turn_reference.choices),
+        )
+        .map_err(|e| format!("dense multi-turn control: {e}"))?;
+    drop(forcing);
+    let mut multi_turn = noise_floor_control(&multi_turn_reference, &multi_turn_control, true)?;
+    multi_turn["tokens"] = multi_turn_reference.choices.len().into();
+    multi_turn["referenceStreamSha256"] = token_stream_sha256(&multi_turn_reference.choices).into();
+    multi_turn["turns"] = serde_json::json!({
+        "reference": reference_turns,
+        "control": control_turns,
+    });
     Ok(serde_json::json!({
         "kind": "sc20669-dense-noise-floor",
         "coordinate": coordinate_slug_value,
-        "snapshotSha256": session.inventory.sha256,
-        "promptTokens": provider.campaign_prompt_tokens(&kernel_prompt).map_err(|e| e.to_string())?,
+        "snapshotSha256": snapshot_sha256,
+        "promptTokens": prompt_tokens,
         "tokens": stream.len(),
         "referenceStreamSha256": token_stream_sha256(stream),
         "prefillChunk": prefill_chunk,
         "thresholds": {
             "greedyTokenAgreement": COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN,
             "perplexityDelta": COMPRESSED_PERPLEXITY_DELTA_MAX,
+            "multiTurnPromptCache": COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN,
         },
         "controls": {
-            "one-shot-repeat": control(&repeat)?,
-            "chunked-prefill": control(&chunked)?,
+            "one-shot-repeat": noise_floor_control(&reference, &repeat, false)?,
+            "chunked-prefill": noise_floor_control(&reference, &chunked, false)?,
+            "multi-turn-repeat": multi_turn,
         },
         "denseTiming": dense_timing,
+    }))
+}
+
+/// One noise-floor control scored on its reference stream with the compressed rows' own metrics:
+/// teacher-forced agreement (A2's kernel or, with `multi_turn`, turn-2 forced-continuation
+/// evidence) and the stream-scored perplexity delta.
+pub fn noise_floor_control(
+    reference: &ScoredContinuation,
+    control: &ScoredContinuation,
+    multi_turn: bool,
+) -> Result<serde_json::Value, String> {
+    let agreement = if multi_turn {
+        multi_turn_forced_continuation_evidence(&reference.choices, &control.choices)?
+    } else {
+        forced_continuation_evidence(&reference.choices, &control.choices)?
+    };
+    let likelihood = StreamLikelihood::from_probabilities(
+        &reference.stream_probabilities,
+        &control.stream_probabilities,
+    )?;
+    Ok(serde_json::json!({
+        "method": agreement.method,
+        "agreement": agreement.agreement,
+        "matches": agreement.matches,
+        "flipCount": agreement.flip_count,
+        "firstFlipPositions": agreement.first_flip_positions,
+        "referenceNegativeLogLikelihood": likelihood.reference,
+        "controlNegativeLogLikelihood": likelihood.candidate,
+        "perplexityDelta": likelihood.candidate - likelihood.reference,
     }))
 }
 
@@ -7718,7 +7824,7 @@ pub fn noise_floor_summary(rows: &[serde_json::Value]) -> Result<serde_json::Val
         return Err("a noise-floor summary needs at least one row".into());
     }
     let mut controls = serde_json::Map::new();
-    for control in ["one-shot-repeat", "chunked-prefill"] {
+    for control in ["one-shot-repeat", "chunked-prefill", "multi-turn-repeat"] {
         let (mut agreement, mut flips, mut delta) = (f64::INFINITY, 0_u64, 0.0_f64);
         let mut worst_agreement_row = String::new();
         let mut worst_delta_row = String::new();
@@ -7760,6 +7866,8 @@ pub fn noise_floor_summary(rows: &[serde_json::Value]) -> Result<serde_json::Val
                 "maxAbsPerplexityDeltaRow": worst_delta_row,
                 "greedyThresholdWithinDenseFloor": agreement < COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN,
                 "perplexityThresholdWithinDenseFloor": delta > COMPRESSED_PERPLEXITY_DELTA_MAX,
+                "multiTurnThresholdWithinDenseFloor": control == "multi-turn-repeat"
+                    && agreement < COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN,
             }),
         );
     }
@@ -7787,6 +7895,7 @@ pub fn noise_floor_summary(rows: &[serde_json::Value]) -> Result<serde_json::Val
         "thresholds": {
             "greedyTokenAgreement": COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN,
             "perplexityDelta": COMPRESSED_PERPLEXITY_DELTA_MAX,
+            "multiTurnPromptCache": COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN,
         },
         "controls": controls,
         "denseTiming": dense_timing,
@@ -13476,6 +13585,7 @@ pub(crate) mod tests {
             "controls": {
                 "one-shot-repeat": control((1.0, 0, 0.0)),
                 "chunked-prefill": control(chunked),
+                "multi-turn-repeat": control((1.0, 0, 0.0)),
             },
         })
     }
@@ -13628,15 +13738,73 @@ pub(crate) mod tests {
         }
     }
 
+    /// A noise-floor control is scored with the compressed rows' own metrics on its reference
+    /// stream: the multi-turn control with A2's turn-2 forced-continuation evidence, the kernel
+    /// controls with the kernel's, both with the stream-scored perplexity delta.
+    #[test]
+    fn noise_floor_multi_turn_control_scores_turn_two_like_a2() {
+        let reference = ScoredContinuation {
+            choices: (0..FORCED_CONTINUATION_TOKENS as i32).collect(),
+            stream_probabilities: vec![0.5; FORCED_CONTINUATION_TOKENS as usize],
+        };
+        let mut control = reference.clone();
+        control.choices[3] = -1;
+        control.choices[700] = -1;
+        control.stream_probabilities[0] = 0.25;
+        let multi_turn = noise_floor_control(&reference, &control, true).unwrap();
+        assert_eq!(multi_turn["method"], MULTI_TURN_FORCED_CONTINUATION_METHOD);
+        assert_eq!(multi_turn["flipCount"], 2);
+        assert_eq!(
+            multi_turn["firstFlipPositions"],
+            serde_json::json!([3, 700])
+        );
+        assert_eq!(multi_turn["agreement"], 1022.0 / 1024.0);
+        let delta = 2.0f64.ln() / FORCED_CONTINUATION_TOKENS as f64;
+        assert!((multi_turn["perplexityDelta"].as_f64().unwrap() - delta).abs() < 1e-12);
+        let kernel = noise_floor_control(&reference, &control, false).unwrap();
+        assert_eq!(kernel["method"], FORCED_CONTINUATION_METHOD);
+        assert_eq!(kernel["flipCount"], 2);
+        assert!(noise_floor_control(
+            &reference,
+            &ScoredContinuation {
+                choices: vec![0],
+                stream_probabilities: vec![0.5],
+            },
+            true,
+        )
+        .is_err());
+    }
+
     /// The SC-20669 dense noise floor: the summary is each control's worst case over the rows and
     /// says whether the dense arm already misses a frozen threshold against itself.
     #[test]
     fn noise_floor_summary_is_each_controls_worst_row() {
-        let rows = [
+        let mut rows = [
             noise_floor_row("a", (0.9995, 1, 0.004)),
             noise_floor_row("b", (0.998, 2, -0.013)),
         ];
+        rows[0]["controls"]["multi-turn-repeat"]["agreement"] = 0.998.into();
+        rows[0]["controls"]["multi-turn-repeat"]["flipCount"] = 2.into();
         let summary = noise_floor_summary(&rows).unwrap();
+        // The dense multi-turn control judges the multi-turn threshold; no other control does.
+        let multi_turn = &summary["controls"]["multi-turn-repeat"];
+        assert_eq!(multi_turn["minAgreement"], 0.998);
+        assert_eq!(multi_turn["minAgreementRow"], "a");
+        assert_eq!(multi_turn["maxFlipCount"], 2);
+        assert_eq!(multi_turn["multiTurnThresholdWithinDenseFloor"], true);
+        assert_eq!(
+            summary["controls"]["chunked-prefill"]["multiTurnThresholdWithinDenseFloor"],
+            false
+        );
+        assert_eq!(summary["thresholds"]["multiTurnPromptCache"], 0.999);
+        let mut without = rows.clone();
+        without[1]["controls"]
+            .as_object_mut()
+            .unwrap()
+            .remove("multi-turn-repeat");
+        assert!(noise_floor_summary(&without)
+            .unwrap_err()
+            .contains("multi-turn-repeat"));
         let chunked = &summary["controls"]["chunked-prefill"];
         assert_eq!(chunked["minAgreement"], 0.998);
         assert_eq!(chunked["minAgreementRow"], "b");
@@ -14963,6 +15131,24 @@ pub(crate) mod tests {
         let activations = request * (3 * 8_192 + 8 * 3_072) * 2 + 128_256 * 2;
         assert_eq!(floor, 2 * payload + kv + tile + activations);
         assert!(activations > 11 << 30, "{activations}");
+    }
+
+    /// The noise floor's worker estimate prices what it holds: the one-shot dense session plus the
+    /// multi-turn control's second dense K/V history (stored turn 1 beside turn 2's cache).
+    #[test]
+    fn noise_floor_footprint_prices_the_multi_turn_second_history() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = temporary.path().join("candidate");
+        write_stub_dtype_snapshot(&candidate, &LLAMA_CANDIDATE, "BF16");
+        let (total, request) = (131_072_u64, 130_593_u64);
+        let one_shot =
+            static_role_footprint_budget(&LLAMA_CANDIDATE, &candidate, total, request).unwrap();
+        // 28 layers x K/V x 8 heads x 128 x BF16.
+        let kv = total * 28 * 2 * 8 * 128 * 2;
+        assert_eq!(
+            noise_floor_footprint_budget(&LLAMA_CANDIDATE, &candidate, total, request).unwrap(),
+            one_shot + kv
+        );
     }
 
     /// sc-20671: the pinned dense KV width is the BF16 compute dtype's for every role, whatever

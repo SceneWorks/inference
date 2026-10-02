@@ -370,6 +370,7 @@ pub(crate) fn forced_cached_decode(
     tokens: usize,
     stop_tokens: &[i32],
     teacher_forced: Option<&[i32]>,
+    score: bool,
 ) -> Result<ForcedCachedDecode> {
     let mut fallbacks = FallbackCapture::default();
     let (mut cache, reused_prefix_tokens) = {
@@ -384,7 +385,7 @@ pub(crate) fn forced_cached_decode(
         tokens,
         stop_tokens,
         teacher_forced,
-        false,
+        score,
         &mut |_| {},
     );
     let packed_evidence = cache.packed_evidence();

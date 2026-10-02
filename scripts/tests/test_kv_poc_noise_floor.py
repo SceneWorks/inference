@@ -201,6 +201,14 @@ class NoiseFloorPhaseTests(unittest.TestCase):
         self.assertIn("| `llama-fit-boundary-single-chunked-cold` | 91000.0 | 91500.0 | 30.5 | 0.01 |", markdown)
         self.assertIn("| `llama-fit-boundary-single-chunked-cold` | chunked-prefill | 0.998 | 2 | 0.013 |", markdown)
         self.assertIn("the dense arm itself misses the greedy and perplexity threshold", markdown)
+        summary["controls"]["multi-turn-repeat"] = {
+            "minAgreement": 0.996, "minAgreementRow": row["coordinate"],
+            "maxAbsPerplexityDelta": 0.0, "maxAbsPerplexityDeltaRow": row["coordinate"],
+            "greedyThresholdWithinDenseFloor": False, "perplexityThresholdWithinDenseFloor": False,
+            "multiTurnThresholdWithinDenseFloor": True,
+        }
+        self.assertIn("the dense arm itself misses the multi-turn threshold",
+                      summarize.noise_floor_markdown([row], summary))
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "evidence" / "sc20669-noise-floor"
             out.mkdir(parents=True)
