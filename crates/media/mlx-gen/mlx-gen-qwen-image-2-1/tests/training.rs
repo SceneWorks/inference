@@ -167,7 +167,7 @@ fn a_trained_adapter_loads_back_strictly_changes_the_velocity_and_is_stamped() {
         assert_eq!(output.steps, 3);
         assert!(output.final_loss.is_finite());
 
-        let meta = safetensors_file_metadata(&output.adapter_path).unwrap();
+        let meta = safetensors_file_metadata(output.adapter_path.as_path()).unwrap();
         assert_eq!(
             meta.get("family").map(String::as_str),
             Some("qwen-image-2-1")
@@ -223,17 +223,21 @@ fn a_trained_adapter_loads_back_strictly_changes_the_velocity_and_is_stamped() {
     }
 }
 
-/// AC1/AC3: checkpoints + resume. A run cancelled after its step-2 checkpoint (it stops at step
-/// 3) resumes from that checkpoint — steps 3..=4 run again — and writes the same adapter as an
-/// uninterrupted run of the same config.
-#[test]
-fn a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run() {
+/// One resume scenario: a run of `cfg` cancelled once step `cancel_at` has run resumes from the
+/// latest resume snapshot (`snapshot_step`) and finishes with the same adapter an uninterrupted
+/// run of `cfg` writes. `no_snapshot_at` are `save_every` multiples that land inside a
+/// gradient-accumulation window and must NOT leave a resume snapshot (only an adapter checkpoint).
+fn assert_cancelled_run_resumes(
+    cfg: TrainingConfig,
+    cancel_at: u32,
+    snapshot_step: u32,
+    no_snapshot_at: &[u32],
+) {
     let tmp = tempfile::tempdir().unwrap();
     let items = dataset(tmp.path());
-    let cfg = TrainingConfig {
-        save_every: 2,
-        ..config(4)
-    };
+    let all: Vec<u32> = (1..=cfg.steps).collect();
+    let resume_file =
+        |dir: &Path, step: u32| dir.join(format!("qwen21_lora-step{step:06}.resume.safetensors"));
 
     // Uninterrupted reference run.
     let straight_dir = tmp.path().join("straight");
@@ -244,42 +248,55 @@ fn a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run()
         |_| {},
     );
     let straight = result.unwrap();
-    assert_eq!(steps, [1, 2, 3, 4]);
+    assert_eq!(steps, all);
     assert!(
-        straight_dir
-            .join("qwen21_lora-step000002.resume.safetensors")
-            .is_file(),
-        "the step-2 resume snapshot must be written"
+        resume_file(&straight_dir, snapshot_step).is_file(),
+        "the step-{snapshot_step} resume snapshot must be written"
     );
-    let ckpt_meta =
-        safetensors_file_metadata(straight_dir.join("qwen21_lora-step000002.safetensors")).unwrap();
+    for &step in no_snapshot_at {
+        assert!(
+            !resume_file(&straight_dir, step).exists(),
+            "step {step} is inside an accumulation window: no resume snapshot"
+        );
+        assert!(
+            straight_dir
+                .join(format!("qwen21_lora-step{step:06}.safetensors"))
+                .is_file(),
+            "the step-{step} adapter checkpoint is still written"
+        );
+    }
+    let ckpt_meta = safetensors_file_metadata(
+        straight_dir.join(format!("qwen21_lora-step{snapshot_step:06}.safetensors")),
+    )
+    .unwrap();
     assert_eq!(
         ckpt_meta.get("family").map(String::as_str),
         Some("qwen-image-2-1"),
         "intermediate checkpoints carry the provenance stamp too"
     );
 
-    // Interrupted run: cancel once step 3 has run → the loop stops before step 4.
+    // Interrupted run: cancel once step `cancel_at` has run → the loop stops before the next.
     let resumed_dir = tmp.path().join("resumed");
     let req = request(items.clone(), cfg.clone(), &resumed_dir);
     let cancel = req.cancel.clone();
     let tripped = Cell::new(false);
     let mut t = trainer();
     let (steps, result) = run(t.as_mut(), &req, |step| {
-        if step == 3 {
+        if step == cancel_at {
             cancel.cancel();
             tripped.set(true);
         }
     });
     assert!(tripped.get());
-    assert_eq!(steps, [1, 2, 3]);
+    assert_eq!(steps, (1..=cancel_at).collect::<Vec<_>>());
     assert_eq!(
         result.unwrap().steps,
-        3,
+        cancel_at,
         "a cancel after a step is a partial Ok"
     );
 
-    // Resume: continues from the step-2 snapshot (steps 3 and 4 run again).
+    // Resume: continues from the snapshot, re-running every step after it.
+    let total = cfg.steps;
     let req = request(
         items,
         TrainingConfig {
@@ -291,11 +308,15 @@ fn a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run()
     let mut t = trainer();
     let (steps, result) = run(t.as_mut(), &req, |_| {});
     let resumed = result.unwrap();
-    assert_eq!(steps, [3, 4], "resume must continue from the saved step");
-    assert_eq!(resumed.steps, 4);
+    assert_eq!(
+        steps,
+        (snapshot_step + 1..=total).collect::<Vec<_>>(),
+        "resume must continue from the saved step"
+    );
+    assert_eq!(resumed.steps, total);
 
-    let a = Array::load_safetensors(&straight.adapter_path).unwrap();
-    let b = Array::load_safetensors(&resumed.adapter_path).unwrap();
+    let a = Array::load_safetensors(straight.adapter_path.as_path()).unwrap();
+    let b = Array::load_safetensors(resumed.adapter_path.as_path()).unwrap();
     assert_eq!(a.len(), b.len());
     for (key, want) in &a {
         let got = b
@@ -307,6 +328,43 @@ fn a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run()
             "{key}: resumed {max_abs:.3e} away from the straight run (peak {peak:.3e})"
         );
     }
+}
+
+/// AC1/AC3: checkpoints + resume. A run cancelled after its step-2 checkpoint (it stops at step
+/// 3) resumes from that checkpoint — steps 3..=4 run again — and writes the same adapter as an
+/// uninterrupted run of the same config.
+#[test]
+fn a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run() {
+    assert_cancelled_run_resumes(
+        TrainingConfig {
+            save_every: 2,
+            ..config(4)
+        },
+        3,
+        2,
+        &[],
+    );
+}
+
+/// Resume is exact under gradient accumulation too: with `accum = 2` and `save_every = 3`, the
+/// step-3 checkpoint falls inside an accumulation window, so it writes the adapter but no resume
+/// snapshot (which cannot hold the half-accumulated gradients); the step-6 one is on an update
+/// boundary. A run cancelled after step 7 resumes from step 6 and matches the straight run.
+///
+/// *Mutation that reds this:* writing the resume bundle on every `save_every` again — the step-3
+/// snapshot then exists, and (cancelled at step 4) a resume would drop step 3's gradients.
+#[test]
+fn resume_under_gradient_accumulation_restarts_from_an_update_boundary() {
+    assert_cancelled_run_resumes(
+        TrainingConfig {
+            save_every: 3,
+            gradient_accumulation: 2,
+            ..config(8)
+        },
+        7,
+        6,
+        &[3],
+    );
 }
 
 /// AC1: preview samples render from the in-progress adapter through the crate's render path.

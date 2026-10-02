@@ -155,9 +155,31 @@ fn quantized_base_refusal(what: &str) -> Error {
 /// Width of one f32 element — the caption/latent caches, the trainable factors and the VAE.
 const F32_WIDTH: u64 = 4;
 
-/// Bytes each trainable factor element costs across a step: the f32 factor itself, its f32
-/// gradient, the gradient-accumulation buffer, and the two AdamW moments.
-const TRAINABLE_BYTES_PER_PARAM: u64 = 5 * F32_WIDTH;
+/// f32 buffers every trainable factor element carries whatever the optimizer: the factor itself,
+/// its gradient and the gradient-accumulation buffer. The optimizer's own state comes on top
+/// ([`optimizer_state_per_param`]).
+const TRAINABLE_BASE_BUFFERS: u64 = 3;
+
+/// Width of one element of a materialised LoKr delta: `install_training_lokr` reconstructs every
+/// target's dense `[out, in]` delta at the trainer's LoKr dtype (bf16).
+const LOKR_DELTA_WIDTH: u64 = 2;
+
+/// f32 optimizer-state elements [`TrainOptimizer`] keeps per trainable element: AdamW/Adam two
+/// (`m`, `v`), Rose none (stateless), Prodigy four (`exp_avg`, `exp_avg_sq`, `s`, `p0`). Names
+/// normalise the way the optimizer picker does (case, `-`/`_`, the `…opt` aliases).
+pub fn optimizer_state_per_param(optimizer: &str) -> u64 {
+    let name: String = optimizer
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| *c != '-' && *c != '_')
+        .collect();
+    match name.as_str() {
+        "rose" | "roseopt" => 0,
+        "prodigy" | "prodigyopt" => 4,
+        _ => 2,
+    }
+}
 
 /// `[S, inner]`-shaped tensors the dense backward retains per block for the **attention** half,
 /// counted off [`crate::transformer`]'s block forward: the LayerNorm input and the modulated `h`,
@@ -270,6 +292,11 @@ pub struct TrainingShape {
     pub compute_width: u64,
     /// Elements of the trainable adapter factors.
     pub trainable_params: u64,
+    /// f32 optimizer-state elements per trainable element ([`optimizer_state_per_param`]).
+    pub optimizer_state_per_param: u64,
+    /// `Σ out·in` over the targets when training **LoKr** (0 for LoRA): every LoKr install
+    /// materialises a dense `[out, in]` bf16 delta per target.
+    pub lokr_delta_elements: u64,
     /// Whether the blocks run gradient-checkpointed.
     pub checkpointed: bool,
     /// Whether preview samples are rendered (keeps the VAE decoder resident).
@@ -282,7 +309,7 @@ pub struct TrainingShape {
 pub struct TrainingFootprint {
     /// Qwen3 tower resident + one caption's encode transient.
     pub caption_phase: u64,
-    /// The VAE resident + one image's encode transient + the caption cache.
+    /// The VAE resident + one image's encode transient + the caption and latent caches.
     pub latent_phase: u64,
     /// The dense DiT + trainable state + caches + the step's activation working set.
     pub train_phase: u64,
@@ -306,6 +333,11 @@ impl TrainingFootprint {
 /// backward ([`ATTENTION_BACKWARD_SCORE_MATRICES`] `[heads, S, S]` matrices) and MLX's pipelined
 /// evaluation ([`MLX_MAX_ACTIVE_TASKS`] + 1 in-flight `[S, inner]` outputs, the same term the
 /// render path's derived model carries), plus [`MLX_EVAL_SLACK_BYTES`].
+///
+/// LoKr adds its materialised deltas (`lokr_delta_elements` at bf16): a dense step keeps every
+/// target's delta live for the backward, a checkpointed step only one block's (rebuilt once in the
+/// forward and once in the recompute), and a preview install materialises all of them in either
+/// mode.
 pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> TrainingFootprint {
     let w = shape.compute_width;
     let side = shape.edge as u64 / facts.pixels_per_token.max(1);
@@ -328,6 +360,7 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
         + facts.vae_decoder_bytes
         + vae_encode
         + caption_cache
+        + latent_cache
         + MLX_EVAL_SLACK_BYTES;
 
     // 3. train: dense DiT at the compute width + trainable state + caches + the step.
@@ -343,7 +376,13 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
     };
     let attention_backward = ATTENTION_BACKWARD_SCORE_MATRICES * facts.heads * seq * seq * w;
     let pipelined = (MLX_MAX_ACTIVE_TASKS + 1) * hidden;
-    let step = retained + attention_backward + pipelined;
+    let lokr_deltas = shape.lokr_delta_elements * LOKR_DELTA_WIDTH;
+    let step_deltas = if shape.checkpointed {
+        2 * lokr_deltas / facts.num_layers.max(1)
+    } else {
+        lokr_deltas
+    };
+    let step = retained + attention_backward + pipelined + step_deltas;
     // A preview render runs between steps (the step's activations are released by then), so its
     // decode transient competes with the step rather than adding to it.
     let (decoder_resident, preview) = if shape.sampling {
@@ -354,14 +393,17 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
         };
         (
             facts.vae_decoder_bytes,
-            VAE_PIPELINED_DECODE_MAPS * facts.vae_decode_channels * tile * tile * F32_WIDTH,
+            VAE_PIPELINED_DECODE_MAPS * facts.vae_decode_channels * tile * tile * F32_WIDTH
+                + lokr_deltas,
         )
     } else {
         (0, 0)
     };
     let train_phase = facts.dit_elements * w
         + decoder_resident
-        + shape.trainable_params * TRAINABLE_BYTES_PER_PARAM
+        + shape.trainable_params
+            * (TRAINABLE_BASE_BUFFERS + shape.optimizer_state_per_param)
+            * F32_WIDTH
         + caption_cache
         + latent_cache
         + step.max(preview)
@@ -444,16 +486,18 @@ fn device_budget_bytes() -> u64 {
     (mlx_rs::memory::get_memory_limit() as f64 * mlx_gen::memory::SAFE_FRAC) as u64
 }
 
-/// Elements of the trainable factors `target_paths` get under `cfg` — exact, from the host's base
-/// shapes (the probe half; no weight is read): LoRA `rank·(in + out)`; LoKr `w1` plus a full or
-/// low-rank `w2` by PEFT's `use_w2` rule, exactly as [`build_lokr_targets`] sizes them.
-fn trainable_param_count(
+/// `(trainable elements, LoKr delta elements)` the targets get under `cfg` — exact, from the
+/// host's base shapes (the probe half; no weight is read). Trainable: LoRA `rank·(in + out)`; LoKr
+/// `w1` plus a full or low-rank `w2` by PEFT's `use_w2` rule, exactly as [`build_lokr_targets`]
+/// sizes them. LoKr deltas: `Σ out·in` (each install materialises the dense delta); 0 for LoRA.
+fn adapter_elements(
     host: &mut QwenImage21Transformer,
     target_paths: &[String],
     cfg: &TrainingConfig,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     let rank = cfg.rank as i64;
     let mut total = 0u64;
+    let mut deltas = 0u64;
     for path in target_paths {
         let segs: Vec<&str> = path.split('.').collect();
         let facts = host.adaptable_facts(&segs).ok_or_else(|| {
@@ -478,8 +522,11 @@ fn trainable_param_count(
             }
         };
         total += elements.max(0) as u64;
+        if cfg.network_type == NetworkType::Lokr {
+            deltas += (out_f * in_f).max(0) as u64;
+        }
     }
-    Ok(total)
+    Ok((total, deltas))
 }
 
 // ── the trainer ──────────────────────────────────────────────────────────────────────────────────
@@ -1056,6 +1103,8 @@ impl QwenImage21Trainer {
         {
             longest = longest.max(caption_tokens(&self.tokenizer, self.drop_count, text)?);
         }
+        let (trainable_params, lokr_delta_elements) =
+            adapter_elements(&mut self.probe, &target_paths, cfg)?;
         let shape = TrainingShape {
             edge,
             caption_tokens: longest,
@@ -1065,7 +1114,9 @@ impl QwenImage21Trainer {
             } else {
                 2
             },
-            trainable_params: trainable_param_count(&mut self.probe, &target_paths, cfg)?,
+            trainable_params,
+            optimizer_state_per_param: optimizer_state_per_param(&cfg.optimizer),
+            lokr_delta_elements,
             checkpointed,
             sampling: sampling_requested,
         };
@@ -1303,7 +1354,22 @@ impl QwenImage21Trainer {
                     &ADAPTER_PROVENANCE,
                     &ckpt,
                 )?;
-                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
+                // The resume bundle holds the factors + optimizer state, not the in-flight
+                // gradient-accumulation buffer, so it is written only on an optimizer-update
+                // boundary: resuming from it is then exact. A `save_every` that lands inside an
+                // accumulation window still writes the adapter checkpoint above, and the run
+                // resumes from the latest boundary snapshot instead of silently dropping the
+                // partial window's gradients.
+                if step % accum == 0 {
+                    checkpoint::save_resume(
+                        &req.output_dir,
+                        &stem,
+                        step,
+                        update_idx,
+                        &opt,
+                        &params,
+                    )?;
+                }
                 on_progress(TrainingProgress::Checkpoint { step });
             }
 
@@ -1612,6 +1678,8 @@ mod tests {
             items: 20,
             compute_width: 2,
             trainable_params: 40_000_000,
+            optimizer_state_per_param: 2,
+            lokr_delta_elements: 0,
             checkpointed,
             sampling: false,
         }
@@ -1666,6 +1734,135 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("still over"), "{err}");
+    }
+
+    /// `Σ out·in` over the default targets of the released DiT — what a LoKr install materialises.
+    fn production_lokr_delta_elements() -> u64 {
+        let dit = TransformerConfig::production();
+        let inner = dit.inner_dim() as u64;
+        let ffn = inner * dit.mlp_ratio as u64;
+        // to_q/to_k/to_v/to_out.0 are inner→inner; gate_layer/proj inner→ffn; out ffn→inner.
+        dit.num_layers as u64 * (4 * inner * inner + 3 * inner * ffn)
+    }
+
+    /// LoKr materialises a dense bf16 delta per target, so at the same rank it must derive a
+    /// larger footprint than LoRA: by the whole delta set on a dense step, by one block's worth
+    /// (twice: forward + recompute) on a checkpointed one, and by the whole set again in the
+    /// preview install in both modes.
+    ///
+    /// *Mutation that reds this:* dropping `step_deltas` from the step, or `lokr_deltas` from
+    /// the preview arm.
+    #[test]
+    fn lokr_deltas_raise_the_footprint_above_lora_at_the_same_rank() {
+        let facts = production_facts();
+        let deltas = production_lokr_delta_elements();
+        for checkpointed in [false, true] {
+            for sampling in [false, true] {
+                let lora = TrainingShape {
+                    sampling,
+                    ..shape(1024, checkpointed)
+                };
+                let lokr = TrainingShape {
+                    lokr_delta_elements: deltas,
+                    ..lora
+                };
+                let (a, b) = (
+                    training_footprint(&facts, &lora).train_phase,
+                    training_footprint(&facts, &lokr).train_phase,
+                );
+                assert!(
+                    b > a,
+                    "LoKr must cost more than LoRA (checkpointed={checkpointed}, \
+                     sampling={sampling}): {b} <= {a}"
+                );
+            }
+        }
+        // A dense LoKr step holds every delta: ~the bf16 size of the targeted Linears.
+        let lora = training_footprint(&facts, &shape(1024, false)).train_phase;
+        let lokr = training_footprint(
+            &facts,
+            &TrainingShape {
+                lokr_delta_elements: deltas,
+                ..shape(1024, false)
+            },
+        )
+        .train_phase;
+        assert_eq!(lokr - lora, deltas * LOKR_DELTA_WIDTH);
+    }
+
+    /// The optimizer's own state is sized per optimizer: Prodigy keeps four f32 buffers per
+    /// element, AdamW two, Rose none.
+    #[test]
+    fn optimizer_state_is_sized_per_optimizer() {
+        assert_eq!(optimizer_state_per_param("adamw"), 2);
+        assert_eq!(optimizer_state_per_param("Adam"), 2);
+        assert_eq!(optimizer_state_per_param("adamw8bit"), 2);
+        assert_eq!(optimizer_state_per_param("rose"), 0);
+        assert_eq!(optimizer_state_per_param("prodigy"), 4);
+        assert_eq!(optimizer_state_per_param("Prodigy-Opt"), 4);
+        let facts = production_facts();
+        let with = |state| {
+            training_footprint(
+                &facts,
+                &TrainingShape {
+                    optimizer_state_per_param: state,
+                    ..shape(1024, true)
+                },
+            )
+            .train_phase
+        };
+        assert!(with(0) < with(2) && with(2) < with(4));
+        assert_eq!(with(4) - with(2), 2 * 40_000_000 * F32_WIDTH);
+    }
+
+    /// Latents accumulate while the VAE is resident, so the latent stage carries their cache.
+    #[test]
+    fn the_latent_stage_carries_the_latent_cache() {
+        let facts = production_facts();
+        let few = training_footprint(&facts, &shape(1024, true)).latent_phase;
+        let many = training_footprint(
+            &facts,
+            &TrainingShape {
+                items: 1020,
+                ..shape(1024, true)
+            },
+        )
+        .latent_phase;
+        // 1000 more items: their captions AND their packed latents.
+        let per_item = 64 * facts.text_hidden * F32_WIDTH
+            + (1024 / 16) * (1024 / 16) * facts.latent_channels * F32_WIDTH;
+        assert_eq!(many - few, 1000 * per_item);
+    }
+
+    /// The preflight's adapter sizing on the tiny DiT: LoRA has no deltas; LoKr's deltas are
+    /// exactly `Σ out·in` over the default targets.
+    #[test]
+    fn adapter_elements_size_lora_and_lokr_off_the_host() {
+        let mut probe = loader::load_transformer_lazy(&tiny_snapshot()).unwrap();
+        let lora_cfg = TrainingConfig {
+            rank: 4,
+            ..Default::default()
+        };
+        let paths = resolve_target_paths(&probe, &lora_cfg);
+        let mut want_deltas = 0u64;
+        let mut want_lora = 0u64;
+        for path in &paths {
+            let segs: Vec<&str> = path.split('.').collect();
+            let shape = probe.adaptable_facts(&segs).unwrap().base_shape;
+            want_deltas += (shape[0] * shape[1]) as u64;
+            want_lora += 4 * (shape[0] + shape[1]) as u64;
+        }
+        assert_eq!(
+            adapter_elements(&mut probe, &paths, &lora_cfg).unwrap(),
+            (want_lora, 0)
+        );
+        let lokr_cfg = TrainingConfig {
+            network_type: NetworkType::Lokr,
+            ..lora_cfg
+        };
+        let (trainable, deltas) = adapter_elements(&mut probe, &paths, &lokr_cfg).unwrap();
+        assert_eq!(deltas, want_deltas);
+        assert!(trainable > 0);
     }
 
     /// The facts come from the snapshot itself: the miniature snapshot derives its own (tiny)
@@ -1854,7 +2051,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, (k, v))| {
                     let p =
-                        multiply(&randn(v.shape(), 100 + i as u64), Array::from_f32(0.05)).unwrap();
+                        multiply(randn(v.shape(), 100 + i as u64), Array::from_f32(0.05)).unwrap();
                     (k, p)
                 })
                 .collect();
