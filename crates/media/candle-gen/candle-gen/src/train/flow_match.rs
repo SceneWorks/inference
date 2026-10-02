@@ -242,6 +242,18 @@ pub fn request_fingerprint(req: &TrainingRequest) -> Result<String> {
             }
             None => fingerprint_field(&mut hasher, b"has_control", &[0]),
         }
+        // Instruction-edit references (sc-24161), in order. Hashed only when present, so every
+        // captioned / control request keeps the fingerprint (and the resume bundles) it had.
+        if !item.reference_image_paths.is_empty() {
+            fingerprint_field(
+                &mut hasher,
+                b"reference_count",
+                &(item.reference_image_paths.len() as u64).to_le_bytes(),
+            );
+            for reference in &item.reference_image_paths {
+                fingerprint_file(&mut hasher, b"reference", reference, req)?;
+            }
+        }
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -910,6 +922,25 @@ mod tests {
             control_fingerprint,
             request_fingerprint(&with_control).unwrap()
         );
+
+        // sc-24161: ordered edit references are part of the cached data — their presence, order
+        // and contents all change the fingerprint (a captioned request's is unchanged by the field).
+        let (ra, rb) = (
+            req.output_dir.join("ref_a.png"),
+            req.output_dir.join("ref_b.png"),
+        );
+        std::fs::write(&ra, b"reference a").unwrap();
+        std::fs::write(&rb, b"reference b").unwrap();
+        let plain = request_fingerprint(&req).unwrap();
+        let mut edit = req.clone();
+        edit.items[0].reference_image_paths = vec![ra.clone(), rb.clone()];
+        let edit_fingerprint = request_fingerprint(&edit).unwrap();
+        assert_ne!(plain, edit_fingerprint);
+        let mut swapped = edit.clone();
+        swapped.items[0].reference_image_paths = vec![rb, ra.clone()];
+        assert_ne!(edit_fingerprint, request_fingerprint(&swapped).unwrap());
+        std::fs::write(&ra, b"changed reference a").unwrap();
+        assert_ne!(edit_fingerprint, request_fingerprint(&edit).unwrap());
     }
 
     /// `build_batch`: `x_t = (1−t)x0 + t·noise`, `target = noise − x0`.

@@ -607,6 +607,10 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         // Adapter-only: the shared `validate_full_finetune_request` floor rejects a full tune.
         supports_full_finetune: false,
+        // Text-to-image only: instruction-edit pairs (sc-24161) are refused by the shared
+        // `validate_edit_request` floor with a typed `Unsupported` (the candle edit trainer is
+        // sc-24162).
+        max_reference_images: 0,
     }
 }
 
@@ -1053,6 +1057,7 @@ impl Trainer for QwenImage21Trainer {
         // trainer is a typed `Unsupported`, never a silently trained plain adapter.
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         if self.targets(&req.config).is_empty() {
             return Err(Error::Msg(format!(
@@ -1083,6 +1088,7 @@ impl QwenImage21Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<TrainingOutput> {
+        gen_core::train::validate_edit_request(&self.descriptor, req)?;
         validate_request(req)?;
         let cfg = &req.config;
         let device = self.device.clone();
@@ -1551,6 +1557,31 @@ mod tests {
         assert!(meta["licenseNotice"].contains("Qwen RESEARCH LICENSE AGREEMENT"));
         for key in ["networkType", "rank", "alpha", "decomposeFactor"] {
             assert!(!meta.contains_key(key), "{key} is a reload-contract key");
+        }
+    }
+
+    /// sc-24161: this text-to-image trainer advertises no reference cap, so an instruction-edit
+    /// dataset is the shared floor's typed `Unsupported` — surfaced unchanged by `validate` and by
+    /// `train` — never a text-to-image adapter silently trained on the edit targets.
+    #[test]
+    fn an_edit_dataset_is_refused_as_unsupported() {
+        assert_eq!(trainer_descriptor().max_reference_images, 0);
+        let mut t = trainer();
+        let mut req = req_with(base_config());
+        req.items = vec![TrainingItem::edit_pair(
+            PathBuf::from("/nonexistent/target.png"),
+            "make the swatch blue".into(),
+            vec![PathBuf::from("/nonexistent/source.png")],
+        )];
+        for err in [
+            t.validate(&req).unwrap_err(),
+            t.train(&req, &mut |_| {}).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, gen_core::Error::Unsupported(_)),
+                "an edit dataset must be a typed Unsupported, got {err:?}"
+            );
+            assert!(err.to_string().contains("instruction-edit"), "{err}");
         }
     }
 
