@@ -342,6 +342,9 @@ pub trait RetainedPackedKernel: fmt::Debug {
 pub struct CompiledKernelHandle {
     inner: Arc<dyn RetainedPackedKernel>,
     warmed: Arc<AtomicBool>,
+    /// The paged-layout kernels are separate pipelines compiled on their own first dispatch, so
+    /// their warm state is tracked apart from the contiguous kernels'.
+    paged_warmed: Arc<AtomicBool>,
 }
 
 impl CompiledKernelHandle {
@@ -349,6 +352,7 @@ impl CompiledKernelHandle {
         Self {
             inner,
             warmed: Arc::new(AtomicBool::new(false)),
+            paged_warmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -375,6 +379,15 @@ impl CompiledKernelHandle {
 
     pub(crate) fn mark_warmed(&self) {
         self.warmed.store(true, Ordering::Release);
+    }
+
+    /// Whether the reader's paged kernels have produced an output (see [`Self::dispatch_paged`]).
+    pub(crate) fn is_paged_warmed(&self) -> bool {
+        self.paged_warmed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_paged_warmed(&self) {
+        self.paged_warmed.store(true, Ordering::Release);
     }
 
     /// The retained reader's paged dispatch (see [`RetainedPackedKernel::dispatch_paged`]).

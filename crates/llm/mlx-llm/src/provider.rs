@@ -7014,9 +7014,12 @@ mod tests {
         assert_eq!(shared.borrow().live_pages(), 0);
     }
 
-    /// sc-20680 AC1: no dense K/V copy survives a fused paged attention call. MLX's active memory
-    /// grows by no more than the page pool's measured arrays plus the sequence's page table and
-    /// residuals (a dense K or V of one layer would exceed the slack several times over).
+    /// sc-20680 AC1: a fused paged attention call neither builds nor keeps a dense K/V copy.
+    /// Retained: MLX's active memory grows by no more than the page pool's measured arrays plus
+    /// the sequence's page table and residuals. Transient: each decode step's MLX peak above its
+    /// own starting point stays within the pool growth of that step plus the sequence's table and
+    /// residuals and a slack far below one layer's dense K (a gather built and dropped inside the
+    /// call shows up in the peak even though nothing survives it).
     #[cfg(target_os = "macos")]
     #[test]
     fn no_dense_kv_copy_survives_a_paged_compressed_attention_call() {
@@ -7076,11 +7079,35 @@ mod tests {
         };
         step(selection.cache_mut(), &prompt, 0);
         check(&selection, prompt.len() as u64);
+        let pool_bytes = || {
+            let storage = packed_pool.borrow().storage();
+            storage.code_bytes + storage.metadata_bytes
+        };
+        let mut worst_transient = 0u64;
         for i in 0..40 {
             let offset = prompt.len() + i;
+            let pool_before = pool_bytes();
+            memory::reset_peak_memory();
+            let start = memory::get_active_memory() as u64;
             step(selection.cache_mut(), &[(i as i32) % 31 + 1], offset);
+            let transient = (memory::get_peak_memory() as u64).saturating_sub(start);
             check(&selection, offset as u64 + 1);
+            let storage = selection.cache().compressed_storage().unwrap().unwrap();
+            let (_, page_metadata) = packed_pool.borrow().page_bytes();
+            let per_sequence = storage.device_metadata_bytes
+                - packed_pool.borrow().live_pages() as u64 * page_metadata;
+            // One layer's dense bf16 K of the history, the smallest gather a step could build.
+            let one_dense_tensor = (offset as u64 + 1) * 4 * 128 * 2;
+            assert!(one_dense_tensor > 4 * SLACK);
+            let allowance = (pool_bytes() - pool_before) + per_sequence + SLACK;
+            assert!(
+                transient <= allowance,
+                "decode step {i}: MLX peak rose {transient} B above the step's start; allowed \
+                 {allowance} B (one dense K of one layer is {one_dense_tensor} B)"
+            );
+            worst_transient = worst_transient.max(transient);
         }
+        eprintln!("worst per-step decode transient: {worst_transient} B");
         assert_eq!(
             selection.report().unwrap().counters.fused_attention_calls,
             2 * 40
