@@ -279,8 +279,10 @@ pub fn memory_strategy_contract(
 /// loader runs) and **fail-closed**.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdapterOverlay {
-    /// LoRA / PEFT LoKr ride as forward-time residuals for the whole render
-    /// (`AdapterResidencyMode::Additive`): every file's safetensors bytes, each non-zero.
+    /// LoRA / LoKr ride as forward-time residuals for the whole render
+    /// (`AdapterResidencyMode::Additive`): every LoRA file's safetensors bytes (each non-zero),
+    /// plus every LoKr module's resident Kronecker factors — `(a·c + b·d)` elements in f32 and
+    /// again at the compute width for the prepared copy (sc-24158).
     pub residual_bytes: u64,
     /// A LyCORIS LoHa is **folded** into the dense weights (`AdapterResidencyMode::Folded` — zero
     /// bytes resident once loaded), but each fold is a load-time transient on the DiT's device:
@@ -326,6 +328,13 @@ pub fn adapter_overlay(
             "{MODEL_ID}: every additive adapter must have a non-zero safetensors residency"
         ))
     })?;
+    // sc-24158: a LoKr (stamped or LyCORIS) keeps its two small Kronecker factors resident in f32
+    // (a low-rank leg materialized to its full `[b, d]`, a tucker leg collapsed to it) plus the
+    // compute-dtype prepared copy the structured residual caches — not its file bytes.
+    let lokr_bytes = plan
+        .lokr_factor_elements
+        .saturating_mul(F32_WIDTH + compute_width());
+    let residual_bytes = residual_bytes.saturating_add(lokr_bytes);
     let fold_bytes_per_element = 3 * F32_WIDTH + compute_width();
     let loha_fold_transient_bytes = plan
         .loha_fold_shapes
