@@ -53,10 +53,31 @@ evidence.
    the same git revision the pin resolved before, so `Cargo.lock` changes by one line (the
    `source` of `candle-core`). Features, targets, dev-dependencies, benches and examples are
    upstream's.
-3. `VENDORED.md` — this file.
+3. `src/quantized/cuda.rs` — one local fix, not upstream (sc-24446; upstream `main` still has
+   the defect as of 2026-10): the four `QCudaStorage` quantizers (`quantize`, `quantize_imatrix`,
+   `quantize_imatrix_onto`, `quantize_onto`) allocate their `MATRIX_ROW_PADDING` tail with
+   `alloc_zeros` instead of `unsafe alloc`, as `load_quantized` and `QCudaStorage::zeros` already
+   do. See *Quantized padding is zeroed* below.
+4. `VENDORED.md` — this file.
 
 Everything else (`src/**`, `tests/**`, `benches/**`, `examples/**`, `README.md`, `LICENSE`) is
 byte-for-byte upstream. Diff against an upstream checkout to confirm these are the sole deltas.
+
+## Quantized padding is zeroed
+
+A CUDA `QTensor` is stored with `MATRIX_ROW_PADDING` (512) elements' worth of blocks after its
+data. The fast MMQ kernels (`fast_mmq`, any quantized matmul over more than 8 rows) load a tile of
+`MMQ_ITER_K` (256) elements per row whatever the row length, so for a row length that is not a
+multiple of 256 (YuE stage-2's 5504-wide `down_proj`, every synthetic fixture under 256 wide) the
+last row's tile reads blocks out of that padding. Their quants meet zero activations, but each
+block's scale is still multiplied in: an inf/NaN f16 scale in the padding turns `0 · scale` into
+NaN in the output. Upstream's `quantize*` left the padding uninitialized, so the result depended on
+what the stream-ordered pool last stored there — a nondeterministic NaN (sc-24446: the CUDA lane's
+`stage2::tests::production_load_upsamples_through_candle_llm` failed with NaN logits on an
+unchanged code path). llama.cpp zeroes the same padding for the same reason. With finite padding
+the term is an exact `0`, so zeroing it changes no finite result. candle-llm's
+`primitives::quant::cuda_tests::quantize_on_load_zeroes_the_padding_mmq_reads` pins it on the CUDA
+lane.
 
 ## Eager behaviour is unchanged outside the guard
 
@@ -123,7 +144,8 @@ candle-core = { git = "https://github.com/SceneWorks/inference", rev = "<the pin
 
 1. Re-copy `candle-core/` from the new revision over this directory (keep this file).
 2. Re-apply `cabbc301` and `f53ed3bf` unless the new revision contains them (upstream main after
-   2026-06-24 does, and then this vendor and its `[patch]` can be dropped).
+   2026-06-24 does), and the zeroed quantized padding (`src/quantized/cuda.rs`) unless the new
+   revision zeroes it itself — only then can this vendor and its `[patch]` be dropped.
 3. Re-derive `Cargo.toml` from the new upstream workspace manifest as described above.
 4. Move every pin (`Cargo.toml`, `scripts/check-workspace.py` `PINNED_WORKSPACE_DEPENDENCIES` and
    `VENDORED_PACKAGES`), re-vendor `candle-kernels` (its own `VENDORED.md`), regenerate the lock,
