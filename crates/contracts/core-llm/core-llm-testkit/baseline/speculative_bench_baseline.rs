@@ -9,8 +9,8 @@
 //! budgets, warm-up rule and repeat statistics, and writes **the harness's JSON schema**
 //! (`core_llm_testkit::BenchRow` documents it): every field the pre-epic revision cannot report is
 //! `null` — `graph_path`, `prefix_cache`, `prefix_hit_tokens`, `prefill_forwards`, `verify_steps`,
-//! `discarded_forwards`, `speculative_demoted_at`, `mean_accepted_length` (its denominator is
-//! `verify_steps`), `fallbacks`,
+//! `discarded_forwards`, `speculative_demoted_at`, `speculative_monitor`, `mean_accepted_length`
+//! (its denominator is `verify_steps`), `fallbacks`,
 //! and the `load` block's
 //! `prefix_cache_bytes`, `draft` and `fallbacks`. Where a pre-epic MLX provider returns no
 //! `DecodeReport`, `proposer` is `mtp` when its legacy `MtpStats` say MTP ran (else `null`) and the
@@ -616,7 +616,7 @@ pub fn row_json(
         (None, Some(_)) => Some("mtp"),
         (None, None) => None,
     };
-    json!({
+    let mut row = json!({
         "prompt_id": prompt_id,
         "class": class,
         "requested": mode_json(mode),
@@ -665,7 +665,10 @@ pub fn row_json(
                 })
             })
             .collect::<Vec<_>>(),
-    })
+    });
+    // Set outside the literal: one more key there overflows `json!`'s default recursion limit.
+    row["speculative_monitor"] = Value::Null;
+    row
 }
 
 /// The document in the harness's schema (`core_llm_testkit::BenchDocument::to_json`), with the

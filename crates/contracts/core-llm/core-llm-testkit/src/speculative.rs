@@ -895,6 +895,7 @@ impl BenchStats {
 /// | `target_forwards`, `prefill_forwards`, `verify_steps`, `replay_forwards`, `discarded_forwards` | [`DecodeReport`] forward counts |
 /// | `proposed_tokens`, `accepted_tokens`, `mean_accepted_length` | draft accounting ([`DecodeReport::mean_accepted_length`]) |
 /// | `speculative_demoted_at` | tokens generated when `auto` demoted the proposer ([`DecodeReport::speculative_demoted_at`]); `null` when it was not |
+/// | `speculative_monitor` | the last window `auto`'s monitor judged ([`DecodeReport::speculative_monitor`]): `{"window", "basis", "demoted", "verifies", "accepted", "mean_accepted_length", "timed_steps", "plain_step_ms", "verify_step_ms", "verify_cost_ratio", "gain"}` (`plain_step_ms` … `gain` `null` when not measured); `null` when no window was judged |
 /// | `prefix_cache` | `{"path", "reason"}` — [`DecodeReport::prefix_cache`] |
 /// | `prefix_hit_tokens` | prompt tokens restored from the prefix cache |
 /// | `sampler`, `kv_cache`, `attention` | [`DecodeReport`] labels |
@@ -960,6 +961,7 @@ impl BenchRow {
             "replay_forwards": report.map(|r| r.replay_forwards),
             "discarded_forwards": report.map(|r| r.discarded_forwards),
             "speculative_demoted_at": report.and_then(|r| r.speculative_demoted_at),
+            "speculative_monitor": report.and_then(|r| r.speculative_monitor).map(monitor_json),
             "proposed_tokens": report.map(|r| r.proposed_tokens),
             "accepted_tokens": report.map(|r| r.accepted_tokens),
             "mean_accepted_length": report.and_then(DecodeReport::mean_accepted_length),
@@ -975,6 +977,24 @@ impl BenchRow {
             "samples": self.samples.iter().map(BenchSample::to_json).collect::<Vec<_>>(),
         })
     }
+}
+
+/// A monitor decision as its bench-row object (see [`BenchRow`]'s `speculative_monitor`).
+fn monitor_json(d: core_llm::MonitorDecision) -> Value {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    json!({
+        "window": d.window,
+        "basis": d.basis.label(),
+        "demoted": d.demoted,
+        "verifies": d.verifies,
+        "accepted": d.accepted,
+        "mean_accepted_length": d.mean_accepted_length(),
+        "timed_steps": d.timed_steps,
+        "plain_step_ms": d.plain_step_ns.map(ms),
+        "verify_step_ms": (d.timed_steps > 0).then(|| ms(d.timed_ns) / f64::from(d.timed_steps)),
+        "verify_cost_ratio": d.verify_cost_ratio(),
+        "gain": d.gain(),
+    })
 }
 
 /// A finished benchmark run: the configuration, what the load settled, and every row.
@@ -1619,6 +1639,17 @@ mod tests {
                     verify_steps: if speculating { 4 } else { 0 },
                     proposed_tokens: if speculating { 8 } else { 0 },
                     accepted_tokens: if speculating { 6 } else { 0 },
+                    speculative_monitor: speculating.then_some(core_llm::MonitorDecision {
+                        window: 1,
+                        verifies: 16,
+                        accepted: 12,
+                        timed_steps: 13,
+                        timed_tokens: 25,
+                        timed_ns: 312_000_000,
+                        plain_step_ns: Some(10_000_000),
+                        basis: core_llm::DemotionBasis::Measured,
+                        demoted: true,
+                    }),
                     ..Default::default()
                 }),
                 finish_reason: Some(FinishReason::Length),
@@ -1770,7 +1801,24 @@ mod tests {
         assert_eq!(off["requested"], "off");
         assert_eq!(off["proposer"], "none");
         assert_eq!(off["mean_accepted_length"], Value::Null);
+        assert_eq!(off["speculative_monitor"], Value::Null);
         let lookup = &json["rows"][1];
+        // sc-24446: the monitor's decision inputs and the quantities derived from them.
+        let monitor = &lookup["speculative_monitor"];
+        assert_eq!(
+            (&monitor["basis"], &monitor["demoted"], &monitor["window"]),
+            (&json!("measured"), &json!(true), &json!(1))
+        );
+        assert_eq!(monitor["mean_accepted_length"], 0.75);
+        // The stub's fake timings (no wall clock): 10 ms plain steps, 24 ms verify steps.
+        for (key, want) in [("plain_step_ms", 10.0), ("verify_step_ms", 24.0)] {
+            assert_eq!(monitor[key], want, "{key}");
+        }
+        let close = |key: &str, want: f64| (monitor[key].as_f64().unwrap() - want).abs() < 1e-9;
+        assert!(
+            close("verify_cost_ratio", 2.4) && close("gain", 250.0 / 312.0),
+            "{monitor}"
+        );
         assert_eq!(lookup["proposer"], "prompt_lookup");
         assert_eq!(lookup["draft_tokens"], 4);
         assert_eq!(lookup["mean_accepted_length"], 1.5);

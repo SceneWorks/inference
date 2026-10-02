@@ -592,6 +592,35 @@ impl Proposer<Qwen35Model> for MtpProposer<'_> {
         }
         Ok(())
     }
+
+    fn catch_up(
+        &mut self,
+        model: &Qwen35Model,
+        tokens: &[i32],
+        preceding_hidden: Option<&Array>,
+        position: i32,
+    ) -> Result<()> {
+        // The probed tokens were fed to the target without a draft step, so the head never paired
+        // them with their predecessor rows: seed them as the warm-up does.
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let preceding = preceding_hidden.ok_or_else(|| {
+            Error::Msg("MtpProposer: no target hidden rows for the probed tokens".into())
+        })?;
+        self.after_cur = None;
+        let shifted = model.embed_input_ids(&input_ids(tokens))?;
+        let positions: Vec<i32> = (0..tokens.len() as i32).map(|i| position + i).collect();
+        let cache = self.cache()?;
+        let seed = model.mtp_warm_from_embeds(
+            &shifted,
+            preceding,
+            cache,
+            [&positions, &positions, &positions],
+        )?;
+        eval([&seed])?;
+        Ok(())
+    }
 }
 
 /// Generate with Qwen3.8's native MTP predictor and exact target verification — the engine with

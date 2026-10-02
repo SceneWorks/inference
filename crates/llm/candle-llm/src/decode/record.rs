@@ -183,6 +183,8 @@ pub struct DecodeRecord {
     /// token-at-a-time steps (sc-24446) — see
     /// [`core_llm::DecodeReport::speculative_demoted_at`]; `None` when nothing was demoted.
     pub speculative_demoted_at: Option<u64>,
+    /// [`core_llm::DecodeReport::speculative_monitor`]; `None` when no monitor judged a window.
+    pub speculative_monitor: Option<core_llm::MonitorDecision>,
 }
 
 impl DecodeRecord {
@@ -217,6 +219,7 @@ impl DecodeRecord {
             prefix_cache: "none",
             prefix_cache_reason: None,
             speculative_demoted_at: None,
+            speculative_monitor: None,
         }
     }
 
@@ -332,6 +335,7 @@ impl DecodeRecord {
             prefix_cache: "none",
             prefix_cache_reason: None,
             speculative_demoted_at: stats.demoted_at.map(|n| n as u64),
+            speculative_monitor: stats.monitor,
         }
     }
 
@@ -416,6 +420,7 @@ impl DecodeRecord {
             // No Candle loop enqueues a look-ahead forward it may discard (E3).
             discarded_forwards: 0,
             speculative_demoted_at: self.speculative_demoted_at,
+            speculative_monitor: self.speculative_monitor,
             prefix_hit_tokens: self.prefix_hit_tokens,
             prefix_cache: core_llm::PathReport {
                 path: self.prefix_cache.to_string(),
@@ -695,6 +700,7 @@ mod tests {
                 direct_rollbacks: 2,
                 replays: 1,
                 demoted_at: Some(7),
+                monitor: Some(DECISION),
             },
             10,
             SpanCounters {
@@ -740,7 +746,22 @@ mod tests {
         assert_eq!(spec.speculative_demoted_at, Some(7));
         assert_eq!(spec.report(false).speculative_demoted_at, Some(7));
         assert_eq!(plain.report(false).speculative_demoted_at, None);
+        // ... and so does the monitor's last decision.
+        assert_eq!(spec.report(false).speculative_monitor, Some(DECISION));
+        assert_eq!(plain.report(false).speculative_monitor, None);
     }
+
+    const DECISION: core_llm::MonitorDecision = core_llm::MonitorDecision {
+        window: 1,
+        verifies: 16,
+        accepted: 12,
+        timed_steps: 13,
+        timed_tokens: 25,
+        timed_ns: 312,
+        plain_step_ns: Some(10),
+        basis: core_llm::DemotionBasis::Measured,
+        demoted: true,
+    };
 
     #[test]
     fn request_span_brackets_this_threads_host_syncs() {
