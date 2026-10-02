@@ -1926,27 +1926,27 @@ mod tests {
             vocab_size: 50,
             recurrent_bytes: 0,
         };
-        // The decode attention's workspace (sc-24441): 4 heads × 1 chunk (100 positions fit one
-        // 256-key chunk) × (8 + 2) f32.
+        // The decode attention's workspace (sc-24441): 4 heads × 2 chunks (100 positions span two
+        // 64-key chunks, sc-24446) × (8 + 2) f32.
         let decode_attention =
             4 * 100u64.div_ceil(candle_quant_kernels::DECODE_ATTN_CHUNK as u64) * (8 + 2) * 4;
         let per_token =
             (3 * 64 + 8 * 32 + 50) * 4 + 4 * 100 * 4 * 3 + decode_attention + 4 + (50 + 32) * 4;
         assert_eq!(
-            decode_attention, 160,
+            decode_attention, 320,
             "the decode attention's workspace, literally"
         );
-        assert_eq!(per_token, 7_284, "one token-row, literally");
+        assert_eq!(per_token, 7_444, "one token-row, literally");
         // A decode-only request (one 1-token shape, two scopes). The parameter cache is a load's,
         // not a request's (`graph_param_cache_load_bytes`).
         assert_eq!(
             graph_workspace_admission_bytes(&geometry, 100, 1),
-            Some(2 * 7_284)
+            Some(2 * 7_444)
         );
         // K = 3: token counts 1..=4 → 10 token-rows per scope.
         assert_eq!(
             graph_workspace_admission_bytes(&geometry, 100, 4),
-            Some(2 * 10 * 7_284)
+            Some(2 * 10 * 7_444)
         );
         assert_eq!(graph_workspace_admission_bytes(&geometry, 100, 0), Some(0));
         let huge = core_llm::LlmMemoryGeometry {
