@@ -27,21 +27,27 @@ fn dense_dit() -> QwenImage21Transformer {
     load_transformer(&tiny_snapshot(), &Device::Cpu).expect("tiny DiT loads")
 }
 
-/// A transformer-only q8 snapshot: the committed packed `model.safetensors` plus the source config
-/// with the converter's `quantization` marker.
-fn packed_root(dir: &Path) -> PathBuf {
-    let out = dir.join("q8");
+/// A transformer-only packed `tier` snapshot: the committed packed `model.safetensors` plus the
+/// source config with the converter's `quantization` marker.
+fn packed_root(dir: &Path, tier: Tier) -> PathBuf {
+    let out = dir.join(tier.dir_name());
     let component = out.join("transformer");
     std::fs::create_dir_all(&component).unwrap();
     std::fs::copy(
-        fixtures().join("tiers/q8/transformer/model.safetensors"),
+        fixtures()
+            .join("tiers")
+            .join(tier.dir_name())
+            .join("transformer/model.safetensors"),
         component.join("model.safetensors"),
     )
     .unwrap();
     let source = tiny_snapshot().join("transformer/config.json");
     let mut config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(source).unwrap()).unwrap();
-    config["quantization"] = serde_json::json!({ "bits": 8, "group_size": GROUP_SIZE });
+    config["quantization"] = serde_json::json!({
+        "bits": tier.transformer_bits().expect("a packed tier"),
+        "group_size": GROUP_SIZE,
+    });
     std::fs::write(
         component.join("config.json"),
         serde_json::to_string_pretty(&config).unwrap(),
@@ -50,8 +56,24 @@ fn packed_root(dir: &Path) -> PathBuf {
     out
 }
 
-fn packed_dit(dir: &Path) -> QwenImage21Transformer {
-    load_transformer(&packed_root(dir), &Device::Cpu).expect("q8 DiT loads")
+/// The packed DiT, with the fixture's packed projection asserted packed — the test is about a
+/// residual over a quantized base, so that base must really be quantized.
+fn packed_dit(dir: &Path, tier: Tier) -> QwenImage21Transformer {
+    let mut dit =
+        load_transformer(&packed_root(dir, tier), &Device::Cpu).expect("packed DiT loads");
+    let mut packed = Vec::new();
+    dit.visit_adaptable_mut(&mut |name, linear| {
+        if linear.is_packed() {
+            packed.push(name.to_string());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        packed.iter().any(|name| name == PACKED_TARGET),
+        "{tier:?}: {PACKED_TARGET} must load packed, packed set = {packed:?}"
+    );
+    dit
 }
 
 fn ramp(shape: (usize, usize, usize), seed: usize) -> Tensor {
@@ -110,12 +132,13 @@ fn write_lora(path: &Path, targets: &[(&str, usize, usize)], seed: usize) {
     save(path, tensors, None);
 }
 
-fn write_lokr(path: &Path, target: &str) {
+/// A PEFT LoKr over `target`: `kron(w1, w2)` reconstructs `[w1.0·w2.0, w1.1·w2.1] = [out, in]`.
+fn write_lokr(path: &Path, target: &str, w1: (usize, usize), w2: (usize, usize)) {
     save(
         path,
         vec![
-            (format!("{target}.lokr_w1"), filled((2, 2), 3)),
-            (format!("{target}.lokr_w2"), filled((DIM / 2, DIM / 2), 4)),
+            (format!("{target}.lokr_w1"), filled(w1, 3)),
+            (format!("{target}.lokr_w2"), filled(w2, 4)),
         ],
         Some(HashMap::from([
             ("networkType".to_string(), "lokr".to_string()),
@@ -228,7 +251,7 @@ fn lora_and_lokr_install_on_the_dense_dit_and_stack() {
     assert!(max_abs_diff(&base, &velocity(&zero)) < 1e-6);
 
     let lokr = temp.path().join("lokr.safetensors");
-    write_lokr(&lokr, ATTN_TARGET);
+    write_lokr(&lokr, ATTN_TARGET, (2, 2), (DIM / 2, DIM / 2));
     let mut kron = dense_dit();
     let report = install(
         &mut kron,
@@ -241,28 +264,47 @@ fn lora_and_lokr_install_on_the_dense_dit_and_stack() {
     assert!(max_abs_diff(&base, &velocity(&kron)) > 1e-4);
 }
 
-/// On the packed q8 DiT the LoRA rides as a residual over the still-packed projection.
+/// On the packed q8 and q4 DiTs a LoRA rides as a residual over the still-packed projection, and a
+/// PEFT LoKr does too.
 #[test]
-fn lora_installs_as_a_residual_over_a_packed_projection() {
-    let temp = tempfile::tempdir().unwrap();
-    let base = velocity(&packed_dit(temp.path()));
-    let adapter = temp.path().join("packed.safetensors");
-    write_lora(&adapter, &[(PACKED_TARGET, HIDDEN, DIM)], 2);
-    let mut dit = packed_dit(temp.path());
-    let report = install(&mut dit, &[lora(&adapter, 1.0)], Tier::Q8, &Device::Cpu).unwrap();
-    assert_eq!(report.residuals, 1);
-    let mut checked = false;
-    dit.visit_adaptable_mut(&mut |name, linear| {
-        if name == PACKED_TARGET {
-            assert!(linear.is_packed(), "the base must stay packed");
-            assert!(linear.is_adapted());
-            checked = true;
-        }
-        Ok(())
-    })
-    .unwrap();
-    assert!(checked);
-    assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4);
+fn lora_and_lokr_install_as_residuals_over_packed_projections() {
+    for tier in [Tier::Q8, Tier::Q4] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = velocity(&packed_dit(temp.path(), tier));
+        let adapter = temp.path().join("packed.safetensors");
+        write_lora(&adapter, &[(PACKED_TARGET, HIDDEN, DIM)], 2);
+        let mut dit = packed_dit(temp.path(), tier);
+        let report = install(&mut dit, &[lora(&adapter, 1.0)], tier, &Device::Cpu).unwrap();
+        assert_eq!(report.residuals, 1);
+        let mut checked = false;
+        dit.visit_adaptable_mut(&mut |name, linear| {
+            if name == PACKED_TARGET {
+                assert!(linear.is_packed(), "{tier:?}: the base must stay packed");
+                assert!(linear.is_adapted());
+                checked = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(checked);
+        assert!(
+            max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+            "{tier:?}: the residual must move the output"
+        );
+
+        let lokr = temp.path().join("lokr.safetensors");
+        write_lokr(&lokr, PACKED_TARGET, (2, 4), (DIM / 2, HIDDEN / 4));
+        let mut kron = packed_dit(temp.path(), tier);
+        let report = install(
+            &mut kron,
+            &[AdapterSpec::new(lokr, 1.0, AdapterKind::Lokr)],
+            tier,
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(report.residuals, 1);
+        assert!(max_abs_diff(&base, &velocity(&kron)) > 1e-4, "{tier:?}");
+    }
 }
 
 /// A LoHa folds into the dense bf16-tier weights and moves the output.
@@ -312,10 +354,19 @@ fn loha_on_a_packed_tier_is_a_typed_refusal() {
             other => panic!("LoHa on {tier:?} must be a typed refusal, got {other:?}"),
         }
     }
-    let mut dit = packed_dit(temp.path());
-    match install(&mut dit, &[lora(&adapter, 1.0)], Tier::Q8, &Device::Cpu) {
-        Err(CandleError::Unsupported(message)) => assert_eq!(message, expected),
-        other => panic!("install must refuse LoHa on q8, got {other:?}"),
+    for tier in [Tier::Q8, Tier::Q4] {
+        let mut dit = packed_dit(temp.path(), tier);
+        match install(&mut dit, &[lora(&adapter, 1.0)], tier, &Device::Cpu) {
+            Err(CandleError::Unsupported(message)) => {
+                assert_eq!(message, loha_on_packed_tier_refusal(tier, &adapter))
+            }
+            other => panic!("install must refuse LoHa on {tier:?}, got {other:?}"),
+        }
+        dit.visit_adaptable_mut(&mut |_, linear| {
+            assert!(!linear.is_adapted(), "a refused LoHa attaches nothing");
+            Ok(())
+        })
+        .unwrap();
     }
 }
 

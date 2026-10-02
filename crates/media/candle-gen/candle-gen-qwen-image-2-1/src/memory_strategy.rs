@@ -268,9 +268,91 @@ pub fn memory_strategy_contract(
     };
     // Refuse a tier/request disagreement here too, so a contract is never built for a load that
     // would be served at a different tier than the one it claims.
-    crate::quant::resolve_requested_tier(root, spec.quantize)?;
+    let tier = crate::quant::resolve_requested_tier(root, spec.quantize)?;
     contract.asset_facts = asset_facts(root)?;
+    price_adapter_stack(&mut contract, adapter_overlay_bytes(spec, tier)?);
     Ok(contract)
+}
+
+/// Bytes the selected adapter stack keeps resident beside the DiT (sc-24157), priced from the
+/// adapter files on disk and **fail-closed**:
+///
+/// * LoRA / PEFT LoKr ride as forward-time residuals for the whole render
+///   (`AdapterResidencyMode::Additive`) — every file must have a non-zero safetensors size;
+/// * a LyCORIS LoHa is folded into the dense weights, but the fold holds the whole adapter file
+///   (plus one projection's f32 delta) while it runs, so its file bytes are charged too rather
+///   than priced as free; on a packed tier it is the same typed refusal the loader raises.
+///
+/// A non-empty stack therefore always prices above zero, and an unsizable one is refused instead
+/// of being admitted as free.
+pub fn adapter_overlay_bytes(spec: &LoadSpec, tier: crate::quant::Tier) -> gen_core::Result<u64> {
+    if spec.adapters.is_empty() {
+        return Ok(0);
+    }
+    let mut additive = Vec::new();
+    let mut folded = 0_u64;
+    for adapter in &spec.adapters {
+        let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(&adapter.path)?;
+        if gen_core::weightsmeta::keys_contain_loha(headers.iter().map(|h| h.name.as_str())) {
+            if tier != crate::quant::Tier::Bf16 {
+                return Err(gen_core::Error::Unsupported(
+                    crate::adapters::loha_on_packed_tier_refusal(tier, &adapter.path),
+                ));
+            }
+            let bytes = gen_core::weightsmeta::safetensors_path_bytes(&adapter.path);
+            if bytes == 0 {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{MODEL_ID}: LoHa adapter {} has no sizable safetensors residency",
+                    adapter.path.display()
+                )));
+            }
+            folded = folded.saturating_add(bytes);
+        } else {
+            additive.push(adapter.clone());
+        }
+    }
+    let residual =
+        gen_core::adapter_stack_resident_bytes(&additive, gen_core::AdapterResidencyMode::Additive)
+            .ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "{MODEL_ID}: every additive adapter must have a non-zero safetensors residency"
+                ))
+            })?;
+    Ok(residual.saturating_add(folded))
+}
+
+/// Declare a non-zero adapter stack as a typed auxiliary resident component beside the base
+/// components (never inside `base_bytes`), with `OverlayBytes` in the formula — the
+/// `candle-gen-qwen-image` edit-route shape. A zero overlay leaves the contract untouched.
+fn price_adapter_stack(contract: &mut MemoryProviderContract, overlay_bytes: u64) {
+    if overlay_bytes == 0 {
+        return;
+    }
+    contract.asset_facts.overlay_bytes = overlay_bytes;
+    let mut variables = contract_variables(&contract.formula);
+    if !variables.contains(&MemoryFormulaVariable::OverlayBytes) {
+        variables.push(MemoryFormulaVariable::OverlayBytes);
+    }
+    contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+        phases: contract.lifecycle.phases.clone(),
+        variables,
+        resident_components: vec![gen_core::MemoryResidentComponent {
+            id: "qwen_image_2_1_adapter_stack".to_owned(),
+            kind: gen_core::MemoryComponentKind::AdapterStack,
+            resident_bytes: overlay_bytes,
+            bounded_by: None,
+            residency: gen_core::MemoryComponentResidency::WholeRender,
+        }],
+    };
+}
+
+fn contract_variables(formula: &MemoryFormulaKind) -> Vec<MemoryFormulaVariable> {
+    match formula {
+        MemoryFormulaKind::Affine { variables }
+        | MemoryFormulaKind::PhaseEnvelope { variables, .. }
+        | MemoryFormulaKind::ComponentPhaseEnvelope { variables, .. } => variables.clone(),
+        MemoryFormulaKind::AssetBytesPlusHeadroom => vec![MemoryFormulaVariable::AssetBytes],
+    }
 }
 
 /// Declaration-equivalent contract with no asset facts — the registry conformance surface.
@@ -442,7 +524,9 @@ pub(crate) fn registered_valid_fixture(
                 reference_count: 0,
                 use_pid: false,
                 has_phases: true,
-                overlay: None,
+                // The loaded adapter stack is part of the route identity (the 2512 edit route's
+                // convention), so a fixture for an adapted load is keyed apart from a plain one.
+                overlay: (!spec.adapters.is_empty()).then(|| "lora".to_owned()),
             },
         )?,
     )])
@@ -931,6 +1015,104 @@ mod tests {
             tower.dtype().size_in_bytes() as u64,
             compute_width(),
             "the priced width is the width the tower is actually materialized at"
+        );
+    }
+    /// sc-24157: a non-empty adapter stack is priced, never admitted as free. LoRA rides as a
+    /// typed auxiliary `AdapterStack` component worth its file bytes, outside `base_bytes`, with
+    /// `OverlayBytes` in the formula; a LoHa (dense fold) is charged its file bytes too; an
+    /// unsizable adapter and a LoHa on a packed tier are refused.
+    #[test]
+    fn a_non_empty_adapter_stack_prices_a_resident_overlay() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use std::collections::HashMap;
+
+        let tiny = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/tiny-snapshot");
+        let plain = LoadSpec::new(WeightsSource::Dir(tiny.clone()));
+        let base = memory_strategy_contract(MODEL_ID, &plain).unwrap();
+        assert_eq!(base.asset_facts.overlay_bytes, 0);
+        assert!(!base.formula.uses(MemoryFormulaVariable::OverlayBytes));
+
+        let temp = tempfile::tempdir().unwrap();
+        let dev = candle_core::Device::Cpu;
+        let lora = temp.path().join("lora.safetensors");
+        let tensors: HashMap<String, candle_core::Tensor> = HashMap::from([
+            (
+                "transformer_blocks.0.attn.to_q.lora_A.weight".to_owned(),
+                candle_core::Tensor::zeros((2, 32), candle_core::DType::F32, &dev).unwrap(),
+            ),
+            (
+                "transformer_blocks.0.attn.to_q.lora_B.weight".to_owned(),
+                candle_core::Tensor::zeros((32, 2), candle_core::DType::F32, &dev).unwrap(),
+            ),
+        ]);
+        candle_core::safetensors::save(&tensors, &lora).unwrap();
+        let lora_bytes = std::fs::metadata(&lora).unwrap().len();
+
+        let adapted = plain.clone().with_adapters(vec![AdapterSpec::new(
+            lora.clone(),
+            1.0,
+            AdapterKind::Lora,
+        )]);
+        let contract = memory_strategy_contract(MODEL_ID, &adapted).unwrap();
+        assert_eq!(contract.asset_facts.overlay_bytes, lora_bytes);
+        assert!(contract.asset_facts.overlay_bytes > 0);
+        assert_eq!(
+            contract.asset_facts.base_bytes, base.asset_facts.base_bytes,
+            "the overlay is declared beside the base, never inside it"
+        );
+        assert!(contract.formula.uses(MemoryFormulaVariable::OverlayBytes));
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        assert!(
+            contract.total_resident_bytes() > base.total_resident_bytes(),
+            "the adapted load must cost more than the plain one"
+        );
+
+        let loha = temp.path().join("loha.safetensors");
+        let mut loha_tensors = HashMap::new();
+        for (factor, shape) in [
+            ("hada_w1_a", (32, 2)),
+            ("hada_w1_b", (2, 32)),
+            ("hada_w2_a", (32, 2)),
+            ("hada_w2_b", (2, 32)),
+        ] {
+            loha_tensors.insert(
+                format!("transformer_blocks.0.attn.to_k.{factor}"),
+                candle_core::Tensor::zeros(shape, candle_core::DType::F32, &dev).unwrap(),
+            );
+        }
+        candle_core::safetensors::save(&loha_tensors, &loha).unwrap();
+        let loha_bytes = std::fs::metadata(&loha).unwrap().len();
+        let stacked = plain.clone().with_adapters(vec![
+            AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora),
+            AdapterSpec::new(loha.clone(), 0.5, AdapterKind::Lora),
+        ]);
+        assert_eq!(
+            adapter_overlay_bytes(&stacked, crate::quant::Tier::Bf16).unwrap(),
+            lora_bytes + loha_bytes
+        );
+        match adapter_overlay_bytes(&stacked, crate::quant::Tier::Q4) {
+            Err(gen_core::Error::Unsupported(message)) => {
+                assert!(
+                    message.contains("LoHa") && message.contains("q4"),
+                    "{message}"
+                )
+            }
+            other => panic!("LoHa on a packed tier must be refused, got {other:?}"),
+        }
+
+        let missing = plain.with_adapters(vec![AdapterSpec::new(
+            temp.path().join("absent.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        )]);
+        assert!(
+            memory_strategy_contract(MODEL_ID, &missing).is_err(),
+            "an unsizable adapter fails closed"
         );
     }
 }
