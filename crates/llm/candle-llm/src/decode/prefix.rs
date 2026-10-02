@@ -470,13 +470,14 @@ where
         // Cancelled while the forward ran: no snapshot of a prefill the request abandons.
         return Err(Error::Canceled);
     }
-    let snapshot = match split {
-        Some(b) => Some(Boundary {
-            len: b,
-            entry: cache.snapshot(b)?,
-        }),
-        None => None,
-    };
+    // A boundary the forward could not capture costs the cache entry, never the request: the
+    // prefill and its output stand, and the boundary is simply not stored.
+    let snapshot = split.and_then(|b| {
+        cache
+            .snapshot(b)
+            .ok()
+            .map(|entry| Boundary { len: b, entry })
+    });
     Ok(PrefixPrefill {
         logits: out.logits,
         hidden: out.hidden,
@@ -643,6 +644,8 @@ mod engine_tests {
         fed: Cell<usize>,
         calls: Cell<usize>,
         cancel_in_forward: Option<&'a CancelFlag>,
+        /// Run every step without its boundary snapshot: a model that captures nothing.
+        drop_snapshot: bool,
     }
 
     impl<'a, M> Counted<'a, M> {
@@ -652,6 +655,7 @@ mod engine_tests {
                 fed: Cell::new(0),
                 calls: Cell::new(0),
                 cancel_in_forward: None,
+                drop_snapshot: false,
             }
         }
 
@@ -684,6 +688,14 @@ mod engine_tests {
             if let Some(cancel) = self.cancel_in_forward {
                 cancel.cancel();
             }
+            let request = if self.drop_snapshot {
+                StepRequest {
+                    snapshot_at: None,
+                    ..request
+                }
+            } else {
+                request
+            };
             self.inner.forward_step(cache, request)
         }
     }
@@ -1065,6 +1077,49 @@ mod engine_tests {
         assert_eq!(gen2, cold(&model, &mut NoProposer, &p2, 8).0);
     }
 
+    /// sc-24446 (epic E1): on both decoder families, a prefix-cache hit on the boundary entry a
+    /// single-forward miss stored decodes exactly the greedy tokens a plain, cache-free run of the
+    /// same prompt decodes — over conversations shorter than one Gated DeltaNet chunk and past
+    /// it, each continued by two different turns (ids below each fixture's vocabulary `v`). Sensitive to the boundary: a recurrent state
+    /// captured one position off changes the hybrid's greedy stream here.
+    #[test]
+    fn a_hit_after_a_single_forward_miss_decodes_the_plain_run() {
+        fn check<M>(model: &M, family: &str, v: i32)
+        where
+            M: StepModel,
+            M::Cache: PrefixSnapshot,
+        {
+            const NEW: usize = 24;
+            for conv_len in [5usize, 8, 13, 21, 34, 55, 70, 90] {
+                let conversation: Vec<i32> = (0..conv_len as i32)
+                    .map(|i| (i * 7 % (v - 4)) + 1)
+                    .collect();
+                let mut pc = PrefixCache::with_budget(1 << 30);
+                let mut p1 = conversation.clone();
+                p1.extend_from_slice(&[v - 2, v - 1]);
+                let (_, reused1, _) =
+                    turn(model, &mut NoProposer, &mut pc, &p1, Some(conv_len), NEW);
+                assert_eq!(reused1, 0, "{family} {conv_len}: a miss");
+                for next in [
+                    [v - 7, v - 6, v - 5, v - 2, v - 1],
+                    [3, 7, v - 3, v - 2, v - 1],
+                ] {
+                    let mut p = conversation.clone();
+                    p.extend_from_slice(&next);
+                    let (tokens, reused, _) = turn(model, &mut NoProposer, &mut pc, &p, None, NEW);
+                    assert!(reused >= conv_len, "{family} {conv_len}: a hit ({reused})");
+                    assert_eq!(
+                        tokens,
+                        cold(model, &mut NoProposer, &p, NEW).0,
+                        "{family} {conv_len} {next:?}"
+                    );
+                }
+            }
+        }
+        check(&tiny_llama(), "causal", 24);
+        check(&text_model().1, "hybrid", 50);
+    }
+
     /// AC2: the hybrid restores the recurrent state snapshotted at the boundary (through the
     /// checkpoint ring), prefills only past it, and matches a cold run; a third turn restores the
     /// same entry after the second decoded past it (the entry is an immutable copy).
@@ -1335,6 +1390,51 @@ mod engine_tests {
         assert_eq!(reused, 0);
         assert_eq!(tokens, cold(&model, &mut NoProposer, &prompt, 4).0);
         assert_eq!(pc.len(), 1);
+    }
+
+    /// sc-24446: a prefill whose forward fails part-way drops the boundary capture its linear
+    /// layers never consumed, so a later prefill on the same cache captures nothing there.
+    #[test]
+    fn a_failed_prefill_leaves_no_stale_boundary_capture() {
+        let (_, model) = text_model();
+        let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
+        let mut bad = prompt.clone();
+        bad[3] = model.vocab_size() as i32 + 5; // past the embedding: the forward fails
+        let mut cache = model.new_cache_for(prompt.len() + 8, 2).unwrap();
+        let step = |tokens| StepRequest::last(tokens).as_prefill();
+        assert!(model
+            .forward_step(&mut cache, step(&bad).with_snapshot_at(8))
+            .is_err());
+        assert_eq!(cache.positions(), 0, "the failed prefill fed nothing");
+        model.forward_step(&mut cache, step(&prompt)).unwrap();
+        assert!(
+            cache.prefix_snapshot_at(8).is_err(),
+            "a stale boundary was captured by a later prefill"
+        );
+    }
+
+    /// sc-24446: a boundary the forward does not capture costs the prefix-cache entry, never the
+    /// request: the prefill returns its output with no boundary snapshot.
+    #[test]
+    fn an_uncaptured_boundary_skips_the_snapshot_not_the_request() {
+        let (_, model) = text_model();
+        let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
+        let mut uncaptured = Counted::new(&model);
+        uncaptured.drop_snapshot = true;
+        let mut cache = model.new_cache_for(prompt.len() + 8, 2).unwrap();
+        let pre = prefill_restored(
+            &uncaptured,
+            &mut cache,
+            None,
+            &prompt,
+            Some(8),
+            false,
+            &CancelFlag::new(),
+        )
+        .expect("the request survives an uncaptured boundary");
+        assert!(pre.boundary.is_none());
+        assert_eq!(pre.fed_tokens, prompt.len());
+        assert_eq!(cache.positions(), prompt.len());
     }
 
     /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward,

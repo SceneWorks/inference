@@ -1308,6 +1308,16 @@ impl Qwen35Cache {
         }
     }
 
+    /// Drop every linear layer's pending [`capture_boundary`](Self::capture_boundary) — after a
+    /// forward that failed part-way, whose later layers never consumed it.
+    pub fn clear_boundary_capture(&mut self) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.clear_capture();
+            }
+        }
+    }
+
     /// [`prefix_snapshot`](Self::prefix_snapshot) of the cache's first `len` positions: at the
     /// cache length, its live state; before it, the attention KV narrowed to `len` (causal: no
     /// later position wrote it) and the linear states the last prefill captured at `len`
@@ -3365,16 +3375,28 @@ impl StepModel for Qwen35Model {
             cache.capture_boundary(cache.offset() + b as i32);
         }
         let _prefill = crate::primitives::prefill_scope(request.prefill);
-        let (logits, hidden) = match (request.scope, request.want_hidden) {
-            (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
-            (LogitsScope::Last, true) => {
-                let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
-                (logits, Some(hidden))
-            }
-            (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
-            (LogitsScope::All, true) => {
-                let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
-                (logits, Some(hidden))
+        let run = (|| -> Result<(Tensor, Option<Tensor>)> {
+            Ok(match (request.scope, request.want_hidden) {
+                (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
+                (LogitsScope::Last, true) => {
+                    let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+                (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
+                (LogitsScope::All, true) => {
+                    let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+            })
+        })();
+        let (logits, hidden) = match run {
+            Ok(out) => out,
+            Err(e) => {
+                // A forward that failed part-way leaves the boundary capture (sc-24446) pending
+                // in the linear layers it never reached: drop it, so no later prefill on this
+                // cache captures a stale boundary.
+                cache.clear_boundary_capture();
+                return Err(e);
             }
         };
         Ok(StepOutput { logits, hidden })

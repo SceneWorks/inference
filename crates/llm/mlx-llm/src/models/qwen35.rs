@@ -796,6 +796,16 @@ impl Qwen35Cache {
         }
     }
 
+    /// Drop every DeltaNet layer's pending [`capture_boundary`](Self::capture_boundary) — after a
+    /// forward that failed part-way, whose later layers never consumed it.
+    pub fn clear_boundary_capture(&mut self) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.clear_capture();
+            }
+        }
+    }
+
     /// The cache as it was after its first `len` positions, `len` below its length: the attention
     /// KV's first `len` positions in their own buffers (causal: no later position wrote them) and
     /// the DeltaNet states the last forward captured at `len`

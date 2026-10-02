@@ -1858,6 +1858,7 @@ mod tests {
     /// the two paths interleaved. Written straight to stderr so libtest does not capture it.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "on-demand timing for the epic-end campaign or an explicit request; needs CUDA"]
     fn decode_attention_vs_sdpa_gqa_timing_at_the_qwen38_decode_shape() {
         use std::io::Write as _;
         let device = crate::device::new_cuda_for_test().expect("cuda device");

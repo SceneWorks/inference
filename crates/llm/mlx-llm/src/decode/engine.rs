@@ -366,31 +366,40 @@ impl SpeculativeTarget for Qwen35Model {
         scope: LogitsScope,
         want_hidden: bool,
     ) -> Result<TargetOutput> {
-        Ok(match (scope, want_hidden) {
-            (LogitsScope::Last, false) => TargetOutput {
-                logits: self.decode_logits(ids, cache, rope_offset)?,
-                hidden: None,
-            },
-            (LogitsScope::All, false) => TargetOutput {
-                logits: self.forward(ids, cache, rope_offset)?,
-                hidden: None,
-            },
-            (LogitsScope::Last, true) => {
-                let (hidden, logits) =
-                    self.prefill_hidden_and_last_logits(ids, cache, rope_offset)?;
-                TargetOutput {
-                    logits,
-                    hidden: Some(hidden),
+        // A forward that fails part-way leaves a pending boundary capture (sc-24446) in the
+        // DeltaNet layers it never reached: drop it, so no later forward on this cache captures
+        // a stale boundary.
+        let out = (|| -> Result<TargetOutput> {
+            Ok(match (scope, want_hidden) {
+                (LogitsScope::Last, false) => TargetOutput {
+                    logits: self.decode_logits(ids, cache, rope_offset)?,
+                    hidden: None,
+                },
+                (LogitsScope::All, false) => TargetOutput {
+                    logits: self.forward(ids, cache, rope_offset)?,
+                    hidden: None,
+                },
+                (LogitsScope::Last, true) => {
+                    let (hidden, logits) =
+                        self.prefill_hidden_and_last_logits(ids, cache, rope_offset)?;
+                    TargetOutput {
+                        logits,
+                        hidden: Some(hidden),
+                    }
                 }
-            }
-            (LogitsScope::All, true) => {
-                let (hidden, logits) = self.hidden_and_logits(ids, cache, rope_offset)?;
-                TargetOutput {
-                    logits,
-                    hidden: Some(hidden),
+                (LogitsScope::All, true) => {
+                    let (hidden, logits) = self.hidden_and_logits(ids, cache, rope_offset)?;
+                    TargetOutput {
+                        logits,
+                        hidden: Some(hidden),
+                    }
                 }
-            }
-        })
+            })
+        })();
+        if out.is_err() {
+            cache.clear_boundary_capture();
+        }
+        out
     }
 
     fn attention_label(&self) -> &'static str {
@@ -1576,11 +1585,12 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
         };
         if let Some(end) = end {
             if let Some(ahead) = ahead {
-                stats.discarded += 1; // enqueued, never read back, never emitted
-                                      // An end the loop could not foresee (a stop token, a caller stop, a cancel): the
-                                      // look-ahead is already on the device. Wait for it here so its device time lands
-                                      // in this request rather than in the next request's prefill (sc-24446); it is never
-                                      // read back, and the cache row it wrote is past `committed_cache_len`.
+                // An end the loop could not foresee (a stop token, a caller stop, a cancel): the
+                // look-ahead is already on the device, enqueued but never read back or emitted.
+                // Wait for it here so its device time lands in this request rather than in the
+                // next request's prefill (sc-24446); the cache row it wrote is past
+                // `committed_cache_len`.
+                stats.discarded += 1;
                 drain_token(&ahead)?;
             }
             return Ok(end);

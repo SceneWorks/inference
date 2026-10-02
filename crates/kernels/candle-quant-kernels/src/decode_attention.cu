@@ -545,3 +545,17 @@ extern "C" __global__ void read_slot_u32(const unsigned int* src, const unsigned
                                          unsigned int* out, size_t n, size_t slots) {
     read_slot<unsigned int>(src, index, out, n, slots);
 }
+
+// read_slot_scaled: out [n] <- src [slots, n] row index[0], element e times g[e / inner] (f32).
+// One IEEE multiply per element and nothing to contract it with, so the result is the bits of
+// read_slot followed by a broadcast multiply (a Gated DeltaNet state's first decay, sc-24446).
+// An out-of-range index yields zeros.
+extern "C" __global__ void read_slot_scaled_f32(const float* src, const unsigned int* index,
+                                                const float* g, float* out, size_t n,
+                                                size_t slots, size_t inner) {
+    const size_t at = index[0];
+    for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < n;
+         e += (size_t)gridDim.x * blockDim.x) {
+        out[e] = at < slots ? src[at * n + e] * g[e / inner] : 0.0f;
+    }
+}

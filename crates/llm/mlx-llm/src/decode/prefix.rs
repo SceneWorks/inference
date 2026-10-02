@@ -146,7 +146,6 @@ impl PrefixSnapshot for ContiguousKvCache {
     }
 
     fn capture_boundary(&mut self, _len: usize) {}
-
     fn at_boundary(&self, len: usize) -> Result<Self> {
         self.prefix(len as i32)
     }
@@ -195,7 +194,6 @@ impl PrefixSnapshot for Qwen35Cache {
     fn capture_boundary(&mut self, len: usize) {
         Qwen35Cache::capture_boundary(self, len as i32);
     }
-
     fn at_boundary(&self, len: usize) -> Result<Self> {
         Qwen35Cache::at_boundary(self, len as i32)
     }
@@ -478,13 +476,15 @@ where
         // Cancelled while the forward ran: no snapshot of a prefill the request abandons.
         return Err(Error::Canceled);
     }
-    let snapshot = match split {
-        Some(b) => Some(Boundary {
-            len: b,
-            cache: cache.at_boundary(b)?,
-        }),
-        None => None,
-    };
+    // A boundary the forward could not capture (a layer still recording a checkpoint window
+    // skips it) costs the cache entry, never the request: the prefill and its output stand, and
+    // the boundary is simply not stored.
+    let snapshot = split.and_then(|b| {
+        cache
+            .at_boundary(b)
+            .ok()
+            .map(|cache| Boundary { len: b, cache })
+    });
     Ok(PrefixPrefill {
         cache,
         logits: out.logits,
@@ -904,6 +904,48 @@ mod engine_tests {
         }
     }
 
+    /// sc-24446 (epic E1): on both decoder families, a prefix-cache hit on the boundary entry a
+    /// single-forward miss stored decodes exactly the greedy tokens a plain, cache-free run of the
+    /// same prompt decodes — over conversations shorter than one Gated DeltaNet chunk and past
+    /// it, each continued by two different turns (ids below each fixture's vocabulary `v`). Sensitive to the boundary: a recurrent state
+    /// captured one position off changes the hybrid's greedy stream here.
+    #[test]
+    fn a_hit_after_a_single_forward_miss_decodes_the_plain_run() {
+        fn check<T>(model: &T, family: &str, v: i32)
+        where
+            T: SpeculativeTarget,
+            T::Cache: PrefixSnapshot,
+        {
+            const NEW: usize = 24;
+            for conv_len in [5usize, 8, 13, 21, 34, 55, 70, 90] {
+                let conversation: Vec<i32> = (0..conv_len as i32)
+                    .map(|i| (i * 7 % (v - 4)) + 1)
+                    .collect();
+                let mut pc = PrefixCache::with_budget(1 << 30);
+                let mut p1 = conversation.clone();
+                p1.extend_from_slice(&[v - 2, v - 1]);
+                let (_, reused1) = turn(model, &mut NoProposer, &mut pc, &p1, Some(conv_len), NEW);
+                assert_eq!(reused1, 0, "{family} {conv_len}: a miss");
+                for next in [
+                    [v - 7, v - 6, v - 5, v - 2, v - 1],
+                    [3, 7, v - 3, v - 2, v - 1],
+                ] {
+                    let mut p = conversation.clone();
+                    p.extend_from_slice(&next);
+                    let (run, reused) = turn(model, &mut NoProposer, &mut pc, &p, None, NEW);
+                    assert!(reused >= conv_len, "{family} {conv_len}: a hit ({reused})");
+                    assert_eq!(
+                        run.output.tokens,
+                        cold(model, &mut NoProposer, &p, NEW),
+                        "{family} {conv_len} {next:?}"
+                    );
+                }
+            }
+        }
+        check(&causal(), "causal", 24);
+        check(&qwen35(false), "hybrid", 50);
+    }
+
     #[test]
     fn a_qwen35_second_turn_restores_the_recurrent_state_at_the_boundary() {
         let model = qwen35(false);
@@ -1235,6 +1277,66 @@ mod engine_tests {
         assert_eq!(reused, 0);
         assert_eq!(run.output.tokens, cold(&model, &mut NoProposer, &prompt, 4));
         assert_eq!(pc.len(), 1);
+    }
+
+    /// sc-24446: a forward that fails part-way drops the boundary capture its DeltaNet layers
+    /// never consumed, so a later forward on the same cache captures nothing there.
+    #[test]
+    fn a_failed_forward_leaves_no_stale_boundary_capture() {
+        let model = qwen35(false);
+        let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
+        let fwd = |cache: &mut Qwen35Cache| {
+            SpeculativeTarget::forward(
+                &model,
+                cache,
+                &input_ids(&prompt),
+                0,
+                LogitsScope::Last,
+                false,
+            )
+        };
+        let mut cache = model.new_cache();
+        // A two-token window: the 12-token forward is refused by the first DeltaNet layer.
+        cache.arm_checkpoints(2);
+        cache.capture_boundary(8);
+        assert!(matches!(
+            fwd(&mut cache),
+            Err(Error::CheckpointWindowFull { .. })
+        ));
+        assert_eq!(cache.offset(), 0, "the refused forward wrote nothing");
+        cache.discard_checkpoints();
+        fwd(&mut cache).unwrap();
+        assert!(
+            cache.at_boundary(8).is_err(),
+            "a stale boundary was captured by a later forward"
+        );
+    }
+
+    /// sc-24446: a boundary the forward cannot capture — a DeltaNet layer still recording a
+    /// checkpoint window skips it — costs the prefix-cache entry, never the request: the prefill
+    /// returns its output with no boundary snapshot.
+    #[test]
+    fn an_uncapturable_boundary_skips_the_snapshot_not_the_request() {
+        let model = qwen35(false);
+        let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
+        let mut recording = model.new_cache();
+        recording.arm_checkpoints(64);
+        let pre = prefill_restored(
+            &model,
+            Some(Restored {
+                cache: recording,
+                reused: 0,
+                mtp: None,
+            }),
+            &prompt,
+            Some(8),
+            false,
+            &CancelFlag::new(),
+        )
+        .expect("the request survives an uncapturable boundary");
+        assert!(pre.boundary.is_none());
+        assert_eq!(pre.fed_tokens, prompt.len());
+        assert_eq!(pre.cache.offset(), prompt.len() as i32);
     }
 
     /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward,

@@ -465,6 +465,39 @@ pub fn read_slot(src: &Tensor, index: &Tensor) -> candle_core::Result<Tensor> {
     }
 }
 
+/// [`read_slot`] times a per-row scale in one pass (sc-24446): slot `index[0]` of the `F32`
+/// `src: [slots, ...]`, each element multiplied by `g` — an `F32` tensor whose shape is a leading
+/// prefix of the slot's (`[B, H]` over a `[B, H, Dv, Dk]` state), broadcast over the rest. The
+/// bits of `read_slot(src, index)?.broadcast_mul(g)` (one IEEE multiply per element) without the
+/// intermediate copy: a Gated DeltaNet step's first state decay fused into its checkpoint-ring
+/// read. Errors as [`read_slot`] does, and on a dtype or shape `g` cannot scale.
+pub fn read_slot_scaled(src: &Tensor, index: &Tensor, g: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = src.dims();
+    if src.dtype() != DType::F32 || g.dtype() != DType::F32 || !g.is_contiguous() {
+        return Err(msg(
+            "read_slot_scaled: src and a contiguous g must both be F32".into(),
+        ));
+    }
+    if dims.is_empty() || g.rank() >= dims.len() || g.dims() != &dims[1..=g.rank()] {
+        return Err(msg(format!(
+            "read_slot_scaled: g {:?} is not a leading prefix of the slot {:?}",
+            g.dims(),
+            dims.get(1..).unwrap_or(&[])
+        )));
+    }
+    match src.device() {
+        Device::Cpu => {
+            let slot = read_slot(src, index)?;
+            let mut shape = g.dims().to_vec();
+            shape.resize(slot.rank(), 1);
+            slot.broadcast_mul(&g.reshape(shape)?)
+        }
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => cuda_impl::read_slot_scaled(src, index, g),
+        other => Err(msg(format!("read_slot_scaled: no kernel for {other:?}"))),
+    }
+}
+
 /// Whether these primitives serve `device`: the CPU (the host reference) always; CUDA when the
 /// kernels compile and load there (the reason is the nvrtc seam's cached error); nothing else.
 pub fn available(device: &Device) -> Result<(), String> {
@@ -761,6 +794,55 @@ mod cuda_impl {
             DType::F16 => run!(half::f16, "read_slot_u16"),
             other => Err(msg(format!("read_slot: dtype {other:?} is not served"))),
         }
+    }
+
+    pub(super) fn read_slot_scaled(
+        src: &Tensor,
+        index: &Tensor,
+        g: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        if !src.is_contiguous() {
+            return Err(msg(
+                "read_slot_scaled: src must be a contiguous [slots, ...] tensor".into(),
+            ));
+        }
+        if index.dtype() != DType::U32 || index.elem_count() == 0 {
+            return Err(msg(
+                "read_slot_scaled: the index must be a non-empty U32 tensor".into(),
+            ));
+        }
+        let (ss, sl) = src.storage_and_layout();
+        let (is, il) = index.storage_and_layout();
+        let (gs, gl) = g.storage_and_layout();
+        let (sc, ic, gc) = (cuda_storage(&ss)?, cuda_storage(&is)?, cuda_storage(&gs)?);
+        let dev = sc.device.clone();
+        let dims = src.dims();
+        let n: usize = dims[1..].iter().product();
+        let inner = n / g.elem_count().max(1);
+        let s = sc.as_cuda_slice::<f32>()?.slice(sl.start_offset()..);
+        let index = ic.as_cuda_slice::<u32>()?.slice(il.start_offset()..);
+        let gv = gc.as_cuda_slice::<f32>()?.slice(gl.start_offset()..);
+        let (n64, slots64, inner64) = (n as u64, dims[0] as u64, inner as u64);
+        // SAFETY: the kernel writes every element.
+        let out = unsafe { dev.alloc::<f32>(n) }?;
+        let f = function(&dev, "read_slot_scaled_f32")?;
+        let stream = dev.cuda_stream();
+        let mut b = stream.launch_builder(&f);
+        b.arg(&s)
+            .arg(&index)
+            .arg(&gv)
+            .arg(&out)
+            .arg(&n64)
+            .arg(&slots64)
+            .arg(&inner64);
+        // SAFETY: argument list matches `read_slot_scaled_f32`.
+        unsafe { b.launch(grid(n)) }.map_err(drv)?;
+        Ok(Tensor::from_storage(
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
+            Shape::from(&dims[1..]),
+            BackpropOp::none(),
+            false,
+        ))
     }
 }
 
@@ -1082,6 +1164,33 @@ mod tests {
                 .unwrap()
         );
         assert!(read_slot(&ring, &start(4)).is_err());
+    }
+
+    /// sc-24446: `read_slot_scaled` is `read_slot` then a broadcast multiply by the leading
+    /// `[B, H]` scale, bit for bit, and refuses a scale that is not a leading prefix or not F32.
+    #[test]
+    fn a_scaled_slot_read_is_the_read_times_the_scale() {
+        let ring = ramp(&[3, 2, 4, 5, 6], 31, 1.0);
+        let g = ramp(&[2, 4], 7, 1.0);
+        let at = Tensor::new(&[1u32], &Device::Cpu).unwrap();
+        let got = read_slot_scaled(&ring, &at, &g).unwrap();
+        let want = read_slot(&ring, &at)
+            .unwrap()
+            .broadcast_mul(&g.reshape((2, 4, 1, 1)).unwrap())
+            .unwrap();
+        assert_eq!(got.dims(), &[2, 4, 5, 6]);
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect()
+        };
+        assert_eq!(bits(&got), bits(&want));
+        assert!(read_slot_scaled(&ring, &at, &ramp(&[4, 2], 7, 1.0)).is_err());
+        assert!(read_slot_scaled(&ring, &at, &g.to_dtype(DType::BF16).unwrap()).is_err());
     }
 }
 
@@ -1432,6 +1541,41 @@ mod cuda_tests {
             let ring = ramp(&[3, 5, 7], 21, &dev, dtype);
             let slot = read_slot(&ring, &Tensor::new(&[1u32], &dev).unwrap()).unwrap();
             assert_eq!(host(&slot), host(&ring.get(1).unwrap()));
+        }
+    }
+
+    /// sc-24446: the fused scaled slot read is bit-identical to `read_slot` then the ops path's
+    /// broadcast multiply — the first decay of a Gated DeltaNet step — at a Qwen3.8 state shape
+    /// and an odd one, at every slot.
+    #[test]
+    fn the_scaled_slot_read_is_bit_identical_to_the_ops_path() {
+        let Some(dev) = device() else { return };
+        for (dims, g_dims) in [
+            (vec![4usize, 1, 48, 128, 128], vec![1usize, 48]),
+            (vec![3, 2, 3, 5, 7], vec![2, 3]),
+        ] {
+            let ring = ramp(&dims, 17, &dev, DType::F32);
+            let g = ramp(&g_dims, 5, &dev, DType::F32);
+            let mut shape = g_dims.clone();
+            shape.resize(dims.len() - 1, 1);
+            for slot in 0..dims[0] as u32 {
+                let at = Tensor::new(&[slot], &dev).unwrap();
+                let fused = read_slot_scaled(&ring, &at, &g).unwrap();
+                let ops = read_slot(&ring, &at)
+                    .unwrap()
+                    .broadcast_mul(&g.reshape(shape.clone()).unwrap())
+                    .unwrap();
+                let bits = |t: &Tensor| -> Vec<u32> {
+                    t.flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect()
+                };
+                assert_eq!(bits(&fused), bits(&ops), "{dims:?} slot {slot}");
+            }
         }
     }
 }

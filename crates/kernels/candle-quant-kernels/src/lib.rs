@@ -66,8 +66,8 @@ pub use cublaslt::{
 pub use cublaslt::{CublasLt, DevNvfp4};
 pub use decode_attention::{
     check_decode_attention, decode_attention, decode_attention_reference,
-    decode_attention_workspace_bytes, read_slot, write_rows_at, DecodeAttnPlan, DecodeAttnSpec,
-    DECODE_ATTENTION_SRC, DECODE_ATTN_CHUNK, DECODE_ATTN_MAX_HEAD_DIM,
+    decode_attention_workspace_bytes, read_slot, read_slot_scaled, write_rows_at, DecodeAttnPlan,
+    DecodeAttnSpec, DECODE_ATTENTION_SRC, DECODE_ATTN_CHUNK, DECODE_ATTN_MAX_HEAD_DIM,
 };
 pub use fused_decode::{
     check_rms_norm, check_rms_norm_rope, check_swiglu, FusedError, FusedRefusal, RmsNormPlan,

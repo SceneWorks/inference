@@ -227,6 +227,23 @@ pub fn gated_delta_recurrence_per_token(
     state: Option<&Tensor>,
     sink: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
 ) -> Result<(Tensor, Tensor)> {
+    per_token(q, k, v, g, beta, state, false, sink)
+}
+
+/// [`gated_delta_recurrence_per_token`], from a `state` that already carries the first token's
+/// decay when `first_decayed` — the device-indexed step's fused ring read
+/// ([`candle_quant_kernels::read_slot_scaled`], sc-24446) — so the first step skips its multiply.
+#[allow(clippy::too_many_arguments)]
+fn per_token(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Option<&Tensor>,
+    first_decayed: bool,
+    sink: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
+) -> Result<(Tensor, Tensor)> {
     let (b, t, hk, dk) = q.dims4()?;
     let (_, _, hv, dv) = v.dims4()?;
 
@@ -250,7 +267,8 @@ pub fn gated_delta_recurrence_per_token(
         let vt = v.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?; // [B,Hv,Dv]
         let gt = g.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?; // [B,Hv]
         let bt = beta.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?; // [B,Hv]
-        let (y, next) = delta_step(&qt, &kt, &vt, &gt, &bt, &state, b, hv, dk, dv)?;
+        let decay = !(first_decayed && ti == 0);
+        let (y, next) = delta_step(&qt, &kt, &vt, &gt, &bt, &state, decay, b, hv, dk, dv)?;
         #[cfg(test)]
         counters::PER_TOKEN_STEPS.with(|c| c.set(c.get() + 1));
         sink(ti, &next)?;
@@ -1004,19 +1022,52 @@ impl DeltaNetCache {
                     }
                 };
                 // Device-indexed: the live state is a copy of the slot the device index names
-                // (the slot `ssm_state` is a view of), taken before any write.
+                // (the slot `ssm_state` is a view of), taken before any write. On the per-token
+                // recurrence an F32 state takes the first token's decay in the same pass
+                // (`read_slot_scaled`: the bits of the read then the step's multiply, sc-24446).
+                let per_token_step = first_write.min(t) < CHUNKED_PREFILL_MIN_TOKENS;
+                let scaled = per_token_step
+                    && ring.ssm.dtype() == candle_core::DType::F32
+                    && g.dtype() == candle_core::DType::F32;
                 let live = match positions {
+                    Some(p) if offset > 0 && scaled => {
+                        Some(candle_quant_kernels::read_slot_scaled(
+                            &ring.ssm,
+                            &p.ring_read()?,
+                            &g.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?,
+                        )?)
+                    }
                     Some(p) if offset > 0 => {
                         Some(candle_quant_kernels::read_slot(&ring.ssm, &p.ring_read()?)?)
                     }
                     _ => None,
                 };
-                let state = match positions {
-                    Some(_) => live.as_ref(),
-                    None => self.ssm_state.as_ref(),
-                };
-                gated_delta_recurrence_with_sink(q, k, v, g, beta, state, first_write, &mut sink)
-                    .and_then(|(y, _)| Ok((y, ring.views(next)?)))
+                match positions {
+                    Some(_) if live.is_some() && scaled => {
+                        per_token(q, k, v, g, beta, live.as_ref(), true, &mut sink)
+                    }
+                    Some(_) => gated_delta_recurrence_with_sink(
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        live.as_ref(),
+                        first_write,
+                        &mut sink,
+                    ),
+                    None => gated_delta_recurrence_with_sink(
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        self.ssm_state.as_ref(),
+                        first_write,
+                        &mut sink,
+                    ),
+                }
+                .and_then(|(y, _)| Ok((y, ring.views(next)?)))
             }
             None => gated_delta_recurrence(q, k, v, g, beta, self.ssm_state.as_ref()).and_then(
                 |(y, final_state)| Ok((y, (conv.tail_after(t - 1)?.contiguous()?, final_state))),
@@ -1048,6 +1099,12 @@ impl DeltaNetCache {
     /// back with [`captured`](Self::captured).
     pub fn capture_at(&mut self, position: i32) {
         self.capture = Some(position);
+    }
+
+    /// Drop a pending [`capture_at`](Self::capture_at) the last forward did not consume (it
+    /// failed before reaching this layer): a later prefill must never capture a stale boundary.
+    pub fn clear_capture(&mut self) {
+        self.capture = None;
     }
 
     /// The `(conv tail, SSM state)` the last prefill captured at `position`
@@ -1349,13 +1406,18 @@ fn delta_step(
     g: &Tensor,
     beta: &Tensor,
     state: &Tensor,
+    decay: bool,
     b: usize,
     hv: usize,
     dk: usize,
     dv: usize,
 ) -> Result<(Tensor, Tensor)> {
-    let decay = g.reshape((b, hv, 1, 1))?; // [B,Hv,1,1]
-    let state = state.broadcast_mul(&decay)?; // S · g
+    // S · g — unless the caller's state already carries this step's decay.
+    let state = if decay {
+        state.broadcast_mul(&g.reshape((b, hv, 1, 1))?)? // [B,Hv,1,1]
+    } else {
+        state.clone()
+    };
     let k_r = k.reshape((b, hv, 1, dk))?; // [B,Hv,1,Dk]
     let kv_mem = state_read(&state, k, &k_r, b, hv, dk)?; // S·k → [B,Hv,Dv]
     let delta = v

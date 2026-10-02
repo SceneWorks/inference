@@ -1125,6 +1125,12 @@ impl DeltaNetCache {
         self.capture = Some(position);
     }
 
+    /// Drop a pending [`capture_at`](Self::capture_at) the last forward did not consume (it
+    /// failed before reaching this layer): a later forward must never capture a stale boundary.
+    pub fn clear_capture(&mut self) {
+        self.capture = None;
+    }
+
     /// This layer as it was after `position`, from the state the last forward captured there
     /// ([`capture_at`](Self::capture_at)) — no checkpoint window, no pending capture — or `None`
     /// when it captured none there.
