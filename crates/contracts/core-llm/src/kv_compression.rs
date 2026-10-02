@@ -98,23 +98,28 @@ pub struct KvQualification {
     pub family: KvModelFamily,
     /// The compressed representation it qualified with.
     pub format: KvCompressionFormat,
-    /// Smallest context (tokens prefilled before decode starts) that runs compressed. Shorter
+    /// Smallest prompt (tokens prefilled before decode starts) that runs compressed. Shorter
     /// contexts decode slower compressed than dense, so they stay dense.
     pub min_context_tokens: u64,
-    /// Exclusive upper bound of the qualified context, `None` when the evidence covers the model's
-    /// own context window.
+    /// Exclusive upper bound of the request's final context — prompt plus every token it may
+    /// generate — so a compressed decode never grows past the evidenced range. `None` only when
+    /// the evidence covers every context the family can reach.
     pub max_context_tokens: Option<u64>,
     /// Where the qualification comes from.
     pub evidence: &'static str,
 }
 
 impl KvQualification {
-    /// Whether `context_tokens` lies in this row's qualified range.
-    pub fn admits(&self, context_tokens: u64) -> bool {
-        context_tokens >= self.min_context_tokens
-            && self
-                .max_context_tokens
-                .is_none_or(|max| context_tokens < max)
+    /// Whether a request prefilling `prompt_tokens` and decoding up to `max_new_tokens` more lies
+    /// in this row's qualified range: its prompt at or above the minimum and its final context
+    /// below the maximum.
+    pub fn admits(&self, prompt_tokens: u64, max_new_tokens: u64) -> bool {
+        prompt_tokens >= self.min_context_tokens
+            && self.max_context_tokens.is_none_or(|max| {
+                prompt_tokens
+                    .checked_add(max_new_tokens)
+                    .is_some_and(|final_tokens| final_tokens < max)
+            })
     }
 }
 
@@ -122,11 +127,14 @@ impl KvQualification {
 ///
 /// Thresholds are the SC-20671 campaign coordinates the evidence was measured at
 /// (`context_band_target` in `mlx-llm`'s campaign): memory-material is a quarter of the evidence
-/// model's native window and fit-boundary is `max(window − 512, ⌈0.9 · window⌉)`. Qwen3-1.7B
-/// (40 960-token window) qualified at both coordinates, so it runs compressed from its
-/// memory-material coordinate (10 240) up. Llama-3.2-3B (131 072-token window) qualified at
-/// memory-material (32 768); its fit-boundary coordinate (130 560) awaits a dense multi-turn
-/// noise-floor run, so contexts from there up stay dense until that row is flipped to `None`.
+/// model's native window and fit-boundary is `max(window − 512, ⌈0.9 · window⌉)`. The minimum
+/// bounds the prompt; the maximum bounds the final context (prompt + generated tokens).
+/// Qwen3-1.7B (40 960-token window) qualified at both coordinates, so it runs compressed from its
+/// memory-material coordinate (10 240) to its evidenced window (final context ≤ 40 960): a Qwen3
+/// checkpoint with a longer window (Qwen3-2507, YaRN) stays dense beyond it. Llama-3.2-3B
+/// (131 072-token window) qualified at memory-material (32 768); its fit-boundary coordinate
+/// (130 560) awaits a dense multi-turn noise-floor run, so final contexts from there up stay
+/// dense until that row's maximum is raised.
 pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
     KvQualification {
         family: KvModelFamily::Llama,
@@ -141,10 +149,10 @@ pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
         family: KvModelFamily::Qwen3,
         format: KvCompressionFormat::GroupAffineK8V8,
         min_context_tokens: 10_240,
-        max_context_tokens: None,
+        max_context_tokens: Some(40_961),
         evidence: "sc-20669 A2 run 37004025116 + dense noise floor 37035827730: \
                    Qwen3-1.7B-4bit memory-material (10240) and fit-boundary (40448) pass at \
-                   group-affine-8",
+                   group-affine-8 within its 40960-token window",
     },
 ];
 
@@ -161,10 +169,10 @@ pub enum KvCacheFallbackReason {
     /// More than one sequence decodes together: batched prefill attends through additive padding
     /// masks, which the fused compressed reader cannot apply.
     BatchedDecode,
-    /// The context is below the family's qualified minimum (short contexts decode slower
+    /// The prompt is below the family's qualified minimum (short contexts decode slower
     /// compressed than dense).
     BelowMinimumContext,
-    /// The context is at or above the family's qualified range.
+    /// The final context (prompt + maximum new tokens) reaches past the family's qualified range.
     AboveQualifiedContext,
     /// The model's attention geometry is outside what the fused reader implements (head
     /// dimension, attention-score soft-cap, shared K/V layers).
@@ -209,13 +217,16 @@ impl KvCacheFallbackReason {
 
 /// Decide one request against [`KV_COMPRESSION_QUALIFICATIONS`]: the qualifying row, or why the
 /// request stays dense. `family` is `None` for a model the backend cannot name as a table family;
-/// `context_tokens` is the number of tokens prefilled before decoding starts; `batch` the number
-/// of sequences decoding together. The checks run in a fixed order — policy, batch, family,
-/// context — so the reported reason is deterministic.
+/// `context_tokens` is the number of tokens prefilled before decoding starts; `max_new_tokens`
+/// the most tokens the request may generate after them (the final context is their sum);
+/// `batch` the number of sequences decoding together. The checks run in a fixed order — policy,
+/// batch, family, prompt minimum, final-context maximum — so the reported reason is
+/// deterministic.
 pub fn qualify_kv_compression(
     policy: KvCompressionPolicy,
     family: Option<KvModelFamily>,
     context_tokens: u64,
+    max_new_tokens: u64,
     batch: u64,
 ) -> Result<&'static KvQualification, KvCacheFallbackReason> {
     qualify_against(
@@ -223,6 +234,7 @@ pub fn qualify_kv_compression(
         policy,
         family,
         context_tokens,
+        max_new_tokens,
         batch,
     )
 }
@@ -232,6 +244,7 @@ fn qualify_against(
     policy: KvCompressionPolicy,
     family: Option<KvModelFamily>,
     context_tokens: u64,
+    max_new_tokens: u64,
     batch: u64,
 ) -> Result<&'static KvQualification, KvCacheFallbackReason> {
     if policy == KvCompressionPolicy::Off {
@@ -247,7 +260,10 @@ fn qualify_against(
     if rows.is_empty() {
         return Err(KvCacheFallbackReason::UnqualifiedModel);
     }
-    if let Some(row) = rows.iter().find(|row| row.admits(context_tokens)) {
+    if let Some(row) = rows
+        .iter()
+        .find(|row| row.admits(context_tokens, max_new_tokens))
+    {
         return Ok(row);
     }
     if rows
@@ -319,7 +335,7 @@ mod tests {
         assert_eq!(KvCompressionPolicy::default(), KvCompressionPolicy::Off);
         for family in [None, Some(KvModelFamily::Llama), Some(KvModelFamily::Qwen3)] {
             assert_eq!(
-                qualify_kv_compression(KvCompressionPolicy::Off, family, 50_000, 1),
+                qualify_kv_compression(KvCompressionPolicy::Off, family, 20_000, 0, 1),
                 Err(KvCacheFallbackReason::PolicyDisabled)
             );
         }
@@ -346,17 +362,26 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_runs_compressed_from_its_memory_material_coordinate_up() {
+    fn qwen3_runs_compressed_from_memory_material_within_its_evidenced_window() {
         let qwen = Some(KvModelFamily::Qwen3);
         assert_eq!(
-            qualify_kv_compression(ON, qwen, 10_239, 1),
+            qualify_kv_compression(ON, qwen, 10_239, 64, 1),
             Err(KvCacheFallbackReason::BelowMinimumContext)
         );
-        for context in [10_240, 40_448, 1 << 40] {
-            let row = qualify_kv_compression(ON, qwen, context, 1).unwrap();
+        // Prompt at memory-material and at fit-boundary, final context up to the 40 960 window.
+        for (prompt, new) in [(10_240, 0), (10_240, 30_720), (40_448, 512)] {
+            let row = qualify_kv_compression(ON, qwen, prompt, new, 1).unwrap();
             assert_eq!(
                 (row.family, row.format),
                 (KvModelFamily::Qwen3, KvCompressionFormat::GroupAffineK8V8)
+            );
+        }
+        // A longer-window Qwen3 (2507, YaRN) has no evidence past 40 960 tokens.
+        for (prompt, new) in [(40_961, 0), (40_448, 513), (200_000, 0)] {
+            assert_eq!(
+                qualify_kv_compression(ON, qwen, prompt, new, 1),
+                Err(KvCacheFallbackReason::AboveQualifiedContext),
+                "{prompt} + {new}"
             );
         }
     }
@@ -365,34 +390,45 @@ mod tests {
     fn llama_runs_compressed_from_memory_material_up_to_its_pending_fit_boundary() {
         let llama = Some(KvModelFamily::Llama);
         assert_eq!(
-            qualify_kv_compression(ON, llama, 32_767, 1),
+            qualify_kv_compression(ON, llama, 32_767, 0, 1),
             Err(KvCacheFallbackReason::BelowMinimumContext)
         );
-        assert!(qualify_kv_compression(ON, llama, 32_768, 1).is_ok());
-        assert!(qualify_kv_compression(ON, llama, 130_559, 1).is_ok());
+        assert!(qualify_kv_compression(ON, llama, 32_768, 512, 1).is_ok());
+        assert!(qualify_kv_compression(ON, llama, 130_559, 0, 1).is_ok());
         assert_eq!(
-            qualify_kv_compression(ON, llama, 130_560, 1),
+            qualify_kv_compression(ON, llama, 130_560, 0, 1),
             Err(KvCacheFallbackReason::AboveQualifiedContext)
+        );
+        // A prompt admitted below the bound whose decode would grow into the unevidenced
+        // fit-boundary band stays dense from the start.
+        assert_eq!(
+            qualify_kv_compression(ON, llama, 130_000, 1_000, 1),
+            Err(KvCacheFallbackReason::AboveQualifiedContext)
+        );
+        assert_eq!(
+            qualify_kv_compression(ON, llama, 32_768, u64::MAX, 1),
+            Err(KvCacheFallbackReason::AboveQualifiedContext),
+            "an overflowing final context is never admitted"
         );
     }
 
     #[test]
     fn batch_and_unknown_families_stay_dense_in_a_fixed_order() {
         assert_eq!(
-            qualify_kv_compression(ON, Some(KvModelFamily::Qwen3), 20_000, 2),
+            qualify_kv_compression(ON, Some(KvModelFamily::Qwen3), 20_000, 0, 2),
             Err(KvCacheFallbackReason::BatchedDecode)
         );
         // Batch is decided before the family, so a batched unknown model reports the batch.
         assert_eq!(
-            qualify_kv_compression(ON, None, 20_000, 4),
+            qualify_kv_compression(ON, None, 20_000, 0, 4),
             Err(KvCacheFallbackReason::BatchedDecode)
         );
         assert_eq!(
-            qualify_kv_compression(ON, None, 20_000, 1),
+            qualify_kv_compression(ON, None, 20_000, 0, 1),
             Err(KvCacheFallbackReason::UnqualifiedModel)
         );
         assert_eq!(
-            qualify_kv_compression(ON, Some(KvModelFamily::Llama), 20_000, 0),
+            qualify_kv_compression(ON, Some(KvModelFamily::Llama), 40_000, 0, 0),
             Err(KvCacheFallbackReason::BatchedDecode)
         );
     }
@@ -407,10 +443,10 @@ mod tests {
             evidence: "test",
         }];
         assert_eq!(
-            qualify_against(ONLY_QWEN, ON, Some(KvModelFamily::Llama), 50_000, 1),
+            qualify_against(ONLY_QWEN, ON, Some(KvModelFamily::Llama), 50_000, 0, 1),
             Err(KvCacheFallbackReason::UnqualifiedModel)
         );
-        assert!(qualify_against(ONLY_QWEN, ON, Some(KvModelFamily::Qwen3), 1, 1).is_ok());
+        assert!(qualify_against(ONLY_QWEN, ON, Some(KvModelFamily::Qwen3), 1, 1 << 40, 1).is_ok());
     }
 
     #[test]
