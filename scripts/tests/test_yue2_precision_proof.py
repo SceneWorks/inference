@@ -109,17 +109,30 @@ class PrecisionControlTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                     IDLE.verify_artifact(Path(directory))
 
-    def test_reviewed_runner_binding_refuses_other_listener(self):
+    def test_saved_runner_is_pinned_and_fresh_runner_matches_an_eligible_listener(self):
         self.assertEqual(IDLE.BASELINE_RUNNER, "cuda-windows-2")
-        manifest = {"completed": True, "targetPid": 38212, "engineSha": IDLE.ENGINE_SHA,
-                    "controlSha": IDLE.BASELINE_CONTROL_SHA, "runner": "cuda-windows"}
-        with patch.object(IDLE, "read_json", return_value=manifest), \
+        source = {"completed": True, "targetPid": 38212, "engineSha": IDLE.ENGINE_SHA,
+                  "controlSha": IDLE.BASELINE_CONTROL_SHA}
+        with patch.object(IDLE, "read_json", return_value={**source, "runner": "cuda-windows"}), \
              self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
             IDLE.summarize(Path("unused"), baseline=True, pid=38212,
                            engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
-        manifest["runner"] = IDLE.BASELINE_RUNNER
+        # Reaching the catalog proves the fresh manifest passed runner provenance;
+        # full fresh evidence still requires the separate 29-file device checks.
+        for runner in ("cuda-windows", "cuda-windows-2"):
+            with self.subTest(runner=runner), patch.dict("os.environ", {"RUNNER_NAME": runner}), \
+                 patch.object(IDLE, "read_json", side_effect=[{**source, "runner": runner},
+                                                            RuntimeError("catalog reached")]), \
+                 self.assertRaisesRegex(RuntimeError, "catalog reached"):
+                IDLE.summarize(Path("unused"), baseline=False, pid=38212,
+                               engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
         with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows"}), \
-             patch.object(IDLE, "read_json", return_value=manifest), \
+             patch.object(IDLE, "read_json", return_value={**source, "runner": "cuda-windows-2"}), \
+             self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
+            IDLE.summarize(Path("unused"), baseline=False, pid=38212,
+                           engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
+        with patch.dict("os.environ", {"RUNNER_NAME": "unknown-listener"}), \
+             patch.object(IDLE, "read_json", return_value={**source, "runner": "unknown-listener"}), \
              self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
             IDLE.summarize(Path("unused"), baseline=False, pid=38212,
                            engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)

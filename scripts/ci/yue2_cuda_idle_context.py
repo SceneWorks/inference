@@ -165,7 +165,7 @@ def summarize(directory: Path, *, baseline: bool, pid: int, engine_sha: str, con
     expected_runner = BASELINE_RUNNER if baseline else os.environ.get("RUNNER_NAME")
     require(manifest.get("completed") is True and manifest.get("targetPid") == pid and
             manifest.get("engineSha") == engine_sha and manifest.get("controlSha") == control_sha and
-            expected_runner == BASELINE_RUNNER and
+            expected_runner in ("cuda-windows", "cuda-windows-2") and
             manifest.get("runner") == expected_runner, "diagnostic manifest/source/runner mismatch")
     catalog = read_json(directory, "windows-counter-catalog")
     listed = {item.get("name"): item for item in catalog.get("sets", [])}
