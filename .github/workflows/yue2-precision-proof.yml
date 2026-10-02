@@ -52,6 +52,9 @@ jobs:
   cuda_diagnostic:
     if: inputs.stage == 'cuda-diagnostic'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: "0"
     timeout-minutes: 10
     defaults:
       run:
