@@ -2282,8 +2282,17 @@ pub struct PagedCacheIdentity {
 
 impl PagedCacheIdentity {
     /// The first field in which `self` differs from `expected`, named, or `None` when they are
-    /// identical.
+    /// identical. An identity with an empty model name or fingerprint matches nothing, itself
+    /// included: K/V of an unnamed model are never shared or restored.
     pub fn mismatch(&self, expected: &Self) -> Option<String> {
+        if [self, expected]
+            .iter()
+            .any(|identity| identity.model.is_empty() || identity.model_fingerprint.is_empty())
+        {
+            return Some(
+                "no model identity: an empty model name or fingerprint is never shared".into(),
+            );
+        }
         let fields: [(&str, String, String); 11] = [
             ("model", self.model.clone(), expected.model.clone()),
             (
@@ -4097,6 +4106,18 @@ pub(crate) mod tests {
             &PagedModelKey::new("model-a", "another decoder"),
             "model fingerprint",
         );
+        // An empty identity matches nothing, not even the same empty identity.
+        for unnamed in [key(""), PagedModelKey::new("model-a", "")] {
+            let mut anonymous = snapshot.clone();
+            anonymous.identity = fresh.borrow().identity(&unnamed);
+            refused(
+                &anonymous,
+                fresh.clone(),
+                handle.clone(),
+                &unnamed,
+                "no model identity",
+            );
+        }
         let mut format = snapshot.clone();
         format.identity.format_version += 1;
         refused(
@@ -4199,6 +4220,9 @@ pub(crate) mod tests {
         for (name, defect) in defects {
             let mut crafted = snapshot.clone();
             defect(&mut crafted);
+            // The digest is not a secret: a crafted header re-serialized with a matching digest
+            // reads back, so restore itself must refuse it (a typed error, never a panic).
+            let crafted = PagedCacheSnapshot::from_bytes(&crafted.to_bytes().unwrap()).unwrap();
             let target = pool(1, 64, 32);
             let result = PagedPackedKvCache::restore(
                 &crafted,
@@ -4324,6 +4348,42 @@ pub(crate) mod tests {
                 assert!(cache.pending.is_none());
             }
         }
+    }
+
+    /// Bounded growth (sc-20681): a sequence that grows its pool page by page, with no
+    /// reservation, never leaves the pool holding more than its live pages plus one growth chunk,
+    /// and once the pool is past its first few chunks the bytes it holds stay at or under 0.60 of
+    /// the dense bf16 K/V of the same positions (doubling would hold up to twice the live pages).
+    #[test]
+    fn unreserved_growth_stays_within_one_chunk_of_the_live_pages() {
+        let dims = (2, 1, 64);
+        let dtype = Dtype::Float32;
+        let shared = pool(1, 64, 32);
+        let mut cache = PagedPackedKvCache::with_pool(shared.clone(), k8v8_reader()).unwrap();
+        // Dense bf16 K/V per position: LAYERS × K and V × 1 KV head × 64 dims × 2 bytes.
+        let dense_per_position = (LAYERS * 2 * 64 * 2) as u64;
+        let mut ratio_checks = 0;
+        for step in 0..260u64 {
+            attend_step(&mut cache, step, 32, dims, dtype);
+            let pool = shared.borrow();
+            let (capacity, live) = (pool.capacity_pages(), pool.live_pages());
+            assert!(
+                capacity <= live + pool.growth_chunk(),
+                "step {step}: {capacity} pages held for {live} live"
+            );
+            if live >= 128 {
+                let storage = pool.storage();
+                let held = (storage.code_bytes + storage.metadata_bytes) as f64;
+                let dense = (cache.offset() as u64 * dense_per_position) as f64;
+                assert!(
+                    held / dense <= 0.60,
+                    "step {step}: pool holds {:.3} of dense bf16",
+                    held / dense
+                );
+                ratio_checks += 1;
+            }
+        }
+        assert!(ratio_checks > 100);
     }
 
     /// Lowest-id-first allocation and trim: after the first and last of three sequences go, a

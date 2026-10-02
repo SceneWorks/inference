@@ -652,52 +652,70 @@ mod compressed_tests {
         assert_eq!(drafted.tokens.len(), reference.tokens.len());
     }
 
-    /// The contiguous compressed cache cannot roll back speculation exactly (it re-stages a cut
-    /// group from its codes), so arming speculation on it moves its history to the explicit dense
-    /// fallback: the run completes position-exact and its report names a runtime fallback for
-    /// speculation instead of claiming a compressed run.
+    /// Prompt-lookup speculation on the contiguous compressed cache (sc-20681): it stays compressed
+    /// (each rejection an exact windowed rollback, `packed_group_affine_kv`'s
+    /// `speculative_rollback_on_the_contiguous_cache_is_exact_and_stays_compressed`), with no
+    /// drafts it is the plain compressed decode token for token, with drafts it accepts and
+    /// rejects, and it ends holding exactly the prompt and every committed token but the last.
     #[test]
-    fn speculation_on_the_contiguous_compressed_cache_falls_back_to_dense_and_says_so() {
+    fn prompt_lookup_speculation_runs_on_the_contiguous_compressed_cache() {
         let model = crate::provider::tests::tiny_causal_model(4, 2, 64);
         let reader = crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap();
-        let (mut cache, refused) =
-            crate::kv_policy::select_compressed_cache(&model, reader, prompt().len());
-        assert_eq!(refused, None, "the request starts on the compressed cache");
-        let (output, _) = generate_prompt_lookup_on(
+        let compressed = || {
+            let (cache, refused) =
+                crate::kv_policy::select_compressed_cache(&model, reader.clone(), prompt().len());
+            assert_eq!(refused, None, "the request starts on the compressed cache");
+            cache
+        };
+        let mut plain = compressed();
+        let reference = generate_with_cache(
             &model,
-            cache.as_mut(),
             &prompt(),
+            plain.as_mut(),
             &config(),
-            &SpeculativeConfig {
-                max_ngram: 3,
-                num_draft: 4,
-            },
             &CancelFlag::new(),
             &mut |_| {},
         )
         .unwrap();
-        assert_eq!(
-            cache.offset() as usize,
-            prompt().len() + output.tokens.len() - 1
-        );
-        let report = crate::kv_policy::compressed_report(
-            core_llm::KvCompressionFormat::GroupAffineK8V8,
-            None,
-            cache.as_ref(),
-        )
-        .unwrap();
-        assert_eq!(
-            report.fallback,
-            Some(core_llm::KvCacheFallbackReason::RuntimeFallback),
-            "{report:?}"
-        );
+        let speculate = |num_draft: usize| {
+            let mut cache = compressed();
+            let (output, stats) = generate_prompt_lookup_on(
+                &model,
+                cache.as_mut(),
+                &prompt(),
+                &config(),
+                &SpeculativeConfig {
+                    max_ngram: 3,
+                    num_draft,
+                },
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                cache.offset() as usize,
+                prompt().len() + output.tokens.len() - 1,
+                "the cache holds the prompt and every fed token"
+            );
+            let report = crate::kv_policy::compressed_report(
+                core_llm::KvCompressionFormat::GroupAffineK8V8,
+                None,
+                cache.as_ref(),
+            )
+            .unwrap();
+            assert!(report.ran_compressed(), "{report:?}");
+            assert_eq!(report.fallback, None, "{report:?}");
+            (output, stats)
+        };
+        let (zero, _) = speculate(0);
+        assert_eq!(zero.tokens, reference.tokens, "no drafts: the plain decode");
+        let (drafted, stats) = speculate(4);
+        assert!(stats.accepted > 0, "{stats:?}");
         assert!(
-            report
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("speculation")),
-            "{report:?}"
+            stats.accepted < stats.proposed,
+            "some drafts were rolled back: {stats:?}"
         );
+        assert_eq!(drafted.tokens.len(), reference.tokens.len());
     }
 
     /// Records whether every rollback truncation lands inside an armed speculation window.

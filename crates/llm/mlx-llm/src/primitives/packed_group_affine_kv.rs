@@ -571,6 +571,65 @@ pub struct DenseFallbackPackedDecoderCache {
     packed_layer_dtypes: Vec<Option<(mlx_rs::Dtype, mlx_rs::Dtype)>>,
     dense_active: bool,
     reason: String,
+    /// The armed speculation window (see [`KvCache::begin_speculation`]); consumed by the next
+    /// truncate.
+    speculation: Option<ContiguousSpeculation>,
+}
+
+/// Exact speculative rollback on the contiguous compressed cache (sc-20681): armed at `base`, it
+/// keeps each layer's unquantized rows from its group-aligned quantized extent at arming to the
+/// logical end, so a truncate back to `len >= base` rebuilds the residual from those rows instead
+/// of re-staging a cut group from its codes. Every group completed below `len` keeps its codes:
+/// they were quantized from exactly these rows, as appending only the kept rows would have.
+#[derive(Clone, Debug)]
+struct ContiguousSpeculation {
+    base: usize,
+    layers: Vec<SpeculationRows>,
+}
+
+/// One layer's speculation window: the unquantized rows `start..start + rows`.
+#[derive(Clone, Debug, Default)]
+struct SpeculationRows {
+    start: usize,
+    rows: usize,
+    /// `[B, H, rows, D]` keys and values; `None` while `rows == 0`.
+    kv: Option<(Array, Array)>,
+}
+
+impl SpeculationRows {
+    fn extend(&mut self, keys: &Array, values: &Array) -> Result<()> {
+        let step = usize::try_from(keys.shape()[2])
+            .map_err(|_| Error::Config("negative speculation step".into()))?;
+        self.kv = Some(match self.kv.take() {
+            None => (keys.clone(), values.clone()),
+            Some((k, v)) => (
+                concatenate_axis(&[&k, keys], 2)?,
+                concatenate_axis(&[&v, values], 2)?,
+            ),
+        });
+        self.rows += step;
+        Ok(())
+    }
+
+    /// Drop the rows past logical position `len` (a rolled-back step's).
+    fn cut_to(&mut self, len: usize) -> Result<()> {
+        let rows = len.saturating_sub(self.start).min(self.rows);
+        if rows == self.rows {
+            return Ok(());
+        }
+        self.kv = match self.kv.take() {
+            Some((k, v)) if rows > 0 => Some((live_rows(&k, rows)?, live_rows(&v, rows)?)),
+            _ => None,
+        };
+        self.rows = rows;
+        Ok(())
+    }
+
+    fn bytes(&self) -> u64 {
+        self.kv
+            .as_ref()
+            .map_or(0, |(k, v)| array_bytes(k).saturating_add(array_bytes(v)))
+    }
 }
 
 impl DenseFallbackPackedDecoderCache {
@@ -657,6 +716,11 @@ impl DenseFallbackPackedDecoderCache {
         if pending.original_len == 0 {
             self.packed_layer_dtypes.fill(None);
         }
+        if let Some(speculation) = self.speculation.as_mut() {
+            for window in &mut speculation.layers {
+                window.cut_to(pending.original_len)?;
+            }
+        }
         Ok(true)
     }
 
@@ -709,6 +773,7 @@ impl DenseFallbackPackedDecoderCache {
         self.staged.dense_read_fallback(operation, reason.clone());
         self.dense = dense;
         self.pending_step = None;
+        self.speculation = None;
         self.staged.handle = None;
         self.staged.clear();
         self.dense_active = true;
@@ -985,6 +1050,13 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 });
             }
             let (written, replaced) = self.staged.append_device_replacing(layer, keys, values)?;
+            if let Some(window) = self
+                .speculation
+                .as_mut()
+                .and_then(|speculation| speculation.layers.get_mut(layer))
+            {
+                window.extend(keys, values)?;
+            }
             if let Some(pending) = self.pending_step.as_mut() {
                 pending.written_bytes = pending.written_bytes.saturating_add(written);
                 if let Some(Some(mark)) = pending.marks.get_mut(layer) {
@@ -1124,7 +1196,16 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         let mut written = 0u64;
         for (layer, (keys, values)) in layers.iter().enumerate() {
             match self.staged.append_device(layer, keys, values) {
-                Ok(bytes) => written = written.saturating_add(bytes),
+                Ok(bytes) => {
+                    written = written.saturating_add(bytes);
+                    if let Some(window) = self
+                        .speculation
+                        .as_mut()
+                        .and_then(|speculation| speculation.layers.get_mut(layer))
+                    {
+                        window.extend(keys, values)?;
+                    }
+                }
                 Err(error) => {
                     self.staged.clear();
                     self.packed_layer_dtypes.fill(None);
@@ -1154,16 +1235,34 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         self.transition_to_dense(operation, reason)
     }
 
-    /// The contiguous compressed cache trims a cut group by re-staging it from its codes, which
-    /// is not the unquantized rows a speculative rollback must restore (sc-20681). Speculation on
-    /// it therefore moves the history to the explicit dense fallback first — recorded, so the
-    /// generation reports a runtime fallback — and its rollbacks are then exact dense truncations.
+    /// Arm exact speculative rollback (sc-20681): keep every layer's unquantized rows from its
+    /// group-aligned quantized extent on, so the next truncate back to at least this position
+    /// restores the residual from them (see [`ContiguousSpeculation`]). The history stays
+    /// compressed. Only a host-staged (CPU reference) store, which keeps no device residual to
+    /// window, moves to the recorded dense fallback.
     fn begin_speculation(&mut self) -> Result<()> {
-        self.transition_to_dense(
-            "speculation",
-            "speculative rollback must restore unquantized rows; the contiguous compressed cache \
-             re-stages a cut group from its codes",
-        )
+        if self.dense_active {
+            return self.dense.begin_speculation();
+        }
+        if self.pending_step.is_some() {
+            return Err(Error::Config(
+                "packed speculation armed inside an open step".into(),
+            ));
+        }
+        match self.staged.speculation_rows()? {
+            Some(layers) => {
+                self.speculation = Some(ContiguousSpeculation {
+                    base: self.staged.logical_len(),
+                    layers,
+                });
+                Ok(())
+            }
+            None => self.transition_to_dense(
+                "speculation",
+                "a host-staged packed store keeps no unquantized residual for an exact \
+                 speculative rollback",
+            ),
+        }
     }
 
     fn packed_evidence(&self) -> Option<PackedCacheEvidence> {
@@ -1190,6 +1289,14 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 .checked_add(metadata)
                 .ok_or_else(|| Error::Msg("packed device metadata bytes overflow".into()))?;
         }
+        // An armed speculation window's unquantized rows are resident too.
+        device_metadata_bytes = device_metadata_bytes.saturating_add(
+            self.speculation
+                .iter()
+                .flat_map(|speculation| &speculation.layers)
+                .map(SpeculationRows::bytes)
+                .sum::<u64>(),
+        );
         let element_bytes = match self.packed_layer_dtypes.iter().flatten().next() {
             Some((mlx_rs::Dtype::Float32, _)) => 4,
             Some((mlx_rs::Dtype::Float16 | mlx_rs::Dtype::Bfloat16, _)) => 2,
@@ -1243,6 +1350,7 @@ impl KvCache for DenseFallbackPackedDecoderCache {
 
     fn truncate(&mut self, len: i32) -> Result<()> {
         if self.dense_active {
+            self.speculation = None;
             return self.dense.truncate(len);
         }
         if self.pending_step.is_some() {
@@ -1251,7 +1359,12 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         let len = usize::try_from(len).map_err(|_| {
             Error::Config("packed cache truncate length must not be negative".into())
         })?;
-        self.staged.trim(len)?;
+        match self.speculation.take() {
+            Some(speculation) if len >= speculation.base && len < self.staged.logical_len() => self
+                .staged
+                .trim_into_speculation(len, &speculation.layers)?,
+            _ => self.staged.trim(len)?,
+        }
         if len == 0 {
             self.packed_layer_dtypes.fill(None);
         }
@@ -1260,6 +1373,7 @@ impl KvCache for DenseFallbackPackedDecoderCache {
 
     fn reset(&mut self) -> Result<()> {
         self.dense.reset()?;
+        self.speculation = None;
         if let Some(pending) = self.pending_step.take() {
             self.staged
                 .restore_device_marks(pending.marks, pending.original_len);
@@ -1357,6 +1471,7 @@ pub fn select_decoder_cache(request: PackedCacheRequest) -> DecoderCacheSelectio
             packed_layer_dtypes: vec![None; request.layers],
             dense_active: false,
             reason,
+            speculation: None,
         }),
     }
 }
@@ -2636,6 +2751,89 @@ impl PackedGroupAffineKvCache {
     }
     pub fn rollback(&mut self, len: usize) -> Result<()> {
         self.trim(len)
+    }
+
+    /// Per layer, the speculation window an exact rollback needs (sc-20681): the authoritative
+    /// device layer's group-aligned quantized extent and its live residual rows. `None` for a
+    /// host-staged store (or a host mirror), which keeps no device residual to window.
+    fn speculation_rows(&self) -> Result<Option<Vec<SpeculationRows>>> {
+        if self.layers.iter().any(Option::is_some) {
+            return Ok(None);
+        }
+        let mut windows = Vec::with_capacity(self.device_layers.len());
+        for device in &self.device_layers {
+            windows.push(match device {
+                None => SpeculationRows::default(),
+                Some(device) if !device.authoritative => return Ok(None),
+                Some(device) => {
+                    let rows = device.key_tail_rows;
+                    SpeculationRows {
+                        start: device.key_packed_tokens,
+                        rows,
+                        kv: (rows > 0)
+                            .then(|| -> Result<(Array, Array)> {
+                                Ok((
+                                    live_rows(&device.key_tail, rows)?,
+                                    live_rows(&device.value_tail, rows)?,
+                                ))
+                            })
+                            .transpose()?,
+                    }
+                }
+            });
+        }
+        Ok(Some(windows))
+    }
+
+    /// Truncate to `len` inside the speculation `windows` (sc-20681): every group completed below
+    /// `len` keeps its codes (they came from exactly the windows' rows), and each residual is
+    /// rebuilt from the windows' unquantized rows — never re-staged from codes. Nothing is mutated
+    /// unless every layer's window covers the cut.
+    fn trim_into_speculation(&mut self, len: usize, windows: &[SpeculationRows]) -> Result<()> {
+        if len > self.logical_len || windows.len() != self.device_layers.len() {
+            return Err(Error::Config(
+                "speculative truncate outside the cache's extent".into(),
+            ));
+        }
+        let geometry = self.geometry();
+        let keep = len / self.group_size * self.group_size;
+        let rows = len - keep;
+        let mut tails = Vec::with_capacity(windows.len());
+        for (device, window) in self.device_layers.iter().zip(windows) {
+            let Some(device) = device.as_ref().filter(|device| device.authoritative) else {
+                tails.push(None);
+                continue;
+            };
+            if keep < window.start || len > window.start + window.rows {
+                return Err(Error::Msg(
+                    "speculative truncate outside the armed window".into(),
+                ));
+            }
+            let tail = match window.kv.as_ref() {
+                Some((keys, values)) if rows > 0 => {
+                    let (from, to) = (keep - window.start, len - window.start);
+                    (
+                        padded_residual(geometry, &rows_range(keys, from, to)?, rows)?,
+                        padded_residual(geometry, &rows_range(values, from, to)?, rows)?,
+                    )
+                }
+                _ => (device.key_tail.clone(), device.value_tail.clone()),
+            };
+            tails.push(Some(tail));
+        }
+        for (device, tail) in self.device_layers.iter_mut().zip(tails) {
+            if let (Some(device), Some((key_tail, value_tail))) = (device.as_mut(), tail) {
+                device.key_packed_tokens = keep;
+                device.value_packed_tokens = keep;
+                device.key_tail_rows = rows;
+                device.value_tail_rows = rows;
+                device.key_tail = key_tail;
+                device.value_tail = value_tail;
+            }
+        }
+        self.logical_len = len;
+        self.update_retained_telemetry();
+        Ok(())
     }
     pub fn clear(&mut self) {
         self.layers.iter_mut().for_each(|l| *l = None);
@@ -6726,6 +6924,94 @@ mod tests {
             .zip(clean.staged.device_layers.iter())
         {
             assert_same_device_layer(actual, expected);
+        }
+    }
+
+    /// sc-20681: speculative rollback on the contiguous compressed cache is exact and stays
+    /// compressed. After a 20-row verify that completes and quantizes a group is cut back to
+    /// `kept` rows, every layer's live codes, metadata and residual equal a cache that appended
+    /// only the kept rows. Without the armed window the same cut re-stages the group from its
+    /// codes, which is not exact (the control).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn speculative_rollback_on_the_contiguous_cache_is_exact_and_stays_compressed() {
+        let width = 64;
+        let history = pseudo_random_outliers(1, 1, 50, width, 31);
+        let draft = pseudo_random_outliers(1, 1, 20, width, 32);
+        let scale = (width as f32).powf(-0.5);
+        let cache = |arm: bool, rows: usize| {
+            let (mut cache, _) = hook_cache_geometry(2, 1, 1, width, None);
+            let packed = cache
+                .as_any_mut()
+                .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                .unwrap();
+            let seed = bhsd(&history, 1, 1, 50, width);
+            assert!(packed
+                .import_prefix(&[(seed.clone(), seed.clone()), (seed.clone(), seed)])
+                .unwrap());
+            if arm {
+                packed.begin_speculation().unwrap();
+            }
+            let q = bhsd(&vec![0.1; rows * width], 1, 1, rows, width);
+            let kv = bhsd(&draft[..rows * width], 1, 1, rows, width);
+            for layer in 0..2 {
+                assert!(packed
+                    .try_packed_attention(
+                        layer,
+                        &q,
+                        &kv,
+                        &kv,
+                        PackedAttentionMask::Causal,
+                        scale,
+                        false
+                    )
+                    .unwrap()
+                    .is_some());
+            }
+            cache
+        };
+        fn packed(cache: &mut Box<dyn KvCache>) -> &mut DenseFallbackPackedDecoderCache {
+            cache
+                .as_any_mut()
+                .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                .unwrap()
+        }
+        for kept in [1, 9, 14, 19] {
+            let mut speculated = cache(true, 20);
+            let spec = packed(&mut speculated);
+            assert_eq!(
+                spec.staged.device_layers[0]
+                    .as_ref()
+                    .unwrap()
+                    .key_packed_tokens,
+                64,
+                "the verify completed a group"
+            );
+            spec.truncate((50 + kept) as i32).unwrap();
+            assert!(!spec.dense_active, "speculation stays compressed");
+            assert!(spec.compressed_storage().unwrap().is_some());
+            let mut reference = cache(false, kept);
+            let reference = packed(&mut reference);
+            assert_eq!(spec.offset(), reference.offset());
+            for (actual, expected) in spec
+                .staged
+                .device_layers
+                .iter()
+                .zip(reference.staged.device_layers.iter())
+            {
+                assert_same_device_layer(actual, expected);
+            }
+
+            if 50 + kept < 64 {
+                let mut control = cache(false, 20);
+                let control = packed(&mut control);
+                control.truncate((50 + kept) as i32).unwrap();
+                assert_ne!(
+                    control.staged.evaluated_dense_layer(0).unwrap(),
+                    reference.staged.evaluated_dense_layer(0).unwrap(),
+                    "kept {kept}: re-staging the cut group from its codes is not exact"
+                );
+            }
         }
     }
 

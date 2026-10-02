@@ -1415,6 +1415,12 @@ mod tests {
     /// admitted), growth is bounded — and every report names the pool's held bytes. The last
     /// request admitted (holding the top pages) retires first and the pool is trimmed right away;
     /// once every request has retired it is trimmed back to (at most) one growth chunk.
+    ///
+    /// The resident-memory claim, at every decode event: the bytes the pool holds (its whole
+    /// capacity, not only the live pages) stay at or under 0.60 of the dense bf16 K/V of the
+    /// positions the live sequences hold — before and after the first (top-page) retirement.
+    /// Doubling growth, unreserved prefills or a pool that is never trimmed hold more (0.85 of
+    /// dense measured before sc-20681's fix).
     #[test]
     fn continuous_runs_reserve_their_prefill_and_trim_the_pool_on_retirement() {
         let model = model();
@@ -1423,11 +1429,20 @@ mod tests {
         let requests = [10_240, 10_331, 10_478, 10_603]
             .into_iter()
             .enumerate()
-            .map(|(i, len)| request(tokens(len, i), if i == 3 { 2 } else { 6 }))
+            .map(|(i, len)| request(tokens(len, i), if i == 3 { 2 } else { 70 }))
             .collect::<Vec<_>>();
         let mut checked = 0;
         let (mut first_tokens, mut retired) = (0, 0);
         let watched = pool.clone();
+        let prompt_lens = requests
+            .iter()
+            .map(|request| request.prompt_ids.len() as u64)
+            .collect::<Vec<_>>();
+        // Positions each sequence's cache holds at its latest event (0 once retired).
+        let mut cached = vec![0_u64; requests.len()];
+        let (mut ratio_checks, mut after_retirement, mut worst) = (0, 0, 0.0_f64);
+        // Dense bf16 K/V per position: 2 layers × K and V × 2 KV heads × 64 dims × 2 bytes.
+        let dense_per_position = (2 * 2 * 2 * 64 * 2) as u64;
         let outputs = generate_continuous_kv(
             &model,
             &requests,
@@ -1438,11 +1453,37 @@ mod tests {
                 ..qualified(None)
             },
             &CancelFlag::new(),
-            &mut |_, event| {
+            &mut |i, event| {
                 match event {
-                    StreamEvent::Done { .. } => retired += 1,
-                    StreamEvent::Token { step: 0, .. } => first_tokens += 1,
-                    StreamEvent::Token { .. } => {}
+                    StreamEvent::Done { .. } => {
+                        retired += 1;
+                        cached[i] = 0;
+                    }
+                    StreamEvent::Token { step, .. } => {
+                        if step == 0 {
+                            first_tokens += 1;
+                        }
+                        cached[i] = prompt_lens[i] + step as u64;
+                        if first_tokens == 4 && retired <= 1 {
+                            // Every request is prefilled (and at most the top-page one retired):
+                            // compare the pool's held bytes with the dense K/V the live sequences
+                            // hold. A retirement below the top leaves its pages as free capacity
+                            // the pool reuses (lowest id first) rather than compacts; the final
+                            // step's retirements are past this check.
+                            let storage = watched.borrow().storage();
+                            let held = (storage.code_bytes + storage.metadata_bytes) as f64;
+                            let dense = (cached.iter().sum::<u64>() * dense_per_position) as f64;
+                            let ratio = held / dense;
+                            worst = worst.max(ratio);
+                            assert!(
+                                ratio <= 0.60,
+                                "pool holds {ratio:.3} of dense bf16 ({retired} retired, \
+                                 {storage:?})"
+                            );
+                            ratio_checks += 1;
+                            after_retirement += usize::from(retired == 1);
+                        }
+                    }
                 }
                 if retired > 1 {
                     return;
@@ -1472,6 +1513,12 @@ mod tests {
         assert!(
             checked >= 4 + 3,
             "every prefill and decode step was checked"
+        );
+        eprintln!("pool held / dense bf16: worst {worst:.3} over {ratio_checks} events");
+        // Decode steps after the first retirement (request 3 leaves after 2 tokens) were checked.
+        assert!(
+            ratio_checks >= 4 && after_retirement >= 3,
+            "{ratio_checks} ratio checks, {after_retirement} after the first retirement"
         );
         for out in &outputs {
             assert_compressed(out);
@@ -1576,6 +1623,16 @@ mod tests {
             assert_eq!(store.stats().refused, refused_before + 1);
             assert_eq!(store.held_pages(), held, "nothing stored");
         }
+        // A store keyed by an empty identity serves nobody, not even its own identity.
+        let mut unnamed = super::tests::store(&model, "");
+        let identity = unnamed.identity().clone();
+        match unnamed.lookup(&identity, &prompt).unwrap() {
+            PagedPrefixLookup::Refused(reason) => {
+                assert!(reason.contains("no model identity"), "{reason}")
+            }
+            other => panic!("an unnamed store served a lookup: {other:?}"),
+        }
+        assert_eq!(unnamed.stats().refused, 1);
     }
 
     /// AC3 measurement (not a gate): `Throughput` continuous batching of `B` qualified sequences
