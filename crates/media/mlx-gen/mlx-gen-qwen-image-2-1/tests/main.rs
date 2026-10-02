@@ -46,6 +46,9 @@ mod text_encoder_parity;
 #[path = "tiers.rs"]
 mod tiers;
 
+#[path = "training.rs"]
+mod training;
+
 #[path = "transformer_parity.rs"]
 mod transformer_parity;
 

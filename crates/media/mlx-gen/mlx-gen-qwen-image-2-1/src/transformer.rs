@@ -20,11 +20,15 @@
 //! (`axes_dims_rope = [16, 56, 56]`, `θ = 10000`) rotates **adjacent** channel pairs
 //! (`view_as_complex`, `use_real=False`), unlike the text tower's half-split RoPE.
 
+use std::rc::Rc;
+
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_tanh, rope_rotate, rope_sincos_from_ids, silu, timestep_sincos};
+use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{
     layer_norm, rms_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask,
 };
@@ -32,6 +36,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{
     add, broadcast_to, concatenate_axis, mean_axis, multiply, r#where, split, stack_axis, tanh,
 };
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use crate::config::TransformerConfig;
@@ -194,6 +199,7 @@ fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     Ok(out.as_dtype(dtype)?)
 }
 
+#[derive(Clone)]
 struct Attention {
     to_q: AdaptableLinear,
     to_k: AdaptableLinear,
@@ -304,6 +310,7 @@ impl AdaptableHost for Attention {
     }
 }
 
+#[derive(Clone)]
 struct FeedForward {
     gate_layer: AdaptableLinear,
     proj: AdaptableLinear,
@@ -363,6 +370,7 @@ impl Trace<'_> {
 
 /// Per-token modulation rows for one forward: `[1, S, inner]` each, already selected between the
 /// sampled-timestep row (target tokens) and the `t = 0` row (prefix tokens).
+#[derive(Clone)]
 struct Modulation {
     scale1: Array,
     gate1: Array,
@@ -370,6 +378,7 @@ struct Modulation {
     gate2: Array,
 }
 
+#[derive(Clone)]
 struct Block {
     attn: Attention,
     mlp: FeedForward,
@@ -426,6 +435,66 @@ impl AdaptableHost for Block {
         out.extend(prefixed_paths("img_mlp", &self.mlp));
         out
     }
+}
+
+/// One block addressed by its **full** DiT path (`transformer_blocks.{index}.…`), so a training
+/// adapter built against the whole transformer installs onto a lone (cloned) block unchanged —
+/// the gradient-checkpoint segment reuses the very [`TrainAdapter::install_as`] the dense path
+/// runs, which is what keeps the recompute numerically identical to the dense forward.
+struct BlockHost<'a> {
+    index: usize,
+    block: &'a mut Block,
+}
+
+impl AdaptableHost for BlockHost<'_> {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] if n.parse::<usize>() == Ok(self.index) => {
+                self.block.adaptable_mut(rest)
+            }
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        prefixed_paths(&format!("transformer_blocks.{}", self.index), &*self.block)
+    }
+}
+
+/// The trainable adapter factors one transformer block carries during training (sc-24159).
+pub struct BlockTrainables {
+    /// The training adapter restricted to this block's targets (built against the whole DiT, so
+    /// its paths are `transformer_blocks.{i}.…`), or `None` for a block with no trained target.
+    pub adapter: Option<Rc<TrainAdapter>>,
+    /// The factor keys ([`LoraParams`] keys) `adapter` reads, in the order they are threaded into
+    /// the checkpoint segment as explicit inputs.
+    pub keys: Vec<Rc<str>>,
+}
+
+/// What [`QwenImage21Transformer::forward_checkpointed`] needs to rebuild each block's adapters
+/// inside its checkpoint segment: the live (traced) factor map plus the install parameters the
+/// dense path's [`TrainAdapter::install_as`] takes.
+pub struct CheckpointedTrainables<'a> {
+    pub params: &'a LoraParams,
+    /// One entry per transformer block, in block order.
+    pub blocks: &'a [BlockTrainables],
+    pub alpha: f32,
+    pub rank: f32,
+    pub lora_dtype: Option<Dtype>,
+    pub lokr_dtype: Dtype,
+}
+
+/// Everything the block stack and the output head consume, built once per forward.
+struct JointInputs {
+    x: Array,
+    m: Modulation,
+    out_scale: Array,
+    cos: Array,
+    sin: Array,
+    prefix_segments: Vec<(usize, usize, bool)>,
+    prefix_len: usize,
+    seq: i32,
+    target: i32,
 }
 
 /// Every non-block Linear of the DiT, in checkpoint (diffusers) naming — the dotted path an adapter
@@ -542,6 +611,74 @@ impl QwenImage21Transformer {
         &self.cfg
     }
 
+    /// Number of single-stream `transformer_blocks`.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// `true` when any Linear of the DiT holds a packed (Q4/Q8) base — the trainer refuses to
+    /// train over one (sc-24159: the trainer is dense-bf16 only).
+    pub fn is_quantized(&self) -> bool {
+        let globals = [
+            &self.img_in,
+            &self.txt_in,
+            &self.txt_out,
+            &self.time_in,
+            &self.time_out,
+            &self.modulation,
+            &self.norm_out,
+            &self.proj_out,
+        ];
+        globals.iter().any(|lin| lin.is_quantized())
+            || self.blocks.iter().any(|block| {
+                [
+                    &block.attn.to_q,
+                    &block.attn.to_k,
+                    &block.attn.to_v,
+                    &block.attn.to_out,
+                    &block.mlp.gate_layer,
+                    &block.mlp.proj,
+                    &block.mlp.out,
+                ]
+                .iter()
+                .any(|lin| lin.is_quantized())
+            })
+    }
+
+    /// Cast every dense weight (Linears and the three norm scales) to `dtype` — the trainer's
+    /// compute-dtype switch (sc-24159: bf16 mixed precision over the bf16 release, or f32 over the
+    /// f32 parity snapshot). Packed Linears are left untouched.
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for lin in [
+            &mut self.img_in,
+            &mut self.txt_in,
+            &mut self.txt_out,
+            &mut self.time_in,
+            &mut self.time_out,
+            &mut self.modulation,
+            &mut self.norm_out,
+            &mut self.proj_out,
+        ] {
+            lin.cast_weights(dtype)?;
+        }
+        self.txt_norm = self.txt_norm.as_dtype(dtype)?;
+        for block in &mut self.blocks {
+            for lin in block.attn.linears() {
+                lin.cast_weights(dtype)?;
+            }
+            for lin in [
+                &mut block.mlp.gate_layer,
+                &mut block.mlp.proj,
+                &mut block.mlp.out,
+            ] {
+                lin.cast_weights(dtype)?;
+            }
+            block.attn.norm_q = block.attn.norm_q.as_dtype(dtype)?;
+            block.attn.norm_k = block.attn.norm_k.as_dtype(dtype)?;
+        }
+        Ok(())
+    }
+
     /// The dtype the model computes in — its weight dtype (bf16 released, f32 fixtures).
     pub fn compute_dtype(&self) -> Dtype {
         self.img_in.weight_dtype().unwrap_or(Dtype::Float32)
@@ -651,6 +788,34 @@ impl QwenImage21Transformer {
         layout: &JointLayout,
         mut trace: Trace<'_>,
     ) -> Result<Array> {
+        let j = self.embed_joint(text, images, timestep, layout, &mut trace)?;
+        let mut x = j.x.clone();
+        for (index, block) in self.blocks.iter().enumerate() {
+            x = block.forward(
+                index,
+                &x,
+                &j.m,
+                &j.cos,
+                &j.sin,
+                &j.prefix_segments,
+                j.prefix_len,
+                &mut trace,
+            )?;
+        }
+        self.head(&x, &j, &mut trace)
+    }
+
+    /// The joint-sequence preamble shared by [`Self::run_joint`] and
+    /// [`Self::forward_checkpointed`]: text/image projections, RoPE, timestep embedding and the
+    /// per-token modulation rows.
+    fn embed_joint(
+        &self,
+        text: &Array,
+        images: &[&Array],
+        timestep: f32,
+        layout: &JointLayout,
+        trace: &mut Trace<'_>,
+    ) -> Result<JointInputs> {
         layout.validate()?;
         let dtype = self.compute_dtype();
         let image_segments = layout
@@ -711,7 +876,7 @@ impl QwenImage21Transformer {
             }
         }
         let refs: Vec<&Array> = pieces.iter().collect();
-        let mut x = concatenate_axis(&refs, 1)?;
+        let x = concatenate_axis(&refs, 1)?;
         let s = x.shape()[1];
 
         let (cos, sin) = self.rope(layout)?;
@@ -758,28 +923,131 @@ impl QwenImage21Transformer {
         };
         let out_scale = select(&self.norm_out.forward(&silu_temb)?)?;
 
-        let prefix_segments = layout.prefix_segments();
-        let prefix_len = layout.prefix_len();
-        for (index, block) in self.blocks.iter().enumerate() {
-            x = block.forward(
-                index,
-                &x,
-                &m,
-                &cos,
-                &sin,
-                &prefix_segments,
-                prefix_len,
-                &mut trace,
-            )?;
-        }
-        let x = scale_residual(&layer_norm(&x, None, None, self.cfg.eps)?, &out_scale)?;
+        Ok(JointInputs {
+            x,
+            m,
+            out_scale,
+            cos,
+            sin,
+            prefix_segments: layout.prefix_segments(),
+            prefix_len: layout.prefix_len(),
+            seq: s,
+            target: layout.target_tokens() as i32,
+        })
+    }
+
+    /// `norm_out` → `proj_out` → the target block's velocity, f32.
+    fn head(&self, x: &Array, j: &JointInputs, trace: &mut Trace<'_>) -> Result<Array> {
+        let x = scale_residual(&layer_norm(x, None, None, self.cfg.eps)?, &j.out_scale)?;
         trace.push("norm_out", &x)?;
         let out = self.proj_out.forward(&x)?;
         trace.push("proj_out", &out)?;
-        let target = layout.target_tokens() as i32;
         Ok(out
-            .index((.., s - target..s, ..))
+            .index((.., j.seq - j.target..j.seq, ..))
             .as_dtype(Dtype::Float32)?)
+    }
+
+    /// [`Self::forward`] with **per-block gradient checkpointing** (sc-24159, training only).
+    ///
+    /// Numerically the dense forward, but each transformer block runs inside an `mlx::checkpoint`
+    /// segment whose explicit inputs are the joint hidden state, the four per-token modulation
+    /// rows, and that block's trainable adapter factors — so the backward recomputes the block
+    /// instead of retaining its activations, while gradients still reach the factors (and, through
+    /// the modulation rows, any adapter on the shared `modulation.1`). The preamble and the output
+    /// head run normally: adapters on the global Linears are installed on `self` by the caller and
+    /// train through ordinary autograd.
+    ///
+    /// Inside a segment the block's adapters are rebuilt with the caller's own
+    /// [`TrainAdapter::install_as`] (LoRA or LoKr alike) over the threaded factors, so the
+    /// recompute is the dense path's install op-for-op. Blocks with no trained target still run
+    /// checkpointed.
+    pub fn forward_checkpointed(
+        &self,
+        latents: &Array,
+        text: &Array,
+        timestep: f32,
+        height: usize,
+        width: usize,
+        trainables: &CheckpointedTrainables<'_>,
+    ) -> Result<Array> {
+        if trainables.blocks.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: {} checkpoint block entries for a {}-block DiT",
+                trainables.blocks.len(),
+                self.blocks.len()
+            )));
+        }
+        let layout = JointLayout::text_to_image(text.shape()[1] as usize, height, width);
+        let mut trace = Trace(None);
+        let j = self.embed_joint(text, &[latents], timestep, &layout, &mut trace)?;
+        let mut x = j.x.clone();
+        for (index, (block, trainable)) in self.blocks.iter().zip(trainables.blocks).enumerate() {
+            // Threaded inputs: [hidden, scale1, gate1, scale2, gate2, factor_0, factor_1, …].
+            let mut inputs: Vec<Array> = Vec::with_capacity(5 + trainable.keys.len());
+            inputs.push(x.clone());
+            inputs.push(j.m.scale1.clone());
+            inputs.push(j.m.gate1.clone());
+            inputs.push(j.m.scale2.clone());
+            inputs.push(j.m.gate2.clone());
+            for key in &trainable.keys {
+                let factor = trainables.params.get(key.as_ref()).ok_or_else(|| {
+                    Error::Msg(format!(
+                        "qwen_image_2_1: trainable factor {key} is missing from the params"
+                    ))
+                })?;
+                inputs.push(factor.clone());
+            }
+            // The segment OWNS its state (Arrays and `Rc`s are cheap refcounted clones): the
+            // backward recompute calls it again after this frame has moved on.
+            let mut owned = block.clone();
+            let keys = trainable.keys.clone();
+            let adapter = trainable.adapter.clone();
+            let (cos, sin) = (j.cos.clone(), j.sin.clone());
+            let prefix_segments = j.prefix_segments.clone();
+            let prefix_len = j.prefix_len;
+            let (alpha, rank) = (trainables.alpha, trainables.rank);
+            let (lora_dtype, lokr_dtype) = (trainables.lora_dtype, trainables.lokr_dtype);
+            let mut segment = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                if let Some(adapter) = adapter.as_deref() {
+                    let factors: LoraParams =
+                        keys.iter().cloned().zip(inp[5..].iter().cloned()).collect();
+                    adapter.install_as(
+                        &mut BlockHost {
+                            index,
+                            block: &mut owned,
+                        },
+                        &factors,
+                        alpha,
+                        rank,
+                        lora_dtype,
+                        lokr_dtype,
+                    )?;
+                }
+                let m = Modulation {
+                    scale1: inp[1].clone(),
+                    gate1: inp[2].clone(),
+                    scale2: inp[3].clone(),
+                    gate2: inp[4].clone(),
+                };
+                let out = owned
+                    .forward(
+                        index,
+                        &inp[0],
+                        &m,
+                        &cos,
+                        &sin,
+                        &prefix_segments,
+                        prefix_len,
+                        &mut Trace(None),
+                    )
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![out])
+            });
+            x = segment(&inputs)?.into_iter().next().ok_or_else(|| {
+                Error::Msg("qwen_image_2_1: a checkpointed block produced no output".into())
+            })?;
+        }
+        self.head(&x, &j, &mut trace)
     }
 }
 
