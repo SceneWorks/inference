@@ -28,7 +28,7 @@ use mlx_gen_qwen_image_2_1::{
     QwenImage21Transformer, BLOCK_ADAPTER_TARGETS, TRAINER_ID,
 };
 use mlx_rs::Array;
-use sceneworks_gen_core_testkit::trainer::{trainer_conformance, TrainerProfile};
+use gen_core_testkit::trainer::{trainer_conformance, TrainerProfile};
 
 use crate::common::{errors, tiny_snapshot};
 
