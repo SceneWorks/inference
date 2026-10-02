@@ -536,9 +536,16 @@ pub const PARAM_CACHE_ADMISSION_BYTES: u64 = 1 << 20;
 /// candle's parameter cache (sc-24441, E7): [`PARAM_CACHE_ADMISSION_BYTES`] for every step shape
 /// the runner can capture — each token count up to
 /// [`MAX_DEVICE_STEP_TOKENS`](crate::primitives::MAX_DEVICE_STEP_TOKENS) (the runner's
-/// [`GraphRunner::MAX_CAPTURED_TOKENS`]) in both logits scopes.
-pub fn graph_param_cache_load_bytes() -> u64 {
-    crate::primitives::MAX_DEVICE_STEP_TOKENS as u64 * 2 * PARAM_CACHE_ADMISSION_BYTES
+/// [`GraphRunner::MAX_CAPTURED_TOKENS`]) in both logits scopes, and, when the load can run steps
+/// that ask for hidden rows (`want_hidden`: an MTP head, native or companion), each of those again
+/// with hidden rows — the runner keys a shape on `want_hidden` too (`ShapeKey`), and a
+/// hidden-row step stages a hidden output the plain one does not (sc-24446).
+pub fn graph_param_cache_load_bytes(want_hidden: bool) -> u64 {
+    let hidden_variants = if want_hidden { 2 } else { 1 };
+    crate::primitives::MAX_DEVICE_STEP_TOKENS as u64
+        * 2
+        * hidden_variants
+        * PARAM_CACHE_ADMISSION_BYTES
 }
 
 /// What a captured graph is made of — the node census the runner takes before instantiating it,
@@ -1908,11 +1915,24 @@ mod tests {
     }
 
     /// sc-24441 (E7): a load under the graph runner prices the parameter cache its captures
-    /// leave resident — 1 MiB for each of the 16 token counts in both logits scopes.
+    /// leave resident — 1 MiB for each of the 16 token counts in both logits scopes, and twice
+    /// that for a load whose steps can also ask for hidden rows (sc-24446: `want_hidden` is part
+    /// of the shape key, so those are distinct captures).
     #[test]
     fn a_load_prices_the_parameter_cache_its_captures_leave_resident() {
         assert_eq!(PARAM_CACHE_ADMISSION_BYTES, 1 << 20);
-        assert_eq!(graph_param_cache_load_bytes(), 32 << 20);
+        assert_eq!(graph_param_cache_load_bytes(false), 32 << 20);
+        assert_eq!(graph_param_cache_load_bytes(true), 64 << 20);
+        let shape = |want_hidden| ShapeKey {
+            tokens: 1,
+            scope: LogitsScope::All,
+            want_hidden,
+        };
+        assert_ne!(
+            shape(true),
+            shape(false),
+            "want_hidden keys a distinct capture"
+        );
     }
 
     #[test]

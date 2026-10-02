@@ -6,8 +6,9 @@
 
 use core_llm::{LoadSpec, TextLlm};
 use core_llm_testkit::{
-    check_draft_model_refused, check_draft_model_resident, check_draft_model_short_context,
-    check_draft_model_stop_token, check_draft_model_targets, write_draft_model_fixture,
+    check_draft_model_qwen3vl_multimodal, check_draft_model_refused, check_draft_model_resident,
+    check_draft_model_short_context, check_draft_model_stop_token, check_draft_model_targets,
+    write_draft_model_fixture, write_qwen3vl_draft_fixture,
 };
 use mlx_llm::LlamaProvider;
 
@@ -70,4 +71,14 @@ fn every_target_and_draft_pairing_is_greedy_exact_at_every_depth() {
     let root = Fixture::new("mlx-llm-draft-model-", None);
     let fixture = write_draft_model_fixture(&root).unwrap();
     check_draft_model_targets(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// sc-24446 (E1, E8): a Qwen3-VL image request with a resident draft runs `draft_model` over the
+/// image-expanded history at every advertised depth and emits exactly `off`'s greedy stream —
+/// the same backend-neutral check the other backend runs.
+#[test]
+fn a_qwen3vl_image_request_runs_the_draft_greedy_exact() {
+    let root = Fixture::new("mlx-llm-draft-model-vl-", None);
+    let fixture = write_qwen3vl_draft_fixture(&root).unwrap();
+    check_draft_model_qwen3vl_multimodal(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
 }

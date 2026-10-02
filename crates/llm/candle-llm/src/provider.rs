@@ -1969,7 +1969,9 @@ impl LlamaProvider {
     ///
     /// A CUDA load whose decoder the CUDA-graph runner wraps (its policy: `spec.cuda_graphs`,
     /// else the process switch) also prices the parameter cache the runner's captures leave
-    /// resident for the process ([`LoadMemoryEstimate::graph_param_cache_bytes`], sc-24441).
+    /// resident for the process ([`LoadMemoryEstimate::graph_param_cache_bytes`], sc-24441) —
+    /// doubled for a load with an MTP head, whose hidden-row steps are captures of their own
+    /// (sc-24446).
     pub fn load_memory_estimate(spec: &LoadSpec, cuda: bool) -> CoreResult<LoadMemoryEstimate> {
         Self::load_memory_estimate_as(spec, cuda, true)
     }
@@ -1996,6 +1998,10 @@ impl LlamaProvider {
         let requested = CopyFormat::requested(spec.quantize);
         // What the load holds on its device while it builds the decoder.
         let mut moe_tables = 0u64;
+        // Whether the load can run steps that ask for hidden rows — an MTP head, native (a
+        // Qwen3.5 snapshot configuring one) or a companion — which the graph runner captures as
+        // shapes of their own (sc-24446).
+        let mut hidden_steps = spec.mtp_head_source.is_some();
         let working = if crate::gguf::is_gguf_path(&spec.source) {
             if crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(source).map_err(to_core)? {
                 // Prism GGUF: packed blocks the loader wraps, never re-quantized.
@@ -2007,6 +2013,8 @@ impl LlamaProvider {
             let config = read_json(source, "config.json");
             let decoder = PricedDecoder::from_config(config.as_ref());
             moe_tables = decoder.moe_indexed_table_bytes();
+            hidden_steps |=
+                matches!(&decoder, PricedDecoder::Qwen35(cfg, _) if cfg.mtp_num_hidden_layers > 0);
             let format = decoder.format(requested);
             let builds = matches!(
                 decoder,
@@ -2041,7 +2049,7 @@ impl LlamaProvider {
         let on_device = |bytes: u64| if cuda { bytes } else { 0 };
         let graphs = target && spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
         let graph_param_cache = if graphs {
-            on_device(crate::decode::graph_param_cache_load_bytes())
+            on_device(crate::decode::graph_param_cache_load_bytes(hidden_steps))
         } else {
             0
         };
@@ -8714,6 +8722,30 @@ mod tests {
         );
     }
 
+    /// sc-24446: a load whose steps can ask for hidden rows — a Qwen3.5 snapshot with a native
+    /// MTP head, or any load naming a companion head — prices the hidden-row captures on top of
+    /// the plain ones (the runner keys a shape on `want_hidden`); one without a head does not.
+    #[test]
+    fn a_load_with_an_mtp_head_prices_its_hidden_row_captures() {
+        let estimate = |dir: &tempfile::TempDir, companion: bool| {
+            let spec = core_llm::LoadSpec {
+                cuda_graphs: Some(true),
+                mtp_head_source: companion.then(|| "companion-head".to_string()),
+                ..core_llm::LoadSpec::dense(dir.path().display().to_string())
+            };
+            super::LlamaProvider::load_memory_estimate(&spec, true)
+                .unwrap()
+                .graph_param_cache_bytes
+        };
+        let (plain, headed) = (
+            qwen35_snapshot(false, false, false),
+            qwen35_snapshot(false, true, false),
+        );
+        assert_eq!(estimate(&plain, false), 32 << 20);
+        assert_eq!(estimate(&headed, false), 64 << 20);
+        assert_eq!(estimate(&plain, true), 64 << 20);
+    }
+
     /// sc-24441 (E7): a CUDA load the graph runner wraps prices the parameter cache its
     /// captures leave resident for the process — 32 MiB, once per load — and nothing with the
     /// runner off or off CUDA; a resident draft is never wrapped, so its admission beside the
@@ -9680,9 +9712,15 @@ mod tests {
             .iter()
             .filter(|r| r.speculative == Speculative::Auto)
             .collect();
-        assert!(auto
-            .iter()
-            .all(|r| r.report.proposer == ProposerKind::Mtp && r.report.draft_tokens == Some(3)));
+        // `auto` runs the head at the depth the snapshot advertises as recommended, whatever the
+        // backend default currently is (sc-24446).
+        let recommended = core_llm::TextLlm::descriptor(&with_head)
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .expect("the head is advertised")
+            .recommended_depth;
+        assert!(auto.iter().all(|r| r.report.proposer == ProposerKind::Mtp
+            && r.report.draft_tokens == Some(recommended)));
     }
 
     /// sc-24438 AC1: the advertised max depth is finite and backend-true — the widest verify the
@@ -9881,7 +9919,8 @@ mod tests {
                 ("explicit 3", explicit(3)),
                 ("explicit max", explicit(mtp.max_depth)),
                 ("legacy", (3, legacy)),
-                ("auto", (3, request(Speculative::Auto))),
+                // `auto` runs at the advertised recommended depth (sc-24446), not a literal.
+                ("auto", (mtp.recommended_depth, request(Speculative::Auto))),
             ] {
                 provider.validate(&req).expect(case);
                 let (events, out) = token_events(&provider, &req);

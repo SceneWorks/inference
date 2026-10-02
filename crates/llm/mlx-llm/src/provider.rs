@@ -5364,7 +5364,11 @@ mod tests {
                 ("explicit 3", explicit(3)),
                 ("explicit max", explicit(mtp.max_depth)),
                 ("legacy", (3, legacy)),
-                ("auto", (3, spec_request(Speculative::Auto))),
+                // `auto` runs at the advertised recommended depth (sc-24446), not a literal.
+                (
+                    "auto",
+                    (mtp.recommended_depth, spec_request(Speculative::Auto)),
+                ),
             ] {
                 provider.validate(&req).unwrap();
                 let (out, ids) = run(&provider, &req);

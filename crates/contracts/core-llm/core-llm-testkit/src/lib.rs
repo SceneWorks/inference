@@ -35,10 +35,11 @@ pub mod speculative;
 pub mod starvector;
 pub use defaults::check_speculative_default;
 pub use draft_model::{
-    check_draft_model_refused, check_draft_model_resident, check_draft_model_short_context,
-    check_draft_model_stop_token, check_draft_model_targets, draft_model_parity_cases,
-    draft_model_prompts, write_draft_model_fixture, DraftLoader, DraftModelFixture,
-    DRAFT_FIXTURE_VOCAB,
+    check_draft_model_qwen3vl_multimodal, check_draft_model_refused, check_draft_model_resident,
+    check_draft_model_short_context, check_draft_model_stop_token, check_draft_model_targets,
+    draft_model_parity_cases, draft_model_prompts, qwen3vl_image_prompts,
+    write_draft_model_fixture, write_qwen3vl_draft_fixture, DraftLoader, DraftModelFixture,
+    Qwen3VlDraftFixture, DRAFT_FIXTURE_VOCAB,
 };
 pub use speculative::{
     advertised_parity_cases, bench_build_stamp, bench_config, bench_env, bench_load_spec,
