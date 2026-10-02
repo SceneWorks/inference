@@ -2851,7 +2851,13 @@ mod tests {
             .unwrap();
         let tokenizer = loader::load_tokenizer(&tiny_snapshot()).unwrap();
         let drop = system_prompt_drop_count(&tokenizer).unwrap();
-        match edit_prompt_tokens(&tokenizer, drop, &vision, "edit", &[thin.clone()]) {
+        match edit_prompt_tokens(
+            &tokenizer,
+            drop,
+            &vision,
+            "edit",
+            std::slice::from_ref(&thin),
+        ) {
             Err(Error::Unsupported(message)) => {
                 assert!(message.contains("smart_resize"), "{message}")
             }
