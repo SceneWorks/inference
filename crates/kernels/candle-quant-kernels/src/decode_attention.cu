@@ -556,6 +556,6 @@ extern "C" __global__ void read_slot_scaled_f32(const float* src, const unsigned
     const size_t at = index[0];
     for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < n;
          e += (size_t)gridDim.x * blockDim.x) {
-        out[e] = at < slots ? src[at * n + e] * g[e / inner] : 0.0f;
+        out[e] = at < slots ? src[at * n + e] * g[0] : 0.0f;  // MUTATION: DO NOT MERGE
     }
 }
