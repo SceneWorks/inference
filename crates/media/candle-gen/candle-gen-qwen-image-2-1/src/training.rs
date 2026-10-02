@@ -830,6 +830,43 @@ fn install_adapters(
     }
 }
 
+/// The `__metadata__` key an adapter's training mode is stamped under (the MLX trainer stamps
+/// `trainingMode = edit` on instruction-edit adapters, sc-24161); a text-to-image adapter carries
+/// no stamp.
+const TRAINING_MODE_KEY: &str = "trainingMode";
+
+/// Refuse resuming this text-to-image run from a run of another training mode: the resume bundle
+/// and every intermediate adapter checkpoint of `stem` in `dir` must carry no `trainingMode` (or
+/// a text-to-image one). An instruction-edit run's factors were trained on a different
+/// conditioning, so continuing them as a text-to-image adapter would silently mix two objectives.
+fn check_resume_training_mode(dir: &Path, stem: &str, snapshot: &Path) -> Result<()> {
+    let prefix = format!("{stem}-step");
+    let mut files = vec![snapshot.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && name.ends_with(".safetensors") {
+                files.push(entry.path());
+            }
+        }
+    }
+    for file in files {
+        let meta = gen_core::weightsmeta::safetensors_file_metadata(&file)
+            .map_err(|e| Error::Msg(format!("{LABEL}: read {}: {e}", file.display())))?;
+        if let Some(mode) = meta.get(TRAINING_MODE_KEY) {
+            if mode != "t2i" && mode != "text_to_image" {
+                return Err(Error::Msg(format!(
+                    "{LABEL}: {} was written by a `{mode}` training run; this text-to-image run \
+                     cannot resume from it — start a fresh run, or resume it with the trainer \
+                     mode that wrote it",
+                    file.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Freeze (`true`) or thaw (`false`) every trainable residual on the DiT — the graph-free preview
 /// seam ([`AdaptLinear::set_trainable_frozen`]).
 fn set_frozen(dit: &mut QwenImage21Transformer, frozen: bool) -> Result<()> {
@@ -1205,6 +1242,7 @@ impl QwenImage21Trainer {
         let mut update_idx = 0u32;
         if cfg.resume {
             if let Some((snapshot, _)) = find_latest_resume(&req.output_dir, &stem) {
+                check_resume_training_mode(&req.output_dir, &stem, &snapshot)?;
                 let restored = load_resume(&snapshot, &mut opt, &set, cfg, &fingerprint)?;
                 if restored.step > cfg.steps {
                     return Err(Error::Msg(format!(
@@ -2530,8 +2568,33 @@ mod tests {
                     ..cfg.clone()
                 },
             );
-            req.output_dir = interrupted_dir;
+            req.output_dir = interrupted_dir.clone();
             assert!(trainer().train(&req, &mut |_| {}).is_err());
+
+            // A checkpoint of the same adapter stamped by an instruction-edit run blocks a
+            // text-to-image resume, even with otherwise matching settings.
+            let mut dit = dit_at(DType::F32);
+            let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
+            let mut meta = provenance_meta();
+            meta.insert(TRAINING_MODE_KEY.into(), "edit".into());
+            save_adapter(
+                &set,
+                &meta,
+                &interrupted_dir.join(checkpoint_filename("adapter", 1)),
+            )
+            .unwrap();
+            let mut req = request(
+                dir.path(),
+                dataset(dir.path(), 2),
+                TrainingConfig {
+                    save_every: 2,
+                    resume: true,
+                    ..cfg.clone()
+                },
+            );
+            req.output_dir = interrupted_dir;
+            let err = trainer().train(&req, &mut |_| {}).unwrap_err().to_string();
+            assert!(err.contains("`edit` training run"), "{err}");
         }
     }
 
