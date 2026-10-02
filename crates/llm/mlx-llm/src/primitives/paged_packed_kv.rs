@@ -840,7 +840,7 @@ impl PagedPackedKvCache {
             mask,
         };
         let selection = handle.paged_kernel_selection(&args);
-        let warmed = handle.is_warmed();
+        let warmed = handle.is_paged_warmed();
         self.dispatch_attempts += 1;
         let output = handle.dispatch_paged(&args).and_then(|output| {
             if !warmed {
@@ -856,7 +856,7 @@ impl PagedPackedKvCache {
                 return Err(error);
             }
         };
-        handle.mark_warmed();
+        handle.mark_paged_warmed();
         self.accepted.fused += 1;
         if let Some(selection) = selection {
             match self
@@ -1039,7 +1039,7 @@ impl PagedPackedKvCache {
             kernel_warmed: self
                 .handle
                 .as_ref()
-                .is_some_and(CompiledKernelHandle::is_warmed),
+                .is_some_and(CompiledKernelHandle::is_paged_warmed),
             retained_device_code_bytes: storage.device_code_bytes,
             retained_device_metadata_bytes: storage.device_metadata_bytes,
             retained_device_packed_logical_bytes: storage.device_bytes(),
@@ -1154,7 +1154,7 @@ impl KvCache for PagedPackedKvCache {
                 let warmed = self
                     .handle
                     .as_ref()
-                    .is_some_and(CompiledKernelHandle::is_warmed);
+                    .is_some_and(CompiledKernelHandle::is_paged_warmed);
                 match self.dispatch(layer, query, packed_mask) {
                     Ok(output) => output,
                     Err(Error::Canceled) => return Err(Error::Canceled),
@@ -1748,10 +1748,14 @@ mod tests {
             code_bits: bits,
             mask: packed_mask,
         };
-        let tolerance = match case.dtype {
-            Dtype::Float32 => 1e-4,
-            Dtype::Float16 => 4e-2,
-            _ => 8e-2,
+        // About twice the worst observed oracle error per query dtype (and, for bf16, head
+        // dimension: its 8-bit mantissa rounding of a D = 256 query dominates), so the negative
+        // control below — one wrong page — lands far outside it.
+        let tolerance = match (case.dtype, d) {
+            (Dtype::Float32, _) => 1e-5,
+            (Dtype::Float16, _) => 6e-3,
+            (_, 256) => 3e-2,
+            _ => 8e-3,
         };
         use PackedMetalGpuFamily::{Apple7OrNewer, ConservativeUnknownApple};
         let mut paths = vec![
@@ -1796,6 +1800,36 @@ mod tests {
         for (actual, expected) in planned.iter().zip(&reference) {
             assert!((actual - expected).abs() <= tolerance);
         }
+        // Negative control: a wrong-but-valid page table (two sequences' last pages swapped, so
+        // every mask's visible range reads the wrong page) must move the output well past the
+        // tolerance, or the tolerance could not catch a page-walk error.
+        let paged = (0..3).filter(|&b| !ids[b].is_empty()).collect::<Vec<_>>();
+        let (a, b) = (paged[0], paged[1]);
+        let mut swapped = table.clone();
+        let (last_a, last_b) = (
+            a * columns + ids[a].len() - 1,
+            b * columns + ids[b].len() - 1,
+        );
+        swapped.swap(last_a, last_b);
+        let swapped = Array::from_slice(&swapped, &[3, columns as i32]);
+        let wrong = host_f32(
+            &qualified
+                .dispatch_paged(&PagedPackedAttentionArgs {
+                    page_table: &swapped,
+                    ..args
+                })
+                .unwrap(),
+        );
+        let wrong_error = wrong
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            wrong_error > 2.0 * tolerance,
+            "{bits:?} case {index}: a swapped page moved the output only {wrong_error} \
+             (tolerance {tolerance})"
+        );
         eprintln!(
             "paged parity {bits:?} case {index} {:?} D={d}: max abs {case_max}",
             case.dtype
@@ -1983,30 +2017,27 @@ mod tests {
                 .chain([20])
                 .chain(std::iter::repeat_n(1, 40))
                 .collect::<Vec<_>>();
-            let (mut to_contiguous, mut to_dense) = (0.0f32, 0.0f32);
+            let mut to_dense = 0.0f32;
             let mut tokens = 0;
             for (i, &step) in steps.iter().enumerate() {
                 let p = attend_step(&mut paged, i as u64, step, dims, dtype);
                 let c = attend_step(contiguous.as_mut(), i as u64, step, dims, dtype);
                 let d = attend_step(&mut dense, i as u64, step, dims, dtype);
                 tokens += step;
-                to_contiguous = to_contiguous.max(max_abs(&p, &c));
+                // Same codes, same kernels: only where they live differs.
+                assert_eq!(p, c, "{dtype:?} step {i}: paged vs contiguous compressed");
                 to_dense = to_dense.max(max_abs(&p, &d));
                 assert_eq!(paged.offset(), tokens as i32);
             }
-            let (contiguous_bound, dense_bound) = match dtype {
-                Dtype::Float32 => (1e-5, 3e-2),
-                _ => (2e-2, 8e-2),
+            let dense_bound = match dtype {
+                Dtype::Float32 => 3e-2,
+                _ => 8e-2,
             };
-            assert!(
-                to_contiguous <= contiguous_bound,
-                "{dtype:?}: paged vs contiguous {to_contiguous}"
-            );
             assert!(
                 to_dense <= dense_bound,
                 "{dtype:?}: paged vs dense {to_dense}"
             );
-            eprintln!("{dtype:?}: paged vs contiguous {to_contiguous}, vs dense paged {to_dense}");
+            eprintln!("{dtype:?}: paged == contiguous, vs dense paged {to_dense}");
             assert_eq!(paged.page_ids.len(), (tokens / 32 * 32).div_ceil(64));
             let evidence = paged.packed_evidence().unwrap();
             assert!(evidence.dense_gather_calls.is_empty(), "{evidence:?}");
@@ -2399,6 +2430,38 @@ mod tests {
             ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
             ids.len()
         );
+    }
+
+    /// The paged kernels are their own pipelines: a reader the contiguous cache has already
+    /// warmed is still cold for paged dispatch, so a failing first paged dispatch takes the counted
+    /// reader-unavailable gather rather than surfacing as a hard error.
+    #[test]
+    fn a_contiguously_warmed_reader_still_degrades_on_a_cold_paged_fault() {
+        let dims = (2, 1, 64);
+        let dtype = Dtype::Float32;
+        let handle = interrupting(0, false);
+        let mut contiguous = contiguous_cache(&handle, LAYERS, 1, 64);
+        for (i, step) in [3, 1].into_iter().enumerate() {
+            attend_step(contiguous.as_mut(), i as u64, step, dims, dtype);
+        }
+        assert!(
+            handle.is_warmed(),
+            "the contiguous kernels warmed the shared handle"
+        );
+        assert!(!handle.is_paged_warmed());
+        let mut paged = PagedPackedKvCache::with_pool(pool(1, 64, 32), handle).unwrap();
+        let (q, k, v) = qkv(0, 3, dims, dtype);
+        let scale = (64f32).powf(-0.5);
+        assert!(paged
+            .try_packed_attention(0, &q, &k, &v, PackedAttentionMask::Causal, scale, false)
+            .unwrap()
+            .is_none());
+        paged.update(0, &k, &v).unwrap();
+        assert_eq!(
+            paged.dense_gathers(),
+            vec![(PagedFallbackReason::ReaderUnavailable, 1)]
+        );
+        assert!(paged.handle.is_none());
     }
 
     /// A reader whose paged kernels fail on their cold dispatch is dropped before any packed output
