@@ -841,3 +841,476 @@ fn an_unsizable_adapter_is_refused_rather_than_priced_at_zero() {
         assert!(err.contains("could not be sized"), "{policy:?}: {err}");
     }
 }
+
+// ── sc-24158: every adapter format, on the dense and the packed DiT ──────────────────────────────
+
+/// [`write_safetensors`] with optional explicit per-entry values: `Some(v)` fills the tensor with
+/// `v` (a per-module `.alpha`), `None` with the deterministic ramp.
+fn write_safetensors_with(
+    path: &Path,
+    entries: &[(String, Vec<usize>, Option<f32>)],
+    meta: &[(&str, &str)],
+    amp: f32,
+) {
+    let mut data: Vec<u8> = Vec::new();
+    let mut header = String::from("{\"__metadata__\":{\"format\":\"pt\"");
+    for (k, v) in meta {
+        header.push_str(&format!(",\"{k}\":\"{v}\""));
+    }
+    header.push('}');
+    for (i, (name, shape, value)) in entries.iter().enumerate() {
+        let n: usize = shape.iter().product();
+        let start = data.len();
+        for j in 0..n {
+            let ramp = (((i * 131 + j * 17 + 7) % 101) as f32 / 101.0 - 0.5) * amp;
+            data.extend_from_slice(&value.unwrap_or(ramp).to_le_bytes());
+        }
+        let dims = shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        header.push_str(&format!(
+            ",\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{dims}],\"data_offsets\":[{start},{}]}}",
+            data.len()
+        ));
+    }
+    header.push('}');
+    let header = header.into_bytes();
+    let mut buf = (header.len() as u64).to_le_bytes().to_vec();
+    buf.extend_from_slice(&header);
+    buf.extend_from_slice(&data);
+    std::fs::write(path, buf).unwrap();
+}
+
+fn transformer_ns(path: &str) -> String {
+    format!("transformer.{path}")
+}
+
+fn peft_wrapper(path: &str) -> String {
+    format!("base_model.model.{path}")
+}
+
+fn diffusion_model_ns(path: &str) -> String {
+    format!("diffusion_model.{path}")
+}
+
+fn kohya(path: &str) -> String {
+    format!("lora_unet_{}", path.replace('.', "_"))
+}
+
+fn lycoris(path: &str) -> String {
+    format!("lycoris_{}", path.replace('.', "_"))
+}
+
+fn bare(path: &str) -> String {
+    path.to_string()
+}
+
+/// One LoRA spelling: how a dotted DiT path becomes the file's module key, and the factor suffixes
+/// the convention writes.
+struct LoraSpelling {
+    name: &'static str,
+    module: fn(&str) -> String,
+    down: &'static str,
+    up: &'static str,
+    /// Whether the convention ships a per-module `.alpha` scalar.
+    alpha: bool,
+}
+
+const LORA_SPELLINGS: [LoraSpelling; 7] = [
+    LoraSpelling {
+        name: "diffusers transformer.",
+        module: transformer_ns,
+        down: "lora_A.weight",
+        up: "lora_B.weight",
+        alpha: false,
+    },
+    LoraSpelling {
+        name: "raw PEFT base_model.model.",
+        module: peft_wrapper,
+        down: "lora_A.weight",
+        up: "lora_B.weight",
+        alpha: false,
+    },
+    LoraSpelling {
+        name: "PEFT .default adapter",
+        module: transformer_ns,
+        down: "lora_A.default.weight",
+        up: "lora_B.default.weight",
+        alpha: false,
+    },
+    LoraSpelling {
+        name: "ComfyUI diffusion_model. lora_down/up",
+        module: diffusion_model_ns,
+        down: "lora_down.weight",
+        up: "lora_up.weight",
+        alpha: true,
+    },
+    LoraSpelling {
+        name: "ai-toolkit diffusion_model. lora_A/B",
+        module: diffusion_model_ns,
+        down: "lora_A.weight",
+        up: "lora_B.weight",
+        alpha: false,
+    },
+    LoraSpelling {
+        name: "kohya lora_unet_",
+        module: kohya,
+        down: "lora_down.weight",
+        up: "lora_up.weight",
+        alpha: true,
+    },
+    LoraSpelling {
+        name: "bare (SceneWorks trainer)",
+        module: bare,
+        down: "lora_A.weight",
+        up: "lora_B.weight",
+        alpha: true,
+    },
+];
+
+/// The globals and the block leaves whose names already carry `_` — the kohya flattening is
+/// ambiguous for them unless resolved against the host's table.
+const FORMAT_TARGETS: [&str; 8] = [
+    "txt_in.in_layer",
+    "time_text_embed.timestep_embedder.linear_1",
+    "modulation.1",
+    "transformer_blocks.0.attn.to_out.0",
+    "transformer_blocks.1.img_mlp.gate_layer",
+    "transformer_blocks.1.img_mlp.out",
+    "norm_out.linear",
+    "proj_out",
+];
+
+/// Neighbours of [`FORMAT_TARGETS`] a mis-resolved key could land on instead — they must stay bare.
+const FORMAT_NEIGHBOURS: [&str; 4] = [
+    "txt_in.out_layer",
+    "time_text_embed.timestep_embedder.linear_2",
+    "transformer_blocks.0.attn.to_q",
+    "transformer_blocks.1.img_mlp.proj",
+];
+
+fn spelled_lora(
+    dir: &Path,
+    name: &str,
+    host: &mut QwenImage21Transformer,
+    spelling: &LoraSpelling,
+    targets: &[&str],
+) -> PathBuf {
+    let mut entries = Vec::new();
+    for target in targets {
+        let (out, inp) = base_shape(host, target);
+        let module = (spelling.module)(target);
+        entries.push((format!("{module}.{}", spelling.down), vec![RANK, inp], None));
+        entries.push((format!("{module}.{}", spelling.up), vec![out, RANK], None));
+        if spelling.alpha {
+            entries.push((format!("{module}.alpha"), vec![], Some(8.0)));
+        }
+    }
+    let path = dir.join(name);
+    write_safetensors_with(&path, &entries, &[], 1.0);
+    path
+}
+
+/// Every LoRA spelling the shared loader accepts — PEFT / diffusers (`transformer.`, a raw
+/// `base_model.model.` wrapper, the `.default` adapter name), ComfyUI and ai-toolkit
+/// (`diffusion_model.`), kohya `lora_unet_` and the trainer's bare keys — applies over the globals
+/// and the underscore-ambiguous leaves, on the dense DiT and as a residual over a load-time Q4 / Q8
+/// one, landing on exactly the Linears it names.
+#[test]
+fn every_lora_spelling_applies_to_exactly_its_targets_on_dense_and_packed() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (tier, build) in [
+        ("dense", dense as Build),
+        ("q4", packed_q4 as Build),
+        ("q8", packed_q8 as Build),
+    ] {
+        let base = velocity(&build());
+        for (i, spelling) in LORA_SPELLINGS.iter().enumerate() {
+            let name = format!("{tier}/{}", spelling.name);
+            let mut model = build();
+            let file = spelled_lora(
+                tmp.path(),
+                &format!("{tier}-{i}.safetensors"),
+                &mut model,
+                spelling,
+                &FORMAT_TARGETS,
+            );
+            let report = apply_qwen_image_2_1_adapters(&mut model, &[lora(&file, 1.0)])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(report.applied, FORMAT_TARGETS.len(), "{name}");
+            assert!(report.unmatched_paths.is_empty(), "{name}");
+            for t in FORMAT_TARGETS {
+                assert_eq!(adapter_count(&mut model, t), 1, "{name}: {t}");
+            }
+            for t in FORMAT_NEIGHBOURS {
+                assert_eq!(
+                    adapter_count(&mut model, t),
+                    0,
+                    "{name}: {t} must stay bare"
+                );
+            }
+            if tier != "dense" {
+                for t in ["transformer_blocks.1.img_mlp.out", "proj_out"] {
+                    assert!(is_packed(&mut model, t), "{name}: {t} stays packed");
+                }
+            }
+            assert_moved(&name, &velocity(&model), &base);
+        }
+    }
+}
+
+/// The factor set of one third-party LyCORIS LoKr module.
+#[derive(Clone, Copy)]
+enum LycorisFactors {
+    /// Full `w1 [2, 2]`, low-rank `w2 = w2_a [out/2, 2] · w2_b [2, in/2]`, per-module alpha.
+    LowRank,
+    /// Both Kronecker factors full (LyCORIS then forces scale 1).
+    Full,
+    /// A Linear tucker right factor: `t2 [2, 2, 1, 1]`, `w2_a [2, out/2]`, `w2_b [2, in/2]`.
+    Tucker,
+    /// A spatial (conv) tucker core `[2, 2, 3, 3]` — no Linear form.
+    ConvTucker,
+}
+
+fn lycoris_lokr_file(
+    dir: &Path,
+    name: &str,
+    host: &mut QwenImage21Transformer,
+    module: fn(&str) -> String,
+    factors: LycorisFactors,
+    targets: &[&str],
+) -> PathBuf {
+    let mut entries = Vec::new();
+    for target in targets {
+        let (out, inp) = match host.adaptable_facts(&target.split('.').collect::<Vec<_>>()) {
+            Some(f) => (f.base_shape[0] as usize, f.base_shape[1] as usize),
+            None => (32, 32),
+        };
+        let key = module(target);
+        entries.push((format!("{key}.lokr_w1"), vec![2, 2], None));
+        match factors {
+            LycorisFactors::LowRank => {
+                entries.push((format!("{key}.lokr_w2_a"), vec![out / 2, 2], None));
+                entries.push((format!("{key}.lokr_w2_b"), vec![2, inp / 2], None));
+                entries.push((format!("{key}.alpha"), vec![], Some(1.0)));
+            }
+            LycorisFactors::Full => {
+                entries.push((format!("{key}.lokr_w2"), vec![out / 2, inp / 2], None));
+            }
+            LycorisFactors::Tucker | LycorisFactors::ConvTucker => {
+                let kernel = if matches!(factors, LycorisFactors::Tucker) {
+                    1
+                } else {
+                    3
+                };
+                entries.push((format!("{key}.lokr_t2"), vec![2, 2, kernel, kernel], None));
+                entries.push((format!("{key}.lokr_w2_a"), vec![2, out / 2], None));
+                entries.push((format!("{key}.lokr_w2_b"), vec![2, inp / 2], None));
+                entries.push((format!("{key}.alpha"), vec![], Some(1.0)));
+            }
+        }
+    }
+    let path = dir.join(name);
+    // No `networkType` stamp: a third-party file.
+    write_safetensors_with(&path, &entries, &[], 1.0);
+    path
+}
+
+/// Every unstamped LyCORIS LoKr layout — lycoris-lib `lycoris_…` and kohya `lora_unet_…` flattened
+/// keys, ai-toolkit's dotted `diffusion_model.…`, a Linear tucker `lokr_t2` — routes through
+/// `apply_lokr_thirdparty` and moves the velocity on the dense DiT and on a load-time Q4 / Q8 one,
+/// whichever kind the caller declared (the file carries no stamp to read it from).
+#[test]
+fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let targets = [
+        "transformer_blocks.0.attn.to_q",
+        "txt_in.in_layer",
+        "transformer_blocks.1.img_mlp.gate_layer",
+        "norm_out.linear",
+    ];
+    let layouts: [(&str, fn(&str) -> String, LycorisFactors); 4] = [
+        ("lycoris_ low-rank", lycoris, LycorisFactors::LowRank),
+        ("lora_unet_ full", kohya, LycorisFactors::Full),
+        (
+            "ai-toolkit diffusion_model.",
+            diffusion_model_ns,
+            LycorisFactors::LowRank,
+        ),
+        ("lycoris_ tucker", lycoris, LycorisFactors::Tucker),
+    ];
+    for (tier, build) in [
+        ("dense", dense as Build),
+        ("q4", packed_q4 as Build),
+        ("q8", packed_q8 as Build),
+    ] {
+        let base = velocity(&build());
+        for (i, (layout, module, factors)) in layouts.into_iter().enumerate() {
+            for spec_of in [lokr as fn(&Path, f32) -> AdapterSpec, lora] {
+                let name = format!("{tier}/{layout}");
+                let mut model = build();
+                let file = lycoris_lokr_file(
+                    tmp.path(),
+                    &format!("{tier}-lycoris-{i}.safetensors"),
+                    &mut model,
+                    module,
+                    factors,
+                    &targets,
+                );
+                let report = apply_qwen_image_2_1_adapters(&mut model, &[spec_of(&file, 1.0)])
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(report.applied, targets.len(), "{name}");
+                assert!(report.unmatched_paths.is_empty(), "{name}");
+                for t in targets {
+                    assert_eq!(adapter_count(&mut model, t), 1, "{name}: {t}");
+                }
+                assert_moved(&name, &velocity(&model), &base);
+            }
+        }
+    }
+}
+
+/// A LyCORIS LoHa applies under its `lycoris_…`, kohya `lora_unet_…`, namespaced
+/// `diffusion_model.…` and raw PEFT `base_model.model.…` spellings — materialized over the dense
+/// DiT and over a load-time Q4 one alike (MLX has no LoHa refusal; candle folds it bf16-only).
+#[test]
+fn loha_applies_under_every_key_spelling_on_dense_and_packed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let targets = ["transformer_blocks.0.attn.to_q", "proj_out"];
+    let spellings: [fn(&str) -> String; 4] = [lycoris, kohya, diffusion_model_ns, peft_wrapper];
+    for (tier, build) in [("dense", dense as Build), ("q4", packed_q4 as Build)] {
+        let base = velocity(&build());
+        for (i, module) in spellings.into_iter().enumerate() {
+            let name = format!("{tier}/{}", module("x"));
+            let mut model = build();
+            let mut entries = Vec::new();
+            for target in targets {
+                let (out, inp) = base_shape(&mut model, target);
+                let key = module(target);
+                entries.push((format!("{key}.hada_w1_a"), vec![out, 2], None));
+                entries.push((format!("{key}.hada_w1_b"), vec![2, inp], None));
+                entries.push((format!("{key}.hada_w2_a"), vec![out, 2], None));
+                entries.push((format!("{key}.hada_w2_b"), vec![2, inp], None));
+                entries.push((format!("{key}.alpha"), vec![], Some(2.0)));
+            }
+            let file = tmp.path().join(format!("{tier}-loha-{i}.safetensors"));
+            write_safetensors_with(&file, &entries, &[], 2.0);
+            let report = apply_qwen_image_2_1_adapters(&mut model, &[lora(&file, 1.0)])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(report.applied, targets.len(), "{name}");
+            assert!(report.unmatched_paths.is_empty(), "{name}");
+            assert_moved(&name, &velocity(&model), &base);
+        }
+    }
+}
+
+/// The key / metadata layout the MLX trainer (sc-24159) writes — bare dotted keys; LoRA
+/// `lora_A`/`lora_B` plus a `[1]` `.alpha` under `networkType=lora`; LoKr `lokr_w1` plus low-rank
+/// `lokr_w2_a`/`lokr_w2_b` (the trainer's `factorization(dim, -1)` split) under `networkType=lokr`
+/// with `rank`/`alpha`/`decomposeFactor` and the provenance stamp — applies on the dense DiT and
+/// over a load-time Q4 one. The candle twin pins the same layout loading there unconverted.
+#[test]
+fn the_trainer_output_layout_applies_on_dense_and_packed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let targets = [
+        "transformer_blocks.0.attn.to_q",
+        "transformer_blocks.1.img_mlp.proj",
+        "transformer_blocks.1.img_mlp.out",
+    ];
+    let provenance = [
+        ("family", "qwen-image-2-1"),
+        ("baseModel", "qwen_image_2_1"),
+        ("ss_base_model_version", "qwen_image_2_1"),
+    ];
+    for (tier, build) in [("dense", dense as Build), ("q4", packed_q4 as Build)] {
+        let base = velocity(&build());
+        for network in ["lora", "lokr"] {
+            let name = format!("{tier}/trainer-{network}");
+            let mut model = build();
+            let mut entries = Vec::new();
+            for target in targets {
+                let (out, inp) = base_shape(&mut model, target);
+                if network == "lora" {
+                    entries.push((format!("{target}.lora_A.weight"), vec![RANK, inp], None));
+                    entries.push((format!("{target}.lora_B.weight"), vec![out, RANK], None));
+                    entries.push((format!("{target}.alpha"), vec![1], Some(RANK as f32)));
+                } else {
+                    let (out_a, out_b) = mlx_gen::train::lora::factorization(out as i32, -1);
+                    let (in_a, in_b) = mlx_gen::train::lora::factorization(inp as i32, -1);
+                    let (out_a, out_b) = (out_a as usize, out_b as usize);
+                    let (in_a, in_b) = (in_a as usize, in_b as usize);
+                    entries.push((format!("{target}.lokr_w1"), vec![out_a, in_a], None));
+                    entries.push((format!("{target}.lokr_w2_a"), vec![out_b, 2], None));
+                    entries.push((format!("{target}.lokr_w2_b"), vec![2, in_b], None));
+                }
+            }
+            let rank = RANK.to_string();
+            let mut meta: Vec<(&str, &str)> = provenance.to_vec();
+            meta.extend([
+                ("networkType", network),
+                ("rank", rank.as_str()),
+                ("alpha", rank.as_str()),
+            ]);
+            if network == "lokr" {
+                meta.push(("decomposeFactor", "-1"));
+            }
+            let file = tmp
+                .path()
+                .join(format!("{tier}-trainer-{network}.safetensors"));
+            write_safetensors_with(&file, &entries, &meta, 1.0);
+            let spec = if network == "lora" {
+                lora(&file, 1.0)
+            } else {
+                lokr(&file, 1.0)
+            };
+            let report = apply_qwen_image_2_1_adapters(&mut model, &[spec])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(report.applied, targets.len(), "{name}");
+            assert!(report.unmatched_paths.is_empty(), "{name}");
+            assert_moved(&name, &velocity(&model), &base);
+        }
+    }
+}
+
+/// Files the DiT cannot serve are refused, never silently skipped: a LyCORIS LoKr whose module
+/// reaches no Linear (refused by name), and a spatial (conv) tucker LoKr, which has no Linear
+/// reconstruction.
+#[test]
+fn unservable_lycoris_lokr_files_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut model = dense();
+    let unmatched = lycoris_lokr_file(
+        tmp.path(),
+        "unmatched.safetensors",
+        &mut model,
+        lycoris,
+        LycorisFactors::Full,
+        &[
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.9.attn.to_q",
+        ],
+    );
+    let err = apply_qwen_image_2_1_adapters(&mut model, &[lokr(&unmatched, 1.0)])
+        .expect_err("an unmatched LyCORIS module must refuse the install")
+        .to_string();
+    assert!(
+        err.contains("lycoris_transformer_blocks_9_attn_to_q"),
+        "the refusal names the key: {err}"
+    );
+
+    let mut model = dense();
+    let conv = lycoris_lokr_file(
+        tmp.path(),
+        "conv.safetensors",
+        &mut model,
+        lycoris,
+        LycorisFactors::ConvTucker,
+        &["transformer_blocks.0.attn.to_q"],
+    );
+    assert!(
+        apply_qwen_image_2_1_adapters(&mut model, &[lokr(&conv, 1.0)]).is_err(),
+        "a conv tucker LoKr has no Linear form"
+    );
+}

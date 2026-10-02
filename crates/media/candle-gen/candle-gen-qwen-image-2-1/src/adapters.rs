@@ -28,14 +28,35 @@
 //! [`ProjectionTable`], the projection set `transformer/config.json` declares, checking LoRA and
 //! LoHa factor shapes against each projection's `[out, in]` (LoKr is key-matched there; its
 //! Kronecker factor shapes are checked at install).
+//!
+//! **Formats (sc-24158)** — every spelling the MLX twin's shared loader accepts for this DiT:
+//!
+//! * **PEFT / diffusers / ComfyUI / ai-toolkit LoRA** — `lora_A`/`lora_B` (optionally
+//!   `.default`) or `lora_down`/`lora_up` factors plus an optional per-module `.alpha`, under no
+//!   namespace, `transformer.`, `diffusion_model.` or a raw PEFT `base_model.model.` wrapper.
+//! * **kohya LoRA** — `lora_unet_<dotted path with . → _>` (`lora_unet_txt_in_in_layer`,
+//!   `lora_unet_transformer_blocks_0_attn_to_out_0`, `lora_unet_norm_out_linear`, …), resolved by
+//!   exact match against the flattened projection table, so names that already contain `_`
+//!   (`img_mlp.gate_layer`, `to_out.0`) are never mis-split.
+//! * **SceneWorks / PEFT-stamped LoKr** (`networkType=lokr`, global `rank`/`alpha`) — the shared
+//!   additive install.
+//! * **Third-party LyCORIS LoKr** (`lokr_*` factors with no `networkType` stamp — lycoris-lib's
+//!   `lycoris_…`, kohya's `lora_unet_…`, ai-toolkit's dotted `diffusion_model.…`) — this crate's
+//!   [`install`] derives the LyCORIS **per-module** scale (`alpha / lora_dim`, forced 1 when both
+//!   Kronecker factors are full), collapses a Linear tucker `lokr_t2` (`[r, r, 1, 1]`) into its
+//!   right factor, and attaches the structured Kronecker residual — so it serves the dense and the
+//!   packed tiers alike. Flattened keys resolve prefix-agnostically by the longest `_`-delimited
+//!   projection stem, as the MLX `apply_lokr_thirdparty` does.
+//! * **LyCORIS LoHa** — folded (bf16 tier only, see above), under the same key spellings.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use candle_core::Device;
+use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen::train::merge::{parse_loha_thirdparty, read_adapter, AdapterFile, ThirdPartyLoha};
+use candle_gen::quant::{AdaptLinear, LokrFactors};
+use candle_gen::train::merge::{parse_loha_thirdparty, read_adapter, read_scalar_opt, AdapterFile};
 use candle_gen::{CandleError as Error, Result};
 
 use crate::config::TransformerConfig;
@@ -94,6 +115,9 @@ fn check_spec(spec: &AdapterSpec) -> Result<()> {
 pub struct ProjectionTable {
     shapes: BTreeMap<String, (usize, usize)>,
     kohya: HashMap<String, String>,
+    /// Flattened stem (dotted path with `.` → `_`, no prefix) → dotted path: the prefix-agnostic
+    /// LyCORIS resolution table ([`wmeta::resolve_lokr_path`]).
+    stems: BTreeMap<String, String>,
 }
 
 impl ProjectionTable {
@@ -106,7 +130,12 @@ impl ProjectionTable {
             .keys()
             .map(|path| (kohya_spelling(path), path.clone()))
             .collect();
-        Self { shapes, kohya }
+        let stems = wmeta::kohya_table(&shapes.keys().cloned().collect::<Vec<_>>());
+        Self {
+            shapes,
+            kohya,
+            stems,
+        }
     }
 
     /// The table for the snapshot at `root` (`<root>/transformer/config.json`).
@@ -116,12 +145,20 @@ impl ProjectionTable {
         )?))
     }
 
-    /// The projection a namespace-stripped module name addresses, by its dotted or kohya spelling.
-    fn resolve(&self, module: &str) -> Option<(&str, (usize, usize))> {
+    /// The projection a namespace-stripped module name addresses, by its dotted or exact kohya
+    /// (`lora_unet_`) spelling — what the shared LoRA / stamped-LoKr install matches. With
+    /// `lycoris`, a third-party LyCORIS key additionally resolves prefix-agnostically
+    /// (`lycoris_…`, `lora_unet_…`, any `<PREFIX>_<stem>`) by the longest `_`-delimited stem,
+    /// exactly as the MLX `apply_lokr_thirdparty` / `apply_loha_thirdparty` resolve it.
+    fn resolve(&self, module: &str, lycoris: bool) -> Option<(&str, (usize, usize))> {
         let path = if self.shapes.contains_key(module) {
             module
+        } else if let Some(path) = self.kohya.get(module) {
+            path.as_str()
+        } else if lycoris {
+            wmeta::resolve_lokr_path(module, &self.stems)?
         } else {
-            self.kohya.get(module)?.as_str()
+            return None;
         };
         self.shapes
             .get_key_value(path)
@@ -181,8 +218,28 @@ pub fn plan(table: &ProjectionTable, specs: &[AdapterSpec], tier: Tier) -> Resul
                 plan.loha_fold_shapes.push(shape);
             }
         } else if wmeta::keys_contain_lokr(entries.iter().map(|(name, _)| *name)) {
-            // Key-matched only: a LoKr's Kronecker factor shapes are checked at install.
-            resolve_modules(spec, table, &entries, Format::Lokr)?;
+            let stamped = wmeta::is_lokr_network_type(
+                wmeta::safetensors_file_metadata(&spec.path)?
+                    .get("networkType")
+                    .map(String::as_str),
+            );
+            if stamped {
+                if spec.kind == AdapterKind::Lora {
+                    return Err(Error::Msg(format!(
+                        "{MODEL_ID}: adapter {} was declared LoRA but its metadata says \
+                         networkType=lokr",
+                        spec.path.display()
+                    )));
+                }
+                // Key-matched only: a LoKr's Kronecker factor shapes are checked at install.
+                resolve_modules(spec, table, &entries, Format::Lokr)?;
+            } else {
+                for (key, _, factors) in
+                    resolve_modules(spec, table, &entries, Format::LokrThirdParty)?
+                {
+                    check_thirdparty_lokr_factors(spec, &key, &factors)?;
+                }
+            }
             plan.additive.push(spec.clone());
         } else {
             for (key, (out_f, in_f), factors) in
@@ -217,7 +274,11 @@ pub fn plan(table: &ProjectionTable, specs: &[AdapterSpec], tier: Tier) -> Resul
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Format {
     Lora,
+    /// A `networkType=lokr`-stamped (SceneWorks / PEFT) LoKr: global `rank`/`alpha`, shared install.
     Lokr,
+    /// An unstamped LyCORIS LoKr: per-module `.alpha`, optional tucker `lokr_t2`, this crate's
+    /// install.
+    LokrThirdParty,
     Loha,
 }
 
@@ -226,8 +287,15 @@ impl Format {
         match self {
             Format::Lora => "LoRA",
             Format::Lokr => "LoKr",
+            Format::LokrThirdParty => "LyCORIS LoKr",
             Format::Loha => "LoHa",
         }
+    }
+
+    /// Whether this format's install resolves keys prefix-agnostically (the LyCORIS routes) or
+    /// only by the exact dotted / `lora_unet_` spelling (the shared additive install).
+    fn lycoris(self) -> bool {
+        matches!(self, Format::LokrThirdParty | Format::Loha)
     }
 
     /// Split `key` into its raw module path and factor name, mirroring what the install consumes
@@ -253,6 +321,16 @@ impl Format {
                 (".lokr_w2_a", "lokr_w2_a"),
                 (".lokr_w2_b", "lokr_w2_b"),
                 (".lokr_w2", "lokr_w2"),
+            ],
+            Format::LokrThirdParty => &[
+                (".lokr_w1_a", "lokr_w1_a"),
+                (".lokr_w1_b", "lokr_w1_b"),
+                (".lokr_w1", "lokr_w1"),
+                (".lokr_w2_a", "lokr_w2_a"),
+                (".lokr_w2_b", "lokr_w2_b"),
+                (".lokr_w2", "lokr_w2"),
+                (".lokr_t2", "lokr_t2"),
+                (".alpha", "alpha"),
             ],
             Format::Loha => &[
                 (".hada_w1_a", "hada_w1_a"),
@@ -314,12 +392,13 @@ fn resolve_modules<'a>(
     let mut targeted: HashMap<&str, &str> = HashMap::new();
     let mut resolved = Vec::with_capacity(modules.len());
     for (module, (raw, factors)) in modules {
-        let Some((path, shape)) = table.resolve(module) else {
+        let Some((path, shape)) = table.resolve(module, format.lycoris()) else {
             return Err(Error::Msg(format!(
                 "{MODEL_ID}: {kind} adapter {file} targets `{raw}`, which matches no DiT \
-                 projection; every target must apply — expected diffusers/PEFT keys over \
-                 `transformer_blocks.{{i}}.{{attn.to_q|to_k|to_v|to_out.0, \
-                 img_mlp.gate_layer|proj|out}}` and the embedder / modulation / output projections"
+                 projection; every target must apply — expected diffusers/PEFT keys (or their \
+                 kohya `lora_unet_` spelling) over `transformer_blocks.{{i}}.{{attn.to_q|to_k|\
+                 to_v|to_out.0, img_mlp.gate_layer|proj|out}}` and the embedder / modulation / \
+                 output projections"
             )));
         };
         if let Some(previous) = targeted.insert(path, raw) {
@@ -344,6 +423,43 @@ fn admit_loha(spec: &AdapterSpec, tier: Tier) -> Result<()> {
         return Err(Error::Unsupported(loha_on_packed_tier_refusal(
             tier, &spec.path,
         )));
+    }
+    Ok(())
+}
+
+/// Header-level shape admission for one third-party LyCORIS LoKr module: each Kronecker factor must
+/// be present (full, or a low-rank `_a`/`_b` pair), every `lokr_w*` factor 2-D, and a tucker
+/// `lokr_t2` the `[r, r, 1, 1]` Linear form — a spatial (`kH·kW > 1`) tucker is a conv LoKr this
+/// DiT has no target for. Whether the factors reconstruct the projection's `[out, in]` is checked
+/// at install, where the structured residual is built.
+fn check_thirdparty_lokr_factors(
+    spec: &AdapterSpec,
+    key: &str,
+    factors: &BTreeMap<&'static str, &[usize]>,
+) -> Result<()> {
+    let file = spec.path.display();
+    let has = |factor: &str| factors.contains_key(factor);
+    let w1 = has("lokr_w1") || (has("lokr_w1_a") && has("lokr_w1_b"));
+    let w2 = has("lokr_w2") || (has("lokr_w2_a") && has("lokr_w2_b"));
+    if !w1 || !w2 {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: LyCORIS LoKr `{key}` in {file} is missing a Kronecker factor (need \
+             lokr_w1 or lokr_w1_a+lokr_w1_b, and lokr_w2 or lokr_w2_a+lokr_w2_b)"
+        )));
+    }
+    for (factor, shape) in factors {
+        let ok = match *factor {
+            "alpha" => shape.iter().product::<usize>() <= 1,
+            "lokr_t2" => shape.len() == 4 && shape[2] == 1 && shape[3] == 1,
+            _ => shape.len() == 2,
+        };
+        if !ok {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: LyCORIS LoKr `{key}` in {file} has {factor} {shape:?}, which is not \
+                 the Linear form (2-D lokr_w* factors, a [r, r, 1, 1] tucker lokr_t2, a scalar \
+                 alpha); a conv LoKr has no target on this DiT"
+            )));
+        }
     }
     Ok(())
 }
@@ -383,19 +499,62 @@ fn kohya_spelling(path: &str) -> String {
     format!("lora_unet_{}", path.replace('.', "_"))
 }
 
-/// The dotted / kohya-flattened spellings an adapter key may use for the projection at `path`.
-fn key_candidates(path: &str) -> [String; 2] {
-    [path.to_string(), kohya_spelling(path)]
-}
+/// The wrapper a raw PEFT `PeftModel.save_pretrained` puts in front of every module path.
+const PEFT_WRAPPER_PREFIX: &str = "base_model.model.";
 
-/// Strip a leading `transformer.` / `diffusion_model.` namespace.
+/// Strip a leading PEFT `base_model.model.` wrapper, then a `transformer.` / `diffusion_model.`
+/// namespace — the same normalisation the shared additive install applies.
 fn strip_namespace(key: &str) -> &str {
+    let key = key.strip_prefix(PEFT_WRAPPER_PREFIX).unwrap_or(key);
     for prefix in wmeta::COMMON_LORA_PREFIXES {
         if let Some(rest) = key.strip_prefix(prefix) {
             return rest;
         }
     }
     key
+}
+
+/// Resolve a LyCORIS file's raw module groups to DiT projections, strictly: two raw keys that
+/// normalize to one module (`transformer.X` beside `X`) or that resolve to one projection (`X`
+/// beside `lora_unet_X` / `lycoris_X`) are refused rather than collapsed or applied twice, and a
+/// group that reaches no projection is refused by name. Returns projection path → (raw key, group).
+fn resolve_lycoris_groups<G>(
+    spec: &AdapterSpec,
+    table: &ProjectionTable,
+    kind: &str,
+    groups: BTreeMap<String, G>,
+) -> Result<HashMap<String, (String, G)>> {
+    let file = spec.path.display();
+    let mut modules: HashMap<String, String> = HashMap::new();
+    let mut resolved: HashMap<String, (String, G)> = HashMap::new();
+    for (raw, group) in groups {
+        let module = strip_namespace(&raw).to_string();
+        if let Some(previous) = modules.insert(module.clone(), raw.clone()) {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: {kind} adapter {file} carries both `{previous}` and `{raw}`, which \
+                 name the same module `{module}`; refusing an ambiguous apply"
+            )));
+        }
+        let Some((path, _)) = table.resolve(&module, true) else {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: {kind} adapter {file} targets `{raw}`, which matches no DiT \
+                 projection; every target must apply"
+            )));
+        };
+        if let Some((previous, _)) = resolved.get(path) {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: {kind} adapter {file} carries both `{previous}` and `{raw}`, which \
+                 target the same projection `{path}`; refusing a double apply"
+            )));
+        }
+        resolved.insert(path.to_owned(), (raw, group));
+    }
+    if resolved.is_empty() {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: {kind} adapter {file} matched no DiT projection"
+        )));
+    }
+    Ok(resolved)
 }
 
 /// Fold one LoHa file into the dense DiT at `spec.scale`, strictly: every module group must reach a
@@ -423,41 +582,14 @@ fn fold_loha(
             stray.len()
         )));
     }
-    // Normalized module → (raw module key, factors). Two raw keys that normalize to one module
-    // (`transformer.X` and `X`) are refused, never silently collapsed to whichever sorts last.
-    let mut groups: BTreeMap<String, (String, ThirdPartyLoha)> = BTreeMap::new();
-    for (raw, group) in parse_loha_thirdparty(file)? {
-        let module = strip_namespace(&raw).to_string();
-        if let Some((previous, _)) = groups.get(&module) {
-            return Err(Error::Msg(format!(
-                "{MODEL_ID}: LoHa adapter {} carries both `{previous}` and `{raw}`, which name the \
-                 same module `{module}`; refusing an ambiguous apply",
-                spec.path.display()
-            )));
-        }
-        groups.insert(module, (raw, group));
-    }
-    let mut matched = HashSet::new();
+    let table = ProjectionTable::from_config(transformer.config());
+    let resolved = resolve_lycoris_groups(spec, &table, "LoHa", parse_loha_thirdparty(file)?)?;
     let mut folded = 0usize;
     transformer.visit_adaptable_mut(&mut |path, linear| {
-        let hits: Vec<String> = key_candidates(path)
-            .into_iter()
-            .filter(|key| groups.contains_key(key))
-            .collect();
-        let key = match hits.as_slice() {
-            [] => return Ok(()),
-            [key] => key,
-            [first, second, ..] => {
-                return Err(candle_core::Error::Msg(format!(
-                    "{MODEL_ID}: LoHa adapter {} carries both `{first}` and `{second}`, which \
-                     target the same projection `{path}`; refusing a double apply",
-                    spec.path.display()
-                )))
-            }
+        let Some((raw, group)) = resolved.get(path) else {
+            return Ok(());
         };
-        let (raw, group) = &groups[key];
-        matched.insert(key.clone());
-        fn dims(t: &Option<candle_core::Tensor>) -> Option<&[usize]> {
+        fn dims(t: &Option<Tensor>) -> Option<&[usize]> {
             t.as_ref().map(|t| t.dims())
         }
         check_loha_orientation(
@@ -480,31 +612,199 @@ fn fold_loha(
         folded += 1;
         Ok(())
     })?;
-    let unmatched: Vec<&String> = groups
-        .iter()
-        .filter(|(module, _)| !matched.contains(*module))
-        .map(|(_, (raw, _))| raw)
-        .collect();
-    if let Some(first) = unmatched.first() {
-        return Err(Error::Msg(format!(
-            "{MODEL_ID}: LoHa adapter {} has {} module(s) that match no DiT projection (first: \
-             `{first}`); every target must apply",
-            spec.path.display(),
-            unmatched.len()
-        )));
-    }
-    if folded == 0 {
-        return Err(Error::Msg(format!(
-            "{MODEL_ID}: LoHa adapter {} matched no DiT projection",
-            spec.path.display()
-        )));
-    }
+    // The table is the visitor walk (pinned by a test), so every resolved group was visited.
+    debug_assert_eq!(folded, resolved.len());
     Ok(folded)
 }
 
-/// Install `specs` on a loaded DiT: LoHa files fold into the dense weights (bf16 tier only), then
-/// every LoRA / LoKr file attaches as a stacked additive residual. `tier` is the tier the DiT was
-/// loaded from; `device` the DiT's device. A no-op for an empty stack.
+/// Whether `file` is a **third-party** LyCORIS LoKr: `lokr_*` factors without the SceneWorks /
+/// PEFT `networkType=lokr` stamp (whose global `rank`/`alpha` the shared install scales by).
+fn is_lycoris_lokr(file: &AdapterFile) -> bool {
+    wmeta::keys_contain_lokr(file.tensors.keys().map(String::as_str)) && !file.declares_lokr()
+}
+
+/// One module of a third-party LyCORIS LoKr: each Kronecker factor full or low-rank, an optional
+/// tucker `lokr_t2` on the right factor, and an optional per-module `.alpha`.
+#[derive(Default)]
+struct LycorisLokr {
+    w1: Option<Tensor>,
+    w1_a: Option<Tensor>,
+    w1_b: Option<Tensor>,
+    w2: Option<Tensor>,
+    w2_a: Option<Tensor>,
+    w2_b: Option<Tensor>,
+    t2: Option<Tensor>,
+    alpha: Option<f32>,
+}
+
+impl LycorisLokr {
+    /// LyCORIS `lora_dim`, from whichever decomposed factor is present, in the MLX order:
+    /// `lokr_w1_a` `[a, r]`, the tucker `lokr_t2` `[r, r, 1, 1]`, then `lokr_w2_a` `[b, r]`.
+    /// `None` when both factors are full.
+    fn rank(&self) -> Result<Option<f64>> {
+        let (factor, tensor, axis) = if let Some(t) = &self.w1_a {
+            ("lokr_w1_a", t, 1)
+        } else if let Some(t) = &self.t2 {
+            ("lokr_t2", t, 0)
+        } else if let Some(t) = &self.w2_a {
+            ("lokr_w2_a", t, 1)
+        } else {
+            return Ok(None);
+        };
+        match tensor.dims().get(axis) {
+            Some(&rank) if rank > 0 => Ok(Some(rank as f64)),
+            _ => Err(Error::Msg(format!(
+                "LyCORIS LoKr {factor} {:?} carries no rank",
+                tensor.dims()
+            ))),
+        }
+    }
+
+    /// LyCORIS `scale = alpha / lora_dim` (alpha defaulting to `lora_dim`), forced 1 when both
+    /// Kronecker factors are full (`LokrModule.__init__`: `if use_w1 and use_w2: alpha = lora_dim`).
+    fn scale(&self) -> Result<f64> {
+        Ok(match self.rank()? {
+            None => 1.0,
+            Some(rank) => self.alpha.map_or(rank, f64::from) / rank,
+        })
+    }
+
+    /// The structured Kronecker residual for a `[out, in]` projection at `strength`, with the
+    /// per-module LyCORIS scale baked in. A Linear tucker right factor
+    /// (`einsum("ijhw,ip,jr->prhw", t2, w2_a, w2_b)` with `h = w = 1`) collapses to the 2-D
+    /// `w2_aᵀ · t2 · w2_b` first, so it is deferrable like any other Linear LoKr. `None` when the
+    /// factors do not reconstruct `base_shape`.
+    fn factors(&self, strength: f32, base_shape: (usize, usize)) -> Result<Option<LokrFactors>> {
+        let scale = self.scale()? * f64::from(strength);
+        let collapsed = match (&self.w2, &self.t2, &self.w2_a, &self.w2_b) {
+            (None, Some(t2), Some(w2_a), Some(w2_b)) => {
+                Some(collapse_linear_tucker(t2, w2_a, w2_b)?)
+            }
+            _ => None,
+        };
+        let (w2, w2_a, w2_b) = match &collapsed {
+            Some(w2) => (Some(w2), None, None),
+            None => (self.w2.as_ref(), self.w2_a.as_ref(), self.w2_b.as_ref()),
+        };
+        LokrFactors::build(
+            scale,
+            base_shape,
+            self.w1.as_ref(),
+            self.w1_a.as_ref(),
+            self.w1_b.as_ref(),
+            w2,
+            None,
+            w2_a,
+            w2_b,
+        )
+    }
+}
+
+/// `w2_aᵀ · t2[:, :, 0, 0] · w2_b` — the LyCORIS tucker rebuild of a Linear (1×1-kernel) LoKr's
+/// right factor. A spatial kernel is a conv LoKr, refused.
+fn collapse_linear_tucker(t2: &Tensor, w2_a: &Tensor, w2_b: &Tensor) -> Result<Tensor> {
+    let (core, wa, wb) = (t2.dims(), w2_a.dims(), w2_b.dims());
+    let linear = core.len() == 4
+        && core[2] == 1
+        && core[3] == 1
+        && wa.len() == 2
+        && wb.len() == 2
+        && wa[0] == core[0]
+        && wb[0] == core[1];
+    if !linear {
+        return Err(Error::Msg(format!(
+            "LyCORIS LoKr tucker lokr_t2 {core:?} / lokr_w2_a {wa:?} / lokr_w2_b {wb:?} is not the \
+             Linear form ([i, j, 1, 1], [i, p], [j, r])"
+        )));
+    }
+    let core = t2.to_dtype(DType::F32)?.reshape((core[0], core[1]))?;
+    let wa = w2_a.to_dtype(DType::F32)?;
+    let wb = w2_b.to_dtype(DType::F32)?;
+    Ok(wa.t()?.matmul(&core)?.matmul(&wb)?)
+}
+
+/// Group a third-party LoKr file by raw module key, strictly: a key that is neither a LoKr factor
+/// nor a per-module `.alpha` is refused, never skipped.
+fn parse_lycoris_lokr(
+    spec: &AdapterSpec,
+    file: &AdapterFile,
+) -> Result<BTreeMap<String, LycorisLokr>> {
+    let mut groups: BTreeMap<String, LycorisLokr> = BTreeMap::new();
+    for (key, tensor) in &file.tensors {
+        if let Some(raw) = key.strip_suffix(".alpha") {
+            let alpha = read_scalar_opt(key, "alpha", tensor)?;
+            groups.entry(raw.to_owned()).or_default().alpha = alpha;
+            continue;
+        }
+        let Some((raw, factor)) = wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES) else {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: LyCORIS LoKr adapter {} carries `{key}`, which is not a LoKr factor; \
+                 refusing a partial apply",
+                spec.path.display()
+            )));
+        };
+        let group = groups.entry(raw.to_owned()).or_default();
+        let slot = match factor {
+            "lokr_w1" => &mut group.w1,
+            "lokr_w1_a" => &mut group.w1_a,
+            "lokr_w1_b" => &mut group.w1_b,
+            "lokr_w2" => &mut group.w2,
+            "lokr_w2_a" => &mut group.w2_a,
+            "lokr_w2_b" => &mut group.w2_b,
+            _ => &mut group.t2,
+        };
+        *slot = Some(tensor.clone());
+    }
+    Ok(groups)
+}
+
+/// Attach one third-party LyCORIS LoKr file as structured Kronecker residuals — over a dense or a
+/// packed projection alike (the base is never touched). Strict: every module must resolve to a
+/// projection and its factors must reconstruct that projection's `[out, in]`.
+fn install_lycoris_lokr(
+    transformer: &mut QwenImage21Transformer,
+    spec: &AdapterSpec,
+    file: &AdapterFile,
+    device: &Device,
+) -> Result<usize> {
+    let table = ProjectionTable::from_config(transformer.config());
+    let resolved = resolve_lycoris_groups(
+        spec,
+        &table,
+        "LyCORIS LoKr",
+        parse_lycoris_lokr(spec, file)?,
+    )?;
+    let mut attached = 0usize;
+    transformer.visit_adaptable_mut(&mut |path, linear: &mut AdaptLinear| {
+        let Some((raw, group)) = resolved.get(path) else {
+            return Ok(());
+        };
+        let message = |e: Error| candle_core::Error::Msg(format!("LyCORIS LoKr `{raw}`: {e}"));
+        let factors = group
+            .factors(spec.scale, linear.base_shape())
+            .map_err(message)?
+            .ok_or_else(|| {
+                let (out_f, in_f) = linear.base_shape();
+                candle_core::Error::Msg(format!(
+                    "{MODEL_ID}: LyCORIS LoKr `{raw}` in {} does not reconstruct `{path}`'s \
+                     [out={out_f}, in={in_f}] as a Kronecker product",
+                    spec.path.display()
+                ))
+            })?;
+        linear
+            .push_lokr_structured(factors.to_device(device).map_err(message)?)
+            .map_err(message)?;
+        attached += 1;
+        Ok(())
+    })?;
+    debug_assert_eq!(attached, resolved.len());
+    Ok(attached)
+}
+
+/// Install `specs` on a loaded DiT: LoHa files fold into the dense weights (bf16 tier only),
+/// third-party LyCORIS LoKr files attach as structured residuals, then every LoRA / stamped LoKr
+/// file attaches as a stacked additive residual through the shared install. `tier` is the tier the
+/// DiT was loaded from; `device` the DiT's device. A no-op for an empty stack.
 pub fn install(
     transformer: &mut QwenImage21Transformer,
     specs: &[AdapterSpec],
@@ -522,6 +822,8 @@ pub fn install(
         if is_loha(&file) {
             admit_loha(spec, tier)?;
             report.loha_folds += fold_loha(transformer, spec, &file)?;
+        } else if is_lycoris_lokr(&file) {
+            report.residuals += install_lycoris_lokr(transformer, spec, &file, device)?;
         } else {
             additive.push(spec.clone());
         }
@@ -536,9 +838,9 @@ pub fn install(
     if let Some(first) = applied.skipped_targets.first() {
         return Err(Error::Msg(format!(
             "{MODEL_ID}: {} adapter target(s) match no DiT projection (first: `{first}`); every \
-             target must apply — expected diffusers/PEFT keys over `transformer_blocks.{{i}}.\
-             {{attn.to_q|to_k|to_v|to_out.0, img_mlp.gate_layer|proj|out}}` and the embedder / \
-             modulation / output projections",
+             target must apply — expected diffusers/PEFT keys (or their kohya `lora_unet_` \
+             spelling) over `transformer_blocks.{{i}}.{{attn.to_q|to_k|to_v|to_out.0, \
+             img_mlp.gate_layer|proj|out}}` and the embedder / modulation / output projections",
             applied.skipped_targets.len()
         )));
     }
@@ -549,6 +851,6 @@ pub fn install(
             applied.skipped_keys
         )));
     }
-    report.residuals = applied.applied;
+    report.residuals += applied.applied;
     Ok(report)
 }

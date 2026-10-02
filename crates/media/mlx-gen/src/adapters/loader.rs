@@ -836,10 +836,13 @@ pub fn apply_lora_peft(
     let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
     for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
         // The down/up factors always carry the file's namespace prefix. `lora_A`/`lora_B` (PEFT) and
-        // `lora_down`/`lora_up` (diffusers/ComfyUI) are interchangeable spellings of the same role.
+        // `lora_down`/`lora_up` (diffusers/ComfyUI) are interchangeable spellings of the same role,
+        // and a PEFT export that kept its adapter name writes `lora_A.default` (sc-24158 — the
+        // candle `install_dotted_adapters` and the kohya loader below already accept it).
         if let Some(rest) = key.strip_prefix(prefix) {
             if let Some(path) = rest
                 .strip_suffix(".lora_A.weight")
+                .or_else(|| rest.strip_suffix(".lora_A.default.weight"))
                 .or_else(|| rest.strip_suffix(".lora_down.weight"))
             {
                 groups.entry(path.to_string()).or_default().a = Some(w.require(&key)?.clone());
@@ -847,6 +850,7 @@ pub fn apply_lora_peft(
             }
             if let Some(path) = rest
                 .strip_suffix(".lora_B.weight")
+                .or_else(|| rest.strip_suffix(".lora_B.default.weight"))
                 .or_else(|| rest.strip_suffix(".lora_up.weight"))
             {
                 groups.entry(path.to_string()).or_default().b = Some(w.require(&key)?.clone());
