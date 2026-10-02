@@ -127,7 +127,8 @@ use crate::reference::{
     calculate_dimensions, prepare_references, reference_fit, PreparedReference,
 };
 use crate::text_encoder::{
-    prompt_template, prompt_template_ti2i, system_prompt_drop_count, QwenImage21TextEncoder,
+    image_pad_token_id, prompt_template, prompt_template_ti2i, system_prompt_drop_count,
+    QwenImage21TextEncoder,
 };
 use crate::transformer::{JointLayout, QwenImage21Transformer, BLOCK_ADAPTER_TARGETS};
 use crate::vae::QwenImage21Vae;
@@ -404,6 +405,12 @@ pub struct TrainingShape {
     pub largest_reference_tokens: u64,
     /// Edit runs: reference latent tokens cached across the whole dataset. `0` for text-to-image.
     pub reference_cache_tokens: u64,
+    /// Score elements (per head) of the block-causal **prefix** attention calls for the costliest
+    /// prompt — `Σ (end − start)·end` over its layout's prefix segments ([`prefix_score_elements`]):
+    /// each prefix segment's rows attend to every key up to that segment's end. `0` falls back to
+    /// the whole prefix squared (`(caption_tokens + reference_tokens)²`), which is exact for a
+    /// text-only prefix and an upper bound otherwise.
+    pub prefix_scores: u64,
     /// Dataset items (each caches one caption feature and one latent).
     pub items: u64,
     /// Bytes per element of the DiT compute dtype (2 for bf16, 4 for f32). The text encoder's
@@ -444,9 +451,10 @@ impl TrainingFootprint {
 /// The DiT working set follows [`QwenImage21Transformer::forward_train`]'s own block structure:
 /// one block retains [`BLOCK_SAVED_HIDDEN`] compute-width + [`BLOCK_SAVED_HIDDEN_F32`] f32 `[S,
 /// inner]` tensors, `mlp_ratio ·` [`BLOCK_SAVED_PER_MLP_RATIO`] SwiGLU-wide ones, and its attention
-/// scores — `heads·(T·S + P²)` elements, `P` the prefix (the text plus, for an edit run, every
-/// condition block; the target rows attend to every key, the block-causal prefix rows to the
-/// prefix), each held [`SCORE_COMPUTE_TENSORS`] times at the
+/// scores — `heads·(T·S + Σ (end − start)·end)` elements over the prefix segments (the text plus,
+/// for an edit run, every condition block: the target rows attend to every key, each block-causal
+/// prefix segment's rows to the keys up to its end — `L²` for a text-only prefix), each held
+/// [`SCORE_COMPUTE_TENSORS`] times at the
 /// compute width and [`SCORE_F32_TENSORS`] times at f32 — plus, for LoKr, the vec-trick
 /// intermediates. A
 /// **dense** step retains that for every block (candle is eager: the graph holds it until the
@@ -506,9 +514,13 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
     // 3. train: the DiT at the compute width + trainable state + caches + the step.
     let hidden = seq * facts.inner * w;
     let hidden_f32 = seq * facts.inner * F32_WIDTH;
-    // The target rows attend to every key; the prefix rows (block-)causally to the prefix, bounded
-    // by the full `prefix²`.
-    let score_elements = facts.heads * (image_tokens * seq + prefix * prefix);
+    // The target rows attend to every key; each prefix segment's rows to the keys up to its end.
+    let prefix_scores = if shape.prefix_scores > 0 {
+        shape.prefix_scores
+    } else {
+        prefix * prefix
+    };
+    let score_elements = facts.heads * (image_tokens * seq + prefix_scores);
     let scores = score_elements * (SCORE_COMPUTE_TENSORS * w + SCORE_F32_TENSORS * F32_WIDTH);
     let block_hidden = BLOCK_SAVED_HIDDEN * hidden
         + BLOCK_SAVED_HIDDEN_F32 * hidden_f32
@@ -1005,8 +1017,10 @@ const TRAINING_MODE_KEY: &str = "trainingMode";
 /// objectives.
 ///
 /// The resume bundle itself carries no mode (the shared `save_resume` writes none), so the mode is
-/// read off the adapter checkpoints of `stem` in `dir` — every bundle is written only after one of
-/// them — plus the bundle's own metadata in case a future writer stamps it:
+/// read off the **adapter checkpoints** of `stem` in `dir` — exactly the
+/// [`checkpoint_filename`] spelling `{stem}-step{digits}.safetensors`, never the
+/// `{stem}-step{digits}.resume.safetensors` bundles that share its prefix; every bundle is written
+/// only after one of them — plus the bundle's own metadata in case a future writer stamps it:
 /// * a **text-to-image** run (`edit = false`) refuses any file stamped with a mode other than
 ///   text-to-image;
 /// * an **edit** run refuses any file stamped otherwise, and any intermediate checkpoint that is
@@ -1017,7 +1031,11 @@ fn check_resume_training_mode(dir: &Path, stem: &str, snapshot: &Path, edit: boo
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&prefix) && name.ends_with(".safetensors") {
+            let is_checkpoint = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".safetensors"))
+                .is_some_and(|step| !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()));
+            if is_checkpoint {
                 checkpoints.push(entry.path());
             }
         }
@@ -1156,25 +1174,66 @@ fn decode_references(item: &TrainingItem) -> Result<Vec<RgbaImage>> {
         .collect()
 }
 
-/// The token budget one edit prompt contributes, from the tokenizer and the reference **headers**
-/// alone (no pixel is decoded, no weight is read): `(text tokens, Σ reference latent tokens, largest
-/// single reference's latent tokens)`. Text tokens are the image-conditioned template's tokens
-/// minus the system prefix and the `count` `<|image_pad|>` placeholders — exactly the rows
-/// [`joint_branch`] keeps; each reference's latent tokens follow the render path's own fit
-/// ([`reference_fit`], which also **refuses** a reference whose fit the Qwen3-VL processor would
-/// rebind — the exact predicate `prepare_reference` applies — so a bad reference fails here, before
-/// any weight loads, rather than after the tower is resident).
-fn edit_prompt_tokens(
+/// The memory-relevant budget of one prompt's joint layout ([`edit_prompt_layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PromptBudget {
+    /// Text rows the DiT sees (every text segment).
+    text_tokens: u64,
+    /// Σ condition-block latent tokens (every image block but the target).
+    reference_tokens: u64,
+    /// Latent tokens of the single largest condition block.
+    largest_reference_tokens: u64,
+    /// [`prefix_score_elements`] of the layout.
+    prefix_scores: u64,
+}
+
+impl PromptBudget {
+    fn of(layout: &JointLayout) -> Self {
+        use crate::transformer::Segment as S;
+        let blocks = layout.segments.len().saturating_sub(1);
+        let mut budget = Self {
+            text_tokens: 0,
+            reference_tokens: 0,
+            largest_reference_tokens: 0,
+            prefix_scores: prefix_score_elements(layout),
+        };
+        for segment in &layout.segments[..blocks] {
+            match *segment {
+                S::Text { len } => budget.text_tokens += len as u64,
+                S::Image { height, width } => {
+                    let tokens = (height * width) as u64;
+                    budget.reference_tokens += tokens;
+                    budget.largest_reference_tokens = budget.largest_reference_tokens.max(tokens);
+                }
+            }
+        }
+        budget
+    }
+}
+
+/// The exact joint layout an edit prompt assembles at a `(width, height)` target, from the
+/// tokenizer and the reference **headers** alone — what [`joint_branch`] builds from the encoded
+/// conditioning, without loading a weight: the image-conditioned template's ids with each
+/// `<|image_pad|>` placeholder expanded to its reference's vision slots (one per merged 2×2 latent
+/// group, [`reference_fit`]'s grid), the system prefix dropped, each slot run one condition block,
+/// the target block last. A test pins it to the branch the real encoder assembles. Each
+/// reference's fit goes through [`reference_fit`], which also **refuses** a reference whose fit the
+/// Qwen3-VL processor would rebind — the exact predicate `prepare_reference` applies — so a bad
+/// reference fails here, before any weight loads, rather than after the tower is resident.
+fn edit_prompt_layout(
     tokenizer: &TextTokenizer,
     drop: usize,
     vision: &VisionConfig,
     prompt: &str,
     reference_paths: &[PathBuf],
-) -> Result<(u64, u64, u64)> {
-    let count = reference_paths.len();
-    let tokens = tokenizer.tokenize_preformatted(&prompt_template_ti2i(prompt, count))?;
-    let text = tokens.ids.len().saturating_sub(drop + count) as u64;
-    let (mut sum, mut largest) = (0u64, 0u64);
+    (width, height): (u32, u32),
+) -> Result<JointLayout> {
+    use crate::transformer::Segment as S;
+    let image_token = image_pad_token_id(tokenizer)?;
+    let ids = tokenizer
+        .tokenize_preformatted(&prompt_template_ti2i(prompt, reference_paths.len()))?
+        .ids;
+    let mut grids = Vec::with_capacity(reference_paths.len());
     for (index, path) in reference_paths.iter().enumerate() {
         let size = image::image_dimensions(path).map_err(|e| {
             Error::Msg(format!(
@@ -1182,11 +1241,88 @@ fn edit_prompt_tokens(
                 path.display()
             ))
         })?;
-        let tokens = target_tokens(reference_fit(size, index, vision)?);
-        sum += tokens;
-        largest = largest.max(tokens);
+        let (rw, rh) = reference_fit(size, index, vision)?;
+        grids.push((
+            (rh / VAE_SCALE_FACTOR) as usize,
+            (rw / VAE_SCALE_FACTOR) as usize,
+        ));
     }
-    Ok((text, sum, largest))
+    // `None` = a text token, `Some(k)` = a vision slot of reference `k`.
+    let mut expanded: Vec<Option<usize>> = Vec::with_capacity(ids.len());
+    let mut next = 0usize;
+    for &id in &ids {
+        if id == image_token {
+            let (h, w) = *grids.get(next).ok_or_else(|| {
+                Error::Msg(format!(
+                    "{LABEL}: the image-conditioned template carries more placeholders than the \
+                     {} reference images",
+                    grids.len()
+                ))
+            })?;
+            expanded.extend(std::iter::repeat_n(
+                Some(next),
+                h * w / IMAGE_TOKENS_PER_SLOT,
+            ));
+            next += 1;
+        } else {
+            expanded.push(None);
+        }
+    }
+    if next != grids.len() || expanded.len() <= drop {
+        return Err(Error::Msg(format!(
+            "{LABEL}: the image-conditioned template placed {next} of {} reference images in a \
+             {}-token prompt (system prefix {drop})",
+            grids.len(),
+            expanded.len()
+        )));
+    }
+    let mut segments = Vec::with_capacity(2 * grids.len() + 2);
+    let (mut text, mut current) = (0usize, None);
+    for slot in &expanded[drop..] {
+        match *slot {
+            None => {
+                text += 1;
+                current = None;
+            }
+            Some(k) if current != Some(k) => {
+                if text > 0 {
+                    segments.push(S::Text { len: text });
+                    text = 0;
+                }
+                let (h, w) = grids[k];
+                segments.push(S::Image {
+                    height: h,
+                    width: w,
+                });
+                current = Some(k);
+            }
+            Some(_) => {}
+        }
+    }
+    if text > 0 {
+        segments.push(S::Text { len: text });
+    }
+    segments.push(S::Image {
+        height: (height / VAE_SCALE_FACTOR) as usize,
+        width: (width / VAE_SCALE_FACTOR) as usize,
+    });
+    Ok(JointLayout { segments })
+}
+
+/// One prompt the preflight prices: `(text, ordered reference paths, target (width, height),
+/// whether its reference latents are cached for the whole run)`.
+type PreflightPrompt<'a> = (&'a str, &'a [PathBuf], (u32, u32), bool);
+
+/// Per-head score elements of a layout's block-causal **prefix** attention calls:
+/// `Σ (end − start)·end` over [`JointLayout::prefix_segments`] — each segment's rows attend to every
+/// key before its end (the text rows are masked causally inside that, but the scores are still
+/// materialised). `L²` for the text-to-image layout.
+pub fn prefix_score_elements(layout: &JointLayout) -> u64 {
+    layout
+        .prefix_segments()
+        .iter()
+        .map(|&(start, end, _)| ((end - start) * end) as u64)
+        .sum()
 }
 
 /// The size an item's **target** trains at. A captioned (text-to-image) item is the centre-cropped
@@ -1580,40 +1716,51 @@ impl QwenImage21Trainer {
             largest_target_tokens =
                 largest_target_tokens.max(target_tokens(edit_target_size(item, edge)?));
         }
-        let prompts = req
-            .items
-            .iter()
-            .map(|item| {
-                (
-                    item.caption.as_str(),
-                    item.reference_image_paths.as_slice(),
-                    true,
-                )
-            })
-            .chain(
-                sample_prompts
-                    .iter()
-                    .map(|prompt| (prompt.as_str(), sample_reference_paths, false)),
-            )
-            .chain(sampling_requested.then_some(("", sample_reference_paths, false)));
-        for (text, reference_paths, cached) in prompts {
+        let mut prefix_scores = 0u64;
+        let mut prompts: Vec<PreflightPrompt<'_>> = Vec::new();
+        for item in &req.items {
+            prompts.push((
+                item.caption.as_str(),
+                item.reference_image_paths.as_slice(),
+                edit_target_size(item, edge)?,
+                true,
+            ));
+        }
+        // Previews render square at `edge²`.
+        prompts.extend(
+            sample_prompts
+                .iter()
+                .map(|prompt| (prompt.as_str(), sample_reference_paths, (edge, edge), false)),
+        );
+        if sampling_requested {
+            prompts.push(("", sample_reference_paths, (edge, edge), false));
+        }
+        for (text, reference_paths, size, cached) in prompts {
             let tokens = match vision.as_ref() {
                 Some(vision) => {
-                    let (text_tokens, sum, largest) = edit_prompt_tokens(
+                    let layout = edit_prompt_layout(
                         &self.tokenizer,
                         self.drop_count,
                         vision,
                         text,
                         reference_paths,
+                        size,
                     )?;
-                    reference_tokens = reference_tokens.max(sum);
-                    largest_reference_tokens = largest_reference_tokens.max(largest);
+                    let budget = PromptBudget::of(&layout);
+                    reference_tokens = reference_tokens.max(budget.reference_tokens);
+                    largest_reference_tokens =
+                        largest_reference_tokens.max(budget.largest_reference_tokens);
                     if cached {
-                        reference_cache_tokens += sum;
+                        reference_cache_tokens += budget.reference_tokens;
                     }
-                    text_tokens
+                    prefix_scores = prefix_scores.max(budget.prefix_scores);
+                    budget.text_tokens
                 }
-                None => caption_tokens(&self.tokenizer, self.drop_count, text)?,
+                None => {
+                    let tokens = caption_tokens(&self.tokenizer, self.drop_count, text)?;
+                    prefix_scores = prefix_scores.max(tokens * tokens);
+                    tokens
+                }
             };
             longest = longest.max(tokens);
         }
@@ -1624,6 +1771,7 @@ impl QwenImage21Trainer {
             reference_tokens,
             largest_reference_tokens,
             reference_cache_tokens,
+            prefix_scores,
             items: req.items.len() as u64,
             compute_width: compute_dtype.size_in_bytes() as u64,
             adapter: adapter_footprint(&targets, cfg),
@@ -2446,6 +2594,7 @@ mod tests {
             reference_tokens: 0,
             largest_reference_tokens: 0,
             reference_cache_tokens: 0,
+            prefix_scores: 0,
             items: 20,
             compute_width: 2,
             adapter: production_adapter(NetworkType::Lora),
@@ -3043,6 +3192,39 @@ mod tests {
                 d_pieces, 0.0,
                 "the pieces are the training forward, op for op"
             );
+
+            // The multi-segment EDIT layout (text / condition / text / condition / text / target):
+            // block-causal prefix segments and the shared-`t = 0` condition rows go through the
+            // same equivalence — render `forward_joint` vs `forward_train_joint`, and the
+            // `train_prelude_joint` → blocks → head pieces vs the training forward.
+            let edit = fixed_edit_batch(&dit);
+            let images = joint_images(&edit.references, &edit.x0);
+            let render = dit
+                .forward_joint(&edit.text, &images, 0.6, &edit.layout)
+                .unwrap();
+            let train = dit
+                .forward_train_joint(&edit.text, &images, 0.6, &edit.layout)
+                .unwrap();
+            let prelude = dit
+                .train_prelude_joint(&edit.text, &images, 0.6, &edit.layout)
+                .unwrap();
+            let mut x = prelude.x.clone();
+            for index in 0..dit.num_blocks() {
+                x = dit
+                    .train_block(index, &x, &prelude.modulation, &prelude.geometry)
+                    .unwrap();
+            }
+            let pieces = dit
+                .train_head(&x, &prelude.out_rows, &prelude.geometry)
+                .unwrap();
+            assert_eq!(render.dims(), &[1, 16, dit.config().out_channels]);
+            let (d_train, d_pieces) = (max_diff(&render, &train), max_diff(&train, &pieces));
+            eprintln!(
+                "[sc-24162] edit layout adapted={adapted}: render vs train {d_train:.2e}, pieces \
+                 {d_pieces:.2e}"
+            );
+            assert!(d_train < 1e-4, "edit adapted={adapted}: {d_train}");
+            assert_eq!(d_pieces, 0.0, "edit pieces are the training forward");
         }
     }
 
@@ -3638,6 +3820,21 @@ mod tests {
         let rendered_refs = encode_references(&vae, &rendered.references).unwrap();
 
         assert_eq!(trained.layout, rendered.pos.layout, "joint layout");
+        // The preflight's header-only layout is the one the encoder really assembles, so the
+        // memory it prices is this sequence's.
+        assert_eq!(
+            edit_prompt_layout(
+                &tokenizer,
+                drop,
+                &vision,
+                prompt,
+                &item.reference_image_paths,
+                edit_target_size(&item, edge).unwrap(),
+            )
+            .unwrap(),
+            trained.layout,
+            "the preflight's header-only layout"
+        );
         assert_eq!(
             trained.layout.position_ids(),
             rendered.pos.layout.position_ids(),
@@ -3719,6 +3916,20 @@ mod tests {
         let drop = system_prompt_drop_count(&tokenizer).unwrap();
         let encoder = loader::load_text_encoder(&root, &dev).unwrap();
         let (branch, _) = item_branch(&encoder, &tokenizer, drop, &item, edge).unwrap();
+        let vision = loader::load_vision_config(&root).unwrap().unwrap();
+        assert_eq!(
+            edit_prompt_layout(
+                &tokenizer,
+                drop,
+                &vision,
+                "widen it",
+                &item.reference_image_paths,
+                size
+            )
+            .unwrap(),
+            branch.layout,
+            "the preflight prices the wide target's real layout"
+        );
         let h = 96 / 16;
         assert_eq!(
             branch.layout.segments.last(),
@@ -3759,12 +3970,13 @@ mod tests {
             .unwrap();
         let tokenizer = loader::load_tokenizer(&tiny_snapshot()).unwrap();
         let drop = system_prompt_drop_count(&tokenizer).unwrap();
-        let header_refusal = match edit_prompt_tokens(
+        let header_refusal = match edit_prompt_layout(
             &tokenizer,
             drop,
             &vision,
             "edit",
             std::slice::from_ref(&thin),
+            (64, 64),
         ) {
             Err(Error::Unsupported(message)) => message,
             other => panic!("expected the render path's Unsupported, got {other:?}"),
@@ -3806,21 +4018,29 @@ mod tests {
     /// resume bundle itself is unstamped (the shared writer stamps no mode), so the mode is read off
     /// the adapter checkpoints.
     ///
-    /// *Mutation that reds this:* `check_resume_training_mode` ignoring `edit` (an edit run then
-    /// resumes a text-to-image run's factors).
+    /// The bundles are the real ones (`save_resume` → `{stem}-step{N:06}.resume.safetensors`, which
+    /// shares the checkpoints' `{stem}-step` prefix), found by the real `find_latest_resume`.
+    ///
+    /// *Mutations that red this:* `check_resume_training_mode` ignoring `edit` (an edit run then
+    /// resumes a text-to-image run's factors); the checkpoint scan matching the unstamped
+    /// `.resume.safetensors` bundle as a text-to-image checkpoint (every edit resume is refused).
     #[test]
     fn a_resume_across_training_modes_is_refused() {
         let mut dit = dit_at(DType::F32);
         let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
+        let cfg = base_config();
+        let opt = TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
         let run = |dir: &Path, edit: bool| {
-            let bundle = dir.join("adapter-resume-step2.safetensors");
-            save_adapter(&set, &HashMap::new(), &bundle).unwrap();
             save_adapter(
                 &set,
                 &provenance_meta(edit),
                 &dir.join(checkpoint_filename("adapter", 2)),
             )
             .unwrap();
+            save_resume(dir, "adapter", 2, 1, &opt, &set, &cfg, "fingerprint").unwrap();
+            let (bundle, step) = find_latest_resume(dir, "adapter").expect("the real bundle");
+            assert_eq!(step, 2);
+            assert!(bundle.to_string_lossy().ends_with(".resume.safetensors"));
             bundle
         };
         let t2i_dir = scratch("mode_t2i");
@@ -3844,6 +4064,106 @@ mod tests {
             err.contains("`edit` training run; this text-to-image run"),
             "{err}"
         );
+    }
+
+    /// `n` edit pairs in `dir`: distinct non-square targets, each with an RGB and a transparent
+    /// RGBA reference.
+    fn edit_dataset(dir: &Path, n: usize) -> Vec<TrainingItem> {
+        let rgb = write_png(dir, "edit_ref_rgb.png", 64, 64, 11);
+        let (rgba, _) = write_rgba_png(dir, "edit_ref_rgba.png", 64, 64);
+        (0..n)
+            .map(|i| {
+                TrainingItem::edit_pair(
+                    write_png(
+                        dir,
+                        &format!("edit_target{i}.png"),
+                        96,
+                        64,
+                        40 + 30 * i as u32,
+                    ),
+                    format!("recolour the first image like the second, variant {i}"),
+                    vec![rgb.clone(), rgba.clone()],
+                )
+            })
+            .collect()
+    }
+
+    /// AC (review): an **edit** run checkpoints and resumes like a text-to-image one — interrupted
+    /// after step 2 (its `save_every = 2` bundle on disk, next to the `trainingMode = edit`
+    /// checkpoint) and resumed to step 4, it lands on the same factors as the straight 4-step edit
+    /// run, with and without gradient accumulation.
+    ///
+    /// *Mutation that reds this:* the resume-mode scan matching the unstamped
+    /// `.resume.safetensors` bundle (the edit resume is then refused as a text-to-image one).
+    #[test]
+    fn an_edit_resume_round_trip_equals_the_straight_run() {
+        for accum in [1u32, 2] {
+            let dir = scratch("edit_resume");
+            let items = edit_dataset(dir.path(), 2);
+            let cfg = TrainingConfig {
+                resolution: 64,
+                gradient_accumulation: accum,
+                ..base_config()
+            };
+            let straight = {
+                let mut req = request(dir.path(), items.clone(), cfg.clone());
+                req.output_dir = dir.path().join("straight");
+                trainer().train(&req, &mut |_| {}).unwrap()
+            };
+
+            let interrupted_dir = dir.path().join("resumed");
+            let resume_cfg = TrainingConfig {
+                save_every: 2,
+                ..cfg.clone()
+            };
+            let mut req = request(dir.path(), items.clone(), resume_cfg.clone());
+            req.output_dir = interrupted_dir.clone();
+            let cancel = req.cancel.clone();
+            let partial = trainer()
+                .train(&req, &mut |p| {
+                    if matches!(p, TrainingProgress::Training { step: 2, .. }) {
+                        cancel.cancel();
+                    }
+                })
+                .unwrap();
+            assert_eq!(partial.steps, 2);
+            let (bundle, _) = find_latest_resume(&interrupted_dir, "adapter").expect("a bundle");
+            assert!(bundle.to_string_lossy().ends_with(".resume.safetensors"));
+            let checkpoint = interrupted_dir.join(checkpoint_filename("adapter", 2));
+            assert_eq!(
+                metadata(&checkpoint)[EDIT_ADAPTER_MARKER.0],
+                EDIT_ADAPTER_MARKER.1
+            );
+
+            let mut req = request(
+                dir.path(),
+                items,
+                TrainingConfig {
+                    resume: true,
+                    ..resume_cfg
+                },
+            );
+            req.output_dir = interrupted_dir;
+            let mut trained_steps = Vec::new();
+            let resumed = trainer()
+                .train(&req, &mut |p| {
+                    if let TrainingProgress::Training { step, .. } = p {
+                        trained_steps.push(step);
+                    }
+                })
+                .unwrap_or_else(|e| panic!("accum {accum}: the edit resume must continue: {e}"));
+            assert_eq!(trained_steps, [3, 4], "accum {accum}");
+
+            let (a, b) = (
+                tensors(&straight.adapter_path),
+                tensors(&resumed.adapter_path),
+            );
+            assert_eq!(a.len(), b.len());
+            for (key, ta) in &a {
+                let diff = max_abs(&(ta - &b[key]).unwrap());
+                assert!(diff <= 1e-6, "accum {accum}: {key} differs by {diff}");
+            }
+        }
     }
 
     /// AC: edit training learns the **conditional** velocity, not one memorised sample — with a
@@ -4028,6 +4348,58 @@ mod tests {
         assert!(c.latent_phase > a.latent_phase && c.train_phase > a.train_phase);
     }
 
+    /// Review: the block-causal prefix is priced exactly, not as `prefix²`. On the fixture edit
+    /// layout (text 3 / 2×2 block / text 1 / 2×4 block / text 4 / target) the prefix segments are
+    /// `[0,3) [3,7) [7,8) [8,16) [16,20)`, so the prefix calls materialise
+    /// `3·3 + 4·7 + 1·8 + 8·16 + 4·20 = 253` scores per head, not `20² = 400`; the text-to-image
+    /// prefix is `L²`. The footprint moves by exactly those elements' retained widths, the
+    /// fallback (`prefix_scores = 0`) is `prefix²`, and the preflight's layout prices its prompt.
+    ///
+    /// *Mutations that red this:* `prefix_score_elements` summing `(end − start)²` or `end²`;
+    /// `training_footprint` ignoring `prefix_scores` (the delta collapses to 0).
+    #[test]
+    fn the_prefix_attention_is_priced_exactly() {
+        let dit = dit_at(DType::F32);
+        let edit = fixed_edit_batch(&dit);
+        assert_eq!(prefix_score_elements(&edit.layout), 253);
+        assert_eq!(prefix_score_elements(&t2i_layout()), 25);
+        let budget = PromptBudget::of(&edit.layout);
+        assert_eq!(
+            budget,
+            PromptBudget {
+                text_tokens: 8,
+                reference_tokens: 12,
+                largest_reference_tokens: 8,
+                prefix_scores: 253,
+            }
+        );
+
+        let facts = production_facts();
+        let base = TrainingShape {
+            reference_tokens: 12,
+            caption_tokens: 8,
+            ..shape(1024, true)
+        };
+        let at = |prefix_scores| {
+            training_footprint(
+                &facts,
+                &TrainingShape {
+                    prefix_scores,
+                    ..base
+                },
+            )
+            .train_phase
+        };
+        // Checkpointed, no previews: the scores are retained once at the compute width
+        // (SCORE_COMPUTE_TENSORS) and at f32 (SCORE_F32_TENSORS), plus the backward's f32 grads.
+        let per_element = facts.heads
+            * (SCORE_COMPUTE_TENSORS * base.compute_width
+                + SCORE_F32_TENSORS * F32_WIDTH
+                + BACKWARD_SCORE_GRADS * F32_WIDTH);
+        assert_eq!(at(400) - at(253), (400 - 253) * per_element);
+        assert_eq!(at(0), at(400), "the fallback is the whole prefix squared");
+    }
+
     /// The facts carry the snapshot's own vision tower: its `model.visual.*` bytes and its config
     /// widths, priced at the component width like the language tower.
     #[test]
@@ -4143,24 +4515,45 @@ mod tests {
             }
         };
         let differing = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
-        let (bare_edit, adapted_edit, adapted_t2i) =
-            (render(false, true), render(true, true), render(true, false));
-        let (vs_bare, vs_t2i) = (
-            differing(&bare_edit, &adapted_edit),
-            differing(&adapted_edit, &adapted_t2i),
+        let (bare_edit, adapted_edit, bare_t2i, adapted_t2i) = (
+            render(false, true),
+            render(true, true),
+            render(false, false),
+            render(true, false),
         );
+        // What the adapter does to each render: the per-byte signed delta against the bare base.
+        let effect = |adapted: &[u8], bare: &[u8]| -> Vec<i16> {
+            adapted
+                .iter()
+                .zip(bare)
+                .map(|(a, b)| i16::from(*a) - i16::from(*b))
+                .collect()
+        };
+        let (edit_effect, t2i_effect) = (
+            effect(&adapted_edit, &bare_edit),
+            effect(&adapted_t2i, &bare_t2i),
+        );
+        let vs_bare = differing(&bare_edit, &adapted_edit);
+        let effect_gap = edit_effect
+            .iter()
+            .zip(&t2i_effect)
+            .filter(|(a, b)| a != b)
+            .count();
         eprintln!(
-            "[sc-24162] adapted edit render differs from bare in {vs_bare} bytes, from the adapted \
-             reference-free render in {vs_t2i} bytes (of {})",
+            "[sc-24162] adapted edit render differs from bare in {vs_bare} bytes; the adapter's \
+             effect differs between the edit and the reference-free render in {effect_gap} bytes \
+             (of {})",
             bare_edit.len()
         );
         assert!(
             vs_bare > 0,
             "the trained edit adapter must change the edit render"
         );
+        // A zero adapter makes both effects all-zero (equal); an adapter whose effect ignored the
+        // references would make them equal too.
         assert!(
-            vs_t2i > 0,
-            "the adapted render must depend on the references"
+            effect_gap > 0,
+            "the adapter's effect on the render must depend on the references"
         );
     }
 }

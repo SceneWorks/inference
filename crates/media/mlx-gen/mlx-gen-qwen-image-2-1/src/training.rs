@@ -109,7 +109,8 @@ use crate::reference::{
     calculate_dimensions, prepare_references, reference_fit, PreparedReference,
 };
 use crate::text_encoder::{
-    prompt_template, prompt_template_ti2i, system_prompt_drop_count, QwenImage21TextEncoder,
+    image_pad_token_id, prompt_template, prompt_template_ti2i, system_prompt_drop_count,
+    QwenImage21TextEncoder,
 };
 use crate::transformer::{
     BlockTrainables, CheckpointedTrainables, JointLayout, QwenImage21Transformer,
@@ -345,6 +346,12 @@ pub struct TrainingShape {
     pub largest_reference_tokens: u64,
     /// Edit runs: reference latent tokens cached across the whole dataset. `0` for text-to-image.
     pub reference_cache_tokens: u64,
+    /// Score elements (per head) of the block-causal **prefix** attention calls for the costliest
+    /// prompt — `Σ (end − start)·end` over its layout's prefix segments ([`prefix_score_elements`]):
+    /// each prefix segment's rows attend to every key up to that segment's end (sc-24162 review).
+    /// `0` falls back to the whole prefix squared (`(caption_tokens + reference_tokens)²`), which
+    /// is exact for a text-only prefix and an upper bound otherwise.
+    pub prefix_scores: u64,
     /// Dataset items (each caches one caption feature and one latent).
     pub items: u64,
     /// Bytes per element of the DiT compute dtype (2 for bf16, 4 for f32).
@@ -389,7 +396,9 @@ impl TrainingFootprint {
 /// block's [`ATTENTION_SAVED_HIDDEN`] + [`FFN_SAVED_HIDDEN_FIXED`] + `mlp_ratio ·`
 /// [`FFN_SAVED_PER_MLP_RATIO`] `[S, inner]` tensors for the backward; a gradient-checkpointed step
 /// retains only each block's input plus ONE block's recompute set. Both add one block's attention
-/// backward ([`ATTENTION_BACKWARD_SCORE_MATRICES`] `[heads, S, S]` matrices) and MLX's pipelined
+/// backward ([`ATTENTION_BACKWARD_SCORE_MATRICES`] score matrices of the block-causal calls:
+/// `heads·(T·S + Σ (end − start)·end)` elements — the target rows attend to every key, each prefix
+/// segment's rows to the keys up to its end, [`TrainingShape::prefix_scores`]) and MLX's pipelined
 /// evaluation ([`MLX_MAX_ACTIVE_TASKS`] + 1 in-flight `[S, inner]` outputs, the same term the
 /// render path's derived model carries), plus [`MLX_EVAL_SLACK_BYTES`].
 ///
@@ -462,7 +471,14 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
     } else {
         facts.num_layers * block_saved
     };
-    let attention_backward = ATTENTION_BACKWARD_SCORE_MATRICES * facts.heads * seq * seq * w;
+    let prefix = shape.caption_tokens + shape.reference_tokens;
+    let prefix_scores = if shape.prefix_scores > 0 {
+        shape.prefix_scores
+    } else {
+        prefix * prefix
+    };
+    let attention_backward =
+        ATTENTION_BACKWARD_SCORE_MATRICES * facts.heads * (image_tokens * seq + prefix_scores) * w;
     let pipelined = (MLX_MAX_ACTIVE_TASKS + 1) * hidden;
     let lokr_deltas = shape.lokr_delta_elements * LOKR_DELTA_WIDTH;
     let step_deltas = if shape.checkpointed {
@@ -969,6 +985,118 @@ fn edit_prompt_tokens(
     Ok((text, sum, largest))
 }
 
+/// The exact joint layout an edit prompt assembles at a `(width, height)` target, from the
+/// tokenizer and the reference **headers** alone — what [`joint_branch`] builds from the encoded
+/// conditioning, without loading a weight: the image-conditioned template's ids with each
+/// `<|image_pad|>` placeholder expanded to its reference's vision slots (one per merged 2×2 latent
+/// group, [`reference_fit`]'s grid), the system prefix dropped, each slot run one condition block,
+/// the target block last. The preflight prices its block-causal prefix
+/// ([`prefix_score_elements`]); a test pins it to the branch the real encoder assembles. The candle
+/// twin's function of the same name (sc-24162).
+fn edit_prompt_layout(
+    tokenizer: &TextTokenizer,
+    drop: usize,
+    vision: &VisionConfig,
+    prompt: &str,
+    reference_paths: &[PathBuf],
+    (width, height): (u32, u32),
+) -> Result<JointLayout> {
+    use crate::transformer::Segment as S;
+    let image_token = image_pad_token_id(tokenizer)?;
+    let ids = tokenizer
+        .tokenize_preformatted(&prompt_template_ti2i(prompt, reference_paths.len()))?
+        .ids;
+    let mut grids: Vec<(usize, usize)> = Vec::with_capacity(reference_paths.len());
+    for (index, path) in reference_paths.iter().enumerate() {
+        let size = image::image_dimensions(path).map_err(|e| {
+            Error::Msg(format!(
+                "{TRAINER_ID} trainer: read reference image {}: {e}",
+                path.display()
+            ))
+        })?;
+        let (rw, rh) = reference_fit(size, index, vision)?;
+        grids.push((
+            (rh / VAE_SCALE_FACTOR) as usize,
+            (rw / VAE_SCALE_FACTOR) as usize,
+        ));
+    }
+    // `None` = a text token, `Some(k)` = a vision slot of reference `k`.
+    let mut expanded: Vec<Option<usize>> = Vec::with_capacity(ids.len());
+    let mut next = 0usize;
+    for &id in &ids {
+        if id == image_token {
+            let (h, w) = *grids.get(next).ok_or_else(|| {
+                Error::Msg(format!(
+                    "{TRAINER_ID} trainer: the image-conditioned template carries more \
+                     placeholders than the {} reference images",
+                    grids.len()
+                ))
+            })?;
+            expanded.extend(std::iter::repeat_n(
+                Some(next),
+                h * w / IMAGE_TOKENS_PER_SLOT,
+            ));
+            next += 1;
+        } else {
+            expanded.push(None);
+        }
+    }
+    if next != grids.len() || expanded.len() <= drop {
+        return Err(Error::Msg(format!(
+            "{TRAINER_ID} trainer: the image-conditioned template placed {next} of {} reference \
+             images in a {}-token prompt (system prefix {drop})",
+            grids.len(),
+            expanded.len()
+        )));
+    }
+    let mut segments: Vec<S> = Vec::with_capacity(2 * grids.len() + 2);
+    let (mut text, mut current) = (0usize, None);
+    for slot in &expanded[drop..] {
+        match *slot {
+            None => {
+                text += 1;
+                current = None;
+            }
+            Some(k) if current != Some(k) => {
+                if text > 0 {
+                    segments.push(S::Text { len: text });
+                    text = 0;
+                }
+                let (h, w) = grids[k];
+                segments.push(S::Image {
+                    height: h,
+                    width: w,
+                });
+                current = Some(k);
+            }
+            Some(_) => {}
+        }
+    }
+    if text > 0 {
+        segments.push(S::Text { len: text });
+    }
+    segments.push(S::Image {
+        height: (height / VAE_SCALE_FACTOR) as usize,
+        width: (width / VAE_SCALE_FACTOR) as usize,
+    });
+    Ok(JointLayout { segments })
+}
+
+/// One prompt the preflight prices: `(text, ordered reference paths, target (width, height),
+/// whether its reference latents are cached for the whole run)`.
+type PreflightPrompt<'a> = (&'a str, &'a [PathBuf], (u32, u32), bool);
+
+/// Per-head score elements of a layout's block-causal **prefix** attention calls:
+/// `Σ (end − start)·end` over [`JointLayout::prefix_segments`] — each segment's rows attend to every
+/// key before its end. `L²` for the text-to-image layout.
+pub fn prefix_score_elements(layout: &JointLayout) -> u64 {
+    layout
+        .prefix_segments()
+        .iter()
+        .map(|&(start, end, _)| ((end - start) * end) as u64)
+        .sum()
+}
+
 /// The size an item's **target** trains at. A captioned (text-to-image) item is the centre-cropped
 /// `edge × edge` square, as before. An edit pair's target keeps its **aspect ratio** — the render
 /// path's own fit, [`calculate_dimensions`]`(edge², w/h)` on the 32-px grid — because its references
@@ -1425,22 +1553,26 @@ impl QwenImage21Trainer {
             largest_target_tokens =
                 largest_target_tokens.max(target_tokens(edit_target_size(item, edge)?));
         }
-        let prompts = req
-            .items
-            .iter()
-            .map(|item| {
-                (
-                    item.caption.as_str(),
-                    item.reference_image_paths.as_slice(),
-                    true,
-                )
-            })
-            .chain(
-                sample_prompts
-                    .iter()
-                    .map(|prompt| (prompt.as_str(), sample_reference_paths, false)),
-            );
-        for (text, reference_paths, cached) in prompts {
+        let mut prefix_scores = 0u64;
+        let mut prompts: Vec<PreflightPrompt<'_>> = Vec::new();
+        for item in &req.items {
+            prompts.push((
+                item.caption.as_str(),
+                item.reference_image_paths.as_slice(),
+                edit_target_size(item, edge)?,
+                true,
+            ));
+        }
+        // Previews render square at `edge²`, the positive prompts and the empty negative alike.
+        prompts.extend(
+            sample_prompts
+                .iter()
+                .map(|prompt| (prompt.as_str(), sample_reference_paths, (edge, edge), false)),
+        );
+        if sampling_requested {
+            prompts.push(("", sample_reference_paths, (edge, edge), false));
+        }
+        for (text, reference_paths, size, cached) in prompts {
             let tokens = match vision.as_ref() {
                 Some(vision) => {
                     let (text_tokens, sum, largest) = edit_prompt_tokens(
@@ -1455,9 +1587,22 @@ impl QwenImage21Trainer {
                     if cached {
                         reference_cache_tokens += sum;
                     }
+                    let layout = edit_prompt_layout(
+                        &self.tokenizer,
+                        self.drop_count,
+                        vision,
+                        text,
+                        reference_paths,
+                        size,
+                    )?;
+                    prefix_scores = prefix_scores.max(prefix_score_elements(&layout));
                     text_tokens
                 }
-                None => caption_tokens(&self.tokenizer, self.drop_count, text)?,
+                None => {
+                    let tokens = caption_tokens(&self.tokenizer, self.drop_count, text)?;
+                    prefix_scores = prefix_scores.max(tokens * tokens);
+                    tokens
+                }
             };
             longest = longest.max(tokens);
         }
@@ -1470,6 +1615,7 @@ impl QwenImage21Trainer {
             reference_tokens,
             largest_reference_tokens,
             reference_cache_tokens,
+            prefix_scores,
             items: req.items.len() as u64,
             compute_width: if compute_dtype == Dtype::Float32 {
                 4
@@ -2085,6 +2231,7 @@ mod tests {
             reference_tokens: 0,
             largest_reference_tokens: 0,
             reference_cache_tokens: 0,
+            prefix_scores: 0,
             items: 20,
             compute_width: 2,
             trainable_params: 40_000_000,
@@ -2728,6 +2875,21 @@ mod tests {
         let rendered_refs = encode_references(&vae, &rendered.references).unwrap();
 
         assert_eq!(trained.layout, rendered.pos.layout, "joint layout");
+        // sc-24162: the preflight's header-only layout is the one the encoder really assembles,
+        // so the attention it prices is this sequence's.
+        assert_eq!(
+            edit_prompt_layout(
+                &tokenizer,
+                drop,
+                &vision,
+                prompt,
+                &item.reference_image_paths,
+                edit_target_size(&item, edge).unwrap(),
+            )
+            .unwrap(),
+            trained.layout,
+            "the preflight's header-only layout"
+        );
         assert_eq!(
             trained.layout.position_ids(),
             rendered.pos.layout.position_ids(),
@@ -3139,5 +3301,76 @@ mod tests {
         );
         let c = training_footprint(&facts, &wide);
         assert!(c.latent_phase > a.latent_phase && c.train_phase > a.train_phase);
+    }
+
+    /// sc-24162 review: the block-causal attention is priced exactly — the target rows against
+    /// every key plus `Σ (end − start)·end` over the prefix segments — not as `S²`. On the fixture
+    /// edit layout (text 3 / 2×2 block / text 1 / 2×4 block / text 4 / target) the prefix segments
+    /// are `[0,3) [3,7) [7,8) [8,16) [16,20)`, so the prefix calls materialise
+    /// `3·3 + 4·7 + 1·8 + 8·16 + 4·20 = 253` scores per head, not `20² = 400`; the text-to-image
+    /// prefix is `L²`. The footprint moves by exactly those elements, and the fallback
+    /// (`prefix_scores = 0`) is the whole prefix squared.
+    ///
+    /// *Mutations that red this:* `prefix_score_elements` summing `(end − start)²`;
+    /// `training_footprint` ignoring `prefix_scores` (the delta collapses to 0); pricing the
+    /// attention as `S²` again (the fallback no longer equals `T·S + P²`).
+    #[test]
+    fn the_prefix_attention_is_priced_exactly() {
+        let edit = JointLayout {
+            segments: vec![
+                Segment::Text { len: 3 },
+                Segment::Image {
+                    height: 2,
+                    width: 2,
+                },
+                Segment::Text { len: 1 },
+                Segment::Image {
+                    height: 2,
+                    width: 4,
+                },
+                Segment::Text { len: 4 },
+                Segment::Image {
+                    height: 4,
+                    width: 4,
+                },
+            ],
+        };
+        assert_eq!(prefix_score_elements(&edit), 253);
+        assert_eq!(
+            prefix_score_elements(&JointLayout::text_to_image(5, 4, 4)),
+            25
+        );
+
+        let facts = production_facts();
+        let base = TrainingShape {
+            reference_tokens: 12,
+            caption_tokens: 8,
+            ..shape(1024, true)
+        };
+        let at = |prefix_scores| {
+            training_footprint(
+                &facts,
+                &TrainingShape {
+                    prefix_scores,
+                    ..base
+                },
+            )
+            .train_phase
+        };
+        let per_element = ATTENTION_BACKWARD_SCORE_MATRICES * facts.heads * base.compute_width;
+        assert_eq!(at(400) - at(253), (400 - 253) * per_element);
+        assert_eq!(at(0), at(400), "the fallback is the whole prefix squared");
+        // The target rows' `T·S` is priced on top: an `S²` attention term would exceed it by
+        // `(S − T)·S − P²` — `P·T` — elements.
+        let target = (1024 / 16) * (1024 / 16);
+        let seq = target + 20;
+        let squared = TrainingShape {
+            prefix_scores: seq * seq - target * seq,
+            ..base
+        };
+        assert_eq!(
+            training_footprint(&facts, &squared).train_phase - at(400),
+            (seq * seq - target * seq - 400) * per_element
+        );
     }
 }
