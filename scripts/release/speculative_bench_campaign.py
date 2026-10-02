@@ -32,7 +32,10 @@ prepare_snapshot -- <source> <out_dir> q4`` (the same quantized projections; adm
 ~20 GB payload) and leave ``format`` at its default; the row's snapshot identity — which hashes the
 prepared ``config.json``'s ``quantization`` block — is what ``compare`` holds both runs to. The
 pre-epic MLX loader refuses Qwen3.6-35B-A3B's MoE MTP head outright, so that model's epic/baseline
-rows use a snapshot prepared with ``--without-mtp`` and the ``off`` option only.
+rows use a snapshot prepared with ``--without-mtp`` and the ``off`` option only. The pre-epic
+Candle loader refuses it too ("qwen3_5 MTP tensor set is incomplete", run 37034184281); on the
+Candle lanes a row says ``"without_mtp": true`` instead and the runner prepares the MTP-free copy
+itself (:func:`prepare_without_mtp`), beside the Hugging Face cache, before the row's first process.
 
 Lanes (``--lane``): ``cuda`` (Candle/CUDA, the ``decode-speedups-bench`` profile of
 ``.github/workflows/real-weights.yml``), ``mlx`` (Apple silicon, run locally with ``local``) and
@@ -73,6 +76,10 @@ The matrix is JSON: ``{"rows": [ROW, ...]}``, each ``ROW`` an object with
   warmup              boolean (default true)
   draft, mtp_head     snapshot path (epic only)
   prefix_cache_bytes  integer or ``"default"`` (a non-zero budget is epic only)
+  without_mtp         boolean (default false; Candle lanes only): measure an MTP-free copy of the
+                      Hugging Face cache snapshot ``snapshot`` names — every ``mtp.*`` tensor
+                      dropped, ``mtp_num_hidden_layers`` 0 — kept at :func:`without_mtp_path`
+                      and prepared by ``run`` when absent (both runs measure the same copy)
   model               the model (family) label recorded verbatim
   switches            ``{VARIABLE: value}`` for the lane's recorded runtime switches
                       (``CANDLE_LLM_CUDA_GRAPHS``, ``MLX_LLM_PIPELINING``, …); set for every
@@ -90,6 +97,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path, PureWindowsPath
@@ -154,6 +162,7 @@ ROW_KEYS = {
     "prefix_cache_bytes",
     "model",
     "switches",
+    "without_mtp",
 }
 ROW_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 MAX_ROWS = 64
@@ -282,6 +291,24 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
         snapshot = resolved
     if not _absolute(snapshot):
         raise MatrixError(f"{tag}: snapshot must be an alias or an absolute path, got {snapshot!r}")
+    prepare = None
+    without_mtp = row.get("without_mtp", False)
+    if not isinstance(without_mtp, bool):
+        raise MatrixError(f"{tag}: without_mtp must be a boolean, got {without_mtp!r}")
+    if without_mtp:
+        if lane.mlx:
+            raise MatrixError(
+                f"{tag}: without_mtp is a Candle-lane preparation; an MLX row names a snapshot "
+                "prepared with `prepare_snapshot --without-mtp`"
+            )
+        derived = without_mtp_path(snapshot)
+        if derived is None:
+            raise MatrixError(
+                f"{tag}: without_mtp needs a Hugging Face cache snapshot "
+                f"(…/models--<org>--<name>/snapshots/<revision>), got {snapshot!r}"
+            )
+        prepare = {"without_mtp": snapshot}
+        snapshot = derived
 
     runs = row.get("runs", list(RUNS))
     if (
@@ -366,13 +393,16 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
                 f"{tag}: {name} is not a recorded {lane.name} switch ({list(lane.switches)})"
             )
         knobs[name] = _text(value, f"{tag}: switch {name}")
-    return {
+    planned = {
         "id": row_id,
         "runs": runs,
         "process_repeats": process_repeats,
         "switches": dict(switches),
         "env": knobs,
     }
+    if prepare:
+        planned["prepare"] = prepare
+    return planned
 
 
 def plan_matrix(text: str, environ: dict[str, str], lane: str = "cuda") -> dict[str, Any]:
@@ -548,6 +578,178 @@ def snapshot_identity(path: str) -> dict[str, Any]:
     if "config.json" not in hashed and not weights:
         raise CampaignError(f"snapshot {path} has no config.json and no weight files")
     return {"sha256": digest.hexdigest(), "hashed": hashed, "weights": weights}
+
+
+# ---------------------------------------------------------------------------- MTP-free snapshots
+
+WITHOUT_MTP_DIR = "prepared-without-mtp"
+WITHOUT_MTP_MARKER = ".sceneworks-without-mtp.json"
+WITHOUT_MTP_VERSION = 1
+_HF_SNAPSHOT_PARTS = re.compile(
+    r"^(?P<base>.*?)[/\\](?P<repo>models--[^/\\]+)[/\\]snapshots[/\\](?P<rest>[^/\\]+(?:[/\\][^/\\]+)*)$"
+)
+_COPY_CHUNK = 64 << 20
+
+
+def without_mtp_path(source: str) -> str | None:
+    """Where the MTP-free copy of the Hugging Face cache snapshot ``source`` lives: the same
+    ``models--<org>--<name>/snapshots/<revision>[/<subdir>]`` under ``prepared-without-mtp`` beside
+    the cache's ``hub`` directory (outside any checkout, on the cache's volume so the shards it keeps
+    are hard links; the cache layout keeps :func:`family_label` naming the repository). ``None``
+    when ``source`` is not a cache snapshot path. Pure string work: the plan names a runner path."""
+    match = _HF_SNAPSHOT_PARTS.match(source.rstrip("/\\"))
+    if not match:
+        return None
+    sep = "\\" if "\\" in source and "/" not in source else "/"
+    base = match["base"]
+    head, _, last = base.replace("\\", "/").rpartition("/")
+    if last == "hub" and head:
+        base = base[: len(head)]
+    rest = match["rest"].replace("\\", sep).replace("/", sep)
+    return sep.join([base, WITHOUT_MTP_DIR, match["repo"], "snapshots", rest])
+
+
+def _is_mtp(key: str) -> bool:
+    return key.startswith("mtp.")
+
+
+def _safetensors_header(path: Path) -> tuple[int, dict[str, Any]]:
+    """The byte offset a safetensors file's data starts at, and its header."""
+    with path.open("rb") as source:
+        length = int.from_bytes(source.read(8), "little")
+        try:
+            header = json.loads(source.read(length))
+        except ValueError as error:
+            raise CampaignError(f"{path}: not a safetensors file ({error})") from error
+    if not isinstance(header, dict):
+        raise CampaignError(f"{path}: not a safetensors file")
+    return 8 + length, header
+
+
+def _tensor_bytes(info: dict[str, Any]) -> int:
+    begin, end = info["data_offsets"]
+    return end - begin
+
+
+def _write_safetensors_without(source: Path, target: Path, drop) -> dict[str, int]:
+    """Write ``source`` to ``target`` without the tensors ``drop`` names, the kept tensors' bytes
+    unchanged and packed in their stored order; returns each dropped tensor's byte size."""
+    start, header = _safetensors_header(source)
+    metadata = header.pop("__metadata__", None)
+    dropped = {k: _tensor_bytes(v) for k, v in header.items() if drop(k)}
+    kept = sorted(
+        ((k, v) for k, v in header.items() if not drop(k)), key=lambda kv: kv[1]["data_offsets"][0]
+    )
+    rewritten: dict[str, Any] = {} if metadata is None else {"__metadata__": metadata}
+    offset, spans = 0, []
+    for key, info in kept:
+        size = _tensor_bytes(info)
+        rewritten[key] = {
+            "dtype": info["dtype"],
+            "shape": info["shape"],
+            "data_offsets": [offset, offset + size],
+        }
+        spans.append((start + info["data_offsets"][0], size))
+        offset += size
+    blob = json.dumps(rewritten, separators=(",", ":")).encode("utf-8")
+    blob += b" " * (-len(blob) % 8)  # the data starts 8-byte aligned, as safetensors writes it
+    with source.open("rb") as reader, target.open("xb") as sink:
+        sink.write(len(blob).to_bytes(8, "little"))
+        sink.write(blob)
+        for position, size in spans:
+            reader.seek(position)
+            while size:
+                chunk = reader.read(min(size, _COPY_CHUNK))
+                if not chunk:
+                    raise CampaignError(f"{source}: truncated tensor data")
+                sink.write(chunk)
+                size -= len(chunk)
+    return dropped
+
+
+def _link_or_copy(source: Path, target: Path) -> None:
+    """A hard link to ``source``'s content (a cache snapshot file is a symlink into ``blobs``),
+    else a copy (another volume, or a filesystem without hard links)."""
+    try:
+        os.link(os.path.realpath(source), target)
+    except OSError:
+        shutil.copyfile(source, target)
+
+
+def _config_without_mtp(text: str) -> str:
+    config = json.loads(text)
+    if not isinstance(config, dict):
+        raise CampaignError("config.json is not an object")
+    root = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    root["mtp_num_hidden_layers"] = 0
+    return json.dumps(config, indent=2) + "\n"
+
+
+def prepare_without_mtp(source: str, destination: str) -> bool:
+    """Make ``destination`` the MTP-free copy of the snapshot ``source``: every ``mtp.*`` tensor
+    dropped from the shards that hold one (the rest hard-linked), the weight index's map and total
+    size without them, ``mtp_num_hidden_layers`` 0 in the (text) config — what both Candle loaders
+    load as a target with no native head — and every other file linked. Idempotent: a copy this
+    preparer made from the same source content is reused (returns ``False``); anything else at
+    ``destination`` is refused, never overwritten. Built beside it and renamed into place, so a
+    stopped preparation leaves no copy that looks finished."""
+    src, out = Path(source), Path(destination)
+    stamp = {
+        "version": WITHOUT_MTP_VERSION,
+        "source": source,
+        "source_identity": snapshot_identity(source)["sha256"],
+    }
+    if out.exists():
+        try:
+            existing = json.loads((out / WITHOUT_MTP_MARKER).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = None
+        if existing != stamp:
+            raise CampaignError(
+                f"{destination} exists and is not this preparer's MTP-free copy of {source}; "
+                "remove it to prepare again"
+            )
+        return False
+    partial = out.with_name(out.name + ".partial")
+    if partial.exists():
+        shutil.rmtree(partial)
+    partial.mkdir(parents=True)
+    dropped: dict[str, int] = {}
+    indices = []
+    for file in sorted(p for p in src.rglob("*") if p.is_file()):
+        relative = file.relative_to(src)
+        target = partial / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if file.name.endswith(".index.json"):
+            indices.append(relative)
+        elif relative == Path("config.json"):
+            try:
+                target.write_text(_config_without_mtp(file.read_text(encoding="utf-8")), "utf-8")
+            except ValueError as error:
+                raise CampaignError(f"{file}: {error}") from error
+        elif file.suffix == ".safetensors" and any(map(_is_mtp, _safetensors_header(file)[1])):
+            dropped.update(_write_safetensors_without(file, target, _is_mtp))
+        else:
+            _link_or_copy(file, target)
+    if not (partial / "config.json").is_file():
+        raise CampaignError(f"snapshot {source} has no config.json")
+    for relative in indices:
+        try:
+            index = json.loads((src / relative).read_text(encoding="utf-8"))
+            index["weight_map"] = {
+                k: v for k, v in index["weight_map"].items() if not _is_mtp(k)
+            }
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            raise CampaignError(f"{src / relative}: not a weight index ({error!r})") from error
+        metadata = index.get("metadata")
+        total = metadata.get("total_size") if isinstance(metadata, dict) else None
+        if isinstance(total, (int, float)) and not isinstance(total, bool):
+            # Hugging Face writes it as a float on some checkpoints (Qwen3.6-35B-A3B).
+            metadata["total_size"] = type(total)(total - sum(dropped.values()))
+        (partial / relative).write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+    (partial / WITHOUT_MTP_MARKER).write_text(json.dumps(stamp, indent=2) + "\n", "utf-8")
+    os.replace(partial, out)
+    return True
 
 
 # -------------------------------------------------------------------------------------------- run
@@ -821,9 +1023,13 @@ def run_plan(
             "complete": False,
             "processes": [],
         }
+        if row.get("prepare"):
+            entry["snapshot"]["prepared_from"] = row["prepare"]["without_mtp"]
         summary["rows"].append(entry)
         write_summary(output, summary)
         try:
+            if row.get("prepare"):
+                prepare_without_mtp(row["prepare"]["without_mtp"], snapshot)
             identity = snapshot_identity(snapshot)["sha256"]
         except (CampaignError, OSError) as error:
             failed.append(f"{row['id']}: {error}")

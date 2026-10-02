@@ -681,6 +681,23 @@ class RunTests(unittest.TestCase):
             summary["builds"], {"epic": {"status": "ok"}, "baseline": {"status": "ok"}}
         )
 
+    def test_a_without_mtp_row_is_prepared_once_and_both_runs_measure_the_copy(self) -> None:
+        source = write_hf_snapshot(self.directory / "huggingface")
+        copy_path = campaign.without_mtp_path(str(source))
+        row = {"snapshot": str(source), "options": ["off"], "without_mtp": True, "process_repeats": 1}
+        code, _, summary, records = self.run_plan([{**row, "id": "a"}, {**row, "id": "b"}])
+        self.assertEqual(code, 0, summary)
+        runs = [r for r in records if not r["build"]]
+        self.assertEqual([r["run"] for r in runs], ["epic", "baseline", "epic", "baseline"])
+        self.assertEqual({r["env"]["SPECULATIVE_BENCH_SNAPSHOT"] for r in runs}, {copy_path})
+        identity = campaign.snapshot_identity(copy_path)["sha256"]
+        for entry in summary["rows"]:
+            self.assertEqual(
+                entry["snapshot"],
+                {"path": copy_path, "identity": identity, "prepared_from": str(source)},
+            )
+        self.assertNotIn("mtp.fc.weight", read_safetensors(Path(copy_path) / "model-00002-of-00002.safetensors")[0])
+
     def test_the_guard_wraps_every_benchmark_process_and_no_build(self) -> None:
         code, _, _, records = self.run_plan(
             [{"id": "a", "snapshot": "qwen38", "process_repeats": 1}],
@@ -1609,6 +1626,193 @@ class CompareTests(unittest.TestCase):
             {e["model"] for e in self.compare(directory)["e6"]},
             {"prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"},
         )
+
+def write_safetensors(path: Path, tensors: dict[str, bytes], metadata=None) -> None:
+    """A safetensors file of 1-D U8 tensors, stored in the given order."""
+    header, offset, data = {}, 0, b""
+    if metadata is not None:
+        header["__metadata__"] = metadata
+    for name, payload in tensors.items():
+        header[name] = {"dtype": "U8", "shape": [len(payload)], "data_offsets": [offset, offset + len(payload)]}
+        offset += len(payload)
+        data += payload
+    blob = json.dumps(header).encode("utf-8")
+    path.write_bytes(len(blob).to_bytes(8, "little") + blob + data)
+
+
+def read_safetensors(path: Path) -> tuple[dict[str, bytes], dict]:
+    raw = path.read_bytes()
+    length = int.from_bytes(raw[:8], "little")
+    header = json.loads(raw[8 : 8 + length])
+    metadata = header.pop("__metadata__", None)
+    data = raw[8 + length :]
+    tensors = {}
+    for name, info in header.items():
+        begin, end = info["data_offsets"]
+        assert 0 <= begin <= end <= len(data), (name, info)
+        tensors[name] = data[begin:end]
+    return tensors, {"metadata": metadata, "aligned": (8 + length) % 8 == 0, "size": len(data)}
+
+
+QWEN36_SHARD_1 = {
+    "model.language_model.embed_tokens.weight": b"E" * 24,
+    "model.language_model.layers.0.mlp.experts.gate_up_proj": b"G" * 40,
+}
+QWEN36_SHARD_2 = {
+    "model.language_model.norm.weight": b"N" * 8,
+    "mtp.fc.weight": b"F" * 16,
+    "lm_head.weight": b"L" * 32,
+    "mtp.layers.0.mlp.experts.down_proj": b"D" * 12,
+}
+QWEN36_CONFIG = {
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
+    "text_config": {
+        "model_type": "qwen3_5_moe_text",
+        "num_experts": 256,
+        "mtp_num_hidden_layers": 1,
+        "mtp_use_dedicated_embeddings": False,
+    },
+}
+
+
+def write_hf_snapshot(cache: Path, revision: str = "995ad96e") -> Path:
+    """A Hugging Face cache snapshot of a Qwen3.6-shaped MoE: every file a symlink into `blobs`,
+    the MTP head split across the last shard as the real checkpoint stores it."""
+    repo = cache / "hub" / "models--Qwen--Qwen3.6-35B-A3B"
+    blobs, snapshot = repo / "blobs", repo / "snapshots" / revision
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    staged = blobs / "staging"
+    staged.mkdir()
+    write_safetensors(staged / "1", QWEN36_SHARD_1)
+    write_safetensors(staged / "2", QWEN36_SHARD_2, {"format": "pt"})
+    weight_map = {k: "model-00001-of-00002.safetensors" for k in QWEN36_SHARD_1}
+    weight_map.update({k: "model-00002-of-00002.safetensors" for k in QWEN36_SHARD_2})
+    sizes = sum(len(v) for v in {**QWEN36_SHARD_1, **QWEN36_SHARD_2}.values())
+    files = {
+        "config.json": json.dumps(QWEN36_CONFIG).encode(),
+        "tokenizer.json": b'{"model": {"vocab": {}}}',
+        "chat_template.jinja": b"{{ messages }}",
+        "model.safetensors.index.json": json.dumps(
+            # A float, as the real Qwen3.6-35B-A3B index stores it.
+            {"metadata": {"total_size": float(sizes)}, "weight_map": weight_map}
+        ).encode(),
+        "model-00001-of-00002.safetensors": (staged / "1").read_bytes(),
+        "model-00002-of-00002.safetensors": (staged / "2").read_bytes(),
+    }
+    shutil.rmtree(staged)
+    for i, (name, payload) in enumerate(files.items()):
+        blob = blobs / f"blob{i}"
+        blob.write_bytes(payload)
+        (snapshot / name).symlink_to(Path("..") / ".." / "blobs" / blob.name)
+    return snapshot
+
+
+class WithoutMtpTests(unittest.TestCase):
+    """sc-24446: the Candle lanes' MTP-free snapshot, so the pre-epic loader (which refuses
+    Qwen3.6-35B-A3B's MoE MTP head) can measure that model's `off` baseline."""
+
+    def setUp(self) -> None:
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.source = write_hf_snapshot(self.directory / "huggingface")
+        self.destination = Path(campaign.without_mtp_path(str(self.source)))
+
+    def test_the_copy_lives_beside_the_hub_in_the_cache_layout(self) -> None:
+        self.assertEqual(
+            self.destination,
+            self.directory / "huggingface" / "prepared-without-mtp"
+            / "models--Qwen--Qwen3.6-35B-A3B" / "snapshots" / "995ad96e",
+        )
+        self.assertEqual(
+            campaign.without_mtp_path(
+                "E:\\huggingface\\hub\\models--Qwen--Qwen3.6-35B-A3B\\snapshots\\995ad\\"
+            ),
+            "E:\\huggingface\\prepared-without-mtp\\models--Qwen--Qwen3.6-35B-A3B\\snapshots\\995ad",
+        )
+        self.assertIsNone(campaign.without_mtp_path("E:\\models\\qwen36"))
+        self.assertIsNone(campaign.without_mtp_path("/models/models--a--b"))
+
+    def test_every_mtp_tensor_is_dropped_and_everything_else_is_kept_byte_for_byte(self) -> None:
+        self.assertTrue(campaign.prepare_without_mtp(str(self.source), str(self.destination)))
+        out = self.destination
+        one, one_info = read_safetensors(out / "model-00001-of-00002.safetensors")
+        two, two_info = read_safetensors(out / "model-00002-of-00002.safetensors")
+        self.assertEqual(one, QWEN36_SHARD_1)
+        self.assertEqual(two, {k: v for k, v in QWEN36_SHARD_2.items() if not k.startswith("mtp.")})
+        self.assertEqual((two_info["metadata"], two_info["aligned"]), ({"format": "pt"}, True))
+        self.assertEqual(two_info["size"], 40)  # no dropped tensor's bytes left behind
+        # The shard without a head tensor is the cache's own bytes, hard-linked, not copied.
+        self.assertEqual(
+            (out / "model-00001-of-00002.safetensors").stat().st_ino,
+            (self.source / "model-00001-of-00002.safetensors").resolve().stat().st_ino,
+        )
+        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        expected = copy.deepcopy(QWEN36_CONFIG)
+        expected["text_config"]["mtp_num_hidden_layers"] = 0
+        self.assertEqual(config, expected)
+        index = json.loads((out / "model.safetensors.index.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            index["weight_map"],
+            {
+                **{k: "model-00001-of-00002.safetensors" for k in QWEN36_SHARD_1},
+                **{
+                    k: "model-00002-of-00002.safetensors"
+                    for k in QWEN36_SHARD_2
+                    if not k.startswith("mtp.")
+                },
+            },
+        )
+        self.assertEqual(index["metadata"]["total_size"], 24.0 + 40 + 8 + 32)
+        self.assertIsInstance(index["metadata"]["total_size"], float)
+        for name in ("tokenizer.json", "chat_template.jinja"):
+            self.assertEqual((out / name).read_bytes(), (self.source / name).read_bytes())
+        self.assertFalse(out.with_name(out.name + ".partial").exists())
+        self.assertNotEqual(
+            campaign.snapshot_identity(str(out))["sha256"],
+            campaign.snapshot_identity(str(self.source))["sha256"],
+        )
+
+    def test_a_flat_config_has_its_own_mtp_layers_zeroed(self) -> None:
+        text = campaign._config_without_mtp('{"model_type": "qwen3_5_text", "mtp_num_hidden_layers": 1}')
+        self.assertEqual(json.loads(text), {"model_type": "qwen3_5_text", "mtp_num_hidden_layers": 0})
+
+    def test_preparing_again_reuses_the_copy_and_never_overwrites_another(self) -> None:
+        self.assertTrue(campaign.prepare_without_mtp(str(self.source), str(self.destination)))
+        shard = self.destination / "model-00002-of-00002.safetensors"
+        before = shard.stat()
+        self.assertFalse(campaign.prepare_without_mtp(str(self.source), str(self.destination)))
+        self.assertEqual((shard.stat().st_ino, shard.stat().st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+        # Another source's content (or a hand-made directory) at the path is refused, untouched.
+        (self.source / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(campaign.CampaignError, "not this preparer's"):
+            campaign.prepare_without_mtp(str(self.source), str(self.destination))
+        self.assertTrue(shard.exists())
+        # A preparation stopped part-way is discarded and redone, never taken as finished.
+        shutil.rmtree(self.destination)
+        partial = self.destination.with_name(self.destination.name + ".partial")
+        partial.mkdir()
+        (partial / "model-00002-of-00002.safetensors").write_bytes(b"half")
+        self.assertTrue(campaign.prepare_without_mtp(str(self.source), str(self.destination)))
+        self.assertNotIn(
+            "mtp.fc.weight", read_safetensors(self.destination / "model-00002-of-00002.safetensors")[0]
+        )
+
+    def test_the_plan_points_both_runs_at_the_copy_on_candle_lanes_only(self) -> None:
+        row = {"id": "f5", "snapshot": str(self.source), "options": ["off"], "without_mtp": True}
+        planned = plan({"rows": [row]})["rows"][0]
+        self.assertEqual(planned["env"]["SPECULATIVE_BENCH_SNAPSHOT"], str(self.destination))
+        self.assertEqual(planned["prepare"], {"without_mtp": str(self.source)})
+        self.assertEqual(planned["runs"], ["epic", "baseline"])
+        self.assertNotIn("prepare", plan({"rows": [{**row, "without_mtp": False}]})["rows"][0])
+        for name, bad, lane in (
+            ("mlx lane", row, "mlx"),
+            ("not a cache snapshot", {**row, "snapshot": "/models/qwen36"}, "cuda"),
+            ("not a boolean", {**row, "without_mtp": "yes"}, "cuda"),
+        ):
+            with self.subTest(name), self.assertRaises(campaign.MatrixError):
+                plan({"rows": [bad]}, lane=lane)
+
 
 if __name__ == "__main__":
     unittest.main()
