@@ -38,6 +38,12 @@
 //! through the shared strict seam ([`adapters::apply_qwen_image_2_1_adapters`]), after any Q4/Q8
 //! quantization, so they apply on the dense and the packed tiers and on every route alike.
 //!
+//! The text-to-image LoRA/LoKr **trainer** (sc-24159, [`training`]) registers under the same id
+//! (`qwen_image_2_1`). It trains over the dense BF16 base only, caches caption features and
+//! latents once (staged, one heavy component at a time), refuses a run whose derived peak exceeds
+//! the device before step 1, and writes PEFT-format adapters stamped with the family, base model
+//! and the Qwen Research License that load straight back through the adapter host above.
+//!
 //! [`Image`]: mlx_gen::Image
 //! [`QwenImage21Vae::decode_rgba`]: crate::vae::QwenImage21Vae::decode_rgba
 
@@ -52,6 +58,7 @@ pub mod quant;
 pub mod reference;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -99,6 +106,7 @@ pub use text_encoder::{
     image_pad_token_id, prompt_template, prompt_template_ti2i, system_prefix,
     system_prompt_drop_count, QwenImage21TextEncoder, TextConditioning, IMAGE_PAD_TOKEN,
 };
+pub use training::{load_trainer, QwenImage21Trainer, TRAINER_ID};
 pub use transformer::{
     JointLayout, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS, GLOBAL_ADAPTER_TARGETS,
 };
@@ -120,6 +128,8 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        // The text-to-image LoRA/LoKr trainer (sc-24159), under the generator's own id.
+        .register_trainer(training::TRAINER_REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -159,6 +169,11 @@ mod tests {
             .map(|registration| (registration.descriptor)().id)
             .collect();
         assert_eq!(ids, ["qwen_image_2_1"]);
+        let trainers: Vec<_> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(trainers, ["qwen_image_2_1"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }

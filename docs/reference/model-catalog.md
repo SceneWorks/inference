@@ -125,6 +125,7 @@ LoRA/LoKr fine-tuning is available for a subset of generator families. Load with
 | `krea_2_control` | — | ✓ |
 | `lens` | ✓ | ✓ |
 | `ltx_2_3` | ✓ | ✓ |
+| `qwen_image_2_1` | ✓ | — |
 | `sd3_5_large` | ✓ | — |
 | `sd3_5_medium` | ✓ | — |
 | `sdxl` | ✓ | ✓ |
