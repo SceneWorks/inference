@@ -134,13 +134,16 @@ pub use loader::{
 pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use pipeline::{
     create_noise, decode_rgb, decode_rgba, decode_tiling, denoise, encode_prompt,
-    encode_references, joint_layout, pack_latents, rgba_to_rgb_over_white, text_rows,
-    unpack_latents, DenoiseInputs, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
+    encode_references, joint_branch, joint_images, joint_layout, missing_vision_tower,
+    pack_latents, prepare_conditioning_references, rgba_to_rgb_over_white, text_rows,
+    unpack_latents, DenoiseInputs, JointBranch, ReferenceConditioning, DECODE_OVERLAP,
+    DECODE_TILE_EDGE,
 };
 pub use quant::{Tier, GROUP_SIZE};
 pub use reference::{
     calculate_dimensions, collect_references, prepare_reference, prepare_references,
-    reference_derived_size, reference_target_size, validate_reference_count, PreparedReference,
+    reference_derived_size, reference_fit, reference_target_size, validate_reference_count,
+    PreparedReference,
 };
 pub use text_encoder::{
     image_pad_token_id, prompt_template, prompt_template_ti2i, system_prefix,
@@ -494,64 +497,22 @@ impl QwenImage21 {
             on_progress,
             |te: &QwenImage21TextEncoder| {
                 // The ordered reference list, host-preprocessed against the snapshot's own
-                // Qwen3-VL processor geometry. Empty ⇒ the text-to-image route, unchanged.
-                let sources = crate::reference::collect_references(req)?;
-                let references = if sources.is_empty() {
-                    Vec::new()
-                } else {
-                    let vision = te.vision_config().ok_or_else(|| {
-                        Error::Unsupported(
-                            "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL \
-                             vision tower (`text_encoder/config.json` `vision_config` + \
-                             `model.visual.*`), which this snapshot does not carry"
-                                .to_string(),
-                        )
-                    })?;
-                    crate::reference::prepare_references(&sources, vision, te.device())?
-                };
-                let pos =
-                    te.encode_conditioning(&self.tokenizer, &req.prompt, drop, &references)?;
-                let neg = if params.use_negative {
-                    Some(te.encode_conditioning(
-                        &self.tokenizer,
-                        req.negative_prompt.as_deref().unwrap_or(""),
-                        drop,
-                        &references,
-                    )?)
-                } else {
-                    None
-                };
-                Ok((pos, neg, references))
+                // Qwen3-VL processor geometry, encoded into one joint branch per CFG side.
+                // Empty ⇒ the text-to-image route, unchanged.
+                assemble_reference_branches(te, &self.tokenizer, req, drop, params.use_negative)
             },
             |_| Ok(()),
-            |heavy, (pos, neg, references), on_progress| {
+            |heavy, branches, on_progress| {
+                let ReferenceBranches {
+                    pos,
+                    neg,
+                    references,
+                } = branches;
                 let channels = heavy.transformer.config().in_channels;
-                // The joint layout + the condition latents: both branches share one reference
-                // encode, but a different prompt is a different text length, hence two layouts.
+                // The condition latents: both branches share one reference encode, but a
+                // different prompt is a different text length, hence two layouts.
                 let reference_latents =
                     crate::pipeline::encode_references(&heavy.vae, &references)?;
-                let pos_layout = crate::pipeline::joint_layout(
-                    &pos.image_pad_mask,
-                    &references,
-                    req.width,
-                    req.height,
-                )?;
-                let neg_layout = neg
-                    .as_ref()
-                    .map(|neg| {
-                        crate::pipeline::joint_layout(
-                            &neg.image_pad_mask,
-                            &references,
-                            req.width,
-                            req.height,
-                        )
-                    })
-                    .transpose()?;
-                let pos_text = crate::pipeline::text_rows(&pos.hidden, &pos.image_pad_mask)?;
-                let neg_text = neg
-                    .as_ref()
-                    .map(|neg| crate::pipeline::text_rows(&neg.hidden, &neg.image_pad_mask))
-                    .transpose()?;
                 let conditioned = !references.is_empty();
                 // ONE decode per image either way — upstream always decodes four channels and
                 // has no transparency flag — so this branch chooses only whether the alpha is
@@ -569,8 +530,8 @@ impl QwenImage21 {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
                             latents,
-                            prompt_embeds: &pos_text,
-                            negative_embeds: neg_text.as_ref(),
+                            prompt_embeds: &pos.text,
+                            negative_embeds: neg.as_ref().map(|neg| &neg.text),
                             true_cfg_scale: params.true_cfg,
                             width: req.width,
                             height: req.height,
@@ -579,8 +540,8 @@ impl QwenImage21 {
                             cancel: &req.cancel,
                             references: conditioned.then(|| ReferenceConditioning {
                                 latents: &reference_latents,
-                                layout: &pos_layout,
-                                negative_layout: neg_layout.as_ref(),
+                                layout: &pos.layout,
+                                negative_layout: neg.as_ref().map(|neg| &neg.layout),
                             }),
                         },
                         on_progress,
@@ -617,6 +578,49 @@ impl QwenImage21 {
             },
         )
     }
+}
+
+/// The text side of one render request, assembled while the text encoder is resident: the
+/// prepared ordered references and one [`JointBranch`] per CFG side (`neg` only when the run uses
+/// a negative branch).
+pub(crate) struct ReferenceBranches {
+    pub(crate) pos: JointBranch,
+    pub(crate) neg: Option<JointBranch>,
+    pub(crate) references: Vec<PreparedReference>,
+}
+
+/// The render path's text-side assembly (sc-24110, factored out by sc-24162): the request's ordered
+/// references ([`collect_references`]) host-preprocessed against the tower's own Qwen3-VL geometry
+/// ([`pipeline::prepare_conditioning_references`]), each prompt encoded by
+/// [`QwenImage21TextEncoder::encode_conditioning`] (the image-conditioned template with vision
+/// tokens when references are present), then [`pipeline::joint_branch`] at the request's size.
+///
+/// Factored out of `generate` so the edit trainer's equivalence test compares against the code
+/// the render path actually runs, not a re-implementation of it.
+pub(crate) fn assemble_reference_branches(
+    te: &QwenImage21TextEncoder,
+    tokenizer: &TextTokenizer,
+    req: &GenerationRequest,
+    drop: usize,
+    use_negative: bool,
+) -> Result<ReferenceBranches> {
+    let images = collect_references(req)?;
+    let references = pipeline::prepare_conditioning_references(te, &images)?;
+    let branch = |prompt: &str| -> Result<JointBranch> {
+        let conditioning = te.encode_conditioning(tokenizer, prompt, drop, &references)?;
+        pipeline::joint_branch(&conditioning, &references, req.width, req.height)
+    };
+    let pos = branch(&req.prompt)?;
+    let neg = if use_negative {
+        Some(branch(req.negative_prompt.as_deref().unwrap_or(""))?)
+    } else {
+        None
+    };
+    Ok(ReferenceBranches {
+        pos,
+        neg,
+        references,
+    })
 }
 
 /// Capability-driven request validation: the shared floor (count, size range + 32-px grid,
