@@ -3720,6 +3720,7 @@ mod tests {
             // Adapter-only: no full base fine-tune path (sc-14056). The shared
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
+            max_reference_images: 0,
         }
     }
 
@@ -3795,6 +3796,7 @@ mod tests {
             // Adapter-only: no full base fine-tune path (sc-14056). The shared
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
+            max_reference_images: 0,
         }
     }
 
@@ -3810,6 +3812,7 @@ mod tests {
             // Adapter-only: no full base fine-tune path (sc-14056). The shared
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
+            max_reference_images: 0,
         }
     }
 

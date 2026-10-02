@@ -201,11 +201,28 @@ impl Default for TrainingConfig {
     }
 }
 
-/// One captioned training example. Paths are resolved by the caller (the worker resolves the
-/// dataset's absolute image paths).
-#[derive(Clone, Debug, PartialEq)]
+/// One training example. Paths are resolved by the caller (the worker resolves the dataset's
+/// absolute image paths).
+///
+/// Three shapes share this one struct (all additive — every existing trainer's behaviour is
+/// unchanged by the later ones):
+///
+/// * **captioned** ([`captioned`](Self::captioned)) — `image_path` + `caption`, the LoRA/LoKr
+///   text-to-image case;
+/// * **control pair** ([`with_control`](Self::with_control)) — plus a `control_image_path`, the
+///   ControlNet case;
+/// * **edit pair** ([`edit_pair`](Self::edit_pair), sc-24161) — `image_path` is the **target**
+///   (the edited result), `caption` is the **edit instruction**, and
+///   [`reference_image_paths`](Self::reference_image_paths) is the **ordered** list of source /
+///   reference images the instruction refers to ("the first image", "the second image", …).
+///   Order is semantic and is preserved end to end. Only a trainer whose descriptor advertises
+///   [`TrainerDescriptor::max_reference_images`] `> 0` may train on edit pairs; every other trainer
+///   refuses them through the shared [`validate_edit_request`] floor.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TrainingItem {
+    /// The image the model learns to produce — for an edit pair, the edit's **target**.
     pub image_path: PathBuf,
+    /// The caption — for an edit pair, the **edit instruction**.
     pub caption: String,
     /// Optional per-item control-conditioning image (the ControlNet case): a rendered condition
     /// aligned to `image_path` — a pose skeleton, canny edge map, depth map, … `None` is the LoRA
@@ -221,6 +238,13 @@ pub struct TrainingItem {
     /// and reject missing inputs for the selected workflow; it must never substitute the image
     /// path or silently fall back to another workflow.
     pub model_options: JsonMap<String, JsonValue>,
+    /// The **ordered** reference images of an instruction-edit pair (sc-24161): the source image(s)
+    /// the `caption` instruction edits or composes, in the order the instruction names them. Empty
+    /// for every captioned / control item (the default), which every trainer treats exactly as
+    /// before. Non-empty makes the item an edit pair, which only an edit-capable trainer
+    /// ([`TrainerDescriptor::max_reference_images`] `> 0`) accepts — and then only up to that cap;
+    /// see [`validate_edit_request`].
+    pub reference_image_paths: Vec<PathBuf>,
 }
 
 impl TrainingItem {
@@ -232,6 +256,7 @@ impl TrainingItem {
             caption,
             control_image_path: None,
             model_options: JsonMap::new(),
+            reference_image_paths: Vec::new(),
         }
     }
 
@@ -242,7 +267,30 @@ impl TrainingItem {
             caption,
             control_image_path: Some(control_image_path),
             model_options: JsonMap::new(),
+            reference_image_paths: Vec::new(),
         }
+    }
+
+    /// An instruction-edit pair (sc-24161): the `target_image_path` the model learns to produce
+    /// from the **ordered** `reference_image_paths` under the edit `instruction`. The order of
+    /// `reference_image_paths` is kept exactly as given.
+    pub fn edit_pair(
+        target_image_path: PathBuf,
+        instruction: String,
+        reference_image_paths: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            image_path: target_image_path,
+            caption: instruction,
+            control_image_path: None,
+            model_options: JsonMap::new(),
+            reference_image_paths,
+        }
+    }
+
+    /// `true` when this item is an instruction-edit pair (it carries at least one reference).
+    pub fn is_edit_pair(&self) -> bool {
+        !self.reference_image_paths.is_empty()
     }
 }
 
@@ -336,6 +384,14 @@ pub struct TrainerDescriptor {
     /// must *reject* a full-fine-tune request, not silently train a LoRA adapter and hand back
     /// something the caller did not ask for (F-006 / F-055, the same class the control floor guards).
     pub supports_full_finetune: bool,
+    /// The most **ordered reference images** one instruction-edit training item may carry
+    /// (sc-24161) — the model's own reference cap, read from the same fact its render path
+    /// enforces (Qwen-Image 2.1: 10), never a second hard-coded number. `0` means the trainer
+    /// cannot train on edit pairs at all: the shared [`validate_edit_request`] floor then refuses
+    /// any request carrying [`TrainingItem::reference_image_paths`] with a typed
+    /// [`crate::Error::Unsupported`] instead of silently training a text-to-image adapter on the
+    /// targets (the F-055 class). `0` for every trainer shipped before sc-24161.
+    pub max_reference_images: u32,
 }
 
 /// The shared control-training validation floor (F-006) — the training analog of
@@ -402,6 +458,93 @@ pub fn validate_full_finetune_request(
              train a LoRA/LoKr adapter",
             desc.id
         )));
+    }
+    Ok(())
+}
+
+/// The shared **instruction-edit dataset** floor (sc-24161) — the analog of
+/// [`validate_control_request`] for [`TrainingItem::reference_image_paths`]. Every family trainer's
+/// `validate` calls it, so "a trainer that cannot use references refuses an edit dataset" and the
+/// per-model reference cap live in one place.
+///
+/// - no item carries references ⇒ the plain captioned / control path: no-op.
+/// - any item carries references on a trainer whose
+///   [`max_reference_images`](TrainerDescriptor::max_reference_images) is `0` ⇒ typed
+///   [`crate::Error::Unsupported`] — never a text-to-image adapter silently trained on the targets.
+/// - an edit-capable trainer, but some item has **no** references (a mixed dataset) ⇒
+///   [`crate::Error::Msg`] naming the item: an edit run conditions every step on its references, so
+///   a reference-less item has no defined training input.
+/// - an item also carries a `control_image_path` ⇒ [`crate::Error::Msg`]: edit pairs and control
+///   pairs are different workflows.
+/// - an item carries more references than the cap ⇒ [`crate::Error::Msg`] naming the item, its
+///   count and the cap.
+/// - an edit pair with an empty (whitespace-only) instruction `caption` ⇒ [`crate::Error::Msg`]: the
+///   instruction is the edit's whole conditioning.
+///
+/// It also carries the **item-shape floor** every trainer gets for free (and the reason
+/// [`TrainingItem`] can derive `Default` safely): any item whose `image_path` — or any of whose
+/// `reference_image_paths` — is empty is refused with [`crate::Error::Msg`] naming the item, so a
+/// `..Default::default()` literal that forgot a path fails `validate` instead of the run.
+pub fn validate_edit_request(desc: &TrainerDescriptor, req: &TrainingRequest) -> crate::Result<()> {
+    for (idx, item) in req.items.iter().enumerate() {
+        if item.image_path.as_os_str().is_empty() {
+            return Err(crate::Error::Msg(format!(
+                "{}: item {idx} has an empty image_path",
+                desc.id
+            )));
+        }
+        if let Some(r) = item
+            .reference_image_paths
+            .iter()
+            .position(|p| p.as_os_str().is_empty())
+        {
+            return Err(crate::Error::Msg(format!(
+                "{}: item {idx} has an empty path at reference {r}",
+                desc.id
+            )));
+        }
+    }
+    let Some(first_edit) = req.items.iter().position(TrainingItem::is_edit_pair) else {
+        return Ok(());
+    };
+    let cap = desc.max_reference_images as usize;
+    if cap == 0 {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: instruction-edit training (item {first_edit} carries ordered reference images) is \
+             not supported by this trainer — it trains on captioned images only, and would \
+             otherwise silently learn text-to-image from the edit targets",
+            desc.id
+        )));
+    }
+    for (idx, item) in req.items.iter().enumerate() {
+        let count = item.reference_image_paths.len();
+        if count == 0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: an instruction-edit dataset needs at least one reference image on every item \
+                 (item {idx} has none); split captioned and edit items into separate runs",
+                desc.id
+            )));
+        }
+        if item.control_image_path.is_some() {
+            return Err(crate::Error::Msg(format!(
+                "{}: item {idx} carries both reference images (edit pair) and a control image \
+                 (control pair); an item is one or the other",
+                desc.id
+            )));
+        }
+        if count > cap {
+            return Err(crate::Error::Msg(format!(
+                "{}: item {idx} carries {count} reference images, but this model accepts at most \
+                 {cap} reference images per edit",
+                desc.id
+            )));
+        }
+        if item.caption.trim().is_empty() {
+            return Err(crate::Error::Msg(format!(
+                "{}: item {idx} is an edit pair with an empty instruction caption",
+                desc.id
+            )));
+        }
     }
     Ok(())
 }
@@ -506,6 +649,7 @@ mod tests {
             supports_lokr: false,
             supports_control,
             supports_full_finetune,
+            max_reference_images: 0,
         }
     }
 
@@ -615,6 +759,174 @@ mod tests {
             validate_full_finetune_request(&trainer_desc_with(false, true), &full_req(items))
                 .is_ok(),
             "a trainer advertising supports_full_finetune must be allowed through the floor"
+        );
+    }
+
+    fn edit_desc(max_reference_images: u32) -> TrainerDescriptor {
+        TrainerDescriptor {
+            max_reference_images,
+            ..trainer_desc(false)
+        }
+    }
+
+    /// sc-24161: the edit-pair item shape keeps its references in the order given, is
+    /// distinguishable from the captioned/control shapes, and the older constructors (and
+    /// `Default`) carry no references — so every pre-existing caller is unaffected.
+    #[test]
+    fn edit_pair_keeps_its_references_in_order_and_older_shapes_carry_none() {
+        let refs: Vec<PathBuf> = ["c.png", "a.png", "b.png"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let item = TrainingItem::edit_pair(
+            PathBuf::from("target.png"),
+            "put the cat from the second image on the sofa of the first".into(),
+            refs.clone(),
+        );
+        assert_eq!(item.image_path, PathBuf::from("target.png"));
+        assert_eq!(
+            item.caption,
+            "put the cat from the second image on the sofa of the first"
+        );
+        assert_eq!(item.reference_image_paths, refs, "order is semantic");
+        assert!(item.is_edit_pair());
+        assert_eq!(item.control_image_path, None);
+
+        // Round trip through a request (the shape the worker hands every trainer) and a clone:
+        // the order survives untouched.
+        let req = train_req(None, vec![item.clone()]);
+        assert_eq!(req.clone().items[0].reference_image_paths, refs);
+        assert_eq!(req.items[0], item);
+
+        let captioned = TrainingItem::captioned(PathBuf::from("a.png"), "a cat".into());
+        let control = TrainingItem::with_control(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+            PathBuf::from("a.pose.png"),
+        );
+        for older in [&captioned, &control, &TrainingItem::default()] {
+            assert!(older.reference_image_paths.is_empty());
+            assert!(!older.is_edit_pair());
+        }
+    }
+
+    /// sc-24161: a trainer that cannot use references (`max_reference_images == 0`, every trainer
+    /// shipped before the edit trainer) refuses an edit dataset with a typed `Unsupported` — never
+    /// a silently trained text-to-image adapter — and passes a captioned dataset untouched.
+    #[test]
+    fn a_non_edit_trainer_refuses_an_edit_dataset() {
+        let edit = vec![TrainingItem::edit_pair(
+            PathBuf::from("t.png"),
+            "make it blue".into(),
+            vec![PathBuf::from("r.png")],
+        )];
+        let err = validate_edit_request(&edit_desc(0), &train_req(None, edit)).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "an edit dataset on a non-edit trainer is a capability gap → Unsupported, got {err:?}"
+        );
+        assert!(err.to_string().contains("instruction-edit"), "{err}");
+
+        let captioned = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        for cap in [0, 10] {
+            assert!(
+                validate_edit_request(&edit_desc(cap), &train_req(None, captioned.clone())).is_ok(),
+                "a captioned dataset is the floor's no-op (cap {cap})"
+            );
+        }
+    }
+
+    /// sc-24161: the reference cap. Exactly `max_reference_images` passes; one more is refused
+    /// with a message naming the cap and the offending item.
+    #[test]
+    fn the_reference_cap_is_enforced_and_named() {
+        let refs = |n: usize| -> Vec<PathBuf> {
+            (0..n).map(|i| PathBuf::from(format!("r{i}.png"))).collect()
+        };
+        let item =
+            |n: usize| TrainingItem::edit_pair(PathBuf::from("t.png"), "compose".into(), refs(n));
+        let desc = edit_desc(10);
+        assert!(validate_edit_request(&desc, &train_req(None, vec![item(1)])).is_ok());
+        assert!(validate_edit_request(&desc, &train_req(None, vec![item(10)])).is_ok());
+        let err =
+            validate_edit_request(&desc, &train_req(None, vec![item(1), item(11)])).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("at most 10"), "{msg}");
+        assert!(msg.contains("item 1 carries 11"), "{msg}");
+    }
+
+    /// sc-24161: an edit run is all-edit — a reference-less item in it, or an item that is both an
+    /// edit pair and a control pair, is refused by name.
+    #[test]
+    fn mixed_and_hybrid_edit_datasets_are_refused() {
+        let edit = TrainingItem::edit_pair(
+            PathBuf::from("t.png"),
+            "make it blue".into(),
+            vec![PathBuf::from("r.png")],
+        );
+        let plain = TrainingItem::captioned(PathBuf::from("a.png"), "a cat".into());
+        let err =
+            validate_edit_request(&edit_desc(10), &train_req(None, vec![edit.clone(), plain]))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("item 1 has none"), "{err}");
+
+        let mut hybrid = edit;
+        hybrid.control_image_path = Some(PathBuf::from("pose.png"));
+        let err = validate_edit_request(&edit_desc(10), &train_req(None, vec![hybrid]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one or the other"), "{err}");
+    }
+
+    /// sc-24161: the item-shape floor that makes `TrainingItem: Default` safe — a forgotten
+    /// (empty) `image_path` or reference path is refused by name on EVERY trainer (cap 0 or not),
+    /// and an edit pair needs a non-empty instruction. A captioned item may keep an empty caption
+    /// (trigger-word-only datasets), so that is NOT refused.
+    #[test]
+    fn empty_paths_and_empty_edit_instructions_are_refused() {
+        for cap in [0, 10] {
+            let forgotten = TrainingItem {
+                caption: "a cat".into(),
+                ..Default::default()
+            };
+            let err = validate_edit_request(&edit_desc(cap), &train_req(None, vec![forgotten]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("item 0 has an empty image_path"),
+                "cap {cap}: {err}"
+            );
+        }
+
+        let empty_ref = TrainingItem::edit_pair(
+            PathBuf::from("t.png"),
+            "make it blue".into(),
+            vec![PathBuf::from("r.png"), PathBuf::new()],
+        );
+        let err = validate_edit_request(&edit_desc(10), &train_req(None, vec![empty_ref]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty path at reference 1"), "{err}");
+
+        let silent = TrainingItem::edit_pair(
+            PathBuf::from("t.png"),
+            "  ".into(),
+            vec![PathBuf::from("r.png")],
+        );
+        let err = validate_edit_request(&edit_desc(10), &train_req(None, vec![silent]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty instruction"), "{err}");
+
+        let trigger_only = TrainingItem::captioned(PathBuf::from("a.png"), String::new());
+        assert!(
+            validate_edit_request(&edit_desc(0), &train_req(None, vec![trigger_only])).is_ok(),
+            "an empty caption on a captioned item stays legal"
         );
     }
 }

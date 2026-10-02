@@ -19,10 +19,10 @@ use mlx_gen::{
 use crate::config::{SchedulerConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, PRESETS, SIZE_MULTIPLE};
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_layout, text_rows,
-    DenoiseInputs, ReferenceConditioning,
+    create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_branch,
+    prepare_conditioning_references, DenoiseInputs, JointBranch, ReferenceConditioning,
 };
-use crate::reference::{collect_references, prepare_references};
+use crate::reference::{collect_references, PreparedReference};
 use crate::scheduler;
 use crate::text_encoder::{system_prompt_drop_count, QwenImage21TextEncoder};
 use crate::transformer::QwenImage21Transformer;
@@ -424,65 +424,22 @@ impl QwenImage21 {
             false,
             on_progress,
             |te: &QwenImage21TextEncoder| {
-                // The ordered reference list, host-preprocessed against the snapshot's own
-                // Qwen3-VL processor geometry. Empty ⇒ the text-to-image route, unchanged.
-                let images = collect_references(req)?;
-                let references = if images.is_empty() {
-                    Vec::new()
-                } else {
-                    let vision = te.vision_config().ok_or_else(|| {
-                        Error::Unsupported(
-                            "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL \
-                             vision tower (`text_encoder/config.json` `vision_config` + \
-                             `model.visual.*`), which this snapshot does not carry"
-                                .into(),
-                        )
-                    })?;
-                    prepare_references(&images, vision)?
-                };
-                let pos =
-                    te.encode_conditioning(&self.tokenizer, &req.prompt, drop, &references)?;
-                let neg = if params.use_negative {
-                    Some(te.encode_conditioning(
-                        &self.tokenizer,
-                        req.negative_prompt.as_deref().unwrap_or(""),
-                        drop,
-                        &references,
-                    )?)
-                } else {
-                    None
-                };
-                // MLX is lazy: force the conditioning while the encoder is alive, so a Sequential
-                // drop cannot leave an unevaluated graph pointing at freed weights.
-                match &neg {
-                    Some(neg) => mlx_rs::transforms::eval([&pos.hidden, &neg.hidden])?,
-                    None => mlx_rs::transforms::eval([&pos.hidden])?,
-                }
-                Ok((pos, neg, references))
+                assemble_reference_branches(te, &self.tokenizer, req, drop, params.use_negative)
             },
             |_| Ok(()),
-            |heavy, (pos, neg, references), on_progress| {
+            |heavy, branches, on_progress| {
+                let ReferenceBranches {
+                    pos,
+                    neg,
+                    references,
+                } = branches;
                 let channels = heavy.transformer.config().in_channels;
-                // The joint layout + the condition latents: both branches share one reference
-                // encode, but a different prompt is a different text length, hence two layouts.
+                // The condition latents: both branches share one reference encode.
                 let reference_latents = encode_references(&heavy.vae, &references)?;
-                let pos_layout =
-                    joint_layout(&pos.image_pad_mask, &references, req.width, req.height)?;
-                let neg_layout = neg
-                    .as_ref()
-                    .map(|neg| {
-                        joint_layout(&neg.image_pad_mask, &references, req.width, req.height)
-                    })
-                    .transpose()?;
-                let pos_text = text_rows(&pos.hidden, &pos.image_pad_mask)?;
-                let neg_text = neg
-                    .as_ref()
-                    .map(|neg| text_rows(&neg.hidden, &neg.image_pad_mask))
-                    .transpose()?;
                 let conditioning = (!references.is_empty()).then(|| ReferenceConditioning {
                     latents: &reference_latents,
-                    layout: &pos_layout,
-                    negative_layout: neg_layout.as_ref(),
+                    layout: &pos.layout,
+                    negative_layout: neg.as_ref().map(|neg| &neg.layout),
                 });
                 // ONE decode per image either way — upstream always decodes four channels and
                 // has no transparency flag — so this branch chooses only whether the alpha is
@@ -500,8 +457,8 @@ impl QwenImage21 {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
                             latents,
-                            prompt_embeds: &pos_text,
-                            negative_embeds: neg_text.as_ref(),
+                            prompt_embeds: &pos.text,
+                            negative_embeds: neg.as_ref().map(|neg| &neg.text),
                             true_cfg_scale: params.true_cfg,
                             width: req.width,
                             height: req.height,
@@ -555,6 +512,54 @@ impl QwenImage21 {
             },
         )
     }
+}
+
+/// The conditioning one render carries, assembled while the text encoder is resident: the
+/// positive (and, with true CFG, negative) [`JointBranch`] and the ordered prepared references.
+pub(crate) struct ReferenceBranches {
+    pub(crate) pos: JointBranch,
+    pub(crate) neg: Option<JointBranch>,
+    pub(crate) references: Vec<PreparedReference>,
+}
+
+/// The render path's whole text-side assembly for `req`: the ordered reference list
+/// ([`collect_references`]), host-preprocessed against the snapshot's own Qwen3-VL geometry
+/// ([`prepare_conditioning_references`]; empty ⇒ the text-to-image route, unchanged), each
+/// prompt encoded with those references and assembled by [`joint_branch`] at the request's size —
+/// a different prompt is a different text length, hence one layout per branch. The text rows are
+/// forced while the encoder is alive, so a Sequential drop cannot leave an unevaluated graph
+/// pointing at freed weights.
+///
+/// Factored out of `generate` so the edit trainer's equivalence test (sc-24161) compares against
+/// the code the render path actually runs, not a re-implementation of it.
+pub(crate) fn assemble_reference_branches(
+    te: &QwenImage21TextEncoder,
+    tokenizer: &TextTokenizer,
+    req: &GenerationRequest,
+    drop: usize,
+    use_negative: bool,
+) -> Result<ReferenceBranches> {
+    let images = collect_references(req)?;
+    let references = prepare_conditioning_references(te, &images)?;
+    let branch = |prompt: &str| -> Result<JointBranch> {
+        let conditioning = te.encode_conditioning(tokenizer, prompt, drop, &references)?;
+        joint_branch(&conditioning, &references, req.width, req.height)
+    };
+    let pos = branch(&req.prompt)?;
+    let neg = if use_negative {
+        Some(branch(req.negative_prompt.as_deref().unwrap_or(""))?)
+    } else {
+        None
+    };
+    match &neg {
+        Some(neg) => mlx_rs::transforms::eval([&pos.text, &neg.text])?,
+        None => mlx_rs::transforms::eval([&pos.text])?,
+    }
+    Ok(ReferenceBranches {
+        pos,
+        neg,
+        references,
+    })
 }
 
 /// Capability-driven request validation: the shared floor (count, size range + 32-px grid,

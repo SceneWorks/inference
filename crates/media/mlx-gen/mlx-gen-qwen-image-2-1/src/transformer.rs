@@ -970,6 +970,23 @@ impl QwenImage21Transformer {
         width: usize,
         trainables: &CheckpointedTrainables<'_>,
     ) -> Result<Array> {
+        let layout = JointLayout::text_to_image(text.shape()[1] as usize, height, width);
+        self.forward_checkpointed_joint(text, &[latents], timestep, &layout, trainables)
+    }
+
+    /// [`Self::forward_joint`] with per-block gradient checkpointing — the general (edit-capable,
+    /// sc-24161) form of [`Self::forward_checkpointed`]: `images` are the layout's image blocks in
+    /// order (condition images first, target last), exactly as [`Self::forward_joint`] takes them,
+    /// and the returned velocity is the target block's. The preamble is the dense path's own
+    /// `embed_joint`, so the joint sequence, positions and RoPE are identical.
+    pub fn forward_checkpointed_joint(
+        &self,
+        text: &Array,
+        images: &[&Array],
+        timestep: f32,
+        layout: &JointLayout,
+        trainables: &CheckpointedTrainables<'_>,
+    ) -> Result<Array> {
         if trainables.blocks.len() != self.blocks.len() {
             return Err(Error::Msg(format!(
                 "qwen_image_2_1: {} checkpoint block entries for a {}-block DiT",
@@ -977,9 +994,8 @@ impl QwenImage21Transformer {
                 self.blocks.len()
             )));
         }
-        let layout = JointLayout::text_to_image(text.shape()[1] as usize, height, width);
         let mut trace = Trace(None);
-        let j = self.embed_joint(text, &[latents], timestep, &layout, &mut trace)?;
+        let j = self.embed_joint(text, images, timestep, layout, &mut trace)?;
         let mut x = j.x.clone();
         for (index, (block, trainable)) in self.blocks.iter().zip(trainables.blocks).enumerate() {
             // Threaded inputs: [hidden, scale1, gate1, scale2, gate2, factor_0, factor_1, …].
