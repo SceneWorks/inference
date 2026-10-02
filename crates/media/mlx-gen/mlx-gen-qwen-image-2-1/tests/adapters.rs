@@ -196,6 +196,9 @@ fn packed_q4() -> QwenImage21Transformer {
     model
 }
 
+/// A DiT constructor — [`dense`] or [`packed_q4`].
+type Build = fn() -> QwenImage21Transformer;
+
 fn is_packed(model: &mut QwenImage21Transformer, path: &str) -> bool {
     let segs: Vec<&str> = path.split('.').collect();
     model.adaptable_facts(&segs).unwrap().is_quantized
@@ -334,8 +337,7 @@ fn a_lokr_residual_changes_the_velocity_on_dense_and_packed_q4() {
         "transformer_blocks.0.attn.to_k",
         "transformer_blocks.1.attn.to_out.0",
     ];
-    let builds: [(&str, fn() -> QwenImage21Transformer); 2] = [("dense", dense), ("q4", packed_q4)];
-    for (name, build) in builds {
+    for (name, build) in [("dense", dense as Build), ("q4", packed_q4 as Build)] {
         let base = velocity(&build());
         let mut model = build();
         let file = peft_lokr(tmp.path(), &mut model, &targets, 1.0);
