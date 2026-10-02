@@ -15,6 +15,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
+use gen_core_testkit::trainer::{trainer_conformance, TrainerProfile};
 use mlx_gen::gen_core::weightsmeta::safetensors_file_metadata;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::{
@@ -28,7 +29,6 @@ use mlx_gen_qwen_image_2_1::{
     QwenImage21Transformer, BLOCK_ADAPTER_TARGETS, TRAINER_ID,
 };
 use mlx_rs::Array;
-use gen_core_testkit::trainer::{trainer_conformance, TrainerProfile};
 
 use crate::common::{errors, tiny_snapshot};
 
