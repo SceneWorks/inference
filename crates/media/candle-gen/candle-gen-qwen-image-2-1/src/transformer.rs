@@ -990,14 +990,21 @@ impl QwenImage21Transformer {
         width: usize,
     ) -> Result<Tensor> {
         let layout = JointLayout::text_to_image(encoder_hidden_states.dim(1)?, height, width);
-        self.run_joint(
-            encoder_hidden_states,
-            &[latents],
-            timestep,
-            &layout,
-            Ops::Composable,
-            Trace(None),
-        )
+        self.forward_train_joint(encoder_hidden_states, &[latents], timestep, &layout)
+    }
+
+    /// The **training** joint forward (sc-24162): [`Self::forward_joint`] — the render path's
+    /// general text/condition-image/target forward — on the composable, differentiable ops. Same
+    /// arguments (`images` = condition latents in order, target last), same target-block-only
+    /// `[1, target_tokens, out_channels]` f32 velocity, so a loss over it covers target tokens only.
+    pub fn forward_train_joint(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<Tensor> {
+        self.run_joint(text, images, timestep, layout, Ops::Composable, Trace(None))
     }
 
     /// The pre-block half of [`Self::forward_train`], for a gradient-checkpointed step: the joint
@@ -1014,13 +1021,19 @@ impl QwenImage21Transformer {
         width: usize,
     ) -> Result<JointPrelude> {
         let layout = JointLayout::text_to_image(encoder_hidden_states.dim(1)?, height, width);
-        self.prelude(
-            encoder_hidden_states,
-            &[latents],
-            timestep,
-            &layout,
-            &mut Trace(None),
-        )
+        self.train_prelude_joint(encoder_hidden_states, &[latents], timestep, &layout)
+    }
+
+    /// The pre-block half of [`Self::forward_train_joint`] (sc-24162) — [`Self::train_prelude`]
+    /// over a general joint layout (condition images first, target last).
+    pub fn train_prelude_joint(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<JointPrelude> {
+        self.prelude(text, images, timestep, layout, &mut Trace(None))
     }
 
     /// Block `index` of [`Self::forward_train`] on its own — one checkpoint segment. `modulation`

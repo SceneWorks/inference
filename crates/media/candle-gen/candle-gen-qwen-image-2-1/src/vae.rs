@@ -631,7 +631,8 @@ impl QwenImage21Vae {
     fn encode_moments_inner(&self, image: &Tensor, mut trace: Trace<'_>) -> Result<Tensor> {
         let encoder = self.encoder.as_ref().ok_or_else(|| {
             Error::Msg(
-                "qwen_image_2_1 vae: the encoder was dropped (the trainer frees it once its                  dataset latents are cached); reload the VAE to encode"
+                "qwen_image_2_1 vae: the encoder was dropped (the trainer frees it once its \
+                 dataset latents are cached); reload the VAE to encode"
                     .into(),
             )
         })?;

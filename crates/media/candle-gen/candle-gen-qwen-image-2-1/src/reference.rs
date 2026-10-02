@@ -169,6 +169,59 @@ pub fn reference_derived_size(
     reference_target_size(last, output_resolution)
 }
 
+/// The fitted `(w', h')` of a `size = (width, height)` reference, **refused** when the Qwen3-VL
+/// processor's `smart_resize` would rebind that fit (its vision slots would then no longer cover
+/// its VAE latents 4:1). Pure geometry — no pixel is read — so a caller holding only an image
+/// header (the edit trainer's preflight, sc-24162) refuses exactly what [`prepare_reference`]
+/// refuses, before any weight loads. `index` only names the offender. The MLX twin's function of
+/// the same name.
+pub fn reference_fit(size: (u32, u32), index: usize, vision: &VisionConfig) -> Result<(u32, u32)> {
+    let (rw, rh) = reference_target_size(size, vision.output_resolution())?;
+    let (sh, sw) = vision
+        .processor
+        .smart_resize(rh as usize, rw as usize)
+        .map_err(from_llm)?;
+    if (sh, sw) != (rh as usize, rw as usize) {
+        let patch = vision.processor.patch_size.max(1);
+        return Err(rebind_refusal(
+            index,
+            size,
+            (rw, rh),
+            (sw / patch, sh / patch),
+            (rw as usize / patch, rh as usize / patch),
+            vision,
+        ));
+    }
+    Ok((rw, rh))
+}
+
+/// The typed refusal for a reference whose fit the Qwen3-VL processor rebinds. `got` / `want` are
+/// `(width, height)` patch grids.
+fn rebind_refusal(
+    index: usize,
+    size: (u32, u32),
+    (rw, rh): (u32, u32),
+    got: (usize, usize),
+    want: (usize, usize),
+    vision: &VisionConfig,
+) -> Error {
+    Error::Unsupported(format!(
+        "qwen_image_2_1: reference image {index} ({}x{}) fits to {rw}x{rh}, but the Qwen3-VL \
+         processor's smart_resize rebinds it to a {}x{} patch grid instead of {}x{}, so its \
+         vision slots would no longer cover its VAE latents 4:1. Supply a reference whose \
+         {}-px fit stays inside the processor's [{}, {}] pixel budget.",
+        size.0,
+        size.1,
+        got.0,
+        got.1,
+        want.0,
+        want.1,
+        vision.output_resolution(),
+        vision.processor.min_pixels,
+        vision.processor.max_pixels,
+    ))
+}
+
 /// Preprocess one reference: resize once (LANCZOS), then fan out to the vision processor and the
 /// VAE, both on `device`. `index` only names the offender in error messages.
 pub fn prepare_reference(
@@ -178,8 +231,7 @@ pub fn prepare_reference(
     device: &Device,
 ) -> Result<PreparedReference> {
     validate_image(image, index)?;
-    let output_resolution = vision.output_resolution();
-    let (rw, rh) = reference_target_size((image.width, image.height), output_resolution)?;
+    let (rw, rh) = reference_fit((image.width, image.height), index, vision)?;
     let (src_h, src_w) = (image.height as usize, image.width as usize);
     let (dst_h, dst_w) = (rh as usize, rw as usize);
 
@@ -220,21 +272,19 @@ pub fn prepare_reference(
 
     // The two grids must describe the same picture: `smart_resize` must have left the 32-aligned
     // sides alone. It does not when the fitted reference falls outside the processor's budget.
+    // `reference_fit` above already refused a rebinding fit from the geometry alone; this re-checks
+    // the grid the processor actually produced, so the two can never disagree silently.
     let patch = vision.processor.patch_size as i32;
     let (want_h, want_w) = ((rh as i32) / patch, (rw as i32) / patch);
     if grid_thw != [1, want_h, want_w] {
-        return Err(Error::Unsupported(format!(
-            "qwen_image_2_1: reference image {index} ({}x{}) fits to {rw}x{rh}, but the Qwen3-VL \
-             processor's smart_resize rebinds it to a {}x{} patch grid instead of {want_w}x{want_h}, \
-             so its vision slots would no longer cover its VAE latents 4:1. Supply a reference whose \
-             {output_resolution}-px fit stays inside the processor's [{}, {}] pixel budget.",
-            image.width,
-            image.height,
-            grid_thw[2],
-            grid_thw[1],
-            vision.processor.min_pixels,
-            vision.processor.max_pixels,
-        )));
+        return Err(rebind_refusal(
+            index,
+            (image.width, image.height),
+            (rw, rh),
+            (grid_thw[2].max(0) as usize, grid_thw[1].max(0) as usize),
+            (want_w.max(0) as usize, want_h.max(0) as usize),
+            vision,
+        ));
     }
 
     Ok(PreparedReference {
