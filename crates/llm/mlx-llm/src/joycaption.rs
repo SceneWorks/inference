@@ -515,7 +515,9 @@ impl TextLlm for JoyCaptionProvider {
             mtp: None,
             decode: None,
             finish_reason: Some(finish),
-            kv_cache: None,
+            kv_cache: Some(core_llm::KvCacheReport::without_table_family(
+                req.kv_compression,
+            )),
         })
     }
 }

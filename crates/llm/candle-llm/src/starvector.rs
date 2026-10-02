@@ -541,7 +541,9 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             // `None` only when the bounded stream stopped on the seeded prompt, before a decode.
             decode: record.map(|record| record.report(false)),
             finish_reason: Some(finish),
-            kv_cache: None,
+            kv_cache: Some(core_llm::KvCacheReport::without_table_family(
+                req.kv_compression,
+            )),
         })
     }
 }

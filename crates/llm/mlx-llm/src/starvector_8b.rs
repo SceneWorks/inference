@@ -422,7 +422,9 @@ impl TextLlm for StarVector8bProvider {
             mtp: None,
             decode: None,
             finish_reason: Some(map_finish(output.finish_reason)),
-            kv_cache: None,
+            kv_cache: Some(core_llm::KvCacheReport::without_table_family(
+                request.kv_compression,
+            )),
         })
     }
 }
