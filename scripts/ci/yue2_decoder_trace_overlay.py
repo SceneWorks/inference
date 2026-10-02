@@ -16,10 +16,16 @@ LOCK_SHA = "e5af5a1126d3bd5374104db537e9dfbd5f2dbc7a579185ce4cd63954d81fbe75"
 VAE_PATH = Path("crates/audio/candle-audio-yue2/src/vae.rs")
 
 
+def canonical_tree_order(root: Path, entries: list[Path]) -> list[Path]:
+    return sorted(entries, key=lambda entry: entry.relative_to(root).as_posix().encode("utf-8"))
+
+
 def tree_digest(root: Path) -> str:
     import hashlib
     digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
+    # Native Windows Path ordering is case-insensitive, unlike POSIX Path ordering.
+    # Hash the same relative-name byte sequence on either runner.
+    for path in canonical_tree_order(root, list(root.rglob("*"))):
         if path.is_dir() and not path.is_symlink():
             continue
         require(path.is_file() and not path.is_symlink(), "overlay tree contains a non-file")

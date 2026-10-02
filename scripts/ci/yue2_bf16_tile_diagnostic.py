@@ -563,6 +563,69 @@ def resolve_binary(build_json: Path, output: Path, overlay_root: Path | None = N
     })
 
 
+def verify_trace_prelaunch_build(args: argparse.Namespace, overlay: Path,
+                                 provenance_path: Path) -> None:
+    """Refuse a changed executable or build graph before any GPU census or child."""
+    evidence = args.evidence
+    build_json = evidence / "build.jsonl"
+    identity = json.loads((evidence / "build-identity.json").read_text(encoding="utf-8"))
+    harness = json.loads((evidence / "harness-provenance.json").read_text(encoding="utf-8"))
+    template = (Path("../control") / "scripts/ci/yue2_bf16_tile_diagnostic").resolve()
+    staged = evidence / "harness"
+    require(identity.get("binary_sha256") == sha256(args.binary) and
+            identity.get("build_json_sha256") == sha256(build_json) and
+            identity.get("candle_core_features") == ["cuda", "cudarc", "default"] and
+            identity.get("derivative_source") == str(overlay),
+            "decoder trace executable or saved build identity changed before launch")
+    expected_kernel = (overlay / "crates/media/candle-gen/vendor/candle-kernels").as_posix().lower()
+    core_features, kernel_sources, candidates = [], [], []
+    for line in build_json.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("reason") != "compiler-artifact":
+            continue
+        name = row.get("target", {}).get("name")
+        if name == "candle_core":
+            core_features.append(set(row.get("features", [])))
+        elif name == "candle_kernels":
+            kernel_sources.append(row.get("package_id", "").replace("\\", "/"))
+        elif name == "yue2-bf16-tile-diagnostic" and row.get("executable"):
+            candidates.append(Path(row["executable"]).resolve())
+    require(len(candidates) == 1 and candidates[0] == args.binary.resolve() and
+            core_features == [{"cuda", "cudarc", "default"}] and
+            len(kernel_sources) == 1 and kernel_sources[0].startswith("path+") and
+            expected_kernel in kernel_sources[0].lower() and
+            identity.get("vendored_kernel_package_id") == kernel_sources[0],
+            "decoder trace build JSON changed CUDA features, kernel source, or executable")
+    require(harness.get("engine_sha") == args.engine_sha and
+            harness.get("control_sha") == args.control_sha and
+            harness.get("m3_dependency_tuples") == 205 and
+            harness.get("overlay_sha256") == sha256(provenance_path) and
+            harness.get("standalone_lock_sha256") == sha256(template / "Cargo.lock.snapshot"),
+            "decoder trace harness provenance changed before launch")
+    def file_hashes(root: Path) -> dict:
+        return {str(path.relative_to(root)): sha256(path) for path in sorted(root.rglob("*"))
+                if path.is_file() and not path.is_symlink()}
+    def safe_tree(root: Path) -> bool:
+        return all(not path.is_symlink() and (path.is_file() or path.is_dir())
+                   for path in root.rglob("*"))
+    require(harness.get("template_files") == file_hashes(template) and
+            harness.get("staged_files") == file_hashes(staged) and
+            safe_tree(template) and safe_tree(staged),
+            "decoder trace harness source changed before launch")
+    root_lock = tomllib.loads((overlay / "Cargo.lock").read_text(encoding="utf-8"))
+    staged_lock = tomllib.loads((staged / "Cargo.lock").read_text(encoding="utf-8"))
+    def package_id(package: dict) -> tuple:
+        return tuple(package.get(key) for key in ("name", "source", "version", "checksum"))
+    baseline = {package_id(package) for package in root_lock["package"]}
+    dependencies = [package for package in staged_lock["package"]
+                    if package["name"] != "yue2-bf16-tile-diagnostic"]
+    require(len(dependencies) == 205 and all(package_id(package) in baseline for package in dependencies),
+            "decoder trace staged dependencies differ from exact M3")
+
+
 def execute(args: argparse.Namespace) -> None:
     require(args.engine_sha == ENGINE_SHA, "diagnostic requires the exact failed M3 source")
     selector = getattr(args, "diagnostic", "waveform")
@@ -594,6 +657,8 @@ def execute(args: argparse.Namespace) -> None:
         require(not dirty.strip(), "diagnostic source checkout is dirty")
     verify_reference(argparse.Namespace(directory=args.reference, engine_sha=args.engine_sha))
     require(args.binary.is_file(), "diagnostic binary absent")
+    if selector == "decoder_trace":
+        verify_trace_prelaunch_build(args, overlay, provenance_path)
     args.evidence.mkdir(parents=True, exist_ok=True)
     if selector == "decoder_trace":
         shutil.copy2(provenance_path, args.evidence / "overlay-provenance.json")
