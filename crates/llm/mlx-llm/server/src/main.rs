@@ -1057,6 +1057,7 @@ mod tests {
                         verify_steps: 4,
                         replay_forwards: 2,
                         discarded_forwards: 1,
+                        speculative_demoted_at: Some(17),
                         prefix_hit_tokens: 5,
                         prefix_cache: core_llm::PathReport {
                             path: "hit".into(),
@@ -1110,6 +1111,7 @@ mod tests {
                 "verify_steps": 4,
                 "replay_forwards": 2,
                 "discarded_forwards": 1,
+                "speculative_demoted_at": 17,
                 "prefix_cache": {"path": "hit", "reason": "why"},
                 "prefix_hit_tokens": 5,
                 "fallbacks": ["speculative: x"],

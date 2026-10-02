@@ -172,6 +172,18 @@ pub struct DecodeReport {
     /// on a stop token, a stop string or a cancel (MLX pipelined decode, story sc-24439) — never
     /// emitted. `0` on a loop that does not look ahead (every Candle path).
     pub discarded_forwards: u64,
+    /// Where `auto`'s acceptance monitor demoted this request's proposer (sc-24446, E5): the
+    /// generated-token count when the probe window
+    /// ([`ACCEPTANCE_PROBE_VERIFIES`](crate::ACCEPTANCE_PROBE_VERIFIES) verify steps) closed below
+    /// the proposer's break-even ([`AcceptanceMonitor`](crate::AcceptanceMonitor)); every later
+    /// token decoded without a proposer — on MLX through the pipelined token-at-a-time loop.
+    /// [`proposer`](Self::proposer) and [`draft_tokens`](Self::draft_tokens) still name the
+    /// proposer that ran before it, and the plain steps after it are counted in
+    /// [`verify_steps`](Self::verify_steps) (one-token verify passes, as on every path). `None` when
+    /// nothing was demoted — always for `off`, for an explicit `{proposer, depth}` request, and
+    /// for prompt lookup where the plain loop is unpipelined anyway (Candle; MLX under a
+    /// constraint, a penalized sampler or pipelining off — no measured regression there).
+    pub speculative_demoted_at: Option<u64>,
     /// Leading prompt tokens whose cache state came from the cross-turn prefix cache instead of a
     /// prefill forward (story sc-24437): the prefill ran only the prompt past them. `0` on a miss,
     /// when the cache is off, and on a request it refuses (a multimodal prompt — its reason is in
@@ -213,7 +225,8 @@ impl DecodeReport {
     /// The realized mean accepted length: draft tokens accepted per verification pass
     /// (`accepted_tokens / verify_steps`), or `None` when no proposer ran or no verify step did.
     /// Each verify step also commits one target-chosen token, so tokens per verify step is this
-    /// plus one.
+    /// plus one. On a request `auto` demoted ([`speculative_demoted_at`](Self::speculative_demoted_at))
+    /// the denominator includes the plain steps after the demotion.
     pub fn mean_accepted_length(&self) -> Option<f64> {
         (self.proposer != ProposerKind::None && self.verify_steps > 0)
             .then(|| self.accepted_tokens as f64 / self.verify_steps as f64)

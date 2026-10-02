@@ -32,14 +32,15 @@ pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
-    generate_speculative, generate_speculative_with, generate_with_sampler, DraftSample,
-    DraftSampler, Drafts, NoProposer, Proposal, ProposeContext, Proposer, RewindableConstraintMask,
-    SpeculativePrompt, SpeculativeRun, TokenSampler,
+    generate_speculative, generate_speculative_monitored, generate_speculative_with,
+    generate_with_sampler, DraftSample, DraftSampler, Drafts, NoProposer, Proposal, ProposeContext,
+    Proposer, RewindableConstraintMask, SpeculativePrompt, SpeculativeRun, TokenSampler,
 };
 pub use graph::{
-    cuda_graphs_enabled, cuda_graphs_scope, graph_param_cache_load_bytes, graph_tally,
-    graph_workspace_admission_bytes, set_cuda_graphs, CudaGraphsScope, GraphRunner, GraphTally,
-    GraphWorkspace, CUDA_GRAPHS_ENV, PARAM_CACHE_ADMISSION_BYTES,
+    cuda_graphs_enabled, cuda_graphs_scope, graph_demoted_step_admission_bytes,
+    graph_param_cache_load_bytes, graph_tally, graph_workspace_admission_bytes, set_cuda_graphs,
+    CudaGraphsScope, GraphRunner, GraphTally, GraphWorkspace, CUDA_GRAPHS_ENV,
+    PARAM_CACHE_ADMISSION_BYTES,
 };
 pub use prefix::{
     generate_cached, prefill_restored, Boundary, PrefixCache, PrefixEntry, PrefixPrefill,

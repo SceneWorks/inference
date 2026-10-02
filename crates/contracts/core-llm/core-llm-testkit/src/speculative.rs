@@ -894,6 +894,7 @@ impl BenchStats {
 /// | `timing_source` | `backend` or `wall` |
 /// | `target_forwards`, `prefill_forwards`, `verify_steps`, `replay_forwards`, `discarded_forwards` | [`DecodeReport`] forward counts |
 /// | `proposed_tokens`, `accepted_tokens`, `mean_accepted_length` | draft accounting ([`DecodeReport::mean_accepted_length`]) |
+/// | `speculative_demoted_at` | tokens generated when `auto` demoted the proposer ([`DecodeReport::speculative_demoted_at`]); `null` when it was not |
 /// | `prefix_cache` | `{"path", "reason"}` — [`DecodeReport::prefix_cache`] |
 /// | `prefix_hit_tokens` | prompt tokens restored from the prefix cache |
 /// | `sampler`, `kv_cache`, `attention` | [`DecodeReport`] labels |
@@ -958,6 +959,7 @@ impl BenchRow {
             "verify_steps": report.map(|r| r.verify_steps),
             "replay_forwards": report.map(|r| r.replay_forwards),
             "discarded_forwards": report.map(|r| r.discarded_forwards),
+            "speculative_demoted_at": report.and_then(|r| r.speculative_demoted_at),
             "proposed_tokens": report.map(|r| r.proposed_tokens),
             "accepted_tokens": report.map(|r| r.accepted_tokens),
             "mean_accepted_length": report.and_then(DecodeReport::mean_accepted_length),

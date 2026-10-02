@@ -1815,10 +1815,12 @@ impl TextLlm for LlamaProvider {
         // (sc-24434). Anything less than the request asked for is named in the report's
         // `fallbacks` (epic sc-24432 E2) — never a silent downgrade, never a failure. A request
         // that leaves the option unset runs the MLX defaults-table default (E5, sc-24446).
-        let resolution = core_llm::resolve_speculative(
-            req.speculative_or(self.speculative_default),
-            &self.descriptor.capabilities,
-        );
+        // The engine also gets the option itself: under `auto` it monitors the proposer it runs
+        // against the plain loop it would fall back to, and demotes one measurably slower than
+        // plain decoding (sc-24446, E5); an explicit `{proposer, depth}` runs as asked.
+        let speculative_mode = req.speculative_or(self.speculative_default);
+        let resolution =
+            core_llm::resolve_speculative(speculative_mode, &self.descriptor.capabilities);
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
         // A `draft_model` request reaching past the draft's own context window runs `auto`
@@ -2136,6 +2138,7 @@ impl TextLlm for LlamaProvider {
                                         .map(|m| m as &mut dyn RewindableConstraintMask),
                                     should_stop: should_stop_opt,
                                     prefill_clock: clock,
+                                    speculative_mode,
                                     ..EngineOptions::default()
                                 },
                             )
@@ -2171,6 +2174,7 @@ impl TextLlm for LlamaProvider {
                                         .map(|m| m as &mut dyn RewindableConstraintMask),
                                     should_stop: should_stop_opt,
                                     prefill_clock: clock,
+                                    speculative_mode,
                                     ..EngineOptions::default()
                                 },
                             )
@@ -2213,6 +2217,7 @@ impl TextLlm for LlamaProvider {
                                 .map(|m| m as &mut dyn RewindableConstraintMask),
                             should_stop: should_stop_opt,
                             prefill_clock: None,
+                            speculative_mode,
                             ..EngineOptions::default()
                         },
                     )
@@ -2228,6 +2233,7 @@ impl TextLlm for LlamaProvider {
                             .map(|m| m as &mut dyn RewindableConstraintMask),
                         should_stop: should_stop_opt,
                         prefill_clock: Some(Instant::now()),
+                        speculative_mode,
                         ..EngineOptions::default()
                     };
                     match &self.model {
@@ -4707,6 +4713,51 @@ mod tests {
                 assert_eq!(report.replay_forwards, 0, "{label}: {report:?}");
             }
         }
+    }
+
+    /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
+    /// proposer does not. The synthetic hybrid's random MTP head never drafts a token the target
+    /// accepts, so `auto` (MTP at the recommended depth) is demoted after the probe window and
+    /// the report says where, while the same proposer asked for explicitly runs to the end; both
+    /// stream exactly `off`'s tokens.
+    #[test]
+    fn auto_is_demoted_and_an_explicit_proposer_is_not() {
+        use core_llm::Speculative;
+        let provider = qwen35_mtp_provider();
+        let request = |speculative| TextLlmRequest {
+            max_new_tokens: 48,
+            ..spec_request(speculative)
+        };
+        let (_, off_ids) = run(&provider, &request(Speculative::Off));
+        let (auto, auto_ids) = run(&provider, &request(Speculative::Auto));
+        let explicit =
+            Speculative::proposer(SpeculativeProposer::Mtp, MLX_ROW.recommended_depths.mtp);
+        let (asked, asked_ids) = run(&provider, &request(explicit));
+        assert_eq!(auto_ids, off_ids, "a demoted run decodes plainly");
+        assert_eq!(asked_ids, off_ids);
+        let auto = auto.decode.unwrap();
+        let asked = asked.decode.unwrap();
+        assert_eq!(
+            (auto.proposer, asked.proposer),
+            (ProposerKind::Mtp, ProposerKind::Mtp)
+        );
+        assert_eq!(
+            (auto.accepted_tokens, asked.accepted_tokens),
+            (0, 0),
+            "the fixture head never pays"
+        );
+        assert_eq!(
+            auto.speculative_demoted_at,
+            Some(1 + u64::from(core_llm::ACCEPTANCE_PROBE_VERIFIES)),
+            "{auto:?}"
+        );
+        assert_eq!(asked.speculative_demoted_at, None, "{asked:?}");
+        assert!(
+            auto.proposed_tokens < asked.proposed_tokens,
+            "auto stopped proposing: {} vs {}",
+            auto.proposed_tokens,
+            asked.proposed_tokens
+        );
     }
 
     /// AC2: the speculative resolution's fallback reaches `DecodeReport::fallbacks` through

@@ -4989,8 +4989,11 @@ jobs:
       - name: Build both checkouts and run every matrix row (epic and baseline alternating)
         shell: cmd
         run: call scripts\ci\real-weights\candle-decode-speedups-bench\run-every-matrix-row.cmd
+      # `always()`, not `!cancelled()`: a job that hits `timeout-minutes` counts as cancelled, and
+      # run 36891326535 lost all 32 finished rows that way. The runner rewrites summary.json after
+      # every process, so a timed-out campaign's documents still compare (sc-24446).
       - name: Keep the decode-speedups benchmark documents
-        if: ${{ !cancelled() }}
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: decode-speedups-bench-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

@@ -73,6 +73,9 @@ pub struct SpeculativeStats {
     /// (at most one per run). `forwards` counts them: forwards = prefill + verify steps + replays +
     /// discarded.
     pub discarded: usize,
+    /// Tokens generated when `auto`'s acceptance monitor demoted the run to token-at-a-time
+    /// decoding (sc-24446); `None` when it was not demoted.
+    pub demoted_at: Option<usize>,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and

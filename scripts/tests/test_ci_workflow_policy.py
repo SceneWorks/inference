@@ -4249,8 +4249,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 errors.append(f"the run step lacks {fragment!r}")
         errors += windows_bash_selection_errors("candle-decode-speedups-bench", job)
         upload = named.get("Keep the decode-speedups benchmark documents", {})
-        if upload.get("if") != "${{ !cancelled() }}":
-            errors.append("the documents upload must survive a failed row")
+        if upload.get("if") != "always()":
+            # A job that hits `timeout-minutes` counts as cancelled: `!cancelled()` dropped every
+            # finished row of run 36891326535 (sc-24446).
+            errors.append("the documents upload must survive a failed row, a cancel and a timeout")
         if upload.get("with", {}).get("if-no-files-found") != "error":
             errors.append("an empty upload must red")
         if upload.get("with", {}).get("path") != (
@@ -4301,6 +4303,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             lambda job: job.update({"timeout-minutes": 240}),
             lambda job: job["steps"][1]["with"].update({"ref": "main"}),
             lambda job: job["steps"][-1].pop("if"),
+            lambda job: job["steps"][-1].update({"if": "${{ !cancelled() }}"}),
             interpolate,
             drop_git_bash,
             select_git_bash_after_the_toolchain,
