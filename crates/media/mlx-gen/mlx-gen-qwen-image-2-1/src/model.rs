@@ -80,8 +80,12 @@ pub fn descriptor() -> ModelDescriptor {
             // that would have to fabricate an alpha to honour the flag. Whether a given render is
             // actually transparent is decided by the prompt, not by this bit; see UPSTREAM.md.
             supports_alpha_output: true,
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA + LoKr (sc-24156): installed onto every DiT Linear through the
+            // transformer's `AdaptableHost`, stacked and mixed via the shared strict seam, as
+            // residuals after any Q4/Q8 — so on every tier and on every route (T2I and the
+            // reference/edit path share the one DiT `load_heavy` builds).
+            supports_lora: true,
+            supports_lokr: true,
             samplers: curated_sampler_names(),
             schedulers: curated_scheduler_names(),
             min_size: MIN_SIZE,
@@ -156,11 +160,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(PRECISION_OVERRIDE_REFUSAL.into()));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Unsupported(
-            "qwen_image_2_1: LoRA/LoKr adapters are not wired for Qwen-Image 2.1 yet".into(),
-        ));
     }
     if spec.text_encoder.is_some() {
         return Err(Error::Unsupported(
@@ -260,6 +259,13 @@ fn load_heavy(spec: &LoadSpec) -> Result<Heavy> {
             .expect("needs_load_time_quant is false without a requested tier")
             .bits();
         transformer.quantize(bits)?;
+    }
+    // LoRA/LoKr (sc-24156): installed AFTER quantization, as forward-time residuals over the dense
+    // or packed base, so a tier never has to re-pack an adapted Linear and every tier takes the
+    // same adapters. Strict: an adapter key that resolves to no DiT Linear fails the load by name.
+    // Every route (T2I and the reference/edit path) renders through this one DiT.
+    if !spec.adapters.is_empty() {
+        crate::adapters::apply_qwen_image_2_1_adapters(&mut transformer, &spec.adapters)?;
     }
     let vae = loader::load_vae(root)?;
     Ok(Heavy { transformer, vae })
