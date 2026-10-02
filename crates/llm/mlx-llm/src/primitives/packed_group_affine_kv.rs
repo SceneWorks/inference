@@ -7815,4 +7815,453 @@ mod tests {
             }
         }
     }
+
+    /// Llama-3.2-3B-shaped synthetic long-context K/V (bf16, `[1, H, S, D]`) with the features that
+    /// stress the stored representation: rotating high-magnitude key channels (RoPE-like, slow and
+    /// fast, so per-channel key groups carry large offsets and wide ranges), constant key-channel
+    /// biases, and a few "needle" tokens whose keys align with the query so attention mass
+    /// concentrates far back in the history instead of averaging to noise. Every value is
+    /// bf16-exact: `keys`/`values` are the host copies of exactly what the dense arm holds.
+    #[cfg(target_os = "macos")]
+    struct LongContextKv {
+        kv_heads: usize,
+        query_heads: usize,
+        tokens: usize,
+        width: usize,
+        keys: Vec<f32>,
+        values: Vec<f32>,
+        key_array: Array,
+        value_array: Array,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn long_context_uniform(state: &mut u64) -> f32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        ((*state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    /// The ±1 direction query head `head` points along (needle keys of its KV head align with it).
+    #[cfg(target_os = "macos")]
+    fn long_context_direction(head: usize, channel: usize) -> f32 {
+        if (channel * 7 + head * 13 + channel / 5).is_multiple_of(3) {
+            -1.0
+        } else {
+            1.0
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn long_context_needles(tokens: usize) -> [usize; 4] {
+        [17, tokens / 3, tokens / 2 + 5, tokens - 700]
+    }
+
+    #[cfg(target_os = "macos")]
+    fn long_context_kv(
+        kv_heads: usize,
+        query_heads: usize,
+        tokens: usize,
+        width: usize,
+    ) -> LongContextKv {
+        let gqa = query_heads / kv_heads;
+        let needles = long_context_needles(tokens);
+        let mut state = 0x5eed_1234_abcd_ef01u64;
+        let mut keys = Vec::with_capacity(kv_heads * tokens * width);
+        let mut values = Vec::with_capacity(kv_heads * tokens * width);
+        for head in 0..kv_heads {
+            for token in 0..tokens {
+                let needle = needles.contains(&token);
+                for channel in 0..width {
+                    let noise = long_context_uniform(&mut state) * 1.7;
+                    // Rotating outlier pairs: channel c and c + D/2 carry a magnitude-6 rotation at a
+                    // slow (1e-3 rad/token) or fast (0.9 rad/token) frequency, like RoPE'd outliers.
+                    let pair = channel % (width / 2);
+                    let angle = token as f32 * if pair.is_multiple_of(2) { 1e-3 } else { 0.9 };
+                    let rotation = if pair % 11 == 3 {
+                        if channel < width / 2 {
+                            6.0 * angle.cos()
+                        } else {
+                            6.0 * angle.sin()
+                        }
+                    } else {
+                        0.0
+                    };
+                    let bias = if channel % 37 == 5 { 4.5 } else { 0.0 };
+                    let key = if needle {
+                        3.0 * long_context_direction(head * gqa, channel) + noise * 0.1 + bias
+                    } else {
+                        noise + rotation + bias
+                    };
+                    keys.push(key);
+                    let value = if needle {
+                        if channel % 8 == head % 8 {
+                            3.0
+                        } else {
+                            -0.5
+                        }
+                    } else {
+                        long_context_uniform(&mut state) * 1.7 + (channel % 5) as f32 * 0.1
+                    };
+                    values.push(value);
+                }
+            }
+        }
+        let shape = [1, kv_heads as i32, tokens as i32, width as i32];
+        let key_array = Array::from_slice(&keys, &shape)
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let value_array = Array::from_slice(&values, &shape)
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let keys = host_readback::<f32>(&key_array.as_dtype(Dtype::Float32).unwrap());
+        let values = host_readback::<f32>(&value_array.as_dtype(Dtype::Float32).unwrap());
+        LongContextKv {
+            kv_heads,
+            query_heads,
+            tokens,
+            width,
+            keys,
+            values,
+            key_array,
+            value_array,
+        }
+    }
+
+    /// bf16 query rows for the last `rows` positions (`[1, Hq, rows, D]`) and their exact values.
+    #[cfg(target_os = "macos")]
+    fn long_context_query(kv: &LongContextKv, rows: usize) -> (Array, Vec<f32>) {
+        let mut state = 0x0bad_5eed_0000_0001u64 ^ rows as u64;
+        let mut query = Vec::with_capacity(kv.query_heads * rows * kv.width);
+        for head in 0..kv.query_heads {
+            for _ in 0..rows {
+                for channel in 0..kv.width {
+                    // Aligned with the KV head's needle direction (the group's first head exactly,
+                    // the others partially), plus noise.
+                    let aligned = long_context_direction(
+                        head - head % (kv.query_heads / kv.kv_heads),
+                        channel,
+                    );
+                    let weight = if head % (kv.query_heads / kv.kv_heads) == 0 {
+                        0.35
+                    } else {
+                        0.2
+                    };
+                    query.push(weight * aligned + long_context_uniform(&mut state) * 0.15);
+                }
+            }
+        }
+        let array = Array::from_slice(
+            &query,
+            &[1, kv.query_heads as i32, rows as i32, kv.width as i32],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let exact = host_readback::<f32>(&array.as_dtype(Dtype::Float32).unwrap());
+        (array, exact)
+    }
+
+    /// fp64 causal attention of the last `rows` positions over host `[H, S, D]` K/V (the oracle).
+    #[cfg(target_os = "macos")]
+    fn long_context_oracle(
+        kv: &LongContextKv,
+        query: &[f32],
+        rows: usize,
+        keys: &[f32],
+        values: &[f32],
+    ) -> Vec<f64> {
+        let (tokens, width) = (kv.tokens, kv.width);
+        let gqa = kv.query_heads / kv.kv_heads;
+        let scale = 1.0 / (width as f64).sqrt();
+        let mut out = vec![0.0f64; kv.query_heads * rows * width];
+        let mut scores = vec![0.0f64; tokens];
+        for head in 0..kv.query_heads {
+            let kv_head = head / gqa;
+            let k = &keys[kv_head * tokens * width..(kv_head + 1) * tokens * width];
+            let v = &values[kv_head * tokens * width..(kv_head + 1) * tokens * width];
+            for row in 0..rows {
+                let position = tokens - rows + row;
+                let q = &query[(head * rows + row) * width..(head * rows + row + 1) * width];
+                let mut max = f64::NEG_INFINITY;
+                for (token, score) in scores.iter_mut().enumerate().take(position + 1) {
+                    let dot = k[token * width..(token + 1) * width]
+                        .iter()
+                        .zip(q)
+                        .map(|(k, q)| f64::from(*k) * f64::from(*q))
+                        .sum::<f64>();
+                    *score = dot * scale;
+                    max = max.max(*score);
+                }
+                let mut norm = 0.0;
+                let target = &mut out[(head * rows + row) * width..(head * rows + row + 1) * width];
+                for (token, score) in scores.iter().enumerate().take(position + 1) {
+                    let weight = (score - max).exp();
+                    norm += weight;
+                    for (accumulator, value) in target
+                        .iter_mut()
+                        .zip(&v[token * width..(token + 1) * width])
+                    {
+                        *accumulator += weight * f64::from(*value);
+                    }
+                }
+                for accumulator in target.iter_mut() {
+                    *accumulator /= norm;
+                }
+            }
+        }
+        out
+    }
+
+    /// Relative L2 error of `actual` against `expected`.
+    #[cfg(target_os = "macos")]
+    fn relative_l2(actual: &[f64], expected: &[f64]) -> f64 {
+        assert_eq!(actual.len(), expected.len());
+        let (mut error, mut norm) = (0.0, 0.0);
+        for (actual, expected) in actual.iter().zip(expected) {
+            error += (actual - expected).powi(2);
+            norm += expected.powi(2);
+        }
+        (error / norm).sqrt()
+    }
+
+    /// The token ranges one fill appends, in order. `chunk` 0 is one whole-history append (the
+    /// prefix-import shape); otherwise chunks of `chunk` tokens, with the last `decode_tail` tokens
+    /// appended one at a time (decode steps after a chunked prefill).
+    #[cfg(target_os = "macos")]
+    fn long_context_fill(tokens: usize, chunk: usize, decode_tail: usize) -> Vec<(usize, usize)> {
+        if chunk == 0 {
+            return vec![(0, tokens)];
+        }
+        let prefill = tokens - decode_tail;
+        let mut ranges = (0..prefill)
+            .step_by(chunk)
+            .map(|start| (start, (start + chunk).min(prefill)))
+            .collect::<Vec<_>>();
+        ranges.extend((prefill..tokens).map(|token| (token, token + 1)));
+        ranges
+    }
+
+    /// One long-context fill and dispatch: the cache filled by `ranges` of device appends exactly as
+    /// the decoder appends (bf16 K/V, quantize-on-append, dense residual), its dequantized readback,
+    /// and the production reader's decode (`S_q = 1`, per-row split-KV) and multi-row (`S_q = 16`,
+    /// causal; NAX/tiled) outputs with the planned paths.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity, clippy::arc_with_non_send_sync)]
+    fn long_context_dispatch(
+        kv: &LongContextKv,
+        bits: PackedCodeBits,
+        ranges: &[(usize, usize)],
+        queries: [&Array; 2],
+    ) -> (Vec<f32>, Vec<f32>, [(Vec<f64>, String); 2]) {
+        use crate::primitives::packed_metal::{
+            PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
+        };
+        let mut cache = device_cache_bits(1, kv.kv_heads, kv.width, bits);
+        for &(start, end) in ranges {
+            cache
+                .append_device(
+                    0,
+                    &rows_range(&kv.key_array, start, end).unwrap(),
+                    &rows_range(&kv.value_array, start, end).unwrap(),
+                )
+                .unwrap();
+            // Bound the lazy graph exactly as the decoder's per-step evaluation does.
+            cache.evaluate_device_store().unwrap();
+        }
+        assert_eq!(cache.logical_len(), kv.tokens);
+        let kernel = || {
+            PackedMetalKernel::for_identity_family_and_bits(
+                "test-packed",
+                PackedMetalGpuFamily::Apple7OrNewer,
+                bits,
+            )
+            .unwrap()
+        };
+        cache
+            .bind_compiled_handle(CompiledKernelHandle::new(Arc::new(kernel())))
+            .unwrap();
+        let kernel = kernel();
+        let (resident, keys, values) = cache.evaluated_dense_layer(0).unwrap();
+        assert_eq!(resident, kv.tokens);
+        let outputs = queries.map(|query| {
+            let staged = cache.staged_reader_arguments(0).unwrap();
+            let path = format!(
+                "{:?}",
+                kernel
+                    .planned_path(&staged.args(query, PackedMask::Causal))
+                    .unwrap()
+            );
+            let output = cache
+                .dispatch_packed(0, query, PackedMask::Causal)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap();
+            let output = host_readback::<f32>(&output)
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>();
+            (output, path)
+        });
+        mlx_rs::memory::clear_cache();
+        (keys, values, outputs)
+    }
+
+    /// SC-20669 fit-boundary investigation: compressed attention error versus history length and
+    /// append-chunk count, per code width, at the Llama-3.2-3B head geometry (bf16, D = 128,
+    /// GQA 3). For each length the dense fp64 oracle runs over the exact bf16 K/V the dense arm
+    /// holds; for each width the fp64 oracle runs over the stored representation's dequantized
+    /// readback (which must be bit-identical for every chunking: a group straddling an append
+    /// boundary quantizes exactly once, from the same rows). Reports, for the decode (per-row
+    /// split-KV) and multi-row (NAX/tiled) readers: `kernel` (reader vs fp64 over the stored
+    /// representation — kernel numerics only), `quant` (fp64 over the representation vs fp64
+    /// dense — quantization only), `total` (reader vs fp64 dense), and the dense bf16 SDPA's own
+    /// `total` as the floor. Asserts that the kernel error does not grow with length or chunking
+    /// and that every width's quantization error is ordered (8 < 4 < 2). At 131072 tokens the
+    /// default `SC20669_LONG_CONTEXT_KV_HEADS=2` (GQA 3 preserved) peaks near 1.3 GiB RSS; the full
+    /// Llama geometry (`=8`) near 3.8 GiB RSS and 14 GiB physical footprint (MLX buffers).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "long-context investigation sweep (131072-token histories, minutes in debug); run with --ignored --nocapture"]
+    fn long_context_compressed_attention_error_is_flat_in_length_and_chunk_count() {
+        let kv_heads = std::env::var("SC20669_LONG_CONTEXT_KV_HEADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2usize);
+        let lengths = std::env::var("SC20669_LONG_CONTEXT_LENGTHS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|length| length.trim().parse().unwrap())
+                    .collect::<Vec<usize>>()
+            })
+            .unwrap_or_else(|| vec![4096, 32768, 131072]);
+        let tile_rows = 16;
+        let mut kernel_errors: Vec<(PackedCodeBits, usize, f64, f64)> = Vec::new();
+        eprintln!(
+            "S_kv\tappends\tbits\tdecode path\tdecode kernel\tdecode quant\tdecode total\tdense bf16 decode\ttile path\ttile kernel\ttile quant\ttile total\tdense bf16 tile"
+        );
+        for &tokens in &lengths {
+            let kv = long_context_kv(kv_heads, kv_heads * 3, tokens, 128);
+            let (decode_query, decode_exact) = long_context_query(&kv, 1);
+            let (tile_query, tile_exact) = long_context_query(&kv, tile_rows);
+            let dense_decode = long_context_oracle(&kv, &decode_exact, 1, &kv.keys, &kv.values);
+            let dense_tile = long_context_oracle(&kv, &tile_exact, tile_rows, &kv.keys, &kv.values);
+            let scale = (kv.width as f32).powf(-0.5);
+            let bf16_sdpa = |query: &Array, mask| {
+                let output = crate::primitives::attention::sdpa(
+                    query,
+                    &kv.key_array,
+                    &kv.value_array,
+                    scale,
+                    mask,
+                )
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap();
+                host_readback::<f32>(&output)
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>()
+            };
+            let dense_floor = [
+                relative_l2(
+                    &bf16_sdpa(&decode_query, crate::primitives::attention::AttnMask::None),
+                    &dense_decode,
+                ),
+                relative_l2(
+                    &bf16_sdpa(&tile_query, crate::primitives::attention::AttnMask::Causal),
+                    &dense_tile,
+                ),
+            ];
+            for bits in PackedCodeBits::ALL {
+                let mut representation: Option<(u64, Vec<f64>, Vec<f64>)> = None;
+                for (chunk, decode_tail) in [(0, 0), (2048, 0), (2000, 40)] {
+                    let ranges = long_context_fill(tokens, chunk, decode_tail);
+                    let (keys, values, [(decode, decode_path), (tile, tile_path)]) =
+                        long_context_dispatch(&kv, bits, &ranges, [&decode_query, &tile_query]);
+                    let digest = {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        for value in keys.iter().chain(&values) {
+                            value.to_bits().hash(&mut hasher);
+                        }
+                        hasher.finish()
+                    };
+                    let (stored, oracle_decode, oracle_tile) =
+                        representation.get_or_insert_with(|| {
+                            let decode = long_context_oracle(&kv, &decode_exact, 1, &keys, &values);
+                            let tile =
+                                long_context_oracle(&kv, &tile_exact, tile_rows, &keys, &values);
+                            // Element-level representation error (relative RMS against the
+                            // bf16 originals): roughly 16x per two bits removed.
+                            let relative_rms = |stored: &[f32], original: &[f32]| {
+                                let (error, norm) = stored.iter().zip(original).fold(
+                                    (0.0f64, 0.0f64),
+                                    |(error, norm), (stored, original)| {
+                                        (
+                                            error + f64::from(stored - original).powi(2),
+                                            norm + f64::from(*original).powi(2),
+                                        )
+                                    },
+                                );
+                                (error / norm).sqrt()
+                            };
+                            eprintln!(
+                                "{tokens}\trepresentation\t{}\tK rel rms {:.3e}\tV rel rms {:.3e}",
+                                bits.bits(),
+                                relative_rms(&keys, &kv.keys),
+                                relative_rms(&values, &kv.values)
+                            );
+                            (digest, decode, tile)
+                        });
+                    assert!(
+                        digest == *stored,
+                        "{bits:?} S={tokens}: {} appends store a different representation than one append",
+                        ranges.len()
+                    );
+                    let decode_kernel = relative_l2(&decode, oracle_decode);
+                    let tile_kernel = relative_l2(&tile, oracle_tile);
+                    eprintln!(
+                        "{tokens}\t{}\t{}\t{decode_path}\t{decode_kernel:.2e}\t{:.2e}\t{:.2e}\t{:.2e}\t{tile_path}\t{tile_kernel:.2e}\t{:.2e}\t{:.2e}\t{:.2e}",
+                        ranges.len(),
+                        bits.bits(),
+                        relative_l2(oracle_decode, &dense_decode),
+                        relative_l2(&decode, &dense_decode),
+                        dense_floor[0],
+                        relative_l2(oracle_tile, &dense_tile),
+                        relative_l2(&tile, &dense_tile),
+                        dense_floor[1],
+                    );
+                    kernel_errors.push((bits, tokens, decode_kernel, tile_kernel));
+                }
+                let (_, oracle_decode, oracle_tile) = representation.unwrap();
+                let quant = relative_l2(&oracle_decode, &dense_decode)
+                    .max(relative_l2(&oracle_tile, &dense_tile));
+                kernel_errors.push((bits, tokens, -quant, -quant));
+            }
+        }
+        // Kernel numerics: bf16-output-level at every length, chunking, and width (no growth with
+        // S_kv or append count), and each width's quantization error is ordered.
+        for &(bits, tokens, decode, tile) in kernel_errors.iter().filter(|entry| entry.2 >= 0.0) {
+            assert!(
+                decode <= 8e-3 && tile <= 8e-3,
+                "{bits:?} S={tokens}: kernel relative L2 decode {decode:.3e} tile {tile:.3e}"
+            );
+        }
+        for &tokens in &lengths {
+            let quant = |bits| {
+                -kernel_errors
+                    .iter()
+                    .find(|entry| entry.0 == bits && entry.1 == tokens && entry.2 < 0.0)
+                    .unwrap()
+                    .2
+            };
+            assert!(
+                quant(PackedCodeBits::Eight) < quant(PackedCodeBits::Four)
+                    && quant(PackedCodeBits::Four) < quant(PackedCodeBits::Two),
+                "S={tokens}: quantization error is not ordered by width"
+            );
+        }
+    }
 }

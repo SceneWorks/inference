@@ -7042,7 +7042,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 reference_repeats.push(half);
             }
             // Compressed rows: the same-weights dense-KV session greedily continues the kernel
-            // fixture prompt through every stop token, once per row (the stream is deterministic).
+            // fixture prompt through every stop token, once per row (the stream is deterministic),
+            // scoring its own likelihood of every token of that stream.
             let forced_reference = compressed
                 .map(|_| {
                     let kernel_prompt =
@@ -7105,10 +7106,13 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             // A compressed row is teacher-forced once on its dense forced continuation (every
             // position compared by argmax); a dense row keeps one forced pass per distinct natural
             // reference stream (greedy reference repeats are usually identical, and each pass is
-            // a full-context prefill).
-            let (teacher_forced, forced_continuation) = match &forced_reference {
-                Some(reference_stream) => {
-                    let choices = kernel_fixture_prompt(&forcing_session, &prompt, &row.coordinate)
+            // a full-context prefill). Each pass also scores the candidate's likelihood of the
+            // reference tokens, so the perplexity delta compares both arms on one stream.
+            let (teacher_forced, forced_continuation, stream_likelihoods) = match &forced_reference
+            {
+                Some(reference) => {
+                    let reference_stream = &reference.choices;
+                    let candidate = kernel_fixture_prompt(&forcing_session, &prompt, &row.coordinate)
                         .and_then(|kernel_prompt| {
                             forcing_session.provider.campaign_forced_continuation(
                                 &kernel_prompt,
@@ -7123,7 +7127,12 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                                 coordinate_slug(&row.coordinate)
                             )
                         })?;
-                    let continuation = forced_continuation_evidence(reference_stream, &choices)?;
+                    let continuation =
+                        forced_continuation_evidence(reference_stream, &candidate.choices)?;
+                    let likelihood = StreamLikelihood::from_probabilities(
+                        &reference.stream_probabilities,
+                        &candidate.stream_probabilities,
+                    )?;
                     eprintln!(
                         "sc20671-kv-baseline: coordinate {} forced continuation agreement {} ({}/{}; first flips {:?})",
                         coordinate_slug(&row.coordinate),
@@ -7132,7 +7141,11 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                         continuation.tokens,
                         continuation.first_flip_positions
                     );
-                    (vec![None; reference_repeats.len()], Some(continuation))
+                    (
+                        vec![None; reference_repeats.len()],
+                        Some(continuation),
+                        vec![Some(likelihood); reference_repeats.len()],
+                    )
                 }
                 None => {
                     let stop_tokens = forcing_session.provider.campaign_stop_tokens().to_vec();
@@ -7144,7 +7157,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                             )
                         })
                         .collect::<Vec<_>>();
-                    let forced = force_distinct_streams(&streams, |stream| {
+                    let passes = force_distinct_streams(&streams, |stream| {
                         teacher_forced_kernel_choices(
                             &forcing_session,
                             &prompt,
@@ -7157,16 +7170,36 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                                 coordinate_slug(&row.coordinate)
                             )
                         })
-                    })?
-                    .into_iter()
-                    .map(|choices| {
-                        Some(TeacherForcedChoices {
-                            choices,
-                            stop_tokens: stop_tokens.clone(),
+                    })?;
+                    // The reference's natural stream is its own greedy output, so its recorded
+                    // probabilities are already its likelihood of that stream.
+                    let likelihoods = reference_repeats
+                        .iter()
+                        .zip(&passes)
+                        .map(|(reference, pass)| {
+                            StreamLikelihood::from_probabilities(
+                                &reference
+                                    .kernel
+                                    .quality_observation
+                                    .token_probabilities
+                                    .iter()
+                                    .map(|(_, probability)| *probability)
+                                    .collect::<Vec<_>>(),
+                                &pass.stream_probabilities,
+                            )
+                            .map(Some)
                         })
-                    })
-                    .collect::<Vec<_>>();
-                    (forced, None)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let forced = passes
+                        .into_iter()
+                        .map(|pass| {
+                            Some(TeacherForcedChoices {
+                                choices: pass.choices,
+                                stop_tokens: stop_tokens.clone(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (forced, None, likelihoods)
                 }
             };
             // Multi-turn prompt-cache agreement (contract v4) is teacher-forced the same way, on
@@ -7286,13 +7319,15 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 .zip(reference_repeats)
                 .zip(teacher_forced)
                 .zip(teacher_forced_cache)
+                .zip(stream_likelihoods)
                 .enumerate()
-                .map(|(repeat, (((candidate, reference), forced), forced_cache))| {
+                .map(|(repeat, ((((candidate, reference), forced), forced_cache), likelihood))| {
                     let mut suite =
                         pair_product_fixture_halves(candidate, reference, reference_kind)?;
                     suite.kernel_parity_errors = compressed_parity.clone();
                     suite.teacher_forced_candidate = forced;
                     suite.forced_continuation = forced_continuation.clone();
+                    suite.stream_likelihood = likelihood;
                     suite.teacher_forced_cache = forced_cache;
                     suite.multi_turn_forced_continuation = multi_turn_continuation.clone();
                     suite.multi_turn_forced_pass = multi_turn_pass.clone();
@@ -7358,7 +7393,22 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             .map_err(|e| e.to_string())?;
             Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options]".into()),
+        "noise-floor" => {
+            let value = dense_noise_floor(
+                Path::new(&required_flag(args, "--snapshot")?),
+                Path::new(&required_flag(args, "--prompt-file")?),
+                &required_flag(args, "--coordinate")?,
+                optional_flag(args, "--prefill-chunk")?
+                    .map(|chunk| chunk.parse::<usize>().map_err(|e| e.to_string()))
+                    .transpose()?
+                    .unwrap_or(crate::primitives::attention::SDPA_PREFILL_BLOCK_QLEN as usize),
+            )?;
+            let bytes = canonical_json_bytes(&value).map_err(|e| e.to_string())?;
+            fs::write(required_flag(args, "--out")?, &bytes).map_err(|e| e.to_string())?;
+            println!("{}", String::from_utf8(bytes).map_err(|e| e.to_string())?);
+            Ok(CampaignOutcome::Completed)
+        }
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --out <json> [--prefill-chunk <tokens>]".into()),
     }
 }
 
@@ -7374,6 +7424,83 @@ pub struct Coordinate {
 /// The frozen covering set: each family runs every context band, while cold/warm,
 /// chunked/single-shot, and single/batch each have observable rows. The material baseline for
 /// SC-20676 remains warm, single, and single-shot in both families.
+/// SC-20669 dense-vs-dense noise floor of the frozen compressed quality thresholds, for one
+/// scheduled coordinate's kernel fixture (dense session only; no compressed arm, no receipt). The
+/// dense session's forced continuation (exactly the compressed rows' reference, scored) is
+/// compared, by the compressed rows' own metrics — teacher-forced greedy agreement and the
+/// stream-scored perplexity delta — with two exact dense recomputations of the same stream:
+/// `one-shot-repeat` (the identical path again: determinism, expected 1.0 / 0) and
+/// `chunked-prefill` (the prompt prefilled in `prefill_chunk`-token steps: exact bf16 dense
+/// attention in another reduction order). A compressed row cannot be held to agreement or a
+/// perplexity delta tighter than `chunked-prefill` shows the dense arm achieves against itself.
+pub fn dense_noise_floor(
+    snapshot: &Path,
+    prompt_file: &Path,
+    coordinate_slug_value: &str,
+    prefill_chunk: usize,
+) -> Result<serde_json::Value, String> {
+    let coordinate = required_coordinates()
+        .into_iter()
+        .find(|coordinate| coordinate_slug(coordinate) == coordinate_slug_value)
+        .ok_or_else(|| format!("{coordinate_slug_value:?} is not a scheduled coordinate"))?;
+    let prompt = fs::read_to_string(prompt_file).map_err(|e| format!("read prompt: {e}"))?;
+    let session = CampaignSession::load(snapshot).map_err(|e| e.to_string())?;
+    session
+        .validate_coordinate_family(&coordinate)
+        .map_err(|e| e.to_string())?;
+    let kernel_prompt =
+        kernel_fixture_prompt(&session, &prompt, &coordinate).map_err(|e| e.to_string())?;
+    let provider = &session.provider;
+    let reference = provider
+        .campaign_forced_continuation(
+            &kernel_prompt,
+            FORCED_CONTINUATION_TOKENS as usize,
+            None,
+            None,
+        )
+        .map_err(|e| format!("dense forced continuation: {e}"))?;
+    let stream = &reference.choices;
+    let repeat = provider
+        .campaign_forced_continuation(&kernel_prompt, stream.len(), None, Some(stream))
+        .map_err(|e| format!("dense one-shot repeat: {e}"))?;
+    let chunked = provider
+        .campaign_chunked_prefill_continuation(&kernel_prompt, stream, prefill_chunk)
+        .map_err(|e| format!("dense chunked-prefill control: {e}"))?;
+    let control = |scored: &ScoredContinuation| -> Result<serde_json::Value, String> {
+        let agreement = forced_continuation_evidence(stream, &scored.choices)?;
+        let likelihood = StreamLikelihood::from_probabilities(
+            &reference.stream_probabilities,
+            &scored.stream_probabilities,
+        )?;
+        Ok(serde_json::json!({
+            "agreement": agreement.agreement,
+            "matches": agreement.matches,
+            "flipCount": agreement.flip_count,
+            "firstFlipPositions": agreement.first_flip_positions,
+            "referenceNegativeLogLikelihood": likelihood.reference,
+            "controlNegativeLogLikelihood": likelihood.candidate,
+            "perplexityDelta": likelihood.candidate - likelihood.reference,
+        }))
+    };
+    Ok(serde_json::json!({
+        "kind": "sc20669-dense-noise-floor",
+        "coordinate": coordinate_slug_value,
+        "snapshotSha256": session.inventory.sha256,
+        "promptTokens": provider.campaign_prompt_tokens(&kernel_prompt).map_err(|e| e.to_string())?,
+        "tokens": stream.len(),
+        "referenceStreamSha256": token_stream_sha256(stream),
+        "prefillChunk": prefill_chunk,
+        "thresholds": {
+            "greedyTokenAgreement": COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN,
+            "perplexityDelta": COMPRESSED_PERPLEXITY_DELTA_MAX,
+        },
+        "controls": {
+            "one-shot-repeat": control(&repeat)?,
+            "chunked-prefill": control(&chunked)?,
+        },
+    }))
+}
+
 pub fn required_coordinates() -> Vec<Coordinate> {
     [
         ("llama", "short", "single", "chunked", "cold"),
@@ -8233,6 +8360,10 @@ pub trait Observer {
     /// Exact probability of the sampled production token, derived at the same decode seam as the
     /// sampler.  It is intentionally not a caller-provided quality number.
     fn token_probability(&mut self, _stage: &'static str, _token: i32, _probability: f64) {}
+    /// Under teacher forcing, the model's exact probability of the forced token at the same decode
+    /// seam (beside [`Self::token_probability`] of its own choice), so the candidate's likelihood
+    /// is measured on the reference's tokens.
+    fn forced_token_probability(&mut self, _token: i32, _probability: f64) {}
     /// Model identity is derived from the exact files resolved by the product loader, never a
     /// caller-authored digest string.
     fn snapshot_inventory(&mut self, _inventory: &SnapshotInventory) {}
@@ -8280,6 +8411,8 @@ pub struct ProductObserver {
     coordinate_scope: Option<CoordinateCompressionScope>,
     /// The reference token stream fed back at each decode step (teacher forcing), if any.
     forced_tokens: Option<Vec<i32>>,
+    /// The model's probability of each forced token, in decode order (teacher forcing only).
+    forced_token_probabilities: Vec<f64>,
     /// Teacher forcing covers only the first observed generation; a second step 0 ends it.
     forcing_started: bool,
     forcing_done: bool,
@@ -8325,6 +8458,7 @@ impl ProductObserver {
             coordinate_start: None,
             coordinate_scope: None,
             forced_tokens: None,
+            forced_token_probabilities: Vec::new(),
             forcing_started: false,
             forcing_done: false,
         }
@@ -8419,6 +8553,11 @@ impl ProductObserver {
             || self.token_probabilities.iter().any(|(_, probability)| {
                 !probability.is_finite() || !(0.0..=1.0).contains(probability)
             })
+            || self
+                .forced_token_probabilities
+                .iter()
+                .any(|probability| !probability.is_finite() || !(0.0..=1.0).contains(probability))
+            || (self.forced_tokens.is_none() && !self.forced_token_probabilities.is_empty())
         {
             return Err("product observer has invalid numeric decode evidence".into());
         }
@@ -8460,6 +8599,7 @@ impl ProductObserver {
             allocations: self.allocations,
             prefill_logits,
             token_probabilities: self.token_probabilities,
+            forced_token_probabilities: self.forced_token_probabilities,
             session_id: self
                 .session_id
                 .ok_or("product observer is missing campaign session")?,
@@ -8494,6 +8634,8 @@ pub struct ProductObservations {
     pub allocations: Vec<ReceiptAllocation>,
     pub prefill_logits: Vec<f32>,
     pub token_probabilities: Vec<(i32, f64)>,
+    /// Teacher-forced observations only: the model's probability of each forced token.
+    pub forced_token_probabilities: Vec<f64>,
     pub session_id: String,
     pub cache_state_version: u64,
     pub operations: Vec<String>,
@@ -8731,6 +8873,18 @@ impl Observer for ProductObserver {
             return;
         }
         self.token_probabilities.push((token, probability));
+    }
+
+    fn forced_token_probability(&mut self, token: i32, probability: f64) {
+        if self.forced_tokens.is_none()
+            || token < 0
+            || !probability.is_finite()
+            || !(0.0..=1.0).contains(&probability)
+        {
+            self.error = Some("invalid teacher-forced token probability".into());
+            return;
+        }
+        self.forced_token_probabilities.push(probability);
     }
 
     fn snapshot_inventory(&mut self, inventory: &SnapshotInventory) {
@@ -9698,16 +9852,25 @@ fn finish_coordinate_lifecycle(
 }
 
 fn negative_log_likelihood(probabilities: &[(i32, f64)]) -> Result<f64, String> {
+    mean_negative_log_likelihood(
+        &probabilities
+            .iter()
+            .map(|(_, probability)| *probability)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn mean_negative_log_likelihood(probabilities: &[f64]) -> Result<f64, String> {
     if probabilities.is_empty()
         || probabilities
             .iter()
-            .any(|(_, probability)| !probability.is_finite() || *probability <= 0.0)
+            .any(|probability| !probability.is_finite() || *probability <= 0.0)
     {
         return Err("missing finite product token probabilities".into());
     }
     Ok(-probabilities
         .iter()
-        .map(|(_, probability)| probability.ln())
+        .map(|probability| probability.ln())
         .sum::<f64>()
         / probabilities.len() as f64)
 }
@@ -9824,6 +9987,7 @@ pub fn quality_from_product_fixtures(
     teacher_forced_cache: Option<&TeacherForcedChoices>,
     multi_turn_forced_continuation: Option<&ReceiptForcedContinuation>,
     multi_turn_forced_pass: Option<&MultiTurnForcedPass>,
+    stream_likelihood: Option<&StreamLikelihood>,
 ) -> Result<QualityObservation, String> {
     if reference == QualityReference::DenseKvSameWeights
         && [
@@ -9855,6 +10019,22 @@ pub fn quality_from_product_fixtures(
         (None, None) => token_agreement(
             &kernel_candidate.quality_observation.token_probabilities,
             &kernel_reference.quality_observation.token_probabilities,
+        ),
+    };
+    // Perplexity is scored like greedy agreement: both arms' likelihood of the reference stream,
+    // the candidate teacher-forced on it. Free-running streams diverge after one argmax flip and
+    // would then score two different texts.
+    let (reference_perplexity, candidate_perplexity) = match stream_likelihood {
+        Some(likelihood) => (likelihood.reference, likelihood.candidate),
+        None if forced_continuation.is_some() || teacher_forced_candidate.is_some() => {
+            return Err(
+                "a teacher-forced repeat is scored on the reference stream's likelihood".into(),
+            )
+        }
+        // Warmups only, like the free-running agreement above: every measured repeat is scored.
+        None => (
+            negative_log_likelihood(&kernel_reference.quality_observation.token_probabilities)?,
+            negative_log_likelihood(&kernel_candidate.quality_observation.token_probabilities)?,
         ),
     };
     // Contract v4: the multi-turn fixture's quality output is turn 2, served in both arms by a
@@ -9926,12 +10106,8 @@ pub fn quality_from_product_fixtures(
     };
     Ok(QualityObservation {
         parity_errors,
-        reference_perplexity: negative_log_likelihood(
-            &kernel_reference.quality_observation.token_probabilities,
-        )?,
-        candidate_perplexity: negative_log_likelihood(
-            &kernel_candidate.quality_observation.token_probabilities,
-        )?,
+        reference_perplexity,
+        candidate_perplexity,
         greedy_matches,
         greedy_total,
         tool_matches: u64::from(outcomes.tool_outputs_match),
@@ -10078,6 +10254,10 @@ pub struct ProductFixtureSuite {
     pub multi_turn_forced_continuation: Option<ReceiptForcedContinuation>,
     /// Compressed rows' measured repeats: both sessions' turn records of that continuation.
     pub multi_turn_forced_pass: Option<MultiTurnForcedPass>,
+    /// Measured repeats: both arms' likelihood of the reference stream the candidate was
+    /// teacher-forced on (the row's dense forced continuation, or a dense row's reference kernel
+    /// stream) — the perplexity-delta inputs.
+    pub stream_likelihood: Option<StreamLikelihood>,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -10340,13 +10520,14 @@ fn teacher_forced_multi_turn_choices(
 }
 
 /// Teacher-forced kernel fixture: the candidate session decodes `reference`'s own kernel token
-/// stream, and at every position the candidate's greedy choice is returned.
+/// stream, and at every position the candidate's greedy choice and its probability of the forced
+/// token are returned.
 fn teacher_forced_kernel_choices(
     session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
     forced: &[i32],
-) -> core_llm::Result<Vec<i32>> {
+) -> core_llm::Result<ScoredContinuation> {
     let kernel_prompt = kernel_fixture_prompt(session, prompt, coordinate)?;
     if forced.is_empty() {
         return Err(core_llm::Error::InvalidRequest(
@@ -10366,15 +10547,18 @@ fn teacher_forced_kernel_choices(
         forced_pass_stayed_compressed(&observation.packed_evidence, &observation.dense_fallbacks)
             .map_err(core_llm::Error::Load)?;
     }
-    Ok(stream_tokens(&observation.token_probabilities))
+    Ok(ScoredContinuation {
+        choices: stream_tokens(&observation.token_probabilities),
+        stream_probabilities: observation.forced_token_probabilities,
+    })
 }
 
 /// Run `force` once per distinct stream and return its result for every stream, in order.
-pub fn force_distinct_streams<E>(
+pub fn force_distinct_streams<T: Clone, E>(
     streams: &[Vec<i32>],
-    mut force: impl FnMut(&[i32]) -> Result<Vec<i32>, E>,
-) -> Result<Vec<Vec<i32>>, E> {
-    let mut forced = std::collections::BTreeMap::<&[i32], Vec<i32>>::new();
+    mut force: impl FnMut(&[i32]) -> Result<T, E>,
+) -> Result<Vec<T>, E> {
+    let mut forced = std::collections::BTreeMap::<&[i32], T>::new();
     streams
         .iter()
         .map(|stream| {
@@ -10412,6 +10596,43 @@ pub fn forced_pass_stayed_compressed(
         );
     }
     Ok(())
+}
+
+/// A greedy pass over one token stream, scored: the session's choice at every position and its
+/// probability of the stream token there (the forced token when teacher-forced, its own choice when
+/// it produced the stream).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoredContinuation {
+    pub choices: Vec<i32>,
+    pub stream_probabilities: Vec<f64>,
+}
+
+/// Both arms' mean per-token negative log-likelihood of ONE token stream — the reference's greedy
+/// stream, which the reference produced and the candidate is teacher-forced on — the inputs of
+/// `perplexityDelta`. Scoring each arm on its own free-running stream instead compares two
+/// different texts once the streams diverge (after a single argmax flip), which measures the
+/// continuation, not the KV representation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamLikelihood {
+    pub reference: f64,
+    pub candidate: f64,
+}
+
+impl StreamLikelihood {
+    /// Per-position probabilities of the same stream from each arm.
+    pub fn from_probabilities(reference: &[f64], candidate: &[f64]) -> Result<Self, String> {
+        if reference.len() != candidate.len() {
+            return Err(format!(
+                "stream likelihood needs both arms scored on one stream: {} reference and {} candidate positions",
+                reference.len(),
+                candidate.len()
+            ));
+        }
+        Ok(Self {
+            reference: mean_negative_log_likelihood(reference)?,
+            candidate: mean_negative_log_likelihood(candidate)?,
+        })
+    }
 }
 
 /// The candidate's greedy choice at every position of a reference stream, and the stop tokens the
@@ -10558,6 +10779,7 @@ fn pair_product_fixture_halves(
         teacher_forced_cache: None,
         multi_turn_forced_continuation: None,
         multi_turn_forced_pass: None,
+        stream_likelihood: None,
     })
 }
 
@@ -10580,6 +10802,7 @@ impl ProductFixtureSuite {
             self.teacher_forced_cache.as_ref(),
             self.multi_turn_forced_continuation.as_ref(),
             self.multi_turn_forced_pass.as_ref(),
+            self.stream_likelihood.as_ref(),
         )
     }
 }
@@ -11985,6 +12208,7 @@ pub(crate) mod tests {
             allocations: Vec::new(),
             prefill_logits: Vec::new(),
             token_probabilities: vec![(7, 0.5), (9, 0.25)],
+            forced_token_probabilities: Vec::new(),
             session_id: "session".into(),
             cache_state_version: 1,
             operations: Vec::new(),
@@ -12223,6 +12447,8 @@ pub(crate) mod tests {
                 ),
                 stop_tokens: Vec::new(),
             });
+            suite.stream_likelihood =
+                Some(StreamLikelihood::from_probabilities(&[0.5, 0.25], &[0.5, 0.25]).unwrap());
             suite.teacher_forced_cache = Some(TeacherForcedChoices {
                 choices: stream_tokens(
                     &suite
@@ -12314,6 +12540,94 @@ pub(crate) mod tests {
         .quality()
         .unwrap_err()
         .contains("same weights"));
+    }
+
+    /// SC-20669 fit-boundary finding: `perplexityDelta` is both arms' likelihood of ONE stream (the
+    /// reference stream the candidate is teacher-forced on), never each arm's likelihood of its
+    /// own free-running stream. The free-running streams of a row with perfect teacher-forced
+    /// agreement diverge after a single near-tie flip (position 9 of the Llama fit-boundary row) and
+    /// then score two different texts: there, 479/479 forced agreement sat beside a 0.29 delta.
+    #[test]
+    fn perplexity_delta_scores_both_arms_on_the_reference_stream() {
+        let mut suite = pair_product_fixture_halves(
+            test_fixture_half(TEST_NEEDLE),
+            test_fixture_half(TEST_NEEDLE),
+            QualityReference::DenseKvSameWeights,
+        )
+        .unwrap();
+        suite.forced_continuation = Some(test_forced_continuation(FORCED_CONTINUATION_TOKENS));
+        suite.multi_turn_forced_continuation = Some(test_multi_turn_forced_continuation(
+            FORCED_CONTINUATION_TOKENS,
+        ));
+        suite.multi_turn_forced_pass = Some(test_multi_turn_forced_pass());
+        // The candidate's free-running continuation diverged into a different, less likely text.
+        suite
+            .kernel_candidate
+            .quality_observation
+            .token_probabilities = vec![(8, 0.05), (10, 0.1)];
+        // A teacher-forced repeat without the scored stream is refused, never silently scored on
+        // the free-running streams.
+        assert!(suite
+            .quality()
+            .unwrap_err()
+            .contains("reference stream's likelihood"));
+        // Both arms scored on the same stream: the delta is the representation's alone.
+        let likelihood =
+            StreamLikelihood::from_probabilities(&[0.9, 0.8, 0.7], &[0.9, 0.8, 0.69]).unwrap();
+        suite.stream_likelihood = Some(likelihood.clone());
+        let quality = suite.quality().unwrap();
+        assert_eq!(quality.reference_perplexity, likelihood.reference);
+        assert_eq!(quality.candidate_perplexity, likelihood.candidate);
+        let delta = compute_quality(&quality).unwrap().perplexity_delta;
+        let expected = -(0.69f64.ln() - 0.7f64.ln()) / 3.0;
+        assert!((delta - expected).abs() < 1e-12, "{delta} != {expected}");
+        assert!(delta < COMPRESSED_PERPLEXITY_DELTA_MAX);
+        // The arms must be scored on the same positions.
+        assert!(StreamLikelihood::from_probabilities(&[0.9, 0.8], &[0.9])
+            .unwrap_err()
+            .contains("one stream"));
+        assert!(StreamLikelihood::from_probabilities(&[0.9, 0.0], &[0.9, 0.5]).is_err());
+        // Dense rows: the candidate teacher-forced on the reference's natural stream is scored the
+        // same way.
+        let mut dense = pair_product_fixture_halves(
+            test_fixture_half(TEST_NEEDLE),
+            test_fixture_half(TEST_NEEDLE),
+            QualityReference::Bf16Characterization,
+        )
+        .unwrap();
+        dense.teacher_forced_candidate = Some(TeacherForcedChoices {
+            choices: vec![7, 9],
+            stop_tokens: Vec::new(),
+        });
+        dense.teacher_forced_cache = Some(TeacherForcedChoices {
+            choices: vec![7, 9],
+            stop_tokens: Vec::new(),
+        });
+        dense
+            .kernel_candidate
+            .quality_observation
+            .token_probabilities = vec![(8, 0.05), (10, 0.1)];
+        assert!(dense.quality().is_err());
+        dense.stream_likelihood =
+            Some(StreamLikelihood::from_probabilities(&[0.5, 0.25], &[0.5, 0.25]).unwrap());
+        let dense = dense.quality().unwrap();
+        assert_eq!(dense.candidate_perplexity, dense.reference_perplexity);
+    }
+
+    /// The product observer keeps the model's probability of each forced token (the dense-row
+    /// candidate's likelihood of the reference stream) and refuses one outside teacher forcing.
+    #[test]
+    fn product_observer_records_forced_token_probabilities_only_under_teacher_forcing() {
+        let mut forced = ProductObserver::teacher_forced(vec![3, 4]);
+        forced.forced_token_probability(3, 0.25);
+        forced.forced_token_probability(4, 0.5);
+        assert!(forced.error.is_none());
+        assert_eq!(forced.forced_token_probabilities, vec![0.25, 0.5]);
+        forced.forced_token_probability(4, f64::NAN);
+        assert!(forced.error.is_some());
+        let mut free = ProductObserver::new();
+        free.forced_token_probability(3, 0.25);
+        assert!(free.error.is_some() && free.forced_token_probabilities.is_empty());
     }
 
     /// Byte-exact inference copy of SceneWorks `config/kv-baseline-quality-contract.json`: its
@@ -14264,6 +14578,7 @@ pub(crate) mod tests {
             allocations: Vec::new(),
             prefill_logits: Vec::new(),
             token_probabilities: Vec::new(),
+            forced_token_probabilities: Vec::new(),
             session_id: "e".repeat(64),
             cache_state_version: 1,
             operations: Vec::new(),
@@ -14686,6 +15001,8 @@ pub(crate) mod tests {
                 .unwrap();
                 suite.kernel_parity_errors = Some(vec![0.00005]);
                 suite.forced_continuation = Some(continuation.clone());
+                suite.stream_likelihood =
+                    Some(StreamLikelihood::from_probabilities(&[0.5, 0.25], &[0.5, 0.25]).unwrap());
                 suite.multi_turn_forced_continuation = Some(test_multi_turn_forced_continuation(
                     FORCED_CONTINUATION_TOKENS,
                 ));
@@ -16994,6 +17311,7 @@ pub(crate) mod tests {
             allocations: Vec::new(),
             prefill_logits: Vec::new(),
             token_probabilities: Vec::new(),
+            forced_token_probabilities: Vec::new(),
             session_id: "session".into(),
             cache_state_version: 1,
             operations: Vec::new(),
@@ -17105,7 +17423,7 @@ pub(crate) mod tests {
     fn forced_passes_are_deduplicated_and_must_stay_compressed() {
         let streams = vec![vec![1, 2], vec![1, 2], vec![3], vec![1, 2], vec![3]];
         let mut passes = Vec::new();
-        let forced = force_distinct_streams::<String>(&streams, |stream| {
+        let forced = force_distinct_streams::<Vec<i32>, String>(&streams, |stream| {
             passes.push(stream.to_vec());
             Ok(stream.iter().map(|token| token + 10).collect())
         })

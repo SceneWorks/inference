@@ -384,6 +384,7 @@ pub(crate) fn forced_cached_decode(
         tokens,
         stop_tokens,
         teacher_forced,
+        false,
         &mut |_| {},
     );
     let packed_evidence = cache.packed_evidence();

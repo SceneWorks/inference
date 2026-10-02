@@ -195,8 +195,15 @@ fn campaign_steady_decode_on(
     stop_tokens: &[i32],
     compressed: Option<&crate::campaign::CompressedKvArm>,
 ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
-    let measured =
-        campaign_forced_decode_on(model, prompt_ids, tokens, stop_tokens, compressed, None)?;
+    let measured = campaign_forced_decode_on(
+        model,
+        prompt_ids,
+        tokens,
+        stop_tokens,
+        compressed,
+        None,
+        false,
+    )?;
     Ok(crate::campaign::SteadyDecodeMeasurement {
         prompt_tokens: prompt_ids.len() as u64,
         generated_tokens: measured.tokens.len() as u64,
@@ -207,9 +214,9 @@ fn campaign_steady_decode_on(
 }
 
 /// One fixed-length greedy decode through every stop token on a fresh cache of the session's
-/// representation, optionally teacher-forced on `teacher_forced` (see
-/// [`crate::decode::forced_greedy_decode`]). A compressed arm must run wholly on its fused
-/// compressed reader or the call fails closed.
+/// representation, optionally teacher-forced on `teacher_forced` and scored on its stream with
+/// `score` (see [`crate::decode::forced_greedy_decode`]). A compressed arm must run wholly on its
+/// fused compressed reader or the call fails closed.
 fn campaign_forced_decode_on(
     model: &Decoder,
     prompt_ids: &[i32],
@@ -217,6 +224,7 @@ fn campaign_forced_decode_on(
     stop_tokens: &[i32],
     compressed: Option<&crate::campaign::CompressedKvArm>,
     teacher_forced: Option<&[i32]>,
+    score: bool,
 ) -> CoreResult<crate::decode::ForcedDecode> {
     let packed = match (compressed, model) {
         (None, _) => None,
@@ -243,6 +251,7 @@ fn campaign_forced_decode_on(
         tokens,
         stop_tokens,
         teacher_forced,
+        score,
         &mut |_| {},
     );
     let evidence = cache.packed_evidence();
@@ -264,6 +273,53 @@ fn campaign_forced_decode_on(
         }
     }
     Ok(measured)
+}
+
+/// SC-20669 dense noise-floor control: the dense model teacher-forced on `stream` and scored, as
+/// [`campaign_forced_decode_on`] does it, except that all but the last prompt token are prefilled
+/// in `prefill_chunk`-token steps. Every value is exact bf16 dense attention over the same K/V; only
+/// the computation order differs (projection row tiling, attention over the cached prefix instead
+/// of in-step K/V). Its agreement with — and likelihood of — the one-shot dense continuation is the
+/// dense arm's own numerical floor for the frozen greedy and perplexity thresholds.
+fn campaign_chunked_prefill_decode_on(
+    model: &Decoder,
+    prompt_ids: &[i32],
+    stream: &[i32],
+    stop_tokens: &[i32],
+    prefill_chunk: usize,
+) -> CoreResult<crate::decode::ForcedDecode> {
+    if prefill_chunk == 0 || prompt_ids.len() < 2 {
+        return Err(CoreError::InvalidRequest(
+            "chunked prefill needs a positive chunk and a prompt of two or more tokens".into(),
+        ));
+    }
+    let mut cache = model.make_cache();
+    let prefilled = prompt_ids.len() - 1;
+    let measured = (|| -> crate::error::Result<crate::decode::ForcedDecode> {
+        for start in (0..prefilled).step_by(prefill_chunk) {
+            let end = (start + prefill_chunk).min(prefilled);
+            let offset = cache.offset();
+            let logits = model.step(
+                &crate::primitives::nn::input_ids(&prompt_ids[start..end]),
+                cache.as_mut(),
+                offset,
+            )?;
+            logits.eval()?;
+        }
+        crate::decode::forced_greedy_decode_from(
+            model,
+            cache.as_mut(),
+            prompt_ids,
+            prefilled,
+            stream.len(),
+            stop_tokens,
+            Some(stream),
+            true,
+            &mut |_| {},
+        )
+    })();
+    cache.reset().map_err(to_core)?;
+    measured.map_err(to_core)
 }
 
 /// The cache record of one prompt-cache turn: whether the lookup since `before` hit, and how many
@@ -1324,15 +1380,17 @@ impl LlamaProvider {
     /// SC-20671 forced continuation (compressed rows): on the session's representation, prefill the
     /// raw `prompt` and greedily decode `min(tokens, context window - prompt)` ids through every
     /// stop token. With `teacher_forced`, the decode is forced on that stream instead and the
-    /// session's argmax at each position is returned (its length is the stream's). Runs outside
-    /// every coordinate's memory attribution on a request-scoped cache.
+    /// session's argmax at each position is returned (its length is the stream's). Either way the
+    /// session's probability of every stream token is returned beside its choices, so both arms'
+    /// likelihoods are measured on the same tokens. Runs outside every coordinate's memory
+    /// attribution on a request-scoped cache.
     pub(crate) fn campaign_forced_continuation(
         &self,
         prompt: &str,
         tokens: usize,
         compressed: Option<&crate::campaign::CompressedKvArm>,
         teacher_forced: Option<&[i32]>,
-    ) -> CoreResult<Vec<i32>> {
+    ) -> CoreResult<crate::campaign::ScoredContinuation> {
         let ids = self
             .tokenizer
             .encode(prompt, false)?
@@ -1359,9 +1417,52 @@ impl LlamaProvider {
             &self.stop_tokens,
             compressed,
             teacher_forced,
+            true,
         );
         mlx_rs::memory::clear_cache();
-        Ok(measured?.tokens)
+        let measured = measured?;
+        Ok(crate::campaign::ScoredContinuation {
+            choices: measured.tokens,
+            stream_probabilities: measured.stream_probabilities,
+        })
+    }
+
+    /// SC-20669 dense noise-floor control (see [`campaign_chunked_prefill_decode_on`]): the dense
+    /// session teacher-forced on `stream` over the raw `prompt` prefilled in `prefill_chunk`-token
+    /// steps, scored on that stream. Refused on a compressed session's provider path by
+    /// construction: it always decodes the dense cache.
+    pub(crate) fn campaign_chunked_prefill_continuation(
+        &self,
+        prompt: &str,
+        stream: &[i32],
+        prefill_chunk: usize,
+    ) -> CoreResult<crate::campaign::ScoredContinuation> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let budget = u32::try_from(stream.len())
+            .map_err(|_| CoreError::InvalidRequest("forced continuation overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            ids.len(),
+            budget,
+        )?;
+        let measured = campaign_chunked_prefill_decode_on(
+            &self.model,
+            &ids,
+            stream,
+            &self.stop_tokens,
+            prefill_chunk,
+        );
+        mlx_rs::memory::clear_cache();
+        let measured = measured?;
+        Ok(crate::campaign::ScoredContinuation {
+            choices: measured.tokens,
+            stream_probabilities: measured.stream_probabilities,
+        })
     }
 
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
@@ -5600,13 +5701,52 @@ mod tests {
         let arm = crate::campaign::CompressedKvMethod::GroupAffine
             .arm()
             .unwrap();
+        let scored = |compressed, stream: Option<&[i32]>| {
+            campaign_forced_decode_on(&model, &prompt, 64, &every_id, compressed, stream, true)
+        };
         let forced = |compressed, stream: Option<&[i32]>| {
-            campaign_forced_decode_on(&model, &prompt, 64, &every_id, compressed, stream)
-                .map(|decode| decode.tokens)
+            scored(compressed, stream).map(|decode| decode.tokens)
         };
         let reference = forced(None, None).unwrap();
         assert_eq!(reference.len(), 64, "every stop token is decoded through");
         assert_eq!(forced(None, Some(&reference)).unwrap(), reference);
+        // Scored on the same stream, the dense arm teacher-forced on its own continuation has
+        // exactly its free-running likelihood; the compressed arm scores those same tokens.
+        let dense = scored(None, None).unwrap().stream_probabilities;
+        assert_eq!(dense.len(), 64);
+        assert_eq!(
+            scored(None, Some(&reference)).unwrap().stream_probabilities,
+            dense
+        );
+        let compressed = scored(Some(&arm), Some(&reference))
+            .unwrap()
+            .stream_probabilities;
+        assert_eq!(compressed.len(), 64);
+        assert!(compressed
+            .iter()
+            .all(|probability| *probability > 0.0 && *probability <= 1.0));
+        // The dense noise-floor control decodes the same stream after a chunked prefill: an exact
+        // dense computation in another order, so it agrees with the one-shot continuation and
+        // scores the same tokens (here identically: the tiny model's chunks are exact).
+        for chunk in [1, 2, 3, 4, 64] {
+            let control =
+                campaign_chunked_prefill_decode_on(&model, &prompt, &reference, &every_id, chunk)
+                    .unwrap();
+            assert_eq!(control.tokens, reference, "chunk {chunk}");
+            assert_eq!(control.stream_probabilities.len(), 64);
+            let likelihood = crate::campaign::StreamLikelihood::from_probabilities(
+                &dense,
+                &control.stream_probabilities,
+            )
+            .unwrap();
+            assert!(
+                (likelihood.candidate - likelihood.reference).abs() < 1e-3,
+                "chunk {chunk}: {likelihood:?}"
+            );
+        }
+        assert!(
+            campaign_chunked_prefill_decode_on(&model, &prompt, &reference, &every_id, 0).is_err()
+        );
         let choices = forced(Some(&arm), Some(&reference)).unwrap();
         let evidence = crate::campaign::forced_continuation_evidence(&reference, &choices).unwrap();
         assert_eq!(evidence.tokens, 64);

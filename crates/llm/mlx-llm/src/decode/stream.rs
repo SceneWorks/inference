@@ -696,9 +696,14 @@ pub(crate) fn decode_loop(
             sample(&logits, &history, &config.sampling, &mut rng, mask)?
         };
 
-        // The model's own choice is what the observer records, forced or not.
+        // The model's own choice is what the observer records, forced or not; under teacher
+        // forcing its probability of the forced token is recorded beside it.
         if let Some(observer) = observer.as_deref_mut() {
             observer.token_probability("decode", next, selected_token_probability(&logits, next)?);
+            if let Some(token) = forced {
+                observer
+                    .forced_token_probability(token, selected_token_probability(&logits, token)?);
+            }
         }
         let next = forced.unwrap_or(next);
 
@@ -762,6 +767,10 @@ pub(crate) struct ForcedDecode {
     pub(crate) decode_ms: f64,
     /// Generated ids that are stop tokens and were decoded through instead of ending generation.
     pub(crate) forced_stop_tokens: u64,
+    /// With `score`: the decoder's probability of the stream token at every position — the forced
+    /// token when teacher-forced, its own greedy choice otherwise — so two decoders scored on the
+    /// same stream give comparable likelihoods. Empty without `score`.
+    pub(crate) stream_probabilities: Vec<f64>,
 }
 
 /// Prefill `prompt_ids` into `cache`, then greedily decode exactly `tokens` ids, feeding each back
@@ -779,7 +788,10 @@ pub(crate) struct ForcedDecode {
 /// With `teacher_forced`, each step feeds the forced stream's previous token instead of the
 /// decoder's own choice (`tokens` must equal the stream length), so the returned ids are the
 /// decoder's greedy argmax at every position of that stream (SC-20671 forced-continuation
-/// agreement).
+/// agreement). With `score`, the decoder's probability of each stream token is recorded too
+/// ([`ForcedDecode::stream_probabilities`]); a timing measurement never scores (the host softmax
+/// would sit inside its timed window).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn forced_greedy_decode(
     decoder: &dyn Decode,
     cache: &mut dyn KvCache,
@@ -787,6 +799,7 @@ pub(crate) fn forced_greedy_decode(
     tokens: usize,
     stop_tokens: &[i32],
     teacher_forced: Option<&[i32]>,
+    score: bool,
     boundary: &mut dyn FnMut(&Array),
 ) -> Result<ForcedDecode> {
     forced_greedy_decode_from(
@@ -797,6 +810,7 @@ pub(crate) fn forced_greedy_decode(
         tokens,
         stop_tokens,
         teacher_forced,
+        score,
         boundary,
     )
 }
@@ -813,6 +827,7 @@ pub(crate) fn forced_greedy_decode_from(
     tokens: usize,
     stop_tokens: &[i32],
     teacher_forced: Option<&[i32]>,
+    score: bool,
     boundary: &mut dyn FnMut(&Array),
 ) -> Result<ForcedDecode> {
     if prompt_ids.is_empty() || tokens < 2 {
@@ -838,6 +853,7 @@ pub(crate) fn forced_greedy_decode_from(
     let mut history = prompt_ids.to_vec();
     let mut release = BufferRelease::new();
     let mut generated: Vec<i32> = Vec::with_capacity(tokens);
+    let mut stream_probabilities = Vec::with_capacity(if score { tokens } else { 0 });
     let mut logits = decoder.step(
         &input_ids(&prompt_ids[prefilled..]),
         cache,
@@ -853,6 +869,10 @@ pub(crate) fn forced_greedy_decode_from(
             release.advance(1);
         }
         let next = sample(&logits, &history, &greedy, &mut rng, None)?;
+        let streamed = teacher_forced.map_or(next, |forced| forced[step]);
+        if score {
+            stream_probabilities.push(selected_token_probability(&logits, streamed)?);
+        }
         boundary(&logits);
         let stamped = Instant::now();
         if opened.is_none() {
@@ -861,7 +881,7 @@ pub(crate) fn forced_greedy_decode_from(
             closed = Some(stamped);
         }
         generated.push(next);
-        history.push(teacher_forced.map_or(next, |forced| forced[step]));
+        history.push(streamed);
     }
     let (Some(opened), Some(closed)) = (opened, closed) else {
         return Err(Error::Msg(
@@ -883,6 +903,7 @@ pub(crate) fn forced_greedy_decode_from(
         tokens: generated,
         decode_ms,
         forced_stop_tokens,
+        stream_probabilities,
     })
 }
 
@@ -1042,6 +1063,7 @@ mod tests {
         struct Forcing {
             forced: Vec<i32>,
             choices: Vec<i32>,
+            scored: Vec<(i32, f64)>,
         }
         impl crate::campaign::Observer for Forcing {
             fn phase(&mut self, _name: &'static str) {}
@@ -1056,11 +1078,15 @@ mod tests {
             fn token_probability(&mut self, _stage: &'static str, token: i32, _probability: f64) {
                 self.choices.push(token);
             }
+            fn forced_token_probability(&mut self, token: i32, probability: f64) {
+                self.scored.push((token, probability));
+            }
         }
         let run = |forced: Vec<i32>, stop_tokens: Vec<i32>| {
             let mut observer = Forcing {
                 forced,
                 choices: Vec::new(),
+                scored: Vec::new(),
             };
             let output = generate_with_observer(
                 &FixedDecoder,
@@ -1078,17 +1104,36 @@ mod tests {
                 Some(&mut observer),
             )
             .unwrap();
-            (output, observer.choices)
+            (output, observer.choices, observer.scored)
         };
         // FixedDecoder's greedy choice is always token 1.
-        let (output, choices) = run(vec![2, 0, 2], Vec::new());
+        let (output, choices, scored) = run(vec![2, 0, 2], Vec::new());
         assert_eq!(output.tokens, vec![2, 0, 2]);
         assert_eq!(choices, vec![1, 1, 1]);
         assert_eq!(output.finish_reason, FinishReason::Stopped);
+        // Beside its own choice, the model's probability of each forced token is recorded (logits
+        // [0, 1, -1]): the candidate's likelihood of the reference stream.
+        let denominator = 1.0 + std::f64::consts::E + (-1.0f64).exp();
+        let expected = [
+            (2, (-1.0f64).exp() / denominator),
+            (0, 1.0 / denominator),
+            (2, (-1.0f64).exp() / denominator),
+        ];
+        assert_eq!(scored.len(), 3);
+        for ((token, probability), (expected_token, expected_probability)) in
+            scored.iter().zip(expected)
+        {
+            assert_eq!(*token, expected_token);
+            assert!(
+                (probability - expected_probability).abs() < 1e-6,
+                "{scored:?}"
+            );
+        }
         // A forced stop token ends generation exactly as the reference stream did.
-        let (output, choices) = run(vec![2, 0, 2], vec![0]);
+        let (output, choices, scored) = run(vec![2, 0, 2], vec![0]);
         assert_eq!(output.tokens, vec![2]);
         assert_eq!(choices, vec![1, 1]);
+        assert_eq!(scored.len(), 2, "the forced stop position is scored too");
         assert_eq!(output.finish_reason, FinishReason::StopToken);
     }
 
@@ -1189,6 +1234,7 @@ mod tests {
             6,
             &[1],
             None,
+            false,
             &mut |_| {},
         )
         .unwrap();
@@ -1203,6 +1249,7 @@ mod tests {
                 1,
                 &[],
                 None,
+                false,
                 &mut |_| {}
             )
             .is_err(),
@@ -1244,11 +1291,61 @@ mod tests {
             4,
             &[],
             Some(&forced),
+            false,
             &mut |_| {},
         )
         .unwrap();
         assert_eq!(*decoder.0.borrow(), vec![1, 3, 3, 0]);
         assert_eq!(measured.tokens, vec![2, 0, 0, 1]);
+        assert!(
+            measured.stream_probabilities.is_empty(),
+            "scored only on request"
+        );
+        // Scored, the probability recorded at each position is the forced stream token's, never
+        // the decoder's own argmax: two decoders scored on one stream are comparable.
+        let (top, other) = (
+            std::f64::consts::E / (std::f64::consts::E + 3.0),
+            1.0 / (std::f64::consts::E + 3.0),
+        );
+        let close = |actual: &[f64], expected: &[f64]| {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, e)| (a - e).abs() < 1e-6)
+        };
+        let mut cache = decoder.make_cache();
+        let scored = forced_greedy_decode(
+            &decoder,
+            cache.as_mut(),
+            &[1],
+            4,
+            &[],
+            Some(&forced),
+            true,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(scored.tokens, measured.tokens);
+        assert!(
+            close(&scored.stream_probabilities, &[other, other, top, other]),
+            "{:?}",
+            scored.stream_probabilities
+        );
+        // Free-running, the stream is the decoder's own greedy choice.
+        let mut cache = decoder.make_cache();
+        let own = forced_greedy_decode(
+            &decoder,
+            cache.as_mut(),
+            &[1],
+            4,
+            &[],
+            None,
+            true,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(close(&own.stream_probabilities, &[top; 4]));
         assert!(forced_greedy_decode(
             &decoder,
             cache.as_mut(),
@@ -1256,6 +1353,7 @@ mod tests {
             3,
             &[],
             Some(&forced),
+            false,
             &mut |_| {}
         )
         .is_err());
@@ -1278,6 +1376,7 @@ mod tests {
             4,
             &[],
             None,
+            false,
             &mut |logits| {
                 let produced = produced.borrow();
                 boundaries.push((
