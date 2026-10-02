@@ -87,12 +87,19 @@ pub struct StepRequest<'a> {
     /// Also return the final-normalized hidden states `[batch, n, hidden]` (what a native MTP head
     /// pairs with the next token). `false` skips the extra tensor.
     pub want_hidden: bool,
-    /// The step is (a segment of) a prompt prefill, not a decode or verify step: a model runs it
-    /// on the host-position path with the reference attention even from a non-empty cache — a
-    /// prefix-cache hit's suffix, a split prefill's second segment (sc-24441 × sc-24437) — so a
-    /// restored request's prompt attends exactly as a cold prefill's, and the graph runner runs
-    /// it eager, never warming or capturing it ([`StepRequest::as_prefill`]).
+    /// The step is a prompt prefill, not a decode or verify step: a model runs it on the
+    /// host-position path with the reference attention even from a non-empty cache — a
+    /// prefix-cache hit's suffix (sc-24441 × sc-24437) — so a restored request's prompt attends
+    /// exactly as a cold prefill's, and the graph runner runs it eager, never warming or
+    /// capturing it ([`StepRequest::as_prefill`]). No position inside a prefill is ever rolled
+    /// back to, so a hybrid's linear layers checkpoint only its final state (sc-24446).
     pub prefill: bool,
+    /// A prefill that also keeps the cache's state after its first `b` tokens (`0 < b < n`) for
+    /// [`PrefixSnapshot::snapshot`](crate::decode::PrefixSnapshot::snapshot) — the prefix cache's
+    /// boundary snapshot taken inside one forward instead of splitting the prefill there
+    /// (sc-24446). Only a recurrent model needs it (its state exists only where it was taken);
+    /// a softmax KV cache can be copied at any prefix after the step and ignores it.
+    pub snapshot_at: Option<usize>,
 }
 
 impl<'a> StepRequest<'a> {
@@ -103,6 +110,7 @@ impl<'a> StepRequest<'a> {
             scope: LogitsScope::Last,
             want_hidden: false,
             prefill: false,
+            snapshot_at: None,
         }
     }
 
@@ -113,6 +121,7 @@ impl<'a> StepRequest<'a> {
             scope: LogitsScope::All,
             want_hidden: false,
             prefill: false,
+            snapshot_at: None,
         }
     }
 
@@ -123,6 +132,7 @@ impl<'a> StepRequest<'a> {
             scope: LogitsScope::Last,
             want_hidden: false,
             prefill: false,
+            snapshot_at: None,
         }
     }
 
@@ -134,6 +144,7 @@ impl<'a> StepRequest<'a> {
             scope: LogitsScope::All,
             want_hidden: false,
             prefill: false,
+            snapshot_at: None,
         }
     }
 
@@ -146,6 +157,13 @@ impl<'a> StepRequest<'a> {
     /// The same request marked as a prompt-prefill segment ([`StepRequest::prefill`]).
     pub fn as_prefill(mut self) -> Self {
         self.prefill = true;
+        self
+    }
+
+    /// The same request keeping the cache's state after its first `b` tokens
+    /// ([`StepRequest::snapshot_at`]).
+    pub fn with_snapshot_at(mut self, b: usize) -> Self {
+        self.snapshot_at = Some(b);
         self
     }
 

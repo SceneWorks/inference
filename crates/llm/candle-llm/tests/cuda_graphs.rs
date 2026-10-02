@@ -194,6 +194,7 @@ fn qwen38_27b_step_census() {
                 scope: LogitsScope::All,
                 want_hidden: true,
                 prefill: false,
+                snapshot_at: None,
             },
         )
         .unwrap();
@@ -215,6 +216,7 @@ fn qwen38_27b_step_census() {
             scope: LogitsScope::All,
             want_hidden: true,
             prefill: false,
+            snapshot_at: None,
         },
     )
     .unwrap();

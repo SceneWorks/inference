@@ -28,7 +28,6 @@
 //! request's state afterwards. [`generate_cached`] is the older single-sequence loop on the same
 //! cache.
 
-use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
 use core_llm::{PrefixReuse, PrefixStore};
@@ -105,6 +104,14 @@ pub trait PrefixSnapshot: Clone + Sized {
     /// reports ([`SpeculativeRun::committed_cache_len`]). Only an [`PrefixReuse::AnyPrefix`] cache
     /// can be cut; a recurrent state holding any other length is an error.
     fn committed(self, len: usize) -> Result<Self>;
+    /// Ask the next forward — a prefill running past `len` — to keep what
+    /// [`at_boundary`](Self::at_boundary)`(len)` needs (sc-24446): a recurrent state exists only
+    /// where it was taken. A cache that can be cut at any prefix afterwards needs nothing.
+    fn capture_boundary(&mut self, len: usize);
+    /// A copy of this cache as it was after its first `len` positions, below its length — the
+    /// prefix cache's boundary snapshot taken after one prefill forward ran past it. Never shares
+    /// a buffer the live cache goes on to write.
+    fn at_boundary(&self, len: usize) -> Result<Self>;
 }
 
 impl PrefixSnapshot for ContiguousKvCache {
@@ -136,6 +143,12 @@ impl PrefixSnapshot for ContiguousKvCache {
             self.truncate(len as i32)?;
         }
         Ok(self)
+    }
+
+    fn capture_boundary(&mut self, _len: usize) {}
+
+    fn at_boundary(&self, len: usize) -> Result<Self> {
+        self.prefix(len as i32)
     }
 }
 
@@ -177,6 +190,14 @@ impl PrefixSnapshot for Qwen35Cache {
                 self.offset()
             )))
         }
+    }
+
+    fn capture_boundary(&mut self, len: usize) {
+        Qwen35Cache::capture_boundary(self, len as i32);
+    }
+
+    fn at_boundary(&self, len: usize) -> Result<Self> {
+        Qwen35Cache::at_boundary(self, len as i32)
     }
 }
 
@@ -370,8 +391,6 @@ pub struct PrefixPrefill<C> {
     pub hidden: Option<Array>,
     /// Leading prompt positions the lookup restored (the prefill starts past them).
     pub reused: usize,
-    /// Target forwards the prefill ran (two when it split at the boundary).
-    pub forwards: usize,
     /// Prompt tokens the prefill fed through the target — `prompt.len() - reused` when the
     /// restored cache was really prefilled on top of; the provider reports
     /// `prefix_hit_tokens = prompt.len() - fed_tokens`, so the report measures the prefill it ran.
@@ -386,12 +405,13 @@ pub struct PrefixPrefill<C> {
 /// Prefill `prompt` through `target` on top of the longest prefix `prefix` can restore.
 ///
 /// A hit restores the cache to `reused` positions and runs only `prompt[reused..]`; a miss runs
-/// the whole prompt on a fresh cache. `boundary` is a prompt length to snapshot at — honoured for
-/// a [`PrefixReuse::WholeEntry`] cache when it falls strictly inside the prefilled span, by
-/// splitting the prefill there (a softmax cache is stored whole after the run instead). `mtp`
-/// asks for the MTP head's state with the restored prefix (and for the target's hidden rows).
-/// The cancel flag is checked before every forward; a cancelled prefill returns
-/// [`Error::Canceled`] and stores nothing.
+/// the whole prompt on a fresh cache — in **one** forward either way. `boundary` is a prompt
+/// length to snapshot at — honoured for a [`PrefixReuse::WholeEntry`] cache when it falls strictly
+/// inside the prefilled span, by capturing the state there inside the forward
+/// ([`PrefixSnapshot::capture_boundary`], sc-24446; a softmax cache is stored whole after the run
+/// instead). `mtp` asks for the MTP head's state with the restored prefix (and for the target's
+/// hidden rows). The cancel flag is checked before and after the forward; a cancelled prefill
+/// returns [`Error::Canceled`] and stores nothing.
 pub fn prefill_with_prefix<T>(
     target: &T,
     prefix: &mut PrefixCache,
@@ -438,54 +458,39 @@ where
     }
     let split = boundary
         .filter(|&b| T::Cache::REUSE == PrefixReuse::WholeEntry && b > reused && b < prompt.len());
-    // One forward (or warm-up) per segment: split at the boundary when there is one.
-    let mut segments = Vec::with_capacity(2);
-    let mut from = reused;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    // One forward over everything past the restored prefix (sc-24446): a boundary inside it is
+    // captured on the way — the recurrent state there kept by the forward, the attention KV
+    // copied up to it afterwards — instead of splitting the prefill into two forwards.
     if let Some(b) = split {
-        segments.push(from..b);
-        from = b;
+        cache.capture_boundary(b);
     }
-    segments.push(from..prompt.len());
-    let mut hidden_rows = Vec::new();
-    let mut logits = None;
-    let mut snapshot = None;
-    let forwards = segments.len();
-    let fed_tokens = segments.iter().map(ExactSizeIterator::len).sum();
-    for segment in segments {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let out = target.forward(
-            &mut cache,
-            &input_ids(&prompt[segment.clone()]),
-            segment.start as i32,
-            LogitsScope::Last,
-            want_hidden,
-        )?;
-        hidden_rows.extend(out.hidden);
-        logits = Some(out.logits);
-        if split == Some(segment.end) {
-            snapshot = Some(Boundary {
-                len: segment.end,
-                cache: cache.clone(),
-            });
-        }
+    let out = target.forward(
+        &mut cache,
+        &input_ids(&prompt[reused..]),
+        reused as i32,
+        LogitsScope::Last,
+        want_hidden,
+    )?;
+    if cancel.is_cancelled() {
+        // Cancelled while the forward ran: no snapshot of a prefill the request abandons.
+        return Err(Error::Canceled);
     }
-    let hidden = match hidden_rows.len() {
-        0 => None,
-        1 => hidden_rows.pop(),
-        _ => Some(concatenate_axis(
-            &hidden_rows.iter().collect::<Vec<_>>(),
-            1,
-        )?),
+    let snapshot = match split {
+        Some(b) => Some(Boundary {
+            len: b,
+            cache: cache.at_boundary(b)?,
+        }),
+        None => None,
     };
     Ok(PrefixPrefill {
         cache,
-        logits: logits.expect("at least one segment"),
-        hidden,
+        logits: out.logits,
+        hidden: out.hidden,
         reused,
-        forwards,
-        fed_tokens,
+        fed_tokens: prompt.len() - reused,
         mtp,
         boundary: snapshot,
     })
@@ -662,6 +667,7 @@ mod engine_tests {
     struct Counted<'a, T> {
         inner: &'a T,
         fed: Cell<usize>,
+        calls: Cell<usize>,
         cancel_in_forward: Option<&'a CancelFlag>,
     }
 
@@ -670,6 +676,7 @@ mod engine_tests {
             Self {
                 inner,
                 fed: Cell::new(0),
+                calls: Cell::new(0),
                 cancel_in_forward: None,
             }
         }
@@ -701,6 +708,7 @@ mod engine_tests {
             want_hidden: bool,
         ) -> Result<TargetOutput> {
             self.fed.set(self.fed.get() + ids.shape()[1] as usize);
+            self.calls.set(self.calls.get() + 1);
             if let Some(cancel) = self.cancel_in_forward {
                 cancel.cancel();
             }
@@ -1216,13 +1224,128 @@ mod engine_tests {
             .err()
             .expect("cancelled");
         assert!(matches!(err, Error::Canceled), "{err}");
-        assert_eq!(counted.take(), 6, "the second segment never ran");
+        assert_eq!(
+            counted.take(),
+            7,
+            "one forward, past the boundary (sc-24446)"
+        );
         assert!(pc.is_empty());
 
         let (run, reused) = turn(&model, &mut NoProposer, &mut pc, &prompt, Some(6), 4);
         assert_eq!(reused, 0);
         assert_eq!(run.output.tokens, cold(&model, &mut NoProposer, &prompt, 4));
         assert_eq!(pc.len(), 1);
+    }
+
+    /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward,
+    /// and the snapshot it stores is the one a prefill split at the boundary into two forwards
+    /// stores — every DeltaNet state and the attention KV up to the boundary, to the GEMM's
+    /// reduction order — and a later hit restoring it decodes the same greedy tokens as a hit on
+    /// the split prefill's snapshot. A conversation shorter
+    /// than one Gated DeltaNet chunk and one past it.
+    #[test]
+    fn a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state() {
+        let model = qwen35(false);
+        let fwd = |cache: &mut Qwen35Cache, ids: &[i32], at: usize| {
+            SpeculativeTarget::forward(
+                &model,
+                cache,
+                &input_ids(ids),
+                at as i32,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap()
+        };
+        let host = |a: &Array| {
+            a.as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        for conv_len in [8usize, 100] {
+            let conversation: Vec<i32> = (0..conv_len as i32).map(|i| (i * 7 % 49) + 1).collect();
+            let mut p1 = conversation.clone();
+            p1.extend_from_slice(&[40, 41, 42, 43, 44]);
+            let counted = Counted::new(&model);
+            let pre = prefill_restored(
+                &counted,
+                None,
+                &p1,
+                Some(conv_len),
+                false,
+                &CancelFlag::new(),
+            )
+            .unwrap();
+            assert_eq!(counted.calls.get(), 1, "{conv_len}: one forward");
+            assert_eq!(counted.take(), p1.len(), "{conv_len}: the whole prompt");
+
+            // The reference: the prefill split at the boundary, snapshotted between the forwards.
+            let mut split = model.new_cache();
+            fwd(&mut split, &p1[..conv_len], 0);
+            let reference = split.clone();
+            let split_logits = fwd(&mut split, &p1[conv_len..], conv_len).logits;
+            let boundary = pre.boundary.expect("a boundary snapshot");
+            assert_eq!(boundary.len(), conv_len);
+            assert_eq!(boundary.cache.offset(), conv_len as i32);
+            // Equal up to the GEMM's row-count-dependent reduction order (one forward of `T` rows
+            // vs `b` then `T - b`; bit-identical on the Metal device this was written on).
+            let close = |g: &[f32], w: &[f32], what: &str| {
+                assert_eq!(g.len(), w.len(), "{conv_len}: {what}");
+                let scale = w.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+                let diff = g
+                    .iter()
+                    .zip(w)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(diff <= 1e-4 * scale, "{conv_len}: {what} differs by {diff}");
+            };
+            let pairs = |got: Vec<(Vec<f32>, Vec<f32>)>, want: Vec<(Vec<f32>, Vec<f32>)>, what| {
+                assert_eq!(got.len(), want.len(), "{conv_len}: {what}");
+                for (i, ((ga, gb), (wa, wb))) in got.iter().zip(&want).enumerate() {
+                    close(ga, wa, &format!("{what} {i}"));
+                    close(gb, wb, &format!("{what} {i}"));
+                }
+            };
+            pairs(
+                boundary.cache.delta_states(),
+                reference.delta_states(),
+                "the DeltaNet states at the boundary",
+            );
+            pairs(
+                boundary.cache.attn_states(),
+                reference.attn_states(),
+                "the attention KV up to the boundary",
+            );
+            close(&host(&pre.logits), &host(&split_logits), "logits");
+            pairs(
+                pre.cache.delta_states(),
+                split.delta_states(),
+                "final states",
+            );
+
+            // A later hit on each snapshot decodes the same.
+            let mut p2 = conversation.clone();
+            p2.extend_from_slice(&[30, 31, 32, 40, 41]);
+            let mut runs = Vec::new();
+            for snapshot in [boundary.cache, reference] {
+                let mut pc = PrefixCache::with_budget(1 << 30);
+                pc.store(
+                    &p1,
+                    &[],
+                    split.clone(),
+                    Some(Boundary {
+                        len: conv_len,
+                        cache: snapshot,
+                    }),
+                    None,
+                );
+                let (run, reused) = turn(&model, &mut NoProposer, &mut pc, &p2, None, 6);
+                assert_eq!(reused, conv_len);
+                runs.push(run.output.tokens);
+            }
+            assert_eq!(runs[0], runs[1], "{conv_len}: decode after the hit");
+        }
     }
 
     /// AC3 on real entries: past the budget the least-recently-used entry is evicted, and the

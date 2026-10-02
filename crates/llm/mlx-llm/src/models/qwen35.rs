@@ -641,6 +641,13 @@ impl AttnKv {
     fn truncate(&mut self, len: i32) -> Result<()> {
         self.kv.truncate(len)
     }
+
+    /// A copy of positions `0..len` in its own buffers ([`ContiguousKvCache::prefix`]).
+    fn prefix(&self, len: i32) -> Result<Self> {
+        Ok(Self {
+            kv: self.kv.prefix(len)?,
+        })
+    }
 }
 
 /// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, growing KV for
@@ -773,6 +780,71 @@ impl Qwen35Cache {
                     c.live_state().map(|(conv, ssm)| (host(conv), host(ssm)))
                 }
                 Qwen35LayerCache::Attn(_) => None,
+            })
+            .collect()
+    }
+
+    /// Ask the next forward — a prefill, outside any checkpoint window — to capture every
+    /// DeltaNet layer's state after `position`, a boundary strictly inside it, so
+    /// [`at_boundary`](Self::at_boundary) can copy the cache as it was there without splitting
+    /// the prefill into two forwards (sc-24446).
+    pub fn capture_boundary(&mut self, position: i32) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.capture_at(position);
+            }
+        }
+    }
+
+    /// The cache as it was after its first `len` positions, `len` below its length: the attention
+    /// KV's first `len` positions in their own buffers (causal: no later position wrote them) and
+    /// the DeltaNet states the last forward captured at `len`
+    /// ([`capture_boundary`](Self::capture_boundary)) — the cache a prefill that stopped at `len`
+    /// would have left, with no checkpoint window. A layer holding no state at `len` is an error.
+    pub fn at_boundary(&self, len: i32) -> Result<Self> {
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| {
+                Ok(match l {
+                    Qwen35LayerCache::Delta(c) => {
+                        Qwen35LayerCache::Delta(c.at_captured(len).ok_or_else(|| {
+                            Error::Msg(format!(
+                                "Qwen35Cache: no recurrent state captured at {len} (the cache \
+                                 is at {})",
+                                c.offset()
+                            ))
+                        })?)
+                    }
+                    Qwen35LayerCache::Attn(a) => Qwen35LayerCache::Attn(a.prefix(len)?),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // The captured conv tails are slices of this forward's conv input: evaluate them with the
+        // KV copies (`prefix` starts those) so the entry holds no pending work for a later request.
+        async_eval(layers.iter().filter_map(|l| match l {
+            Qwen35LayerCache::Delta(c) => c.live_state().map(|(conv, _)| conv),
+            Qwen35LayerCache::Attn(_) => None,
+        }))?;
+        Ok(Self { layers })
+    }
+
+    /// Every attention layer's live `(keys, values)` on the host, in layer order.
+    #[cfg(test)]
+    pub(crate) fn attn_states(&self) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let host = |a: &Array| {
+            a.as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Attn(a) => {
+                    a.kv.peek(0).unwrap().map(|(k, v)| (host(&k), host(&v)))
+                }
+                Qwen35LayerCache::Delta(_) => None,
             })
             .collect()
     }

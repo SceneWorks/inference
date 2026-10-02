@@ -4277,7 +4277,6 @@ impl TextLlm for LlamaProvider {
         )?;
         let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
         let mut prefix_hit = 0usize;
-        let mut prefill_forwards = 1usize;
 
         self.model
             .device()
@@ -4639,7 +4638,6 @@ impl TextLlm for LlamaProvider {
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         // Measured, not looked up: the positions the prefill did not feed.
                         prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
-                        prefill_forwards = prefilled.forwards;
                         if prefix_hit > 0 {
                             prefix_path = "hit";
                         }
@@ -4709,10 +4707,7 @@ impl TextLlm for LlamaProvider {
                     mtp_stats = Some(MtpStats {
                         proposed_tokens: u32::try_from(run.stats.proposed).unwrap_or(u32::MAX),
                         accepted_tokens: u32::try_from(run.stats.accepted).unwrap_or(u32::MAX),
-                        target_forwards: u32::try_from(
-                            run.stats.forwards + prefill_forwards.saturating_sub(1),
-                        )
-                        .unwrap_or(u32::MAX),
+                        target_forwards: u32::try_from(run.stats.forwards).unwrap_or(u32::MAX),
                     });
                 }
                 engine_record = Some(run.record);
@@ -4916,7 +4911,6 @@ impl TextLlm for LlamaProvider {
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         // Measured, not looked up: the positions the prefill did not feed.
                         prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
-                        prefill_forwards = prefilled.forwards;
                         if prefix_hit > 0 {
                             prefix_path = "hit";
                         }
@@ -5148,15 +5142,10 @@ impl TextLlm for LlamaProvider {
         // prefill — supplies the host-side counters and every tally. Both records name the
         // proposer that ran: `none` for a request whose speculation is off, including one whose
         // option resolved to no proposer (AC3, sc-24130) — the reference loop never runs one.
-        // The engine counts a caller's prefill as one forward; a prefill split at the
-        // conversation boundary (sc-24437) ran two.
-        let extra_prefill = prefill_forwards.saturating_sub(1) as u64;
+        // The engine counts a caller's prefill as its one prefill forward: the prefix cache's
+        // boundary snapshot is taken inside it (sc-24446).
         let mut decode_record = match engine_record {
-            Some(mut record) => {
-                record.target_forwards += extra_prefill;
-                record.prefill_forwards += extra_prefill;
-                record.with_request_span(&request_span)
-            }
+            Some(record) => record.with_request_span(&request_span),
             None => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
@@ -9072,13 +9061,15 @@ mod tests {
         assert_eq!(report.proposer, ProposerKind::None);
         // `Auto` on a snapshot without a head: the engine with no proposer, since sc-24140.
         assert_eq!(report.path, "step_model");
-        // The prefill forward plus one per generated token after the first — and one more: the
-        // prefill splits at the end of the rendered conversation, where the prefix cache
-        // snapshots the hybrid's recurrent state (sc-24437).
+        // The prefill forward plus one per generated token after the first: the prefix cache's
+        // snapshot of the hybrid's recurrent state at the end of the rendered conversation
+        // (sc-24437) is captured inside that one prefill forward, not by splitting it
+        // (sc-24446).
         assert_eq!(report.prefix_cache.path, "miss");
+        assert_eq!(report.prefill_forwards, 1);
         assert_eq!(
             report.target_forwards,
-            u64::from(out.usage.generated_tokens) + 1
+            u64::from(out.usage.generated_tokens)
         );
 
         // `None` keeps the process switch at load (off here); the report says so.
