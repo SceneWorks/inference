@@ -20,7 +20,7 @@ from yue2_precision_proof import (REFERENCE_SHA256, cuda_census, require, sample
 
 ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
 LATENT_SHA256 = "f89f02851d08128baa12a3f50cc3e73c80fbb5578797b7c166888dd815dc70c9"
-DIAGNOSTICS = ("waveform", "first_conv")
+DIAGNOSTICS = ("waveform", "first_conv", "first_conv_math")
 
 
 def verify_diagnostic_data(data: Path) -> None:
@@ -112,13 +112,18 @@ def same_first_conv_comparison(observed: dict, expected: dict) -> bool:
         return False
     if any(a[key] != b[key] for key in ("channel", "globalLatentFrame")):
         return False
-    return all(bits(a[key]) == bits(b[key]) for key in ("fullValue", "tileValue", "absError"))
+    values = ("fullValue", "tileValue", "absError") if "fullValue" in b else ("aValue", "bValue", "absError")
+    return all(bits(a[key]) == bits(b[key]) for key in values)
 
 
-def verify_first_conv_data(data: Path, meta: dict) -> None:
-    report = json.loads((data / "report.json").read_text(encoding="utf-8"))
-    require(report.get("schemaVersion") == 2 and report.get("selector") == "first_conv" and
-            report.get("purpose") == "diagnostic_only_no_gate_change", "first Conv7 schema/selector changed")
+def verify_first_conv_data(data: Path, meta: dict, report: dict | None = None,
+                           schema: int = 2, selector: str = "first_conv",
+                           purpose: str = "diagnostic_only_no_gate_change",
+                           allow_input_mismatch: bool = False) -> None:
+    if report is None:
+        report = json.loads((data / "report.json").read_text(encoding="utf-8"))
+    require(report.get("schemaVersion") == schema and report.get("selector") == selector and
+            report.get("purpose") == purpose, "first Conv7 schema/selector changed")
     require(report.get("engineSha") == ENGINE_SHA and report.get("referenceSha256") == REFERENCE_SHA256 and
             report.get("referenceMetadataSha256") == sha256(Path("crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json")),
             "first Conv7 source/reference identity changed")
@@ -181,9 +186,121 @@ def verify_first_conv_data(data: Path, meta: dict) -> None:
                                                  right - left, start, left, end - start)
                 require(same_first_conv_comparison(window["alignedCore"][stage], expected),
                         "first Conv7 aligned residual does not match saved arrays")
-            require(window["alignedCore"]["input"]["differentValues"] == 0,
-                    "first Conv7 same-input core is not byte-identical")
+            if not allow_input_mismatch:
+                require(window["alignedCore"]["input"]["differentValues"] == 0,
+                        "first Conv7 same-input core is not byte-identical")
     require(len(artifacts) == len(set(artifacts)) == 36, "first Conv7 raw arrays collided")
+
+
+def first_conv_all_comparison(a: tuple[list[float], list[int]], b: tuple[list[float], list[int]],
+                              channels: int, length: int, origin: int) -> dict:
+    maximum = 0.0
+    different = 0
+    first = None
+    for channel in range(channels):
+        for frame in range(length):
+            index = channel * length + frame
+            error = struct.unpack("<f", struct.pack("<f", abs(a[0][index] - b[0][index])))[0]
+            maximum = max(maximum, error)
+            if a[1][index] != b[1][index]:
+                different += 1
+                if first is None:
+                    first = {"channel": channel, "globalLatentFrame": origin + frame,
+                             "aValue": a[0][index], "bValue": b[0][index], "absError": error}
+    return {"maxAbs": maximum, "differentValues": different, "firstDifferent": first,
+            "comparedValues": channels * length}
+
+
+def first_conv_math_gate(windows: list[dict]) -> str:
+    if any(window["alignedCore"]["input"]["differentValues"] for window in windows):
+        return "input_core_mismatch"
+    if any(window["alignedCore"]["preBias"]["differentValues"] > 0 and
+           math.isfinite(window["alignedCore"]["preBias"]["maxAbs"]) and
+           window["alignedCore"]["preBias"]["maxAbs"] > 0 for window in windows):
+        return "positive_pre_bias_residual"
+    return "no_positive_pre_bias_residual"
+
+
+def verify_first_conv_math_file_set(data: Path, arrays: list[str], expected_count: int) -> None:
+    require(len(arrays) == len(set(arrays)) == expected_count, "first Conv7 math arrays collided")
+    expected = {"report.json", "math-mode-events.jsonl", *arrays}
+    entries = list(data.iterdir())
+    require(all(entry.is_file() and not entry.is_symlink() for entry in entries),
+            "first Conv7 math data contains a non-regular entry")
+    require(len(entries) == len(expected) and {entry.name for entry in entries} == expected,
+            "first Conv7 math data file set differs from report")
+
+
+def verify_first_conv_math_data(data: Path, meta: dict) -> None:
+    report = json.loads((data / "report.json").read_text(encoding="utf-8"))
+    verify_first_conv_data(data, meta, report, 3, "first_conv_math",
+                           "controlled_diagnostic_only_no_gate_change", allow_input_mismatch=True)
+    controlled = report.get("controlled", {})
+    baseline = report["runs"]["bf16"]
+    reason = first_conv_math_gate(baseline["windows"])
+    require(controlled.get("reason") == reason, "first Conv7 math gate reason changed")
+    require(controlled.get("modeEventsFile") == "math-mode-events.jsonl", "math-mode event path changed")
+    event_path = data / "math-mode-events.jsonl"
+    require(event_path.is_file() and controlled.get("modeEventsSha256") == sha256(event_path),
+            "math-mode event hash mismatch")
+    events = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    actions = (["before_default_arm"] if reason != "positive_pre_bias_residual" else
+               ["before_default_arm", "before_flagged_arm", "set_disallow", "read_disallow",
+                "restore_default", "read_restored"])
+    modes = ([0] if reason != "positive_pre_bias_residual" else [0, 0, 16, 16, 0, 0])
+    require(len(events) == len(actions) and all(
+        row == {"action": action, "status": "CUBLAS_STATUS_SUCCESS", "rawMode": mode}
+        for row, action, mode in zip(events, actions, modes)), "math-mode call/readback sequence incomplete")
+    files = [capture["file"] for run in report["runs"].values()
+             for capture in run["full"].values()]
+    files += [capture["file"] for run in report["runs"].values()
+              for window in run["windows"] for capture in window["captures"].values()]
+    if reason != "positive_pre_bias_residual":
+        require(controlled.get("status") == "not_applicable" and controlled.get("flagged") is None and
+                controlled.get("crossArm") is None, "inapplicable first Conv7 math arm ran")
+        verify_first_conv_math_file_set(data, files, 36)
+        return
+    require(controlled.get("status") == "collected", "applicable first Conv7 math arm absent")
+    flagged = controlled.get("flagged", {})
+    require(flagged.get("resident") == baseline["resident"], "flagged BF16 operands changed")
+    channels = baseline["resident"]["weightShape"][0]
+    stages = (("input", 64), ("preBias", channels), ("postBias", channels))
+    captured = {"full": {}, "windows": []}
+    for stage, stage_channels in stages:
+        a = first_conv_array(data, baseline["full"][stage], "BF16", [1, stage_channels, 75])
+        b = first_conv_array(data, flagged["full"][stage], "BF16", [1, stage_channels, 75])
+        captured["full"][stage] = (a, b)
+        expected = first_conv_all_comparison(a, b, stage_channels, 75, 0)
+        require(same_first_conv_comparison(controlled["crossArm"]["full"][stage], expected),
+                "flagged full tensor comparison differs from saved arrays")
+        if stage == "input":
+            require(expected["differentValues"] == 0, "controlled BF16 full input bytes changed")
+    windows = flagged.get("windows", [])
+    require(len(windows) == len(baseline["windows"]) == len(controlled["crossArm"]["windows"]) == 5,
+            "flagged first Conv7 window coverage incomplete")
+    files += [capture["file"] for capture in flagged["full"].values()]
+    for index, window in enumerate(windows):
+        original = baseline["windows"][index]
+        require((window.get("start"), window.get("end"), window.get("left"), window.get("right"),
+                 window.get("coreLength")) ==
+                (original["start"], original["end"], original["left"], original["right"],
+                 original["coreLength"]), "flagged first Conv7 geometry changed")
+        length, left = window["right"] - window["left"], window["left"]
+        for stage, stage_channels in stages:
+            a = first_conv_array(data, original["captures"][stage], "BF16", [1, stage_channels, length])
+            b = first_conv_array(data, window["captures"][stage], "BF16", [1, stage_channels, length])
+            files.append(window["captures"][stage]["file"])
+            expected = first_conv_all_comparison(a, b, stage_channels, length, left)
+            require(same_first_conv_comparison(controlled["crossArm"]["windows"][index][stage], expected),
+                    "flagged window tensor comparison differs from saved arrays")
+            if stage == "input":
+                require(expected["differentValues"] == 0, "controlled BF16 window input bytes changed")
+            full = first_conv_array(data, flagged["full"][stage], "BF16", [1, stage_channels, 75])
+            aligned = first_conv_comparison(full, b, stage_channels, 75, length, window["start"],
+                                            left, window["coreLength"])
+            require(same_first_conv_comparison(window["alignedCore"][stage], aligned),
+                    "flagged aligned residual differs from saved arrays")
+    verify_first_conv_math_file_set(data, files, 54)
 
 
 def prepare_harness(args: argparse.Namespace) -> None:
@@ -325,9 +442,12 @@ def execute(args: argparse.Namespace) -> None:
     require(child.poll() is not None and not after_busy and after_error is None,
             "diagnostic accelerator release unverified")
     require((data / "report.json").is_file(), "diagnostic residual report absent")
-    if selector == "first_conv":
+    if selector in ("first_conv", "first_conv_math"):
         meta = json.loads(Path("crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json").read_text(encoding="utf-8"))
-        verify_first_conv_data(data, meta)
+        if selector == "first_conv_math":
+            verify_first_conv_math_data(data, meta)
+        else:
+            verify_first_conv_data(data, meta)
     else:
         verify_diagnostic_data(data)
 

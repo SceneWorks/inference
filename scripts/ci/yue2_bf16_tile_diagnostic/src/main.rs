@@ -8,6 +8,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(feature = "cuda")]
+use candle_audio::candle_core::cuda::cudarc::cublas::{self, sys};
 use candle_audio::candle_core::{self, DType, Device, Tensor};
 use candle_audio::neural_codec::fold_weight_norm;
 use candle_audio_yue2::inventory::{ComponentId, YUE2_VAE_REPO};
@@ -28,6 +30,7 @@ const FIRST_CONV_KERNEL: usize = 7;
 enum Diagnostic {
     Waveform,
     FirstConv,
+    FirstConvMath,
 }
 
 impl Diagnostic {
@@ -35,6 +38,7 @@ impl Diagnostic {
         match value {
             "waveform" => Ok(Self::Waveform),
             "first_conv" => Ok(Self::FirstConv),
+            "first_conv_math" => Ok(Self::FirstConvMath),
             _ => Err(format!("unsupported diagnostic {value:?}").into()),
         }
     }
@@ -516,6 +520,372 @@ fn run_first_conv(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+struct FirstArm {
+    record: Value,
+    full: [FirstTensor; 3],
+    windows: Vec<[FirstTensor; 3]>,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn capture_first_arm(
+    z: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    dtype: DType,
+    out: &Path,
+    label: &str,
+    resident: Value,
+    frames: usize,
+    core: usize,
+    halo: usize,
+) -> Result<FirstArm, Box<dyn Error>> {
+    let full = first_conv_capture(z, weight, bias, dtype, out, &format!("{label}-full"))?;
+    let mut records = Vec::new();
+    let mut windows = Vec::new();
+    for start in (0..frames).step_by(core) {
+        let end = frames.min(start + core);
+        let left = start.saturating_sub(halo);
+        let right = frames.min(end + halo);
+        let tile = first_conv_capture(
+            &z.narrow(2, left, right - left)?,
+            weight,
+            bias,
+            dtype,
+            out,
+            &format!("{label}-tile-{}", start / core),
+        )?;
+        records.push(json!({"start":start,"end":end,"left":left,"right":right,
+            "coreLength":end-start,"captures":{
+                "input":tile[0].record.clone(),"preBias":tile[1].record.clone(),"postBias":tile[2].record.clone()},
+            "alignedCore":{
+                "input":compare_first_core(&full[0],&tile[0],start,left,end-start),
+                "preBias":compare_first_core(&full[1],&tile[1],start,left,end-start),
+                "postBias":compare_first_core(&full[2],&tile[2],start,left,end-start)}}));
+        windows.push(tile);
+    }
+    let record = json!({"resident":resident,"full":{
+        "input":full[0].record.clone(),"preBias":full[1].record.clone(),"postBias":full[2].record.clone()},
+        "windows":records});
+    Ok(FirstArm {
+        record,
+        full,
+        windows,
+    })
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MathGate {
+    InputCoreMismatch,
+    NoPositivePreBiasResidual,
+    Applicable,
+}
+
+#[cfg(feature = "cuda")]
+impl MathGate {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InputCoreMismatch => "input_core_mismatch",
+            Self::NoPositivePreBiasResidual => "no_positive_pre_bias_residual",
+            Self::Applicable => "positive_pre_bias_residual",
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn math_gate(windows: &[Value]) -> MathGate {
+    if windows
+        .iter()
+        .any(|window| window["alignedCore"]["input"]["differentValues"] != 0)
+    {
+        return MathGate::InputCoreMismatch;
+    }
+    if windows.iter().any(|window| {
+        window["alignedCore"]["preBias"]["differentValues"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+            && window["alignedCore"]["preBias"]["maxAbs"]
+                .as_f64()
+                .is_some_and(|maximum| maximum.is_finite() && maximum > 0.0)
+    }) {
+        MathGate::Applicable
+    } else {
+        MathGate::NoPositivePreBiasResidual
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn compare_first_arrays(a: &FirstTensor, b: &FirstTensor, origin: usize) -> Value {
+    assert_eq!((a.channels, a.length), (b.channels, b.length));
+    let mut maximum = 0f32;
+    let mut different = 0usize;
+    let mut first = Value::Null;
+    for channel in 0..a.channels {
+        for frame in 0..a.length {
+            let a_value = a.values[channel * a.length + frame];
+            let b_value = b.values[channel * b.length + frame];
+            let error = (a_value - b_value).abs();
+            maximum = maximum.max(error);
+            if a_value.to_bits() != b_value.to_bits() {
+                different += 1;
+                if first.is_null() {
+                    first = json!({"channel":channel,"globalLatentFrame":origin+frame,
+                        "aValue":a_value,"bValue":b_value,"absError":error});
+                }
+            }
+        }
+    }
+    json!({"maxAbs":maximum,"differentValues":different,"firstDifferent":first,
+        "comparedValues":a.channels*a.length})
+}
+
+#[cfg(feature = "cuda")]
+fn compare_first_arms(default: &FirstArm, flagged: &FirstArm) -> Value {
+    assert_eq!(default.windows.len(), flagged.windows.len());
+    let comparison = |a: &[FirstTensor; 3], b: &[FirstTensor; 3], origin| {
+        json!({"input":compare_first_arrays(&a[0],&b[0],origin),
+            "preBias":compare_first_arrays(&a[1],&b[1],origin),
+            "postBias":compare_first_arrays(&a[2],&b[2],origin)})
+    };
+    json!({"full":comparison(&default.full,&flagged.full,0),
+        "windows":default.windows.iter().zip(&flagged.windows).enumerate()
+            .map(|(index,(a,b))| {
+                let left = default.record["windows"][index]["left"].as_u64().expect("pinned window left");
+                comparison(a,b,left as usize)
+            })
+            .collect::<Vec<_>>()})
+}
+
+#[cfg(feature = "cuda")]
+struct MathModeGuard {
+    device: Device,
+    blas: std::sync::Arc<cublas::CudaBlas>,
+    events: std::fs::File,
+    active: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl MathModeGuard {
+    fn new(device: &Device, out: &Path) -> Result<Self, Box<dyn Error>> {
+        let mut guard = Self {
+            device: device.clone(),
+            blas: device.as_cuda_device()?.cublas_handle(),
+            events: OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(out.join("math-mode-events.jsonl"))?,
+            active: false,
+        };
+        if guard.get("before_default_arm")? != 0 {
+            return Err("cuBLAS handle did not start in CUBLAS_DEFAULT_MATH".into());
+        }
+        Ok(guard)
+    }
+
+    fn event(
+        &mut self,
+        action: &str,
+        status: sys::cublasStatus_t,
+        raw: Option<u32>,
+    ) -> Result<(), Box<dyn Error>> {
+        writeln!(
+            self.events,
+            "{}",
+            json!({"action":action,"status":format!("{status:?}"),"rawMode":raw})
+        )?;
+        self.events.flush()?;
+        Ok(())
+    }
+
+    fn get(&mut self, action: &str) -> Result<u32, Box<dyn Error>> {
+        // cublasMath_t is repr(u32), but combinations need not be declared enum variants.
+        let mut raw = u32::MAX;
+        let status =
+            unsafe { sys::cublasGetMathMode(*self.blas.handle(), (&mut raw as *mut u32).cast()) };
+        self.event(
+            action,
+            status,
+            (status == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS).then_some(raw),
+        )?;
+        status.result()?;
+        Ok(raw)
+    }
+
+    fn set(&mut self, action: &str, mode: sys::cublasMath_t) -> Result<(), Box<dyn Error>> {
+        let status = unsafe { sys::cublasSetMathMode(*self.blas.handle(), mode) };
+        self.event(action, status, Some(mode as u32))?;
+        status.result()?;
+        Ok(())
+    }
+
+    fn enable(&mut self) -> Result<(), Box<dyn Error>> {
+        self.device.synchronize()?;
+        if self.get("before_flagged_arm")? != 0 {
+            return Err("cuBLAS math mode changed before the controlled arm".into());
+        }
+        // Arm restoration before attempting the setter: even a failing setter may alter state.
+        self.active = true;
+        self.set(
+            "set_disallow",
+            sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+        )?;
+        if self.get("read_disallow")? != 16 {
+            return Err("cuBLAS disallow-reduction mode readback differed from 16".into());
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.active {
+            return Ok(());
+        }
+        self.device.synchronize()?;
+        self.set("restore_default", sys::cublasMath_t::CUBLAS_DEFAULT_MATH)?;
+        if self.get("read_restored")? != 0 {
+            return Err("cuBLAS default math mode restoration readback failed".into());
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for MathModeGuard {
+    fn drop(&mut self) {
+        if self.active && self.restore().is_err() {
+            eprintln!("cuBLAS math-mode restoration failed; aborting owned diagnostic child");
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn run_first_conv_math(
+    engine: &Path,
+    out: &Path,
+    source: &AcousticLatents,
+    verified: &candle_audio_yue2::snapshot::VerifiedComponent,
+    device: &Device,
+    meta: &Value,
+    reference_hash: &str,
+    frames: usize,
+    core: usize,
+    halo: usize,
+) -> Result<(), Box<dyn Error>> {
+    let standard = &meta["decoders"]["standard"];
+    let component = verified.component();
+    if component.repo.id != standard["repo"]
+        || component.repo.revision != standard["revision"]
+        || component.weights().map(|file| file.sha256) != standard["weights_sha256"].as_str()
+        || component.file("config.json").map(|file| file.sha256)
+            != standard["config_sha256"].as_str()
+    {
+        return Err("first Conv7 component differs from pinned standard VAE reference".into());
+    }
+    let mut mode = MathModeGuard::new(device, out)?;
+    let (bf16_weight, bf16_bias, bf16_resident) =
+        first_conv_weights(verified, device, DType::BF16)?;
+    let z_bf16 = source.to_decoder_input(device)?.to_dtype(DType::BF16)?;
+    let default = capture_first_arm(
+        &z_bf16,
+        &bf16_weight,
+        &bf16_bias,
+        DType::BF16,
+        out,
+        "bf16",
+        bf16_resident,
+        frames,
+        core,
+        halo,
+    )?;
+    let (f32_weight, f32_bias, f32_resident) = first_conv_weights(verified, device, DType::F32)?;
+    let z_f32 = source.to_decoder_input(device)?.to_dtype(DType::F32)?;
+    let f32_arm = capture_first_arm(
+        &z_f32,
+        &f32_weight,
+        &f32_bias,
+        DType::F32,
+        out,
+        "f32",
+        f32_resident,
+        frames,
+        core,
+        halo,
+    )?;
+    let gate = math_gate(
+        default.record["windows"]
+            .as_array()
+            .ok_or("windows absent")?,
+    );
+    let (status, flagged, cross_arm) = if gate == MathGate::Applicable {
+        mode.enable()?;
+        let result = capture_first_arm(
+            &z_bf16,
+            &bf16_weight,
+            &bf16_bias,
+            DType::BF16,
+            out,
+            "bf16-disallow",
+            default.record["resident"].clone(),
+            frames,
+            core,
+            halo,
+        );
+        mode.restore()?;
+        let flagged = result?;
+        let cross = compare_first_arms(&default, &flagged);
+        ("collected", Some(flagged.record), Some(cross))
+    } else {
+        ("not_applicable", None, None)
+    };
+    mode.events.flush()?;
+    let mode_events = fs::read(out.join("math-mode-events.jsonl"))?;
+    let metadata =
+        engine.join("crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json");
+    let report = json!({"schemaVersion":3,"selector":"first_conv_math",
+        "purpose":"controlled_diagnostic_only_no_gate_change","engineSha":ENGINE_SHA,
+        "referenceSha256":reference_hash,"referenceMetadataSha256":sha256(&fs::read(metadata)?),
+        "latentIdentity":source.identity().to_json(),"backend":"cuda","deviceOrdinal":0,
+        "decoderIdentity":{"repo":YUE2_VAE_REPO.id,"revision":YUE2_VAE_REPO.revision,
+            "weights_sha256":standard["weights_sha256"],"config_sha256":standard["config_sha256"]},
+        "frames":frames,"coreFrames":core,"haloFrames":halo,
+        "operator":{"name":"decoder.layers.0.Conv1d","kernel":FIRST_CONV_KERNEL,
+            "padding":3,"stride":1,"dilation":1,"groups":1},
+        "originalWaveformObservation":{"runId":"36884387320","clampedMaxAbs":0.03125,
+            "originalBound":ORIGINAL_BOUND,"interpretation":"prior_failed_waveform_proof_not_a_first_conv_gate"},
+        "runs":{"bf16":default.record,"f32":f32_arm.record},
+        "controlled":{"status":status,"reason":gate.as_str(),"flagged":flagged,
+            "crossArm":cross_arm,"modeEventsFile":"math-mode-events.jsonl",
+            "modeEventsSha256":sha256(&mode_events)}});
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out.join("report.json"))?;
+    file.write_all(serde_json::to_string_pretty(&report)?.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn run_first_conv_math(
+    _engine: &Path,
+    _out: &Path,
+    _source: &AcousticLatents,
+    _verified: &candle_audio_yue2::snapshot::VerifiedComponent,
+    _device: &Device,
+    _meta: &Value,
+    _reference_hash: &str,
+    _frames: usize,
+    _core: usize,
+    _halo: usize,
+) -> Result<(), Box<dyn Error>> {
+    Err("first_conv_math requires the pinned CUDA build".into())
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let engine = verified_engine()?;
     if std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref() != Some("0") {
@@ -574,6 +944,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     let device = Device::new_cuda(0)?;
     if diagnostic == Diagnostic::FirstConv {
         return run_first_conv(
+            &engine,
+            &out,
+            &source,
+            &verified,
+            &device,
+            &meta,
+            &reference_hash,
+            frames,
+            core,
+            halo,
+        );
+    }
+    if diagnostic == Diagnostic::FirstConvMath {
+        return run_first_conv_math(
             &engine,
             &out,
             &source,
@@ -686,7 +1070,44 @@ mod tests {
             Diagnostic::parse("first_conv").unwrap(),
             Diagnostic::FirstConv
         );
+        assert_eq!(
+            Diagnostic::parse("first_conv_math").unwrap(),
+            Diagnostic::FirstConvMath
+        );
         assert!(Diagnostic::parse("full_vae").is_err());
+    }
+
+    #[test]
+    fn math_gate_needs_identical_inputs_and_positive_pre_bias_error() {
+        let mut windows = vec![json!({"alignedCore":{
+            "input":{"differentValues":0},
+            "preBias":{"differentValues":1,"maxAbs":0.0}}})];
+        assert_eq!(math_gate(&windows), MathGate::NoPositivePreBiasResidual);
+        windows[0]["alignedCore"]["preBias"]["maxAbs"] = json!(0.03125);
+        assert_eq!(math_gate(&windows), MathGate::Applicable);
+        windows[0]["alignedCore"]["input"]["differentValues"] = json!(1);
+        assert_eq!(math_gate(&windows), MathGate::InputCoreMismatch);
+    }
+
+    #[test]
+    fn math_cross_arm_comparison_locates_changed_value() {
+        let a = FirstTensor {
+            record: Value::Null,
+            values: vec![0., 0., 0., 0.],
+            channels: 1,
+            length: 4,
+        };
+        let mut b = FirstTensor {
+            record: Value::Null,
+            values: a.values.clone(),
+            channels: 1,
+            length: 4,
+        };
+        b.values[2] = 0.03125;
+        let compared = compare_first_arrays(&a, &b, 16);
+        assert_eq!(compared["differentValues"], 1);
+        assert_eq!(compared["firstDifferent"]["globalLatentFrame"], 18);
+        assert_eq!(compared["maxAbs"], 0.03125);
     }
 
     #[test]
