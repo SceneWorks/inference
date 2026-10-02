@@ -37,6 +37,10 @@
 //!   served a generation, on [`TextLlmOutput::decode`]), [`LoadReport`] (what a load produced, via
 //!   [`TextLlm::load_report`]) and [`BackendCapabilities`] (what the host can serve — NVFP4, CUDA
 //!   graphs — with the refusal reason when it cannot).
+//! - [`kv_compression`] — the opt-in compressed-KV policy ([`KvCompressionPolicy`] on
+//!   [`TextLlmRequest::kv_compression`]), its one qualification table
+//!   ([`KV_COMPRESSION_QUALIFICATIONS`]) and the per-generation [`KvCacheReport`] on
+//!   [`TextLlmOutput::kv_cache`], with a [`KvCacheFallbackReason`] whenever the cache ran dense.
 //! - [`registry`] — explicit provider composition, id-based routing, and **model-first** resolution
 //!   ([`TextLlmRegistry::load_for_model`] / [`ModelRequirements`] over a weightless `can_load`
 //!   probe).
@@ -49,6 +53,7 @@ pub mod capabilities;
 pub mod constraint;
 pub mod detok;
 pub mod error;
+pub mod kv_compression;
 pub mod message;
 pub mod output;
 pub mod paging;
@@ -78,6 +83,11 @@ pub use constraint::{
 };
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
+pub use kv_compression::{
+    qualify_kv_compression, KvCacheCounters, KvCacheFallbackReason, KvCacheReport,
+    KvCompressionFormat, KvCompressionPolicy, KvModelFamily, KvQualification,
+    KV_CACHE_FORMAT_VERSION, KV_COMPRESSION_QUALIFICATIONS,
+};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
 pub use output::{
     Channel, FinishReason, GenerationTimings, MtpStats, StreamEvent, TextLlmOutput, Usage,

@@ -1605,19 +1605,12 @@ impl CompressedKvMethod {
 
     /// Build this method's retained fused reader once per campaign session.
     pub fn arm(self) -> Result<CompressedKvArm, String> {
+        // The same retained reader production generation builds (`kv_policy`), at this arm's
+        // code width: its identity and GPU-family profile are `representation_identity` and
+        // `kernel_gpu_family`.
         let reader = match self {
             Self::GroupAffine | Self::GroupAffine4 | Self::GroupAffine8 => {
-                let kernel = crate::primitives::PackedMetalKernel::for_identity_family_and_bits(
-                    self.representation_identity(),
-                    self.kernel_gpu_family(),
-                    self.code_bits(),
-                )
-                .map_err(|e| e.to_string())?;
-                // The single-threaded campaign worker owns this non-Send Metal object through the
-                // cache handle's `Arc`, exactly as the SC-20676 evidence worker does.
-                #[allow(clippy::arc_with_non_send_sync)]
-                let kernel = std::sync::Arc::new(kernel);
-                crate::primitives::CompiledKernelHandle::new(kernel)
+                crate::kv_policy::group_affine_reader(self.code_bits())?
             }
         };
         Ok(CompressedKvArm {

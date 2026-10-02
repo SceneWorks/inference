@@ -623,6 +623,7 @@ impl TextLlm for LlavaProvider {
             // (no graph runner wraps its decoder), so the report says the switch was off here.
             decode: Some(gen.record.report(false)),
             finish_reason: Some(finish),
+            kv_cache: None,
         })
     }
 }

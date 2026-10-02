@@ -27,9 +27,9 @@ use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     generate_batch, generate_from_prefill, generate_from_prefill_with_timings,
     generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
-    generate_with_observer, generate_with_timings, BatchRequest, CancelFlag, ConstraintMask,
-    Decode, FinishReason, GenerationConfig, GenerationOutput, Qwen35MtpMultimodalPrompt,
-    RewindableConstraintMask, StreamEvent,
+    generate_with_observer, generate_with_timings, generate_with_timings_on, BatchRequest,
+    CancelFlag, ConstraintMask, Decode, FinishReason, GenerationConfig, GenerationOutput,
+    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -384,6 +384,20 @@ fn prompt_cache_turn(
 enum Decoder {
     Causal(Box<CausalLm>),
     Qwen35(Box<Qwen35Model>),
+}
+
+/// The KV cache one production generation runs on (sc-20679), decided before any K/V mutation.
+enum KvPlan {
+    /// The SC-20671 campaign observer path: it selects its own explicit arm and is not a product
+    /// generation, so it reports no [`core_llm::KvCacheReport`].
+    Unreported,
+    /// Dense, with the report (and its reason) the output carries.
+    Dense(core_llm::KvCacheReport),
+    /// The qualified compressed format and the provider's retained fused reader.
+    Compressed {
+        format: core_llm::KvCompressionFormat,
+        reader: crate::primitives::CompiledKernelHandle,
+    },
 }
 
 impl Decode for Decoder {
@@ -932,6 +946,10 @@ pub struct LlamaProvider {
     gemma4: Option<Gemma4Runtime>,
     /// Campaign-only prefix cache; ordinary serving never consults this state.
     campaign_prefix_cache: RefCell<Option<crate::decode::PrefixCache>>,
+    /// The retained fused compressed-KV reader (sc-20679), built on the first request the
+    /// qualification table admits and reused by every later one; `Err` is the build failure each
+    /// such request then reports as [`core_llm::KvCacheFallbackReason::ReaderUnavailable`].
+    kv_reader: OnceCell<Result<crate::primitives::CompiledKernelHandle, String>>,
     /// Dense Prism `vision_tower.*` tensors retained verbatim for the native multimodal adapter.
     /// Text loading must not discard them merely because sc-23937 constructs only the decoder.
     _prism_vision_weights: Option<Weights>,
@@ -1727,6 +1745,7 @@ impl LlamaProvider {
             vision,
             gemma4,
             campaign_prefix_cache: RefCell::new(None),
+            kv_reader: OnceCell::new(),
             _prism_vision_weights: prism_vision_weights,
         })
     }
@@ -1789,6 +1808,7 @@ impl LlamaProvider {
             vision,
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
+            kv_reader: OnceCell::new(),
             _prism_vision_weights: None,
         })
     }
@@ -1825,6 +1845,7 @@ impl LlamaProvider {
             vision: None,
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
+            kv_reader: OnceCell::new(),
             _prism_vision_weights: None,
         }
     }
@@ -2718,6 +2739,61 @@ impl LlamaProvider {
         ))
     }
 
+    /// Decide the KV cache of one product generation against the qualification table: the
+    /// request's opt-in, this model's table family and the `context_tokens` prefilled before
+    /// decode, then the request shape, the decoder's attention geometry and the retained reader.
+    /// Every refusal is a dense plan with its reason.
+    fn plan_kv_cache(
+        &self,
+        policy: core_llm::KvCompressionPolicy,
+        context_tokens: usize,
+        multimodal: bool,
+    ) -> KvPlan {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCacheReport};
+        let dense =
+            |reason, detail: Option<String>| KvPlan::Dense(KvCacheReport::dense(reason, detail));
+        let family = crate::kv_policy::family_for(self.campaign_family);
+        let context = u64::try_from(context_tokens).unwrap_or(u64::MAX);
+        let row = match core_llm::qualify_kv_compression(policy, family, context, 1) {
+            Ok(row) => row,
+            Err(reason) => return dense(reason, None),
+        };
+        if multimodal {
+            return dense(
+                Reason::UnsupportedRequest,
+                Some("multimodal prefill splices embeddings outside the compressed cache".into()),
+            );
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return dense(
+                Reason::UnsupportedRequest,
+                Some("the hybrid recurrent decoder has no compressed cache".into()),
+            );
+        };
+        if let Some(refusal) = crate::kv_policy::geometry_refusal(model.config()) {
+            return dense(Reason::UnsupportedGeometry, Some(refusal));
+        }
+        let bits = crate::kv_policy::packed_code_bits(row.format);
+        match self
+            .kv_reader
+            .get_or_init(|| crate::kv_policy::group_affine_reader(bits))
+        {
+            Ok(reader) if reader.code_bits() == bits => KvPlan::Compressed {
+                format: row.format,
+                reader: reader.clone(),
+            },
+            Ok(reader) => dense(
+                Reason::ReaderUnavailable,
+                Some(format!(
+                    "the retained reader reads {}-bit codes, not {}",
+                    reader.code_bits().bits(),
+                    row.format.id()
+                )),
+            ),
+            Err(error) => dense(Reason::ReaderUnavailable, Some(error.clone())),
+        }
+    }
+
     fn generate_inner(
         &self,
         req: &TextLlmRequest,
@@ -2862,6 +2938,22 @@ impl LlamaProvider {
             prompt_len,
             req.max_new_tokens,
         )?;
+
+        // sc-20679: the request's KV cache, decided against the qualification table before any
+        // K/V mutation. Only the plain text decode below runs a compressed plan.
+        let kv_plan = if observer.is_some() {
+            KvPlan::Unreported
+        } else {
+            self.plan_kv_cache(
+                req.kv_compression,
+                prompt_len,
+                multimodal || gemma4_mm_request,
+            )
+        };
+        let mut kv_report = match &kv_plan {
+            KvPlan::Dense(report) => Some(report.clone()),
+            KvPlan::Unreported | KvPlan::Compressed { .. } => None,
+        };
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -3213,7 +3305,57 @@ impl LlamaProvider {
                                     .map_err(to_core)?;
                                     (timed.output, Some(stats), Some(timed.timer))
                                 }
-                                _ => {
+                                (Decoder::Causal(model), _) => {
+                                    if let KvPlan::Compressed { format, reader } = &kv_plan {
+                                        // The compressed cache is selected before any K/V
+                                        // mutation and its evidence read before it is reset.
+                                        let (mut cache, refused) =
+                                            crate::kv_policy::select_compressed_cache(
+                                                model,
+                                                reader.clone(),
+                                                prompt_ids.len(),
+                                            );
+                                        let timed = generate_with_timings_on(
+                                            &self.model,
+                                            cache.as_mut(),
+                                            &prompt_ids,
+                                            &config,
+                                            &req.cancel,
+                                            &mut sink,
+                                            json_mask
+                                                .as_mut()
+                                                .map(|m| m as &mut dyn ConstraintMask),
+                                            should_stop_opt,
+                                        );
+                                        let report = timed.as_ref().ok().map(|_| {
+                                            crate::kv_policy::compressed_report(
+                                                *format,
+                                                refused,
+                                                cache.as_ref(),
+                                            )
+                                        });
+                                        let reset = cache.reset();
+                                        let timed = timed.map_err(to_core)?;
+                                        reset.map_err(to_core)?;
+                                        kv_report = report.transpose().map_err(to_core)?;
+                                        (timed.output, None, Some(timed.timer))
+                                    } else {
+                                        let timed = generate_with_timings(
+                                            &self.model,
+                                            &prompt_ids,
+                                            &config,
+                                            &req.cancel,
+                                            &mut sink,
+                                            json_mask
+                                                .as_mut()
+                                                .map(|m| m as &mut dyn ConstraintMask),
+                                            should_stop_opt,
+                                        )
+                                        .map_err(to_core)?;
+                                        (timed.output, None, Some(timed.timer))
+                                    }
+                                }
+                                (Decoder::Qwen35(_), None) => {
                                     let timed = generate_with_timings(
                                         &self.model,
                                         &prompt_ids,
@@ -3342,6 +3484,7 @@ impl LlamaProvider {
             }),
             decode: None,
             finish_reason: Some(finish),
+            kv_cache: kv_report,
         })
     }
 }
@@ -4890,14 +5033,19 @@ mod tests {
 
     /// Tiny synthetic Llama whose head dimension the packed Metal reader supports.
     fn tiny_packed_capable_model() -> CausalLm {
+        tiny_causal_model(2, 1, 64)
+    }
+
+    /// Tiny synthetic two-layer Llama (hidden 128) with the given attention geometry.
+    fn tiny_causal_model(heads: i32, kv_heads: i32, head_dim: i32) -> CausalLm {
         use crate::primitives::sampler::{SplitMix64, TokenRng};
         let cfg = crate::config::ModelConfig {
             hidden_size: 128,
             intermediate_size: 64,
             num_layers: 2,
-            num_heads: 2,
-            num_kv_heads: 1,
-            head_dim: 64,
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim,
             vocab_size: 32,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
@@ -5260,6 +5408,12 @@ mod tests {
     /// A tiny packed-capable on-disk snapshot (head dim 64, 32-word vocabulary, a 2048-token
     /// window, no reachable stop token) the provider loads like a real one.
     fn tiny_packed_capable_snapshot() -> tempfile::TempDir {
+        tiny_snapshot(json!({"architectures": ["LlamaForCausalLM"]}), 2048, false)
+    }
+
+    /// [`tiny_packed_capable_snapshot`] with the config's architecture `identity` keys, a
+    /// `window`-token context, and (for Qwen3) unit per-head q/k RMSNorm weights.
+    fn tiny_snapshot(identity: serde_json::Value, window: u64, qk_norm: bool) -> tempfile::TempDir {
         use crate::primitives::sampler::{SplitMix64, TokenRng};
         let dir = tempfile::tempdir().unwrap();
         let mut vocab = serde_json::Map::new();
@@ -5277,13 +5431,16 @@ mod tests {
             "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" },
         });
         std::fs::write(dir.path().join("tokenizer.json"), tokenizer.to_string()).unwrap();
-        let config = json!({
-            "architectures": ["LlamaForCausalLM"], "hidden_size": 128,
+        let mut config = json!({
+            "hidden_size": 128,
             "intermediate_size": 64, "num_hidden_layers": 2, "num_attention_heads": 2,
             "num_key_value_heads": 1, "head_dim": 64, "vocab_size": 32, "rms_norm_eps": 1e-5,
             "rope_theta": 10000.0, "tie_word_embeddings": false,
-            "max_position_embeddings": 2048, "eos_token_id": 99,
+            "max_position_embeddings": window, "eos_token_id": 99,
         });
+        for (key, value) in identity.as_object().unwrap() {
+            config[key] = value.clone();
+        }
         std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
         let mut rng = SplitMix64::new(0x5c20671);
         let mut randn = |shape: &[i32]| {
@@ -5325,6 +5482,18 @@ mod tests {
                 (p("mlp.up_proj.weight"), randn(&[64, 128])),
                 (p("mlp.down_proj.weight"), randn(&[128, 64])),
             ]);
+            if qk_norm {
+                arrays.extend([
+                    (
+                        p("self_attn.q_norm.weight"),
+                        Array::ones::<f32>(&[64]).unwrap(),
+                    ),
+                    (
+                        p("self_attn.k_norm.weight"),
+                        Array::ones::<f32>(&[64]).unwrap(),
+                    ),
+                ]);
+            }
         }
         let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, a)| (k.as_str(), a)).collect();
         Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
@@ -5895,5 +6064,444 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("fused compressed reader"), "{error}");
+    }
+
+    // ---- sc-20679: production compressed KV ----
+
+    /// One greedy product generation over `words` user words at `policy`, through the
+    /// production entry point (`TextLlm::generate`).
+    fn kv_generate(
+        provider: &LlamaProvider,
+        words: usize,
+        policy: core_llm::KvCompressionPolicy,
+        max_new_tokens: u32,
+    ) -> TextLlmOutput {
+        let text = (0..words)
+            .map(|i| format!("w{}", (i * 7) % 26 + 6))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let request = TextLlmRequest {
+            messages: vec![Message::text(Role::User, text)],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens,
+            seed: Some(0),
+            kv_compression: policy,
+            ..Default::default()
+        };
+        provider.generate(&request, &mut |_| {}).unwrap()
+    }
+
+    fn load_tiny(snapshot: &tempfile::TempDir) -> LlamaProvider {
+        LlamaProvider::load(&core_llm::LoadSpec::dense(
+            snapshot.path().to_string_lossy().to_string(),
+        ))
+        .unwrap()
+    }
+
+    /// AC3: a request at the family's qualified minimum context runs wholly on the fused
+    /// compressed reader through the production entry point and generates exactly what the dense
+    /// cache does; the same provider keeps a short request, and an un-opted request, dense with
+    /// their reasons.
+    fn assert_compressed_matches_dense(
+        identity: serde_json::Value,
+        qk_norm: bool,
+        family: core_llm::KvModelFamily,
+    ) {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
+            .iter()
+            .find(|row| row.family == family)
+            .unwrap();
+        let min = usize::try_from(row.min_context_tokens).unwrap();
+        let snapshot = tiny_snapshot(identity, row.min_context_tokens + 1024, qk_norm);
+        let provider = load_tiny(&snapshot);
+        const NEW: u32 = 24;
+
+        let dense = kv_generate(&provider, min, Policy::Off, NEW);
+        let compressed = kv_generate(&provider, min, Policy::Qualified, NEW);
+        assert!(
+            u64::from(compressed.usage.prompt_tokens) >= row.min_context_tokens,
+            "{:?}",
+            compressed.usage
+        );
+        assert_eq!(compressed.usage, dense.usage);
+        assert_eq!(compressed.usage.generated_tokens, NEW);
+        assert_eq!(
+            dense.kv_cache,
+            Some(core_llm::KvCacheReport::dense(Reason::PolicyDisabled, None))
+        );
+        let report = compressed.kv_cache.clone().unwrap();
+        assert!(report.ran_compressed(), "{report:?}");
+        assert_eq!(report.format, Some(row.format));
+        assert_eq!(report.format_version, core_llm::KV_CACHE_FORMAT_VERSION);
+        // Every decode step after the prefill reads both layers through the fused reader.
+        assert!(
+            report.counters.fused_attention_calls >= 2 * u64::from(NEW - 1),
+            "{report:?}"
+        );
+        assert_eq!(report.counters.full_cache_dequantizations, 0);
+        assert_eq!(report.counters.dense_fallback_events, 0);
+        // Retained compressed bytes stay below the dense K/V of the same tokens
+        // (2 layers × K,V × 1 KV head × head dim 64 × bf16).
+        let tokens = u64::from(compressed.usage.total_tokens());
+        assert!(report.counters.compressed_cache_bytes > 0);
+        assert!(
+            report.counters.compressed_cache_bytes < tokens * 2 * 2 * 64 * 2,
+            "{report:?}"
+        );
+        assert_eq!(
+            compressed.text, dense.text,
+            "compressed vs dense generation"
+        );
+        assert!(!dense.text.is_empty());
+
+        // The same provider keeps a short request dense: short contexts decode slower compressed.
+        let short = kv_generate(&provider, 64, Policy::Qualified, 8);
+        assert_eq!(
+            short.kv_cache,
+            Some(core_llm::KvCacheReport::dense(
+                Reason::BelowMinimumContext,
+                None
+            ))
+        );
+        assert_eq!(
+            short.text,
+            kv_generate(&provider, 64, Policy::Off, 8).text,
+            "a refused request generates exactly the dense output"
+        );
+    }
+
+    /// Per-position logits of `model` prefilling `prompt` on `cache` and then teacher-forced on
+    /// `stream`, one token per step: the prefill's last position, then one row per forced token.
+    fn forced_logits(
+        model: &CausalLm,
+        cache: &mut dyn KvCache,
+        prompt: &[i32],
+        stream: &[i32],
+    ) -> Vec<Vec<f32>> {
+        let host = |logits: Array| {
+            let logits = logits.as_dtype(Dtype::Float32).unwrap();
+            logits.eval().unwrap();
+            logits.as_slice::<f32>().to_vec()
+        };
+        let mut rows = vec![host(model.step(&input_ids(prompt), cache, 0).unwrap())];
+        for (i, &token) in stream.iter().enumerate() {
+            let offset = (prompt.len() + i) as i32;
+            rows.push(host(
+                model.step(&input_ids(&[token]), cache, offset).unwrap(),
+            ));
+        }
+        rows
+    }
+
+    /// AC3 logit parity: on the cache the production plan selects for a request at the family's
+    /// qualified minimum context, every teacher-forced decode position's logits stay within 8-bit
+    /// rounding of the dense cache's. Returns the largest error relative to the dense logit range.
+    fn compressed_logit_error(
+        snapshot: &tempfile::TempDir,
+        family: core_llm::KvModelFamily,
+    ) -> f32 {
+        let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
+            .iter()
+            .find(|row| row.family == family)
+            .unwrap();
+        let provider = load_tiny(snapshot);
+        let Decoder::Causal(model) = &provider.model else {
+            panic!("a qualified family is a causal decoder");
+        };
+        let prompt = (0..row.min_context_tokens)
+            .map(|i| ((i * 7) % 26 + 6) as i32)
+            .collect::<Vec<_>>();
+        let stream = (0..40).map(|i| (i * 5) % 26 + 6).collect::<Vec<i32>>();
+        let KvPlan::Compressed { format, reader } = provider.plan_kv_cache(
+            core_llm::KvCompressionPolicy::Qualified,
+            prompt.len(),
+            false,
+        ) else {
+            panic!("the qualified context must plan compressed");
+        };
+        let (mut cache, refused) =
+            crate::kv_policy::select_compressed_cache(model, reader, prompt.len());
+        assert_eq!(refused, None);
+        let compressed = forced_logits(model, cache.as_mut(), &prompt, &stream);
+        let report = crate::kv_policy::compressed_report(format, None, cache.as_ref()).unwrap();
+        assert!(report.ran_compressed(), "{report:?}");
+        assert_eq!(
+            report.counters.fused_attention_calls,
+            2 * stream.len() as u64
+        );
+        let mut dense_cache = model.make_cache();
+        let dense = forced_logits(model, dense_cache.as_mut(), &prompt, &stream);
+        let range = dense
+            .iter()
+            .flatten()
+            .fold(0.0f32, |max, value| max.max(value.abs()));
+        assert!(range > 0.0);
+        dense
+            .iter()
+            .zip(&compressed)
+            .flat_map(|(dense, compressed)| dense.iter().zip(compressed))
+            .map(|(dense, compressed)| (dense - compressed).abs() / range)
+            .fold(0.0f32, f32::max)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_kv_decode_logits_match_dense_within_8_bit_rounding() {
+        for (identity, qk_norm, family) in [
+            (
+                json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"}),
+                false,
+                core_llm::KvModelFamily::Llama,
+            ),
+            (
+                json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+                true,
+                core_llm::KvModelFamily::Qwen3,
+            ),
+        ] {
+            let snapshot = tiny_snapshot(identity, 40_960, qk_norm);
+            // Measured ~0.009 at 8 bits (bf16 kernel rounding included) against ~0.3 for the same
+            // cache at 2 bits; 0.02 is the bound the SC-20671 8-bit prompt-cache test uses.
+            let error = compressed_logit_error(&snapshot, family);
+            eprintln!("sc-20679 {family:?}: K8V8 decode logit error {error}");
+            assert!(
+                error < 0.02,
+                "{family:?}: K8V8 decode logits drifted {error}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qwen3_compressed_kv_matches_dense_at_its_qualified_context() {
+        assert_compressed_matches_dense(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            true,
+            core_llm::KvModelFamily::Qwen3,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn llama_compressed_kv_matches_dense_at_its_qualified_context() {
+        assert_compressed_matches_dense(
+            json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"}),
+            false,
+            core_llm::KvModelFamily::Llama,
+        );
+    }
+
+    /// AC1: a model whose family has no qualification row stays dense when opted in, and says so;
+    /// so does every non-text path the plan refuses before any cache exists.
+    #[test]
+    fn unqualified_models_stay_dense_with_their_reason() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        // Mistral shares the Llama decoder but is not the family the evidence measured.
+        let snapshot = tiny_snapshot(
+            json!({"architectures": ["MistralForCausalLM"], "model_type": "mistral"}),
+            2048,
+            false,
+        );
+        let provider = load_tiny(&snapshot);
+        let output = kv_generate(&provider, 64, Policy::Qualified, 4);
+        assert_eq!(
+            output.kv_cache,
+            Some(core_llm::KvCacheReport::dense(
+                Reason::UnqualifiedModel,
+                None
+            ))
+        );
+        // The plan refuses a multimodal request on a qualified family before any cache exists.
+        let qwen = load_tiny(&tiny_snapshot(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            40_960,
+            true,
+        ));
+        let KvPlan::Dense(report) = qwen.plan_kv_cache(Policy::Qualified, 20_000, true) else {
+            panic!("a multimodal request must plan dense");
+        };
+        assert_eq!(report.fallback, Some(Reason::UnsupportedRequest));
+        assert!(matches!(
+            qwen.plan_kv_cache(Policy::Qualified, 20_000, false),
+            KvPlan::Compressed { .. }
+        ));
+        assert!(matches!(
+            qwen.plan_kv_cache(Policy::Off, 20_000, false),
+            KvPlan::Dense(report) if report.fallback == Some(Reason::PolicyDisabled)
+        ));
+    }
+
+    /// A reader that binds to the K8V8 cache and faults on every dispatch.
+    #[derive(Debug)]
+    struct FaultingReader;
+
+    impl crate::primitives::RetainedPackedKernel for FaultingReader {
+        fn cache_identity(&self) -> &str {
+            crate::primitives::PACKED_METAL_B8_IDENTITY
+        }
+        fn backend(&self) -> &str {
+            "mlx-metal"
+        }
+        fn retained_host_bytes_estimate(&self) -> usize {
+            0
+        }
+        fn dispatch(
+            &self,
+            _args: &crate::primitives::PackedAttentionArgs<'_>,
+        ) -> crate::error::Result<Array> {
+            Err(crate::error::Error::Msg("injected dispatch fault".into()))
+        }
+        fn code_bits(&self) -> crate::primitives::PackedCodeBits {
+            crate::primitives::PackedCodeBits::Eight
+        }
+    }
+
+    /// AC1: a compressed generation that the cache moves to dense part-way, or whose reader the
+    /// selection refuses, reports the dense outcome with its reason — never a compressed label.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_reader_fault_or_refusal_is_reported_as_a_dense_fallback() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionFormat as Format};
+        let model = tiny_packed_capable_model();
+        let prompt = (0..40).map(|i| i % 31 + 1).collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 4,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let run = |reader: crate::primitives::CompiledKernelHandle| {
+            let (mut cache, refused) =
+                crate::kv_policy::select_compressed_cache(&model, reader, prompt.len());
+            generate_with_timings_on(
+                &model,
+                cache.as_mut(),
+                &prompt,
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+            )
+            .unwrap();
+            crate::kv_policy::compressed_report(Format::GroupAffineK8V8, refused, cache.as_ref())
+                .unwrap()
+        };
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let faulting =
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(FaultingReader));
+        let report = run(faulting);
+        assert_eq!(report.format, Some(Format::GroupAffineK8V8));
+        assert_eq!(report.fallback, Some(Reason::RuntimeFallback), "{report:?}");
+        assert!(!report.ran_compressed());
+        assert!(report.counters.dense_fallback_events > 0);
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("dispatch")),
+            "{report:?}"
+        );
+
+        let refused = crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+            crate::primitives::OpaqueCompiledKernel::new(
+                "sc20679-refused",
+                "cpu",
+                0,
+                std::sync::Arc::new(()),
+            ),
+        ));
+        let report = run(refused);
+        assert_eq!(report.format, None);
+        assert_eq!(
+            report.fallback,
+            Some(Reason::ReaderUnavailable),
+            "{report:?}"
+        );
+        assert!(report.detail.is_some());
+
+        let healthy =
+            crate::kv_policy::group_affine_reader(crate::primitives::PackedCodeBits::Eight)
+                .unwrap();
+        assert!(run(healthy).ran_compressed());
+    }
+
+    /// AC2: no dense K/V mirror survives an attention call on the compressed path. After the
+    /// prefill and after every decode step, the compressed cache's dense fallback owns no K/V
+    /// (handle accounting), and MLX active memory above the pre-request baseline is the compressed
+    /// representation's own device bytes (byte accounting) — far below what any one layer's dense
+    /// K or V of the same tokens would add.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_dense_kv_mirror_survives_a_compressed_attention_call() {
+        use mlx_rs::memory;
+        // Four K/V heads of 128 make one layer's dense K (1.5 MB at 1536 bf16 tokens) dwarf the
+        // accounting slack.
+        let model = tiny_causal_model(4, 4, 128);
+        let reader =
+            crate::kv_policy::group_affine_reader(crate::primitives::PackedCodeBits::Eight)
+                .unwrap();
+        let prompt = (0..1536).map(|i| i % 31 + 1).collect::<Vec<i32>>();
+        let step = |cache: &mut dyn KvCache, ids: &[i32], offset: usize| {
+            let logits = model.step(&input_ids(ids), cache, offset as i32).unwrap();
+            logits.eval().unwrap();
+        };
+        // Warm every lazily retained model and reader state on a throwaway cache first.
+        {
+            let (mut warm, refused) =
+                crate::kv_policy::select_compressed_cache(&model, reader.clone(), prompt.len());
+            assert_eq!(refused, None);
+            step(warm.as_mut(), &prompt, 0);
+            step(warm.as_mut(), &[3], prompt.len());
+            warm.reset().unwrap();
+        }
+        memory::clear_cache();
+        let baseline = memory::get_active_memory() as u64;
+
+        let (mut cache, refused) =
+            crate::kv_policy::select_compressed_cache(&model, reader, prompt.len());
+        assert_eq!(refused, None);
+        const SLACK: u64 = 256 * 1024;
+        let check = |cache: &dyn KvCache, tokens: u64| {
+            let dense = cache
+                .compressed_dense_fallback()
+                .expect("the compressed cache owns an explicit dense fallback");
+            assert_eq!(
+                dense.retained_snapshot().unwrap(),
+                None,
+                "the dense fallback holds K/V after an attention call"
+            );
+            assert!(dense.events().is_empty(), "{:?}", dense.events());
+            let evidence = cache.packed_evidence().unwrap();
+            assert!(!evidence.dense_active && evidence.fallback_reasons.is_empty());
+            assert_eq!(evidence.full_cache_dequantizations, 0);
+            let storage = cache.compressed_storage().unwrap().unwrap();
+            assert_eq!(storage.tokens, tokens);
+            // One layer's dense K of the same tokens: what the smallest surviving mirror adds.
+            let one_dense_tensor = tokens * 4 * 128 * storage.element_bytes;
+            assert!(
+                one_dense_tensor > 4 * SLACK,
+                "the fixture must expose a mirror"
+            );
+            let growth = (memory::get_active_memory() as u64).saturating_sub(baseline);
+            assert!(
+                growth <= storage.device_bytes() + SLACK,
+                "{tokens} tokens: active memory grew {growth} B; the compressed cache retains \
+                 {} B (a dense K or V of one layer is {one_dense_tensor} B)",
+                storage.device_bytes()
+            );
+        };
+        step(cache.as_mut(), &prompt, 0);
+        check(cache.as_ref(), prompt.len() as u64);
+        // Decode steps cross the next 32-token group boundary and fill its residual.
+        for i in 0..40 {
+            let offset = prompt.len() + i;
+            step(cache.as_mut(), &[(i as i32) % 31 + 1], offset);
+            check(cache.as_ref(), offset as u64 + 1);
+        }
+        let evidence = cache.packed_evidence().unwrap();
+        assert!(evidence.accepted_direct_calls >= 2 * 40, "{evidence:?}");
+        cache.reset().unwrap();
     }
 }

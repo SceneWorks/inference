@@ -4066,6 +4066,7 @@ impl TextLlm for LlamaProvider {
             mtp: mtp_stats,
             decode: Some(decode_record.report(cuda_graphs_on)),
             finish_reason: Some(finish),
+            kv_cache: None,
         })
     }
 }
