@@ -1504,6 +1504,12 @@ impl Flux2 {
                         },
                         predict,
                     )?;
+                    // SC-20686: return the denoise's freed transients (a KV edit's reference-K/V
+                    // build is ~26 GiB at 768x512 with two references) to the OS before the VAE
+                    // decode, so the decode's working set does not stack on the pooled denoise
+                    // (D run 37041026188: 58.1 GiB at decode, 50.2 GiB during denoise).
+                    mlx_rs::transforms::eval([&final_latents])?;
+                    mlx_gen::memory_probe::clear_cache();
                     on_progress(Progress::Decoding);
                     let packed =
                         final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
