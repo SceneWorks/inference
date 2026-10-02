@@ -525,9 +525,12 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             }
             let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
             let cache = owned.insert(model.new_cache_for(capacity, drafts)?);
+            // A prompt prefill: no position inside it is ever rolled back to (sc-24446).
             let out = model.forward_step(
                 cache,
-                StepRequest::last(prompt_ids).with_hidden(wants_hidden),
+                StepRequest::last(prompt_ids)
+                    .with_hidden(wants_hidden)
+                    .as_prefill(),
             )?;
             stats.forwards += 1;
             stats.prefill_forwards += 1;
@@ -737,6 +740,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 scope: LogitsScope::All,
                 want_hidden: wants_hidden,
                 prefill: false,
+                snapshot_at: None,
             },
         )?;
         stats.forwards += 1;
@@ -2070,6 +2074,40 @@ mod tests {
             assert_eq!(run_qwen.record.target_forwards_per_verify_step(), Some(1.0));
             assert_eq!(run_qwen.record.replay_forwards, 0);
         }
+    }
+
+    /// sc-24446 (defect A): the engine's own prompt prefill is a prefill — on the hybrid it takes
+    /// no per-token Gated DeltaNet step and writes one ring slot per linear layer whatever the
+    /// draft depth — so a long prompt's greedy run is the same with and without drafts.
+    #[test]
+    fn the_engine_prefill_rings_only_the_final_state_at_every_draft_depth() {
+        use crate::primitives::gated_delta::counters;
+        let (cfg, qwen) = text_model();
+        let linear = (0..cfg.num_layers).filter(|&i| cfg.is_linear(i)).count();
+        let prompt: Vec<i32> = (0..100).map(|i| (i * 7 % 49) + 1).collect();
+        let mut first = Vec::new();
+        for k in [0usize, 3, 7] {
+            let (run_k, steps, writes) = counters::counting(|| {
+                run(&qwen, &mut NgramProposer::default(), &prompt, &greedy(1), k)
+            });
+            assert_eq!(run_k.stats.forwards, 1, "K={k}: the prefill alone");
+            assert_eq!((steps, writes), (0, linear), "K={k}");
+            first.push(run_k.output.tokens);
+        }
+        assert!(first.windows(2).all(|w| w[0] == w[1]));
+        let plain = run(&qwen, &mut NoProposer, &prompt, &greedy(12), 0)
+            .output
+            .tokens;
+        let lookup = run(
+            &qwen,
+            &mut NgramProposer::default(),
+            &prompt,
+            &greedy(12),
+            4,
+        )
+        .output
+        .tokens;
+        assert_eq!(lookup, plain);
     }
 
     /// Proposes the ramp continuation after `cur`, `len` drafts wide **regardless of

@@ -447,8 +447,9 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
         // The K + 1 single-token draft steps each start a forward; the step start they must
         // roll back to has to survive them.
         cache.retain_checkpoints(self.max_drafts + 2)?;
+        // A prompt prefill: every rollback stops at a proposal's start, past it (sc-24446).
         self.draft
-            .forward_step(&mut cache, StepRequest::last(prompt))?;
+            .forward_step(&mut cache, StepRequest::last(prompt).as_prefill())?;
         self.draft_forwards += 1;
         self.cache = Some(cache);
         Ok(())

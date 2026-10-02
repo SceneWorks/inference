@@ -112,8 +112,9 @@ thread_local! {
 /// **prefill** (`on`) or not — [`StepRequest::prefill`](crate::decode::StepRequest::prefill),
 /// set by each model's `forward_step`. A prefill segment runs the host-position path and the
 /// reference (`sdpa_gqa`) attention even from a non-empty cache — a prefix-cache hit's suffix
-/// (sc-24437), a split prefill's second segment — so a restored request attends its prompt
-/// exactly as a cold prefill does; only decode / verify steps take the device-positions path.
+/// (sc-24437) — so a restored request attends its prompt exactly as a cold prefill does; only
+/// decode / verify steps take the device-positions path. A hybrid's linear layers ring only a
+/// prefill's final state (sc-24446).
 pub fn prefill_scope(on: bool) -> PrefillScope {
     PrefillScope {
         previous: PREFILL.with(|p| p.replace(on)),

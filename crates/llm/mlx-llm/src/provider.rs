@@ -2371,7 +2371,8 @@ impl TextLlm for LlamaProvider {
         let mut report = run.report;
         // The request's resolution fallbacks join the engine's measured report (E2/E3), and so
         // does what the prefix cache restored — the engine counts a caller's prefill as one
-        // forward, so a prefill split at the conversation boundary adds its second.
+        // forward, and any further forward the prefill ran joins it (none since the boundary
+        // snapshot is taken inside the one prefill forward, sc-24446).
         report.fallbacks = fallbacks;
         report.prefix_hit_tokens = prefix_hit as u64;
         report.prefix_cache = core_llm::PathReport {
@@ -4586,8 +4587,8 @@ mod tests {
         use core_llm::Speculative;
         // The absolute accounting of a budget-bound run without stop tokens: the first token
         // comes from the prefill and each verify step commits its accepted drafts plus one; every
-        // forward is a prefill forward (two when the hybrid's prefill split at the prefix cache's
-        // conversation boundary, sc-24437), a verify step or a recovery replay.
+        // forward is the prefill forward (one, also when the hybrid's prefix cache snapshots its
+        // conversation boundary inside it, sc-24446), a verify step or a recovery replay.
         let accounting = |label: &str, ids: &[u32], report: &core_llm::DecodeReport| {
             assert_eq!(
                 ids.len() as u64,

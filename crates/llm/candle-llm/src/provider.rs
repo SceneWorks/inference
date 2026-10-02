@@ -5148,8 +5148,9 @@ impl TextLlm for LlamaProvider {
         // prefill — supplies the host-side counters and every tally. Both records name the
         // proposer that ran: `none` for a request whose speculation is off, including one whose
         // option resolved to no proposer (AC3, sc-24130) — the reference loop never runs one.
-        // The engine counts a caller's prefill as one forward; a prefill split at the
-        // conversation boundary (sc-24437) ran two.
+        // The engine counts a caller's prefill as one forward; any further forward the prefill
+        // ran joins it (none since the prefix cache's boundary snapshot is taken inside the one
+        // prefill forward, sc-24446).
         let extra_prefill = prefill_forwards.saturating_sub(1) as u64;
         let mut decode_record = match engine_record {
             Some(mut record) => {
@@ -9072,13 +9073,15 @@ mod tests {
         assert_eq!(report.proposer, ProposerKind::None);
         // `Auto` on a snapshot without a head: the engine with no proposer, since sc-24140.
         assert_eq!(report.path, "step_model");
-        // The prefill forward plus one per generated token after the first — and one more: the
-        // prefill splits at the end of the rendered conversation, where the prefix cache
-        // snapshots the hybrid's recurrent state (sc-24437).
+        // The prefill forward plus one per generated token after the first: the prefix cache's
+        // snapshot of the hybrid's recurrent state at the end of the rendered conversation
+        // (sc-24437) is captured inside that one prefill forward, not by splitting it
+        // (sc-24446).
         assert_eq!(report.prefix_cache.path, "miss");
+        assert_eq!(report.prefill_forwards, 1);
         assert_eq!(
             report.target_forwards,
-            u64::from(out.usage.generated_tokens) + 1
+            u64::from(out.usage.generated_tokens)
         );
 
         // `None` keeps the process switch at load (off here); the report says so.

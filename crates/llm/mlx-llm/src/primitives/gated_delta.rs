@@ -932,6 +932,11 @@ pub struct DeltaNetCache {
     offset: i32,
     /// The open or last-closed checkpoint window.
     window: Option<CheckpointWindow>,
+    /// The position the next forward outside a checkpoint window captures its state at
+    /// ([`capture_at`](DeltaNetCache::capture_at)), if any.
+    capture: Option<i32>,
+    /// `(position, conv_state, ssm_state)` the last forward captured.
+    captured: Option<(i32, Array, Array)>,
 }
 
 /// A checkpoint window: the state at `start` and the per-token states of every forward since.
@@ -1064,7 +1069,37 @@ impl DeltaNetCache {
             self.window = None;
         }
         let conv_state = conv.tail_after(t - 1)?;
-        let (y, ssm_state) = if recording && t > 1 {
+        let offset = self.offset;
+        self.captured = None;
+        let capture = self
+            .capture
+            .take()
+            .filter(|&p| !recording && p > offset && p < offset + t);
+        let (y, ssm_state) = if let Some(p) = capture {
+            // A boundary inside a prefill (sc-24446): run the recurrence up to it, keep the state
+            // there, continue from it — the arithmetic of two forwards split at `p`.
+            let b = p - offset;
+            let head = |x: &Array| slice_axis(x, 1, 0, b);
+            let tail = |x: &Array| slice_axis(x, 1, b, t);
+            let (y_head, at) = gated_delta_recurrence(
+                &head(q)?,
+                &head(k)?,
+                &head(v)?,
+                &head(g)?,
+                &head(beta)?,
+                self.ssm_state.as_ref(),
+            )?;
+            let (y_tail, last) = gated_delta_recurrence(
+                &tail(q)?,
+                &tail(k)?,
+                &tail(v)?,
+                &tail(g)?,
+                &tail(beta)?,
+                Some(&at),
+            )?;
+            self.captured = Some((p, conv.tail_after(b - 1)?, at));
+            (concatenate_axis(&[&y_head, &y_tail], 1)?, last)
+        } else if recording && t > 1 {
             let (y, last, states) =
                 gated_delta_recurrence_checkpointed(q, k, v, g, beta, self.ssm_state.as_ref())?;
             self.record(conv, states);
@@ -1081,6 +1116,26 @@ impl DeltaNetCache {
         self.ssm_state = Some(ssm_state);
         self.offset += t;
         Ok(y)
+    }
+
+    /// Ask the next forward to capture the state after `position` — a boundary strictly inside
+    /// that forward, which runs outside a checkpoint window (a prefill) — so the prefix cache can
+    /// snapshot the layer there without splitting the prefill into two forwards (sc-24446).
+    pub fn capture_at(&mut self, position: i32) {
+        self.capture = Some(position);
+    }
+
+    /// This layer as it was after `position`, from the state the last forward captured there
+    /// ([`capture_at`](Self::capture_at)) — no checkpoint window, no pending capture — or `None`
+    /// when it captured none there.
+    pub fn at_captured(&self, position: i32) -> Option<DeltaNetCache> {
+        let (p, conv, ssm) = self.captured.as_ref()?;
+        (*p == position).then(|| DeltaNetCache {
+            conv_state: Some(conv.clone()),
+            ssm_state: Some(ssm.clone()),
+            offset: position,
+            ..DeltaNetCache::default()
+        })
     }
 
     fn record(&mut self, conv: ConvTrace, ssm: Array) {
@@ -1188,6 +1243,8 @@ impl DeltaNetCache {
         self.ssm_state = None;
         self.offset = 0;
         self.window = None;
+        self.capture = None;
+        self.captured = None;
     }
 }
 

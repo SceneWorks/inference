@@ -151,9 +151,10 @@ pub struct DecodeReport {
     /// Target-model forward passes, including the prompt prefill.
     pub target_forwards: u64,
     /// The target forwards the prompt prefill took, counted in
-    /// [`target_forwards`](Self::target_forwards): one for a prompt prefilled in one pass, two
-    /// when a hybrid decoder's prefill split at the cross-turn prefix cache's snapshot boundary
-    /// (story sc-24437), `0` on a path that does not report it. On the speculative engine
+    /// [`target_forwards`](Self::target_forwards): one for a prompt prefilled in one pass — also
+    /// when a hybrid decoder's prefill takes the cross-turn prefix cache's boundary snapshot
+    /// (story sc-24437), which it captures inside that pass (sc-24446) — `0` on a path that
+    /// does not report it. On the speculative engine
     /// `target_forwards == prefill_forwards + verify_steps + replay_forwards +
     /// discarded_forwards`.
     pub prefill_forwards: u64,

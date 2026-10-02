@@ -1561,6 +1561,7 @@ mod cuda {
                             scope: request.scope,
                             want_hidden: request.want_hidden,
                             prefill: request.prefill,
+                            snapshot_at: request.snapshot_at,
                         },
                     )?;
                     stage_outputs(&logits, hidden.as_ref(), out)
@@ -1684,6 +1685,7 @@ mod cuda {
             scope: request.scope,
             want_hidden: request.want_hidden,
             prefill: request.prefill,
+            snapshot_at: request.snapshot_at,
         }
     }
 
