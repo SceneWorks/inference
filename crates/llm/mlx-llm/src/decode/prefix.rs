@@ -609,6 +609,11 @@ impl PagedPrefixCache {
         self.entries.is_empty()
     }
 
+    /// Every stored sequence's cache (for a pool compaction to remap).
+    pub fn caches_mut(&mut self) -> impl Iterator<Item = &mut PagedPackedKvCache> {
+        self.entries.values_mut().map(|entry| &mut entry.cache)
+    }
+
     /// Distinct pages the entries reference.
     pub fn held_pages(&self) -> usize {
         self.entries

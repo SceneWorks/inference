@@ -70,7 +70,7 @@
 //!   reused.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use core_llm::paging::BlockAllocator;
@@ -397,6 +397,70 @@ impl PackedPagePool {
         self.arrays = trimmed;
         self.capacity_pages = target;
         Ok(())
+    }
+
+    /// Page references the pool's sequences and prefix-store entries hold (summed refcounts).
+    pub fn page_references(&self) -> usize {
+        self.alloc.references()
+    }
+
+    /// Compact the pool (sc-20681): move the live pages above the live count into the lowest
+    /// free ids, then shrink to the live count rounded up to the growth chunk — so a sequence that
+    /// retires below the top returns its capacity too, not only one at the top. One gather per
+    /// array builds the compacted arrays (owned, so the old buffers are freed). Returns the moves
+    /// (old id → new id); the caller must apply them to every sequence and entry referencing a
+    /// moved page ([`PagedPackedKvCache::remap_pages`]) before its next step. Call it between
+    /// model steps, only when every holder of the pool's pages is in hand.
+    pub fn compact(&mut self) -> Result<HashMap<usize, usize>> {
+        let live = self.live_pages();
+        let mut holes = (0..live).filter(|&id| !self.alloc.is_live(id));
+        let movers = (live..self.capacity_pages)
+            .filter(|&id| self.alloc.is_live(id))
+            .collect::<Vec<_>>();
+        let moves = movers
+            .into_iter()
+            .map(|from| {
+                let to = holes
+                    .next()
+                    .ok_or_else(|| Error::Msg("page pool compaction ran out of holes".into()))?;
+                Ok((from, to))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        if moves.is_empty() {
+            self.trim()?;
+            return Ok(moves);
+        }
+        let target = live
+            .next_multiple_of(self.growth_chunk())
+            .min(self.capacity_pages);
+        let mut source = (0..target).collect::<Vec<_>>();
+        for (&from, &to) in &moves {
+            source[to] = from;
+        }
+        let index = source
+            .iter()
+            .map(|&id| mlx_i32(id, "page id"))
+            .collect::<Result<Vec<_>>>()?;
+        let index = Array::from_slice(&index, &[mlx_i32(target, "pool capacity")?]);
+        let mut compacted = Vec::with_capacity(self.arrays.len());
+        for layer in &self.arrays {
+            let gather = |array: &Array| -> Result<Array> { Ok(array.take_axis(&index, 0)?) };
+            compacted.push(PageArrays {
+                key_codes: gather(&layer.key_codes)?,
+                key_scales: gather(&layer.key_scales)?,
+                key_zeros: gather(&layer.key_zeros)?,
+                value_codes: gather(&layer.value_codes)?,
+                value_scales: gather(&layer.value_scales)?,
+                value_zeros: gather(&layer.value_zeros)?,
+            });
+        }
+        mlx_rs::transforms::eval(compacted.iter().flat_map(PageArrays::all))?;
+        self.arrays = compacted;
+        self.capacity_pages = target;
+        for (&from, &to) in &moves {
+            self.alloc.relocate(from, to);
+        }
+        Ok(moves)
     }
 
     /// Resize every layer's arrays to exactly `capacity` (> the current capacity) pages.
@@ -786,6 +850,48 @@ impl PagedPackedKvCache {
                 .key_tail
                 .as_ref()
                 .map_or(0, |_| PACKED_METAL_QUANT_GROUP_SIZE - state.tail_rows)
+    }
+
+    /// Apply a pool compaction's moves ([`PackedPagePool::compact`]) to this sequence's page
+    /// table. Refused inside an open step.
+    pub fn remap_pages(&mut self, moves: &HashMap<usize, usize>) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(Error::Config(
+                "paged packed pages remapped inside an open step".into(),
+            ));
+        }
+        let mut moved = false;
+        for id in &mut self.page_ids {
+            if let Some(&to) = moves.get(id) {
+                *id = to;
+                moved = true;
+            }
+        }
+        if moved {
+            // Same width as before (the table grows by doubling): only the moved ids change.
+            let columns = self
+                .page_table
+                .as_ref()
+                .map_or(0, |table| table.shape()[1] as usize)
+                .max(self.page_ids.len())
+                .max(MIN_TABLE_COLUMNS);
+            let mut ids = self
+                .page_ids
+                .iter()
+                .map(|&id| mlx_i32(id, "page id"))
+                .collect::<Result<Vec<_>>>()?;
+            ids.resize(columns, 0);
+            self.page_table = Some(Array::from_slice(
+                &ids,
+                &[1, mlx_i32(columns, "page table")?],
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether a model step is open on the sequence.
+    pub fn has_open_step(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// Rebuild the device page table from `page_ids` (a fork, a restore, or a rolled-back

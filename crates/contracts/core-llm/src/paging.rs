@@ -93,6 +93,29 @@ impl BlockAllocator {
         id
     }
 
+    /// Move every reference of live block `from` to free block `to` (a backend compacting its
+    /// id-indexed storage, having copied the block's contents): `to` takes `from`'s refcount and
+    /// `from` becomes free.
+    ///
+    /// Panics unless `from` is live and `to` is free.
+    pub fn relocate(&mut self, from: usize, to: usize) {
+        assert!(self.is_live(from), "relocate of free/unknown block {from}");
+        let slot = self
+            .free
+            .iter()
+            .position(|&id| id == to)
+            .unwrap_or_else(|| panic!("relocate into a block that is not free: {to}"));
+        self.free.swap_remove(slot);
+        self.refcount[to] = self.refcount[from];
+        self.refcount[from] = 0;
+        self.free.push(from);
+    }
+
+    /// References over every live block (the sum of their refcounts).
+    pub fn references(&self) -> usize {
+        self.refcount.iter().sum()
+    }
+
     /// The highest live id, or `None` when no block is live.
     pub fn highest_live(&self) -> Option<usize> {
         self.refcount.iter().rposition(|&r| r > 0)

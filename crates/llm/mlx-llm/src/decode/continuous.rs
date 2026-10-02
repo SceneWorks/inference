@@ -391,6 +391,41 @@ impl<'a> KvRun<'a> {
         pool.reserve(pages)
     }
 
+    /// After a retirement: compact the pool — the live pages above the live count move into the
+    /// freed holes and the capacity past them is returned — and remap every holder (`lanes` and
+    /// the prefix store's entries). When some holder of the pool's pages is not in hand (a
+    /// caller's pool with sequences outside this run), only the capacity above the highest live
+    /// page is returned.
+    fn compact<'l>(&mut self, lanes: impl IntoIterator<Item = &'l mut Lane>) -> Result<()> {
+        let Some(pool) = self.packed_pool.clone() else {
+            return Ok(());
+        };
+        let mut holders = lanes
+            .into_iter()
+            .filter_map(Lane::packed)
+            .filter(|cache| Rc::ptr_eq(cache.pool(), &pool))
+            .collect::<Vec<_>>();
+        if let Some((store, _)) = self.store.as_mut() {
+            holders.extend(store.caches_mut());
+        }
+        let held = holders
+            .iter()
+            .map(|cache| cache.page_ids().len())
+            .sum::<usize>();
+        if held != pool.borrow().page_references()
+            || holders.iter().any(|cache| cache.has_open_step())
+        {
+            return pool.borrow_mut().trim();
+        }
+        let moves = pool.borrow_mut().compact()?;
+        if !moves.is_empty() {
+            for cache in holders {
+                cache.remap_pages(&moves)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Return the pool's capacity above its highest live page (after a sequence retired).
     fn trim(&self) -> Result<()> {
         match self.packed_pool.as_ref() {
@@ -535,6 +570,7 @@ pub fn generate_continuous_kv(
             break;
         }
         // A request cancelled on its own leaves the batch before the next step.
+        let lanes_before = lanes.len();
         let mut kept = Vec::with_capacity(lanes.len());
         for lane in std::mem::take(&mut lanes) {
             if run.cancelled(lane.req_index) {
@@ -550,7 +586,11 @@ pub fn generate_continuous_kv(
                 kept.push(lane);
             }
         }
+        let cancelled = kept.len() < lanes_before;
         lanes = kept;
+        if cancelled {
+            run.compact(lanes.iter_mut())?;
+        }
         if lanes.is_empty() {
             // Refill below; nothing to step this iteration.
             while lanes.len() < config.max_batch && next_req < requests.len() {
@@ -566,26 +606,40 @@ pub fn generate_continuous_kv(
 
         let per_lane = step_logits(model, &mut lanes, config.exactness)?;
 
-        let mut survivors: Vec<Lane> = Vec::with_capacity(lanes.len());
-        for (mut lane, logits) in std::mem::take(&mut lanes).into_iter().zip(per_lane) {
+        // Slots, so a retirement can compact the pool across every lane still in the batch (the
+        // ones already stepped and the ones still to sample) before the next lane's event.
+        let mut slots = std::mem::take(&mut lanes)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        for (i, logits) in per_lane.into_iter().enumerate() {
+            let mut lane = slots[i].take().expect("each lane is sampled once");
             let tok = sample(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
             match record_token(&mut sched, &mut lane, tok, on_event) {
-                LaneStep::Continue => survivors.push(lane),
-                LaneStep::Done => retire_lane(&mut run, lane)?,
+                LaneStep::Continue => slots[i] = Some(lane),
+                LaneStep::Done => {
+                    retire_lane(&mut run, lane)?;
+                    run.compact(slots.iter_mut().flatten())?;
+                }
             }
         }
-        lanes = survivors;
+        lanes = slots.into_iter().flatten().collect();
         // After sampling: the step's graphs have been evaluated, so their transients are freeable.
         release.advance(1);
 
         // Admit-on-retire: refill every freed slot from the waiting requests.
+        let mut admitted_retired = false;
         while lanes.len() < config.max_batch && next_req < requests.len() {
-            if let Some(lane) = admit_lane(
+            match admit_lane(
                 model, &mut run, requests, &seq_ids, next_req, &mut sched, on_event,
             )? {
-                lanes.push(lane);
+                Some(lane) => lanes.push(lane),
+                None => admitted_retired = true,
             }
             next_req += 1;
+        }
+        if admitted_retired {
+            run.compact(lanes.iter_mut())?;
         }
     }
 
@@ -1418,9 +1472,11 @@ mod tests {
     ///
     /// The resident-memory claim, at every decode event: the bytes the pool holds (its whole
     /// capacity, not only the live pages) stay at or under 0.60 of the dense bf16 K/V of the
-    /// positions the live sequences hold — before and after the first (top-page) retirement.
-    /// Doubling growth, unreserved prefills or a pool that is never trimmed hold more (0.85 of
-    /// dense measured before sc-20681's fix).
+    /// positions the live sequences hold, before and after every retirement — the top-page one
+    /// (request 3) and one below the top (request 1, whose freed pages the pool compacts away by
+    /// moving the pages above them into the holes). Doubling growth, unreserved prefills, a pool
+    /// that is never trimmed or never compacted hold more (0.85 of dense measured before
+    /// sc-20681's fix).
     #[test]
     fn continuous_runs_reserve_their_prefill_and_trim_the_pool_on_retirement() {
         let model = model();
@@ -1429,7 +1485,7 @@ mod tests {
         let requests = [10_240, 10_331, 10_478, 10_603]
             .into_iter()
             .enumerate()
-            .map(|(i, len)| request(tokens(len, i), if i == 3 { 2 } else { 70 }))
+            .map(|(i, len)| request(tokens(len, i), [70, 20, 70, 2][i]))
             .collect::<Vec<_>>();
         let mut checked = 0;
         let (mut first_tokens, mut retired) = (0, 0);
@@ -1440,7 +1496,8 @@ mod tests {
             .collect::<Vec<_>>();
         // Positions each sequence's cache holds at its latest event (0 once retired).
         let mut cached = vec![0_u64; requests.len()];
-        let (mut ratio_checks, mut after_retirement, mut worst) = (0, 0, 0.0_f64);
+        let (mut ratio_checks, mut after_retirement, mut after_below_top, mut worst) =
+            (0, 0, 0, 0.0_f64);
         // Dense bf16 K/V per position: 2 layers × K and V × 2 KV heads × 64 dims × 2 bytes.
         let dense_per_position = (2 * 2 * 2 * 64 * 2) as u64;
         let outputs = generate_continuous_kv(
@@ -1464,12 +1521,10 @@ mod tests {
                             first_tokens += 1;
                         }
                         cached[i] = prompt_lens[i] + step as u64;
-                        if first_tokens == 4 && retired <= 1 {
-                            // Every request is prefilled (and at most the top-page one retired):
-                            // compare the pool's held bytes with the dense K/V the live sequences
-                            // hold. A retirement below the top leaves its pages as free capacity
-                            // the pool reuses (lowest id first) rather than compacts; the final
-                            // step's retirements are past this check.
+                        if first_tokens == 4 {
+                            // Every request is prefilled: compare the pool's held bytes with the
+                            // dense K/V the live sequences hold (a retired sequence's pages are
+                            // back before the next event).
                             let storage = watched.borrow().storage();
                             let held = (storage.code_bytes + storage.metadata_bytes) as f64;
                             let dense = (cached.iter().sum::<u64>() * dense_per_position) as f64;
@@ -1482,6 +1537,7 @@ mod tests {
                             );
                             ratio_checks += 1;
                             after_retirement += usize::from(retired == 1);
+                            after_below_top += usize::from(retired >= 2);
                         }
                     }
                 }
@@ -1515,10 +1571,25 @@ mod tests {
             "every prefill and decode step was checked"
         );
         eprintln!("pool held / dense bf16: worst {worst:.3} over {ratio_checks} events");
+        // Compaction moved live pages under running sequences: each still decodes exactly as it
+        // does alone.
+        for (request, out) in requests.iter().zip(&outputs) {
+            let alone = run(
+                &model,
+                std::slice::from_ref(request),
+                &config(1, BatchExactness::Throughput),
+                ContinuousKv {
+                    page_tokens: 32,
+                    ..qualified(None)
+                },
+            );
+            assert_eq!(out.output.tokens, alone[0].output.tokens);
+        }
         // Decode steps after the first retirement (request 3 leaves after 2 tokens) were checked.
         assert!(
-            ratio_checks >= 4 && after_retirement >= 3,
-            "{ratio_checks} ratio checks, {after_retirement} after the first retirement"
+            ratio_checks >= 4 && after_retirement >= 3 && after_below_top >= 3,
+            "{ratio_checks} ratio checks, {after_retirement} after the first retirement, \
+             {after_below_top} after a retirement below the top"
         );
         for out in &outputs {
             assert_compressed(out);
