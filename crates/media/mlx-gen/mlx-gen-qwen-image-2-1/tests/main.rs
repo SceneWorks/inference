@@ -13,6 +13,9 @@
 
 mod common;
 
+#[path = "adapters.rs"]
+mod adapters;
+
 #[path = "descriptor_conformance.rs"]
 mod descriptor_conformance;
 
