@@ -92,8 +92,12 @@ class PrecisionControlTests(unittest.TestCase):
             with self.subTest(platform=platform, visible=visible, order=order), \
                  self.assertRaisesRegex(RuntimeError, "PCI-ordered CUDA GPU0"):
                 IDLE.check_device_selection(platform, visible, order)
+        self.assertEqual(IDLE.RUN_ID, "37073714206")
+        self.assertEqual(IDLE.BASELINE_DIGEST,
+                         "a05afe09223020d39f698f9ec5ed9bc4f2258a1fa8950e69ee4fa9e2769339a1")
         IDLE.check_dispatch(IDLE.RUN_ID, IDLE.ENGINE_SHA, "a" * 40, "a" * 40)
         for run_id, engine, control, github in (
+            ("36956986577", IDLE.ENGINE_SHA, "a" * 40, "a" * 40),
             ("other", IDLE.ENGINE_SHA, "a" * 40, "a" * 40),
             (IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40),
             (IDLE.RUN_ID, IDLE.ENGINE_SHA, "a" * 40, "b" * 40),
@@ -366,6 +370,7 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertIn("yue2-reviewed-idle-context", workflow)
             self.assertIn("if: inputs.idle_cuda_context_run_id != ''", workflow)
             self.assertIn(f"{IDLE.ENGINE_SHA}-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1", workflow)
+            self.assertNotIn("-36956986577-1", workflow)
             self.assertIn("run-id: ${{ inputs.idle_cuda_context_run_id }}", workflow)
             self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
         self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
