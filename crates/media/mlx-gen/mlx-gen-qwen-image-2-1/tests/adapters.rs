@@ -587,6 +587,42 @@ fn adapters_reach_the_reference_edit_route() {
     );
 }
 
+/// The documented boundary — ten ordered references — carries the adapter too (sc-24163): the
+/// 10-reference edit render runs, and the LoRA changes it.
+///
+/// *Mutation that reds this:* the reference/edit route denoising through an un-adapted DiT.
+#[test]
+fn adapters_reach_a_ten_reference_edit_render() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = render_lora(tmp.path());
+    let edge = 64u32;
+    let images: Vec<Image> = (0..mlx_gen_qwen_image_2_1::MAX_REFERENCE_IMAGES as u32)
+        .map(|r| Image {
+            width: edge,
+            height: edge,
+            pixels: (0..edge * edge * 3)
+                .map(|i| ((i * 37 + r * 53 + 11) % 251) as u8)
+                .collect(),
+        })
+        .collect();
+    assert_eq!(images.len(), 10);
+    let req = GenerationRequest {
+        prompt: "combine every image".to_owned(),
+        conditioning: vec![Conditioning::MultiReference { images }],
+        ..t2i(edge)
+    };
+    let plain = render(&snapshot_spec(tiny_snapshot()), &req);
+    let adapted = render(
+        &snapshot_spec(tiny_snapshot()).with_adapters(vec![lora(&file, 1.0)]),
+        &req,
+    );
+    assert_eq!(adapted.pixels.len(), (edge * edge * 3) as usize);
+    assert_ne!(
+        adapted.pixels, plain.pixels,
+        "the LoRA must change the 10-reference render"
+    );
+}
+
 /// Convert the tiny snapshot into `tier` under `dir`.
 fn convert_tier(dir: &Path, tier: Tier) -> PathBuf {
     let out = dir.join(tier.dir_name());
