@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -17,10 +18,12 @@ import tomllib
 
 from yue2_precision_proof import (REFERENCE_SHA256, cuda_census, require, sample_cuda,
                                  DECODER_SHA256, sha256, verify_reference, verify_revisions, write_json)
+from yue2_decoder_trace_overlay import tree_digest
 
 ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
 LATENT_SHA256 = "f89f02851d08128baa12a3f50cc3e73c80fbb5578797b7c166888dd815dc70c9"
 DIAGNOSTICS = ("waveform", "first_conv", "first_conv_math")
+DIAGNOSTICS += ("decoder_trace",)
 
 
 def verify_diagnostic_data(data: Path) -> None:
@@ -55,6 +58,175 @@ def verify_diagnostic_data(data: Path) -> None:
                             "diagnostic residual array hash mismatch")
                     artifacts.append(path.resolve())
     require(len(set(artifacts)) == 12, "diagnostic arrays collided")
+
+
+def verify_decoder_trace_data(data: Path, source_provenance: dict) -> None:
+    report = json.loads((data / "report.json").read_text(encoding="utf-8"))
+    require(report.get("schemaVersion") == 4 and report.get("selector") == "decoder_trace" and
+            report.get("purpose") == "diagnostic_only_no_gate_change" and
+            report.get("engineSha") == ENGINE_SHA and
+            report.get("derivativeSource") == source_provenance,
+            "decoder trace source/schema identity changed")
+    require(report.get("referenceSha256") == REFERENCE_SHA256 and
+            report.get("latentIdentity", {}).get("sha256") == LATENT_SHA256 and
+            report.get("backend") == "cuda" and report.get("deviceOrdinal") == 0 and
+            (report.get("frames"), report.get("coreFrames"), report.get("haloFrames")) == (75, 16, 16) and
+            report.get("stageCount") == 33 and report.get("originalBound") == 1 / 64 and
+            report.get("originalWaveformRunId") == "36884387320",
+            "decoder trace request or original observation changed")
+    require(report.get("waveformParity") is True and report.get("bf16ClampedMaxAbs") == 0.03125,
+            "decoder trace did not reproduce the original M3 failure")
+    original = {
+        "bf16": (("c12b2b7dca34ee4810536fcee12872674376c24ba484fa600c47fcb35317a908",
+                  "33046e24cd16c415a9963711807abfc1579159036671ea4d2f08a6ca0a61a9f3"),
+                 ("aa032057a51ad3451ab5826ffe18b2f14afae223adcae245b7663d787676f42c",
+                  "a09be42f9ce9d0129c0640daadef40f711a6c3f65751a28b3e73a14de65d0a17")),
+        "f32": (("742f7878e04093aee8abbb0389ebd4fe4a3e734d8c16a3a3f449cc0281bfad99",
+                 "dcd3a7091bb2e0a442951ae94f81c2abc27b5956853645e37a998738af3a9646"),
+                ("2cc2dc0824b1e2115d366829ef1dbc97c6a935e02dfc91237a5f4e7b7211a499",
+                 "9cd3aace4657165201b692c2a20b63750d7d004ac68c8dc0136b38101eae9ec3")),
+    }
+    runs = report.get("runs", {})
+    require(set(runs) == {"bf16", "f32"}, "decoder trace precision controls absent")
+    earliest = None
+    for label, dtype in (("bf16", "BF16"), ("f32", "F32")):
+        run = runs[label]
+        require(run.get("residentDtype") == dtype and len(run.get("stages", [])) == 33 and
+                run.get("decoderIdentity", {}).get("weights_sha256") == DECODER_SHA256["standard"],
+                "decoder trace resident graph changed")
+        for index, stage in enumerate(run["stages"]):
+            require(stage.get("index") == index and stage.get("kind") in
+                    {"conv", "conv_transpose", "snake", "residual"} and
+                    len(stage.get("windows", [])) == 5 and stage.get("full", {}).get("dtype") == dtype,
+                    "decoder trace stage sequence incomplete")
+            for window_index, window in enumerate(stage["windows"]):
+                start = window_index * 16
+                end = min(start + 16, 75)
+                left = max(0, start - 16)
+                right = min(75, end + 16)
+                require((window.get("index"), window.get("start"), window.get("end"),
+                         window.get("left"), window.get("right")) ==
+                        (window_index, start, end, left, right) and
+                        window.get("capture", {}).get("dtype") == dtype,
+                        "decoder trace tile bounds changed")
+                comparison = window.get("comparison", {})
+                require(isinstance(comparison.get("positiveDifferences"), int) and
+                        isinstance(comparison.get("bitDifferences"), int) and
+                        0 <= comparison["positiveDifferences"] <= comparison["bitDifferences"] and
+                        isinstance(comparison.get("maxAbs"), (int, float)) and
+                        math.isfinite(comparison["maxAbs"]) and
+                        (comparison["positiveDifferences"] > 0) == (comparison["maxAbs"] > 0),
+                        "decoder trace stage comparison is internally inconsistent")
+                if label == "bf16" and comparison["positiveDifferences"]:
+                    earliest = index if earliest is None else min(index, earliest)
+        for mode, expected in zip(("full", "tiled"), original[label]):
+            capture = run.get("waveform", {}).get(mode, {})
+            require(capture.get("rawSha256") == expected[0] and
+                    capture.get("clampedSha256") == expected[1] and
+                    capture.get("matchesOriginal") is True and capture.get("rawDtype") == dtype,
+                    "decoder trace final waveform differs from exact M3")
+    require(report.get("earliestBf16Stage") == earliest,
+            "decoder trace earliest positive stage differs from stage rows")
+    adaptive = report.get("adaptive", {})
+    if earliest is None:
+        require(adaptive.get("status") == "not_applicable", "adaptive replay ran without a divergence")
+    else:
+        require(adaptive.get("stage") == earliest and adaptive.get("kind") ==
+                runs["bf16"]["stages"][earliest]["kind"] and
+                adaptive.get("source") == "single_native_layer_replay" and
+                adaptive.get("status") in {"collected", "inconclusive_replay_mismatch"},
+                "adaptive replay is not bound to the first divergent stage")
+        exact = all(adaptive["runs"][label][mode].get(key) is True
+                    for label in ("bf16", "f32") for mode in ("full", "window")
+                    for key in ("inputBitExact", "outputBitExact"))
+        require((adaptive["status"] == "collected") == exact,
+                "adaptive substeps were claimed without exact native replay")
+
+    verify_decoder_trace_file_set(data, report)
+
+
+def verify_decoder_trace_file_set(data: Path, report: dict, minimum_files: int = 404) -> None:
+    references = []
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            if {"file", "sha256", "bytes"} <= set(value):
+                name = value["file"]
+                require(isinstance(name, str) and name == Path(name).name and
+                        name not in ("", ".", ".."), "decoder trace array path escaped data directory")
+                path = data / name
+                require(path.is_file() and not path.is_symlink() and path.stat().st_size == value["bytes"] and
+                        sha256(path) == value["sha256"], "decoder trace array hash/size changed")
+                references.append(name)
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    visit(report)
+    require(len(set(references)) >= minimum_files, "decoder trace raw stage or waveform coverage incomplete")
+    entries = list(data.iterdir())
+    require(all(item.is_file() and not item.is_symlink() for item in entries) and
+            {item.name for item in entries} == {"report.json", *references},
+            "decoder trace data contains unreferenced or unsafe files")
+
+
+def decoder_trace_expected_bytes() -> dict:
+    """Exact pinned 75-frame standard decoder widths and five source tile lengths."""
+    lengths = [75, 32, 48, 48, 43, 27]
+    total_elements = 0
+    largest_stage_elements = 0
+    for frames in lengths:
+        rows = [(2048, frames)]
+        channels = 2048
+        length = frames
+        for stride, out_channels in ((6, 1024), (5, 512), (4, 256),
+                                     (4, 128), (2, 64), (2, 64)):
+            rows.append((channels, length))  # Snake before transposed convolution.
+            length = stride * length + stride - 2 * ((stride + 1) // 2)
+            channels = out_channels
+            rows.extend([(channels, length)] * 4)  # ConvT and three residuals.
+        rows.extend([(channels, length), (2, length)])  # Final Snake and Conv7.
+        require(len(rows) == 33, "pinned standard decoder stage count changed")
+        total_elements += sum(channels * extent for channels, extent in rows)
+        largest_stage_elements = max(largest_stage_elements,
+                                     *(channels * extent for channels, extent in rows))
+    return {"stage_count": 33, "source_lengths": lengths,
+            "bf16_raw_bytes": total_elements * 2, "f32_raw_bytes": total_elements * 4,
+            "max_stage_f32_bytes": largest_stage_elements * 4}
+
+
+def available_physical_memory() -> int:
+    require(os.name == "nt", "decoder trace resource preflight requires Windows")
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ulong), ("memory_load", ctypes.c_ulong),
+                    ("total_physical", ctypes.c_ulonglong), ("available_physical", ctypes.c_ulonglong),
+                    ("total_page", ctypes.c_ulonglong), ("available_page", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
+                    ("available_extended", ctypes.c_ulonglong)]
+    state = MemoryStatus()
+    state.length = ctypes.sizeof(state)
+    require(bool(ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(state))),
+            "GlobalMemoryStatusEx failed; available host memory is unknown")
+    return state.available_physical
+
+
+def preflight_decoder_trace_resources(evidence: Path) -> dict:
+    predicted = decoder_trace_expected_bytes()
+    disk_free = shutil.disk_usage(evidence).free
+    memory_free = available_physical_memory()
+    # All 33 BF16/F32 full+tile arrays are retained for independent audit; reserve one
+    # additional copy for adaptive substeps, temp serialization and failure evidence.
+    disk_required = 2 * (predicted["bf16_raw_bytes"] + predicted["f32_raw_bytes"])
+    # One stage can have simultaneous native-device->CPU F32 copy, Vec, raw bytes,
+    # paired full/tile reads and decoded comparison arrays. This is a bound on the
+    # diagnostic's own host scratch, not a claim about GPU model residency.
+    host_required = 8 * predicted["max_stage_f32_bytes"]
+    result = {**predicted, "disk_free_bytes": disk_free, "disk_required_bytes": disk_required,
+              "host_memory_available_bytes": memory_free, "host_scratch_required_bytes": host_required}
+    write_json(evidence / "decoder-trace-resource-preflight.json", result)
+    require(disk_free >= disk_required and memory_free >= host_required,
+            "insufficient measured host resources for bounded decoder trace arrays")
+    return result
 
 
 def first_conv_array(data: Path, row: dict, dtype: str, shape: list[int]) -> tuple[list[float], list[int]]:
@@ -318,27 +490,43 @@ def prepare_harness(args: argparse.Namespace) -> None:
     def identity(package: dict) -> tuple:
         return tuple(package.get(key) for key in ("name", "source", "version", "checksum"))
     baseline = {identity(package) for package in original_lock["package"]}
-    require(all(identity(package) in baseline for package in harness_lock["package"]
-                if package["name"] != "yue2-bf16-tile-diagnostic"),
+    harness_dependencies = [package for package in harness_lock["package"]
+                            if package["name"] != "yue2-bf16-tile-diagnostic"]
+    require(len(harness_dependencies) == 205 and
+            all(identity(package) in baseline for package in harness_dependencies),
             "diagnostic dependencies differ from the failed M3 lock")
+    overlay = getattr(args, "overlay_root", None)
+    if overlay is not None:
+        overlay = overlay.resolve(strict=True)
+        require(overlay != engine and sha256(overlay / "Cargo.lock") == sha256(engine / "Cargo.lock"),
+                "decoder trace overlay does not preserve exact M3 lock")
+        provenance = json.loads((overlay.parent / "overlay-provenance.json").read_text(encoding="utf-8"))
+        require(provenance.get("engine_sha") == ENGINE_SHA and
+                provenance.get("derivative_vae_sha256") == sha256(overlay / "crates/audio/candle-audio-yue2/src/vae.rs") and
+                provenance.get("control_sha") == args.control_sha,
+                "decoder trace source overlay provenance changed")
     manifest = (template / "Cargo.toml.in").read_text(encoding="utf-8")
     require("__ENGINE_ROOT__" in manifest, "manifest lacks the exact-source path placeholder")
     # A JSON string body is also a valid escaped TOML basic string body.
-    escaped_engine = json.dumps(engine.as_posix(), ensure_ascii=False)[1:-1]
+    escaped_engine = json.dumps((overlay or engine).as_posix(), ensure_ascii=False)[1:-1]
     manifest = manifest.replace("__ENGINE_ROOT__", escaped_engine)
     target.mkdir(parents=True)
     (target / "src").mkdir()
     (target / "Cargo.toml").write_text(manifest, encoding="utf-8")
     shutil.copy2(template / "Cargo.lock.snapshot", target / "Cargo.lock")
     shutil.copy2(template / "src/main.rs", target / "src/main.rs")
+    shutil.copy2(template / "src/decoder_trace.rs", target / "src/decoder_trace.rs")
     write_json(target.parent / "harness-provenance.json", {
         "engine_sha": args.engine_sha, "control_sha": args.control_sha,
+        "standalone_lock_sha256": sha256(template / "Cargo.lock.snapshot"),
+        "m3_dependency_tuples": len(harness_dependencies),
+        "overlay_sha256": sha256(overlay.parent / "overlay-provenance.json") if overlay else None,
         "template_files": {str(p.relative_to(template)): sha256(p) for p in sorted(template.rglob("*")) if p.is_file()},
         "staged_files": {str(p.relative_to(target)): sha256(p) for p in sorted(target.rglob("*")) if p.is_file()},
     })
 
 
-def resolve_binary(build_json: Path, output: Path) -> None:
+def resolve_binary(build_json: Path, output: Path, overlay_root: Path | None = None) -> None:
     candidates = []
     core_features = []
     kernel_sources = []
@@ -361,16 +549,104 @@ def resolve_binary(build_json: Path, output: Path) -> None:
     # The failed M3 binary had no cuDNN: preserve that actual implementation,
     # including its source-owned CUDA kernel patch, in this same-input comparison.
     require(core_features == [{"cuda", "cudarc", "default"}], "Candle features differ from failed M3 build")
+    expected_kernel = ((overlay_root.resolve() if overlay_root else Path.cwd().resolve()) /
+                       "crates/media/candle-gen/vendor/candle-kernels").as_posix().lower()
     require(len(kernel_sources) == 1 and kernel_sources[0].startswith("path+") and
-            "/engine/crates/media/candle-gen/vendor/candle-kernels#" in kernel_sources[0],
+            expected_kernel in kernel_sources[0].lower(),
             "diagnostic must use the failed M3 vendored CUDA kernels")
     output.write_text(str(candidates[0].resolve()) + "\n", encoding="utf-8")
+    write_json(output.parent / "build-identity.json", {
+        "binary_sha256": sha256(candidates[0]), "build_json_sha256": sha256(build_json),
+        "candle_core_features": sorted(core_features[0]),
+        "vendored_kernel_package_id": kernel_sources[0],
+        "derivative_source": str(overlay_root.resolve()) if overlay_root else None,
+    })
+
+
+def verify_trace_prelaunch_build(args: argparse.Namespace, overlay: Path,
+                                 provenance_path: Path) -> None:
+    """Refuse a changed executable or build graph before any GPU census or child."""
+    evidence = args.evidence
+    build_json = evidence / "build.jsonl"
+    identity = json.loads((evidence / "build-identity.json").read_text(encoding="utf-8"))
+    harness = json.loads((evidence / "harness-provenance.json").read_text(encoding="utf-8"))
+    template = (Path("../control") / "scripts/ci/yue2_bf16_tile_diagnostic").resolve()
+    staged = evidence / "harness"
+    require(identity.get("binary_sha256") == sha256(args.binary) and
+            identity.get("build_json_sha256") == sha256(build_json) and
+            identity.get("candle_core_features") == ["cuda", "cudarc", "default"] and
+            identity.get("derivative_source") == str(overlay),
+            "decoder trace executable or saved build identity changed before launch")
+    expected_kernel = (overlay / "crates/media/candle-gen/vendor/candle-kernels").as_posix().lower()
+    core_features, kernel_sources, candidates = [], [], []
+    for line in build_json.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("reason") != "compiler-artifact":
+            continue
+        name = row.get("target", {}).get("name")
+        if name == "candle_core":
+            core_features.append(set(row.get("features", [])))
+        elif name == "candle_kernels":
+            kernel_sources.append(row.get("package_id", "").replace("\\", "/"))
+        elif name == "yue2-bf16-tile-diagnostic" and row.get("executable"):
+            candidates.append(Path(row["executable"]).resolve())
+    require(len(candidates) == 1 and candidates[0] == args.binary.resolve() and
+            core_features == [{"cuda", "cudarc", "default"}] and
+            len(kernel_sources) == 1 and kernel_sources[0].startswith("path+") and
+            expected_kernel in kernel_sources[0].lower() and
+            identity.get("vendored_kernel_package_id") == kernel_sources[0],
+            "decoder trace build JSON changed CUDA features, kernel source, or executable")
+    require(harness.get("engine_sha") == args.engine_sha and
+            harness.get("control_sha") == args.control_sha and
+            harness.get("m3_dependency_tuples") == 205 and
+            harness.get("overlay_sha256") == sha256(provenance_path) and
+            harness.get("standalone_lock_sha256") == sha256(template / "Cargo.lock.snapshot"),
+            "decoder trace harness provenance changed before launch")
+    def file_hashes(root: Path) -> dict:
+        return {str(path.relative_to(root)): sha256(path) for path in sorted(root.rglob("*"))
+                if path.is_file() and not path.is_symlink()}
+    def safe_tree(root: Path) -> bool:
+        return all(not path.is_symlink() and (path.is_file() or path.is_dir())
+                   for path in root.rglob("*"))
+    require(harness.get("template_files") == file_hashes(template) and
+            harness.get("staged_files") == file_hashes(staged) and
+            safe_tree(template) and safe_tree(staged),
+            "decoder trace harness source changed before launch")
+    root_lock = tomllib.loads((overlay / "Cargo.lock").read_text(encoding="utf-8"))
+    staged_lock = tomllib.loads((staged / "Cargo.lock").read_text(encoding="utf-8"))
+    def package_id(package: dict) -> tuple:
+        return tuple(package.get(key) for key in ("name", "source", "version", "checksum"))
+    baseline = {package_id(package) for package in root_lock["package"]}
+    dependencies = [package for package in staged_lock["package"]
+                    if package["name"] != "yue2-bf16-tile-diagnostic"]
+    require(len(dependencies) == 205 and all(package_id(package) in baseline for package in dependencies),
+            "decoder trace staged dependencies differ from exact M3")
 
 
 def execute(args: argparse.Namespace) -> None:
     require(args.engine_sha == ENGINE_SHA, "diagnostic requires the exact failed M3 source")
     selector = getattr(args, "diagnostic", "waveform")
     require(selector in DIAGNOSTICS, "unknown diagnostic selector")
+    overlay = getattr(args, "overlay_root", None)
+    if selector == "decoder_trace":
+        require(overlay is not None, "decoder trace requires declared M3 derivative source")
+        overlay = overlay.resolve(strict=True)
+        provenance_path = overlay.parent / "overlay-provenance.json"
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        require(provenance.get("engine_sha") == ENGINE_SHA and
+                provenance.get("control_sha") == args.control_sha and
+                provenance.get("tracked_archive_sha256") == sha256(overlay.parent / "m3-tracked-source.tar.gz") and
+                provenance.get("overlay_patch_sha256") == sha256(overlay.parent / "decoder-trace-vae.patch") and
+                provenance.get("derivative_vae_sha256") ==
+                sha256(overlay / "crates/audio/candle-audio-yue2/src/vae.rs") and
+                provenance.get("derivative_tree_sha256") == tree_digest(overlay) and
+                provenance.get("cargo_lock_sha256") == sha256(overlay / "Cargo.lock"),
+                "decoder trace derivative source provenance changed")
+    else:
+        require(overlay is None, "source overlay is reserved for decoder trace")
     verify_revisions(args.engine_sha, args.control_sha)
     require(os.environ.get("RUNNER_NAME") in {"cuda-windows", "cuda-windows-2"},
             "diagnostic requires an eligible shared CUDA listener")
@@ -381,7 +657,28 @@ def execute(args: argparse.Namespace) -> None:
         require(not dirty.strip(), "diagnostic source checkout is dirty")
     verify_reference(argparse.Namespace(directory=args.reference, engine_sha=args.engine_sha))
     require(args.binary.is_file(), "diagnostic binary absent")
+    if selector == "decoder_trace":
+        verify_trace_prelaunch_build(args, overlay, provenance_path)
     args.evidence.mkdir(parents=True, exist_ok=True)
+    if selector == "decoder_trace":
+        shutil.copy2(provenance_path, args.evidence / "overlay-provenance.json")
+        shutil.copy2(overlay.parent / "decoder-trace-vae.patch", args.evidence / "decoder-trace-vae.patch")
+        require(sha256(args.evidence / "decoder-trace-vae.patch") == provenance["overlay_patch_sha256"],
+                "archived decoder trace patch differs from built derivative")
+        preflight_decoder_trace_resources(args.evidence)
+    idle_run_id = os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID", "")
+    idle_receipt = None
+    if selector == "decoder_trace" and idle_run_id:
+        receipt_source = Path(os.environ.get("YUE2_IDLE_CONTEXT_RECEIPT_DIR") or
+                              (Path(os.environ["RUNNER_TEMP"]) / "yue2-reviewed-idle-context"))
+        require(receipt_source.is_dir(), "reviewed idle-context receipt absent")
+        copied = args.evidence / "idle-context-receipt"
+        shutil.copytree(receipt_source, copied, symlinks=False)
+        idle_receipt = {"run_id": idle_run_id, "files": [
+            {"path": p.relative_to(copied).as_posix(), "bytes": p.stat().st_size, "sha256": sha256(p)}
+            for p in sorted(copied.rglob("*")) if p.is_file() and not p.is_symlink()]}
+        require(all(p.is_file() and not p.is_symlink() for p in copied.rglob("*")),
+                "reviewed idle-context receipt contains unsafe entries")
     data = args.evidence / "data"
     require(not data.exists(), "diagnostic data must be fresh")
     before_raw, before_busy = cuda_census()
@@ -393,6 +690,8 @@ def execute(args: argparse.Namespace) -> None:
     started = time.time_ns()
     env = os.environ.copy()
     env["YUE2_ENGINE_ROOT"] = str(Path.cwd().resolve())
+    if selector == "decoder_trace":
+        env["YUE2_DECODER_TRACE_PROVENANCE"] = str(provenance_path)
     with (args.evidence / "diagnostic.log").open("w", encoding="utf-8") as log:
         child = subprocess.Popen([str(args.binary), "--diagnostic", selector,
                                   "--reference-dir", str(args.reference),
@@ -435,6 +734,18 @@ def execute(args: argparse.Namespace) -> None:
               "timed_out": timed_out, "owned_process_released": child.poll() is not None,
               "post_census_busy": after_busy, "post_census_error": after_error,
               "sample_count": len(samples), "sampler_faults": faults, "data_files": files}
+    if selector == "decoder_trace":
+        report["derivative_source"] = provenance
+        report["idle_context_receipt"] = idle_receipt
+        report["harness_provenance"] = json.loads(
+            (args.evidence / "harness-provenance.json").read_text(encoding="utf-8"))
+        report["build_identity"] = json.loads(
+            (args.evidence / "build-identity.json").read_text(encoding="utf-8"))
+        require(report["build_identity"]["binary_sha256"] == report["binary_sha256"] and
+                report["build_identity"]["candle_core_features"] == ["cuda", "cudarc", "default"] and
+                report["build_identity"]["derivative_source"] == str(overlay) and
+                report["harness_provenance"]["m3_dependency_tuples"] == 205,
+                "decoder trace build/source/dependency identity changed")
     write_json(args.evidence / "diagnostic-control.json", report)
     print(json.dumps(report, indent=2), flush=True)
     require(not timed_out and code == 0, "diagnostic execution failed; saved output is not acceptance")
@@ -442,7 +753,9 @@ def execute(args: argparse.Namespace) -> None:
     require(child.poll() is not None and not after_busy and after_error is None,
             "diagnostic accelerator release unverified")
     require((data / "report.json").is_file(), "diagnostic residual report absent")
-    if selector in ("first_conv", "first_conv_math"):
+    if selector == "decoder_trace":
+        verify_decoder_trace_data(data, provenance)
+    elif selector in ("first_conv", "first_conv_math"):
         meta = json.loads(Path("crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json").read_text(encoding="utf-8"))
         if selector == "first_conv_math":
             verify_first_conv_math_data(data, meta)
@@ -460,20 +773,23 @@ def main() -> None:
         prepare.add_argument(f"--{name}", type=Path, required=True)
     for name in ("engine-sha", "control-sha"):
         prepare.add_argument(f"--{name}", required=True)
+    prepare.add_argument("--overlay-root", type=Path)
     resolve = commands.add_parser("resolve-binary")
     resolve.add_argument("--build-json", type=Path, required=True)
     resolve.add_argument("--output", type=Path, required=True)
+    resolve.add_argument("--overlay-root", type=Path)
     run = commands.add_parser("run")
     run.add_argument("--diagnostic", choices=DIAGNOSTICS, default="waveform")
     for name in ("binary", "reference", "evidence"):
         run.add_argument(f"--{name}", type=Path, required=True)
     for name in ("engine-sha", "control-sha"):
         run.add_argument(f"--{name}", required=True)
+    run.add_argument("--overlay-root", type=Path)
     args = parser.parse_args()
     if args.command == "prepare-harness":
         prepare_harness(args)
     elif args.command == "resolve-binary":
-        resolve_binary(args.build_json, args.output)
+        resolve_binary(args.build_json, args.output, args.overlay_root)
     else:
         execute(args)
 

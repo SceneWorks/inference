@@ -1,0 +1,295 @@
+--- a/crates/audio/candle-audio-yue2/src/vae.rs
++++ b/crates/audio/candle-audio-yue2/src/vae.rs
+@@ -402,0 +403,5 @@
++
++type SubstepObserver<'a> = dyn FnMut(&str, &Tensor) -> candle_core::Result<()> + 'a;
++type StageObserver<'a> = dyn FnMut(usize, &Tensor, &Tensor) -> candle_core::Result<()> + 'a;
++type TileObserver<'a> =
++    dyn FnMut(usize, usize, usize, usize, &Tensor, &Tensor) -> candle_core::Result<()> + 'a;
+@@ -405,0 +411,8 @@
++        self.forward_observed(x, None)
++    }
++
++    fn forward_observed(
++        &self,
++        x: &Tensor,
++        mut observer: Option<&mut SubstepObserver<'_>>,
++    ) -> candle_core::Result<Tensor> {
+@@ -406,0 +420,3 @@
++        if let Some(observer) = observer.as_mut() {
++            observer("native_conv", &y)?;
++        }
+@@ -408 +424,7 @@
+-            Some(b) => y.broadcast_add(&b.reshape((1, (), 1))?),
++            Some(b) => {
++                let biased = y.broadcast_add(&b.reshape((1, (), 1))?)?;
++                if let Some(observer) = observer.as_mut() {
++                    observer("biased", &biased)?;
++                }
++                Ok(biased)
++            }
+@@ -438,0 +461,8 @@
++        self.forward_observed(x, None)
++    }
++
++    fn forward_observed(
++        &self,
++        x: &Tensor,
++        mut observer: Option<&mut SubstepObserver<'_>>,
++    ) -> candle_core::Result<Tensor> {
+@@ -439,0 +470,3 @@
++        if let Some(observer) = observer.as_mut() {
++            observer("native_unpadded_conv_transpose", &y)?;
++        }
+@@ -441,2 +474,9 @@
+-        y.narrow(D::Minus1, self.padding, len)?
+-            .broadcast_add(&self.bias.reshape((1, (), 1))?)
++        let cropped = y.narrow(D::Minus1, self.padding, len)?;
++        if let Some(observer) = observer.as_mut() {
++            observer("cropped", &cropped)?;
++        }
++        let biased = cropped.broadcast_add(&self.bias.reshape((1, (), 1))?)?;
++        if let Some(observer) = observer.as_mut() {
++            observer("biased", &biased)?;
++        }
++        Ok(biased)
+@@ -459,0 +500,8 @@
++    forward_all_observed(layers, x, None)
++}
++
++fn forward_all_observed(
++    layers: &[Layer],
++    x: &Tensor,
++    mut observer: Option<&mut StageObserver<'_>>,
++) -> candle_core::Result<Tensor> {
+@@ -461,2 +509,2 @@
+-    for layer in layers {
+-        x = match layer {
++    for (index, layer) in layers.iter().enumerate() {
++        let next = match layer {
+@@ -467,0 +516,4 @@
++        if let Some(observer) = observer.as_mut() {
++            observer(index, &x, &next)?;
++        }
++        x = next;
+@@ -1064,0 +1117,98 @@
++    }
++
++    /// Diagnostic-only observation of the unchanged resident decoder graph. The callback sees
++    /// borrowed native tensors; it never supplies an input to the next layer.
++    pub fn trace_decode_full(
++        &self,
++        z: &Tensor,
++        observer: &mut StageObserver<'_>,
++    ) -> Result<Tensor> {
++        self.check_latent(z)?;
++        Ok(forward_all_observed(
++            &self.decoder,
++            &z.to_device(&self.device)?,
++            Some(observer),
++        )?)
++    }
++
++    /// M3's inclusive original-latent support and output length at one decoder prefix.
++    pub fn trace_prefix_geometry(
++        &self,
++        stage: usize,
++        latent_frames: usize,
++        output_index: usize,
++    ) -> Option<(usize, usize, (i64, i64))> {
++        let prefix = self.decoder.get(..=stage)?;
++        let scale = prefix.iter().fold(1usize, |scale, layer| match layer {
++            Layer::ConvT(c) => scale * c.stride,
++            _ => scale,
++        });
++        let len = output_length(prefix, latent_frames as i64);
++        (output_index < len as usize).then(|| {
++            (
++                scale,
++                len as usize,
++                dependency_interval(prefix, output_index as i64, output_index as i64),
++            )
++        })
++    }
++
++    /// Stable diagnostic names for the source-owned top-level decoder sequence.
++    pub fn trace_stage_kind(&self, stage: usize) -> Option<&'static str> {
++        Some(match self.decoder.get(stage)? {
++            Layer::Snake(_) => "snake",
++            Layer::Conv(_) => "conv",
++            Layer::ConvT(_) => "conv_transpose",
++            Layer::Residual(_) => "residual",
++        })
++    }
++
++    pub fn trace_conv_transpose_padding(&self, stage: usize) -> Option<usize> {
++        match self.decoder.get(stage)? {
++            Layer::ConvT(c) => Some(c.padding),
++            _ => None,
++        }
++    }
++
++    /// Replay only one native M3 layer from independently verified, same-dtype checkpoint input.
++    /// A caller must check replay input/output bits against the original observations.
++    pub fn trace_replay_stage(
++        &self,
++        stage: usize,
++        input: &Tensor,
++        observer: &mut SubstepObserver<'_>,
++    ) -> Result<Tensor> {
++        if input.dtype() != self.dtype || !input.device().same_device(&self.device) {
++            return Err(VaeError::Input(
++                "trace replay input dtype/device differs from resident decoder".into(),
++            ));
++        }
++        let layer = self
++            .decoder
++            .get(stage)
++            .ok_or_else(|| VaeError::Input("trace stage absent".into()))?;
++        Ok(match layer {
++            Layer::Snake(s) => s.forward(input)?,
++            Layer::Conv(c) => c.forward_observed(input, Some(observer))?,
++            Layer::ConvT(c) => c.forward_observed(input, Some(observer))?,
++            Layer::Residual(inner) => {
++                let branch = forward_all_observed(
++                    inner,
++                    input,
++                    Some(&mut |i, _, output| {
++                        observer(
++                            match i {
++                                0 => "inner_snake0",
++                                1 => "inner_conv7",
++                                2 => "inner_snake2",
++                                _ => "inner_conv1",
++                            },
++                            output,
++                        )
++                    }),
++                )?;
++                let added = (&branch + input)?;
++                observer("skip_add", &added)?;
++                added
++            }
++        })
+@@ -1066,0 +1217,49 @@
++    /// Same tile boundaries, native decoder, CPU crop and concatenation as `decode_tiled`.
++    pub fn trace_decode_tiled(
++        &self,
++        z: &Tensor,
++        core_frames: usize,
++        halo_frames: usize,
++        observer: &mut TileObserver<'_>,
++    ) -> Result<Tensor> {
++        self.check_latent(z)?;
++        if core_frames < 1 {
++            return Err(VaeError::Input(
++                "core_frames must be a positive integer".into(),
++            ));
++        }
++        let required = self.required_halo(core_frames);
++        if halo_frames < required {
++            return Err(VaeError::Input(format!(
++                "halo_frames must be at least {required} for this decoder (got {halo_frames})"
++            )));
++        }
++        let frames = z.dim(2)?;
++        let ratio = self.config.downsampling_ratio;
++        let total = self.natural_output_length(frames)?;
++        let tiles = frames.div_ceil(core_frames);
++        let mut pieces = Vec::with_capacity(tiles);
++        for (index, start) in (0..frames).step_by(core_frames).enumerate() {
++            let end = frames.min(start + core_frames);
++            let left = start.saturating_sub(halo_frames);
++            let right = frames.min(end + halo_frames);
++            let tile = forward_all_observed(
++                &self.decoder,
++                &z.narrow(2, left, right - left)?.to_device(&self.device)?,
++                Some(&mut |stage, input, output| {
++                    observer(index, left, right, stage, input, output)
++                }),
++            )?;
++            let (out_start, out_end) = (start * ratio, (end * ratio).min(total));
++            let crop_start = (start - left) * ratio;
++            let len = out_end - out_start;
++            if crop_start + len > tile.dim(2)? {
++                return Err(VaeError::Input(
++                    "VAE tile did not cover its requested output core".into(),
++                ));
++            }
++            pieces.push(tile.narrow(2, crop_start, len)?.to_device(&Device::Cpu)?);
++        }
++        Ok(Tensor::cat(&pieces, 2)?)
++    }
++
+@@ -1308,0 +1508,71 @@
++    #[test]
++    fn diagnostic_prefix_valid_boundaries_use_original_latent_support() {
++        let vae = tiny(VaeVariant::Standard, VaeParts::DecoderOnly);
++        let valid = |stage: usize, left: i64, right: i64| {
++            let (scale, full_len, _) = vae.trace_prefix_geometry(stage, 75, 0).unwrap();
++            let (_, tile_len, _) = vae
++                .trace_prefix_geometry(stage, (right - left) as usize, 0)
++                .unwrap();
++            let origin = left as usize * scale;
++            let mut indices = (origin..full_len.min(origin + tile_len)).filter(|&index| {
++                let (_, _, (low, high)) = vae.trace_prefix_geometry(stage, 75, index).unwrap();
++                (left == 0 || low >= left) && (right == 75 || high < right)
++            });
++            let first = indices.next().unwrap();
++            (first, indices.last().unwrap_or(first), tile_len)
++        };
++        assert_eq!(valid(0, 0, 32), (0, 28, 32));
++        assert_eq!(valid(0, 16, 64), (19, 60, 48));
++        assert_eq!(valid(0, 48, 75), (51, 74, 27));
++        assert_eq!(valid(2, 16, 64), (117, 362, 288));
++        assert_eq!(valid(3, 16, 64), (120, 359, 288));
++        assert_eq!(valid(4, 16, 64), (129, 350, 288));
++        assert_eq!(valid(5, 16, 64), (156, 323, 288));
++        assert_eq!(valid(7, 16, 64), (782, 1616, 1439));
++        assert_eq!(valid(32, 16, 64), (53487, 100048, 92096));
++        assert_eq!(valid(32, 48, 75), (114927, 143935, 51776));
++        assert_eq!(vae.trace_prefix_geometry(32, 75, 0).unwrap().1, 143936);
++    }
++
++    #[test]
++    fn diagnostic_observation_preserves_tiny_full_and_tiled_outputs() {
++        let vae = tiny(VaeVariant::Standard, VaeParts::DecoderOnly);
++        let z = latent_bct();
++        let bits = |x: &Tensor| {
++            x.flatten_all()
++                .unwrap()
++                .to_vec1::<f32>()
++                .unwrap()
++                .into_iter()
++                .map(f32::to_bits)
++                .collect::<Vec<_>>()
++        };
++        let mut seen = Vec::new();
++        let traced = vae
++            .trace_decode_full(&z, &mut |index, input, output| {
++                assert_eq!(input.dtype(), DType::F32);
++                assert_eq!(output.dtype(), DType::F32);
++                seen.push(index);
++                Ok(())
++            })
++            .unwrap();
++        assert_eq!(seen, (0..33).collect::<Vec<_>>());
++        assert_eq!(bits(&traced), bits(&vae.decode_full(&z).unwrap()));
++
++        let mut windows = Vec::new();
++        let traced_tiles = vae
++            .trace_decode_tiled(&z, 3, 16, &mut |window, left, right, stage, _, _| {
++                windows.push((window, left, right, stage));
++                Ok(())
++            })
++            .unwrap();
++        let normal_tiles = vae
++            .decode_tiled(&z, 3, 16, &|| false, &mut |_, _| {})
++            .unwrap();
++        assert_eq!(bits(&traced_tiles), bits(&normal_tiles));
++        assert_eq!(windows.len(), 3 * 33);
++        assert!(windows
++            .iter()
++            .all(|(_, left, right, _)| (*left, *right) == (0, 7)));
++    }
++

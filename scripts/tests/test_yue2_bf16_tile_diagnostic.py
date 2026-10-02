@@ -4,7 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import struct
 import sys
@@ -18,6 +18,73 @@ sys.path.insert(0, str(CI))
 spec = importlib.util.spec_from_file_location("yue2_bf16_tile_diagnostic", CI / "yue2_bf16_tile_diagnostic.py")
 diag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(diag)
+from yue2_decoder_trace_overlay import canonical_tree_order
+
+
+def synthetic_trace_build(root: Path) -> argparse.Namespace:
+    engine = root / "engine"
+    overlay = root / "overlay"
+    evidence = root / "evidence"
+    template = root / "control/scripts/ci/yue2_bf16_tile_diagnostic"
+    staged = evidence / "harness"
+    for directory in (engine, overlay, evidence, template, staged):
+        directory.mkdir(parents=True, exist_ok=True)
+    packages = "".join(f'[[package]]\nname="test-dependency-{index}"\nversion="1.0.0"\n'
+                       for index in range(205))
+    (overlay / "Cargo.lock").write_text(packages, encoding="utf-8")
+    for directory in (template, staged):
+        (directory / "Cargo.lock.snapshot").write_text(packages, encoding="utf-8")
+    (staged / "Cargo.lock").write_text(packages, encoding="utf-8")
+    (template / "src").mkdir()
+    (staged / "src").mkdir()
+    (template / "src/main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    (staged / "src/main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    vae = overlay / "crates/audio/candle-audio-yue2/src/vae.rs"
+    vae.parent.mkdir(parents=True)
+    vae.write_text("// diagnostic overlay\n", encoding="utf-8")
+    archive = root / "m3-tracked-source.tar.gz"
+    patch_file = root / "decoder-trace-vae.patch"
+    archive.write_bytes(b"tracked source")
+    patch_file.write_bytes(b"declared VAE patch")
+    control_sha = "a" * 40
+    provenance = {"engine_sha": diag.ENGINE_SHA, "control_sha": control_sha,
+                  "tracked_archive_sha256": diag.sha256(archive),
+                  "overlay_patch_sha256": diag.sha256(patch_file),
+                  "derivative_vae_sha256": diag.sha256(vae),
+                  "derivative_tree_sha256": "synthetic-tree",
+                  "cargo_lock_sha256": diag.sha256(overlay / "Cargo.lock")}
+    provenance_path = root / "overlay-provenance.json"
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    binary = root / "diagnostic.exe"
+    binary.write_bytes(b"reviewed executable")
+    kernel = (overlay / "crates/media/candle-gen/vendor/candle-kernels").as_posix()
+    kernel_id = f"path+file:///{kernel}#0.10.2"
+    rows = [
+        {"reason": "compiler-artifact", "target": {"name": "candle_core"},
+         "features": ["cuda", "cudarc", "default"]},
+        {"reason": "compiler-artifact", "target": {"name": "candle_kernels"},
+         "package_id": kernel_id},
+        {"reason": "compiler-artifact", "target": {"name": "yue2-bf16-tile-diagnostic"},
+         "executable": str(binary)},
+    ]
+    build = evidence / "build.jsonl"
+    build.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    identity = {"binary_sha256": diag.sha256(binary), "build_json_sha256": diag.sha256(build),
+                "candle_core_features": ["cuda", "cudarc", "default"],
+                "vendored_kernel_package_id": kernel_id, "derivative_source": str(overlay)}
+    (evidence / "build-identity.json").write_text(json.dumps(identity), encoding="utf-8")
+    def hashes(directory: Path) -> dict:
+        return {str(path.relative_to(directory)): diag.sha256(path)
+                for path in directory.rglob("*") if path.is_file()}
+    harness = {"engine_sha": diag.ENGINE_SHA, "control_sha": control_sha,
+               "m3_dependency_tuples": 205,
+               "overlay_sha256": diag.sha256(provenance_path),
+               "standalone_lock_sha256": diag.sha256(template / "Cargo.lock.snapshot"),
+               "template_files": hashes(template), "staged_files": hashes(staged)}
+    (evidence / "harness-provenance.json").write_text(json.dumps(harness), encoding="utf-8")
+    return argparse.Namespace(binary=binary, reference=root / "reference", evidence=evidence,
+                              engine_sha=diag.ENGINE_SHA, control_sha=control_sha,
+                              diagnostic="decoder_trace", overlay_root=overlay)
 
 
 def synthetic_math_report(root: Path, applicable: bool) -> tuple[Path, dict, dict]:
@@ -112,12 +179,152 @@ def synthetic_math_report(root: Path, applicable: bool) -> tuple[Path, dict, dic
 
 
 class DiagnosticGuards(unittest.TestCase):
+    def test_decoder_trace_tree_hash_uses_case_sensitive_posix_utf8_order(self):
+        windows_root = PureWindowsPath("C:/source")
+        windows_entries = [windows_root / name for name in
+                           ("advisory-ignores.toml", "AGENTS.md", "Zeta")]
+        self.assertEqual([path.name for path in canonical_tree_order(windows_root, windows_entries)],
+                         ["AGENTS.md", "Zeta", "advisory-ignores.toml"])
+        self.assertNotEqual([path.name for path in sorted(windows_entries)],
+                            ["AGENTS.md", "Zeta", "advisory-ignores.toml"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            names = ("advisory-ignores.toml", "AGENTS.md", "Zeta")
+            for name in names:
+                (root / name).write_bytes(name.encode("utf-8"))
+            expected = hashlib.sha256()
+            for name in sorted(names, key=lambda item: item.encode("utf-8")):
+                encoded = name.encode("utf-8")
+                expected.update(len(encoded).to_bytes(4, "little"))
+                expected.update(encoded)
+                expected.update(hashlib.sha256(encoded).digest())
+            self.assertEqual(diag.tree_digest(root), expected.hexdigest())
+
+    def test_decoder_trace_build_and_harness_mutations_refuse_prelaunch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = synthetic_trace_build(root)
+            old = Path.cwd()
+            try:
+                os.chdir(root / "engine")
+                provenance_path = root / "overlay-provenance.json"
+                diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance_path)
+                build = args.evidence / "build.jsonl"
+                identity_path = args.evidence / "build-identity.json"
+                harness_path = args.evidence / "harness-provenance.json"
+                original_binary = args.binary.read_bytes()
+                args.binary.write_bytes(b"changed executable")
+                with self.assertRaisesRegex(RuntimeError, "executable or saved build"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance_path)
+                args.binary.write_bytes(original_binary)
+                original_build = build.read_bytes()
+                build.write_bytes(original_build + b"{}\n")
+                with self.assertRaisesRegex(RuntimeError, "executable or saved build"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance_path)
+                build.write_bytes(original_build)
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                identity["derivative_source"] = str(root / "wrong-overlay")
+                identity_path.write_text(json.dumps(identity), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "executable or saved build"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance_path)
+                identity["derivative_source"] = str(args.overlay_root)
+                identity_path.write_text(json.dumps(identity), encoding="utf-8")
+                rows = [json.loads(line) for line in build.read_text(encoding="utf-8").splitlines()]
+                rows[0]["features"].append("cudnn")
+                build.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                identity["build_json_sha256"] = diag.sha256(build)
+                identity_path.write_text(json.dumps(identity), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "build JSON changed CUDA features"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance_path)
+                build.write_bytes(original_build)
+                identity["build_json_sha256"] = diag.sha256(build)
+                identity_path.write_text(json.dumps(identity), encoding="utf-8")
+                rows = [json.loads(line) for line in original_build.decode("utf-8").splitlines()]
+                rows[1]["package_id"] = "git+https://example.invalid/alternate-kernels"
+                build.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                identity["build_json_sha256"] = diag.sha256(build)
+                identity["vendored_kernel_package_id"] = rows[1]["package_id"]
+                identity_path.write_text(json.dumps(identity), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "build JSON changed CUDA features"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance_path)
+                build.write_bytes(original_build)
+                identity["build_json_sha256"] = diag.sha256(build)
+                identity["vendored_kernel_package_id"] = json.loads(
+                    original_build.decode("utf-8").splitlines()[1])["package_id"]
+                identity_path.write_text(json.dumps(identity), encoding="utf-8")
+                harness = json.loads(harness_path.read_text(encoding="utf-8"))
+                harness["overlay_sha256"] = "0" * 64
+                harness_path.write_text(json.dumps(harness), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "harness provenance"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance_path)
+                harness["overlay_sha256"] = diag.sha256(provenance_path)
+                harness_path.write_text(json.dumps(harness), encoding="utf-8")
+                (args.evidence / "harness/src/main.rs").write_text("fn changed() {}\n", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "harness source"):
+                    diag.verify_trace_prelaunch_build(args, args.overlay_root, provenance_path)
+            finally:
+                os.chdir(old)
+
+    def test_decoder_trace_binary_mismatch_reaches_neither_census_nor_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = synthetic_trace_build(root)
+            args.binary.write_bytes(b"replaced executable")
+            old = Path.cwd()
+            try:
+                os.chdir(root / "engine")
+                with patch.dict(os.environ, RUNNER_NAME="cuda-windows-2", CUDA_VISIBLE_DEVICES="0"), \
+                     patch.object(diag, "verify_revisions"), patch.object(diag, "verify_reference"), \
+                     patch.object(diag, "tree_digest", return_value="synthetic-tree"), \
+                     patch.object(diag.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="")), \
+                     patch.object(diag, "cuda_census") as census, \
+                     patch.object(diag.subprocess, "Popen") as launch:
+                    with self.assertRaisesRegex(RuntimeError, "executable or saved build"):
+                        diag.execute(args)
+                    census.assert_not_called()
+                    launch.assert_not_called()
+            finally:
+                os.chdir(old)
+
+    def test_decoder_trace_resource_bound_comes_from_all_33_native_stage_shapes(self):
+        expected = diag.decoder_trace_expected_bytes()
+        self.assertEqual(expected["source_lengths"], [75, 32, 48, 48, 43, 27])
+        self.assertEqual(expected["stage_count"], 33)
+        self.assertEqual(expected["bf16_raw_bytes"], 817244160)
+        self.assertEqual(expected["f32_raw_bytes"], 1634488320)
+        self.assertEqual(expected["max_stage_f32_bytes"], 36847616)
+
+    def test_decoder_trace_inventory_refuses_extra_missing_corrupt_and_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            raw = b"\x00\x80\xc0\x3f"
+            (data / "native.bf16le").write_bytes(raw)
+            report = {"capture": {"file": "native.bf16le", "sha256": hashlib.sha256(raw).hexdigest(),
+                                  "bytes": len(raw)}}
+            (data / "report.json").write_text(json.dumps(report), encoding="utf-8")
+            diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
+            with self.assertRaisesRegex(RuntimeError, "coverage incomplete"):
+                diag.verify_decoder_trace_file_set(data, report)
+            (data / "extra.bin").write_bytes(b"extra")
+            with self.assertRaisesRegex(RuntimeError, "unreferenced"):
+                diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
+            (data / "extra.bin").unlink()
+            (data / "native.bf16le").write_bytes(b"wrong")
+            with self.assertRaisesRegex(RuntimeError, "hash/size changed"):
+                diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
+            (data / "native.bf16le").unlink()
+            (data / "native.bf16le").symlink_to(data / "report.json")
+            with self.assertRaisesRegex(RuntimeError, "hash/size changed"):
+                diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
+            (data / "native.bf16le").unlink()
+            with self.assertRaisesRegex(RuntimeError, "hash/size changed"):
+                diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
     def test_explicit_selector_keeps_waveform_default_and_forwards_to_child(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("default: waveform", workflow)
-        self.assertIn("options: [waveform, first_conv, first_conv_math]", workflow)
+        self.assertIn("options: [waveform, first_conv, first_conv_math, decoder_trace]", workflow)
         self.assertIn('run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR"', workflow)
-        self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math"))
+        self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math", "decoder_trace"))
 
     def test_first_conv_math_conditional_arms_and_restore_receipt(self):
         for applicable in (False, True):
