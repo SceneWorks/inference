@@ -759,16 +759,46 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
             "{LABEL}: control images are not part of text-to-image LoRA/LoKr training"
         )));
     }
-    if req.items.iter().any(|item| !item.model_options.is_empty())
-        || !req.config.model_options.is_empty()
-    {
+    // The worker forwards its whole `advanced` map as `model_options` and native trainers parse
+    // only the keys they own, so an unknown key is ignored — but a key that would switch this run
+    // into a workflow it cannot perform (reference / control conditioning) is refused rather than
+    // silently trained as plain text-to-image.
+    let refused = |options: &serde_json::Map<String, serde_json::Value>| {
+        UNHONOURED_MODEL_OPTIONS
+            .iter()
+            .find(|key| options.get(**key).is_some_and(|v| !v.is_null()))
+            .copied()
+    };
+    let hit = refused(&req.config.model_options).or_else(|| {
+        req.items
+            .iter()
+            .find_map(|item| refused(&item.model_options))
+    });
+    if let Some(key) = hit {
         return Err(Error::Msg(format!(
-            "{LABEL}: model_options are not consumed by the text-to-image trainer; refusing \
-             rather than silently training without them"
+            "{LABEL}: model_options `{key}` selects reference/control conditioning, which the \
+             text-to-image trainer does not perform; refusing rather than silently training \
+             without it"
         )));
     }
     Ok(())
 }
+
+/// `model_options` keys naming a workflow this text-to-image trainer cannot honour: ordered
+/// reference images (instruction-edit training travels as `TrainingItem::reference_image_paths`,
+/// refused by the shared edit floor) and control conditioning. Every other key — the worker's
+/// `mixedPrecision`, `cacheLatents`, `networkType`, `sampleEvery`, … — is not this trainer's to
+/// read and is ignored.
+const UNHONOURED_MODEL_OPTIONS: [&str; 8] = [
+    "references",
+    "referenceImages",
+    "reference_images",
+    "referenceImagePaths",
+    "controlType",
+    "control_type",
+    "controlImage",
+    "control_image",
+];
 
 /// Resolve the config's target-module *suffixes* to `(dotted path, [out, in])` on the DiT's
 /// weight-free projection table. The DEFAULT (empty `lora_target_modules`) is every
@@ -1617,9 +1647,17 @@ mod tests {
             &|r| {
                 r.config
                     .model_options
-                    .insert("references".into(), serde_json::json!([]));
+                    .insert("references".into(), serde_json::json!(["/r.png"]));
             },
-            "model_options",
+            "model_options `references`",
+        );
+        bad(
+            &|r| {
+                r.items[0]
+                    .model_options
+                    .insert("controlType".into(), serde_json::json!("canny"));
+            },
+            "model_options `controlType`",
         );
         bad(
             &|r| r.config.lora_target_modules = vec!["no_such_module".into()],
@@ -1634,6 +1672,32 @@ mod tests {
         ok.config.loss_type = "L1".into();
         ok.config.gradient_checkpointing = true;
         assert!(t.validate(&ok).is_ok());
+    }
+
+    /// The SceneWorks worker forwards its whole `advanced` map as `model_options` on every run;
+    /// keys this trainer does not own are ignored (the "parse only your keys" worker contract), so
+    /// a defaults-shaped map — on the config and on the items — passes `validate`.
+    #[test]
+    fn a_sceneworks_shaped_advanced_map_passes_validate() {
+        let t = trainer();
+        let advanced = serde_json::json!({
+            "mixedPrecision": "bf16",
+            "cacheLatents": true,
+            "networkType": "lora",
+            "sampleEvery": 250,
+            "samplePrompts": ["a swatch"],
+            "gradientCheckpointing": true,
+            "optimizer": "adamw",
+            "lrScheduler": "constant",
+            "timestepType": "sigmoid",
+            "captionDropout": 0.05,
+            "controlType": null,
+        });
+        let mut req = req_with(base_config());
+        req.config.model_options = advanced.as_object().unwrap().clone();
+        req.items[0].model_options = advanced.as_object().unwrap().clone();
+        t.validate(&req)
+            .expect("unknown advanced keys are ignored, not refused");
     }
 
     /// The default surface is every [`BLOCK_ADAPTER_TARGETS`] Linear of every block (and no
