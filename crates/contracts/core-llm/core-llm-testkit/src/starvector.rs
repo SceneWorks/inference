@@ -274,6 +274,9 @@ fn expected_fixture_output(fixture: &StarVectorFixture) -> StarVectorOutput {
         generated_tokens: fixture.fragments.len() as u32,
         generated_bytes: fixture.expected_svg.len(),
         finish_reason: StarVectorFinishReason::CompleteRoot,
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(
+            core_llm::KvCompressionPolicy::Off,
+        )),
     }
 }
 

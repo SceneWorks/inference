@@ -83,7 +83,19 @@ from a fixed ratio, at the cache's block-rounded capacity of prompt plus `max_ne
   growth's pre-growth copy, or a group flush's output, beside the live arrays: one per in-flight
   MLX evaluator buffer), every layer's residual rows again (a step's rollback point), and every
   layer's fused-reader split-KV scratch (`Hq · 128 splits · (D + 2) · 4` bytes for the one-token
-  decode dispatches a product generation issues; its prompt step attends through dense SDPA).
+  decode dispatches a product generation issues; its prompt step attends through dense SDPA),
+  plus one layer's dense prompt K/V (`P·Hkv·D·element_bytes·2`). The prompt step evaluates each
+  layer's packed store and attention output before building the next layer; left as one lazy
+  graph, every layer's dense prompt K/V stayed resident beside the packed store (measured 1.88x
+  the estimate on a 28-layer, 8×128-KV-head decoder, above the same request run dense).
+
+Every dense MLX estimate (a dense plan, an un-opted request, a dense re-admission) prices the
+dense cache the same way: its block-rounded buffers plus `min(layers, 11)` layers' pre-growth
+buffers, which a block growth holds beside their successors until the evaluator releases them
+(a dense decode across growth blocks peaked 1.30x the unrounded K/V term without this).
+`admission_estimates_cover_the_measured_peak_compressed_and_dense` holds the MLX allocator's
+measured peak at or below the estimate for both cache kinds through prefill and a decode across
+growth blocks.
 
 For K8V8 the resident term is `2.25·D` bytes per layer, head and token against `4·D` for BF16
 dense. A shallow decoder can price above dense once the transients are added; a qualified request
@@ -94,7 +106,9 @@ so the provider admits the request again at the dense estimate before any K/V ex
 generation that later transitions to dense (a reader fault over resident history) admits that
 transition against fresh capacity before reconstructing: the larger of the reconstruction (every
 layer's dense K/V at block capacity plus one layer's Float32 dequantization) and the dense cache
-the rest of the generation grows to. A refusal fails the generation with the same typed
+the rest of the generation grows to (block-rounded, with its window of growth copies). It is
+admitted even when no history is resident to rebuild, because the rest of the generation still
+runs dense. A refusal fails the generation with the same typed
 `RequestResourceExhausted` rather than oversubscribing memory.
 
 Every generation reports its cache on `TextLlmOutput::kv_cache` (`KvCacheReport`):

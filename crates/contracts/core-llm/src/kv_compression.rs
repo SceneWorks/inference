@@ -145,6 +145,9 @@ pub struct CompressedKvAllocation {
     /// Scratch one layer's fused-reader dispatch holds (split-KV partials), priced for every
     /// layer.
     pub reader_scratch_bytes_per_layer: u64,
+    /// Dense K/V the prompt step holds beside the packed store before it is quantized (the
+    /// layers' fresh prompt K/V the backend lets coexist).
+    pub prefill_transient_bytes: u64,
 }
 
 /// Bytes a compressed KV cache of `format` needs to serve `tokens` positions (prompt plus every
@@ -155,8 +158,9 @@ pub struct CompressedKvAllocation {
 ///   dense K and V residual rows at the decoder's compute width;
 /// * transient: `coexisting_layer_transients` layers' packed arrays at full capacity plus one block
 ///   (the pre-growth copy or the flush output beside the live arrays), every layer's residual
-///   rows once more (a step's rollback point holds the residuals a flush replaced), and every
-///   layer's fused-reader scratch.
+///   rows once more (a step's rollback point holds the residuals a flush replaced), every
+///   layer's fused-reader scratch, and the prompt step's dense K/V
+///   (`prefill_transient_bytes`).
 ///
 /// `None` on overflow or a zero growth block.
 pub fn compressed_kv_cache_bytes(
@@ -196,7 +200,8 @@ pub fn compressed_kv_cache_bytes(
             allocation
                 .reader_scratch_bytes_per_layer
                 .checked_mul(shape.layers)?,
-        )?;
+        )?
+        .checked_add(allocation.prefill_transient_bytes)?;
     resident.checked_add(transient)
 }
 
@@ -735,6 +740,7 @@ mod tests {
         growth_block_tokens: 256,
         coexisting_layer_transients: 0,
         reader_scratch_bytes_per_layer: 0,
+        prefill_transient_bytes: 0,
     };
 
     #[test]
@@ -797,6 +803,21 @@ mod tests {
         );
         assert_eq!(with(1_000, 0), with(28, 0));
         assert_eq!(with(0, 7) - base, 7 * shape.layers);
+        // The prompt step's dense K/V transient is charged as supplied.
+        assert_eq!(
+            compressed_kv_cache_bytes(
+                format,
+                shape,
+                40_960,
+                CompressedKvAllocation {
+                    prefill_transient_bytes: 12_345,
+                    ..NO_TRANSIENT
+                },
+            )
+            .unwrap()
+                - base,
+            12_345
+        );
         assert_eq!(
             compressed_kv_cache_bytes(
                 format,
@@ -820,16 +841,18 @@ mod tests {
     #[test]
     fn qualified_contexts_price_below_dense() {
         let format = KvCompressionFormat::GroupAffineK8V8;
-        let allocation = CompressedKvAllocation {
-            growth_block_tokens: 256,
-            coexisting_layer_transients: 11,
-            reader_scratch_bytes_per_layer: 32 * 128 * 130 * 4,
-        };
         for row in KV_COMPRESSION_QUALIFICATIONS {
             for tokens in [
                 row.min_context_tokens,
                 row.max_context_tokens.map_or(40_960, |max| max - 1),
             ] {
+                let allocation = CompressedKvAllocation {
+                    growth_block_tokens: 256,
+                    coexisting_layer_transients: 11,
+                    reader_scratch_bytes_per_layer: 32 * 128 * 130 * 4,
+                    // One layer's dense K/V of the whole context as the prompt step's transient.
+                    prefill_transient_bytes: tokens * 8 * 128 * 2 * 2,
+                };
                 let compressed =
                     compressed_kv_cache_bytes(format, EVIDENCE_SHAPE, tokens, allocation).unwrap();
                 let dense = EVIDENCE_SHAPE.dense_bytes(tokens).unwrap();

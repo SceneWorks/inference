@@ -2837,9 +2837,9 @@ impl LlamaProvider {
             ),
             Some(format) => u64::try_from(prompt_tokens)
                 .ok()
-                .and_then(|prompt| prompt.checked_add(u64::from(max_new_tokens)))
-                .and_then(|total| {
-                    crate::kv_policy::compressed_request_kv_bytes(format, &geometry, total)
+                .and_then(|prompt| {
+                    let total = prompt.checked_add(u64::from(max_new_tokens))?;
+                    crate::kv_policy::compressed_request_kv_bytes(format, &geometry, prompt, total)
                 })
                 .and_then(|kv| {
                     estimate_mlx_compressed_request_bytes(
@@ -3989,7 +3989,18 @@ fn estimate_mlx_request_bytes(
     mtp_width: u32,
     contract: MlxWorkspaceContract<'_>,
 ) -> Option<u64> {
-    match contract {
+    // The shared estimates price the dense K/V at exactly `prompt + max_new` positions. The MLX
+    // dense cache holds whole 256-position blocks and, at each block growth, every layer's
+    // pre-growth buffer beside its successor until the evaluator releases it (sc-20682 review:
+    // a dense decode across growth blocks peaked 1.30x the shared estimate). Charge the
+    // difference to every dense MLX estimate.
+    let total = u64::try_from(prompt_tokens)
+        .ok()?
+        .checked_add(u64::from(max_new_tokens))?;
+    let shape = geometry.kv_shape();
+    let growth = crate::kv_policy::dense_final_kv_bytes(shape, total)?
+        .checked_sub(shape.dense_bytes(total)?)?;
+    let base = match contract {
         MlxWorkspaceContract::Eager => core_llm::estimate_request_bytes(
             prompt_tokens,
             max_new_tokens,
@@ -4018,7 +4029,8 @@ fn estimate_mlx_request_bytes(
                 prism,
             )?)
         }
-    }
+    }?;
+    base.checked_add(growth)
 }
 
 fn validate_context_window(
@@ -4371,9 +4383,18 @@ mod tests {
         assert!(eager > 400_000_000_000, "quadratic eager peak: {eager}");
         assert_eq!(
             eager,
-            core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap(),
-            "non-fused paths retain the shared fail-closed estimate"
+            core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap()
+                + dense_growth(29_600, 128, geometry),
+            "non-fused paths retain the shared fail-closed estimate (plus the MLX dense growth)"
         );
+    }
+
+    /// sc-20682: what every dense MLX estimate adds to the shared estimate's unrounded K/V term —
+    /// the dense cache's block rounding and its window of pre-growth copies.
+    fn dense_growth(prompt: usize, new_tokens: u32, geometry: LlmMemoryGeometry) -> u64 {
+        let total = prompt as u64 + u64::from(new_tokens);
+        crate::kv_policy::dense_final_kv_bytes(geometry.kv_shape(), total).unwrap()
+            - geometry.kv_shape().dense_bytes(total).unwrap()
     }
 
     /// The shared tiled estimate with the attention term `sdpa`'s routing implies for `geometry`.
@@ -4423,7 +4444,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 estimate,
-                routed_estimate(prompt, 16, geometry),
+                routed_estimate(prompt, 16, geometry) + dense_growth(prompt, 16, geometry),
                 "head_dim {head_dim}"
             );
         }
@@ -4537,9 +4558,11 @@ mod tests {
             let at_compute_width =
                 estimate_mlx_request_bytes(prompt as usize, 128, compute_width, 0, 0, contract)
                     .unwrap();
+            let growth = dense_growth(prompt as usize, 128, g)
+                - dense_growth(prompt as usize, 128, compute_width);
             assert_eq!(
                 estimate - at_compute_width,
-                kv + activations,
+                kv + activations + growth,
                 "prompt {prompt}"
             );
         }
@@ -4577,7 +4600,8 @@ mod tests {
             assert_eq!(
                 estimate,
                 routed_estimate(prompt, new_tokens, geometry)
-                    + estimate_qwen35_workspace_extra_bytes(prompt, &config, true).unwrap(),
+                    + estimate_qwen35_workspace_extra_bytes(prompt, &config, true).unwrap()
+                    + dense_growth(prompt, new_tokens, geometry),
                 "prompt {prompt}"
             );
         }
@@ -5654,7 +5678,15 @@ mod tests {
         // the attention path still moves the argmax (2-bit K/V flips positions).
         let head = &arrays[0].1 * gains.head_align + randn(&[32, 128]);
         arrays.push(("lm_head.weight".into(), head));
-        // The identity may deepen the decoder (`num_hidden_layers`); every layer gets weights.
+        // The identity may deepen the decoder (`num_hidden_layers`) and widen its attention
+        // (`num_attention_heads`, `num_key_value_heads`, `head_dim`); every layer gets weights of
+        // that geometry.
+        let dim = |key: &str| i32::try_from(config[key].as_u64().unwrap()).unwrap();
+        let (q_width, kv_width, head) = (
+            dim("num_attention_heads") * dim("head_dim"),
+            dim("num_key_value_heads") * dim("head_dim"),
+            dim("head_dim"),
+        );
         for i in 0..config["num_hidden_layers"].as_u64().unwrap() {
             let p = |s: &str| format!("model.layers.{i}.{s}");
             arrays.extend([
@@ -5666,10 +5698,22 @@ mod tests {
                     p("post_attention_layernorm.weight"),
                     Array::ones::<f32>(&[128]).unwrap(),
                 ),
-                (p("self_attn.q_proj.weight"), randn(&[128, 128]) * gains.qk),
-                (p("self_attn.k_proj.weight"), randn(&[64, 128]) * gains.qk),
-                (p("self_attn.v_proj.weight"), randn(&[64, 128]) * gains.vo),
-                (p("self_attn.o_proj.weight"), randn(&[128, 128]) * gains.vo),
+                (
+                    p("self_attn.q_proj.weight"),
+                    randn(&[q_width, 128]) * gains.qk,
+                ),
+                (
+                    p("self_attn.k_proj.weight"),
+                    randn(&[kv_width, 128]) * gains.qk,
+                ),
+                (
+                    p("self_attn.v_proj.weight"),
+                    randn(&[kv_width, 128]) * gains.vo,
+                ),
+                (
+                    p("self_attn.o_proj.weight"),
+                    randn(&[128, q_width]) * gains.vo,
+                ),
                 (p("mlp.gate_proj.weight"), randn(&[64, 128])),
                 (p("mlp.up_proj.weight"), randn(&[64, 128])),
                 (p("mlp.down_proj.weight"), randn(&[128, 64])),
@@ -5678,11 +5722,11 @@ mod tests {
                 arrays.extend([
                     (
                         p("self_attn.q_norm.weight"),
-                        Array::ones::<f32>(&[64]).unwrap() * gains.qk,
+                        Array::ones::<f32>(&[head]).unwrap() * gains.qk,
                     ),
                     (
                         p("self_attn.k_norm.weight"),
-                        Array::ones::<f32>(&[64]).unwrap() * gains.qk,
+                        Array::ones::<f32>(&[head]).unwrap() * gains.qk,
                     ),
                 ]);
             }
@@ -6696,8 +6740,10 @@ mod tests {
         let (prompt, new) = (32_768_usize, 512_u32);
         let total = prompt as u64 + u64::from(new);
         let compressed_kv =
-            crate::kv_policy::compressed_request_kv_bytes(format, &geometry, total).unwrap();
-        let dense_kv = geometry.kv_shape().dense_bytes(total).unwrap();
+            crate::kv_policy::compressed_request_kv_bytes(format, &geometry, prompt as u64, total)
+                .unwrap();
+        // The MLX dense K/V: block-rounded buffers plus the window of growth copies.
+        let dense_kv = crate::kv_policy::dense_final_kv_bytes(geometry.kv_shape(), total).unwrap();
         assert!(compressed_kv < dense_kv);
         let dense =
             estimate_mlx_request_bytes(prompt, new, geometry, 0, 0, MlxWorkspaceContract::Chunked)
@@ -6913,6 +6959,62 @@ mod tests {
                 KvPlan::Unreported => panic!("a product plan always reports"),
             }
         });
+    }
+
+    /// sc-20682 review: the admission estimate covers the MLX allocator's measured peak of the
+    /// same request, through the prompt step AND a decode that crosses several 256-token growth
+    /// blocks, on a KV-dominant decoder (28 layers of 8 KV heads x 128 over a 128-wide residual
+    /// stream, so K/V rather than activations set the peak). Both the compressed run and the same
+    /// request run dense (the price a dense re-admission charges) must fit their estimates.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admission_estimates_cover_the_measured_peak_compressed_and_dense() {
+        use core_llm::{KvCompressionFormat as Format, KvCompressionPolicy as Policy};
+        use mlx_rs::memory;
+        let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
+            .iter()
+            .find(|row| row.family == core_llm::KvModelFamily::Qwen3)
+            .unwrap();
+        let words = usize::try_from(row.min_context_tokens).unwrap();
+        let snapshot = tiny_snapshot(
+            json!({
+                "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+                "num_hidden_layers": 28, "num_attention_heads": 8,
+                "num_key_value_heads": 8, "head_dim": 128,
+            }),
+            row.min_context_tokens + 2048,
+            true,
+        );
+        let provider = load_tiny(&snapshot);
+        const NEW: u32 = 600;
+        // Warm both paths (kernel compilation, allocator pools) before measuring.
+        let prompt = kv_generate(&provider, words, Policy::Qualified, 4)
+            .usage
+            .prompt_tokens as usize;
+        kv_generate(&provider, words, Policy::Off, 4);
+        for (policy, format) in [
+            (Policy::Qualified, Some(Format::GroupAffineK8V8)),
+            (Policy::Off, None),
+        ] {
+            memory::clear_cache();
+            let baseline = memory::get_active_memory() as u64;
+            memory::reset_peak_memory();
+            let output = kv_generate(&provider, words, policy, NEW);
+            let peak = (memory::get_peak_memory() as u64).saturating_sub(baseline);
+            assert_eq!(output.usage.generated_tokens, NEW);
+            assert_eq!(
+                output.kv_cache.as_ref().unwrap().ran_compressed(),
+                format.is_some()
+            );
+            let estimate = provider
+                .admission_estimate(format, prompt, NEW, 0, 0)
+                .unwrap();
+            eprintln!("sc-20682 {policy:?}: measured peak {peak} B, estimate {estimate} B");
+            assert!(
+                peak <= estimate,
+                "{policy:?}: measured peak {peak} B exceeds the admission estimate {estimate} B"
+            );
+        }
     }
 
     /// A reader that binds to the K8V8 cache and faults on every dispatch.

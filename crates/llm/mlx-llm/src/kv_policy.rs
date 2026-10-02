@@ -42,35 +42,43 @@ pub(crate) const fn packed_code_bits(format: KvCompressionFormat) -> PackedCodeB
 /// * a product generation's reader dispatches are one-token decode steps (`query_heads` rows):
 ///   its prompt step runs on an empty cache, whose multi-row steps attend their fresh K/V through
 ///   dense SDPA (priced by the prefill attention term), and every qualified prompt is far longer
-///   than the fused-SDPA row limit.
+///   than the fused-SDPA row limit;
+/// * that prompt step evaluates each layer's store and attention output before building the next
+///   layer, so one layer's dense prompt K/V coexists with the packed store.
 pub(crate) fn mlx_compressed_allocation(
-    query_heads: u64,
-    head_dim: u64,
+    geometry: &core_llm::LlmMemoryGeometry,
+    prompt_tokens: u64,
 ) -> Option<core_llm::CompressedKvAllocation> {
+    let shape = geometry.kv_shape();
     Some(core_llm::CompressedKvAllocation {
         growth_block_tokens: u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?,
         coexisting_layer_transients: crate::provider::MLX_EVAL_BUFFER_WINDOW,
         reader_scratch_bytes_per_layer:
             crate::primitives::packed_metal::packed_reader_partial_scratch_bound_bytes(
-                query_heads,
-                head_dim,
+                geometry.query_heads,
+                geometry.head_dim,
             )?,
+        prefill_transient_bytes: shape
+            .dense_bytes(prompt_tokens)?
+            .checked_div(shape.layers.max(1))?,
     })
 }
 
-/// K/V bytes admission prices for a generation of `total_tokens` positions (prompt plus every
-/// generated token) on the compressed cache of `format`: the format-derived packed representation
-/// plus the MLX allocation's transients ([`core_llm::compressed_kv_cache_bytes`]).
+/// K/V bytes admission prices for a generation prefilling `prompt_tokens` and reaching
+/// `total_tokens` positions (prompt plus every generated token) on the compressed cache of
+/// `format`: the format-derived packed representation plus the MLX allocation's transients
+/// ([`core_llm::compressed_kv_cache_bytes`]).
 pub(crate) fn compressed_request_kv_bytes(
     format: KvCompressionFormat,
     geometry: &core_llm::LlmMemoryGeometry,
+    prompt_tokens: u64,
     total_tokens: u64,
 ) -> Option<u64> {
     core_llm::compressed_kv_cache_bytes(
         format,
         geometry.kv_shape(),
         total_tokens,
-        mlx_compressed_allocation(geometry.query_heads, geometry.head_dim)?,
+        mlx_compressed_allocation(geometry, prompt_tokens)?,
     )
 }
 
@@ -200,9 +208,12 @@ pub(crate) fn dense_transition_admission(
     })
 }
 
-/// Dense K/V bytes a generation that turned dense grows to by its last position: every layer's
-/// buffer at the dense cache's block-rounded capacity of `total_tokens`, plus one layer's buffer
-/// again for a block growth's pre-growth copy beside its successor.
+/// Dense K/V bytes the MLX dense cache needs to reach `total_tokens` positions: every layer's
+/// buffer at the block-rounded capacity, plus the pre-growth buffers a block growth holds beside
+/// their successors — one per layer, up to one per in-flight evaluator buffer
+/// ([`MLX_EVAL_BUFFER_WINDOW`](crate::provider::MLX_EVAL_BUFFER_WINDOW)): every layer grows in the
+/// same decode step and the evaluator keeps each replaced input until its command buffer
+/// completes. Prices both a dense request and a compressed generation that turned dense.
 pub(crate) fn dense_final_kv_bytes(
     shape: core_llm::KvCacheShape,
     total_tokens: u64,
@@ -210,7 +221,8 @@ pub(crate) fn dense_final_kv_bytes(
     let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
     let capacity = total_tokens.div_ceil(block).max(1).checked_mul(block)?;
     let dense = shape.dense_bytes(capacity)?;
-    dense.checked_add(dense.checked_div(shape.layers.max(1))?)
+    let layer = dense.checked_div(shape.layers.max(1))?;
+    dense.checked_add(layer.checked_mul(shape.layers.min(crate::provider::MLX_EVAL_BUFFER_WINDOW))?)
 }
 
 /// The report of a generation that ran on a cache [`select_compressed_cache`] chose, read from the
@@ -442,43 +454,56 @@ mod tests {
             Some(24 * 128 * 130 * 4)
         );
         assert_eq!(
-            mlx_compressed_allocation(24, 128),
+            mlx_compressed_allocation(&geometry, 32_768),
             Some(core_llm::CompressedKvAllocation {
                 growth_block_tokens: 256,
                 coexisting_layer_transients: 11,
                 reader_scratch_bytes_per_layer: 24 * 128 * 130 * 4,
+                // One layer's dense prompt K/V: 32768 tokens x 8 heads x 128 x bf16 x (K, V).
+                prefill_transient_bytes: 32_768 * 8 * 128 * 2 * 2,
             })
         );
         let format = KvCompressionFormat::GroupAffineK8V8;
-        for total in [10_240 + 512, 32_768 + 1_024, 130_559] {
-            let priced = compressed_request_kv_bytes(format, &geometry, total).unwrap();
+        for (prompt, total) in [
+            (10_240, 10_240 + 512),
+            (32_768, 32_768 + 1_024),
+            (130_000, 130_559),
+        ] {
+            let priced = compressed_request_kv_bytes(format, &geometry, prompt, total).unwrap();
             assert_eq!(
                 Some(priced),
                 core_llm::compressed_kv_cache_bytes(
                     format,
                     geometry.kv_shape(),
                     total,
-                    mlx_compressed_allocation(24, 128).unwrap()
+                    mlx_compressed_allocation(&geometry, prompt).unwrap()
                 )
             );
             assert!(priced < geometry.kv_shape().dense_bytes(total).unwrap());
         }
     }
 
-    /// A generation that turns dense part-way grows to its block-rounded dense cache, plus one
-    /// layer's pre-growth copy.
+    /// The dense cache's block-rounded buffers plus one pre-growth copy per layer, capped at the
+    /// evaluator's in-flight window.
     #[test]
-    fn dense_final_bytes_cover_block_capacity_and_one_growth_copy() {
-        let shape = core_llm::KvCacheShape {
-            layers: 2,
+    fn dense_final_bytes_cover_block_capacity_and_the_window_of_growth_copies() {
+        let shape = |layers| core_llm::KvCacheShape {
+            layers,
             kv_heads: 1,
             head_dim: 64,
             element_bytes: 2,
         };
         let layer = 512 * 64 * 2 * 2;
-        assert_eq!(dense_final_kv_bytes(shape, 300), Some(2 * layer + layer));
-        assert_eq!(dense_final_kv_bytes(shape, 512), Some(3 * layer));
-        assert_eq!(dense_final_kv_bytes(shape, u64::MAX), None);
+        assert_eq!(
+            dense_final_kv_bytes(shape(2), 300),
+            Some(2 * layer + 2 * layer)
+        );
+        assert_eq!(dense_final_kv_bytes(shape(2), 512), Some(4 * layer));
+        assert_eq!(
+            dense_final_kv_bytes(shape(28), 300),
+            Some(28 * layer + 11 * layer)
+        );
+        assert_eq!(dense_final_kv_bytes(shape(2), u64::MAX), None);
     }
 
     /// The dense-transition admission refuses — typed, with the request's own geometry — when the

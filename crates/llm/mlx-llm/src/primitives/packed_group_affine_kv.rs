@@ -699,11 +699,11 @@ impl DenseFallbackPackedDecoderCache {
         if self.dense_active {
             return Ok(());
         }
+        // Admitted even with no resident history to rebuild (a first-step fault rolled back to
+        // an empty cache): the rest of the generation still runs dense, which the request's
+        // compressed admission did not price (sc-20682).
         if let Some(admission) = &self.transition_admission {
-            let required = self.dense_reconstruction_bytes();
-            if required > 0 {
-                admission.admit(required)?;
-            }
+            admission.admit(self.dense_reconstruction_bytes())?;
         }
         let mut dense = ContiguousKvCache::new(self.staged.layers());
         let mut reconstructed = false;
@@ -1028,7 +1028,17 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 if let Some(pending) = self.pending_step.as_mut() {
                     pending.store_unread = true;
                 }
-                crate::primitives::attention::sdpa(query, keys, values, scale, dense_mask)?
+                let output =
+                    crate::primitives::attention::sdpa(query, keys, values, scale, dense_mask)?;
+                // Evaluate this layer's appended store and its attention output before the next
+                // layer is built (sc-20682). Left lazy until the last layer, the whole step is one
+                // graph and every layer's dense prompt K/V stays resident beside the packed store:
+                // measured 1.88x the request's admission estimate on a KV-dominant decoder, above
+                // the same request run dense. Evaluated per layer, only the current layer's dense
+                // K/V coexist with the packed history. Inside the transaction, so a quantizer
+                // fault still rolls the step back.
+                self.staged.evaluate_device_layer(layer, &output)?;
+                output
             } else {
                 let snapshot_overhead = self.pending_device_snapshot_overhead();
                 match self.staged.dispatch_layer(
@@ -3097,6 +3107,28 @@ impl PackedGroupAffineKvCache {
 
     /// Evaluate every resident device layer's store (packed extents, metadata, and residuals), so
     /// the arrays the cache accounts are materialized and no lazy append retains its dense input.
+    /// Evaluate one device layer's store together with `with` (the attention output that layer
+    /// returns), so the step's dense K/V that feed them are released before the next layer.
+    fn evaluate_device_layer(&self, layer: usize, with: &Array) -> Result<()> {
+        let Some(device) = self.device_layers.get(layer).and_then(Option::as_ref) else {
+            return Err(Error::Msg(format!(
+                "packed layer {layer} has no device store"
+            )));
+        };
+        mlx_rs::transforms::eval([
+            with,
+            &device.key_codes,
+            &device.key_scales,
+            &device.key_zeros,
+            &device.key_tail,
+            &device.value_codes,
+            &device.value_scales,
+            &device.value_zeros,
+            &device.value_tail,
+        ])?;
+        Ok(())
+    }
+
     fn evaluate_device_store(&self) -> Result<()> {
         mlx_rs::transforms::eval(self.device_layers.iter().flatten().flat_map(|device| {
             [
@@ -7084,6 +7116,32 @@ mod tests {
         let evidence = packed.packed_evidence().unwrap();
         assert!(evidence.dense_active);
         assert_eq!(evidence.full_cache_dequantizations, 1);
+    }
+
+    /// sc-20682: a transition with nothing resident to rebuild is still admitted (with zero
+    /// reconstruction bytes) — the generation continues dense from there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_empty_dense_transition_is_still_admitted() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let width = 64;
+        let (mut cache, _kernel) = hook_cache_geometry(2, 1, 1, width, None);
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+        assert_eq!(packed.dense_reconstruction_bytes(), 0);
+        let seen = Rc::new(Cell::new(None));
+        let observed = seen.clone();
+        packed.set_dense_transition_admission(DenseTransitionAdmission::new(move |bytes| {
+            observed.set(Some(bytes));
+            Err(Error::Msg("refused".into()))
+        }));
+        let kv = bhsd(&vec![0.2; width], 1, 1, 1, width);
+        assert!(packed.update(0, &kv, &kv).is_err());
+        assert_eq!(seen.get(), Some(0));
+        assert!(!packed.packed_evidence().unwrap().dense_active);
     }
 
     /// Oracle output over the device representation `cache` holds for layer 0.
