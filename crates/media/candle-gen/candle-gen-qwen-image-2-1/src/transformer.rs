@@ -585,6 +585,92 @@ impl QwenImage21Transformer {
         })
     }
 
+    /// Visit every adaptable projection under its diffusers dotted key — the candle twin of the MLX
+    /// host's adapter module map, and the walk `candle_gen::quant::install_dotted_adapters` (and the
+    /// LoHa dense fold in [`crate::adapters`]) resolve adapter targets against. Each projection is
+    /// visited exactly once, in load order:
+    ///
+    /// * `img_in`, `txt_in.in_layer`, `txt_in.out_layer`,
+    ///   `time_text_embed.timestep_embedder.linear_{1,2}`, `modulation.1`;
+    /// * per block `transformer_blocks.{i}.attn.{to_q, to_k, to_v, to_out.0}` and
+    ///   `transformer_blocks.{i}.img_mlp.{gate_layer, proj, out}`;
+    /// * `norm_out.linear`, `proj_out`.
+    ///
+    /// These are exactly the weight keys the DiT loads (minus the norm vectors), so a PEFT/diffusers
+    /// adapter trained against the upstream module tree resolves 1:1.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_core::Result<()>,
+    ) -> candle_core::Result<()> {
+        visitor("img_in", &mut self.img_in)?;
+        visitor("txt_in.in_layer", &mut self.txt_in)?;
+        visitor("txt_in.out_layer", &mut self.txt_out)?;
+        visitor(
+            "time_text_embed.timestep_embedder.linear_1",
+            &mut self.time_in,
+        )?;
+        visitor(
+            "time_text_embed.timestep_embedder.linear_2",
+            &mut self.time_out,
+        )?;
+        visitor("modulation.1", &mut self.modulation)?;
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            let prefix = format!("transformer_blocks.{index}");
+            for (name, linear) in [
+                ("attn.to_q", &mut block.attn.to_q),
+                ("attn.to_k", &mut block.attn.to_k),
+                ("attn.to_v", &mut block.attn.to_v),
+                ("attn.to_out.0", &mut block.attn.to_out),
+                ("img_mlp.gate_layer", &mut block.mlp.gate_layer),
+                ("img_mlp.proj", &mut block.mlp.proj),
+                ("img_mlp.out", &mut block.mlp.out),
+            ] {
+                visitor(&format!("{prefix}.{name}"), linear)?;
+            }
+        }
+        visitor("norm_out.linear", &mut self.norm_out)?;
+        visitor("proj_out", &mut self.proj_out)
+    }
+
+    /// The weight-free twin of [`Self::visit_adaptable_mut`]: every adaptable projection's dotted
+    /// key and `[out, in]` base shape, in the same order, derived from `cfg` alone (sc-24157). The
+    /// adapter preflight and the memory contract resolve adapter targets against this before any
+    /// DiT weight is read; a test pins it to the visitor walk of a loaded DiT.
+    pub fn adaptable_projections(cfg: &TransformerConfig) -> Vec<(String, (usize, usize))> {
+        let inner = cfg.inner_dim();
+        let hidden = inner * cfg.mlp_ratio;
+        let mut out = vec![
+            ("img_in".to_owned(), (inner, cfg.in_channels)),
+            ("txt_in.in_layer".to_owned(), (inner, cfg.context_in_dim)),
+            ("txt_in.out_layer".to_owned(), (inner, inner)),
+            (
+                "time_text_embed.timestep_embedder.linear_1".to_owned(),
+                (inner, TIMESTEP_DIM),
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2".to_owned(),
+                (inner, inner),
+            ),
+            ("modulation.1".to_owned(), (4 * inner, inner)),
+        ];
+        for index in 0..cfg.num_layers {
+            for (name, shape) in [
+                ("attn.to_q", (inner, inner)),
+                ("attn.to_k", (inner, inner)),
+                ("attn.to_v", (inner, inner)),
+                ("attn.to_out.0", (inner, inner)),
+                ("img_mlp.gate_layer", (hidden, inner)),
+                ("img_mlp.proj", (hidden, inner)),
+                ("img_mlp.out", (inner, hidden)),
+            ] {
+                out.push((format!("transformer_blocks.{index}.{name}"), shape));
+            }
+        }
+        out.push(("norm_out.linear".to_owned(), (inner, inner)));
+        out.push(("proj_out".to_owned(), (cfg.out_channels, inner)));
+        out
+    }
+
     pub fn config(&self) -> &TransformerConfig {
         &self.cfg
     }

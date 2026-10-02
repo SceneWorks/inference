@@ -46,6 +46,11 @@
 //! `Conditioning::Mask` is deliberately unadvertised and refused with the workaround named — see
 //! `UPSTREAM.md`.
 //!
+//! Adapters (sc-24157): LoRA and PEFT-stamped LoKr stack as forward-time additive residuals over
+//! the DiT's projections on every tier (dense bf16 and packed q8/q4), each at its own strength;
+//! LyCORIS LoHa folds into the dense weights on the bf16 tier and is a typed refusal on a packed
+//! one. See [`mod@adapters`].
+//!
 //! ## Deliberate differences from the MLX twin
 //!
 //! * `backend = "candle"`, `mac_only = false`.
@@ -78,6 +83,7 @@ use candle_gen::gen_core::{
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
 
+pub mod adapters;
 pub mod config;
 pub mod loader;
 pub mod memory_strategy;
@@ -188,8 +194,11 @@ pub fn descriptor() -> ModelDescriptor {
             // that would have to fabricate an alpha to honour the flag. Whether a given render is
             // actually transparent is decided by the prompt, not by this bit; see UPSTREAM.md.
             supports_alpha_output: true,
-            supports_lora: false,
-            supports_lokr: false,
+            // sc-24157: LoRA and PEFT LoKr ride as stacked additive residuals over every tier
+            // (dense bf16 and packed q8/q4); LyCORIS LoHa folds into the dense weights on the bf16
+            // tier and is a typed refusal on a packed one — see `crate::adapters`.
+            supports_lora: true,
+            supports_lokr: true,
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
             min_size: MIN_SIZE,
@@ -270,11 +279,6 @@ pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
             )));
         }
     }
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "qwen_image_2_1: LoRA/LoKr adapters are not wired for Qwen-Image 2.1 yet".into(),
-        ));
-    }
     if spec.text_encoder.is_some() {
         return Err(gen_core::Error::Unsupported(
             "qwen_image_2_1: the Qwen3-VL text encoder is loaded from the snapshot's own \
@@ -324,6 +328,12 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // The loaded contract is priced from the snapshot on disk BEFORE any weight is read, so a
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
     // through the memory registration.
+    //
+    // It is also the adapter admission: pricing the stack runs `adapters::plan` (the weight-free
+    // preflight, safetensors headers only), so a LoHa on a packed tier, a key that reaches no DiT
+    // projection and a mis-oriented factor are refused here on EVERY offload policy — under
+    // `Sequential` the DiT (and so `adapters::install`) is deferred to the first render, so without
+    // this a bad adapter would pass `load` and fail mid-generate.
     let memory_strategy = memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     let residency = build_residency(spec, &device)?;
     Ok(Box::new(QwenImage21 {
@@ -356,7 +366,12 @@ fn build_residency(
 
 fn load_heavy(spec: &LoadSpec, device: &Device) -> Result<Heavy> {
     let root: &Path = loader::snapshot_root(&spec.weights)?;
-    let transformer = loader::load_transformer(root, device)?;
+    let mut transformer = loader::load_transformer(root, device)?;
+    // One install for every route: T2I, and the 1-10 reference edit, all denoise through this DiT.
+    if !spec.adapters.is_empty() {
+        let tier = quant::resolve_requested_tier(root, spec.quantize)?;
+        adapters::install(&mut transformer, &spec.adapters, tier, device)?;
+    }
     let vae = loader::load_vae(root, device)?;
     Ok(Heavy { transformer, vae })
 }

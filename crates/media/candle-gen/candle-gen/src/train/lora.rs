@@ -1250,6 +1250,11 @@ pub fn conv_lora_delta(
 /// **Linear-only**: pass 2-D factors. The conv/tucker LoHa form (lycoris `use_cp`, `hada_t1`/`hada_t2`)
 /// is out of the candle SDXL adapter surface — like third-party LoKr, LoHa merges only into the
 /// attention/proj Linears (the conv surface is LoRA-only), so a conv-shaped LoHa is surfaced as skipped.
+///
+/// **Orientation is checked, not just element count** (sc-24157): every factor must be 2-D with
+/// `w*_a` `[out, r]` and `w*_b` `[r, in]` for `base_shape = (out, in)`. A transposed module
+/// (`[in, r]`·`[r, out]`) has the same `out·in` elements and would otherwise reshape into a
+/// scrambled `[out, in]` delta and merge silently.
 pub fn reconstruct_loha_delta(
     w1_a: &Tensor,
     w1_b: &Tensor,
@@ -1258,10 +1263,24 @@ pub fn reconstruct_loha_delta(
     scale: f32,
     base_shape: (usize, usize),
 ) -> Result<Tensor> {
+    let (out_f, in_f) = base_shape;
+    let oriented = |a: &Tensor, b: &Tensor| {
+        let (a, b) = (a.dims(), b.dims());
+        a.len() == 2 && b.len() == 2 && a[0] == out_f && b[1] == in_f && a[1] == b[0]
+    };
+    if !(oriented(w1_a, w1_b) && oriented(w2_a, w2_b)) {
+        return Err(CandleError::Msg(format!(
+            "loha: factors w1_a {:?} / w1_b {:?} / w2_a {:?} / w2_b {:?} do not reconstruct the \
+             base [out={out_f}, in={in_f}] (expected w*_a [out, r] and w*_b [r, in])",
+            w1_a.dims(),
+            w1_b.dims(),
+            w2_a.dims(),
+            w2_b.dims()
+        )));
+    }
     let f32d = |t: &Tensor| t.to_dtype(DType::F32);
     let m1 = f32d(w1_a)?.matmul(&f32d(w1_b)?)?; // [out, rank]·[rank, in] → [out, in]
     let m2 = f32d(w2_a)?.matmul(&f32d(w2_b)?)?;
-    let (out_f, in_f) = base_shape;
     let delta = (m1 * m2)?.reshape((out_f, in_f))?;
     Ok((delta * scale as f64)?)
 }
@@ -2555,6 +2574,40 @@ mod tests {
         assert_eq!(delta.dims(), &[2, 2]);
         let got = delta.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(got, vec![7.5, 12.0, 0.0, 0.0]);
+    }
+
+    /// sc-24157: a transposed LoHa (`[in, r]`·`[r, out]` against an `[out, in]` base) has the right
+    /// element count, so a reshape alone would accept it; the orientation check refuses it. The
+    /// correctly oriented factors over the same base still reconstruct.
+    #[test]
+    fn reconstruct_loha_delta_refuses_a_transposed_module() {
+        let dev = Device::Cpu;
+        let ones = |r, c| Tensor::ones((r, c), DType::F32, &dev).unwrap();
+        // base [out=2, in=3]; factors for [3, 2].
+        let err = reconstruct_loha_delta(
+            &ones(3, 1),
+            &ones(1, 2),
+            &ones(3, 1),
+            &ones(1, 2),
+            1.0,
+            (2, 3),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("do not reconstruct the base [out=2, in=3]"),
+            "got: {err}"
+        );
+        let ok = reconstruct_loha_delta(
+            &ones(2, 1),
+            &ones(1, 3),
+            &ones(2, 1),
+            &ones(1, 3),
+            1.0,
+            (2, 3),
+        )
+        .unwrap();
+        assert_eq!(ok.dims(), &[2, 3]);
     }
 
     /// sc-5374: a diffusers / PEFT `lora_adapter_metadata` blob with `lora_alpha ≠ r` parses to the

@@ -911,6 +911,46 @@ impl AdaptLinear {
         self.out_features
     }
 
+    /// Fold an `[out, in]` delta into a **dense** base weight (`W ← W + δ`), for an adapter type that
+    /// has no deferred additive form (LyCORIS **LoHa** — a Hadamard product of two low-rank pairs).
+    ///
+    /// The sum is computed in f32 on the base weight's device and cast back to the base's storage
+    /// dtype; a fresh weight tensor replaces the old one, so a tensor shared with another holder
+    /// (an mmap'd snapshot, a cloned trunk) is never mutated in place. Attached residuals are kept.
+    ///
+    /// A **packed** (MLX q4/q8) or **NVFP4** base has no dense weight to fold into and is refused
+    /// with a typed `Unsupported` rather than silently dequantized; a delta whose shape is not the
+    /// base's `[out, in]` is refused too.
+    pub fn fold_dense_delta(&mut self, delta: &Tensor) -> Result<()> {
+        let (out_f, in_f) = self.base_shape();
+        if delta.dims() != [out_f, in_f] {
+            return Err(CandleError::Msg(format!(
+                "dense fold: delta {:?} does not match the base [out={out_f}, in={in_f}]",
+                delta.dims()
+            )));
+        }
+        match &mut self.base {
+            Base::Dense(l) => {
+                let w = l.weight();
+                let merged = (w.to_dtype(DType::F32)?
+                    + delta.to_device(w.device())?.to_dtype(DType::F32)?)?
+                .to_dtype(w.dtype())?;
+                let bias = l.bias().cloned();
+                *l = Linear::new(merged, bias);
+                Ok(())
+            }
+            Base::Packed(_) => Err(CandleError::Unsupported(
+                "dense fold: the base is MLX-packed (q4/q8); a delta cannot be folded into \
+                 quantized codes"
+                    .into(),
+            )),
+            Base::Nvfp4(_) => Err(CandleError::Unsupported(
+                "dense fold: the base is NVFP4; a delta cannot be folded into packed E2M1 codes"
+                    .into(),
+            )),
+        }
+    }
+
     /// Whether any additive residual is attached.
     pub fn is_adapted(&self) -> bool {
         !self.adapters.is_empty()
@@ -2684,5 +2724,41 @@ mod tests {
         let (a, b) = lora_pair(in_dim + 1, rank, out_dim);
         let error = host.push_lora_checked(a, b, 1.0).unwrap_err().to_string();
         assert!(error.contains("dense base"), "{error}");
+    }
+
+    /// `fold_dense_delta` adds the delta to a dense base (output moves by exactly `x·δᵀ`, kept at
+    /// the base dtype) and refuses a packed base and a mis-shaped delta with an error, never a
+    /// silent dequantize or skip.
+    #[test]
+    fn fold_dense_delta_adds_on_dense_and_refuses_packed() {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (2usize, 64usize);
+        let w = deterministic_weight(out_dim, in_dim, DType::F32);
+        let mut dense = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
+        let x = Tensor::ones((1, in_dim), DType::F32, &dev).unwrap();
+        let before = dense.forward(&x).unwrap();
+        let delta = Tensor::full(0.5f32, (out_dim, in_dim), &dev).unwrap();
+        dense.fold_dense_delta(&delta).unwrap();
+        let after = dense.forward(&x).unwrap();
+        let moved: Vec<f32> = (after - before)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for value in moved {
+            assert!((value - 32.0).abs() < 1e-4, "x·δᵀ = 64·0.5, got {value}");
+        }
+        assert!(!dense.is_adapted(), "a fold attaches no residual");
+        let wrong = Tensor::zeros((out_dim, in_dim + 1), DType::F32, &dev).unwrap();
+        assert!(dense.fold_dense_delta(&wrong).is_err());
+
+        let (wq, s, b, _grid) = q4_packed(out_dim, in_dim);
+        let packed = QLinear::from_packed(&wq, &s, &b, None, &dev).unwrap();
+        let mut packed = AdaptLinear::from_packed(packed, in_dim, out_dim);
+        match packed.fold_dense_delta(&delta) {
+            Err(CandleError::Unsupported(message)) => assert!(message.contains("packed")),
+            other => panic!("a packed base must refuse the fold, got {other:?}"),
+        }
     }
 }
