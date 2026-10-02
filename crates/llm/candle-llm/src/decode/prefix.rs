@@ -1339,7 +1339,8 @@ mod engine_tests {
 
     /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward,
     /// and the snapshot it stores is the one a prefill split at the boundary into two forwards
-    /// stores; a later hit restoring it decodes as a hit on the split prefill's snapshot does.
+    /// stores (to the GEMM's reduction order); a later hit restoring it decodes the same greedy
+    /// tokens as a hit on the split prefill's snapshot.
     /// A conversation shorter than one Gated DeltaNet chunk and one long enough to run chunkwise.
     #[test]
     fn a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state() {
@@ -1379,18 +1380,26 @@ mod engine_tests {
                 panic!("a hybrid entry");
             };
             assert_eq!(state.len(), conv_len);
-            let (got, want) = (state.host_tensors(), reference.host_tensors());
-            assert_eq!(got.len(), want.len());
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            // Equal up to the GEMM's row-count-dependent reduction order: one forward of `T` rows
+            // vs `b` then `T - b` (bit-identical on the Apple CPU; last-ulp on x86, the S2
+            // finding). The recurrence itself is split exactly where the two forwards split it.
+            let close = |g: &[f32], w: &[f32], what: &str| {
+                assert_eq!(g.len(), w.len(), "{conv_len}: {what}");
+                let scale = w.iter().fold(1.0f32, |m, x| m.max(x.abs()));
                 let diff = g
                     .iter()
                     .zip(w)
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
-                assert_eq!(g, w, "{conv_len}: snapshot tensor {i} differs by {diff}");
+                assert!(diff <= 1e-5 * scale, "{conv_len}: {what} differs by {diff}");
+            };
+            let (got, want) = (state.host_tensors(), reference.host_tensors());
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                close(g, w, &format!("snapshot tensor {i}"));
             }
             let host = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            assert_eq!(host(&pre.logits), host(&split_logits), "{conv_len}: logits");
+            close(&host(&pre.logits), &host(&split_logits), "logits");
 
             // A later hit on each snapshot decodes the same.
             let mut p2 = conversation.clone();

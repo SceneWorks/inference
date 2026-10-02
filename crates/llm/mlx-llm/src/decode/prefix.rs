@@ -1239,8 +1239,9 @@ mod engine_tests {
 
     /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward,
     /// and the snapshot it stores is the one a prefill split at the boundary into two forwards
-    /// stores — every DeltaNet state and the attention KV up to the boundary — and a later hit
-    /// restoring it decodes as a hit on the split prefill's snapshot does. A conversation shorter
+    /// stores — every DeltaNet state and the attention KV up to the boundary, to the GEMM's
+    /// reduction order — and a later hit restoring it decodes the same greedy tokens as a hit on
+    /// the split prefill's snapshot. A conversation shorter
     /// than one Gated DeltaNet chunk and one past it.
     #[test]
     fn a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state() {
@@ -1287,18 +1288,41 @@ mod engine_tests {
             let boundary = pre.boundary.expect("a boundary snapshot");
             assert_eq!(boundary.len(), conv_len);
             assert_eq!(boundary.cache.offset(), conv_len as i32);
-            assert_eq!(
+            // Equal up to the GEMM's row-count-dependent reduction order (one forward of `T` rows
+            // vs `b` then `T - b`; bit-identical on the Metal device this was written on).
+            let close = |g: &[f32], w: &[f32], what: &str| {
+                assert_eq!(g.len(), w.len(), "{conv_len}: {what}");
+                let scale = w.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+                let diff = g
+                    .iter()
+                    .zip(w)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(diff <= 1e-4 * scale, "{conv_len}: {what} differs by {diff}");
+            };
+            let pairs = |got: Vec<(Vec<f32>, Vec<f32>)>, want: Vec<(Vec<f32>, Vec<f32>)>, what| {
+                assert_eq!(got.len(), want.len(), "{conv_len}: {what}");
+                for (i, ((ga, gb), (wa, wb))) in got.iter().zip(&want).enumerate() {
+                    close(ga, wa, &format!("{what} {i}"));
+                    close(gb, wb, &format!("{what} {i}"));
+                }
+            };
+            pairs(
                 boundary.cache.delta_states(),
                 reference.delta_states(),
-                "{conv_len}: the DeltaNet states at the boundary"
+                "the DeltaNet states at the boundary",
             );
-            assert_eq!(
+            pairs(
                 boundary.cache.attn_states(),
                 reference.attn_states(),
-                "{conv_len}: the attention KV up to the boundary"
+                "the attention KV up to the boundary",
             );
-            assert_eq!(host(&pre.logits), host(&split_logits), "{conv_len}: logits");
-            assert_eq!(pre.cache.delta_states(), split.delta_states(), "{conv_len}");
+            close(&host(&pre.logits), &host(&split_logits), "logits");
+            pairs(
+                pre.cache.delta_states(),
+                split.delta_states(),
+                "final states",
+            );
 
             // A later hit on each snapshot decodes the same.
             let mut p2 = conversation.clone();
