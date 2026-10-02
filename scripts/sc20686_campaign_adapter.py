@@ -835,6 +835,17 @@ def admission_estimate_arguments(estimate, measured_peak_host_bytes, policy):
             "measured_peak_host_bytes": measured}
 
 
+# The adapter-owned directory a run writes its observer events and media into; the reducer binds a
+# command's event and media paths to one directory of this name.
+SEALED_RUN = "sealed-run"
+
+
+def route_media_output_name(variant):
+    """The name a route's media output carries (the reducer binds a manifest's `output_name` to
+    its route): a FLUX.2 edit writes one image, a Wan route a directory of frames."""
+    return "media.png" if variant in FLUX_ROUTES else "media"
+
+
 def run_entrypoint(
     entrypoint, snapshot, variant, arm, inference_revision, residency_strategy,
     extra_args=(), timeout_seconds=21600, *, safety_policy, static_floor_host_bytes=None,
@@ -850,12 +861,10 @@ def run_entrypoint(
     directory = Path(tempfile.mkdtemp(prefix="sc20686-events-"))
     result = None
     try:
-        run_directory = directory / "sealed-run"
+        run_directory = directory / SEALED_RUN
         run_directory.mkdir()
         event_path = run_directory / "events.jsonl"
-        media_output = run_directory / (
-            "media.png" if variant in FLUX_ROUTES else "media"
-        )
+        media_output = run_directory / route_media_output_name(variant)
         command = [
             str(Path(entrypoint).resolve()), "--sc20686-campaign", "--sc20686-events",
             str(event_path), "--sc20686-source-ref", inference_revision,
@@ -1434,13 +1443,26 @@ def _load_unit(root, stem, identity_sha, variant, arm):
     if supervision.get("exitCode") != 0 or supervision.get("ownedProcessGroupReaped") is not True or not isinstance(supervision.get("pid"), int) or supervision["pid"] <= 0:
         raise ValueError(f"{stem} resume supervision is not a clean, reaped exit")
     supervisor.validate_admission(supervision.get("admission"), policy_sha256=_resume_policy_sha(root, identity_sha))
-    transcript = (unit / "events.jsonl").read_bytes()
+    # A unit keeps the run's own layout -- `sealed-run/events.jsonl` beside `sealed-run/<route
+    # output>` -- so a resumed arm publishes exactly what a fresh one does: the route's output name
+    # and a command whose event and media paths share the sealed run directory (D run 37041026188
+    # refused every saved unit's `media_output` and unit-root event path at publication).
+    sealed = unit / SEALED_RUN
+    transcript = (sealed / "events.jsonl").read_bytes()
     events = parse_event_transcript(transcript, variant, arm)
     events.extend(samples)
     if not samples:
         raise ValueError(f"{stem} resume process evidence is missing")
+    media_output = sealed / route_media_output_name(variant)
+    if (
+        "--out" not in command
+        or Path(command[command.index("--out") + 1]) != media_output
+        or "--sc20686-events" not in command
+        or Path(command[command.index("--sc20686-events") + 1]) != sealed / "events.jsonl"
+    ):
+        raise ValueError(f"{stem} resume command does not bind its sealed run")
     return CampaignRun(events, (unit / "stdout").read_bytes(), (unit / "stderr").read_bytes(),
-                       command, samples, transcript, unit / "media_output", None, supervision)
+                       command, samples, transcript, media_output, None, supervision)
 
 
 def _save_unit(root, stem, identity_sha, variant, arm, run):
@@ -1455,7 +1477,11 @@ def _save_unit(root, stem, identity_sha, variant, arm, run):
     partial.mkdir()
     try:
         output = Path(run.media_output)
-        saved_output = partial / "media_output"
+        output_name = route_media_output_name(variant)
+        if output.name != output_name:
+            raise ValueError(f"{stem} media output is not its route's {output_name}")
+        (partial / SEALED_RUN).mkdir()
+        saved_output = partial / SEALED_RUN / output_name
         if output.is_dir():
             shutil.copytree(output, saved_output, symlinks=False)
         elif output.is_file():
@@ -1463,12 +1489,12 @@ def _save_unit(root, stem, identity_sha, variant, arm, run):
         elif arm != "cancel":
             raise ValueError(f"{stem} generated media is missing")
         command = list(run.command)
-        command[command.index("--sc20686-events") + 1] = str(unit / "events.jsonl")
-        command[command.index("--out") + 1] = str(unit / "media_output")
+        command[command.index("--sc20686-events") + 1] = str(unit / SEALED_RUN / "events.jsonl")
+        command[command.index("--out") + 1] = str(unit / SEALED_RUN / output_name)
         (partial / "command.json").write_bytes(canonical({"argv": command}))
         (partial / "process.json").write_bytes(canonical({"samples": list(run.process_samples)}))
         (partial / "supervision.json").write_bytes(canonical(run.supervision))
-        (partial / "events.jsonl").write_bytes(run.event_transcript)
+        (partial / SEALED_RUN / "events.jsonl").write_bytes(run.event_transcript)
         (partial / "stdout").write_bytes(run.stdout)
         (partial / "stderr").write_bytes(run.stderr)
         record = {"schema": "sc-20686-resume-unit-v1", "identitySha256": identity_sha,

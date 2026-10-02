@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 import importlib.util
 import json
 import os
@@ -1017,7 +1018,7 @@ class CampaignAdapterTests(unittest.TestCase):
                 calls.append(arm)
                 if arm in touch_during:
                     stop.write_bytes(b"")  # the operator asks while this arm is running
-                output = media if arm == "normal" else root / f"absent-{arm}"
+                output = media if arm == "normal" else root / f"absent-{arm}" / "media"
                 return self.adapter.CampaignRun(
                     [{"phase": "metadata"}, sample], b"stdout", b"",
                     ("producer", "--sc20686-events", str(root / "events"), "--out", str(output)),
@@ -1068,6 +1069,58 @@ class CampaignAdapterTests(unittest.TestCase):
             # Every completed arm, fresh or resumed, reaches the next arm's admission estimate.
             self.assertEqual(seen, [("wan_vace", "normal", 101), ("wan_vace", "normal", 101),
                                     ("wan_vace", "cancel", 102)])
+
+    def test_a_resumed_arm_publishes_its_routes_media_output_name(self):
+        # D run 37041026188: every saved unit stored its media as `media_output`, so publication
+        # sealed that as the manifest's output_name and the reducer refused it (it binds
+        # `media.png` to the FLUX edit routes and `media` to every Wan route).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            resume = root / "resume"
+            policy = self.runner_safety()["safety_policy"]
+            identity_raw = self.adapter.canonical({"safetyPolicySha256": policy.sha256})
+            identity_sha = self.adapter.digest(identity_raw)
+            resume.mkdir()
+            (resume / "units").mkdir()
+            (resume / "identity.json").write_bytes(identity_raw)
+            sample = {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 1}
+            for index, (variant, name) in enumerate(
+                (("wan2_2_t2v_14b", "media"), ("flux2_klein_9b_edit", "media.png"))
+            ):
+                self.assertEqual(self.adapter.route_media_output_name(variant), name)
+                sealed = root / f"run-{index}" / "sealed-run"
+                sealed.mkdir(parents=True)
+                media = sealed / name
+                if name == "media":
+                    media.mkdir()
+                    (media / "frame-0000.png").write_bytes(b"frame")
+                else:
+                    media.write_bytes(b"png")
+                run = self.adapter.CampaignRun(
+                    [{"phase": "metadata"}, sample], b"stdout", b"",
+                    ("producer", "--sc20686-events", str(sealed / "events.jsonl"), "--out", str(media)),
+                    (sample,), self.adapter.canonical({"phase": "metadata"}), media, None,
+                    {"pid": 200 + index, "exitCode": 0, "ownedProcessGroupReaped": True,
+                     "admission": self.measured_admission(policy)},
+                )
+                stem = f"run-{index:02d}-normal"
+                saved = self.adapter._save_unit(resume, stem, identity_sha, variant, "normal", run)
+                self.assertEqual(saved.media_output, resume / "units" / stem / "sealed-run" / name)
+                manifest, _sources = self.adapter.media_artifacts(saved, stem, "normal")
+                self.assertEqual(json.loads(manifest)["output_name"], name)
+                expected = "media.png" if variant in self.reducer.FLUX_IMAGE_ROUTES else "media"
+                self.assertEqual(json.loads(manifest)["output_name"], expected)
+                # A unit whose sealed command binds another output name is refused on resume.
+                with self.assertRaisesRegex(ValueError, "media output is not its route's"):
+                    self.adapter._save_unit(
+                        resume, f"run-{index:02d}-cancel", identity_sha, variant, "cancel",
+                        self.adapter.CampaignRun(
+                            run.events, run.stdout, run.stderr,
+                            ("producer", "--sc20686-events", "e", "--out", str(sealed / "media_output")),
+                            run.process_samples, run.event_transcript, sealed / "media_output",
+                            None, run.supervision,
+                        ),
+                    )
 
     def test_resume_directory_tolerates_the_operator_stop_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1363,6 +1416,43 @@ class CampaignAdapterTests(unittest.TestCase):
             transcript.write_bytes(transcript.read_bytes() + b"tamper")
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 self.reducer.verify_campaign_bundle(destination)
+
+            # The production path: every arm is sealed into the resume directory and published
+            # from its resumed unit, with the supervisor record beside its transcript. D run
+            # 37041026188 ran all 36 arms, then refused publication three ways (the unit's media
+            # name, its supervisor record counted as media, its command bound outside `sealed-run`).
+            policy = self.runner_safety()["safety_policy"]
+            identity_raw = self.adapter.canonical({"safetyPolicySha256": policy.sha256})
+            identity_sha = self.adapter.digest(identity_raw)
+            resume = Path(directory) / "resume"
+            (resume / "units").mkdir(parents=True)
+            (resume / "identity.json").write_bytes(identity_raw)
+            media_root = Path(directory) / "run-media-resumed"
+            pids = iter(range(1000, 2000))
+
+            def supervised_runner(coordinate, arm):
+                return dataclasses.replace(runner(coordinate, arm), supervision={
+                    "pid": next(pids), "exitCode": 0, "ownedProcessGroupReaped": True,
+                    "admission": self.measured_admission(policy),
+                })
+
+            resumed_destination = Path(directory) / "campaign-resumed"
+            self.adapter.publish_campaign(
+                coordinates, supervised_runner, row_builder, resumed_destination, {
+                    "campaign-inputs.resolved.json": (
+                        json.dumps(resolved, indent=2, sort_keys=True) + "\n"
+                    ).encode("utf-8"),
+                    "resume-identity.json": identity_raw,
+                }, resume_root=resume, resume_identity_sha=identity_sha,
+            )
+            self.reducer.verify_campaign_bundle(resumed_destination)
+            for index, coordinate in enumerate(coordinates):
+                name = "media.png" if coordinate.family == "flux2-klein" else "media"
+                for arm in ("normal", "cancel"):
+                    manifest = json.loads((resumed_destination / f"run-{index:02d}-{arm}.media.json")
+                                          .read_text(encoding="utf-8"))
+                    self.assertEqual(manifest["output_name"], name, (coordinate, arm))
+            self.assertTrue((resumed_destination / "run-00-normal.supervision.json").is_file())
 
 
 if __name__ == "__main__":

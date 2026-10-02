@@ -1025,7 +1025,15 @@ def verify_campaign_bundle(bundle):
             or manifest_names != [f"{expected_stem}.media.json"]
         ):
             fail("row evidence artifact inventory lacks an exact transcript or media manifest")
-        fixed_names = {names[0] for names in by_suffix.values()} | {manifest_names[0]}
+        # The adapter also seals each arm's supervisor record (admission, peaks, PID) beside its
+        # transcript: at most the arm's own, and never mistaken for generated media (D run
+        # 37041026188's publication refused every row for counting it as a media file).
+        supervision_names = [item for item in evidence_names if item.endswith(".supervision.json")]
+        if supervision_names not in ([], [f"{expected_stem}.supervision.json"]):
+            fail("row evidence artifact inventory has a foreign supervisor record")
+        fixed_names = (
+            {names[0] for names in by_suffix.values()} | {manifest_names[0]} | set(supervision_names)
+        )
         media_evidence_names = evidence_names - fixed_names
         manifest_name = manifest_names[0]
         if row.get("media_manifest_sha256") != artifacts.get(manifest_name):

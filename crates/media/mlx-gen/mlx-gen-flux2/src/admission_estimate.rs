@@ -13,7 +13,8 @@
 //! * KV edit route: the cached reference K/V of every transformer block at bf16.
 //!
 //! The staged `Sequential` product residency releases the text encoder before the DiT loads, so the
-//! estimate is the MAX of the conditioning and denoise phase totals.
+//! estimate is the MAX of the conditioning and denoise phase totals -- but the measured process
+//! footprint keeps the encoder's bytes through the denoise, so the denoise phase carries them.
 
 use std::path::Path;
 
@@ -38,13 +39,20 @@ pub struct Flux2AdmissionEstimate {
 }
 
 impl Flux2AdmissionEstimate {
-    /// `(phase, bytes)` for the two staged phases.
+    /// `(phase, bytes)` for the two staged phases. The denoise phase also carries the text
+    /// encoder's bytes: on the SC-20686 Metal lane (D run 37041026188) the process footprint stayed
+    /// ~12-14 GiB above MLX's active memory for the rest of every Klein render after the staged
+    /// encoder was dropped and its cache drained -- 21.3 / 32.3 / 32.3 / 58.1 GiB measured where an
+    /// estimate without that carry priced 19.1 / 40.7 / 19.6 / 42.2 GiB. The admission prices the
+    /// footprint the watchdog sees, so the carry is priced until the encoder's footprint is shown
+    /// to leave the process.
     pub fn phases(&self) -> [(&'static str, u64); 2] {
         [
             ("conditioning", self.text_encoder_bytes),
             (
                 "denoise",
-                self.transformer_bytes
+                self.text_encoder_bytes
+                    .saturating_add(self.transformer_bytes)
                     .saturating_add(self.vae_bytes)
                     .saturating_add(self.activation_bytes)
                     .saturating_add(self.reference_kv_bytes),
@@ -256,7 +264,10 @@ mod tests {
         );
         assert_eq!(
             large.peak_bytes(),
-            large.transformer_bytes + large.vae_bytes + large.activation_bytes
+            large.text_encoder_bytes
+                + large.transformer_bytes
+                + large.vae_bytes
+                + large.activation_bytes
         );
         // The KV route also holds K/V of every block for every reference token, at bf16.
         let kv = product_admission_estimate(
@@ -267,8 +278,9 @@ mod tests {
         .unwrap();
         assert_eq!(kv.reference_kv_bytes, 2 * 32 * 32 * 128 * 3072 * 2);
         assert_eq!(kv.peak_bytes(), large.peak_bytes() + kv.reference_kv_bytes);
-        // Text encoding is its own (released) phase: a max, not a sum.
-        assert!(small.peak_bytes() < small.phases().iter().map(|(_, bytes)| bytes).sum::<u64>());
+        // The encoder's footprint carries into the denoise (measured), so the denoise phase binds.
+        assert_eq!(small.peak_bytes(), small.phases()[1].1);
+        assert!(small.phases()[1].1 >= small.text_encoder_bytes + small.activation_bytes);
         assert!(product_admission_estimate(
             "flux2_klein_9b",
             &spec(FLUX2_KLEIN_9B_EDIT_ID),
