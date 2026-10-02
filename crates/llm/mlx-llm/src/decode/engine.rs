@@ -57,8 +57,8 @@ use mlx_rs::Array;
 
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{
-    AcceptanceMonitor, CudaGraphsReport, DecodeReport, HostSampleReason, PathReport, ProposerKind,
-    SamplerPath,
+    AcceptanceMonitor, CudaGraphsReport, DecodeReport, HostSampleReason, PathReport, PlainDecode,
+    ProposerKind, SamplerPath, Speculative,
 };
 
 use crate::decode::cancel::CancelFlag;
@@ -821,11 +821,12 @@ pub struct EngineOptions<'a, 'c> {
     pub sampler: Option<&'a mut (dyn TokenSampler + 'c)>,
     /// Whether the token-at-a-time loop may pipeline (see [`generate_speculative`]).
     pub pipelining: Pipelining,
-    /// `auto`'s acceptance monitor ([`AcceptanceMonitor::for_request`], sc-24446): `Some` demotes
-    /// a speculative run whose proposer is not paying for itself to token-at-a-time decoding (see
-    /// [`generate_speculative`]); `None` — an explicit proposer request, or no proposer — runs the
-    /// proposer to the end.
-    pub acceptance: Option<AcceptanceMonitor>,
+    /// The request's speculative option (sc-24446). [`Speculative::Auto`] runs under `auto`'s
+    /// acceptance monitor ([`AcceptanceMonitor::for_request`], against the plain loop this run
+    /// would fall back to — pipelined or not), which demotes a proposer that is not paying for
+    /// itself to token-at-a-time decoding (see [`generate_speculative`]); any other option — an
+    /// explicit proposer, `off`, the default — runs the proposer to the end.
+    pub speculative_mode: Speculative,
 }
 
 /// Whether [`generate_speculative`] pipelines its token-at-a-time loop (story sc-24439).
@@ -897,7 +898,7 @@ impl SpeculativeRun {
 /// unread token would advance.
 ///
 /// ## Demotion (sc-24446)
-/// With an [`EngineOptions::acceptance`] monitor (`auto`), the run's first
+/// Under `auto` ([`EngineOptions::speculative_mode`]), the run's first
 /// [`ACCEPTANCE_PROBE_VERIFIES`](core_llm::ACCEPTANCE_PROBE_VERIFIES) verify steps decide whether
 /// the proposer pays for itself; below its break-even the run is **demoted**: no further step
 /// proposes, asks for hidden rows or commits to the proposer, and — where the draws allow
@@ -928,7 +929,7 @@ where
         prefill_clock,
         sampler,
         pipelining,
-        acceptance,
+        speculative_mode,
     } = options;
     let mut owned_sampler;
     let sampler: &mut dyn TokenSampler = match sampler {
@@ -1127,7 +1128,16 @@ where
     // `auto`'s acceptance monitor (sc-24446): once demoted, no step proposes, asks for hidden
     // rows or commits to the proposer — the rest of the run is token-at-a-time, handed to the
     // pipelined loop when the draws allow it.
-    let mut monitor = acceptance.filter(|_| width > 0);
+    let mut monitor = AcceptanceMonitor::for_request(
+        speculative_mode,
+        kind,
+        u32::try_from(width).unwrap_or(u32::MAX),
+        if can_pipeline {
+            PlainDecode::MlxPipelined
+        } else {
+            PlainDecode::MlxUnpipelined
+        },
+    );
     let mut demoted = false;
     'outer: while generated.len() < config.max_new_tokens && finish != FinishReason::Stopped {
         if cancel.is_cancelled() {
@@ -4162,13 +4172,25 @@ pub(crate) mod tests {
         }
     }
 
-    /// A test proposer of fixed kind drafting `width` tokens every step: the plain loop's own
-    /// continuation (always accepted) when `right`, else a token the greedy target never picks
-    /// (always rejected). Counts its proposals and commits.
+    /// What a [`Scripted`] proposer drafts every step.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Script {
+        /// The plain loop's own continuation: always accepted.
+        Right,
+        /// A token the greedy target never picks: always rejected.
+        Wrong,
+        /// Nothing: every step is an ordinary single-token draw.
+        Empty,
+    }
+
+    /// A test proposer of a chosen kind drafting up to `max_drafts` tokens every step by its
+    /// [`Script`] against `expected` (the plain loop's tokens after `prompt_len` prompt ids).
+    /// Counts its proposals and commits.
     struct Scripted {
         expected: Vec<i32>,
         prompt_len: usize,
-        right: bool,
+        script: Script,
+        kind: ProposerKind,
         vocab: i32,
         wants_hidden: bool,
         proposals: usize,
@@ -4176,11 +4198,12 @@ pub(crate) mod tests {
     }
 
     impl Scripted {
-        fn new(expected: &[i32], right: bool, vocab: i32) -> Self {
+        fn new(expected: &[i32], script: Script, kind: ProposerKind, vocab: i32) -> Self {
             Self {
                 expected: expected.to_vec(),
                 prompt_len: PROMPT.len(),
-                right,
+                script,
+                kind,
                 vocab,
                 wants_hidden: false,
                 proposals: 0,
@@ -4191,7 +4214,7 @@ pub(crate) mod tests {
 
     impl<T: SpeculativeTarget + ?Sized> Proposer<T> for Scripted {
         fn kind(&self) -> ProposerKind {
-            ProposerKind::PromptLookup
+            self.kind
         }
         fn wants_hidden(&self) -> bool {
             self.wants_hidden
@@ -4207,11 +4230,17 @@ pub(crate) mod tests {
         ) -> Result<Proposal> {
             self.proposals += 1;
             let at = ctx.history.len() - self.prompt_len;
-            let drafts = self.expected[at..]
-                .iter()
-                .take(ctx.max_drafts)
-                .map(|&t| if self.right { t } else { (t + 1) % self.vocab })
-                .collect();
+            let drafts = match self.script {
+                Script::Empty => Vec::new(),
+                script => self.expected[at.min(self.expected.len())..]
+                    .iter()
+                    .take(ctx.max_drafts)
+                    .map(|&t| match script {
+                        Script::Right => t,
+                        _ => (t + 1) % self.vocab,
+                    })
+                    .collect(),
+            };
             Ok(Proposal {
                 drafts,
                 dists: Vec::new(),
@@ -4223,13 +4252,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// One engine run from [`PROMPT`] with `acceptance` and `pipelining`.
-    fn monitored<T, P>(
+    /// One engine run from `prompt` requesting `mode`, with `pipelining`.
+    fn monitored_from<T, P>(
         target: &T,
         proposer: &mut P,
+        prompt: &[i32],
         config: &GenerationConfig,
         drafts: usize,
-        acceptance: Option<AcceptanceMonitor>,
+        mode: core_llm::Speculative,
         pipelining: Pipelining,
     ) -> SpeculativeRun
     where
@@ -4240,7 +4270,7 @@ pub(crate) mod tests {
         let run = generate_speculative(
             target,
             proposer,
-            SpeculativePrompt::Tokens(&PROMPT),
+            SpeculativePrompt::Tokens(prompt),
             config,
             drafts,
             &CancelFlag::new(),
@@ -4250,7 +4280,7 @@ pub(crate) mod tests {
                 }
             },
             EngineOptions {
-                acceptance,
+                speculative_mode: mode,
                 pipelining,
                 ..EngineOptions::default()
             },
@@ -4260,19 +4290,34 @@ pub(crate) mod tests {
         run
     }
 
-    fn auto_lookup() -> Option<AcceptanceMonitor> {
-        AcceptanceMonitor::for_request(core_llm::Speculative::Auto, ProposerKind::PromptLookup, 4)
+    /// [`monitored_from`] from [`PROMPT`].
+    fn monitored<T, P>(
+        target: &T,
+        proposer: &mut P,
+        config: &GenerationConfig,
+        drafts: usize,
+        mode: core_llm::Speculative,
+        pipelining: Pipelining,
+    ) -> SpeculativeRun
+    where
+        T: SpeculativeTarget,
+        P: Proposer<T> + ?Sized,
+    {
+        monitored_from(target, proposer, &PROMPT, config, drafts, mode, pipelining)
     }
+
+    const AUTO: core_llm::Speculative = core_llm::Speculative::Auto;
+    const WINDOW: usize = core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
 
     /// The token count at which a never-accepting proposer is demoted: the first token plus one
     /// committed token per probe-window verify step.
-    const DEMOTED_AT: u64 = 1 + core_llm::ACCEPTANCE_PROBE_VERIFIES as u64;
+    const DEMOTED_AT: u64 = 1 + WINDOW as u64;
 
-    /// sc-24446: under `auto`, a proposer below its break-even is demoted after the probe window
-    /// — never proposed to or committed to again — and the rest of the run is the pipelined plain
-    /// loop (one handoff step, then every remaining token pipelined); the output is the plain
-    /// greedy loop's, the report records the demotion, and the forward accounting holds — on the
-    /// causal and the hybrid (checkpoint-ring) targets.
+    /// sc-24446: under `auto`, prompt lookup below its break-even on the pipelinable MLX path is
+    /// demoted after the probe window — never proposed to or committed to again — and the rest of
+    /// the run is the pipelined plain loop (one handoff step, then every remaining token
+    /// pipelined); the output is the plain greedy loop's, the report records the demotion, and
+    /// the forward accounting holds — on the causal and the hybrid (checkpoint-ring) targets.
     #[test]
     fn auto_demotes_a_losing_proposer_to_the_pipelined_plain_loop() {
         fn check<T: SpeculativeTarget + crate::decode::Decode>(
@@ -4282,15 +4327,9 @@ pub(crate) mod tests {
         ) {
             let config = greedy(40);
             let expected = plain(target, &PROMPT, &config, None).tokens;
-            let mut wrong = Scripted::new(&expected, false, vocab);
-            let run = monitored(
-                target,
-                &mut wrong,
-                &config,
-                4,
-                auto_lookup(),
-                Pipelining::Auto,
-            );
+            let mut wrong =
+                Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, vocab);
+            let run = monitored(target, &mut wrong, &config, 4, AUTO, Pipelining::Auto);
             assert_eq!(
                 run.output.tokens, expected,
                 "{label}: demotion changed the output"
@@ -4300,10 +4339,9 @@ pub(crate) mod tests {
                 Some(DEMOTED_AT),
                 "{label}"
             );
-            let window = core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
             assert_eq!(
                 (wrong.proposals, wrong.commits),
-                (window, window),
+                (WINDOW, WINDOW),
                 "{label}: the proposer is not driven after the demotion"
             );
             // After the handoff step, every remaining token but the last is a pipelined
@@ -4315,35 +4353,76 @@ pub(crate) mod tests {
             );
             assert_eq!(run.report.proposer, ProposerKind::PromptLookup, "{label}");
             assert_eq!(run.report.accepted_tokens, 0, "{label}");
-            assert_eq!(run.report.proposed_tokens, 4 * window as u64, "{label}");
+            assert_eq!(run.report.proposed_tokens, 4 * WINDOW as u64, "{label}");
             assert_accounting(label, &run, &config);
         }
         check("causal", &causal(), 24);
         check("qwen35", &qwen35(false), 50);
     }
 
-    /// With pipelining off (the parity reference) a demoted run continues as unpipelined
-    /// single-token verify steps — same output, same demotion point, the proposer idle.
+    /// E5 (sc-24446 review): prompt lookup is demoted only where the demoted request would run
+    /// MLX's pipelined loop — the regime its break-even was measured in. Where the plain loop is
+    /// unpipelined anyway (`Pipelining::Off`, the pipelining switch off, a history-reading
+    /// sampler) the same losing lookup runs to the end; an MTP-kind proposer is demoted there
+    /// all the same (its cost is its own forwards) and the rest is single-token verify steps.
     #[test]
-    fn a_demoted_run_without_pipelining_continues_token_at_a_time() {
+    fn lookup_is_demoted_only_where_the_plain_loop_is_pipelined() {
         let model = causal();
         let config = greedy(40);
-        let expected = plain(&model, &PROMPT, &config, None).tokens;
-        let mut wrong = Scripted::new(&expected, false, 24);
-        let run = monitored(
-            &model,
-            &mut wrong,
-            &config,
-            4,
-            auto_lookup(),
-            Pipelining::Off,
-        );
-        assert_eq!(run.output.tokens, expected);
-        assert_eq!(run.report.speculative_demoted_at, Some(DEMOTED_AT));
-        assert_eq!(run.stats.pipelined, 0);
-        let window = core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
-        assert_eq!((wrong.proposals, wrong.commits), (window, window));
-        assert_accounting("off", &run, &config);
+        let mut penalized = penalized(40);
+        penalized.sampling.temperature = 0.0;
+        type Run<'a> = Box<dyn Fn(&mut Scripted) -> SpeculativeRun + 'a>;
+        let unpipelined: [(&str, &GenerationConfig, Run<'_>); 3] = [
+            (
+                "pipelining off",
+                &config,
+                Box::new(|p| monitored(&model, p, &config, 4, AUTO, Pipelining::Off)),
+            ),
+            (
+                "switch off",
+                &config,
+                Box::new(|p| {
+                    crate::switches::PIPELINING.scoped(false, || {
+                        monitored(&model, p, &config, 4, AUTO, Pipelining::Auto)
+                    })
+                }),
+            ),
+            (
+                "penalized",
+                &penalized,
+                Box::new(|p| monitored(&model, p, &penalized, 4, AUTO, Pipelining::Auto)),
+            ),
+        ];
+        for (label, config, run) in unpipelined {
+            let expected = plain(&model, &PROMPT, config, None).tokens;
+            let mut lookup =
+                Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, 24);
+            let kept = run(&mut lookup);
+            assert_eq!(kept.output.tokens, expected, "{label}");
+            assert_eq!(
+                kept.report.speculative_demoted_at, None,
+                "{label}: lookup kept"
+            );
+            assert_eq!(
+                lookup.proposals as u64,
+                kept.report.verify_steps - 1,
+                "{label}"
+            );
+            let mut head = Scripted::new(&expected, Script::Wrong, ProposerKind::Mtp, 24);
+            let demoted = run(&mut head);
+            assert_eq!(demoted.output.tokens, expected, "{label}");
+            assert_eq!(
+                demoted.report.speculative_demoted_at,
+                Some(DEMOTED_AT),
+                "{label}"
+            );
+            assert_eq!(
+                demoted.stats.pipelined, 0,
+                "{label}: nothing to pipeline into"
+            );
+            assert_eq!((head.proposals, head.commits), (WINDOW, WINDOW), "{label}");
+            assert_accounting(label, &demoted, config);
+        }
     }
 
     /// A demoted run stops asking the target for hidden rows: the prefill and the probe window's
@@ -4356,13 +4435,13 @@ pub(crate) mod tests {
         let expected = plain(&model, &PROMPT, &config, None).tokens;
         for pipelining in [Pipelining::Auto, Pipelining::Off] {
             let target = DispatchesAtForward::new(&model);
-            let mut wrong = Scripted::new(&expected, false, 50);
+            let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::Mtp, 50);
             wrong.wants_hidden = true;
-            let run = monitored(&target, &mut wrong, &config, 4, auto_lookup(), pipelining);
+            let run = monitored(&target, &mut wrong, &config, 2, AUTO, pipelining);
             assert_eq!(run.output.tokens, expected, "{pipelining:?}");
             assert_eq!(run.report.speculative_demoted_at, Some(DEMOTED_AT));
             let hidden = target.hidden.into_inner();
-            let window = 1 + core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
+            let window = 1 + WINDOW;
             assert!(
                 hidden[..window].iter().all(|&h| h),
                 "{pipelining:?}: {hidden:?}"
@@ -4375,6 +4454,104 @@ pub(crate) mod tests {
         }
     }
 
+    /// The edges of the handoff: a budget one token past the demotion point (the handoff step
+    /// draws the last token, nothing is enqueued after it), and a stop token drawn by the handoff
+    /// step itself (the run ends there; on the pipelined path the look-ahead enqueued behind it
+    /// is discarded unread) — pipelined (lookup) and unpipelined (MTP kind), each the plain
+    /// loop's output.
+    #[test]
+    fn the_handoff_honours_the_budget_and_a_stop_token_it_draws() {
+        let model = causal();
+        for (pipelining, kind) in [
+            (Pipelining::Auto, ProposerKind::PromptLookup),
+            (Pipelining::Off, ProposerKind::Mtp),
+        ] {
+            let label = format!("{pipelining:?} {kind:?}");
+            // Budget = demotion point + 1.
+            let config = greedy(DEMOTED_AT as usize + 1);
+            let expected = plain(&model, &PROMPT, &config, None).tokens;
+            let mut wrong = Scripted::new(&expected, Script::Wrong, kind, 24);
+            let run = monitored(&model, &mut wrong, &config, 4, AUTO, pipelining);
+            assert_eq!(run.output.tokens, expected, "{label}");
+            assert_eq!(run.output.finish_reason, FinishReason::MaxTokens, "{label}");
+            assert_eq!(
+                run.report.speculative_demoted_at,
+                Some(DEMOTED_AT),
+                "{label}"
+            );
+            assert_eq!(run.stats.pipelined, 0, "{label}: nothing past the budget");
+            assert_eq!(run.stats.discarded, 0, "{label}");
+            assert_accounting(&label, &run, &config);
+
+            // A stop token first drawn by the handoff step (token index `DEMOTED_AT`): a prompt
+            // whose plain continuation draws a fresh token there.
+            let (prompt, stop) = handoff_stop_prompt(&model);
+            let mut stopping = greedy(40);
+            stopping.stop_tokens = vec![stop];
+            let expected = plain(&model, &prompt, &stopping, None);
+            assert_eq!(
+                expected.tokens.len(),
+                DEMOTED_AT as usize,
+                "{label}: fixture premise"
+            );
+            let mut wrong = Scripted::new(&expected.tokens, Script::Wrong, kind, 24);
+            wrong.prompt_len = prompt.len();
+            let run = monitored_from(&model, &mut wrong, &prompt, &stopping, 4, AUTO, pipelining);
+            assert_eq!(run.output.tokens, expected.tokens, "{label}");
+            assert_eq!(run.output.finish_reason, FinishReason::StopToken, "{label}");
+            assert_eq!(
+                run.report.speculative_demoted_at,
+                Some(DEMOTED_AT),
+                "{label}"
+            );
+            let discarded = usize::from(pipelining == Pipelining::Auto);
+            assert_eq!(run.stats.discarded, discarded, "{label}: the look-ahead");
+            let r = &run.report;
+            assert_eq!(
+                r.target_forwards,
+                r.prefill_forwards + r.verify_steps + r.replay_forwards + r.discarded_forwards,
+                "{label}: {r:?}"
+            );
+        }
+    }
+
+    /// A prompt (and the token) whose plain greedy continuation on `model` first draws that token
+    /// at index [`DEMOTED_AT`] — the handoff step's draw.
+    fn handoff_stop_prompt(model: &CausalLm) -> (Vec<i32>, i32) {
+        let config = greedy(DEMOTED_AT as usize + 1);
+        for seed in 0..64i32 {
+            let prompt: Vec<i32> = (0..12)
+                .map(|i| (i * 7 + seed * 5 + i * i * seed) % 24)
+                .collect();
+            let tokens = plain(model, &prompt, &config, None).tokens;
+            let at = DEMOTED_AT as usize;
+            if !tokens[..at].contains(&tokens[at]) {
+                return (prompt, tokens[at]);
+            }
+        }
+        panic!("no fixture prompt draws a fresh token at the handoff step");
+    }
+
+    /// A seeded stochastic run across a demotion draws exactly the plain seeded run's tokens: a
+    /// proposer that never drafts makes every verify step the ordinary draw, the demotion hands
+    /// the same sampler (and its stream) to the plain loop — pipelined (lookup) or not (MTP kind).
+    #[test]
+    fn a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run() {
+        let model = causal();
+        for (pipelining, kind) in [
+            (Pipelining::Auto, ProposerKind::PromptLookup),
+            (Pipelining::Off, ProposerKind::Mtp),
+        ] {
+            let config = top_p(40);
+            let reference = off_run(&model, &config, pipelining, None).output.tokens;
+            let mut empty = Scripted::new(&[], Script::Empty, kind, 24);
+            let run = monitored(&model, &mut empty, &config, 4, AUTO, pipelining);
+            assert_eq!(run.output.tokens, reference, "{pipelining:?} {kind:?}");
+            assert_eq!(run.report.speculative_demoted_at, Some(DEMOTED_AT));
+            assert_eq!(run.report.sampler, "device");
+        }
+    }
+
     /// A proposer at or above its break-even is never demoted under `auto`: it proposes to the
     /// end, nothing is pipelined, and the output is still the plain loop's.
     #[test]
@@ -4382,20 +4559,13 @@ pub(crate) mod tests {
         let model = causal();
         let config = greedy(120);
         let expected = plain(&model, &PROMPT, &config, None).tokens;
-        let mut right = Scripted::new(&expected, true, 24);
-        let run = monitored(
-            &model,
-            &mut right,
-            &config,
-            4,
-            auto_lookup(),
-            Pipelining::Auto,
-        );
+        let mut right = Scripted::new(&expected, Script::Right, ProposerKind::PromptLookup, 24);
+        let run = monitored(&model, &mut right, &config, 4, AUTO, Pipelining::Auto);
         assert_eq!(run.output.tokens, expected);
         assert_eq!(run.report.speculative_demoted_at, None);
         assert_eq!(run.stats.pipelined, 0);
         assert!(
-            run.report.verify_steps > u64::from(core_llm::ACCEPTANCE_PROBE_VERIFIES),
+            run.report.verify_steps > WINDOW as u64,
             "the run outlasts the probe window: {:?}",
             run.report
         );
@@ -4412,19 +4582,22 @@ pub(crate) mod tests {
         let model = causal();
         let config = greedy(40);
         let expected = plain(&model, &PROMPT, &config, None).tokens;
-        let explicit = AcceptanceMonitor::for_request(
-            Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
-            ProposerKind::PromptLookup,
-            4,
-        );
-        assert_eq!(explicit, None);
-        let mut wrong = Scripted::new(&expected, false, 24);
-        let run = monitored(&model, &mut wrong, &config, 4, explicit, Pipelining::Auto);
-        assert_eq!(run.output.tokens, expected);
-        assert_eq!(run.report.speculative_demoted_at, None);
-        assert_eq!(run.stats.pipelined, 0);
-        // Every step but the budget-clamped last one proposes.
-        assert_eq!(wrong.proposals as u64, run.report.verify_steps - 1);
+        for (kind, proposer) in [
+            (
+                ProposerKind::PromptLookup,
+                SpeculativeProposer::PromptLookup,
+            ),
+            (ProposerKind::Mtp, SpeculativeProposer::Mtp),
+        ] {
+            let explicit = Speculative::proposer(proposer, 4);
+            let mut wrong = Scripted::new(&expected, Script::Wrong, kind, 24);
+            let run = monitored(&model, &mut wrong, &config, 4, explicit, Pipelining::Auto);
+            assert_eq!(run.output.tokens, expected);
+            assert_eq!(run.report.speculative_demoted_at, None, "{kind:?}");
+            assert_eq!(run.stats.pipelined, 0);
+            // Every step but the budget-clamped last one proposes.
+            assert_eq!(wrong.proposals as u64, run.report.verify_steps - 1);
+        }
     }
 
     /// The MTP head (a proposer that wants the target's hidden rows) demotes the same way on the
@@ -4435,20 +4608,21 @@ pub(crate) mod tests {
         let model = qwen35(true);
         let config = greedy(40);
         let expected = plain(&model, &PROMPT, &config, None).tokens;
-        // A threshold no run reaches, so the demotion is certain whatever the random head drafts.
-        let always = AcceptanceMonitor::with_threshold(1e9);
         let run = monitored(
             &model,
             &mut MtpProposer::new(),
             &config,
             2,
-            always,
+            AUTO,
             Pipelining::Auto,
         );
         assert_eq!(run.output.tokens, expected);
-        let demoted = run.report.speculative_demoted_at.expect("demoted") as usize;
-        assert!(demoted > core_llm::ACCEPTANCE_PROBE_VERIFIES as usize);
-        assert_eq!(run.stats.pipelined, 40 - demoted - 1);
+        assert_eq!(
+            run.report.accepted_tokens, 0,
+            "fixture premise: the random head never pays"
+        );
+        assert_eq!(run.report.speculative_demoted_at, Some(DEMOTED_AT));
+        assert_eq!(run.stats.pipelined, 40 - DEMOTED_AT as usize - 1);
         assert_eq!(run.report.proposer, ProposerKind::Mtp);
         assert_accounting("mtp", &run, &config);
     }

@@ -448,11 +448,38 @@ impl GraphWorkspace {
 /// outlives every request and the model itself, so a load prices it once —
 /// [`graph_param_cache_load_bytes`].) The speculative engine can present
 /// `max_step_tokens` token counts (`1 ..= K + 1`: the verify and every replay length) in two logits
-/// scopes each, so every one is priced. `None` on overflow (the caller fails closed).
+/// scopes each, so every one is priced. A request whose steps ask for hidden rows (MTP) presents
+/// one shape outside that set once `auto` demotes it (sc-24446): the plain one-token step without
+/// hidden rows — [`graph_demoted_step_admission_bytes`], which the caller adds for such a route.
+/// `None` on overflow (the caller fails closed).
 pub fn graph_workspace_admission_bytes(
     geometry: &core_llm::LlmMemoryGeometry,
     total_positions: u64,
     max_step_tokens: u32,
+) -> Option<u64> {
+    // Σ_{M=1}^{N} M = N (N + 1) / 2 token-rows, in two scopes.
+    let n = u64::from(max_step_tokens);
+    let rows = n.checked_mul(n.checked_add(1)?)? / 2;
+    graph_token_row_bytes(geometry, total_positions)?
+        .checked_mul(rows)?
+        .checked_mul(2)
+}
+
+/// The graph a demoted MTP request may add (sc-24446): its steps ask for hidden rows, so the
+/// shape key of every step [`graph_workspace_admission_bytes`] priced carries `want_hidden`, and
+/// the plain one-token step it takes after `auto` demotes it — `(1 token, all-position logits, no
+/// hidden rows)` — is one more captured shape: one token-row. `None` on overflow.
+pub fn graph_demoted_step_admission_bytes(
+    geometry: &core_llm::LlmMemoryGeometry,
+    total_positions: u64,
+) -> Option<u64> {
+    graph_token_row_bytes(geometry, total_positions)
+}
+
+/// One captured token-row's working set (see [`graph_workspace_admission_bytes`]).
+fn graph_token_row_bytes(
+    geometry: &core_llm::LlmMemoryGeometry,
+    total_positions: u64,
 ) -> Option<u64> {
     let e = geometry.element_bytes;
     let chunk = candle_quant_kernels::DECODE_ATTN_CHUNK as u64;
@@ -483,10 +510,7 @@ pub fn graph_workspace_admission_bytes(
                 .checked_add(geometry.hidden_size)?
                 .checked_mul(e)?,
         )?;
-    // Σ_{M=1}^{N} M = N (N + 1) / 2 token-rows, in two scopes.
-    let n = u64::from(max_step_tokens);
-    let rows = n.checked_mul(n.checked_add(1)?)? / 2;
-    per_token.checked_mul(rows)?.checked_mul(2)
+    Some(per_token)
 }
 
 /// What a load charges per step shape its graph runner may capture for the vendored candle's

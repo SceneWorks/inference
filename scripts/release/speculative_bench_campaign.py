@@ -42,11 +42,14 @@ Subcommands:
 
   plan     validate the matrix in ``$DECODE_BENCH_MATRIX`` (untrusted dispatch input) and write the
            resolved plan; every field is checked before anything is built
-  run      build both checkouts (stamped), run every row of a plan, write ``summary.json``
+  run      build both checkouts (stamped), run every row of a plan, write ``summary.json`` —
+           rewritten after every process, so a campaign stopped part-way (a job timeout) keeps
+           every finished row; ``complete`` marks the summary and each row that ran to its end
   local    the whole lane on this host: create the epic and pre-epic worktrees under
            ``--work-dir``, apply the baseline driver mechanically, plan ``--matrix``, then ``run``
   compare  read campaign directories and write the E6 verdicts and the E5 defaults decisions
-           (machine JSON + markdown); refuses incomplete or mismatched evidence. A row id two
+           (machine JSON + markdown); refuses incomplete or mismatched evidence. A row the
+           campaign stopped during (``complete: false``) is set aside by name, never judged. A row id two
            campaigns of one lane measured is taken from the campaign whose epic commit descends
            from the other's (``--repo`` orders them; unordered commits are refused), the older
            one listed as superseded
@@ -718,9 +721,14 @@ def run_process(
 
 
 def write_summary(output: Path, summary: dict[str, Any]) -> None:
-    with (output / "summary.json").open("x", encoding="utf-8") as sink:
+    """Write ``summary.json`` atomically (a temporary file, then a rename): the runner rewrites
+    it after every process, so a campaign stopped part-way — a job timeout kills the runner —
+    still leaves a whole summary of every process that finished."""
+    temporary = output / "summary.json.tmp"
+    with temporary.open("w", encoding="utf-8") as sink:
         json.dump(summary, sink, indent=2)
         sink.write("\n")
+    os.replace(temporary, output / "summary.json")
 
 
 def run_plan(
@@ -739,9 +747,14 @@ def run_plan(
     if plan.get("schema") != CAMPAIGN_SCHEMA or plan.get("document_schema") != SCHEMA:
         print(f"::error::the plan is not a {CAMPAIGN_SCHEMA} plan over {SCHEMA}", file=sys.stderr)
         return 1
+    if (output / "summary.json").exists():
+        print(f"::error::{output} already holds a campaign summary", file=sys.stderr)
+        return 1
     lane = LANES[plan["lane"]]
     expected = {"epic": epic_sha, "baseline": PRE_EPIC_SHA}
     needed = [run for run in RUNS if any(run in row["runs"] for row in plan["rows"])]
+    # `complete` stays false until the last row has run: a summary a stopped campaign left
+    # behind says so, and so does the row it stopped during.
     summary: dict[str, Any] = {
         "schema": CAMPAIGN_SCHEMA,
         "document_schema": SCHEMA,
@@ -750,6 +763,7 @@ def run_plan(
         "epic_sha": epic_sha,
         "pre_epic_sha": PRE_EPIC_SHA,
         "sha_override": sha_override,
+        "complete": False,
         "builds": {},
         "rows": [],
     }
@@ -797,14 +811,18 @@ def run_plan(
             "format": row["env"]["SPECULATIVE_BENCH_FORMAT"],
             "env": row["env"],
             "snapshot": {"path": snapshot, "identity": None},
+            "complete": False,
             "processes": [],
         }
         summary["rows"].append(entry)
+        write_summary(output, summary)
         try:
             identity = snapshot_identity(snapshot)["sha256"]
         except (CampaignError, OSError) as error:
             failed.append(f"{row['id']}: {error}")
             print(f"::error::{row['id']}: {error}")
+            entry["complete"] = True
+            write_summary(output, summary)
             continue
         entry["snapshot"]["identity"] = identity
         for index in range(1, row["process_repeats"] + 1):
@@ -844,6 +862,10 @@ def run_plan(
                         "switches": row["switches"],
                     }
                 )
+                write_summary(output, summary)
+        entry["complete"] = True
+        write_summary(output, summary)
+    summary["complete"] = True
     write_summary(output, summary)
     for line in failed:
         print(line, file=sys.stderr)
@@ -1043,21 +1065,40 @@ def family_label(process: Process) -> str:
     return f"{org}/{repo}{subdir.replace(chr(92), '/')}{suffix}"
 
 
-def load_campaign(directory: Path) -> tuple[dict[str, Any], list[Process], list[str]]:
-    """A campaign directory's summary and every process document, with every refusal."""
+def load_campaign(
+    directory: Path,
+) -> tuple[dict[str, Any], list[Process], list[str], list[str]]:
+    """A campaign directory's summary and every process document, with every refusal, and the
+    rows the campaign stopped during (``complete: false`` — a job timeout): those are set aside
+    by name, never judged, so the rows that finished stay usable. A summary written before rows
+    carried ``complete`` counts every row as finished."""
     refusals: list[str] = []
+    incomplete: list[str] = []
     path = directory / "summary.json"
     if not path.is_file():
-        return {}, [], [f"{directory}: no summary.json"]
+        return {}, [], [f"{directory}: no summary.json"], []
     summary = json.loads(path.read_text(encoding="utf-8"))
     if summary.get("schema") != CAMPAIGN_SCHEMA or summary.get("document_schema") != SCHEMA:
-        return summary, [], [f"{directory}: the summary is not {CAMPAIGN_SCHEMA} over {SCHEMA}"]
+        return (
+            summary,
+            [],
+            [f"{directory}: the summary is not {CAMPAIGN_SCHEMA} over {SCHEMA}"],
+            [],
+        )
     for name, build in (summary.get("builds") or {}).items():
         if build.get("status") != "ok":
             refusals.append(f"{directory}: the {name} build failed")
     processes = []
     for row in summary.get("rows", []):
         tag = f"{directory.name}/{row['id']}"
+        if row.get("complete") is False:
+            ran = len(row.get("processes", []))
+            declared = row["process_repeats"] * len(row["runs"])
+            incomplete.append(
+                f"{tag}: the campaign stopped during this row ({ran} of {declared} processes "
+                "ran); not judged"
+            )
+            continue
         if not (row.get("snapshot") or {}).get("identity"):
             refusals.append(f"{tag}: no snapshot identity was recorded")
         counts = {run: 0 for run in row["runs"]}
@@ -1101,7 +1142,7 @@ def load_campaign(directory: Path) -> tuple[dict[str, Any], list[Process], list[
                 refusals.append(
                     f"{tag}: {count} {run} processes, the row declares {row['process_repeats']}"
                 )
-    return summary, processes, refusals
+    return summary, processes, refusals, incomplete
 
 
 def document_config(process: Process) -> dict[str, Any]:
@@ -1679,6 +1720,12 @@ def markdown_report(report: dict[str, Any]) -> str:
                 f"{j['prompt_id']} | `{j['option']}` | {j['metric']} | {j['on_n']}/{j['off_n']} | "
                 f"{_fmt(j['delta_pct'])} | {_fmt(j['margin_pct'])} | {j['verdict']} | {j['reason']} |"
             )
+    if report.get("incomplete"):
+        lines += [
+            "",
+            "## Incomplete (the campaign stopped during them; excluded from every verdict)",
+            "",
+        ] + [f"- {row}" for row in report["incomplete"]]
     if report["notes"]:
         lines += ["", "## Notes", ""] + [f"- {note}" for note in report["notes"]]
     return "\n".join(lines) + "\n"
@@ -1770,10 +1817,12 @@ def compare_campaigns(
     """The comparison report over campaign directories; raises :class:`Refused` listing every
     reason the evidence cannot be judged. ``repo`` orders the campaigns' epic commits."""
     refusals: list[str] = []
+    incomplete: list[str] = []
     campaigns, groups = [], {}
     for directory in directories:
-        summary, processes, problems = load_campaign(directory)
+        summary, processes, problems, stopped = load_campaign(directory)
         refusals += problems
+        incomplete += stopped
         campaigns.append(
             {
                 "directory": directory.name,
@@ -1782,6 +1831,7 @@ def compare_campaigns(
                 "pre_epic_sha": summary.get("pre_epic_sha") or "",
                 "rows": len(summary.get("rows", [])),
                 "sha_override": summary.get("sha_override"),
+                "complete": summary.get("complete", True),
             }
         )
         if summary and summary.get("pre_epic_sha") != PRE_EPIC_SHA:
@@ -1790,6 +1840,8 @@ def compare_campaigns(
             groups.setdefault((process.campaign, process.row), []).append(process)
     if len({c["directory"] for c in campaigns}) != len(campaigns):
         refusals.append("two campaign directories share a name")
+    if incomplete and not groups:
+        refusals.append("no row ran to its end: " + "; ".join(incomplete))
     for processes in groups.values():
         refusals += check_row_evidence(processes)
     groups, superseded, problems = supersede(groups, repo)
@@ -1840,6 +1892,7 @@ def compare_campaigns(
         "comparisons": comparisons,
         "not_comparable": not_comparable,
         "defaults": defaults,
+        "incomplete": incomplete,
         "notes": notes,
     }
 

@@ -49,7 +49,7 @@
 
 use candle_core::Tensor;
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
-use core_llm::{AcceptanceMonitor, ProposerKind, SamplerPath};
+use core_llm::{AcceptanceMonitor, PlainDecode, ProposerKind, SamplerPath, Speculative};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::record::{DecodePath, DecodeRecord, RequestSpan};
@@ -351,13 +351,14 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         constraint,
         should_stop,
         on_prefill_complete,
-        None,
+        Speculative::Off,
     )
 }
 
-/// [`generate_speculative_with`] under `auto`'s acceptance monitor
-/// ([`AcceptanceMonitor::for_request`], sc-24446; `None` — an explicit proposer request — is
-/// [`generate_speculative_with`]).
+/// [`generate_speculative_with`] for a request that asked for `speculative_mode` (sc-24446): under
+/// [`Speculative::Auto`] the run is watched by `auto`'s acceptance monitor
+/// ([`AcceptanceMonitor::for_request`] against [`PlainDecode::Candle`]); any other option — an
+/// explicit proposer, `off` — is [`generate_speculative_with`].
 ///
 /// ## Demotion (sc-24446)
 /// The run's first [`ACCEPTANCE_PROBE_VERIFIES`](core_llm::ACCEPTANCE_PROBE_VERIFIES) verify steps
@@ -380,7 +381,7 @@ pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Size
     constraint: Option<&mut dyn RewindableConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
     on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
-    acceptance: Option<AcceptanceMonitor>,
+    speculative_mode: Speculative,
 ) -> Result<SpeculativeRun> {
     run_engine(
         model,
@@ -394,7 +395,7 @@ pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Size
         should_stop,
         on_prefill_complete,
         None,
-        acceptance,
+        speculative_mode,
     )
 }
 
@@ -446,7 +447,7 @@ pub fn generate_with_sampler<M: StepModel + ?Sized>(
         should_stop,
         None,
         Some(sampler),
-        None,
+        Speculative::Off,
     )
 }
 
@@ -484,7 +485,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     should_stop: Option<&dyn Fn() -> bool>,
     mut on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
     mut sampler: Option<&mut dyn TokenSampler>,
-    acceptance: Option<AcceptanceMonitor>,
+    speculative_mode: Speculative,
 ) -> Result<SpeculativeRun> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
@@ -657,7 +658,12 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     // ---- Speculative steps. ----
     // `auto`'s acceptance monitor (sc-24446): once demoted, no step proposes, asks for hidden
     // rows or commits to the proposer — the rest of the run is the ordinary token-at-a-time step.
-    let mut monitor = acceptance.filter(|_| drafts > 0 && kind != ProposerKind::None);
+    let mut monitor = AcceptanceMonitor::for_request(
+        speculative_mode,
+        kind,
+        u32::try_from(drafts).unwrap_or(u32::MAX),
+        PlainDecode::Candle,
+    );
     let mut demoted = false;
     'outer: while generated.len() < config.max_new_tokens && finish != FinishReason::Stopped {
         if cancel.is_cancelled() {
@@ -2729,23 +2735,40 @@ mod tests {
 
     // ---- `auto`'s acceptance monitor (sc-24446) ----
 
-    /// A test proposer of fixed kind drafting every step: the plain loop's own continuation
-    /// (always accepted) when `right`, else a token the greedy target never picks (always
-    /// rejected). Counts its proposals and commits.
+    /// What a [`Scripted`] proposer drafts every step.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Script {
+        /// The plain loop's own continuation: always accepted.
+        Right,
+        /// A token the greedy target never picks: always rejected.
+        Wrong,
+        /// Nothing: every step is an ordinary single-token draw.
+        Empty,
+    }
+
+    /// A test proposer of a chosen kind drafting up to `max_drafts` tokens every step by its
+    /// [`Script`] against `expected` (the plain tokens after `prompt_len` prompt ids). Counts its
+    /// proposals and commits.
     struct Scripted {
         expected: Vec<i32>,
-        right: bool,
+        prompt_len: usize,
+        script: Script,
+        kind: ProposerKind,
         vocab: i32,
+        wants_hidden: bool,
         proposals: usize,
         commits: usize,
     }
 
     impl Scripted {
-        fn new(expected: &[i32], right: bool, vocab: usize) -> Self {
+        fn new(expected: &[i32], script: Script, kind: ProposerKind, vocab: usize) -> Self {
             Self {
                 expected: expected.to_vec(),
-                right,
+                prompt_len: PROMPT.len(),
+                script,
+                kind,
                 vocab: vocab as i32,
+                wants_hidden: false,
                 proposals: 0,
                 commits: 0,
             }
@@ -2754,7 +2777,10 @@ mod tests {
 
     impl Proposer for Scripted {
         fn kind(&self) -> ProposerKind {
-            ProposerKind::PromptLookup
+            self.kind
+        }
+        fn wants_hidden(&self) -> bool {
+            self.wants_hidden
         }
         fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
             Ok(())
@@ -2765,12 +2791,18 @@ mod tests {
             _: &mut DraftSampler<'_, '_>,
         ) -> Result<Proposal> {
             self.proposals += 1;
-            let at = ctx.history.len() - PROMPT.len();
-            let drafts = self.expected[at..]
-                .iter()
-                .take(ctx.max_drafts)
-                .map(|&t| if self.right { t } else { (t + 1) % self.vocab })
-                .collect();
+            let at = ctx.history.len() - self.prompt_len;
+            let drafts = match self.script {
+                Script::Empty => Vec::new(),
+                script => self.expected[at.min(self.expected.len())..]
+                    .iter()
+                    .take(ctx.max_drafts)
+                    .map(|&t| match script {
+                        Script::Right => t,
+                        _ => (t + 1) % self.vocab,
+                    })
+                    .collect(),
+            };
             Ok(Proposal {
                 drafts: Some(Drafts::Host(drafts)),
                 dists: Vec::new(),
@@ -2782,17 +2814,55 @@ mod tests {
         }
     }
 
-    fn monitored<M: StepModel, P: Proposer + ?Sized>(
+    /// A step model that records whether each step asked for hidden rows.
+    struct HiddenLog<'a, M> {
+        inner: &'a M,
+        hidden: std::cell::RefCell<Vec<bool>>,
+    }
+
+    impl<M: StepModel> StepModel for HiddenLog<'_, M> {
+        type Cache = M::Cache;
+        fn new_cache(&self) -> M::Cache {
+            self.inner.new_cache()
+        }
+        fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<M::Cache> {
+            self.inner.new_cache_for(capacity, overshoot)
+        }
+        fn attn_formulation(&self, cache: &M::Cache) -> crate::primitives::AttnFormulation {
+            self.inner.attn_formulation(cache)
+        }
+        fn graph_support(&self) -> std::result::Result<(), &'static str> {
+            self.inner.graph_support()
+        }
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+        fn forward_step(
+            &self,
+            cache: &mut M::Cache,
+            request: StepRequest<'_>,
+        ) -> Result<StepOutput> {
+            self.hidden.borrow_mut().push(request.want_hidden);
+            self.inner.forward_step(cache, request)
+        }
+    }
+
+    /// One engine run from `prompt` requesting `mode`.
+    fn monitored_from<M: StepModel, P: Proposer + ?Sized>(
         model: &M,
         proposer: &mut P,
+        prompt: &[i32],
         config: &GenerationConfig,
         drafts: usize,
-        acceptance: Option<AcceptanceMonitor>,
+        mode: core_llm::Speculative,
     ) -> SpeculativeRun {
         generate_speculative_monitored(
             model,
             proposer,
-            SpeculativePrompt::Tokens(&PROMPT),
+            SpeculativePrompt::Tokens(prompt),
             config,
             drafts,
             &CancelFlag::new(),
@@ -2800,30 +2870,68 @@ mod tests {
             None,
             None,
             None,
-            acceptance,
+            mode,
         )
         .unwrap()
     }
 
-    fn auto_lookup() -> Option<AcceptanceMonitor> {
-        AcceptanceMonitor::for_request(core_llm::Speculative::Auto, ProposerKind::PromptLookup, 4)
+    fn monitored<M: StepModel, P: Proposer + ?Sized>(
+        model: &M,
+        proposer: &mut P,
+        config: &GenerationConfig,
+        drafts: usize,
+        mode: core_llm::Speculative,
+    ) -> SpeculativeRun {
+        monitored_from(model, proposer, &PROMPT, config, drafts, mode)
     }
+
+    /// The parity reference: the reference `Decode` loop ([`generate_with`]) — a separate
+    /// implementation from the engine under test.
+    fn reference(
+        model: &Qwen35Model,
+        prompt: &[i32],
+        config: &GenerationConfig,
+    ) -> GenerationOutput {
+        generate_with(model, prompt, config, &CancelFlag::new(), &mut |_| {}, None).unwrap()
+    }
+
+    const AUTO: core_llm::Speculative = core_llm::Speculative::Auto;
+    const WINDOW: usize = core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
 
     /// The token count at which a never-accepting proposer is demoted: the first token plus one
     /// committed token per probe-window verify step.
-    const DEMOTED_AT: usize = 1 + core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
+    const DEMOTED_AT: usize = 1 + WINDOW;
 
-    /// sc-24446: under `auto` a proposer below its break-even is demoted after the probe window —
-    /// never proposed to or committed to again — and the rest of the run is the engine's ordinary
-    /// token-at-a-time steps: the step driver's greedy tokens, the demotion on the record and its
-    /// report, and the forward accounting intact.
+    fn assert_forward_accounting(label: &str, run: &SpeculativeRun) {
+        assert_eq!(
+            run.stats.forwards,
+            run.stats.prefill_forwards + run.stats.verify_steps + run.stats.replays,
+            "{label}: {:?}",
+            run.stats
+        );
+    }
+
+    /// sc-24446: under `auto` an MTP-kind proposer below its break-even is demoted after the
+    /// probe window — never proposed to, committed to or asked for hidden rows again — and the
+    /// rest of the run is the engine's ordinary token-at-a-time steps: the reference loop's greedy
+    /// tokens, the demotion on the record and its report, the forward accounting intact.
     #[test]
     fn auto_demotes_a_losing_proposer_to_the_plain_steps() {
         let (_cfg, model) = text_model();
         let config = greedy(40);
-        let expected = step_tokens(&model, &PROMPT, &config);
-        let mut wrong = Scripted::new(&expected, false, model.vocab_size());
-        let run = monitored(&model, &mut wrong, &config, 4, auto_lookup());
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let logged = HiddenLog {
+            inner: &model,
+            hidden: Default::default(),
+        };
+        let mut wrong = Scripted::new(
+            &expected,
+            Script::Wrong,
+            ProposerKind::Mtp,
+            model.vocab_size(),
+        );
+        wrong.wants_hidden = true;
+        let run = monitored(&logged, &mut wrong, &config, 2, AUTO);
         assert_eq!(run.output.tokens, expected, "demotion changed the output");
         assert_eq!(run.stats.demoted_at, Some(DEMOTED_AT));
         assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
@@ -2831,20 +2939,110 @@ mod tests {
             run.record.report(false).speculative_demoted_at,
             Some(DEMOTED_AT as u64)
         );
-        let window = core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
         assert_eq!(
             (wrong.proposals, wrong.commits),
-            (window, window),
+            (WINDOW, WINDOW),
             "the proposer is not driven after the demotion"
         );
-        assert_eq!(run.stats.proposed, 4 * window);
+        assert_eq!(run.stats.proposed, 2 * WINDOW);
         assert_eq!(run.stats.accepted, 0);
         // Every token after the first is one verify step; every forward is the prefill or one.
         assert_eq!(run.stats.verify_steps, 39);
-        assert_eq!(
-            run.stats.forwards,
-            run.stats.prefill_forwards + run.stats.verify_steps + run.stats.replays
+        assert_forward_accounting("mtp kind", &run);
+        // The prefill and the probe window ask for hidden rows; no step after the demotion does.
+        let hidden = logged.hidden.into_inner();
+        assert_eq!(hidden.len(), run.stats.forwards);
+        assert!(hidden[..1 + WINDOW].iter().all(|&h| h), "{hidden:?}");
+        assert!(hidden[1 + WINDOW..].iter().all(|&h| !h), "{hidden:?}");
+    }
+
+    /// E5 (sc-24446 review): Candle has no pipelined loop, so a prompt-lookup step forfeits
+    /// nothing a demotion would win back and no campaign measured a lookup regression here — a
+    /// losing lookup under `auto` runs to the end, undemoted, with the reference loop's tokens.
+    #[test]
+    fn auto_never_demotes_prompt_lookup_on_candle() {
+        let (_cfg, model) = text_model();
+        let config = greedy(40);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut wrong = Scripted::new(
+            &expected,
+            Script::Wrong,
+            ProposerKind::PromptLookup,
+            model.vocab_size(),
         );
+        let run = monitored(&model, &mut wrong, &config, 4, AUTO);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.record.speculative_demoted_at, None);
+        assert_eq!(run.stats.accepted, 0);
+        // Every step but the budget-clamped last one proposes.
+        assert_eq!(wrong.proposals, run.stats.verify_steps - 1);
+    }
+
+    /// The edges of the demotion: a budget one token past the demotion point (the first plain
+    /// step draws the last token), and a stop token drawn by the first step after the demotion —
+    /// each the reference loop's output, the demotion recorded.
+    #[test]
+    fn the_first_plain_step_honours_the_budget_and_a_stop_token_it_draws() {
+        let (_cfg, model) = text_model();
+        let vocab = model.vocab_size();
+        let config = greedy(DEMOTED_AT + 1);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::Mtp, vocab);
+        let run = monitored(&model, &mut wrong, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.output.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_forward_accounting("budget", &run);
+
+        // A prompt whose reference continuation first draws a fresh token at index `DEMOTED_AT`
+        // (the fixture loops, so search a fixed pseudo-random prompt sequence for one).
+        let mut state = 0x1234_5678_u64;
+        let (prompt, stop) = (0..400usize)
+            .find_map(|n| {
+                let prompt: Vec<i32> = (0..4 + n % 8)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        ((state >> 33) % vocab as u64) as i32
+                    })
+                    .collect();
+                let tokens = reference(&model, &prompt, &greedy(DEMOTED_AT + 1)).tokens;
+                (!tokens[..DEMOTED_AT].contains(&tokens[DEMOTED_AT]))
+                    .then(|| (prompt, tokens[DEMOTED_AT]))
+            })
+            .expect("a fixture prompt drawing a fresh token at the first plain step");
+        let mut stopping = greedy(40);
+        stopping.stop_tokens = vec![stop];
+        let expected = reference(&model, &prompt, &stopping);
+        assert_eq!(expected.tokens.len(), DEMOTED_AT, "fixture premise");
+        let mut wrong = Scripted::new(&expected.tokens, Script::Wrong, ProposerKind::Mtp, vocab);
+        wrong.prompt_len = prompt.len();
+        let run = monitored_from(&model, &mut wrong, &prompt, &stopping, 2, AUTO);
+        assert_eq!(run.output.tokens, expected.tokens);
+        assert_eq!(run.output.finish_reason, FinishReason::StopToken);
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_forward_accounting("stop", &run);
+    }
+
+    /// A seeded stochastic run across a demotion draws exactly the plain seeded run's tokens: a
+    /// proposer that never drafts makes every verify step the ordinary draw from the same seeded
+    /// stream, before the demotion and after it.
+    #[test]
+    fn a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run() {
+        let (_cfg, model) = text_model();
+        let config = stochastic(40);
+        let plain = run(&model, &mut NoProposer, &PROMPT, &config, 0)
+            .output
+            .tokens;
+        let mut empty = Scripted::new(&[], Script::Empty, ProposerKind::Mtp, model.vocab_size());
+        let demoted = monitored(&model, &mut empty, &config, 2, AUTO);
+        assert_eq!(demoted.output.tokens, plain);
+        assert_eq!(
+            demoted.record.speculative_demoted_at,
+            Some(DEMOTED_AT as u64)
+        );
+        assert_eq!(empty.proposals, WINDOW);
     }
 
     /// A proposer at or above its break-even is never demoted under `auto`.
@@ -2852,13 +3050,18 @@ mod tests {
     fn auto_keeps_a_proposer_that_pays_for_itself() {
         let (_cfg, model) = text_model();
         let config = greedy(96);
-        let expected = step_tokens(&model, &PROMPT, &config);
-        let mut right = Scripted::new(&expected, true, model.vocab_size());
-        let run = monitored(&model, &mut right, &config, 4, auto_lookup());
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut right = Scripted::new(
+            &expected,
+            Script::Right,
+            ProposerKind::Mtp,
+            model.vocab_size(),
+        );
+        let run = monitored(&model, &mut right, &config, 2, AUTO);
         assert_eq!(run.output.tokens, expected);
         assert_eq!(run.record.speculative_demoted_at, None);
         assert!(
-            run.stats.verify_steps > core_llm::ACCEPTANCE_PROBE_VERIFIES as usize,
+            run.stats.verify_steps > WINDOW,
             "the run outlasts the probe window: {:?}",
             run.stats
         );
@@ -2873,43 +3076,36 @@ mod tests {
         use core_llm::{Speculative, SpeculativeProposer};
         let (_cfg, model) = text_model();
         let config = greedy(40);
-        let expected = step_tokens(&model, &PROMPT, &config);
-        let explicit = AcceptanceMonitor::for_request(
-            Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
-            ProposerKind::PromptLookup,
-            4,
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut wrong = Scripted::new(
+            &expected,
+            Script::Wrong,
+            ProposerKind::Mtp,
+            model.vocab_size(),
         );
-        assert_eq!(explicit, None);
-        let mut wrong = Scripted::new(&expected, false, model.vocab_size());
-        let run = monitored(&model, &mut wrong, &config, 4, explicit);
+        let explicit = Speculative::proposer(SpeculativeProposer::Mtp, 2);
+        let run = monitored(&model, &mut wrong, &config, 2, explicit);
         assert_eq!(run.output.tokens, expected);
         assert_eq!(run.record.speculative_demoted_at, None);
         assert_eq!(wrong.proposals, run.stats.verify_steps - 1);
     }
 
     /// The MTP head (a proposer that wants the target's hidden rows) demotes the same way: the
-    /// rest of the run is plain steps with the step driver's greedy tokens.
+    /// rest of the run is plain steps with the reference loop's greedy tokens.
     #[test]
     fn a_demoted_mtp_head_decodes_the_rest_plainly() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let config = greedy(40);
-        let expected = step_tokens(&model, &PROMPT, &config);
+        let expected = reference(&model, &PROMPT, &config).tokens;
         let mut head = MtpProposer::new(&mtp);
-        // A threshold no run reaches, so the demotion is certain whatever the head drafts.
-        let run = monitored(
-            &model,
-            &mut head,
-            &config,
-            2,
-            AcceptanceMonitor::with_threshold(1e9),
-        );
+        let run = monitored(&model, &mut head, &config, 2, AUTO);
         assert_eq!(run.output.tokens, expected);
-        let demoted = run.record.speculative_demoted_at.expect("demoted") as usize;
-        assert!(demoted > core_llm::ACCEPTANCE_PROBE_VERIFIES as usize);
-        assert_eq!(run.record.proposer, ProposerKind::Mtp);
         assert_eq!(
-            run.stats.forwards,
-            run.stats.prefill_forwards + run.stats.verify_steps + run.stats.replays
+            run.stats.accepted, 0,
+            "fixture premise: the random head never pays"
         );
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_eq!(run.record.proposer, ProposerKind::Mtp);
+        assert_forward_accounting("mtp", &run);
     }
 }

@@ -180,7 +180,9 @@ pub struct DecodeReport {
     /// [`proposer`](Self::proposer) and [`draft_tokens`](Self::draft_tokens) still name the
     /// proposer that ran before it, and the plain steps after it are counted in
     /// [`verify_steps`](Self::verify_steps) (one-token verify passes, as on every path). `None` when
-    /// nothing was demoted — always for `off` and for an explicit `{proposer, depth}` request.
+    /// nothing was demoted — always for `off`, for an explicit `{proposer, depth}` request, and
+    /// for prompt lookup where the plain loop is unpipelined anyway (Candle; MLX under a
+    /// constraint, a penalized sampler or pipelining off — no measured regression there).
     pub speculative_demoted_at: Option<u64>,
     /// Leading prompt tokens whose cache state came from the cross-turn prefix cache instead of a
     /// prefill forward (story sc-24437): the prefill ran only the prompt past them. `0` on a miss,

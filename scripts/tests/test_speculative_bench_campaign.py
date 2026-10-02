@@ -730,6 +730,45 @@ class RunTests(unittest.TestCase):
         self.assertEqual(summary["builds"], {"epic": {"status": "failed"}})
         self.assertEqual(summary["rows"], [])
 
+    def test_a_campaign_stopped_part_way_keeps_every_finished_process(self) -> None:
+        """sc-24446: a job timeout kills the runner mid-campaign (run 36891326535 lost 32 finished
+        rows that way). The summary is rewritten after every process, so what the stopped
+        campaign leaves says which rows finished and which one it stopped during."""
+        original = campaign.run_process
+        calls = []
+
+        def stop_on_the_third(**kwargs):
+            calls.append(kwargs["name"])
+            if len(calls) == 3:
+                raise KeyboardInterrupt  # the job's timeout killing the runner
+            return original(**kwargs)
+
+        rows = [
+            {"id": "a", "snapshot": "qwen38", "process_repeats": 1},
+            {"id": "b", "snapshot": "qwen38", "process_repeats": 1},
+        ]
+        with mock.patch.object(campaign, "run_process", stop_on_the_third):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_plan(rows)
+        output = self.directory / "out"
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertFalse((output / "summary.json.tmp").exists())
+        self.assertIs(summary["complete"], False)
+        a, b = summary["rows"]
+        self.assertIs(a["complete"], True)
+        self.assertEqual(
+            [(p["run"], p["status"]) for p in a["processes"]],
+            [("epic", "ok"), ("baseline", "ok")],
+        )
+        self.assertIs(b["complete"], False)
+        self.assertEqual(b["processes"], [])
+
+        # A campaign that ran to its end says so, row by row.
+        code, _, summary, _ = self.run_plan(rows)
+        self.assertEqual(code, 0)
+        self.assertIs(summary["complete"], True)
+        self.assertTrue(all(row["complete"] for row in summary["rows"]))
+
     def test_the_operator_sha_is_taken_only_with_the_explicit_override(self) -> None:
         code, _, summary, records = self.run_plan(
             [{"id": "a", "snapshot": "qwen38", "process_repeats": 1}], "--allow-sha-override"
@@ -1018,6 +1057,51 @@ class CompareTests(unittest.TestCase):
                 mutate(directory)
                 with self.assertRaises(campaign.Refused):
                     self.compare(directory)
+
+    def test_a_row_the_campaign_stopped_during_is_set_aside_and_the_rest_compare(self) -> None:
+        """sc-24446: a timed-out campaign's partial summary is usable — its finished rows are
+        judged, the row it stopped during is named and excluded (never judged on a short
+        process count); a campaign that finished no row is refused."""
+
+        def make(run, k):
+            def value(prompt, option, metric):
+                return (50.0 if metric == "decode_tok_s" else 100.0) + jitter(k)
+
+            return document(run, value=value)
+
+        def partial(name, stopped):
+            directory = write_campaign(
+                self.directory / name,
+                [{"id": row, "document": make} for row in ("finished", "stopped")],
+            )
+            path = directory / "summary.json"
+            summary = json.loads(path.read_text(encoding="utf-8"))
+            summary["complete"] = False
+            for row in summary["rows"]:
+                row["complete"] = row["id"] not in stopped
+                if row["id"] in stopped:
+                    row["processes"] = row["processes"][:2]
+            path.write_text(json.dumps(summary), encoding="utf-8")
+            return directory
+
+        report = self.compare(partial("timed-out", {"stopped"}))
+        self.assertEqual([r["row"] for r in report["rows"]], ["finished"])
+        self.assertEqual(len(report["incomplete"]), 1)
+        self.assertIn("timed-out/stopped", report["incomplete"][0])
+        self.assertIn("2 of 6 processes", report["incomplete"][0])
+        self.assertIs(report["campaigns"][0]["complete"], False)
+        self.assertIn("## Incomplete", campaign.markdown_report(report))
+        # A row marked finished with a short process count is still refused, not set aside.
+        directory = partial("short", set())
+        path = directory / "summary.json"
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        summary["rows"][1]["processes"] = summary["rows"][1]["processes"][:2]
+        path.write_text(json.dumps(summary), encoding="utf-8")
+        with self.assertRaises(campaign.Refused):
+            self.compare(directory)
+        with self.assertRaises(campaign.Refused) as refused:
+            self.compare(partial("nothing-finished", {"finished", "stopped"}))
+        self.assertIn("no row ran to its end", str(refused.exception))
 
     def test_the_compare_command_writes_json_and_markdown_and_refuses_with_exit_1(self) -> None:
         directory = self.campaign_with()

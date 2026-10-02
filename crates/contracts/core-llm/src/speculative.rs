@@ -434,27 +434,45 @@ pub fn fit_draft_context(
 pub const ACCEPTANCE_PROBE_VERIFIES: u32 = 16;
 
 // The break-even thresholds below (E5: the justification sits next to the value). A verify step
-// commits `1 + accepted` tokens for the cost of `r` pipelined single-token steps, so speculation
-// pays only while the mean accepted length per verify `mal` exceeds `r − 1`. The sc-24446 MLX
-// campaign's per-process `DecodeReport`s measured `r`:
+// commits `1 + accepted` tokens for the cost of `r` plain single-token steps, so speculation pays
+// only while the mean accepted length per verify `mal` exceeds `r − 1`.
 //
-// * MTP / model-drafted: a verify step costs 1.25–1.6× a pipelined step at 1 draft and
-//   2.2–2.9× at depth 3 (each draft is one more sequential head forward). Open-ended prompts on a
-//   companion MTP head measured mal 0.66–0.85 and lost 22–32 %; native MTP heads (Qwen3.8, the
-//   Qwen3.6 MoE) measured mal 1.38–2.8 and won 5–49 %.
-// * Prompt lookup: the drafts are free (a host n-gram search), so its cost does not grow per draft
-//   the same way; its runs' implied ratio `(1 + mal) / (1 + speedup)` is 1.42–1.58 (open-ended:
-//   acceptance 1–9 %, mal 0.02–0.5, lost 5–28 %; grounded code / RAG / summary: acceptance
-//   43–71 %, up to +122 %).
+// Evidence: the sc-24446 campaign documents mlx-campaign-2 (epic commit 9b310c4da) and
+// mlx-campaign-3 (epic commit 8a886fce6), attached to Shortcut epic 24432 — the per-process
+// `DecodeReport`s of rows `f1-qwen38-*`, `f2-bonsai-*`, `f3-qwen3-8b-*` and `f4-gemma4-*`
+// (`-auto-s`, `-full`, `-cache`), each `auto` / explicit option against its own `off` twin. They
+// measured `r` against MLX's **pipelined** plain loop:
+//
+// * MTP: a verify step costs 1.25–1.6× a pipelined step at 1 draft and 2.2–2.9× at depth 3 (each
+//   draft is one more sequential head forward). Open-ended prompts on a companion MTP head
+//   (`f2-bonsai`) measured mal 0.66–0.85 and lost 22–32 %; native MTP heads (`f1-qwen38`, the
+//   Qwen3.6 MoE) measured mal 1.38–2.8 and won 5–49 %. The head forwards are most of that cost
+//   and are paid whichever plain loop a demoted request falls back to, so the MTP thresholds hold
+//   on every [`PlainDecode`].
+// * Prompt lookup (`f3-qwen3-8b`, `f4-gemma4`): the drafts are free (a host n-gram search); its
+//   runs' implied ratio `(1 + mal) / (1 + speedup)` is 1.42–1.58 (open-ended: acceptance 1–9 %,
+//   mal 0.02–0.5, lost 5–28 %; grounded code / RAG / summary: acceptance 43–71 %, up to +122 %).
+//   Much of that cost is a lookup step forfeiting pipelining (the proposer reads each token on
+//   the host): mlx-campaign-2's `f3-qwen3-8b-pipe-on` / `-pipe-off` pair measured the pipelined
+//   plain loop 3–15 % faster than the unpipelined one. Where the demoted request would continue
+//   **unpipelined** anyway — Candle, which has no pipelined loop, and MLX under a constraint, a
+//   history-reading (penalized) sampler, `Pipelining::Off` or `MLX_LLM_PIPELINING=0` — that part
+//   of the cost does not exist, and no campaign row measured lookup against an unpipelined `off`.
+//   Scaling the pipelined ratio by the pipe-on/off pair (1.42 / 1.15) would put the break-even
+//   near 0.23, but only for a device-sampled run: a penalized or constrained verify copies a
+//   logits row per draft, a cost nothing measured, and Candle's step costs are not MLX's. So
+//   lookup is **not demoted** there (E5: off only on a measured regression); the CUDA campaign's
+//   `auto`-vs-`off` lookup pairs (and an unpipelined MLX lookup pair) settle it.
 //
 // Demotion is irreversible for the request, so every threshold is the break-even at the
 // **cheapest** measured cost: a request is demoted only when it is losing even if its verify
 // steps are as cheap as any the campaign measured — no measured winning request falls below its
 // threshold, and the measured open-ended losers (companion MTP 0.66–0.85, lookup ≤ 0.4) do.
 
-/// Mean accepted drafts per verify below which `auto`'s prompt lookup is demoted: the cheapest
-/// measured prompt-lookup verify cost `r = 1.4` (the 1.42 floor of the campaign's implied ratios,
-/// rounded down), minus the one token every verify commits anyway.
+/// Mean accepted drafts per verify below which `auto`'s prompt lookup is demoted when the plain
+/// loop it would fall back to is MLX's pipelined one ([`PlainDecode::MlxPipelined`], the only
+/// measured regime): the cheapest measured prompt-lookup verify cost `r = 1.4` (the 1.42 floor of
+/// the campaign's implied ratios, rounded down), minus the one token every verify commits anyway.
 pub const PROMPT_LOOKUP_DEMOTE_BELOW: f64 = 0.4;
 
 /// Mean accepted drafts per verify below which `auto`'s MTP head at **one** draft is demoted: the
@@ -466,19 +484,36 @@ pub const MTP_DEMOTE_BELOW_AT_ONE_DRAFT: f64 = 0.25;
 /// sequential head forward — so depth 3 (the recommended depth) demotes below mal 1.2.
 pub const MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT: f64 = 0.475;
 
-/// The mean accepted length per verify below which `proposer` at `depth` loses to plain decoding
-/// at the cheapest measured verify cost (see the constants above), or `None` when no demotion
-/// applies: no proposer, a zero depth, or `draft_model` — which [`Speculative::Auto`] never
-/// resolves to ([`resolve_speculative`] picks MTP, else prompt lookup) and whose cost the campaign
-/// did not measure.
+/// The plain decoding a demoted request would continue on (sc-24446) — what a proposer's verify
+/// cost is weighed against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlainDecode {
+    /// MLX's pipelined token-at-a-time loop: device-resident draws, no constraint, a sampler that
+    /// does not read the history, `Pipelining::Auto` and the pipelining switch on.
+    MlxPipelined,
+    /// MLX's unpipelined loop: a constraint, a history-reading (penalized) sampler,
+    /// `Pipelining::Off` or `MLX_LLM_PIPELINING=0`.
+    MlxUnpipelined,
+    /// Candle's token-at-a-time engine steps (Candle has no pipelined loop).
+    Candle,
+}
+
+/// The mean accepted length per verify below which `proposer` at `depth` loses to `plain`
+/// decoding at the cheapest measured verify cost (see the constants above), or `None` when no
+/// demotion applies: no proposer, a zero depth, prompt lookup falling back to an unpipelined loop
+/// (no measured regression there), or `draft_model` — which [`Speculative::Auto`] never resolves
+/// to ([`resolve_speculative`] picks MTP, else prompt lookup) and whose cost the campaign did not
+/// measure.
 ///
 /// [`Speculative::Auto`]: crate::Speculative::Auto
-pub fn demotion_threshold(proposer: ProposerKind, depth: u32) -> Option<f64> {
+pub fn demotion_threshold(proposer: ProposerKind, depth: u32, plain: PlainDecode) -> Option<f64> {
     if depth == 0 {
         return None;
     }
     match proposer {
-        ProposerKind::PromptLookup => Some(PROMPT_LOOKUP_DEMOTE_BELOW),
+        ProposerKind::PromptLookup => {
+            (plain == PlainDecode::MlxPipelined).then_some(PROMPT_LOOKUP_DEMOTE_BELOW)
+        }
         ProposerKind::Mtp => Some(
             MTP_DEMOTE_BELOW_AT_ONE_DRAFT + MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT * f64::from(depth - 1),
         ),
@@ -510,17 +545,18 @@ pub struct AcceptanceMonitor {
 impl AcceptanceMonitor {
     /// The monitor a request runs under: `Some` only when the request asked for
     /// [`Speculative::Auto`](crate::Speculative::Auto) and it resolved to a proposer with a
-    /// [`demotion_threshold`] (`proposer` / `depth` are what the engine will actually run, after
-    /// any route fallback).
+    /// [`demotion_threshold`] against the `plain` loop a demotion would fall back to (`proposer` /
+    /// `depth` are what the engine will actually run, after any route fallback).
     pub fn for_request(
         mode: crate::Speculative,
         proposer: ProposerKind,
         depth: u32,
+        plain: PlainDecode,
     ) -> Option<Self> {
         if mode != crate::Speculative::Auto {
             return None;
         }
-        Self::with_threshold(demotion_threshold(proposer, depth)?)
+        Self::with_threshold(demotion_threshold(proposer, depth, plain)?)
     }
 
     /// A monitor demoting below `threshold` mean accepted drafts per verify (a finite,
@@ -1118,27 +1154,30 @@ mod tests {
     // --- auto's acceptance monitor (sc-24446) ---
 
     /// E5: the thresholds are the cheapest-measured break-evens — prompt lookup 0.4 at any depth,
-    /// MTP 0.25 at one draft growing 0.475 per extra draft (1.2 at the recommended depth 3) — and
-    /// nothing is monitored without a measured cost (no proposer, a zero depth, `draft_model`).
+    /// but only where the demoted request would continue on MLX's pipelined loop (the measured
+    /// regime); MTP 0.25 at one draft growing 0.475 per extra draft (1.2 at the recommended depth
+    /// 3) on every plain loop — and nothing is monitored without a measured cost (no proposer, a
+    /// zero depth, `draft_model`, lookup falling back to an unpipelined loop).
     #[test]
     fn the_demotion_thresholds_are_the_measured_break_evens() {
+        use PlainDecode::{Candle, MlxPipelined, MlxUnpipelined};
         let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-12;
-        assert!(close(
-            demotion_threshold(ProposerKind::PromptLookup, 4),
-            0.4
-        ));
-        assert!(close(
-            demotion_threshold(ProposerKind::PromptLookup, 1),
-            0.4
-        ));
-        assert!(close(demotion_threshold(ProposerKind::Mtp, 1), 0.25));
-        assert!(close(demotion_threshold(ProposerKind::Mtp, 3), 1.2));
-        assert_eq!(demotion_threshold(ProposerKind::Mtp, 0), None);
-        assert_eq!(demotion_threshold(ProposerKind::DraftModel, 4), None);
-        assert_eq!(demotion_threshold(ProposerKind::None, 4), None);
+        let lookup = |depth, plain| demotion_threshold(ProposerKind::PromptLookup, depth, plain);
+        assert!(close(lookup(4, MlxPipelined), 0.4));
+        assert!(close(lookup(1, MlxPipelined), 0.4));
+        for unpipelined in [MlxUnpipelined, Candle] {
+            assert_eq!(lookup(4, unpipelined), None, "{unpipelined:?}");
+        }
+        for plain in [MlxPipelined, MlxUnpipelined, Candle] {
+            assert!(close(demotion_threshold(ProposerKind::Mtp, 1, plain), 0.25));
+            assert!(close(demotion_threshold(ProposerKind::Mtp, 3, plain), 1.2));
+            assert_eq!(demotion_threshold(ProposerKind::Mtp, 0, plain), None);
+            assert_eq!(demotion_threshold(ProposerKind::DraftModel, 4, plain), None);
+            assert_eq!(demotion_threshold(ProposerKind::None, 4, plain), None);
+        }
         // The measured families land on the documented sides: a companion head's open-ended mal
         // (0.66–0.85) demotes at depth 3, a native head's (1.38+) does not.
-        let mtp3 = demotion_threshold(ProposerKind::Mtp, 3).unwrap();
+        let mtp3 = demotion_threshold(ProposerKind::Mtp, 3, Candle).unwrap();
         assert!(0.85 < mtp3 && mtp3 < 1.38);
     }
 
@@ -1175,11 +1214,22 @@ mod tests {
     #[test]
     fn only_auto_is_monitored() {
         use crate::{Speculative, SpeculativeProposer};
-        let auto = AcceptanceMonitor::for_request(Speculative::Auto, ProposerKind::Mtp, 3).unwrap();
+        use PlainDecode::MlxPipelined;
+        let monitor = |mode, proposer, depth| {
+            AcceptanceMonitor::for_request(mode, proposer, depth, MlxPipelined)
+        };
+        let auto = monitor(Speculative::Auto, ProposerKind::Mtp, 3).unwrap();
         assert!((auto.threshold() - 1.2).abs() < 1e-12);
-        assert!(
-            AcceptanceMonitor::for_request(Speculative::Auto, ProposerKind::PromptLookup, 4)
-                .is_some()
+        assert!(monitor(Speculative::Auto, ProposerKind::PromptLookup, 4).is_some());
+        assert_eq!(
+            AcceptanceMonitor::for_request(
+                Speculative::Auto,
+                ProposerKind::PromptLookup,
+                4,
+                PlainDecode::Candle
+            ),
+            None,
+            "lookup is not demoted where nothing measured a regression"
         );
         for explicit in [
             Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
@@ -1187,22 +1237,19 @@ mod tests {
             Speculative::Off,
         ] {
             assert_eq!(
-                AcceptanceMonitor::for_request(explicit, ProposerKind::PromptLookup, 4),
+                monitor(explicit, ProposerKind::PromptLookup, 4),
                 None,
                 "{explicit:?}"
             );
             assert_eq!(
-                AcceptanceMonitor::for_request(explicit, ProposerKind::Mtp, 3),
+                monitor(explicit, ProposerKind::Mtp, 3),
                 None,
                 "{explicit:?}"
             );
         }
+        assert_eq!(monitor(Speculative::Auto, ProposerKind::None, 0), None);
         assert_eq!(
-            AcceptanceMonitor::for_request(Speculative::Auto, ProposerKind::None, 0),
-            None
-        );
-        assert_eq!(
-            AcceptanceMonitor::for_request(Speculative::Auto, ProposerKind::DraftModel, 4),
+            monitor(Speculative::Auto, ProposerKind::DraftModel, 4),
             None
         );
     }

@@ -1815,6 +1815,9 @@ impl TextLlm for LlamaProvider {
         // (sc-24434). Anything less than the request asked for is named in the report's
         // `fallbacks` (epic sc-24432 E2) — never a silent downgrade, never a failure. A request
         // that leaves the option unset runs the MLX defaults-table default (E5, sc-24446).
+        // The engine also gets the option itself: under `auto` it monitors the proposer it runs
+        // against the plain loop it would fall back to, and demotes one measurably slower than
+        // plain decoding (sc-24446, E5); an explicit `{proposer, depth}` runs as asked.
         let speculative_mode = req.speculative_or(self.speculative_default);
         let resolution =
             core_llm::resolve_speculative(speculative_mode, &self.descriptor.capabilities);
@@ -1920,14 +1923,6 @@ impl TextLlm for LlamaProvider {
             req.max_new_tokens,
             gemma4_mm_request,
             &mut fallbacks,
-        );
-        // `auto`'s acceptance monitor over the proposer this request will actually run (sc-24446,
-        // E5): it demotes a proposer measurably slower than plain decoding; an explicit
-        // `{proposer, depth}` runs as asked.
-        let acceptance = core_llm::AcceptanceMonitor::for_request(
-            speculative_mode,
-            route.kind(),
-            u32::try_from(route.width()).unwrap_or(u32::MAX),
         );
 
         let config = GenerationConfig {
@@ -2143,7 +2138,7 @@ impl TextLlm for LlamaProvider {
                                         .map(|m| m as &mut dyn RewindableConstraintMask),
                                     should_stop: should_stop_opt,
                                     prefill_clock: clock,
-                                    acceptance,
+                                    speculative_mode,
                                     ..EngineOptions::default()
                                 },
                             )
@@ -2179,7 +2174,7 @@ impl TextLlm for LlamaProvider {
                                         .map(|m| m as &mut dyn RewindableConstraintMask),
                                     should_stop: should_stop_opt,
                                     prefill_clock: clock,
-                                    acceptance,
+                                    speculative_mode,
                                     ..EngineOptions::default()
                                 },
                             )
@@ -2222,7 +2217,7 @@ impl TextLlm for LlamaProvider {
                                 .map(|m| m as &mut dyn RewindableConstraintMask),
                             should_stop: should_stop_opt,
                             prefill_clock: None,
-                            acceptance,
+                            speculative_mode,
                             ..EngineOptions::default()
                         },
                     )
@@ -2238,7 +2233,7 @@ impl TextLlm for LlamaProvider {
                             .map(|m| m as &mut dyn RewindableConstraintMask),
                         should_stop: should_stop_opt,
                         prefill_clock: Some(Instant::now()),
-                        acceptance,
+                        speculative_mode,
                         ..EngineOptions::default()
                     };
                     match &self.model {
@@ -2615,16 +2610,6 @@ impl SpeculativeRoute {
 
     fn is_mtp(self) -> bool {
         matches!(self, SpeculativeRoute::Mtp { .. })
-    }
-
-    /// The proposer this route runs.
-    fn kind(self) -> ProposerKind {
-        match self {
-            SpeculativeRoute::Plain => ProposerKind::None,
-            SpeculativeRoute::Mtp { .. } => ProposerKind::Mtp,
-            SpeculativeRoute::PromptLookup { .. } => ProposerKind::PromptLookup,
-            SpeculativeRoute::DraftModel { .. } => ProposerKind::DraftModel,
-        }
     }
 
     /// The proposer for any target: prompt lookup, the resident `draft` model, or none. (MTP
