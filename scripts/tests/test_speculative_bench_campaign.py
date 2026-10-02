@@ -761,9 +761,12 @@ PROMPTS = (("code_edit", "predictable"), ("chat", "open_ended"))
 OPTIONS = ("off", {"proposer": "mtp", "depth": 3}, "auto")
 
 
-def document(run, *, effective=None, prefix_cache_bytes=0, value=None, **overrides):
+def document(
+    run, *, effective=None, prefix_cache_bytes=0, value=None, epic_sha=EPIC_SHA, row_extra=None,
+    **overrides,
+):
     """A synthetic benchmark document; ``value(prompt, option, metric)`` gives each in-process
-    mean."""
+    mean, ``row_extra(prompt, option)`` extra row fields (e.g. the DecodeReport's ``proposer``)."""
     value = value or (lambda prompt, option, metric: 50.0 if metric == "decode_tok_s" else 100.0)
     switches = {name: {"env": None, "effective": None} for name in campaign.SWITCHES}
     for name, state in (effective or {}).items():
@@ -784,6 +787,7 @@ def document(run, *, effective=None, prefix_cache_bytes=0, value=None, **overrid
                         "stddev": 0.5,
                     },
                     "ttft_ms": {"n": 3, "mean": value(prompt, key, "ttft_ms"), "stddev": 2.0},
+                    **(row_extra(prompt, key) if row_extra else {}),
                 }
             )
     return {
@@ -798,7 +802,7 @@ def document(run, *, effective=None, prefix_cache_bytes=0, value=None, **overrid
         "options": list(OPTIONS),
         "load": {"prefix_cache_bytes": prefix_cache_bytes},
         "provenance": {
-            "git": {"sha": EPIC_SHA if run == "epic" else campaign.PRE_EPIC_SHA},
+            "git": {"sha": epic_sha if run == "epic" else campaign.PRE_EPIC_SHA},
             "switches": switches,
             "env": {"CUDA_VISIBLE_DEVICES": "1", "CANDLE_LLM_DEVICE": None},
         },
@@ -807,15 +811,16 @@ def document(run, *, effective=None, prefix_cache_bytes=0, value=None, **overrid
     }
 
 
-def write_campaign(root: Path, rows, lane="cuda"):
-    """``rows``: ``{"id", "runs", "process_repeats", "switches", "env", "document": fn(run, k)}``."""
+def write_campaign(root: Path, rows, lane="cuda", epic_sha=EPIC_SHA):
+    """``rows``: ``{"id", "runs", "process_repeats", "switches", "env", "format", "snapshot",
+    "document": fn(run, k)}``."""
     root.mkdir(parents=True)
     summary = {
         "schema": campaign.CAMPAIGN_SCHEMA,
         "document_schema": campaign.SCHEMA,
         "lane": lane,
         "backend": campaign.LANES[lane].backend,
-        "epic_sha": EPIC_SHA,
+        "epic_sha": epic_sha,
         "pre_epic_sha": campaign.PRE_EPIC_SHA,
         "sha_override": False,
         "builds": {"epic": {"status": "ok"}, "baseline": {"status": "ok"}},
@@ -828,9 +833,9 @@ def write_campaign(root: Path, rows, lane="cuda"):
             "runs": row.get("runs", ["epic", "baseline"]),
             "process_repeats": row.get("process_repeats", 3),
             "switches": row.get("switches", {}),
-            "format": "bf16",
+            "format": row.get("format", "bf16"),
             "env": row.get("env", {}),
-            "snapshot": {"path": "/s", "identity": "f" * 64},
+            "snapshot": {"path": row.get("snapshot", "/s"), "identity": "f" * 64},
             "processes": [],
         }
         for k in range(1, entry["process_repeats"] + 1):
@@ -1000,6 +1005,10 @@ class CompareTests(unittest.TestCase):
             ),
             "pre-epic sha": lambda d: edit_summary(d, lambda s: s.update(pre_epic_sha="b" * 40)),
             "summary schema": lambda d: edit_summary(d, lambda s: s.update(schema="x")),
+            "measured commit": doc(
+                "epic-2.json", lambda x: x["provenance"]["git"].update(sha="b" * 40)
+            ),
+            "summary commit": lambda d: edit_summary(d, lambda s: s.update(epic_sha="b" * 40)),
             "no summary": lambda d: (d / "summary.json").unlink(),
         }
         for index, (name, mutate) in enumerate(mutations.items()):
@@ -1115,7 +1124,7 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(
             (slower["outcome"], slower["recommended_on"], slower["flip"]), ("off", False, False)
         )
-        self.assertIn("measured regression", slower["reason"])
+        self.assertIn("measured on-vs-off regression", slower["reason"])
         # Rows that differ in anything else (here the token budget) are not a pair.
         unpaired = self.decisions(
             [
@@ -1161,6 +1170,239 @@ class CompareTests(unittest.TestCase):
         )["CANDLE_CUDA.prefix_cache_bytes"]
         self.assertEqual((cache["outcome"], cache["flip"]), ("on", False))
 
+    # ---- sc-24446 compare fixes: supersession, E5 pairing, n=1, unpaired rows, labels
+
+    def history(self):
+        """A repository ``base -> older -> newer`` plus ``other`` branching from ``base``."""
+        repo = self.directory / "repo"
+        git_repo(repo)
+        (repo / "f").write_text("0", encoding="utf-8")
+        base = commit(repo)
+        (repo / "f").write_text("1", encoding="utf-8")
+        older = commit(repo)
+        (repo / "f").write_text("2", encoding="utf-8")
+        newer = commit(repo)
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "side", base], check=True)
+        (repo / "g").write_text("x", encoding="utf-8")
+        other = commit(repo)
+        return repo, older, newer, other
+
+    def sha_campaign(self, name, sha, rows):
+        """``rows``: ``{row id: epic decode-rate factor}`` (the baseline decodes at 50 tok/s)."""
+
+        def row(row_id, factor):
+            def make(run, k):
+                def value(prompt, option, metric):
+                    base = 50.0 if metric == "decode_tok_s" else 100.0
+                    if run == "epic" and metric == "decode_tok_s":
+                        base *= factor
+                    return base + jitter(k)
+
+                return document(run, value=value, epic_sha=sha)
+
+            return {"id": row_id, "document": make}
+
+        return write_campaign(
+            self.directory / name, [row(r, f) for r, f in rows.items()], epic_sha=sha
+        )
+
+    def test_a_row_re_measured_at_a_descendant_commit_supersedes_the_older_measurement(self) -> None:
+        repo, older, newer, _ = self.history()
+        stale = self.sha_campaign("c-old", older, {"qwen38-bf16": 0.7, "bonsai": 1.0})
+        fresh = self.sha_campaign("c-new", newer, {"qwen38-bf16": 1.0})
+        for order in ((stale, fresh), (fresh, stale)):
+            report = campaign.compare_campaigns(list(order), self.DEFAULTS, repo=repo)
+            self.assertEqual(
+                [(s["row"], s["campaign"], s["epic_sha"], s["superseded_by"]) for s in report["superseded"]],
+                [("qwen38-bf16", "c-old", older, f"c-new@{newer}")],
+            )
+            # The stale 30%-slower measurement is gone from every verdict; the row only the older
+            # campaign measured stays, attributed to its commit.
+            self.assertTrue(all(e["verdict"] == "pass" for e in report["e6"]), report["e6"])
+            self.assertEqual(
+                {(r["row"], r["campaign"], r["epic_sha"]) for r in report["rows"]},
+                {("qwen38-bf16", "c-new", newer), ("bonsai", "c-old", older)},
+            )
+            self.assertFalse(any(c["campaign"] == "c-old" and c["row"] == "qwen38-bf16"
+                                 for c in report["comparisons"]))
+            markdown = campaign.markdown_report(report)
+            self.assertIn("## Superseded", markdown)
+            self.assertIn(f"`{older[:12]}`", markdown)
+
+    def test_unordered_or_conflicting_re_measurements_are_refused(self) -> None:
+        repo, older, newer, other = self.history()
+        cases = {
+            "neither is an ancestor": (newer, other, "no measurement descends"),
+            "same commit, different data": (newer, newer, "with different data"),
+            "unknown commit": (newer, "e" * 40, "cannot order"),
+        }
+        for index, (name, (first, second, message)) in enumerate(cases.items()):
+            with self.subTest(name):
+                a = self.sha_campaign(f"a{index}", first, {"qwen38-bf16": 1.0})
+                b = self.sha_campaign(f"b{index}", second, {"qwen38-bf16": 0.9})
+                with self.assertRaises(campaign.Refused) as refused:
+                    campaign.compare_campaigns([a, b], self.DEFAULTS, repo=repo)
+                self.assertIn(message, str(refused.exception))
+        # A byte-identical copy at the same commit is a duplicate, not a conflict.
+        a = self.sha_campaign("dup-a", newer, {"qwen38-bf16": 1.0})
+        b = self.directory / "dup-b"
+        shutil.copytree(a, b)
+        report = campaign.compare_campaigns([a, b], self.DEFAULTS, repo=repo)
+        self.assertEqual(
+            [(s["campaign"], s["why"]) for s in report["superseded"]],
+            [("dup-b", "duplicate at the same commit")],
+        )
+
+    def spec_row(self, row_id, auto_speed, *, process_repeats=3, proposer="mtp", runs=("epic",)):
+        def make(run, k):
+            return document(
+                run,
+                value=lambda p, o, m: (
+                    (auto_speed if o == "auto" else 50.0) if m == "decode_tok_s" else 100.0
+                )
+                + jitter(k),
+                row_extra=lambda p, o: {"proposer": (proposer if o == "auto" else "none")},
+            )
+
+        return {
+            "id": row_id,
+            "runs": list(runs),
+            "process_repeats": process_repeats,
+            "document": make,
+        }
+
+    def test_e5_speculative_is_judged_only_from_its_own_on_off_pairs(self) -> None:
+        # An E6 row slower than the baseline is no speculative evidence: no option pair, no
+        # regression, whatever the epic-vs-baseline verdict.
+        def e6_row(run, k):
+            def value(prompt, option, metric):
+                slow = run == "epic" and metric == "decode_tok_s"
+                return (25.0 if slow else 50.0 if metric == "decode_tok_s" else 100.0) + jitter(k)
+
+            return document(run, value=value, options=["off"])
+
+        e6_only = write_campaign(self.directory / "e6-only", [{"id": "cmp", "document": e6_row}])
+        report = self.compare(e6_only)
+        self.assertEqual({e["verdict"] for e in report["e6"]}, {"regression"})
+        speculative = {d["entry"]: d for d in report["defaults"]}["CANDLE_CUDA.speculative"]
+        self.assertEqual((speculative["outcome"], speculative["pairs"]), ("unmeasured", 0))
+        # A regression cites the row and prompt it was measured on.
+        slower = self.decisions([self.spec_row("spec", 30.0)])["CANDLE_CUDA.speculative"]
+        self.assertEqual(slower["outcome"], "off")
+        self.assertRegex(slower["reason"], r"/spec vs \S+/spec (chat|code_edit) `auto vs off`")
+        # `auto` that resolved to plain decode (no proposer) is not applicable, never a regression.
+        plain = self.decisions([self.spec_row("plain", 30.0, proposer="none")])[
+            "CANDLE_CUDA.speculative"
+        ]
+        self.assertEqual({j["verdict"] for j in plain["judged"]}, {"not_applicable"})
+        self.assertNotEqual(plain["outcome"], "off")
+        # Unresolved pairs (here n=1) are not a regression: E5 keeps the default on.
+        single = self.decisions([self.spec_row("single", 30.0, process_repeats=1)])[
+            "CANDLE_CUDA.speculative"
+        ]
+        self.assertEqual(
+            (single["outcome"], single["recommended_on"]), ("on (unresolved)", True)
+        )
+        self.assertEqual(
+            {j["reason"] for j in single["judged"]}, {"n=1, no process-level band"}
+        )
+        self.assertIn("n<2, no process-level band", single["reason"])
+
+    def test_n1_has_no_process_level_band(self) -> None:
+        result = campaign.verdict([40], [50, 51, 52], True, 0.1)
+        self.assertEqual(
+            (result["verdict"], result["reason"]), ("inconclusive", "n=1, no process-level band")
+        )
+
+    def cache_row(self, row_id, budget, ttft, *, options=None, runs=("epic",)):
+        def make(run, k):
+            extra = {"options": options} if options else {}
+            return document(
+                run,
+                prefix_cache_bytes=budget if run == "epic" else 0,
+                value=lambda p, o, m: (50.0 if m == "decode_tok_s" else ttft) + jitter(k),
+                **extra,
+            )
+
+        env = {"SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": str(budget)} if budget else {}
+        return {"id": row_id, "runs": list(runs), "env": env, "document": make}
+
+    def test_prefix_cache_pairs_only_twin_rows_and_names_the_unpaired(self) -> None:
+        twins = self.decisions(
+            [self.cache_row("cache-on", 1 << 30, 140.0), self.cache_row("cache-off", 0, 100.0)]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual((twins["pairs"], twins["outcome"]), (1, "off"))
+        # An option-list mismatch or a row interleaved with the pre-epic baseline is no twin: the
+        # cache-on row is reported as unpaired instead of judged against a different regime.
+        for name, off_row in {
+            "options": self.cache_row("cache-off", 0, 100.0, options=["off", "auto"]),
+            "schedule": self.cache_row("cache-off", 0, 100.0, runs=("epic", "baseline")),
+        }.items():
+            with self.subTest(name):
+                decision = self.decisions([self.cache_row("cache-on", 1 << 30, 140.0), off_row])[
+                    "CANDLE_CUDA.prefix_cache_bytes"
+                ]
+                self.assertEqual((decision["pairs"], decision["outcome"]), (0, "unmeasured"))
+                self.assertEqual(len(decision["unpaired"]), 1)
+                self.assertTrue(decision["unpaired"][0].endswith("/cache-on"))
+                self.assertIn("unpaired, no twin row identical but for the prefix cache", decision["reason"])
+
+    def test_a_justified_default_with_a_measured_pair_is_reported_as_informational(self) -> None:
+        def pipe_row(row_id, state, ttft):
+            def make(run, k):
+                return document(
+                    run,
+                    backend="mlx",
+                    effective={"MLX_LLM_PIPELINING": state},
+                    value=lambda p, o, m: (50.0 if m == "decode_tok_s" else ttft) + jitter(k),
+                )
+
+            switches = {} if state else {"MLX_LLM_PIPELINING": "0"}
+            return {"id": row_id, "runs": ["epic"], "switches": switches, "document": make}
+
+        directory = write_campaign(
+            self.directory / "pipe",
+            [pipe_row("pipe-on", True, 130.0), pipe_row("pipe-off", False, 100.0)],
+            lane="mlx",
+        )
+        decisions = {d["entry"]: d for d in self.compare(directory)["defaults"]}
+        pipelining = decisions["MLX.pipelining"]
+        self.assertTrue(pipelining["informational"])
+        self.assertFalse(pipelining["provisional"])
+        self.assertEqual((pipelining["pairs"], pipelining["outcome"]), (1, "off"))
+        self.assertIn("sc-24439", pipelining["justification"])
+        # A justified entry nothing measured is not listed.
+        self.assertNotIn("MLX.device_sampler", decisions)
+        self.assertIn("informational", campaign.markdown_report(self.compare(directory)))
+
+    def test_family_labels_name_the_hugging_face_repository(self) -> None:
+        def label(model, path, fmt="bf16"):
+            row = {"snapshot": {"path": path}, "format": fmt}
+            return campaign.family_label(
+                campaign.Process("c", "r", "epic", 1, {"model": model}, {}, row)
+            )
+
+        hub = "/hub/models--prism-ml--Ternary-Bonsai-2-27B-mlx-2bit/snapshots/3f926b41"
+        self.assertEqual(label("3f926b41", hub), "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit")
+        self.assertEqual(
+            label("b968826d@q4", "/hub/models--Qwen--Qwen3-8B/snapshots/b968826d", "q4"),
+            "Qwen/Qwen3-8B@q4",
+        )
+        self.assertEqual(
+            label("enhancer@q4", "/hub/models--SceneWorks--ltx-2.5-mlx/snapshots/791e/enhancer", "q4"),
+            "SceneWorks/ltx-2.5-mlx/enhancer@q4",
+        )
+        # An explicit label, or a snapshot outside the hub cache, is kept verbatim.
+        self.assertEqual(label("my-label", hub), "my-label")
+        self.assertEqual(label("Qwen3.8-27B-q4", "/prepared/Qwen3.8-27B-q4"), "Qwen3.8-27B-q4")
+        directory = write_campaign(
+            self.directory / "hub",
+            [{"id": "bonsai", "snapshot": hub, "document": lambda run, k: document(run, model="3f926b41")}],
+        )
+        self.assertEqual(
+            {e["model"] for e in self.compare(directory)["e6"]},
+            {"prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"},
+        )
 
 if __name__ == "__main__":
     unittest.main()

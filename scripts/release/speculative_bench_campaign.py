@@ -46,7 +46,10 @@ Subcommands:
   local    the whole lane on this host: create the epic and pre-epic worktrees under
            ``--work-dir``, apply the baseline driver mechanically, plan ``--matrix``, then ``run``
   compare  read campaign directories and write the E6 verdicts and the E5 defaults decisions
-           (machine JSON + markdown); refuses incomplete or mismatched evidence
+           (machine JSON + markdown); refuses incomplete or mismatched evidence. A row id two
+           campaigns of one lane measured is taken from the campaign whose epic commit descends
+           from the other's (``--repo`` orders them; unordered commits are refused), the older
+           one listed as superseded
 
 The matrix is JSON: ``{"rows": [ROW, ...]}``, each ``ROW`` an object with
 
@@ -70,8 +73,9 @@ The matrix is JSON: ``{"rows": [ROW, ...]}``, each ``ROW`` an object with
   model               the model (family) label recorded verbatim
   switches            ``{VARIABLE: value}`` for the lane's recorded runtime switches
                       (``CANDLE_LLM_CUDA_GRAPHS``, ``MLX_LLM_PIPELINING``, …); set for every
-                      process of the row. Rows that differ only in one switch are the on/off pairs
-                      ``compare`` decides that switch's default from.
+                      process of the row. Rows that differ only in one switch (same options and
+                      runs) are the on/off pairs ``compare`` decides that switch's default from;
+                      likewise a ``prefix_cache_bytes`` row needs a twin without it.
 """
 
 from __future__ import annotations
@@ -939,6 +943,9 @@ NOT_COMPARABLE = {
 }
 VERDICT_ORDER = {"pass": 0, "inconclusive": 1, "regression": 2}
 DEFAULT_MAX_NOISE = 0.10
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# `models--<org>--<name>/snapshots/<revision>[/<subdir>]`: a Hugging Face cache snapshot path.
+HF_SNAPSHOT = re.compile(r"models--([^/\\]+?)--([^/\\]+)[/\\]snapshots[/\\][^/\\]+((?:[/\\][^/\\]+)*)$")
 
 
 def t_critical(df: float) -> float:
@@ -968,7 +975,9 @@ def verdict(
     a, b = series(candidate), series(reference)
     out: dict[str, Any] = {"candidate": a, "reference": b}
     if a["n"] < 2 or b["n"] < 2:
-        return {**out, "verdict": "inconclusive", "reason": "fewer than two processes per side"}
+        # The band is process-level only; in-process jitter never stands in for it.
+        n = min(a["n"], b["n"])
+        return {**out, "verdict": "inconclusive", "reason": f"n={n}, no process-level band"}
     va, vb = a["stddev"] ** 2 / a["n"], b["stddev"] ** 2 / b["n"]
     se = math.sqrt(va + vb)
     df = se**4 / (va**2 / (a["n"] - 1) + vb**2 / (b["n"] - 1)) if se > 0 else math.inf
@@ -1013,6 +1022,25 @@ class Process(NamedTuple):
     document: dict[str, Any]
     label: dict[str, Any]  # the summary's process entry
     row_entry: dict[str, Any]  # the summary's row entry
+    lane: str = ""  # the campaign summary's lane
+    epic_sha: str = ""  # the campaign summary's measured commit
+
+
+def family_label(process: Process) -> str:
+    """The family a reader recognises: the document's model label, except that the harness's
+    default label (the snapshot directory's name, ``@<format>`` unless bf16) of a Hugging Face
+    cache snapshot — a revision hash or a bare subdirectory name — becomes ``<org>/<name>`` (plus
+    the subdirectory and format suffix). An explicit ``SPECULATIVE_BENCH_MODEL`` is kept verbatim."""
+    model = process.document.get("model")
+    path = str((process.row_entry.get("snapshot") or {}).get("path") or "")
+    fmt = process.row_entry.get("format") or "bf16"
+    suffix = "" if fmt == "bf16" else f"@{fmt}"
+    name = re.split(r"[/\\]", path.rstrip("/\\"))[-1] if path else ""
+    match = HF_SNAPSHOT.search(path.rstrip("/\\"))
+    if not isinstance(model, str) or not match or model != f"{name}{suffix}":
+        return model if isinstance(model, str) else str(model)
+    org, repo, subdir = match.groups()
+    return f"{org}/{repo}{subdir.replace(chr(92), '/')}{suffix}"
 
 
 def load_campaign(directory: Path) -> tuple[dict[str, Any], list[Process], list[str]]:
@@ -1048,10 +1076,24 @@ def load_campaign(directory: Path) -> tuple[dict[str, Any], list[Process], list[
                 continue
             if entry.get("snapshot_identity") != row["snapshot"]["identity"]:
                 refusals.append(f"{name}: snapshot identity differs from the row's")
+            # The commit a row is attributed to (and superseded by) is the summary's; every
+            # document must have measured exactly that commit.
+            measured = ((document.get("provenance") or {}).get("git") or {}).get("sha")
+            expected = summary.get("epic_sha") if entry["run"] == "epic" else PRE_EPIC_SHA
+            if measured != expected:
+                refusals.append(f"{name}: measured {measured!r}, the summary says {expected!r}")
             counts[entry["run"]] += 1
             processes.append(
                 Process(
-                    directory.name, row["id"], entry["run"], entry["process"], document, entry, row
+                    directory.name,
+                    row["id"],
+                    entry["run"],
+                    entry["process"],
+                    document,
+                    entry,
+                    row,
+                    summary.get("lane") or "",
+                    summary.get("epic_sha") or "",
                 )
             )
         for run, count in counts.items():
@@ -1170,7 +1212,9 @@ def compare_epic_to_baseline(
                 base = {
                     "campaign": campaign,
                     "row": row_id,
-                    "model": config["model"],
+                    "epic_sha": epic[0].epic_sha,
+                    "model": family_label(epic[0]),
+                    "document_model": config["model"],
                     "backend": config["backend"],
                     "snapshot": config["snapshot"],
                     "defaults_row": is_defaults_row(epic[0].row_entry),
@@ -1209,11 +1253,13 @@ def e6_verdicts(comparisons: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The E6 table: per (family, backend, prompt class, option) over the rows measuring the
     build's defaults, each metric's worst per-prompt verdict, and the overall worst."""
     table: dict[tuple, dict[str, list[str]]] = {}
+    evidence: dict[tuple, set[str]] = {}
     for c in comparisons:
         if not c["defaults_row"]:
             continue
         key = (c["model"], c["backend"], c["class"], c["option"])
         table.setdefault(key, {m: [] for m in METRICS})[c["metric"]].append(c["verdict"])
+        evidence.setdefault(key, set()).add(f"{c['campaign']}/{c['row']}@{c['epic_sha'][:12]}")
     out = []
     for (model, backend, prompt_class, option), metrics in sorted(table.items()):
         per_metric = {m: worst(v) for m, v in metrics.items()}
@@ -1225,6 +1271,7 @@ def e6_verdicts(comparisons: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "option": option,
                 **per_metric,
                 "verdict": worst(list(per_metric.values())),
+                "rows": sorted(evidence[(model, backend, prompt_class, option)]),
             }
         )
     return out
@@ -1256,6 +1303,12 @@ DEFAULTS_BACKENDS = {
 def provisional_defaults(source: str) -> list[dict[str, Any]]:
     """Every ``PROVISIONAL`` entry of the defaults table (``core-llm/src/defaults.rs``): its row
     and field, its current value read as on/off, and how a campaign measures it."""
+    return [e for e in default_entries(source) if e["provisional"]]
+
+
+def default_entries(source: str) -> list[dict[str, Any]]:
+    """Every entry of the defaults table with its justification comment and whether that
+    justification is ``PROVISIONAL``."""
     entries = []
     for const, backend in DEFAULTS_BACKENDS.items():
         match = re.search(
@@ -1272,9 +1325,10 @@ def provisional_defaults(source: str) -> list[dict[str, Any]]:
                 comment.append(stripped)
                 continue
             field = re.fullmatch(r"(\w+): (.+),", stripped)
-            if field and any("PROVISIONAL" in c for c in comment):
+            if field and comment:
                 name, value = field.groups()
                 kind, switch = FIELD_MEASUREMENT.get(name, (None, None))
+                justification = " ".join(c.lstrip("/ ").strip() for c in comment)
                 entries.append(
                     {
                         "entry": f"{const}.{name}",
@@ -1284,6 +1338,8 @@ def provisional_defaults(source: str) -> list[dict[str, Any]]:
                         "on": value not in ("false", "Speculative::Off", "0"),
                         "kind": kind,
                         "switch": switch,
+                        "provisional": "PROVISIONAL" in justification,
+                        "justification": justification.removeprefix("justification: "),
                     }
                 )
             comment = []
@@ -1300,9 +1356,12 @@ def _prefix_cache_on(process: Process) -> bool:
 
 
 def _context(process: Process, exclude_switch: str | None, include_cache: bool) -> str:
-    """Everything two epic rows must share to be an on/off pair, but the setting under test."""
+    """Everything two epic rows of one campaign must share to be an on/off pair — twins: their
+    whole configuration (options included) and process schedule (``runs``: a row alternating with
+    pre-epic processes is a different measurement regime), but the setting under test."""
     config = document_config(process)
     config.pop("switch_env")
+    config["runs"] = process.row_entry.get("runs")
     switches = (process.document.get("provenance") or {}).get("switches") or {}
     config["effective"] = {
         name: (value or {}).get("effective")
@@ -1314,15 +1373,28 @@ def _context(process: Process, exclude_switch: str | None, include_cache: bool) 
     return json.dumps({"campaign": process.campaign, **config}, sort_keys=True, default=str)
 
 
+def _deliberate(entry: dict[str, Any], processes: list[Process]) -> bool:
+    """Whether the row set ``entry``'s setting on purpose (a switch in its ``switches``, or a
+    non-zero prefix-cache budget): a row that did so and has no twin is a missing measurement."""
+    if entry["kind"] == "switch":
+        return entry["switch"] in (processes[0].row_entry.get("switches") or {})
+    return entry["kind"] == "prefix_cache" and _prefix_cache_on(processes[0])
+
+
 def _pairs(
     entry: dict[str, Any], rows: list[list[Process]]
-) -> list[tuple[list[Process], list[Process], tuple[str, str] | None]]:
+) -> tuple[list[tuple[list[Process], list[Process], list[tuple[str, str]]]], list[list[Process]]]:
+    """``entry``'s on/off pairs, each with the (on option, off option) pairs to judge, and the
+    rows that set the setting deliberately but have no twin. The speculative option is ``auto`` vs
+    ``off`` inside one row's processes; a switch or the prefix cache is two twin rows
+    (:func:`_context`) differing in that setting, judged option by option."""
     if entry["kind"] == "speculative":
-        return [
-            (processes, processes, ("auto", "off"))
+        pairs = [
+            (processes, processes, [("auto", "off")])
             for processes in rows
             if {"auto", "off"} <= set(document_config(processes[0])["options"])
         ]
+        return pairs, []
     buckets: dict[str, dict[bool, list[list[Process]]]] = {}
     for processes in rows:
         if entry["kind"] == "switch":
@@ -1334,14 +1406,65 @@ def _pairs(
             state = _prefix_cache_on(processes[0])
             context = _context(processes[0], None, include_cache=False)
         else:
-            return []
+            return [], []
         buckets.setdefault(context, {}).setdefault(state, []).append(processes)
-    return [
-        (on, off, None)
-        for states in buckets.values()
-        for on in states.get(True, [])
-        for off in states.get(False, [])
-    ]
+    pairs, unpaired = [], []
+    for states in buckets.values():
+        for on in states.get(True, []):
+            for off in states.get(False, []):
+                options = document_config(on[0])["options"]
+                pairs.append((on, off, [(o, o) for o in options]))
+        if len(states) == 1:
+            unpaired += [p for ps in states.values() for p in ps if _deliberate(entry, p)]
+    return pairs, unpaired
+
+
+def _resolved_to_plain_decode(processes: list[Process], prompt_id: str, option: str) -> bool:
+    """Whether ``option`` ran no proposer for ``prompt_id`` in every process (the DecodeReport's
+    ``proposer`` is ``none``: e.g. ``auto`` on a model with no proposer is plain decode, so it is
+    no evidence about speculation). A document without the field is not assumed either way."""
+    proposers = [(rows_by_key(p)[0].get((prompt_id, option)) or {}).get("proposer") for p in processes]
+    return bool(proposers) and all(proposer == "none" for proposer in proposers)
+
+
+def _e5_outcome(entry: dict[str, Any], judged: list[dict[str, Any]]) -> dict[str, Any]:
+    """E5: ON unless a measured on-vs-off regression (worse beyond the process-level noise band)
+    justifies OFF. ``inconclusive`` and ``not_applicable`` are never a regression."""
+    count = {v: sum(j["verdict"] == v for j in judged) for v in (*VERDICT_ORDER, "not_applicable")}
+    unbanded = sum(j["reason"].endswith("no process-level band") for j in judged)
+    tally = (
+        f"{len(judged)} judged: {count['pass']} pass, {count['regression']} regression, "
+        f"{count['inconclusive']} inconclusive ({unbanded} of them n<2, no process-level band), "
+        f"{count['not_applicable']} not applicable"
+    )
+    regressions = [j for j in judged if j["verdict"] == "regression"]
+    if not judged:
+        reason = "no on/off pair of this setting in the campaigns"
+        if not entry["kind"]:
+            reason = "no measurement mapping"
+        return {"outcome": "unmeasured", "recommended_on": None, "reason": reason}
+    if regressions:
+        where = "; ".join(
+            f"{j['model']} {j['on_row']} vs {j['off_row']} {j['prompt_id']} `{j['option']}` "
+            f"{j['metric']} {j['delta_pct']:+.1f}% (band ±{j['margin_pct']:.1f}%)"
+            for j in regressions
+        )
+        return {
+            "outcome": "off",
+            "recommended_on": False,
+            "reason": f"measured on-vs-off regression ({tally}): {where}",
+        }
+    if count["pass"]:
+        return {
+            "outcome": "on",
+            "recommended_on": True,
+            "reason": f"no measured on-vs-off regression ({tally})",
+        }
+    return {
+        "outcome": "on (unresolved)",
+        "recommended_on": True,
+        "reason": f"no on/off pair resolved and none regressed, so E5 keeps it on ({tally})",
+    }
 
 
 def decide_defaults(
@@ -1349,9 +1472,10 @@ def decide_defaults(
     groups: dict[tuple[str, str], list[Process]],
     max_noise: float,
 ) -> list[dict[str, Any]]:
-    """For each PROVISIONAL entry: the on/off pairs the campaign measured (epic processes only),
-    each (prompt, option, metric) judged on vs off, and what E5 implies — ON unless a measured
-    regression (on worse than off beyond the noise band) justifies OFF."""
+    """For each defaults entry: the on/off pairs of that setting the campaigns measured (epic
+    processes only), each (prompt, option, metric) judged on vs off with the process-level Welch
+    band E6 uses, and what E5 implies. Informational (already-justified) entries are reported only
+    when a pair was measured."""
     epic_rows = []
     for processes in groups.values():
         epic = sorted((p for p in processes if p.run == "epic"), key=lambda p: p.index)
@@ -1360,58 +1484,66 @@ def decide_defaults(
     decisions = []
     for entry in entries:
         rows = [r for r in epic_rows if r[0].document.get("backend") == entry["backend"]]
-        pairs = _pairs(entry, rows)
+        pairs, unpaired = _pairs(entry, rows)
+        if not entry["provisional"] and not pairs and not unpaired:
+            continue
         judged = []
-        for on, off, speculative in pairs:
+        for on, off, option_pairs in pairs:
             config = document_config(on[0])
-            option_pairs = [speculative] if speculative else [(o, o) for o in config["options"]]
             for prompt_id, prompt_class in config["prompts"]:
                 for on_option, off_option in option_pairs:
+                    plain = entry["kind"] == "speculative" and _resolved_to_plain_decode(
+                        on, prompt_id, on_option
+                    )
                     for metric, higher in METRICS.items():
-                        result = verdict(
-                            metric_values(on, prompt_id, on_option, metric),
-                            metric_values(off, prompt_id, off_option, metric),
-                            higher,
-                            max_noise,
-                        )
+                        if plain:
+                            result = {
+                                "verdict": "not_applicable",
+                                "reason": f"`{on_option}` resolved to plain decode (no proposer)",
+                            }
+                        else:
+                            result = verdict(
+                                metric_values(on, prompt_id, on_option, metric),
+                                metric_values(off, prompt_id, off_option, metric),
+                                higher,
+                                max_noise,
+                            )
                         judged.append(
                             {
                                 "on_row": f"{on[0].campaign}/{on[0].row}",
                                 "off_row": f"{off[0].campaign}/{off[0].row}",
-                                "model": config["model"],
+                                "epic_sha": on[0].epic_sha,
+                                "model": family_label(on[0]),
                                 "class": prompt_class,
                                 "prompt_id": prompt_id,
-                                "option": "auto vs off" if speculative else on_option,
+                                "option": f"{on_option} vs {off_option}"
+                                if on_option != off_option
+                                else on_option,
                                 "metric": metric,
+                                "on_n": len(on),
+                                "off_n": len(off),
                                 "verdict": result["verdict"],
+                                "reason": result["reason"],
                                 "delta_pct": result.get("delta_pct"),
                                 "margin_pct": result.get("margin_pct"),
                             }
                         )
-        verdicts = [j["verdict"] for j in judged]
-        if not judged:
-            outcome, recommended = "unmeasured", None
-            reason = "no on/off pair in the campaign" if entry["kind"] else "no measurement mapping"
-        elif "regression" in verdicts:
-            outcome, recommended = "off", False
-            where = sorted(
-                {f"{j['model']} {j['class']} {j['metric']}" for j in judged if j["verdict"] == "regression"}
+        outcome = _e5_outcome(entry, judged)
+        if unpaired:
+            what = "the prefix cache" if entry["kind"] == "prefix_cache" else entry["switch"]
+            outcome["reason"] += (
+                f"; unpaired, no twin row identical but for {what}: "
+                + ", ".join(f"{p[0].campaign}/{p[0].row}" for p in unpaired)
             )
-            reason = "measured regression with it on: " + "; ".join(where)
-        elif "inconclusive" in verdicts:
-            outcome, recommended = "inconclusive", None
-            reason = "some on/off comparisons sit inside a noise band too wide to decide"
-        else:
-            outcome, recommended = "on", True
-            reason = "no measured regression with it on"
+        recommended = outcome["recommended_on"]
         decisions.append(
             {
                 **entry,
+                "informational": not entry["provisional"],
                 "pairs": len(pairs),
-                "outcome": outcome,
-                "recommended_on": recommended,
+                "unpaired": [f"{p[0].campaign}/{p[0].row}" for p in unpaired],
+                **outcome,
                 "flip": recommended is not None and recommended != entry["on"],
-                "reason": reason,
                 "judged": judged,
             }
         )
@@ -1429,7 +1561,8 @@ def markdown_report(report: dict[str, Any]) -> str:
         "Noise band: Welch's two-sided 95% interval over **process-level** repeats (each process's "
         "in-process mean is one sample; the in-process standard deviation is reported as "
         "within-process jitter only). A worse mean inside the band passes unless the band is "
-        f"wider than {report['max_noise']:.0%} of the reference (then inconclusive).",
+        f"wider than {report['max_noise']:.0%} of the reference (then inconclusive). A side with "
+        "fewer than two processes has no band and is inconclusive (`n=1, no process-level band`).",
         "",
         "## Campaigns",
         "",
@@ -1443,28 +1576,56 @@ def markdown_report(report: dict[str, Any]) -> str:
         )
     lines += [
         "",
+        "## Rows judged (each attributed to the epic commit it measured)",
+        "",
+        "| lane | row | campaign | epic | family | epic processes | baseline processes |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for r in report["rows"]:
+        lines.append(
+            f"| {r['lane']} | {r['row']} | {r['campaign']} | `{r['epic_sha'][:12]}` | {r['model']} | "
+            f"{r['processes']['epic']} | {r['processes']['baseline']} |"
+        )
+    lines += [
+        "",
+        "## Superseded (re-measured at a descendant commit; excluded from every verdict)",
+        "",
+        "| lane | row | campaign | epic | superseded by | why |",
+        "|---|---|---|---|---|---|",
+    ]
+    for s in report["superseded"]:
+        by_campaign, _, by_sha = s["superseded_by"].partition("@")
+        lines.append(
+            f"| {s['lane']} | {s['row']} | {s['campaign']} | `{s['epic_sha'][:12]}` | "
+            f"{by_campaign} `{by_sha[:12]}` | {s['why']} |"
+        )
+    if not report["superseded"]:
+        lines.append("| — | — | — | — | — | no row was measured by more than one campaign |")
+    lines += [
+        "",
         "## E6 — epic vs pre-epic baseline (rows at the build's defaults)",
         "",
-        "| family | backend | class | option | decode tok/s | TTFT | verdict |",
-        "|---|---|---|---|---|---|---|",
+        "| family | backend | class | option | decode tok/s | TTFT | verdict | rows (epic) |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for e in report["e6"]:
         lines.append(
             f"| {e['model']} | {e['backend']} | {e['class']} | `{e['option']}` | "
-            f"{e['decode_tok_s']} | {e['ttft_ms']} | **{e['verdict']}** |"
+            f"{e['decode_tok_s']} | {e['ttft_ms']} | **{e['verdict']}** | {', '.join(e['rows'])} |"
         )
     if not report["e6"]:
-        lines.append("| — | — | — | — | — | — | no defaults row ran both revisions |")
+        lines.append("| — | — | — | — | — | — | no defaults row ran both revisions | — |")
     lines += [
         "",
         "### Per prompt",
         "",
-        "| row | prompt | option | metric | epic mean (n) | baseline mean (n) | Δ % | band % | verdict |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| row | epic | prompt | option | metric | epic mean (n) | baseline mean (n) | Δ % | band % | verdict |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for c in report["comparisons"]:
         lines.append(
-            f"| {c['campaign']}/{c['row']} | {c['prompt_id']} | `{c['option']}` | {c['metric']} | "
+            f"| {c['campaign']}/{c['row']} | `{c['epic_sha'][:12]}` | {c['prompt_id']} | "
+            f"`{c['option']}` | {c['metric']} | "
             f"{_fmt(c['epic']['mean'], 2)} ({c['epic']['n']}) | "
             f"{_fmt(c['baseline']['mean'], 2)} ({c['baseline']['n']}) | "
             f"{_fmt(c.get('delta_pct'))} | {_fmt(c.get('margin_pct'))} | {c['verdict']} |"
@@ -1486,27 +1647,128 @@ def markdown_report(report: dict[str, Any]) -> str:
         )
     lines += [
         "",
-        "## E5 — PROVISIONAL defaults",
+        "## E5 — defaults decided from on-vs-off pairs of the same setting",
+        "",
+        "PROVISIONAL entries are decided here; an already-justified entry with a measured pair is "
+        "listed as *informational* beside its justification. A default is ON unless an on-vs-off "
+        "pair regresses beyond the noise band; `inconclusive` and `not_applicable` never do.",
         "",
         "| entry | current | pairs | outcome | recommended | flip | reason |",
         "|---|---|---|---|---|---|---|",
     ]
     for d in report["defaults"]:
         recommended = {True: "on", False: "off", None: "—"}[d["recommended_on"]]
+        entry = f"`{d['entry']}`"
+        if d["informational"]:
+            entry += f" (informational; justified: {d['justification']})"
         lines.append(
-            f"| `{d['entry']}` | `{d['value']}` | {d['pairs']} | {d['outcome']} | {recommended} | "
+            f"| {entry} | `{d['value']}` | {d['pairs']} | {d['outcome']} | {recommended} | "
             f"{'**yes**' if d['flip'] else 'no'} | {d['reason']} |"
         )
+    lines += [
+        "",
+        "### E5 judged pairs",
+        "",
+        "| entry | family | on row | off row | prompt | option | metric | n on/off | Δ % | band % | verdict | why |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for d in report["defaults"]:
+        for j in d["judged"]:
+            lines.append(
+                f"| `{d['entry']}` | {j['model']} | {j['on_row']} | {j['off_row']} | "
+                f"{j['prompt_id']} | `{j['option']}` | {j['metric']} | {j['on_n']}/{j['off_n']} | "
+                f"{_fmt(j['delta_pct'])} | {_fmt(j['margin_pct'])} | {j['verdict']} | {j['reason']} |"
+            )
     if report["notes"]:
         lines += ["", "## Notes", ""] + [f"- {note}" for note in report["notes"]]
     return "\n".join(lines) + "\n"
 
 
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """``git merge-base --is-ancestor``; refuses a commit the repository does not know."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise Refused(
+            f"cannot order {ancestor} and {descendant} in {repo}: "
+            f"{result.stderr.strip() or f'git exited {result.returncode}'}"
+        )
+    return result.returncode == 0
+
+
+def _measurement(processes: list[Process]) -> list[tuple[str, int, str]]:
+    return sorted((p.run, p.index, json.dumps(p.document, sort_keys=True)) for p in processes)
+
+
+def supersede(
+    groups: dict[tuple[str, str], list[Process]], repo: Path
+) -> tuple[dict[tuple[str, str], list[Process]], list[dict[str, Any]], list[str]]:
+    """One measurement per (lane, row id): where campaigns measured the same row, the one at the
+    descendant epic commit supersedes the others. Refused when the commits are unordered (neither
+    is an ancestor of the other) or equal with different data; a byte-identical copy at the same
+    commit is a duplicate. Rows no later campaign re-measured stay, attributed to their commit."""
+    by_row: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for (campaign, row_id), processes in groups.items():
+        by_row.setdefault((processes[0].lane, row_id), []).append((campaign, processes[0].epic_sha))
+    kept = dict(groups)
+    superseded, refusals = [], []
+    for (lane, row_id), measured in by_row.items():
+        if len(measured) < 2:
+            continue
+        tag = f"{lane} row {row_id}"
+        try:
+            same = [
+                (a, b)
+                for i, a in enumerate(measured)
+                for b in measured[i + 1 :]
+                if a[1] == b[1]
+                and _measurement(groups[(a[0], row_id)]) != _measurement(groups[(b[0], row_id)])
+            ]
+            if same:
+                (a, sha), (b, _) = same[0]
+                raise Refused(f"{tag}: {a} and {b} both measured {sha} with different data")
+            newest = [
+                (campaign, sha)
+                for campaign, sha in measured
+                if all(other == sha or is_ancestor(repo, other, sha) for _, other in measured)
+            ]
+            if not newest:
+                shas = ", ".join(f"{c}@{s}" for c, s in measured)
+                raise Refused(f"{tag}: no measurement descends from all the others ({shas})")
+        except Refused as refused:
+            refusals.append(str(refused))
+            continue
+        winner = newest[0]
+        for campaign, sha in measured:
+            if (campaign, sha) == winner:
+                continue
+            del kept[(campaign, row_id)]
+            superseded.append(
+                {
+                    "lane": lane,
+                    "row": row_id,
+                    "campaign": campaign,
+                    "epic_sha": sha,
+                    "superseded_by": f"{winner[0]}@{winner[1]}",
+                    "why": "duplicate at the same commit" if sha == winner[1] else "older commit",
+                }
+            )
+    return kept, superseded, refusals
+
+
 def compare_campaigns(
-    directories: list[Path], defaults_source: str, max_noise: float = DEFAULT_MAX_NOISE
+    directories: list[Path],
+    defaults_source: str,
+    max_noise: float = DEFAULT_MAX_NOISE,
+    repo: Path = REPO_ROOT,
 ) -> dict[str, Any]:
     """The comparison report over campaign directories; raises :class:`Refused` listing every
-    reason the evidence cannot be judged."""
+    reason the evidence cannot be judged. ``repo`` orders the campaigns' epic commits."""
     refusals: list[str] = []
     campaigns, groups = [], {}
     for directory in directories:
@@ -1530,8 +1792,22 @@ def compare_campaigns(
         refusals.append("two campaign directories share a name")
     for processes in groups.values():
         refusals += check_row_evidence(processes)
+    groups, superseded, problems = supersede(groups, repo)
+    refusals += problems
     if refusals:
         raise Refused("\n".join(refusals))
+    rows = []
+    for (campaign, row_id), processes in sorted(groups.items()):
+        rows.append(
+            {
+                "lane": processes[0].lane,
+                "row": row_id,
+                "campaign": campaign,
+                "epic_sha": processes[0].epic_sha,
+                "model": family_label(processes[0]),
+                "processes": {run: sum(p.run == run for p in processes) for run in RUNS},
+            }
+        )
     notes = []
     for (campaign, row_id), processes in sorted(groups.items()):
         tokens = {
@@ -1551,12 +1827,15 @@ def compare_campaigns(
                 f"(a chat-template change?): {tokens}"
             )
     comparisons, not_comparable = compare_epic_to_baseline(groups, max_noise)
-    defaults = decide_defaults(provisional_defaults(defaults_source), groups, max_noise)
+    entries = [e for e in default_entries(defaults_source) if e["provisional"] or e["kind"]]
+    defaults = decide_defaults(entries, groups, max_noise)
     return {
         "schema": COMPARE_SCHEMA,
         "max_noise": max_noise,
         "confidence": 0.95,
         "campaigns": campaigns,
+        "rows": rows,
+        "superseded": superseded,
         "e6": e6_verdicts(comparisons),
         "comparisons": comparisons,
         "not_comparable": not_comparable,
@@ -1571,6 +1850,7 @@ def command_compare(args: argparse.Namespace) -> int:
             [Path(d) for d in args.campaign],
             Path(args.defaults).read_text(encoding="utf-8"),
             args.max_noise,
+            Path(args.repo),
         )
     except Refused as refused:
         print("::error::refused to compare:", file=sys.stderr)
@@ -1637,6 +1917,11 @@ def main(argv: list[str] | None = None) -> int:
     compare.add_argument("--markdown", required=True, help="report path (must not exist)")
     compare.add_argument("--defaults", default=str(DEFAULTS_SOURCE), help="core-llm defaults.rs")
     compare.add_argument("--max-noise", type=float, default=DEFAULT_MAX_NOISE)
+    compare.add_argument(
+        "--repo",
+        default=str(REPO_ROOT),
+        help="a clone holding every campaign's epic commit (orders re-measured rows)",
+    )
 
     args = parser.parse_args(argv)
     return {
