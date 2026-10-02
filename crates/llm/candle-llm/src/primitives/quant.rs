@@ -515,3 +515,109 @@ mod tests {
         );
     }
 }
+
+/// sc-24446: a CUDA quantize-on-load leaves no garbage in the quantized storage's row padding.
+/// candle's MMQ kernels (any quantized matmul over more than 8 rows) load `MMQ_ITER_K` = 256
+/// elements of every row, so a row narrower than that — the stage-2 synthetic fixture's 32/64,
+/// a real 5504-wide `down_proj`'s ragged last tile — reads blocks out of the padding after the
+/// last row. Their quants meet zero activations, but each block's f16 scale is still multiplied
+/// in: an inf/NaN there made the YuE stage-2 test's logits NaN, intermittently, as whatever the
+/// pool last held there changed.
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests {
+    use super::*;
+    use candle_core::cuda_backend::cudarc;
+
+    /// The quantizer's storage is `data` plus 512 elements' worth of blocks of padding.
+    fn padded_bytes(dtype: GgmlDType, elems: usize) -> (usize, usize) {
+        let data = elems / dtype.block_size() * dtype.type_size();
+        (data, data + 512 / dtype.block_size() * dtype.type_size())
+    }
+
+    fn uniform(seed: u64, len: usize) -> Vec<f32> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// Fill the device's free pool with all-ones bytes (an f16 `0xFFFF` is a NaN) in exactly the
+    /// size the quantizer is about to allocate, then free it, so its allocation is handed poisoned
+    /// memory rather than fresh (zeroed) pages.
+    fn poison_pool(dev: &candle_core::CudaDevice, bytes: usize) {
+        let poison = vec![0xFFu8; bytes];
+        let slices: Vec<_> = (0..256)
+            .map(|_| dev.clone_htod(&poison).expect("poison buffer"))
+            .collect();
+        drop(slices);
+    }
+
+    #[test]
+    fn quantize_on_load_zeroes_the_padding_mmq_reads() {
+        let dev = crate::device::new_cuda_for_test().expect("a CUDA device");
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!("new_cuda_for_test opens a CUDA device")
+        };
+        // 64 output rows of 32 inputs (one Q8_0 / Q4_0 block per row), 16 activation rows: the
+        // MMQ path, whose tile reads 7 blocks past the end of the last weight row.
+        let (out, inn, rows) = (64usize, 32usize, 16usize);
+        for (seed, dtype) in [(1u64, GgmlDType::Q8_0), (2, GgmlDType::Q4_0)] {
+            let w_host =
+                Tensor::from_vec(uniform(seed, out * inn), (out, inn), &Device::Cpu).unwrap();
+            let x_host =
+                Tensor::from_vec(uniform(seed + 10, rows * inn), (rows, inn), &Device::Cpu)
+                    .unwrap();
+            let w = w_host.to_device(&dev).unwrap();
+            let (data, padded) = padded_bytes(dtype, out * inn);
+            // `quantize` compacts an f32 weight first (one `out·in·4`-byte copy), then allocates
+            // the padded storage: poison both sizes.
+            poison_pool(cuda, out * inn * 4);
+            poison_pool(cuda, padded);
+            let q = QuantizedLinear::quantize(&w, dtype, None).unwrap();
+
+            // The padding itself is zero.
+            let QuantizedWeight::Matmul(QMatMul::QTensor(qt)) = &q.inner else {
+                panic!("{dtype:?} quantizes to a GGML block tensor");
+            };
+            assert_eq!(qt.storage_size_in_bytes(), data);
+            let base = qt.device_ptr().unwrap() as u64;
+            let mut tail = vec![0xAAu8; padded - data];
+            cuda.cuda_stream().context().bind_to_thread().unwrap();
+            // SAFETY: `[base, base + padded)` is the live allocation `qt` owns; the legacy-stream
+            // device orders this synchronous copy after the quantizer's upload.
+            unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut tail, base + data as u64) }
+                .unwrap();
+            assert!(
+                tail.iter().all(|&b| b == 0),
+                "{dtype:?}: {} non-zero padding bytes",
+                tail.iter().filter(|&&b| b != 0).count()
+            );
+
+            // And the MMQ forward over it is finite and matches the dequantized weight's matmul.
+            let y = q
+                .forward(&x_host.to_device(&dev).unwrap())
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let deq = qt.dequantize(&Device::Cpu).unwrap();
+            let want = x_host
+                .matmul(&deq.t().unwrap())
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            for (r, (got, want)) in y.iter().zip(&want).enumerate() {
+                for (c, (g, w)) in got.iter().zip(want).enumerate() {
+                    assert!(g.is_finite(), "{dtype:?}: output [{r}, {c}] is {g}");
+                    assert!((g - w).abs() < 0.05, "{dtype:?}: [{r}, {c}] {g} vs {w}");
+                }
+            }
+        }
+    }
+}

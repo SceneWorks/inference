@@ -620,7 +620,8 @@ impl QCudaStorage {
         let data = qcpu_storage.data()?;
         let padded_len =
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
-        let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
+        // Zeroed (SceneWorks delta, see VENDORED.md): MMQ tiles read this padding past the last row.
+        let mut inner = self.device.alloc_zeros::<u8>(padded_len)?;
         self.device
             .memcpy_htod(&*data, &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
@@ -648,7 +649,8 @@ impl QCudaStorage {
         let data = qcpu_storage.data()?;
         let padded_len =
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
-        let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
+        // Zeroed (SceneWorks delta, see VENDORED.md): MMQ tiles read this padding past the last row.
+        let mut inner = self.device.alloc_zeros::<u8>(padded_len)?;
         self.device
             .memcpy_htod(&*data, &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
@@ -677,7 +679,8 @@ impl QCudaStorage {
         let data = qcpu_storage.data()?;
         let padded_len =
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
-        let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
+        // Zeroed (SceneWorks delta, see VENDORED.md): MMQ tiles read this padding past the last row.
+        let mut inner = self.device.alloc_zeros::<u8>(padded_len)?;
         self.device
             .memcpy_htod(&*data, &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
@@ -701,7 +704,8 @@ impl QCudaStorage {
         let data = qcpu_storage.data()?;
         let padded_len =
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
-        let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
+        // Zeroed (SceneWorks delta, see VENDORED.md): MMQ tiles read this padding past the last row.
+        let mut inner = self.device.alloc_zeros::<u8>(padded_len)?;
         self.device
             .memcpy_htod(&*data, &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
