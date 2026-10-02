@@ -9,7 +9,8 @@
 //! budgets, warm-up rule and repeat statistics, and writes **the harness's JSON schema**
 //! (`core_llm_testkit::BenchRow` documents it): every field the pre-epic revision cannot report is
 //! `null` — `graph_path`, `prefix_cache`, `prefix_hit_tokens`, `prefill_forwards`, `verify_steps`,
-//! `discarded_forwards`, `mean_accepted_length` (its denominator is `verify_steps`), `fallbacks`,
+//! `discarded_forwards`, `speculative_demoted_at`, `mean_accepted_length` (its denominator is
+//! `verify_steps`), `fallbacks`,
 //! and the `load` block's
 //! `prefix_cache_bytes`, `draft` and `fallbacks`. Where a pre-epic MLX provider returns no
 //! `DecodeReport`, `proposer` is `mtp` when its legacy `MtpStats` say MTP ran (else `null`) and the
@@ -636,6 +637,7 @@ pub fn row_json(
         "verify_steps": null,
         "replay_forwards": report.map(|r| r.replay_forwards),
         "discarded_forwards": null,
+        "speculative_demoted_at": null,
         "proposed_tokens": count(|r| r.proposed_tokens, |m| m.proposed_tokens),
         "accepted_tokens": count(|r| r.accepted_tokens, |m| m.accepted_tokens),
         "mean_accepted_length": null,

@@ -179,6 +179,10 @@ pub struct DecodeRecord {
     pub prefix_cache: &'static str,
     /// Why the cache was bypassed, or why this request's state was not kept.
     pub prefix_cache_reason: Option<&'static str>,
+    /// Tokens generated when `auto`'s acceptance monitor demoted the speculative engine to
+    /// token-at-a-time steps (sc-24446) — see
+    /// [`core_llm::DecodeReport::speculative_demoted_at`]; `None` when nothing was demoted.
+    pub speculative_demoted_at: Option<u64>,
 }
 
 impl DecodeRecord {
@@ -212,6 +216,7 @@ impl DecodeRecord {
             prefix_hit_tokens: 0,
             prefix_cache: "none",
             prefix_cache_reason: None,
+            speculative_demoted_at: None,
         }
     }
 
@@ -326,6 +331,7 @@ impl DecodeRecord {
             prefix_hit_tokens: 0,
             prefix_cache: "none",
             prefix_cache_reason: None,
+            speculative_demoted_at: stats.demoted_at.map(|n| n as u64),
         }
     }
 
@@ -409,6 +415,7 @@ impl DecodeRecord {
             replay_forwards: self.replay_forwards,
             // No Candle loop enqueues a look-ahead forward it may discard (E3).
             discarded_forwards: 0,
+            speculative_demoted_at: self.speculative_demoted_at,
             prefix_hit_tokens: self.prefix_hit_tokens,
             prefix_cache: core_llm::PathReport {
                 path: self.prefix_cache.to_string(),
@@ -687,6 +694,7 @@ mod tests {
                 verify_steps: 4,
                 direct_rollbacks: 2,
                 replays: 1,
+                demoted_at: Some(7),
             },
             10,
             SpanCounters {
@@ -727,6 +735,11 @@ mod tests {
         assert_eq!(spec.proposer.label(), "mtp");
         assert_eq!(spec.logits_to_host_per_token(), Some(0.0));
         assert_eq!(spec.sampler.label(), "device");
+        // sc-24446: the engine's demotion point reaches the record and its report; a plain record
+        // was never demoted.
+        assert_eq!(spec.speculative_demoted_at, Some(7));
+        assert_eq!(spec.report(false).speculative_demoted_at, Some(7));
+        assert_eq!(plain.report(false).speculative_demoted_at, None);
     }
 
     #[test]

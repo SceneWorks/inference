@@ -136,13 +136,15 @@ pub use resource::{
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{
-    accept_greedy_run, accept_token, draft_compatibility, draft_load_refusal,
+    accept_greedy_run, accept_token, demotion_threshold, draft_compatibility, draft_load_refusal,
     draft_model_capabilities, draft_refusal, draft_tokenizer_refusal, draft_unpriced_refusal,
     fit_draft_context, greedy_commit, ngram_propose, no_proposer_fallback,
     prompt_lookup_capabilities, resolve_speculative, settle_draft, verify_depth_bound, Acceptance,
-    ProposerKind, SpeculativePlan, SpeculativeResolution, CAPTIONER_NO_PREFIX_CACHE,
-    CAPTIONER_NO_PROPOSER, DRAFT_MODEL_NOT_LOADED, DRAFT_MODEL_RECOMMENDED_DEPTH,
-    MTP_RECOMMENDED_DEPTH, PROMPT_LOOKUP_RECOMMENDED_DEPTH,
+    AcceptanceMonitor, ProposerKind, SpeculativePlan, SpeculativeResolution,
+    ACCEPTANCE_PROBE_VERIFIES, CAPTIONER_NO_PREFIX_CACHE, CAPTIONER_NO_PROPOSER,
+    DRAFT_MODEL_NOT_LOADED, DRAFT_MODEL_RECOMMENDED_DEPTH, MTP_DEMOTE_BELOW_AT_ONE_DRAFT,
+    MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT, MTP_RECOMMENDED_DEPTH, PROMPT_LOOKUP_DEMOTE_BELOW,
+    PROMPT_LOOKUP_RECOMMENDED_DEPTH,
 };
 pub use starvector::{
     generated_token_budget, validate_advertised_generated_token_cap,

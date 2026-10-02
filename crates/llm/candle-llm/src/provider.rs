@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_with,
+    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_monitored,
     graph_workspace_admission_bytes, prefill_restored, Boundary, ConstraintMask, CountingDecode,
     Decode, DecodePath, DecodeRecord, DraftModelProposer, FinishReason, GenerationConfig,
     GraphRunner, GraphTally, MtpProposer, NgramProposer, NoProposer, PrefixCache, PrefixStats,
@@ -4325,6 +4325,15 @@ impl TextLlm for LlamaProvider {
             }
         }
 
+        // `auto`'s acceptance monitor over the proposer the engine will actually run (sc-24446,
+        // E5): it demotes a proposer measurably slower than plain decoding to the engine's
+        // ordinary steps; an explicit `{proposer, depth}` runs as asked.
+        let acceptance = match route {
+            DecodeRoute::Engine { proposer, drafts } => {
+                core_llm::AcceptanceMonitor::for_request(speculative, proposer, drafts)
+            }
+            DecodeRoute::Reference => None,
+        };
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
             sampling: map_sampling(&req.sampling),
@@ -4563,7 +4572,7 @@ impl TextLlm for LlamaProvider {
                                 }
                                 (None, None) => &mut no_proposer,
                             };
-                        let run = generate_speculative_with(
+                        let run = generate_speculative_monitored(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -4583,6 +4592,7 @@ impl TextLlm for LlamaProvider {
                             constraint,
                             should_stop_opt,
                             None,
+                            acceptance,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
@@ -4651,7 +4661,7 @@ impl TextLlm for LlamaProvider {
                                 }
                                 (None, None) => &mut no_proposer,
                             };
-                        let run = generate_speculative_with(
+                        let run = generate_speculative_monitored(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -4669,6 +4679,7 @@ impl TextLlm for LlamaProvider {
                             constraint,
                             should_stop_opt,
                             Some(&mut boundary),
+                            acceptance,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
@@ -4782,7 +4793,7 @@ impl TextLlm for LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
-                        let run = generate_speculative_with(
+                        let run = generate_speculative_monitored(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -4800,6 +4811,7 @@ impl TextLlm for LlamaProvider {
                             constraint,
                             should_stop_opt,
                             None,
+                            acceptance,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -4842,7 +4854,7 @@ impl TextLlm for LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
-                        let run = generate_speculative_with(
+                        let run = generate_speculative_monitored(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -4860,6 +4872,7 @@ impl TextLlm for LlamaProvider {
                             constraint,
                             should_stop_opt,
                             None,
+                            acceptance,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -4909,7 +4922,7 @@ impl TextLlm for LlamaProvider {
                             decode_started = Some(std::time::Instant::now());
                             Ok(())
                         };
-                        let run = generate_speculative_with(
+                        let run = generate_speculative_monitored(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -4927,6 +4940,7 @@ impl TextLlm for LlamaProvider {
                             constraint,
                             should_stop_opt,
                             Some(&mut boundary),
+                            acceptance,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -9749,6 +9763,46 @@ mod tests {
             "legacy",
         );
         assert_eq!(fallbacks, clamp("mtp", 40, super::MTP_MAX_DEPTH));
+    }
+
+    /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
+    /// proposer does not. On the synthetic Qwen3.5 snapshot `auto` resolves to its MTP head, whose
+    /// random weights never draft a token the target accepts (asserted as the premise): `auto` is
+    /// demoted at the end of the probe window and the report says where, while the same proposer
+    /// asked for explicitly runs to the end. Both stream exactly `off`'s tokens.
+    #[test]
+    fn auto_is_monitored_and_an_explicit_proposer_is_not() {
+        use core_llm::{Sampling, Speculative, SpeculativeProposer};
+        let dir = q8_capable_qwen35_snapshot(false);
+        let provider = super::LlamaProvider::load(&core_llm::LoadSpec::dense(
+            dir.path().display().to_string(),
+        ))
+        .expect("load the synthetic Qwen3.5 snapshot with an MTP head");
+        let prompt = &fixture_prompts()[0];
+        let request = |spec| core_llm_testkit::bench_request(prompt, spec, &Sampling::greedy(), 48);
+        let (off, _) = token_events(&provider, &request(Speculative::Off));
+        let (auto_events, auto) = token_events(&provider, &request(Speculative::Auto));
+        let auto = auto.decode.unwrap();
+        let depth = auto.draft_tokens.expect("auto ran a proposer");
+        let explicit = Speculative::proposer(SpeculativeProposer::Mtp, depth);
+        let (asked_events, asked) = token_events(&provider, &request(explicit));
+        let asked = asked.decode.unwrap();
+        assert_eq!(auto_events, off, "auto is greedy-exact");
+        assert_eq!(asked_events, off, "the explicit request is greedy-exact");
+        assert_eq!(
+            (auto.proposer, asked.proposer),
+            (ProposerKind::Mtp, ProposerKind::Mtp)
+        );
+        assert_eq!(asked.speculative_demoted_at, None, "{asked:?}");
+        // The fixture head never pays at this depth (accepted 0 over the whole explicit run), so
+        // `auto` is demoted at the end of the probe window and stops proposing.
+        assert_eq!(asked.accepted_tokens, 0, "fixture premise: {asked:?}");
+        assert_eq!(
+            auto.speculative_demoted_at,
+            Some(1 + u64::from(core_llm::ACCEPTANCE_PROBE_VERIFIES)),
+            "{auto:?}"
+        );
+        assert!(auto.proposed_tokens < asked.proposed_tokens);
     }
 
     /// sc-24438 AC2: a qwen3_5 MoE snapshot carrying an MTP head — its predictor layer a

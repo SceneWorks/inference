@@ -265,6 +265,7 @@ pub fn x_decode(report: &DecodeReport) -> Value {
         "verify_steps": report.verify_steps,
         "replay_forwards": report.replay_forwards,
         "discarded_forwards": report.discarded_forwards,
+        "speculative_demoted_at": report.speculative_demoted_at,
         "prefix_cache": path(&report.prefix_cache),
         "prefix_hit_tokens": report.prefix_hit_tokens,
         "fallbacks": report.fallbacks,

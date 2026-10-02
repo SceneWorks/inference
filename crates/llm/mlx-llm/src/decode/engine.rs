@@ -57,7 +57,8 @@ use mlx_rs::Array;
 
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{
-    CudaGraphsReport, DecodeReport, HostSampleReason, PathReport, ProposerKind, SamplerPath,
+    AcceptanceMonitor, CudaGraphsReport, DecodeReport, HostSampleReason, PathReport, ProposerKind,
+    SamplerPath,
 };
 
 use crate::decode::cancel::CancelFlag;
@@ -820,6 +821,11 @@ pub struct EngineOptions<'a, 'c> {
     pub sampler: Option<&'a mut (dyn TokenSampler + 'c)>,
     /// Whether the token-at-a-time loop may pipeline (see [`generate_speculative`]).
     pub pipelining: Pipelining,
+    /// `auto`'s acceptance monitor ([`AcceptanceMonitor::for_request`], sc-24446): `Some` demotes
+    /// a speculative run whose proposer is not paying for itself to token-at-a-time decoding (see
+    /// [`generate_speculative`]); `None` — an explicit proposer request, or no proposer — runs the
+    /// proposer to the end.
+    pub acceptance: Option<AcceptanceMonitor>,
 }
 
 /// Whether [`generate_speculative`] pipelines its token-at-a-time loop (story sc-24439).
@@ -880,11 +886,24 @@ impl SpeculativeRun {
 /// [`SpeculativeRun::committed_cache_len`] is where the committed sequence ends. The draws, and so the
 /// output, are the same with or without pipelining ([`Pipelining::Off`]).
 ///
-/// A **speculative** run (any proposer) is not pipelined: the proposer must read the committed
-/// token on the host — the n-gram context, the MTP head's hidden row — before it can draft the next
-/// step, and the verify decision reads the drafts' rows, so there is no next step to enqueue before
-/// this one is read back. A penalized or constrained run is not pipelined either: its draws read
-/// the host history / grammar that the unread token would advance.
+/// The first token is handed to the device before step 1 is enqueued behind it, so its read-back
+/// waits for the prefill and its own draw only — never for step 1's forward (sc-24446).
+///
+/// A **speculative** step (any proposer) is not pipelined, even one whose proposer found nothing
+/// to draft: the proposer must read the committed token on the host — the n-gram context, the MTP
+/// head's hidden row — before it can draft the next step, and the verify decision reads the drafts'
+/// rows, so there is no next step to enqueue before this one is read back. A penalized or
+/// constrained run is not pipelined either: its draws read the host history / grammar that the
+/// unread token would advance.
+///
+/// ## Demotion (sc-24446)
+/// With an [`EngineOptions::acceptance`] monitor (`auto`), the run's first
+/// [`ACCEPTANCE_PROBE_VERIFIES`](core_llm::ACCEPTANCE_PROBE_VERIFIES) verify steps decide whether
+/// the proposer pays for itself; below its break-even the run is **demoted**: no further step
+/// proposes, asks for hidden rows or commits to the proposer, and — where the draws allow
+/// pipelining — the rest of the run is handed to the pipelined token-at-a-time loop (otherwise it
+/// continues as unpipelined single-token verify steps). The output is unchanged: a step without
+/// drafts is the plain loop's draw. [`DecodeReport::speculative_demoted_at`] records where.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_speculative<T, P>(
     target: &T,
@@ -909,6 +928,7 @@ where
         prefill_clock,
         sampler,
         pipelining,
+        acceptance,
     } = options;
     let mut owned_sampler;
     let sampler: &mut dyn TokenSampler = match sampler {
@@ -1035,86 +1055,37 @@ where
         let mask = constraint.as_mut().map(|c| c.allowed());
         sampler.sample(&logits, &history, mask)?
     };
-    if pipelining == Pipelining::Auto
+    // Whether the token-at-a-time steps may pipeline: the draws are device-resident and
+    // independent of the host. A run with no proposer pipelines from token 0; a speculative run
+    // `auto` demotes hands its remaining plain steps to the same loop.
+    let can_pipeline = pipelining == Pipelining::Auto
         && crate::switches::PIPELINING.enabled()
-        && kind == ProposerKind::None
         && constraint.is_none()
-        && !wants_hidden
-        && !sampler.reads_history()
-    {
+        && !sampler.reads_history();
+    if can_pipeline && kind == ProposerKind::None && !wants_hidden {
         if let Some(warm) = warm.as_ref() {
             eval([warm])?;
         }
         drop(warm);
         drop(prompt_hidden);
-        let mut prefill_logits = Some(logits);
-        let mut pending = first;
-        let mut release = BufferRelease::new();
-        loop {
-            // Enqueue step t + 1 on step t's unread token, then read step t back while the device
-            // runs it. Never past the budget; a host draw is already read back, so it waits.
-            let ahead = if pending.is_device() && generated.len() + 1 < config.max_new_tokens {
-                let position = target.cache_len(cache) + position_delta;
-                let out =
-                    target.forward(cache, &pending.input()?, position, LogitsScope::Last, false)?;
-                let next = sampler.sample(&out.logits, &history, None)?;
-                if let SampledToken::Device(id) = &next {
-                    async_eval([id])?;
-                }
-                stats.forwards += 1;
-                stats.pipelined += 1;
-                Some(next)
-            } else {
-                None
-            };
-            let token = pending.resolve()?;
-            // The first read-back evaluated the prefill: its prompt-length logits retire here and
-            // the post-prefill buffer release rides the first `advance` below.
-            drop(prefill_logits.take());
-            let end = if config.stop_tokens.contains(&token) {
-                Some(FinishReason::StopToken)
-            } else {
-                on_event(StreamEvent::Token {
-                    id: token,
-                    step: generated.len(),
-                });
-                generated.push(token);
-                history.push(token);
-                if should_stop.is_some_and(|stop| stop()) {
-                    Some(FinishReason::Stopped)
-                } else if generated.len() >= config.max_new_tokens {
-                    Some(FinishReason::MaxTokens)
-                } else if cancel.is_cancelled() {
-                    Some(FinishReason::Cancelled)
-                } else {
-                    None
-                }
-            };
-            if let Some(end) = end {
-                finish = end;
-                if ahead.is_some() {
-                    stats.discarded += 1; // enqueued, never read back, never emitted
-                }
-                break;
-            }
-            release.advance(1);
-            stats.verify_steps += 1;
-            pending = match ahead {
-                Some(next) => next,
-                None => {
-                    let position = target.cache_len(cache) + position_delta;
-                    let out = target.forward(
-                        cache,
-                        &input_ids(&[token]),
-                        position,
-                        LogitsScope::Last,
-                        false,
-                    )?;
-                    stats.forwards += 1;
-                    sampler.sample(&out.logits, &history, None)?
-                }
-            };
-        }
+        finish = pipelined_steps(
+            target,
+            cache,
+            position_delta,
+            first,
+            Some(logits),
+            PlainState {
+                history: &mut history,
+                generated: &mut generated,
+                stats: &mut stats,
+                release: &mut BufferRelease::new(),
+            },
+            config,
+            &mut *sampler,
+            should_stop,
+            cancel,
+            on_event,
+        )?;
         return Ok(finished(
             generated, finish, stats, sampler, timer, start_len, on_event,
         ));
@@ -1153,13 +1124,23 @@ where
     }
 
     // ---- Speculative steps. ----
+    // `auto`'s acceptance monitor (sc-24446): once demoted, no step proposes, asks for hidden
+    // rows or commits to the proposer — the rest of the run is token-at-a-time, handed to the
+    // pipelined loop when the draws allow it.
+    let mut monitor = acceptance.filter(|_| width > 0);
+    let mut demoted = false;
     'outer: while generated.len() < config.max_new_tokens && finish != FinishReason::Stopped {
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
             break;
         }
         let remaining = config.max_new_tokens - generated.len();
-        let k = width.min(remaining.saturating_sub(1));
+        let k = if demoted {
+            0
+        } else {
+            width.min(remaining.saturating_sub(1))
+        };
+        let wants_hidden = wants_hidden && !demoted;
         let base = target.cache_len(cache);
         let position = base + position_delta;
         let checkpoint = constraint.as_ref().map(|c| c.checkpoint());
@@ -1283,17 +1264,20 @@ where
             }
         };
         release.advance(committed.len());
-        proposer.commit(
-            target,
-            cur,
-            &draft_ids[..accepted],
-            kept_hidden.as_ref(),
-            position + 1,
-        )?;
-        previous_hidden = match kept_hidden.as_ref() {
-            Some(h) => Some(seq_rows(h, accepted as i32, 1)?),
-            None => None,
-        };
+        if !demoted {
+            proposer.commit(
+                target,
+                cur,
+                &draft_ids[..accepted],
+                kept_hidden.as_ref(),
+                position + 1,
+            )?;
+            previous_hidden = match kept_hidden.as_ref() {
+                Some(h) => Some(seq_rows(h, accepted as i32, 1)?),
+                None => None,
+            };
+        }
+        let demote_now = monitor.as_mut().is_some_and(|m| m.observe(accepted));
 
         // 5. Commit through the shared event path.
         for &token in &committed {
@@ -1325,11 +1309,182 @@ where
             Some(token) => token.input()?,
             None => input_ids(&[cur]),
         };
+        if demote_now {
+            demoted = true;
+            stats.demoted_at = Some(generated.len());
+            previous_hidden = None;
+            if can_pipeline {
+                // Hand the rest to the pipelined loop: one plain step feeds `cur` (committed,
+                // emitted, not yet in the cache) and draws the next token, which the loop then
+                // dispatches, enqueues ahead of and reads back like any pipelined token.
+                if cancel.is_cancelled() {
+                    finish = FinishReason::Cancelled;
+                    break;
+                }
+                let position = target.cache_len(cache) + position_delta;
+                let out = target.forward(cache, &cur_input, position, LogitsScope::Last, false)?;
+                stats.forwards += 1;
+                stats.verify_steps += 1;
+                let next = sampler.sample(&out.logits, &history, None)?;
+                drop(out);
+                finish = pipelined_steps(
+                    target,
+                    cache,
+                    position_delta,
+                    next,
+                    None,
+                    PlainState {
+                        history: &mut history,
+                        generated: &mut generated,
+                        stats: &mut stats,
+                        release: &mut release,
+                    },
+                    config,
+                    &mut *sampler,
+                    should_stop,
+                    cancel,
+                    on_event,
+                )?;
+                break;
+            }
+        }
     }
 
     Ok(finished(
         generated, finish, stats, sampler, timer, start_len, on_event,
     ))
+}
+
+/// The committed-sequence state the pipelined loop extends: the history (prompt + every committed
+/// token), the emitted tokens, the run's counters and its buffer release.
+struct PlainState<'s> {
+    history: &'s mut Vec<i32>,
+    generated: &'s mut Vec<i32>,
+    stats: &'s mut SpeculativeStats,
+    release: &'s mut BufferRelease,
+}
+
+thread_local! {
+    /// Drawn tokens [`dispatch_token`] handed to the device on this thread.
+    static TOKEN_DISPATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Hand a drawn, device-resident token to the device ([`async_eval`]) so it is computed before
+/// any later step enqueued behind it — the read-back then waits for this token only, never for the
+/// step enqueued after it. Counted ([`token_dispatches`]) so the order is observable.
+fn dispatch_token(id: &Array) -> Result<()> {
+    async_eval([id])?;
+    TOKEN_DISPATCHES.with(|n| n.set(n.get() + 1));
+    Ok(())
+}
+
+/// How many drawn tokens this thread's decode loops handed to the device ahead of their
+/// read-back ([`dispatch_token`]).
+#[cfg(test)]
+fn token_dispatches() -> u64 {
+    TOKEN_DISPATCHES.with(std::cell::Cell::get)
+}
+
+/// The pipelined token-at-a-time loop (story sc-24439) from `pending` — a drawn token not yet
+/// emitted whose forward has not run, the next position of `cache` — to the end of the run;
+/// returns why it ended. `retire_on_first_read` is an array the first read-back retires (the
+/// prefill logits).
+///
+/// Step `t + 1`'s forward and draw are enqueued on step `t`'s unread token and handed to the
+/// device before step `t`'s id is read back, so the device computes the next step while the host
+/// commits this one. `pending` itself is handed to the device first (sc-24446): otherwise its
+/// read-back, queued behind step `t + 1`, waits for that whole forward — the first token of every
+/// run would arrive one decode step late. The look-ahead is never enqueued past the budget, and a
+/// look-ahead enqueued behind the token that ends the run is discarded unread and counted
+/// ([`SpeculativeStats::discarded`]). The caller has checked the draws are device-resident and
+/// independent of the host (no constraint, a sampler that does not read the history).
+#[allow(clippy::too_many_arguments)]
+fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
+    target: &T,
+    cache: &mut T::Cache,
+    position_delta: i32,
+    mut pending: SampledToken,
+    mut retire_on_first_read: Option<Array>,
+    state: PlainState<'_>,
+    config: &GenerationConfig,
+    sampler: &mut dyn TokenSampler,
+    should_stop: Option<&dyn Fn() -> bool>,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> Result<FinishReason> {
+    let PlainState {
+        history,
+        generated,
+        stats,
+        release,
+    } = state;
+    if let SampledToken::Device(id) = &pending {
+        dispatch_token(id)?;
+    }
+    loop {
+        // Enqueue step t + 1 on step t's unread token, then read step t back while the device
+        // runs it. Never past the budget; a host draw is already read back, so it waits.
+        let ahead = if pending.is_device() && generated.len() + 1 < config.max_new_tokens {
+            let position = target.cache_len(cache) + position_delta;
+            let out =
+                target.forward(cache, &pending.input()?, position, LogitsScope::Last, false)?;
+            let next = sampler.sample(&out.logits, history, None)?;
+            if let SampledToken::Device(id) = &next {
+                dispatch_token(id)?;
+            }
+            stats.forwards += 1;
+            stats.pipelined += 1;
+            Some(next)
+        } else {
+            None
+        };
+        let token = pending.resolve()?;
+        // The first read-back evaluated the prefill: its prompt-length logits retire here and
+        // the post-prefill buffer release rides the first `advance` below.
+        drop(retire_on_first_read.take());
+        let end = if config.stop_tokens.contains(&token) {
+            Some(FinishReason::StopToken)
+        } else {
+            on_event(StreamEvent::Token {
+                id: token,
+                step: generated.len(),
+            });
+            generated.push(token);
+            history.push(token);
+            if should_stop.is_some_and(|stop| stop()) {
+                Some(FinishReason::Stopped)
+            } else if generated.len() >= config.max_new_tokens {
+                Some(FinishReason::MaxTokens)
+            } else if cancel.is_cancelled() {
+                Some(FinishReason::Cancelled)
+            } else {
+                None
+            }
+        };
+        if let Some(end) = end {
+            if ahead.is_some() {
+                stats.discarded += 1; // enqueued, never read back, never emitted
+            }
+            return Ok(end);
+        }
+        release.advance(1);
+        stats.verify_steps += 1;
+        pending = match ahead {
+            Some(next) => next,
+            None => {
+                let position = target.cache_len(cache) + position_delta;
+                let out = target.forward(
+                    cache,
+                    &input_ids(&[token]),
+                    position,
+                    LogitsScope::Last,
+                    false,
+                )?;
+                stats.forwards += 1;
+                sampler.sample(&out.logits, history, None)?
+            }
+        };
+    }
 }
 
 /// The run's measured report. Backend features MLX does not have (CUDA graphs, NVFP4
@@ -1380,6 +1535,7 @@ fn report<T: SpeculativeTarget + ?Sized>(
         // A pipelined loop's look-ahead enqueued and never read back (counted in
         // `target_forwards`), so `target_forwards == prefill + verify + replay + discarded`.
         discarded_forwards: stats.discarded as u64,
+        speculative_demoted_at: stats.demoted_at.map(|n| n as u64),
         prefix_hit_tokens: 0,
         prefix_cache: none(),
         fallbacks: Vec::new(),
@@ -3922,5 +4078,378 @@ pub(crate) mod tests {
                 rates[0][3], rates[1][3]
             );
         }
+    }
+
+    // ---- `auto`'s acceptance monitor and the first-token dispatch (sc-24446). ----
+
+    /// A target that records, at each forward, how many drawn tokens the decode loops had handed
+    /// to the device ([`dispatch_token`]) since the run began, and whether it asked for hidden
+    /// rows.
+    struct DispatchesAtForward<'a, T> {
+        inner: &'a T,
+        start: u64,
+        dispatched: std::cell::RefCell<Vec<u64>>,
+        hidden: std::cell::RefCell<Vec<bool>>,
+    }
+
+    impl<'a, T> DispatchesAtForward<'a, T> {
+        fn new(inner: &'a T) -> Self {
+            Self {
+                inner,
+                start: token_dispatches(),
+                dispatched: Default::default(),
+                hidden: Default::default(),
+            }
+        }
+    }
+
+    impl<T: SpeculativeTarget> SpeculativeTarget for DispatchesAtForward<'_, T> {
+        type Cache = T::Cache;
+        type Rollback = T::Rollback;
+
+        fn new_cache(&self) -> T::Cache {
+            self.inner.new_cache()
+        }
+
+        fn cache_len(&self, cache: &T::Cache) -> i32 {
+            self.inner.cache_len(cache)
+        }
+
+        fn rollback(&self, width: usize) -> T::Rollback {
+            self.inner.rollback(width)
+        }
+
+        fn forward(
+            &self,
+            cache: &mut T::Cache,
+            ids: &Array,
+            rope_offset: i32,
+            scope: LogitsScope,
+            want_hidden: bool,
+        ) -> Result<TargetOutput> {
+            self.dispatched
+                .borrow_mut()
+                .push(token_dispatches() - self.start);
+            self.hidden.borrow_mut().push(want_hidden);
+            self.inner
+                .forward(cache, ids, rope_offset, scope, want_hidden)
+        }
+
+        fn attention_label(&self) -> &'static str {
+            self.inner.attention_label()
+        }
+    }
+
+    /// Token 0 is handed to the device before step 1 is enqueued behind it, so its read-back
+    /// waits for the prefill and its draw only: at the `k`-th forward (`k >= 1`) `k` tokens have
+    /// been dispatched — token 0 included — where the pre-fix loop had dispatched `k - 1` (token
+    /// 0 then waited for step 1's whole forward). Step 1 is still enqueued before token 0 is read
+    /// back ([`a_pipelined_step_is_enqueued_before_the_previous_token_is_read`]), so the overlap
+    /// is kept; the unpipelined loop dispatches nothing ahead of its reads.
+    #[test]
+    fn the_first_token_is_dispatched_before_step_one_is_enqueued() {
+        let model = causal();
+        for (pipelining, expected) in [
+            (Pipelining::Auto, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            (Pipelining::Off, vec![0; 8]),
+        ] {
+            let target = DispatchesAtForward::new(&model);
+            let run = off_run(&target, &top_p(8), pipelining, None);
+            assert_eq!(run.output.tokens.len(), 8);
+            assert_eq!(target.dispatched.into_inner(), expected, "{pipelining:?}");
+            let again = off_run(&model, &top_p(8), pipelining, None);
+            assert_eq!(again.output.tokens, run.output.tokens, "{pipelining:?}");
+        }
+    }
+
+    /// A test proposer of fixed kind drafting `width` tokens every step: the plain loop's own
+    /// continuation (always accepted) when `right`, else a token the greedy target never picks
+    /// (always rejected). Counts its proposals and commits.
+    struct Scripted {
+        expected: Vec<i32>,
+        prompt_len: usize,
+        right: bool,
+        vocab: i32,
+        wants_hidden: bool,
+        proposals: usize,
+        commits: usize,
+    }
+
+    impl Scripted {
+        fn new(expected: &[i32], right: bool, vocab: i32) -> Self {
+            Self {
+                expected: expected.to_vec(),
+                prompt_len: PROMPT.len(),
+                right,
+                vocab,
+                wants_hidden: false,
+                proposals: 0,
+                commits: 0,
+            }
+        }
+    }
+
+    impl<T: SpeculativeTarget + ?Sized> Proposer<T> for Scripted {
+        fn kind(&self) -> ProposerKind {
+            ProposerKind::PromptLookup
+        }
+        fn wants_hidden(&self) -> bool {
+            self.wants_hidden
+        }
+        fn warm(&mut self, _: &T, _: &[i32], _: Option<&Array>) -> Result<Option<Array>> {
+            Ok(None)
+        }
+        fn propose(
+            &mut self,
+            _: &T,
+            ctx: &ProposeContext<'_>,
+            _: &mut DraftSampler<'_, '_>,
+        ) -> Result<Proposal> {
+            self.proposals += 1;
+            let at = ctx.history.len() - self.prompt_len;
+            let drafts = self.expected[at..]
+                .iter()
+                .take(ctx.max_drafts)
+                .map(|&t| if self.right { t } else { (t + 1) % self.vocab })
+                .collect();
+            Ok(Proposal {
+                drafts,
+                dists: Vec::new(),
+            })
+        }
+        fn commit(&mut self, _: &T, _: i32, _: &[i32], _: Option<&Array>, _: i32) -> Result<()> {
+            self.commits += 1;
+            Ok(())
+        }
+    }
+
+    /// One engine run from [`PROMPT`] with `acceptance` and `pipelining`.
+    fn monitored<T, P>(
+        target: &T,
+        proposer: &mut P,
+        config: &GenerationConfig,
+        drafts: usize,
+        acceptance: Option<AcceptanceMonitor>,
+        pipelining: Pipelining,
+    ) -> SpeculativeRun
+    where
+        T: SpeculativeTarget,
+        P: Proposer<T> + ?Sized,
+    {
+        let mut ids = Vec::new();
+        let run = generate_speculative(
+            target,
+            proposer,
+            SpeculativePrompt::Tokens(&PROMPT),
+            config,
+            drafts,
+            &CancelFlag::new(),
+            &mut |e| {
+                if let StreamEvent::Token { id, .. } = e {
+                    ids.push(id);
+                }
+            },
+            EngineOptions {
+                acceptance,
+                pipelining,
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, run.output.tokens, "streamed ids == returned tokens");
+        run
+    }
+
+    fn auto_lookup() -> Option<AcceptanceMonitor> {
+        AcceptanceMonitor::for_request(core_llm::Speculative::Auto, ProposerKind::PromptLookup, 4)
+    }
+
+    /// The token count at which a never-accepting proposer is demoted: the first token plus one
+    /// committed token per probe-window verify step.
+    const DEMOTED_AT: u64 = 1 + core_llm::ACCEPTANCE_PROBE_VERIFIES as u64;
+
+    /// sc-24446: under `auto`, a proposer below its break-even is demoted after the probe window
+    /// — never proposed to or committed to again — and the rest of the run is the pipelined plain
+    /// loop (one handoff step, then every remaining token pipelined); the output is the plain
+    /// greedy loop's, the report records the demotion, and the forward accounting holds — on the
+    /// causal and the hybrid (checkpoint-ring) targets.
+    #[test]
+    fn auto_demotes_a_losing_proposer_to_the_pipelined_plain_loop() {
+        fn check<T: SpeculativeTarget + crate::decode::Decode>(
+            label: &str,
+            target: &T,
+            vocab: i32,
+        ) {
+            let config = greedy(40);
+            let expected = plain(target, &PROMPT, &config, None).tokens;
+            let mut wrong = Scripted::new(&expected, false, vocab);
+            let run = monitored(
+                target,
+                &mut wrong,
+                &config,
+                4,
+                auto_lookup(),
+                Pipelining::Auto,
+            );
+            assert_eq!(
+                run.output.tokens, expected,
+                "{label}: demotion changed the output"
+            );
+            assert_eq!(
+                run.report.speculative_demoted_at,
+                Some(DEMOTED_AT),
+                "{label}"
+            );
+            let window = core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
+            assert_eq!(
+                (wrong.proposals, wrong.commits),
+                (window, window),
+                "{label}: the proposer is not driven after the demotion"
+            );
+            // After the handoff step, every remaining token but the last is a pipelined
+            // look-ahead.
+            assert_eq!(
+                run.stats.pipelined,
+                40 - DEMOTED_AT as usize - 1,
+                "{label}: the rest is pipelined"
+            );
+            assert_eq!(run.report.proposer, ProposerKind::PromptLookup, "{label}");
+            assert_eq!(run.report.accepted_tokens, 0, "{label}");
+            assert_eq!(run.report.proposed_tokens, 4 * window as u64, "{label}");
+            assert_accounting(label, &run, &config);
+        }
+        check("causal", &causal(), 24);
+        check("qwen35", &qwen35(false), 50);
+    }
+
+    /// With pipelining off (the parity reference) a demoted run continues as unpipelined
+    /// single-token verify steps — same output, same demotion point, the proposer idle.
+    #[test]
+    fn a_demoted_run_without_pipelining_continues_token_at_a_time() {
+        let model = causal();
+        let config = greedy(40);
+        let expected = plain(&model, &PROMPT, &config, None).tokens;
+        let mut wrong = Scripted::new(&expected, false, 24);
+        let run = monitored(
+            &model,
+            &mut wrong,
+            &config,
+            4,
+            auto_lookup(),
+            Pipelining::Off,
+        );
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.report.speculative_demoted_at, Some(DEMOTED_AT));
+        assert_eq!(run.stats.pipelined, 0);
+        let window = core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
+        assert_eq!((wrong.proposals, wrong.commits), (window, window));
+        assert_accounting("off", &run, &config);
+    }
+
+    /// A demoted run stops asking the target for hidden rows: the prefill and the probe window's
+    /// verify steps do (the proposer wants them), no forward after the demotion does — pipelined
+    /// or not.
+    #[test]
+    fn a_demoted_run_asks_for_no_hidden_rows() {
+        let model = qwen35(false);
+        let config = greedy(40);
+        let expected = plain(&model, &PROMPT, &config, None).tokens;
+        for pipelining in [Pipelining::Auto, Pipelining::Off] {
+            let target = DispatchesAtForward::new(&model);
+            let mut wrong = Scripted::new(&expected, false, 50);
+            wrong.wants_hidden = true;
+            let run = monitored(&target, &mut wrong, &config, 4, auto_lookup(), pipelining);
+            assert_eq!(run.output.tokens, expected, "{pipelining:?}");
+            assert_eq!(run.report.speculative_demoted_at, Some(DEMOTED_AT));
+            let hidden = target.hidden.into_inner();
+            let window = 1 + core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
+            assert!(
+                hidden[..window].iter().all(|&h| h),
+                "{pipelining:?}: {hidden:?}"
+            );
+            assert!(
+                hidden[window..].iter().all(|&h| !h),
+                "{pipelining:?}: {hidden:?}"
+            );
+            assert_eq!(hidden.len() as u64, run.report.target_forwards);
+        }
+    }
+
+    /// A proposer at or above its break-even is never demoted under `auto`: it proposes to the
+    /// end, nothing is pipelined, and the output is still the plain loop's.
+    #[test]
+    fn auto_keeps_a_proposer_that_pays_for_itself() {
+        let model = causal();
+        let config = greedy(120);
+        let expected = plain(&model, &PROMPT, &config, None).tokens;
+        let mut right = Scripted::new(&expected, true, 24);
+        let run = monitored(
+            &model,
+            &mut right,
+            &config,
+            4,
+            auto_lookup(),
+            Pipelining::Auto,
+        );
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.report.speculative_demoted_at, None);
+        assert_eq!(run.stats.pipelined, 0);
+        assert!(
+            run.report.verify_steps > u64::from(core_llm::ACCEPTANCE_PROBE_VERIFIES),
+            "the run outlasts the probe window: {:?}",
+            run.report
+        );
+        // Every step proposes but one the budget clamped to no drafts.
+        assert!(right.proposals as u64 + 1 >= run.report.verify_steps);
+        assert_accounting("paying", &run, &config);
+    }
+
+    /// An explicit `{proposer, depth}` is the caller's choice: no monitor, so a losing proposer
+    /// runs to the end of the request — every step proposes — and nothing is demoted.
+    #[test]
+    fn an_explicit_proposer_request_is_never_demoted() {
+        use core_llm::{Speculative, SpeculativeProposer};
+        let model = causal();
+        let config = greedy(40);
+        let expected = plain(&model, &PROMPT, &config, None).tokens;
+        let explicit = AcceptanceMonitor::for_request(
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
+            ProposerKind::PromptLookup,
+            4,
+        );
+        assert_eq!(explicit, None);
+        let mut wrong = Scripted::new(&expected, false, 24);
+        let run = monitored(&model, &mut wrong, &config, 4, explicit, Pipelining::Auto);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.report.speculative_demoted_at, None);
+        assert_eq!(run.stats.pipelined, 0);
+        // Every step but the budget-clamped last one proposes.
+        assert_eq!(wrong.proposals as u64, run.report.verify_steps - 1);
+    }
+
+    /// The MTP head (a proposer that wants the target's hidden rows) demotes the same way on the
+    /// hybrid: the head is not committed to after the demotion and the rest is the pipelined
+    /// plain loop, with the plain greedy output.
+    #[test]
+    fn a_demoted_mtp_head_hands_the_hybrid_to_the_pipelined_loop() {
+        let model = qwen35(true);
+        let config = greedy(40);
+        let expected = plain(&model, &PROMPT, &config, None).tokens;
+        // A threshold no run reaches, so the demotion is certain whatever the random head drafts.
+        let always = AcceptanceMonitor::with_threshold(1e9);
+        let run = monitored(
+            &model,
+            &mut MtpProposer::new(),
+            &config,
+            2,
+            always,
+            Pipelining::Auto,
+        );
+        assert_eq!(run.output.tokens, expected);
+        let demoted = run.report.speculative_demoted_at.expect("demoted") as usize;
+        assert!(demoted > core_llm::ACCEPTANCE_PROBE_VERIFIES as usize);
+        assert_eq!(run.stats.pipelined, 40 - demoted - 1);
+        assert_eq!(run.report.proposer, ProposerKind::Mtp);
+        assert_accounting("mtp", &run, &config);
     }
 }
