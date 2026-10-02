@@ -105,6 +105,14 @@ def noise_floor_markdown(rows: list[dict], summary: dict | None) -> str:
         for control, measured in sorted((row.get("controls") or {}).items()):
             lines.append(f"| `{row.get('coordinate', '?')}` | {control} | {measured.get('agreement', '?')} | "
                          f"{measured.get('flipCount', '?')} | {measured.get('perplexityDelta', '?')} |")
+    timed = [row for row in rows if isinstance(row.get("denseTiming"), dict)]
+    if timed:
+        lines += ["\nSame-process dense timing (A2 definitions; pair by coordinate):\n",
+                  "| coordinate | prefill ms | first token ms | decode tok/s | decode CV |", "|---|---|---|---|---|"]
+        for row in sorted(timed, key=lambda row: str(row.get("coordinate", ""))):
+            timing = row["denseTiming"]
+            lines.append(f"| `{row.get('coordinate', '?')}` | {timing.get('prefillMs', '?')} | {timing.get('firstTokenMs', '?')} | "
+                         f"{timing.get('decodeTokensPerSecond', '?')} | {timing.get('decodeTokensPerSecondCoefficientOfVariation', '?')} |")
     if summary:
         thresholds = summary.get("thresholds") or {}
         lines.append(f"\nWorst case over {summary.get('rows', '?')} rows (frozen thresholds: greedy >= "

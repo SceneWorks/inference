@@ -38,7 +38,7 @@ use crate::models::{
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::attention::prefill_attention_tile_bytes;
-use crate::primitives::kv_cache::KvCache;
+use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{dtype_bytes, input_ids, Weights};
@@ -293,22 +293,13 @@ fn campaign_chunked_prefill_decode_on(
             "chunked prefill needs a positive chunk and a prompt of two or more tokens".into(),
         ));
     }
-    let mut cache = model.make_cache();
+    let mut cache = chunked_prefill_cache(model, prompt_ids.len() + stream.len())?;
     let prefilled = prompt_ids.len() - 1;
     let measured = (|| -> crate::error::Result<crate::decode::ForcedDecode> {
-        for start in (0..prefilled).step_by(prefill_chunk) {
-            let end = (start + prefill_chunk).min(prefilled);
-            let offset = cache.offset();
-            let logits = model.step(
-                &crate::primitives::nn::input_ids(&prompt_ids[start..end]),
-                cache.as_mut(),
-                offset,
-            )?;
-            logits.eval()?;
-        }
+        chunked_prefill(model, &mut cache, &prompt_ids[..prefilled], prefill_chunk)?;
         crate::decode::forced_greedy_decode_from(
             model,
-            cache.as_mut(),
+            &mut cache,
             prompt_ids,
             prefilled,
             stream.len(),
@@ -320,6 +311,48 @@ fn campaign_chunked_prefill_decode_on(
     })();
     cache.reset().map_err(to_core)?;
     measured.map_err(to_core)
+}
+
+/// The chunked control's dense cache: ONE allocation covering the prompt and the forced stream.
+/// The decoder's default cache grows by concatenation as chunks arrive, so every chunk of a long
+/// prompt retired a whole-history buffer into MLX's freed-buffer cache (run 37021783368: the
+/// 130k-token llama row's 64 growths reached a 73.8 GB footprint against a 68 GiB cap). Sized
+/// once, the chunked control holds what a one-shot dense run holds: one dense K/V history.
+fn chunked_prefill_cache(model: &Decoder, positions: usize) -> CoreResult<ContiguousKvCache> {
+    let block = i32::try_from(positions.max(1))
+        .map_err(|_| CoreError::InvalidRequest("chunked prefill length overflows i32".into()))?;
+    match model {
+        Decoder::Causal(model) => Ok(ContiguousKvCache::with_block_tokens(
+            model.config().num_layers,
+            block,
+        )),
+        Decoder::Qwen35(_) => Err(CoreError::Unsupported(
+            "the chunked-prefill noise-floor control needs the causal decoder".into(),
+        )),
+    }
+}
+
+/// Prefill `prompt_ids` into `cache` in `prefill_chunk`-token steps, evaluating each step and
+/// releasing MLX's freed-buffer cache after it, so no chunk's transients outlive it.
+fn chunked_prefill(
+    model: &Decoder,
+    cache: &mut dyn KvCache,
+    prompt_ids: &[i32],
+    prefill_chunk: usize,
+) -> crate::error::Result<()> {
+    for start in (0..prompt_ids.len()).step_by(prefill_chunk.max(1)) {
+        let end = (start + prefill_chunk).min(prompt_ids.len());
+        let offset = cache.offset();
+        let logits = model.step(
+            &crate::primitives::nn::input_ids(&prompt_ids[start..end]),
+            cache,
+            offset,
+        )?;
+        logits.eval()?;
+        drop(logits);
+        mlx_rs::memory::clear_cache();
+    }
+    Ok(())
 }
 
 /// The cache record of one prompt-cache turn: whether the lookup since `before` hit, and how many
@@ -5746,6 +5779,32 @@ mod tests {
         }
         assert!(
             campaign_chunked_prefill_decode_on(&model, &prompt, &reference, &every_id, 0).is_err()
+        );
+        // Run 37021783368: the control's cache is ONE allocation for the prompt and stream, so a
+        // prompt longer than the default 256-position block retires no growth buffer (the
+        // default cache retired one per growth into MLX's buffer cache, past the row's cap).
+        let long_prompt = (0..600).map(|index| index % 31).collect::<Vec<_>>();
+        let mut cache = chunked_prefill_cache(&model, long_prompt.len() + 64).unwrap();
+        chunked_prefill(&model, &mut cache, &long_prompt, 64).unwrap();
+        assert_eq!(cache.offset(), 600);
+        assert!(
+            cache
+                .events()
+                .iter()
+                .all(|event| event.operation != "dense_block_growth_retired_buffer"),
+            "the chunked control retired a dense growth buffer"
+        );
+        let mut grown = match &model {
+            Decoder::Causal(model) => model.new_cache(),
+            Decoder::Qwen35(_) => unreachable!(),
+        };
+        chunked_prefill(&model, &mut grown, &long_prompt, 64).unwrap();
+        assert!(
+            grown
+                .events()
+                .iter()
+                .any(|event| event.operation == "dense_block_growth_retired_buffer"),
+            "the default cache grows (the defect the sized cache removes)"
         );
         let choices = forced(Some(&arm), Some(&reference)).unwrap();
         let evidence = crate::campaign::forced_continuation_evidence(&reference, &choices).unwrap();

@@ -91,9 +91,9 @@ class NoiseFloorPhaseTests(unittest.TestCase):
             self.assertIn(argument, launch)
 
     def test_nf_command_line_resolves_every_rows_pinned_snapshots(self):
-        """Run 37003931977: the nf parent admits each row on the dense row's estimate, which
-        reads the bf16 reference's weight headers, so the launch must name the pinned candidate
-        AND reference snapshots of both families, resolved exactly like A1/A2's."""
+        """Run 37003931977: the nf launch must name resolvable pinned snapshots for every row. It
+        passes the A1/A2 snapshot arguments verbatim (the worker loads the 4-bit candidate; the
+        bf16 reference flags ride along unused), resolved exactly like A1/A2's."""
         pins = [
             line.split("\t")
             for line in (KV_POC / "models.tsv").read_text(encoding="utf-8").splitlines()
@@ -195,7 +195,10 @@ class NoiseFloorPhaseTests(unittest.TestCase):
                 },
             },
         }
+        row["denseTiming"] = {"prefillMs": 91000.0, "firstTokenMs": 91500.0, "decodeTokensPerSecond": 30.5,
+                              "decodeTokensPerSecondCoefficientOfVariation": 0.01}
         markdown = summarize.noise_floor_markdown([row], summary)
+        self.assertIn("| `llama-fit-boundary-single-chunked-cold` | 91000.0 | 91500.0 | 30.5 | 0.01 |", markdown)
         self.assertIn("| `llama-fit-boundary-single-chunked-cold` | chunked-prefill | 0.998 | 2 | 0.013 |", markdown)
         self.assertIn("the dense arm itself misses the greedy and perplexity threshold", markdown)
         with tempfile.TemporaryDirectory() as tmp:

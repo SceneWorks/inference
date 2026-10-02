@@ -290,6 +290,8 @@ pub const RUNTIME_GUARDED_ADMISSION: &str = "runtime-guarded";
 /// the candidate and reference roles' model-load (2x payload) plus KV, fused prefill tile and
 /// tiled-prefill activation budget.
 pub const SC20671_ESTIMATE_SOURCE: &str = "sc20671-static-row-footprint-budget";
+/// Estimate source of a noise-floor row: one dense candidate session (`static_role_footprint_budget`).
+pub const NOISE_FLOOR_ESTIMATE_SOURCE: &str = "sc20669-noise-floor-dense-session-budget";
 /// Allocation kinds that explicitly witness a dense full-cache temporary. Mirrors SceneWorks'
 /// `detectFullCacheTemporary`; a compressed receipt carrying either is rejected regardless of size.
 pub const FULL_CACHE_MATERIALIZATION_KIND: &str = "full_cache_materialization";
@@ -1127,6 +1129,36 @@ fn static_row_requirements(
         policy,
     )?;
     Ok((total, max_request, known_footprint_budget))
+}
+
+/// The requirements of one noise-floor row: what its worker actually holds, a single dense session
+/// of the candidate (never the bf16 reference, which it does not load) over the row's live tokens.
+/// The chunked-prefill control's cache is sized once ([`crate::provider`]), so the one-shot dense
+/// budget of [`static_role_footprint_budget`] prices every pass of the row.
+fn noise_floor_row_requirements(
+    coordinate: &Coordinate,
+    snapshot: &Path,
+    prompt: &str,
+    policy: &CampaignSafetyPolicy,
+) -> Result<(u64, u64, u64), String> {
+    let spec = benchmark_model(coordinate.family, false)?;
+    let (total, max_request) =
+        preflight_total_live_tokens(snapshot, spec, coordinate, prompt, false)?;
+    if max_request > policy.max_request_tokens || total > policy.max_context_tokens {
+        return Err(format!(
+            "{} requires request ceiling {max_request} and total-live ceiling {total}; policy refuses before model load",
+            coordinate_slug(coordinate)
+        ));
+    }
+    let budget = static_role_footprint_budget(spec, snapshot, total, max_request)?;
+    if budget > policy.child_footprint_cap_bytes {
+        return Err(format!(
+            "{} needs at least {budget} bytes of one dense session; child footprint cap {} refuses before spawn",
+            coordinate_slug(coordinate),
+            policy.child_footprint_cap_bytes,
+        ));
+    }
+    Ok((total, max_request, budget))
 }
 
 /// The runtime admission a row ran under. It is recorded in every receipt so the stated child cap,
@@ -2460,6 +2492,70 @@ pub struct ReceiptCompression {
     /// Packed-to-dense transitions that rebuilt the full history as dense K/V. E3 requires zero.
     pub full_cache_dequantizations: u64,
     pub failed_dispatches: u64,
+    /// The KV path each measurement block of the row actually ran on (additive; absent on receipts
+    /// produced before it). A supported-batch row's coordinate operation, which supplies memory,
+    /// representation, prefill and first-token time, runs the explicit dense fallback, while its
+    /// steady decode and quality run single-sequence on the compressed reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_paths: Option<ReceiptMeasurementPaths>,
+}
+
+/// The KV path one receipt measurement block ran on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptMeasurementPath {
+    /// `compressed` or `dense-fallback` (the persistent-KV representation tokens).
+    pub kv_path: String,
+    /// The product operation measured: the coordinate operation (`supported-batch`,
+    /// `chunked-prefix-reuse`, `single-shot-generation`), `steady-decode`, or `quality`.
+    pub operation: String,
+    /// Sequences the measured dispatch decoded.
+    pub sequences: u64,
+}
+
+/// Per-block KV paths of a compressed receipt ([`ReceiptCompression::measurement_paths`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptMeasurementPaths {
+    /// `memory`, `compression` storage and `persistentKvRepresentation`: the coordinate operation.
+    pub memory: ReceiptMeasurementPath,
+    /// `timings.prefillMs`, `ttftMs` and `firstTokenMs`: the same coordinate operation.
+    pub prefill_first_token: ReceiptMeasurementPath,
+    /// `timings.decodeTokensPerSecond`: the fixed-length steady decode, always one sequence on
+    /// the fused compressed reader (it fails closed otherwise).
+    pub decode_timing: ReceiptMeasurementPath,
+    /// `quality`: the single-request fixtures and the teacher-forced passes on the compressed
+    /// reader (the forced passes fail closed off the fused reader).
+    pub quality: ReceiptMeasurementPath,
+}
+
+/// The measurement paths a compressed row of `request_mode`/`prefill_mode` runs, given the
+/// representation its coordinate operation recorded.
+pub fn receipt_measurement_paths(
+    request_mode: &str,
+    prefill_mode: &str,
+    persistent_kv_representation: &str,
+) -> ReceiptMeasurementPaths {
+    let (operation, sequences) = if request_mode == "supported-batch" {
+        ("supported-batch", 2)
+    } else if prefill_mode == "chunked" {
+        ("chunked-prefix-reuse", 1)
+    } else {
+        ("single-shot-generation", 1)
+    };
+    let path = |kv_path: &str, operation: &str, sequences: u64| ReceiptMeasurementPath {
+        kv_path: kv_path.into(),
+        operation: operation.into(),
+        sequences,
+    };
+    ReceiptMeasurementPaths {
+        memory: path(persistent_kv_representation, operation, sequences),
+        prefill_first_token: path(persistent_kv_representation, operation, sequences),
+        decode_timing: path(COMPRESSED_PERSISTENT_KV, "steady-decode", 1),
+        quality: path(COMPRESSED_PERSISTENT_KV, "quality", 1),
+    }
 }
 
 pub const COMPRESSED_PERSISTENT_KV: &str = "compressed";
@@ -3052,6 +3148,18 @@ fn validate_receipt_compression(
     }
     if compression.full_cache_dequantizations != 0 {
         return Err("compressed row reconstructed a dense full cache".into());
+    }
+    if compression.measurement_paths.as_ref().is_some_and(|paths| {
+        *paths
+            != receipt_measurement_paths(
+                &receipt.matrix.request_mode,
+                &receipt.matrix.prefill_mode,
+                &compression.persistent_kv_representation,
+            )
+    }) {
+        return Err(
+            "compression.measurementPaths does not name the KV path each measurement ran on".into(),
+        );
     }
     Ok(())
 }
@@ -7405,13 +7513,15 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     .map(|chunk| chunk.parse::<usize>().map_err(|e| e.to_string()))
                     .transpose()?
                     .unwrap_or(crate::primitives::attention::SDPA_PREFILL_BLOCK_QLEN as usize),
+                load_campaign_safety_policy(Path::new(&required_flag(args, "--safety-policy")?))?
+                    .max_request_tokens,
             )?;
             let bytes = canonical_json_bytes(&value).map_err(|e| e.to_string())?;
             fs::write(required_flag(args, "--out")?, &bytes).map_err(|e| e.to_string())?;
             println!("{}", String::from_utf8(bytes).map_err(|e| e.to_string())?);
             Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --out <json> [--prefill-chunk <tokens>] | noise-floor-parent --llama-snapshot <dir> --qwen-snapshot <dir> --llama-fp32-reference-snapshot <dir> --qwen-fp32-reference-snapshot <dir> --prompt-file <file> --safety-policy <json> --resume-dir <dir> --out <dir> [--prefill-chunk <tokens>] [--stop-file <path>]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --safety-policy <json> --out <json> [--prefill-chunk <tokens>] | noise-floor-parent --llama-snapshot <dir> --qwen-snapshot <dir> --llama-fp32-reference-snapshot <dir> --qwen-fp32-reference-snapshot <dir> --prompt-file <file> --safety-policy <json> --resume-dir <dir> --out <dir> [--prefill-chunk <tokens>] [--stop-file <path>]".into()),
     }
 }
 
@@ -7441,6 +7551,7 @@ pub fn dense_noise_floor(
     prompt_file: &Path,
     coordinate_slug_value: &str,
     prefill_chunk: usize,
+    max_request_tokens: u64,
 ) -> Result<serde_json::Value, String> {
     let coordinate = required_coordinates()
         .into_iter()
@@ -7451,6 +7562,37 @@ pub fn dense_noise_floor(
     session
         .validate_coordinate_family(&coordinate)
         .map_err(|e| e.to_string())?;
+    // Same-process dense timing first, with A2's exact definitions and order (a warm row's
+    // warmups, then the timed repeats; a cold row's repeat 0 is the process's first dispatch),
+    // and before any scored pass, whose per-token host softmax would distort a timed window.
+    let warmups = if coordinate.process_temperature == "warm" {
+        TIMING_WARMUPS
+    } else {
+        0
+    };
+    for index in 0..warmups {
+        run_timing_on_session(&session, &prompt, &coordinate, max_request_tokens)
+            .map_err(|e| format!("dense timing warmup {index}: {e}"))?;
+    }
+    let mut operation = None;
+    let samples = (0..TIMING_REPEATS)
+        .map(|index| {
+            let run = run_timing_on_session(&session, &prompt, &coordinate, max_request_tokens)
+                .map_err(|e| format!("dense timing repeat {index}: {e}"))?;
+            operation.get_or_insert_with(|| run.coordinate.primary.operation.clone());
+            timing_from_product_observation(
+                &run.coordinate.primary.observation,
+                &run.steady_decode,
+                coordinate.process_temperature,
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let dense_timing = noise_floor_dense_timing(
+        &coordinate,
+        operation.as_deref().unwrap_or_default(),
+        warmups,
+        &samples,
+    )?;
     let kernel_prompt =
         kernel_fixture_prompt(&session, &prompt, &coordinate).map_err(|e| e.to_string())?;
     let provider = &session.provider;
@@ -7501,6 +7643,66 @@ pub fn dense_noise_floor(
             "one-shot-repeat": control(&repeat)?,
             "chunked-prefill": control(&chunked)?,
         },
+        "denseTiming": dense_timing,
+    }))
+}
+
+/// The noise floor's same-process dense timing of one coordinate (`denseTiming`): A2's timing
+/// definitions (`run_timing_on_session`, [`timing_from_product_observation`]) and aggregates
+/// (`prefillMs`, `ttftMs`, `firstTokenMs` and `decodeTokensPerSecond` are the repeats' means, as
+/// a receipt's `timings`), keyed by the coordinate and matrix so a reader pairs it with that A2
+/// row. It never shares a window with the scored passes.
+pub fn noise_floor_dense_timing(
+    coordinate: &Coordinate,
+    operation: &str,
+    warmups: usize,
+    samples: &[RawTiming],
+) -> Result<serde_json::Value, String> {
+    let expected_warmups = if coordinate.process_temperature == "warm" {
+        TIMING_WARMUPS
+    } else {
+        0
+    };
+    if samples.len() != TIMING_REPEATS || warmups != expected_warmups || operation.is_empty() {
+        return Err(format!(
+            "dense timing needs {TIMING_REPEATS} repeats after {expected_warmups} warmups of the coordinate operation, got {} after {warmups}",
+            samples.len()
+        ));
+    }
+    let mean = |f: fn(&RawTiming) -> f64| samples.iter().map(f).sum::<f64>() / samples.len() as f64;
+    let decode = mean(|t| t.decode_tokens_per_second);
+    let variance = samples
+        .iter()
+        .map(|t| (t.decode_tokens_per_second - decode).powi(2))
+        .sum::<f64>()
+        / samples.len() as f64;
+    Ok(serde_json::json!({
+        "coordinate": coordinate_slug(coordinate),
+        "matrix": {
+            "family": coordinate.family,
+            "contextBand": coordinate.context_band,
+            "requestMode": coordinate.request_mode,
+            "prefillMode": coordinate.prefill_mode,
+            "processTemperature": coordinate.process_temperature,
+        },
+        "kvPath": "dense",
+        "coordinateOperation": operation,
+        "method": "same-process dense session: the kernel-prompt coordinate operation and a fixed-length steady decode per repeat (A2 run_timing_on_session), before and apart from the scored passes",
+        "warmups": warmups,
+        "repeats": samples.len(),
+        "prefillMs": mean(|t| t.prefill_ms),
+        "ttftMs": mean(|t| t.ttft_ms),
+        "firstTokenMs": mean(|t| t.first_token_ms),
+        "decodeTokensPerSecond": decode,
+        "decodeTokensPerSecondCoefficientOfVariation": variance.sqrt() / decode,
+        "samples": samples.iter().map(|t| serde_json::json!({
+            "prefillMs": t.prefill_ms,
+            "ttftMs": t.ttft_ms,
+            "firstTokenMs": t.first_token_ms,
+            "decodeTokensPerSecond": t.decode_tokens_per_second,
+            "steadyDecodeTimedTokens": t.steady_decode.timed_tokens,
+            "steadyDecodeMs": t.steady_decode.decode_ms,
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -7561,6 +7763,24 @@ pub fn noise_floor_summary(rows: &[serde_json::Value]) -> Result<serde_json::Val
             }),
         );
     }
+    // Each row's same-process dense timing, keyed by coordinate (the A2 receipt row it pairs with).
+    let dense_timing = rows
+        .iter()
+        .filter_map(|row| {
+            let timing = row.get("denseTiming")?;
+            Some((
+                timing.get("coordinate")?.as_str()?.to_owned(),
+                serde_json::json!({
+                    "processTemperature": timing.get("matrix")?.get("processTemperature")?,
+                    "prefillMs": timing.get("prefillMs")?,
+                    "firstTokenMs": timing.get("firstTokenMs")?,
+                    "decodeTokensPerSecond": timing.get("decodeTokensPerSecond")?,
+                    "decodeTokensPerSecondCoefficientOfVariation": timing
+                        .get("decodeTokensPerSecondCoefficientOfVariation")?,
+                }),
+            ))
+        })
+        .collect::<serde_json::Map<_, _>>();
     Ok(serde_json::json!({
         "kind": NOISE_FLOOR_SUMMARY_KIND,
         "rows": rows.len(),
@@ -7569,23 +7789,14 @@ pub fn noise_floor_summary(rows: &[serde_json::Value]) -> Result<serde_json::Val
             "perplexityDelta": COMPRESSED_PERPLEXITY_DELTA_MAX,
         },
         "controls": controls,
+        "denseTiming": dense_timing,
     }))
 }
 
 /// Every pinned file of a row's candidate and reference snapshots exists (a cheap check before the
 /// header reads of [`static_row_requirements`]); the error names the first missing path.
-fn pinned_snapshot_files_present(
-    coordinate: &Coordinate,
-    snapshot: &Path,
-    reference_snapshot: &Path,
-) -> Result<(), String> {
-    for (path, spec) in [
-        (snapshot, benchmark_model(coordinate.family, false)?),
-        (
-            reference_snapshot,
-            benchmark_model(coordinate.family, true)?,
-        ),
-    ] {
+fn pinned_snapshot_files_present(coordinate: &Coordinate, snapshot: &Path) -> Result<(), String> {
+    for (path, spec) in [(snapshot, benchmark_model(coordinate.family, false)?)] {
         for required in spec.required_files {
             let file = path.join(required.path);
             if !file.is_file() {
@@ -7620,16 +7831,16 @@ fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
     // (family, measured candidate snapshot, its pinned bf16 reference). The worker loads only the
     // candidate; the reference is named so the row is admitted on the same static estimate as the
     // SC-20671 dense row (candidate plus reference), an upper bound for one dense session.
+    // The measured 4-bit candidate of each family: the worker's only session (the bf16 reference
+    // flags phase.sh shares with A1/A2 are accepted and unused).
     let snapshots = [
         (
             "llama",
             PathBuf::from(required_flag(args, "--llama-snapshot")?),
-            PathBuf::from(required_flag(args, "--llama-fp32-reference-snapshot")?),
         ),
         (
             "qwen",
             PathBuf::from(required_flag(args, "--qwen-snapshot")?),
-            PathBuf::from(required_flag(args, "--qwen-fp32-reference-snapshot")?),
         ),
     ];
     let prefill_chunk = optional_flag(args, "--prefill-chunk")?;
@@ -7662,21 +7873,18 @@ fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
         )? {
             return Ok(CampaignOutcome::StoppedByOperator(stop));
         }
-        let (_, snapshot, reference_snapshot) = snapshots
+        let (_, snapshot) = snapshots
             .iter()
-            .find(|(family, ..)| *family == coordinate.family)
+            .find(|(family, _)| *family == coordinate.family)
             .ok_or("noise-floor coordinate family has no snapshot")?;
-        pinned_snapshot_files_present(coordinate, snapshot, reference_snapshot)?;
-        let (total_tokens, request_tokens, static_footprint_floor) = static_row_requirements(
-            coordinate,
-            snapshot,
-            reference_snapshot,
-            &prompt,
+        pinned_snapshot_files_present(coordinate, snapshot)?;
+        let (total_tokens, request_tokens, static_footprint_floor) =
+            noise_floor_row_requirements(coordinate, snapshot, &prompt, &policy)?;
+        let admission = runtime_guarded_admission(
             &policy,
-            false,
+            static_footprint_floor,
+            NOISE_FLOOR_ESTIMATE_SOURCE,
         )?;
-        let admission =
-            runtime_guarded_admission(&policy, static_footprint_floor, SC20671_ESTIMATE_SOURCE)?;
         let staged = resume_dir.join(format!("{slug}.json.partial"));
         let _ = fs::remove_file(&staged);
         let mut command = Command::new(&executable);
@@ -7688,6 +7896,8 @@ fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
             .arg(&prompt_file)
             .arg("--coordinate")
             .arg(&slug)
+            .arg("--safety-policy")
+            .arg(&safety_policy)
             .arg("--out")
             .arg(&staged);
         if let Some(chunk) = &prefill_chunk {
@@ -12303,6 +12513,7 @@ pub fn compressed_receipt_block(
         fallbacks,
         full_cache_dequantizations,
         failed_dispatches,
+        measurement_paths: None,
     })
 }
 
@@ -12438,6 +12649,14 @@ fn product_receipt(
                 observation,
                 &compressed_arm_observations(suites, &timing_runs),
             )
+            .map(|mut block| {
+                block.measurement_paths = Some(receipt_measurement_paths(
+                    coordinate.request_mode,
+                    coordinate.prefill_mode,
+                    &block.persistent_kv_representation,
+                ));
+                block
+            })
         })
         .transpose()?;
     let mode = if compression.is_some() {
@@ -13261,6 +13480,154 @@ pub(crate) mod tests {
         })
     }
 
+    /// Receipt honesty: a compressed receipt names the KV path of each measurement block, so a
+    /// supported-batch row's dense-fallback memory and first-token time are never read as the path
+    /// its compressed single-sequence decode and quality ran on.
+    #[test]
+    fn measurement_paths_name_each_blocks_kv_path() {
+        let batch = receipt_measurement_paths(
+            "supported-batch",
+            "single-shot",
+            DENSE_FALLBACK_PERSISTENT_KV,
+        );
+        let path = |kv: &str, operation: &str, sequences: u64| ReceiptMeasurementPath {
+            kv_path: kv.into(),
+            operation: operation.into(),
+            sequences,
+        };
+        assert_eq!(
+            batch,
+            ReceiptMeasurementPaths {
+                memory: path("dense-fallback", "supported-batch", 2),
+                prefill_first_token: path("dense-fallback", "supported-batch", 2),
+                decode_timing: path("compressed", "steady-decode", 1),
+                quality: path("compressed", "quality", 1),
+            }
+        );
+        let chunked = receipt_measurement_paths("single", "chunked", COMPRESSED_PERSISTENT_KV);
+        assert_eq!(
+            chunked.memory,
+            path("compressed", "chunked-prefix-reuse", 1)
+        );
+        assert_eq!(chunked.prefill_first_token, chunked.memory);
+
+        let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS);
+        let suites = compressed_test_suites(&continuation, &[]);
+        let mut receipt = compressed_test_builder(receipt_quality_over_repeats(&suites).unwrap())
+            .finish()
+            .unwrap();
+        let compression = receipt.compression.as_mut().unwrap();
+        let honest = receipt_measurement_paths(
+            &receipt.matrix.request_mode,
+            &receipt.matrix.prefill_mode,
+            &compression.persistent_kv_representation,
+        );
+        compression.measurement_paths = Some(honest.clone());
+        validate_receipt_semantics(&receipt).unwrap();
+        // The field round-trips, and a receipt produced before it still reads.
+        let parsed: Receipt = serde_json::from_slice(&receipt.bytes().unwrap()).unwrap();
+        assert_eq!(
+            parsed.compression.as_ref().unwrap().measurement_paths,
+            Some(honest.clone())
+        );
+        let mut legacy = serde_json::to_value(&receipt).unwrap();
+        legacy["compression"]
+            .as_object_mut()
+            .unwrap()
+            .remove("measurementPaths");
+        let legacy: Receipt = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.compression.unwrap().measurement_paths.is_none());
+        // A block that claims another path is refused.
+        for edit in [
+            (|paths: &mut ReceiptMeasurementPaths| {
+                paths.decode_timing.kv_path = DENSE_FALLBACK_PERSISTENT_KV.into()
+            }) as fn(&mut ReceiptMeasurementPaths),
+            |paths| paths.memory.kv_path = DENSE_FALLBACK_PERSISTENT_KV.into(),
+            |paths| paths.prefill_first_token.sequences = 2,
+            |paths| paths.quality.operation = "supported-batch".into(),
+        ] {
+            let mut forged = receipt.clone();
+            edit(
+                forged
+                    .compression
+                    .as_mut()
+                    .unwrap()
+                    .measurement_paths
+                    .as_mut()
+                    .unwrap(),
+            );
+            assert!(validate_receipt_semantics(&forged)
+                .unwrap_err()
+                .contains("measurementPaths"));
+        }
+    }
+
+    /// The noise floor's same-process dense timing uses A2's definitions and aggregates exactly:
+    /// over the same timing samples it reports the values a receipt's `timings` would, keyed by the
+    /// coordinate, and the summary pairs each row's dense timing with its coordinate.
+    #[test]
+    fn noise_floor_dense_timing_is_a2s_timing_of_the_dense_session() {
+        let mut builder = test_receipt_builder();
+        // Distinct samples, so an aggregate other than the receipt's mean is visible.
+        for (index, sample) in builder.timings.iter_mut().enumerate() {
+            let step = index as f64;
+            sample.prefill_ms += step * 0.5;
+            sample.ttft_ms += step * 0.25;
+            sample.first_token_ms += step * 0.75;
+            sample.decode_tokens_per_second = 1.0 + step * 0.01;
+            sample.steady_decode.decode_ms = sample.steady_decode.timed_tokens as f64 * 1_000.0
+                / sample.decode_tokens_per_second;
+        }
+        let samples = builder.timings.clone();
+        let receipt = builder.finish().unwrap();
+        let matrix = &receipt.matrix;
+        let coordinate = required_coordinates()
+            .into_iter()
+            .find(|coordinate| {
+                coordinate.family == matrix.family
+                    && coordinate.process_temperature == matrix.process_temperature
+            })
+            .unwrap();
+        let warmups = if coordinate.process_temperature == "warm" {
+            TIMING_WARMUPS
+        } else {
+            0
+        };
+        let timing =
+            noise_floor_dense_timing(&coordinate, "single-shot-generation", warmups, &samples)
+                .unwrap();
+        assert_eq!(timing["coordinate"], coordinate_slug(&coordinate));
+        assert_eq!(timing["kvPath"], "dense");
+        assert_eq!(timing["repeats"], TIMING_REPEATS);
+        for (key, value) in [
+            ("prefillMs", receipt.timings.prefill_ms),
+            ("ttftMs", receipt.timings.ttft_ms),
+            ("firstTokenMs", receipt.timings.first_token_ms),
+            (
+                "decodeTokensPerSecond",
+                receipt.timings.decode_tokens_per_second,
+            ),
+        ] {
+            assert_eq!(timing[key].as_f64(), Some(value), "{key}");
+        }
+        assert!(noise_floor_dense_timing(&coordinate, "op", warmups, &samples[1..]).is_err());
+        assert!(noise_floor_dense_timing(&coordinate, "op", warmups + 1, &samples).is_err());
+        let mut row = noise_floor_row(&coordinate_slug(&coordinate), (1.0, 0, 0.0));
+        row["denseTiming"] = timing;
+        let summary = noise_floor_summary(&[row]).unwrap();
+        let paired = &summary["denseTiming"][coordinate_slug(&coordinate)];
+        // Synthetic fixture values (no clock): the paired entry carries the receipt aggregates.
+        for (key, value) in [
+            (
+                "decodeTokensPerSecond",
+                receipt.timings.decode_tokens_per_second,
+            ),
+            ("firstTokenMs", receipt.timings.first_token_ms),
+        ] {
+            assert_eq!(paired[key].as_f64(), Some(value), "{key}");
+        }
+    }
+
     /// The SC-20669 dense noise floor: the summary is each control's worst case over the rows and
     /// says whether the dense arm already misses a frozen threshold against itself.
     #[test]
@@ -13350,16 +13717,19 @@ pub(crate) mod tests {
             missing.contains(&slugs[1]) && missing.contains("/nonexistent/llama/"),
             "{missing}"
         );
-        // Without a reference snapshot the parent cannot admit a row as the dense row is admitted.
+        // A row is priced and checked on the one dense candidate session its worker loads: the
+        // bf16 reference is never read (the 650993bc5 path read its shards), so its flag is optional.
         let mut unreferenced = args(&[]);
         let flag = unreferenced
             .iter()
             .position(|arg| arg == "--llama-fp32-reference-snapshot")
             .unwrap();
         unreferenced.drain(flag..flag + 2);
-        assert!(sc20671_cli(&unreferenced)
-            .unwrap_err()
-            .contains("--llama-fp32-reference-snapshot"));
+        let unreferenced = sc20671_cli(&unreferenced).unwrap_err();
+        assert!(
+            unreferenced.contains("/nonexistent/llama/") && !unreferenced.contains("bf16"),
+            "{unreferenced}"
+        );
         for slug in &slugs[1..] {
             seal_row(slug);
         }

@@ -325,8 +325,8 @@ for v in $values; do
         ${ONLY_ARGS[@]+"${ONLY_ARGS[@]}"} --resume-dir "$RESUME" --out "$OUT" || rc=$?
       ;;
     nf)
-      # The A1/A2 snapshot, prompt and policy arguments: the worker loads the 4-bit candidate; the
-      # parent admits each row on the dense row's estimate, which reads the bf16 reference too.
+      # The A1/A2 snapshot, prompt and policy arguments: each row's worker loads one dense session
+      # of the 4-bit candidate and is admitted on that session's estimate (bf16 flags unused).
       run_cmd "$F/sc20671_kv_baseline" noise-floor-parent "${LLM_ARGS[@]}" \
         --stop-file "$CTL/stop-requested" --resume-dir "$RESUME" --out "$OUT" || rc=$?
       ;;
