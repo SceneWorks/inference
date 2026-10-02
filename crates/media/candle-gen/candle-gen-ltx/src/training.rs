@@ -1786,12 +1786,12 @@ fn prepared_condition_header(
 /// pack through its header only, never materializing a base-model or latent tensor.
 pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     let descriptor = trainer_descriptor_25();
-    gen_core::train::validate_control_request(&descriptor, req)
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
-    gen_core::train::validate_full_finetune_request(&descriptor, req)
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
-    gen_core::train::validate_edit_request(&descriptor, req)
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
+    // The shared floors keep their typed variant across the seam (`?` maps
+    // `gen_core::Error::Unsupported` 1:1): a capability gap must stay `Unsupported` for the worker,
+    // never be flattened to a message (sc-24161).
+    gen_core::train::validate_control_request(&descriptor, req)?;
+    gen_core::train::validate_full_finetune_request(&descriptor, req)?;
+    gen_core::train::validate_edit_request(&descriptor, req)?;
     validate_ltx_request(req, MODEL_25_ID)?;
     if !req.config.alpha.is_finite() || req.config.alpha <= 0.0 {
         return Err(CandleError::Msg(
@@ -3858,5 +3858,23 @@ mod tests {
         manifest.quant.bits = 4;
         manifest.model_version = "2.3.0".into();
         assert!(validate_ltx25_dev_q4_manifest(&manifest).is_err());
+    }
+
+    /// sc-24161: the LTX-2.5 weights-free preflight keeps the shared floors' typed variant — an
+    /// edit dataset is a capability gap (`Unsupported`), never flattened to `Msg`.
+    #[test]
+    fn ltx25_preflight_keeps_the_edit_refusal_typed() {
+        let mut req = request();
+        req.items = vec![TrainingItem::edit_pair(
+            PathBuf::from("target.png"),
+            "make it blue".into(),
+            vec![PathBuf::from("ref.png")],
+        )];
+        match validate_ltx25_training_request(&req) {
+            Err(CandleError::Unsupported(message)) => {
+                assert!(message.contains("instruction-edit"), "{message}")
+            }
+            other => panic!("expected a typed Unsupported, got {other:?}"),
+        }
     }
 }

@@ -564,13 +564,25 @@ fn an_edit_adapter_trains_is_marked_and_changes_the_edit_render() {
         ..Default::default()
     };
     let plain = render(&dense_spec(), &edit);
-    let adapted = render(
-        &dense_spec().with_adapters(vec![AdapterSpec::new(
-            output.adapter_path.clone(),
-            1.0,
-            AdapterKind::Lora,
-        )]),
-        &edit,
+    let adapted_spec = dense_spec().with_adapters(vec![AdapterSpec::new(
+        output.adapter_path.clone(),
+        1.0,
+        AdapterKind::Lora,
+    )]);
+    let adapted = render(&adapted_spec, &edit);
+    // The same adapter, prompt and seed WITHOUT the references renders differently: the edit
+    // render really is reference-conditioned through the adapted DiT (the T2I route would ignore
+    // them). *Mutation that reds this:* the render path dropping `ReferenceConditioning`.
+    let adapted_t2i = render(
+        &adapted_spec,
+        &GenerationRequest {
+            conditioning: Vec::new(),
+            ..edit.clone()
+        },
+    );
+    assert_ne!(
+        adapted.pixels, adapted_t2i.pixels,
+        "the adapted edit render must depend on its references"
     );
     let changed = adapted
         .pixels

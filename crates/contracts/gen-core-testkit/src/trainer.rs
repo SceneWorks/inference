@@ -177,21 +177,30 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
     for item in &mut edit.items {
         item.reference_image_paths = vec![item.image_path.clone(); refs];
     }
-    if t.validate(&edit).is_ok() {
-        return Err(if cap == 0 {
-            format!(
-                "validate-honesty[{id}]: an instruction-edit dataset (items with reference images) \
-                 was accepted by validate() despite max_reference_images == 0 — it must be \
-                 rejected, not silently trained as a text-to-image adapter (F-055)"
-            )
-        } else {
-            format!(
-                "validate-honesty[{id}]: an edit item with {refs} reference images was accepted by \
-                 validate() despite max_reference_images == {cap}"
-            )
-        });
+    // The refusal must be the RIGHT one, not any error: a capability gap stays a typed
+    // `Unsupported` (the worker gates on the variant), and a cap refusal names the cap.
+    match (t.validate(&edit), cap) {
+        (Ok(()), 0) => Err(format!(
+            "validate-honesty[{id}]: an instruction-edit dataset (items with reference images) was \
+             accepted by validate() despite max_reference_images == 0 — it must be rejected, not \
+             silently trained as a text-to-image adapter (F-055)"
+        )),
+        (Ok(()), _) => Err(format!(
+            "validate-honesty[{id}]: an edit item with {refs} reference images was accepted by \
+             validate() despite max_reference_images == {cap}"
+        )),
+        (Err(Error::Unsupported(_)), 0) => Ok(()),
+        (Err(other), 0) => Err(format!(
+            "validate-honesty[{id}]: an instruction-edit dataset on a trainer with \
+             max_reference_images == 0 must be refused with a typed Error::Unsupported, got \
+             {other:?}"
+        )),
+        (Err(e), _) if e.to_string().contains(&format!("at most {cap}")) => Ok(()),
+        (Err(other), _) => Err(format!(
+            "validate-honesty[{id}]: an edit item with {refs} reference images must be refused \
+             naming the cap (\"at most {cap}\"), got {other:?}"
+        )),
     }
-    Ok(())
 }
 
 /// **Progress.** A completed (uncancelled) run streams `TrainingProgress::Caching` over exactly

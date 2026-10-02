@@ -478,7 +478,32 @@ pub fn validate_full_finetune_request(
 ///   pairs are different workflows.
 /// - an item carries more references than the cap ⇒ [`crate::Error::Msg`] naming the item, its
 ///   count and the cap.
+/// - an edit pair with an empty (whitespace-only) instruction `caption` ⇒ [`crate::Error::Msg`]: the
+///   instruction is the edit's whole conditioning.
+///
+/// It also carries the **item-shape floor** every trainer gets for free (and the reason
+/// [`TrainingItem`] can derive `Default` safely): any item whose `image_path` — or any of whose
+/// `reference_image_paths` — is empty is refused with [`crate::Error::Msg`] naming the item, so a
+/// `..Default::default()` literal that forgot a path fails `validate` instead of the run.
 pub fn validate_edit_request(desc: &TrainerDescriptor, req: &TrainingRequest) -> crate::Result<()> {
+    for (idx, item) in req.items.iter().enumerate() {
+        if item.image_path.as_os_str().is_empty() {
+            return Err(crate::Error::Msg(format!(
+                "{}: item {idx} has an empty image_path",
+                desc.id
+            )));
+        }
+        if let Some(r) = item
+            .reference_image_paths
+            .iter()
+            .position(|p| p.as_os_str().is_empty())
+        {
+            return Err(crate::Error::Msg(format!(
+                "{}: item {idx} has an empty path at reference {r}",
+                desc.id
+            )));
+        }
+    }
     let Some(first_edit) = req.items.iter().position(TrainingItem::is_edit_pair) else {
         return Ok(());
     };
@@ -511,6 +536,12 @@ pub fn validate_edit_request(desc: &TrainerDescriptor, req: &TrainingRequest) ->
             return Err(crate::Error::Msg(format!(
                 "{}: item {idx} carries {count} reference images, but this model accepts at most \
                  {cap} reference images per edit",
+                desc.id
+            )));
+        }
+        if item.caption.trim().is_empty() {
+            return Err(crate::Error::Msg(format!(
+                "{}: item {idx} is an edit pair with an empty instruction caption",
                 desc.id
             )));
         }
@@ -850,5 +881,52 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("one or the other"), "{err}");
+    }
+
+    /// sc-24161: the item-shape floor that makes `TrainingItem: Default` safe — a forgotten
+    /// (empty) `image_path` or reference path is refused by name on EVERY trainer (cap 0 or not),
+    /// and an edit pair needs a non-empty instruction. A captioned item may keep an empty caption
+    /// (trigger-word-only datasets), so that is NOT refused.
+    #[test]
+    fn empty_paths_and_empty_edit_instructions_are_refused() {
+        for cap in [0, 10] {
+            let forgotten = TrainingItem {
+                caption: "a cat".into(),
+                ..Default::default()
+            };
+            let err = validate_edit_request(&edit_desc(cap), &train_req(None, vec![forgotten]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("item 0 has an empty image_path"),
+                "cap {cap}: {err}"
+            );
+        }
+
+        let empty_ref = TrainingItem::edit_pair(
+            PathBuf::from("t.png"),
+            "make it blue".into(),
+            vec![PathBuf::from("r.png"), PathBuf::new()],
+        );
+        let err = validate_edit_request(&edit_desc(10), &train_req(None, vec![empty_ref]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty path at reference 1"), "{err}");
+
+        let silent = TrainingItem::edit_pair(
+            PathBuf::from("t.png"),
+            "  ".into(),
+            vec![PathBuf::from("r.png")],
+        );
+        let err = validate_edit_request(&edit_desc(10), &train_req(None, vec![silent]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty instruction"), "{err}");
+
+        let trigger_only = TrainingItem::captioned(PathBuf::from("a.png"), String::new());
+        assert!(
+            validate_edit_request(&edit_desc(0), &train_req(None, vec![trigger_only])).is_ok(),
+            "an empty caption on a captioned item stays legal"
+        );
     }
 }
