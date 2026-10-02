@@ -1,15 +1,20 @@
 //! LoRA / LoKr on the Qwen-Image 2.1 DiT (sc-24156), on the committed miniature snapshot.
 //!
-//! Two layers:
+//! Three layers:
 //!
 //! * **The host** (`AdaptableHost for QwenImage21Transformer`) — the key→module surface, the kohya
 //!   flattened table, and the residual itself: an installed adapter changes the DiT's velocity on
-//!   the dense base and on a load-time **Q4-packed** base (where it must stay a residual — the base
-//!   remains packed), LoRA and LoKr alike, stacked across files with their own strengths; a strength
-//!   of zero is byte-identical to no adapter. Unmatched keys are a strict refusal that names them.
+//!   the dense base and on a load-time **Q4- or Q8-packed** base (where it must stay a residual —
+//!   the base remains packed), LoRA and LoKr alike, stacked across files with their own strengths;
+//!   a strength of zero is byte-identical to no adapter. Unmatched keys are a strict refusal that
+//!   names them.
 //! * **The load path** (`provider_registry().load(..)` with `LoadSpec::adapters`) — the refusal is
 //!   gone, the descriptor advertises LoRA + LoKr, and the adapters reach the text-to-image route
-//!   (Resident and Sequential), the reference/edit route, and a pre-quantized Q4 tier.
+//!   (Resident and Sequential), the reference/edit route, and pre-quantized Q4 and Q8 tiers whose
+//!   DiT is asserted packed. An unmatched key fails the load under both residency policies.
+//! * **The memory contract** — an adapter load prices its resident overlay (factors plus every
+//!   materialized LoKr delta, per the tier's real packing) on the typed component axis, and an
+//!   unsizable source is refused rather than priced at zero.
 //!
 //! The adapter files are synthesized at test time against the host's own base shapes (read through
 //! the probe half, `adaptable_facts`), with deterministic bounded values — no RNG, no real weights.
@@ -17,10 +22,11 @@
 use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core::Conditioning;
+use mlx_gen::gen_core::{Conditioning, MemoryComponentKind, MemoryFormulaVariable};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, WeightsSource};
 use mlx_gen_qwen_image_2_1::convert::prequantize_turnkey;
+use mlx_gen_qwen_image_2_1::memory_strategy::memory_strategy_contract;
 use mlx_gen_qwen_image_2_1::quant::Tier;
 use mlx_gen_qwen_image_2_1::{
     apply_qwen_image_2_1_adapters, load_transformer, QwenImage21Transformer, BLOCK_ADAPTER_TARGETS,
@@ -196,7 +202,14 @@ fn packed_q4() -> QwenImage21Transformer {
     model
 }
 
-/// A DiT constructor — [`dense`] or [`packed_q4`].
+/// The tiny DiT quantized at load to Q8 — same packing rule as [`packed_q4`], 8-bit codes.
+fn packed_q8() -> QwenImage21Transformer {
+    let mut model = dense();
+    model.quantize(8).expect("load-time Q8");
+    model
+}
+
+/// A DiT constructor — [`dense`], [`packed_q4`] or [`packed_q8`].
 type Build = fn() -> QwenImage21Transformer;
 
 fn is_packed(model: &mut QwenImage21Transformer, path: &str) -> bool {
@@ -304,40 +317,58 @@ fn a_lora_residual_changes_the_dense_velocity() {
     assert_identical("dense/lora@0", &velocity(&off), &base);
 }
 
-/// On a Q4-packed DiT the adapter is a residual over the packed base: the base stays packed, the
+/// On a packed DiT the adapter is a residual over the packed base: the base stays packed, the
 /// adapter is installed on it, and the velocity moves relative to the same packed DiT without it.
-#[test]
-fn a_lora_residual_changes_the_packed_q4_velocity_and_leaves_the_base_packed() {
+fn assert_lora_moves_a_packed_dit(name: &str, build: Build) {
     let tmp = tempfile::tempdir().unwrap();
-    let base = velocity(&packed_q4());
+    let base = velocity(&build());
 
-    let mut model = packed_q4();
-    for t in TARGETS {
-        assert!(is_packed(&mut model, t), "{t} packs at Q4 on the tiny DiT");
-    }
-    let file = peft_lora(tmp.path(), "lora.safetensors", &mut model, &TARGETS, 1.0);
-    let report = apply_qwen_image_2_1_adapters(&mut model, &[lora(&file, 1.0)]).unwrap();
-    assert_eq!(report.applied, TARGETS.len());
+    let mut model = build();
     for t in TARGETS {
         assert!(
             is_packed(&mut model, t),
-            "{t}: the install must not unpack the base"
+            "{name}: {t} packs on the tiny DiT"
         );
-        assert_eq!(adapter_count(&mut model, t), 1, "{t}");
     }
-    assert_moved("q4/lora", &velocity(&model), &base);
+    let file = peft_lora(tmp.path(), "lora.safetensors", &mut model, &TARGETS, 1.0);
+    let report = apply_qwen_image_2_1_adapters(&mut model, &[lora(&file, 1.0)]).unwrap();
+    assert_eq!(report.applied, TARGETS.len(), "{name}");
+    for t in TARGETS {
+        assert!(
+            is_packed(&mut model, t),
+            "{name}: {t}: the install must not unpack the base"
+        );
+        assert_eq!(adapter_count(&mut model, t), 1, "{name}: {t}");
+    }
+    assert_moved(&format!("{name}/lora"), &velocity(&model), &base);
 }
 
-/// LoKr on both bases: a materialized delta over the dense DiT, the structured (never-materialized)
-/// Kronecker residual over the packed one — both move the velocity.
 #[test]
-fn a_lokr_residual_changes_the_velocity_on_dense_and_packed_q4() {
+fn a_lora_residual_changes_the_packed_q4_velocity_and_leaves_the_base_packed() {
+    assert_lora_moves_a_packed_dit("q4", packed_q4);
+}
+
+/// The Q8 twin: 8-bit codes over the same packing, so an install that unpacked a Q8 base, or a
+/// residual that was lost against Q8's finer codes, shows here.
+#[test]
+fn a_lora_residual_changes_the_packed_q8_velocity_and_leaves_the_base_packed() {
+    assert_lora_moves_a_packed_dit("q8", packed_q8);
+}
+
+/// LoKr on every base: a materialized delta over the dense DiT, the structured (never-materialized)
+/// Kronecker residual over the packed Q4 and Q8 ones — all move the velocity.
+#[test]
+fn a_lokr_residual_changes_the_velocity_on_dense_and_packed_q4_q8() {
     let tmp = tempfile::tempdir().unwrap();
     let targets = [
         "transformer_blocks.0.attn.to_k",
         "transformer_blocks.1.attn.to_out.0",
     ];
-    for (name, build) in [("dense", dense as Build), ("q4", packed_q4 as Build)] {
+    for (name, build) in [
+        ("dense", dense as Build),
+        ("q4", packed_q4 as Build),
+        ("q8", packed_q8 as Build),
+    ] {
         let base = velocity(&build());
         let mut model = build();
         let file = peft_lokr(tmp.path(), &mut model, &targets, 1.0);
@@ -556,31 +587,65 @@ fn adapters_reach_the_reference_edit_route() {
     );
 }
 
-/// A pre-quantized Q4 tier takes the same adapters as residuals over its packed DiT.
-#[test]
-fn adapters_reach_a_packed_q4_tier() {
+/// Convert the tiny snapshot into `tier` under `dir`.
+fn convert_tier(dir: &Path, tier: Tier) -> PathBuf {
+    let out = dir.join(tier.dir_name());
+    prequantize_turnkey(&tiny_snapshot(), &out, tier).expect("the tiny snapshot converts");
+    out
+}
+
+/// The Linear [`render_lora`] relies on reaching a packed base: `img_mlp.out` reads the 64-wide
+/// FFN, a multiple of the tier's group, so the converter packs it.
+const PACKED_RENDER_TARGET: &str = "transformer_blocks.0.img_mlp.out";
+
+/// A pre-quantized tier takes the same adapters as residuals over its packed DiT. The packing is
+/// asserted on the tier's own DiT, not assumed: loaded from the converted snapshot, the render
+/// target is packed, and installing the render LoRA on it leaves it packed with the adapter on.
+fn assert_adapters_reach_a_packed_tier(tier: Tier) {
     let tmp = tempfile::tempdir().unwrap();
     let file = render_lora(tmp.path());
-    let tier = tmp.path().join(Tier::Q4.dir_name());
-    prequantize_turnkey(&tiny_snapshot(), &tier, Tier::Q4).expect("the tiny snapshot converts");
-    let quant = Tier::Q4.selected_quant().expect("Q4 selects a quant");
-    let req = t2i(32);
+    let root = convert_tier(tmp.path(), tier);
+    let quant = tier.selected_quant().expect("the tier selects a quant");
 
-    let plain = render(&snapshot_spec(tier.clone()).with_quant(quant), &req);
+    let mut dit = load_transformer(&root).expect("the converted tier's DiT loads");
+    assert!(
+        is_packed(&mut dit, PACKED_RENDER_TARGET),
+        "{tier:?}: the converted tier must pack {PACKED_RENDER_TARGET}"
+    );
+    apply_qwen_image_2_1_adapters(&mut dit, &[lora(&file, 1.0)]).unwrap();
+    assert!(
+        is_packed(&mut dit, PACKED_RENDER_TARGET),
+        "{tier:?}: the install must not unpack the tier's base"
+    );
+    assert_eq!(adapter_count(&mut dit, PACKED_RENDER_TARGET), 1, "{tier:?}");
+
+    let req = t2i(32);
+    let plain = render(&snapshot_spec(root.clone()).with_quant(quant), &req);
     let adapted = render(
-        &snapshot_spec(tier)
+        &snapshot_spec(root)
             .with_quant(quant)
             .with_adapters(vec![lora(&file, 1.0)]),
         &req,
     );
     assert_ne!(
         adapted.pixels, plain.pixels,
-        "the LoRA must change the packed-tier render"
+        "{tier:?}: the LoRA must change the packed-tier render"
     );
 }
 
-/// The load path is strict too: an unmatched key fails the load (Resident builds the DiT eagerly)
-/// and the error names it.
+#[test]
+fn adapters_reach_a_packed_q4_tier() {
+    assert_adapters_reach_a_packed_tier(Tier::Q4);
+}
+
+#[test]
+fn adapters_reach_a_packed_q8_tier() {
+    assert_adapters_reach_a_packed_tier(Tier::Q8);
+}
+
+/// The load path is strict under both residency policies: an unmatched key fails the load and the
+/// error names it. `Resident` builds the DiT eagerly; `Sequential` defers it to every generate, so
+/// `load` resolves the stack against a lazy DiT graph rather than let each request fail instead.
 #[test]
 fn an_unmatched_adapter_key_fails_the_load_by_name() {
     let tmp = tempfile::tempdir().unwrap();
@@ -592,16 +657,187 @@ fn an_unmatched_adapter_key_fails_the_load_by_name() {
         &["proj_out", "transformer_blocks.0.attn.to_add_out"],
         1.0,
     );
-    let spec = snapshot_spec(tiny_snapshot()).with_adapters(vec![lora(&file, 1.0)]);
-    let err = match mlx_gen_qwen_image_2_1::provider_registry()
-        .unwrap()
-        .load(ID, &spec)
-    {
-        Ok(_) => panic!("an unmatched adapter key must fail the load"),
-        Err(err) => err.to_string(),
-    };
+    for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+        let spec = snapshot_spec(tiny_snapshot())
+            .with_offload_policy(policy)
+            .with_adapters(vec![lora(&file, 1.0)]);
+        let err = match mlx_gen_qwen_image_2_1::provider_registry()
+            .unwrap()
+            .load(ID, &spec)
+        {
+            Ok(_) => panic!("{policy:?}: an unmatched adapter key must fail the load"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("transformer_blocks.0.attn.to_add_out"),
+            "{policy:?}: {err}"
+        );
+    }
+}
+
+// ── the memory contract ──────────────────────────────────────────────────────────────────────────
+
+/// LoKr targets that split the packing rules three ways on the tiny DiT: `to_k` reads the 32-wide
+/// inner dim (packed at load time, which falls back to group 32, but left dense by the group-64
+/// converter), `img_mlp.out` reads the 64-wide FFN (packed everywhere), `img_in` reads 8 latent
+/// channels (dense everywhere).
+const PRICED_LOKR_TARGETS: [&str; 3] = [
+    "transformer_blocks.0.attn.to_k",
+    "transformer_blocks.1.img_mlp.out",
+    "img_in",
+];
+
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
+}
+
+/// Bytes of the bf16 `[out, in]` deltas the shared install materializes for `targets` on `host`:
+/// one per target whose base is dense (a LoKr over a packed base stays structured).
+fn dense_target_delta_bytes(host: &mut QwenImage21Transformer, targets: &[&str]) -> u64 {
+    let mut bytes = 0;
+    for target in targets {
+        if !is_packed(host, target) {
+            let (out, inp) = base_shape(host, target);
+            bytes += (out * inp * 2) as u64;
+        }
+    }
+    bytes
+}
+
+/// The contract for `spec`, checked against the plain contract of the same snapshot and tier:
+/// the overlay is exactly `expected`, declared on the typed component axis, excluded from
+/// `base_bytes`, and added to the resident total — and the contract conforms.
+fn assert_overlay_priced(name: &str, spec: &LoadSpec, expected: u64) {
+    let mut bare = spec.clone();
+    bare.adapters.clear();
+    let plain = memory_strategy_contract(ID, &bare).unwrap();
+    assert_eq!(plain.asset_facts.overlay_bytes, 0, "{name}: bare overlay");
+    assert!(plain.resident_components().is_empty(), "{name}");
+
+    let contract = memory_strategy_contract(ID, spec).unwrap();
+    assert!(expected > 0, "{name}: a non-empty stack prices above zero");
+    assert_eq!(contract.asset_facts.overlay_bytes, expected, "{name}");
+    assert_eq!(contract.auxiliary_resident_bytes(), expected, "{name}");
     assert!(
-        err.contains("transformer_blocks.0.attn.to_add_out"),
-        "{err}"
+        contract
+            .resident_components()
+            .iter()
+            .all(|c| c.kind == MemoryComponentKind::AdapterStack),
+        "{name}"
     );
+    assert!(
+        contract.formula.uses(MemoryFormulaVariable::OverlayBytes),
+        "{name}: the overlay must be load-bearing in the formula"
+    );
+    assert_eq!(
+        contract.asset_facts.base_bytes, plain.asset_facts.base_bytes,
+        "{name}: the overlay never enters base_bytes"
+    );
+    assert_eq!(
+        contract.total_resident_bytes(),
+        plain.total_resident_bytes() + expected,
+        "{name}: the overlay reaches the resident total"
+    );
+    // The core validator's overlay legs (component sum == `overlay_bytes`, `OverlayBytes` in the
+    // formula, `base_bytes` excluding the overlay) add no error the bare contract does not have.
+    assert_eq!(
+        contract.conformance_errors(),
+        plain.conformance_errors(),
+        "{name}"
+    );
+    gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+}
+
+/// An adapter load prices what `load_heavy` keeps resident: every file's factors (residuals), plus a
+/// full bf16 `[out, in]` delta for each LoKr module whose target base is dense — so the same LoKr
+/// file prices differently on the dense DiT, a load-time Q8 DiT and a Q8 tier, exactly as their
+/// packing differs. The expected deltas are read from the real DiT at each tier, not restated.
+#[test]
+fn an_adapter_load_prices_its_resident_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut probe = dense();
+    let lora_file = peft_lora(tmp.path(), "lora.safetensors", &mut probe, &TARGETS, 1.0);
+    let lokr_file = peft_lokr(tmp.path(), &mut probe, &PRICED_LOKR_TARGETS, 1.0);
+    let q8 = Tier::Q8.selected_quant().unwrap();
+
+    // A LoRA is residuals only: its file.
+    assert_overlay_priced(
+        "dense/lora",
+        &snapshot_spec(tiny_snapshot()).with_adapters(vec![lora(&lora_file, 1.0)]),
+        file_bytes(&lora_file),
+    );
+
+    // A LoKr over the dense DiT materializes every target.
+    let dense_deltas = dense_target_delta_bytes(&mut dense(), &PRICED_LOKR_TARGETS);
+    let all_deltas: u64 = PRICED_LOKR_TARGETS
+        .iter()
+        .map(|t| {
+            let (out, inp) = base_shape(&mut probe, t);
+            (out * inp * 2) as u64
+        })
+        .sum();
+    assert_eq!(
+        dense_deltas, all_deltas,
+        "nothing is packed on the dense DiT"
+    );
+    assert_overlay_priced(
+        "dense/lokr",
+        &snapshot_spec(tiny_snapshot()).with_adapters(vec![lokr(&lokr_file, 1.0)]),
+        file_bytes(&lokr_file) + dense_deltas,
+    );
+
+    // A load-time Q8 packs every Linear at least 32 wide: only `img_in` materializes.
+    let load_time_deltas = dense_target_delta_bytes(&mut packed_q8(), &PRICED_LOKR_TARGETS);
+    assert!(load_time_deltas > 0 && load_time_deltas < dense_deltas);
+    assert_overlay_priced(
+        "load-time-q8/lokr",
+        &snapshot_spec(tiny_snapshot())
+            .with_quant(q8)
+            .with_adapters(vec![lokr(&lokr_file, 1.0)]),
+        file_bytes(&lokr_file) + load_time_deltas,
+    );
+
+    // A Q8 tier packs only group-64 widths: `to_k` is dense there too.
+    let tier = convert_tier(tmp.path(), Tier::Q8);
+    let tier_deltas =
+        dense_target_delta_bytes(&mut load_transformer(&tier).unwrap(), &PRICED_LOKR_TARGETS);
+    assert!(tier_deltas > load_time_deltas && tier_deltas < dense_deltas);
+    assert_overlay_priced(
+        "q8-tier/lokr",
+        &snapshot_spec(tier)
+            .with_quant(q8)
+            .with_adapters(vec![lokr(&lokr_file, 1.0)]),
+        file_bytes(&lokr_file) + tier_deltas,
+    );
+
+    // A stack sums.
+    assert_overlay_priced(
+        "dense/lora+lokr",
+        &snapshot_spec(tiny_snapshot())
+            .with_adapters(vec![lora(&lora_file, 0.5), lokr(&lokr_file, 1.0)]),
+        file_bytes(&lora_file) + file_bytes(&lokr_file) + dense_deltas,
+    );
+}
+
+/// An adapter source that cannot be sized fails closed — in the contract and therefore in `load`,
+/// under both policies — rather than pricing a zero the shared validator would wave through.
+#[test]
+fn an_unsizable_adapter_is_refused_rather_than_priced_at_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let absent = tmp.path().join("absent.safetensors");
+    let spec = snapshot_spec(tiny_snapshot()).with_adapters(vec![lora(&absent, 1.0)]);
+    let err = memory_strategy_contract(ID, &spec)
+        .expect_err("an unsizable adapter must refuse the contract")
+        .to_string();
+    assert!(err.contains("could not be sized"), "{err}");
+    for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+        let err = match mlx_gen_qwen_image_2_1::provider_registry()
+            .unwrap()
+            .load(ID, &spec.clone().with_offload_policy(policy))
+        {
+            Ok(_) => panic!("{policy:?}: an unsizable adapter must fail the load"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("could not be sized"), "{policy:?}: {err}");
+    }
 }

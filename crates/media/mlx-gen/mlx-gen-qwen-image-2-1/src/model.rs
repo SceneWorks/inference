@@ -183,6 +183,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
     // through the memory registration.
     let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
+    // `Resident` builds the DiT (and installs the adapters) right here; `Sequential` defers that to
+    // every generate, where an unmatched adapter key would fail each request instead of the load.
+    // Resolve the stack now so both policies refuse a bad key at load, by name.
+    if spec.offload_policy == gen_core::OffloadPolicy::Sequential && !spec.adapters.is_empty() {
+        validate_adapters_on_lazy_dit(spec)?;
+    }
     let tokenizer = loader::load_tokenizer(root)?;
     let drop_count = system_prompt_drop_count(&tokenizer)?;
     let scheduler = loader::load_scheduler_config(root)?;
@@ -246,6 +252,29 @@ fn load_text_encoder(spec: &LoadSpec) -> Result<QwenImage21TextEncoder> {
         }
     }
     Ok(encoder)
+}
+
+/// Run the exact `load_heavy` adapter install — same quantize decision, same strict seam, same
+/// key→module map — against a DiT that is only a lazy graph, and drop it unevaluated.
+///
+/// MLX safetensors loads, the load-time quantize and the adapter install are all lazy graph
+/// construction; nothing here calls `eval` or `materialize_accessed` (which
+/// [`loader::load_transformer`] does), so no DiT weight is read and a `Sequential` load keeps its
+/// `max(text encoder, DiT + VAE)` bound. What it does do is resolve every adapter key against the
+/// real module tree, so an unmatched key fails here with the same named error the `Resident`
+/// install raises.
+fn validate_adapters_on_lazy_dit(spec: &LoadSpec) -> Result<()> {
+    let root: &Path = loader::snapshot_root(&spec.weights)?;
+    let mut probe = loader::load_transformer_lazy(root)?;
+    if crate::quant::needs_load_time_quant(root, spec.quantize)? {
+        let bits = spec
+            .quantize
+            .expect("needs_load_time_quant is false without a requested tier")
+            .bits();
+        probe.quantize(bits)?;
+    }
+    crate::adapters::apply_qwen_image_2_1_adapters(&mut probe, &spec.adapters)?;
+    Ok(())
 }
 
 fn load_heavy(spec: &LoadSpec) -> Result<Heavy> {
@@ -359,12 +388,16 @@ impl QwenImage21 {
         // (freed buffers above it go back to the OS instead of pooling to the device's working-set
         // line, which is what let the footprint reach 110 GB), memory limit = resident + budget
         // (uncredited defence in depth against the eval pipeline's run-ahead). Restored on drop.
+        // The resident term credits the installed adapter stack (sc-24156) — its residual factors
+        // and any materialized LyCORIS deltas, exactly as the loaded contract prices them in
+        // `overlay_bytes` — so an adapter load does not run under a limit sized for the bare base.
         let _bounds = crate::memory_strategy::AllocatorBounds::enter(
             crate::memory_strategy::derived::resident_weights(
                 crate::quant::Tier::from_selected(self.spec.quantize)
                     .unwrap_or(crate::quant::Tier::Bf16),
             )
-            .resident_total(),
+            .resident_total()
+            .saturating_add(self.memory_strategy.asset_facts.overlay_bytes),
             crate::memory_strategy::derived::request_transient_budget_bytes(
                 req.width,
                 req.height,
