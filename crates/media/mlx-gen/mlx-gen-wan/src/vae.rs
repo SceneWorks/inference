@@ -805,18 +805,22 @@ impl WanVae {
         if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode(z);
         }
-        // Denormalize + conv2 + the attention-bearing middle blocks, once on the full latent.
-        let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
-        let middle = self
-            .decoder
-            .forward_middle(&self.conv2.forward(&denorm, None)?)?;
+        // Denormalize + conv2 + the attention-bearing middle blocks, once on the full latent,
+        // materialized with their intermediates released before the first tile (sc-20686).
+        let middle = {
+            let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
+            self.decoder
+                .forward_middle(&self.conv2.forward(&denorm, None)?)?
+        };
+        DeadStageBuffers::Release.materialize(&middle)?;
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
-        // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile work = upsample tail + clamp.
+        // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile work = upsample tail + clamp,
+        // released at every block like the single pass, and the pool released after every tile.
         tile_decode_accumulate(&middle, &plan, [2, 3, 4], cancel, |tile| {
             let dec = self
                 .decoder
-                .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
+                .forward_upsample_tail(tile, DeadStageBuffers::Release)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })
     }
@@ -1035,10 +1039,12 @@ mod tests {
 
     /// sc-20686: a single-pass decode materializes and releases after every residual block and
     /// resample plus once with the output, without changing a single output value; a tiled decode
-    /// stays one lazy graph per tile and releases nothing. Sized: dim 8, latent [1,16,2,8,8] → a
-    /// few MiB.
+    /// releases its middle once, every tile's tail at every block and every tile's pool, again
+    /// without changing a value (the D-run regression: a tiled decode that kept its pool and ran
+    /// each tail as one lazy graph outgrew its planned budget). Sized: dim 8, latent [1,16,2,8,8] →
+    /// a few MiB.
     #[test]
-    fn single_pass_decode_releases_every_block_and_tiles_keep_them() {
+    fn single_pass_and_tiled_decodes_release_every_block() {
         let vae = synthetic_decoder(8);
         let latent = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
 
@@ -1050,13 +1056,115 @@ mod tests {
         assert_eq!(released.shape(), kept.shape());
         assert_eq!(released.as_slice::<f32>(), kept.as_slice::<f32>());
 
+        let cfg = TilingConfig::spatial_only(32, 16);
+        let sh = latent.shape();
+        let plan = cfg.plan(WanVae::VAE_TILING, sh[2], sh[3], sh[4]);
+        let tiles = plan.t.len() * plan.h.len() * plan.w.len();
+        assert!(tiles > 1, "the fixture must actually tile");
         let before = block_releases();
-        let tiled = vae
-            .decode_tiled(&latent, &TilingConfig::spatial_only(32, 16), None)
-            .unwrap();
+        let tiled = vae.decode_tiled(&latent, &cfg, None).unwrap();
         eval(&tiled);
         assert_eq!(tiled.shape(), released.shape());
-        assert_eq!(block_releases(), before, "tiled decode must keep its pool");
+        assert_eq!(
+            block_releases() - before,
+            1 + tiles * (vae.decoder.upsamples.len() + 1),
+            "the middle, every tail block of every tile, and every tile's pool are released"
+        );
+        // The releases change no value: the same tiles with the pool kept and the tail lazy.
+        let denorm = add(divide(&latent, &vae.inv_std).unwrap(), &vae.mean).unwrap();
+        let middle = vae
+            .decoder
+            .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
+            .unwrap();
+        let kept = mlx_gen::vae_tiling::tiled_decode(&middle, &plan, [2, 3, 4], None, |tile| {
+            let dec = vae
+                .decoder
+                .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
+            Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
+        })
+        .unwrap();
+        eval(&kept);
+        assert_eq!(tiled.as_slice::<f32>(), kept.as_slice::<f32>());
+    }
+
+    const TILED_CHILD: &str = "WAN_Z16_TILED_DECODE_CHILD";
+
+    /// sc-20686 (the D-run regression): a tiled decode's live + cache peak stays at or below the
+    /// same tiles decoded with the pool kept and each tail one lazy graph, and it leaves MLX's cache
+    /// empty. MLX's counters are process-wide, so the measurement runs alone in a child process.
+    /// Sized: dim 16 f32 weights (< 8 MiB), latent [1,16,3,16,16] in 4 spatial tiles; < 256 MiB.
+    #[test]
+    fn tiled_decode_releases_its_pool_and_bounds_its_peak() {
+        if std::env::var_os(TILED_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae::tests::tiled_decode_releases_its_pool_and_bounds_its_peak",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(TILED_CHILD, "1")
+                .output()
+                .expect("spawn the isolated tiled-decode child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated tiled-decode child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use mlx_rs::memory::{
+            clear_cache, get_active_memory, get_cache_memory, get_peak_memory, reset_peak_memory,
+        };
+        const MIB: usize = 1 << 20;
+        let vae = synthetic_decoder(16);
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, 3, 16, 16], None, None, None).unwrap();
+        eval(&latent);
+        let cfg = TilingConfig::spatial_only(80, 16);
+        let plan = cfg.plan(WanVae::VAE_TILING, 3, 16, 16);
+        assert!(
+            plan.h.len() * plan.w.len() > 1,
+            "the fixture must actually tile"
+        );
+
+        // Control: the same tiles with every tail one lazy graph and the pool kept.
+        clear_cache();
+        reset_peak_memory();
+        let base = get_active_memory();
+        let kept = {
+            let denorm = add(divide(&latent, &vae.inv_std).unwrap(), &vae.mean).unwrap();
+            let middle = vae
+                .decoder
+                .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
+                .unwrap();
+            mlx_gen::vae_tiling::tiled_decode(&middle, &plan, [2, 3, 4], None, |tile| {
+                let dec = vae
+                    .decoder
+                    .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
+                Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
+            })
+            .unwrap()
+        };
+        eval(&kept);
+        let kept_peak = get_peak_memory() - base;
+        drop(kept);
+
+        clear_cache();
+        reset_peak_memory();
+        let base = get_active_memory();
+        let tiled = vae.decode_tiled(&latent, &cfg, None).unwrap();
+        eval(&tiled);
+        let tiled_peak = get_peak_memory() - base;
+        let cached = get_cache_memory();
+        assert!(
+            tiled_peak <= kept_peak,
+            "the releasing tiled decode peaked at {tiled_peak} B, above the kept pool's {kept_peak} B"
+        );
+        assert!(
+            cached < MIB,
+            "a tiled decode must leave the cache empty: {cached} B"
+        );
     }
 
     const CACHE_CHILD: &str = "WAN_Z16_DECODE_CACHE_CHILD";

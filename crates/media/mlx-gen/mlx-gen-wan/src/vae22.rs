@@ -1414,13 +1414,17 @@ impl Wan22Vae {
         if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode_cl(&z);
         }
-        let denorm = add(&multiply(&z, &self.std)?, &self.mean)?;
-        // The attention-bearing middle blocks run once, in `compute_dtype`, on the full latent.
-        let middle = self.decoder.forward_middle(
-            &self
-                .conv2
-                .forward(&denorm.as_dtype(self.compute_dtype)?, None)?,
-        )?;
+        // The attention-bearing middle blocks run once, in `compute_dtype`, on the full latent,
+        // materialized with their intermediates released before the first tile (sc-20686).
+        let middle = {
+            let denorm = add(&multiply(&z, &self.std)?, &self.mean)?;
+            self.decoder.forward_middle(
+                &self
+                    .conv2
+                    .forward(&denorm.as_dtype(self.compute_dtype)?, None)?,
+            )?
+        };
+        DeadStageBuffers::Release.materialize(&middle)?;
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
         // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile work adds the 2× spatial
@@ -1430,7 +1434,7 @@ impl Wan22Vae {
         tile_decode_accumulate(&middle, &plan, [1, 2, 3], cancel, |tile| {
             let dec = self
                 .decoder
-                .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
+                .forward_upsample_tail(tile, DeadStageBuffers::Release)?;
             let dec = unpatchify(&dec, 2)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })
@@ -1568,10 +1572,11 @@ mod tests {
     }
 
     /// sc-20686: a single-pass decode releases inside and after every block of every up-stage plus
-    /// once with the output, without changing a single output value; a tiled decode releases nothing.
+    /// once with the output, without changing a single output value; a tiled decode releases its
+    /// middle, every tile's tail the same way, and every tile's pool, also value-neutral.
     /// Sized: dec_dim 8, latent [48,2,8,8] → a few MiB.
     #[test]
-    fn single_pass_decode_releases_every_block_and_tiles_keep_them() {
+    fn single_pass_and_tiled_decodes_release_every_block() {
         let vae = synthetic_decoder(8, Dtype::Float32);
         let latent = mlx_rs::random::normal::<f32>(&[48, 2, 8, 8], None, None, None).unwrap();
         let blocks: usize = vae
@@ -1595,13 +1600,40 @@ mod tests {
         assert_eq!(released.shape(), kept.shape());
         assert_eq!(released.as_slice::<f32>(), kept.as_slice::<f32>());
 
+        let cfg = TilingConfig::spatial_only(64, 32);
+        let z = vae.to_channels_last(&latent).unwrap();
+        let sh = z.shape();
+        let plan = cfg.plan(Wan22Vae::VAE_TILING, sh[1], sh[2], sh[3]);
+        let tiles = plan.t.len() * plan.h.len() * plan.w.len();
+        assert!(tiles > 1, "the fixture must actually tile");
         let before = block_releases();
-        let tiled = vae
-            .decode_tiled(&latent, &TilingConfig::spatial_only(64, 32), None)
-            .unwrap();
+        let tiled = vae.decode_tiled(&latent, &cfg, None).unwrap();
         eval(&tiled).unwrap();
         assert_eq!(tiled.shape(), released.shape());
-        assert_eq!(block_releases(), before, "tiled decode must keep its pool");
+        assert_eq!(
+            block_releases() - before,
+            1 + tiles * (blocks + 1),
+            "the middle, every tail block of every tile, and every tile's pool are released"
+        );
+        // The releases change no value: the same tiles with the pool kept and the tail lazy.
+        let denorm = add(multiply(&z, &vae.std).unwrap(), &vae.mean)
+            .unwrap()
+            .as_dtype(vae.compute_dtype)
+            .unwrap();
+        let middle = vae
+            .decoder
+            .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
+            .unwrap();
+        let kept = mlx_gen::vae_tiling::tiled_decode(&middle, &plan, [1, 2, 3], None, |tile| {
+            let dec = vae
+                .decoder
+                .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
+            let dec = unpatchify(&dec, 2)?;
+            Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
+        })
+        .unwrap();
+        eval(&kept).unwrap();
+        assert_eq!(tiled.as_slice::<f32>(), kept.as_slice::<f32>());
     }
 
     const CACHE_CHILD: &str = "WAN22_DECODE_CACHE_CHILD";

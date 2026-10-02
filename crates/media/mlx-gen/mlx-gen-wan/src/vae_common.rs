@@ -57,11 +57,12 @@ pub(crate) fn eval(x: &Array) -> Result<()> {
 /// 768x512x33 decode priced at 41.6 GiB carried a footprint far past 64 GiB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeadStageBuffers {
-    /// Single-pass decode: every block boundary materializes its output and returns all freed
-    /// buffers to the OS, so the cache stays near zero and the live-only cost model holds.
+    /// Every block boundary materializes its output and returns all freed buffers to the OS, so the
+    /// cache stays near zero and the live-only cost model holds. Both the single-pass and the tiled
+    /// decode run their tails this way (sc-20686).
     Release,
-    /// Tiled decode: the next tile runs the same blocks at the same extents and reuses the cached
-    /// buffers, so they stay pooled.
+    /// The tail stays one lazy graph and its freed buffers stay pooled (reference/test control
+    /// only: it is what let a tiled decode outgrow its planned budget).
     Keep,
 }
 
@@ -91,7 +92,7 @@ impl DeadStageBuffers {
         Ok(())
     }
 
-    fn release(self) {
+    pub(crate) fn release(self) {
         if self.releases() {
             #[cfg(test)]
             BLOCK_RELEASES.with(|count| count.set(count.get() + 1));
@@ -140,6 +141,12 @@ impl FeatCache {
 /// carry — a softmax attention over every `H·W` token) is **not** tile-consistent, and no blend
 /// width recovers it. Both callers therefore hoist their attention-bearing middle blocks into a
 /// dense head and pass only a spatially-local tail through here.
+///
+/// **Memory (sc-20686).** Every tile's fold is materialized and, once only the accumulators are
+/// live, MLX's buffer cache is released ([`DeadStageBuffers::Release`]), so a tile's decoder and
+/// assembly buffers never pool into the next tile's. A tiled decode that kept its pool across
+/// tiles (and ran each tile's tail as one lazy graph) peaked at 75+ GiB on an A14B 768x512x33
+/// render planned at a 58.7 GiB safe budget -- above the 63 GiB the releasing single pass took.
 pub(crate) fn tile_decode_accumulate(
     denorm: &Array,
     plan: &TilePlan,
@@ -147,7 +154,15 @@ pub(crate) fn tile_decode_accumulate(
     cancel: Option<&CancelFlag>,
     decode_tile: impl Fn(&Array) -> Result<Array>,
 ) -> Result<Array> {
-    mlx_gen::vae_tiling::tiled_decode(denorm, plan, axes, cancel, decode_tile)
+    mlx_gen::vae_tiling::tiled_decode_with_hooks(
+        denorm,
+        plan,
+        axes,
+        cancel,
+        decode_tile,
+        |accumulators| Ok(mlx_rs::transforms::eval(accumulators.iter().copied())?),
+        || DeadStageBuffers::Release.release(),
+    )
 }
 
 /// Validate a temporal tile policy before it crosses the generic [`mlx_gen::LatentDecoder`] seam.
