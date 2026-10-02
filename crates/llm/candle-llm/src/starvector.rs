@@ -529,20 +529,39 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             finish_reason: finish,
             usage,
         });
-        Ok(core_llm::TextLlmOutput {
-            timings: None,
-            text: out.svg.unwrap_or_default(),
-            thinking: None,
-            tool_calls: vec![],
+        // The continuation decodes through the shared engine (sc-24138), so it reports its path.
+        // No graph runner wraps this decoder, so the CUDA-graph switch was off here. `None` only
+        // when the bounded stream stopped on the seeded prompt, before a decode.
+        Ok(svg_text_output(
+            out.svg,
             usage,
-            mtp: None,
-            // The continuation decodes through the shared engine (sc-24138), so it reports its
-            // path. No graph runner wraps this decoder, so the CUDA-graph switch was off here.
-            // `None` only when the bounded stream stopped on the seeded prompt, before a decode.
-            decode: record.map(|record| record.report(false)),
-            finish_reason: Some(finish),
-            kv_cache: None,
-        })
+            record,
+            finish,
+            req.kv_compression,
+        ))
+    }
+}
+
+/// The text output of one SVG generation: the SVG source (empty when none closed), and — the
+/// StarVector wrapper having no compressed-KV table family — the dense KV-cache report for the
+/// request's `policy` (sc-20683).
+fn svg_text_output(
+    svg: Option<String>,
+    usage: core_llm::Usage,
+    record: Option<DecodeRecord>,
+    finish: core_llm::FinishReason,
+    policy: core_llm::KvCompressionPolicy,
+) -> core_llm::TextLlmOutput {
+    core_llm::TextLlmOutput {
+        timings: None,
+        text: svg.unwrap_or_default(),
+        thinking: None,
+        tool_calls: vec![],
+        usage,
+        mtp: None,
+        decode: record.map(|record| record.report(false)),
+        finish_reason: Some(finish),
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(policy)),
     }
 }
 impl core_llm::StarVectorProvider for CandleStarVectorProvider {
@@ -772,6 +791,28 @@ mod tests {
             "num_attention_heads": 16,
             "multi_query": true
         })
+    }
+
+    /// sc-20683: every SVG text output reports the dense KV cache with the shared reason for its
+    /// policy.
+    #[test]
+    fn svg_text_output_reports_the_dense_kv_cache_for_the_policy() {
+        use core_llm::{
+            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        };
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let output = svg_text_output(
+                None,
+                core_llm::Usage::default(),
+                None,
+                core_llm::FinishReason::Stop,
+                policy,
+            );
+            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
+        }
     }
 
     #[test]

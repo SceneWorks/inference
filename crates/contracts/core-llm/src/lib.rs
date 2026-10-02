@@ -84,9 +84,11 @@ pub use constraint::{
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
 pub use kv_compression::{
-    compressed_kv_cache_bytes, qualify_kv_compression, CompressedKvAllocation, KvCacheCounters,
-    KvCacheFallbackReason, KvCacheReport, KvCacheShape, KvCompressionFormat, KvCompressionPolicy,
-    KvModelFamily, KvQualification, KV_CACHE_FORMAT_VERSION, KV_COMPRESSION_QUALIFICATIONS,
+    compressed_kv_cache_bytes, kv_model_family, plan_kv_cache, plan_kv_cache_without_reader,
+    qualify_kv_compression, CompressedKvAllocation, KvCacheCounters, KvCacheFallbackReason,
+    KvCachePlan, KvCacheReport, KvCacheRequest, KvCacheShape, KvCompressionFormat,
+    KvCompressionPolicy, KvModelFamily, KvQualification, KV_CACHE_FORMAT_VERSION,
+    KV_COMPRESSION_QUALIFICATIONS,
 };
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
 pub use output::{
