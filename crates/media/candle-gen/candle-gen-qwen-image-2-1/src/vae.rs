@@ -552,7 +552,9 @@ pub struct QwenImage21Vae {
     cfg: VaeConfig,
     device: Device,
     dtype: DType,
-    encoder: Encoder,
+    /// `None` once [`Self::drop_encoder`] has run — the trainer (sc-24160) encodes its dataset
+    /// latents once and then frees the encoder, keeping only the decoder for preview renders.
+    encoder: Option<Encoder>,
     quant_conv: Conv,
     post_quant_conv: Conv,
     decoder: Decoder,
@@ -566,7 +568,7 @@ impl QwenImage21Vae {
             cfg: cfg.clone(),
             device: vb.device().clone(),
             dtype: vb.dtype(),
-            encoder: Encoder::new(&vb, "encoder", cfg)?,
+            encoder: Some(Encoder::new(&vb, "encoder", cfg)?),
             quant_conv: Conv::new(&vb, "quant_conv", 1, 0)?,
             post_quant_conv: Conv::new(&vb, "post_quant_conv", 1, 0)?,
             decoder: Decoder::new(&vb, "decoder", cfg)?,
@@ -575,6 +577,19 @@ impl QwenImage21Vae {
 
     pub fn config(&self) -> &VaeConfig {
         &self.cfg
+    }
+
+    /// Free the encoder half (sc-24160): every encode after this is a typed error. The trainer
+    /// caches its dataset latents once, then drops the encoder before the train loop so only the
+    /// decoder (needed for preview samples) stays resident. The candle twin of the MLX VAE's
+    /// `drop_encoder`.
+    pub fn drop_encoder(&mut self) {
+        self.encoder = None;
+    }
+
+    /// `true` until [`Self::drop_encoder`] has run.
+    pub fn has_encoder(&self) -> bool {
+        self.encoder.is_some()
     }
 
     /// The device the weights live on.
@@ -614,10 +629,14 @@ impl QwenImage21Vae {
     }
 
     fn encode_moments_inner(&self, image: &Tensor, mut trace: Trace<'_>) -> Result<Tensor> {
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "qwen_image_2_1 vae: the encoder was dropped (the trainer frees it once its                  dataset latents are cached); reload the VAE to encode"
+                    .into(),
+            )
+        })?;
         let x = self.to_compute(image)?;
-        let moments = self
-            .quant_conv
-            .forward(&self.encoder.forward(&x, &mut trace)?)?;
+        let moments = self.quant_conv.forward(&encoder.forward(&x, &mut trace)?)?;
         trace.push("quant_conv", &moments)?;
         Ok(moments.to_dtype(DType::F32)?)
     }
