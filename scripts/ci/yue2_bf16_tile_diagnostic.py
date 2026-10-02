@@ -22,6 +22,7 @@ from yue2_decoder_trace_overlay import tree_digest
 
 ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
 LATENT_SHA256 = "f89f02851d08128baa12a3f50cc3e73c80fbb5578797b7c166888dd815dc70c9"
+HISTORICAL_STAGE2_PATH = Path(__file__).parent / "yue2_bf16_tile_diagnostic/historical-stage2.json"
 DIAGNOSTICS = ("waveform", "first_conv", "first_conv_math")
 DIAGNOSTICS += ("decoder_trace", "native_convt_columns")
 
@@ -192,6 +193,72 @@ def native_contributor_stats(full_bytes: bytes, tile_bytes: bytes, dtype: str) -
             "signedZeroOnly": signed_zero, "maxAbs": peak, "firstDifferent": first}
 
 
+def verify_historical_stage2_data(data: Path, report: dict,
+                                  manifest_path: Path = HISTORICAL_STAGE2_PATH) -> None:
+    historical = json.loads(manifest_path.read_text(encoding="utf-8"))
+    require(historical.get("source_run") == 36979353496 and
+            historical.get("source_control") == "4f89f150e13647c53d37dddfa7d36e3f1d28ac85" and
+            historical.get("engine") == ENGINE_SHA and
+            historical.get("report_sha256") ==
+            "9dd0a4113f43a185e573f79c99c2d3e01eb8525923e271cc56a341e21344301f" and
+            historical.get("metrics_zip_sha256") ==
+            "a26439ced8b5244b75a65d31b565341ff4bf0280cc3d02e6fb982563ccca379c" and
+            (historical.get("stage"), historical.get("window")) == (2, 0),
+            "pinned historical stage-2 receipt identity changed")
+    binding = report.get("historicalStage2", {})
+    require(binding.get("sourceRunId") == historical["source_run"] and
+            binding.get("sourceControlSha") == historical["source_control"] and
+            binding.get("sourceReportSha256") == historical["report_sha256"] and
+            binding.get("sourceMetricsZipSha256") == historical["metrics_zip_sha256"] and
+            binding.get("expectedMapSha256") == sha256(manifest_path) and
+            binding.get("matchesHistorical") is True and
+            set(binding.get("checks", {})) == {"bf16", "f32"},
+            "native column report omitted historical stage-2 binding")
+    expected_runs = historical["records"]
+    require(set(expected_runs) == {"bf16", "f32"}, "historical stage-2 dtype controls changed")
+    identity_keys = ("file", "sha256", "bytes", "dtype", "shape")
+    def same_identity(left: dict, right: dict, include_file: bool = True) -> bool:
+        keys = identity_keys if include_file else identity_keys[1:]
+        return all(left.get(key) == right.get(key) for key in keys)
+    for dtype in ("bf16", "f32"):
+        require(set(expected_runs[dtype]) == {"full", "window"} and
+                binding["checks"].get(dtype) == {"full": True, "window": True},
+                "historical stage-2 full/window checks incomplete")
+        for slot in ("full", "window"):
+            current = report["adaptive"]["runs"][dtype][slot]
+            expected = expected_runs[dtype][slot]
+            stages = report["runs"][dtype]["stages"]
+            source_stage = (stages[1]["full"] if slot == "full" else
+                            stages[1]["windows"][0]["capture"])
+            target_stage = (stages[2]["full"] if slot == "full" else
+                            stages[2]["windows"][0]["capture"])
+            require(current.get("inputBitExact") is True and
+                    current.get("outputBitExact") is True and
+                    same_identity(current["sourceInput"], source_stage) and
+                    same_identity(current["replayInput"], current["sourceInput"], False) and
+                    same_identity(current["originalOutput"], target_stage) and
+                    same_identity(current["replayOutput"], current["originalOutput"], False),
+                    "current stage-2 source/replay identity changed")
+            require(set(expected) == {"sourceInput", "replayInput", "originalOutput", "replayOutput",
+                                     "native_unpadded_conv_transpose", "cropped", "biased"},
+                    "historical stage-2 record set changed")
+            steps = current.get("substeps", [])
+            require(len(steps) == 3 and
+                    {step.get("name") for step in steps} ==
+                    {"native_unpadded_conv_transpose", "cropped", "biased"},
+                    "native stage-2 substeps changed")
+            for name, old in expected.items():
+                record = (next(step["capture"] for step in steps if step["name"] == name)
+                          if name in {"native_unpadded_conv_transpose", "cropped", "biased"}
+                          else current.get(name, {}))
+                require(all(record.get(key) == old[key] for key in identity_keys),
+                        f"{dtype}/{slot}/{name} differs from historical stage-2 bytes")
+                file = data / record["file"]
+                require(file.parent == data and file.is_file() and not file.is_symlink() and
+                        file.stat().st_size == old["bytes"] and sha256(file) == old["sha256"],
+                        f"{dtype}/{slot}/{name} raw array differs from historical stage-2 bytes")
+
+
 def verify_native_column_data(data: Path, report: dict) -> None:
     native = report.get("nativeColumns", {})
     require(report.get("earliestBf16Stage") == 2 and
@@ -202,6 +269,7 @@ def verify_native_column_data(data: Path, report: dict) -> None:
             {"stride": 6, "kernel": 12, "cropPadding": 3,
              "rawValidInclusive": [3, 173], "inputValidInclusive": [0, 28]},
             "native column split is not bound to the verified first ConvT divergence")
+    verify_historical_stage2_data(data, report)
     require(set(native.get("runs", {})) == {"bf16", "f32"}, "native column dtype controls incomplete")
 
     def values(record: dict, shape: list[int], dtype: str, layout: str) -> bytes:
@@ -650,6 +718,8 @@ def prepare_harness(args: argparse.Namespace) -> None:
     shutil.copy2(template / lock_name, target / "Cargo.lock")
     shutil.copy2(template / "src/main.rs", target / "src/main.rs")
     shutil.copy2(template / "src/decoder_trace.rs", target / "src/decoder_trace.rs")
+    if native_candle:
+        shutil.copy2(template / "historical-stage2.json", target / "historical-stage2.json")
     write_json(target.parent / "harness-provenance.json", {
         "engine_sha": args.engine_sha, "control_sha": args.control_sha,
         "standalone_lock_sha256": sha256(template / lock_name),

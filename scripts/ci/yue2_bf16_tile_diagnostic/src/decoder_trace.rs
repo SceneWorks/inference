@@ -4,6 +4,10 @@ use super::*;
 use std::io::{BufWriter, Read};
 
 const STAGES: usize = 33;
+#[cfg(feature = "native_convt_columns")]
+const HISTORICAL_STAGE2: &str = include_str!("../historical-stage2.json");
+#[cfg(not(feature = "native_convt_columns"))]
+const HISTORICAL_STAGE2: &str = "{}";
 const ORIGINAL_RAW: [[&str; 2]; 2] = [
     [
         "c12b2b7dca34ee4810536fcee12872674376c24ba484fa600c47fcb35317a908",
@@ -588,6 +592,43 @@ fn replay_one(
     Ok(result)
 }
 
+fn matches_historical_record(actual: &Value, expected: &Value) -> bool {
+    ["file", "sha256", "bytes", "dtype", "shape"]
+        .iter()
+        .all(|key| !expected[key].is_null() && actual[key] == expected[key])
+}
+
+fn matches_historical_stage2_slot(replay: &Value, expected: &Value) -> bool {
+    for key in [
+        "sourceInput",
+        "replayInput",
+        "originalOutput",
+        "replayOutput",
+    ] {
+        if !matches_historical_record(&replay[key], &expected[key]) {
+            return false;
+        }
+    }
+    let Some(steps) = replay["substeps"].as_array() else {
+        return false;
+    };
+    if steps.len() != 3 {
+        return false;
+    }
+    for name in ["native_unpadded_conv_transpose", "cropped", "biased"] {
+        let mut matching = steps.iter().filter(|step| step["name"] == name);
+        let Some(step) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some()
+            || !matches_historical_record(&step["capture"], &expected[name])
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_decoder_trace(
     engine: &Path,
@@ -618,6 +659,21 @@ pub(super) fn run_decoder_trace(
     let mut earliest = None;
     let mut first_window = None;
     let mut adaptive_runs = BTreeMap::new();
+    let historical: Value = serde_json::from_str(HISTORICAL_STAGE2)?;
+    if native_columns
+        && (historical["source_run"] != 36979353496u64
+            || historical["source_control"] != "4f89f150e13647c53d37dddfa7d36e3f1d28ac85"
+            || historical["engine"] != ENGINE_SHA
+            || historical["report_sha256"]
+                != "9dd0a4113f43a185e573f79c99c2d3e01eb8525923e271cc56a341e21344301f"
+            || historical["metrics_zip_sha256"]
+                != "a26439ced8b5244b75a65d31b565341ff4bf0280cc3d02e6fb982563ccca379c"
+            || historical["stage"] != 2
+            || historical["window"] != 0)
+    {
+        return Err("historical stage-2 receipt identity changed".into());
+    }
+    let mut historical_checks = BTreeMap::new();
     let mut native_runs = BTreeMap::<&str, Value>::new();
     let mut bf16_clamped_peak = None;
     for (rank, (label, dtype)) in [("bf16", DType::BF16), ("f32", DType::F32)]
@@ -759,6 +815,16 @@ pub(super) fn run_decoder_trace(
                 weight_sha256,
             )?;
             if native_columns {
+                let expected = &historical["records"][label];
+                historical_checks.insert(
+                    label,
+                    json!({
+                        "full": matches_historical_stage2_slot(&full_replay, &expected["full"]),
+                        "window": matches_historical_stage2_slot(&tile_replay, &expected["window"]),
+                    }),
+                );
+            }
+            if native_columns {
                 #[cfg(feature = "native_convt_columns")]
                 {
                     let full = &full_replay["nativeColumn"];
@@ -790,6 +856,10 @@ pub(super) fn run_decoder_trace(
             && run["window"]["inputBitExact"] == true
             && run["window"]["outputBitExact"] == true
     });
+    let historical_exact = historical_checks.len() == 2
+        && historical_checks
+            .values()
+            .all(|check: &Value| check["full"] == true && check["window"] == true);
     let adaptive = if let (Some(stage), Some(window)) = (earliest, first_window) {
         json!({"status":if replay_exact{"collected"}else{"inconclusive_replay_mismatch"},
             "source":"single_native_layer_replay","stage":stage,"window":window,
@@ -817,7 +887,16 @@ pub(super) fn run_decoder_trace(
         "waveformParity":parity,"bf16ClampedMaxAbs":bf16_clamped_peak,
         "earliestBf16Stage":earliest,"adaptive":adaptive,"runs":runs});
     if native_columns {
-        report["nativeColumns"] = json!({"status":if parity && replay_exact {"collected"}
+        report["historicalStage2"] = json!({
+            "sourceRunId":historical["source_run"],
+            "sourceControlSha":historical["source_control"],
+            "sourceReportSha256":historical["report_sha256"],
+            "sourceMetricsZipSha256":historical["metrics_zip_sha256"],
+            "expectedMapSha256":sha256(HISTORICAL_STAGE2.as_bytes()),
+            "checks":historical_checks,
+            "matchesHistorical":historical_exact,
+        });
+        report["nativeColumns"] = json!({"status":if parity && replay_exact && historical_exact {"collected"}
             else {"inconclusive_parity"},"stage":2,"window":0,
             "geometry":{"stride":6,"kernel":12,"cropPadding":3,
                 "rawValidInclusive":[3,173],"inputValidInclusive":[0,28]},
@@ -829,8 +908,11 @@ pub(super) fn run_decoder_trace(
         .open(out.join("report.json"))?;
     file.write_all(serde_json::to_string_pretty(&report)?.as_bytes())?;
     file.write_all(b"\n")?;
-    if !parity || (native_columns && !replay_exact) {
-        return Err("traced final waveform differs from original M3: inconclusive".into());
+    if !parity || (native_columns && (!replay_exact || !historical_exact)) {
+        return Err(
+            "trace failed original waveform, replay, or historical stage-2 identity: inconclusive"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -856,5 +938,49 @@ mod tests {
         assert_eq!(first_true(0, 100, |x| x >= 19), 19);
         assert_eq!(first_true(19, 100, |x| x >= 61), 61);
         assert_eq!(first_true(0, 100, |_| false), 100);
+    }
+
+    #[cfg(feature = "native_convt_columns")]
+    #[test]
+    fn historical_stage2_rejects_consistent_current_run_mutations() {
+        assert_eq!(
+            sha256(HISTORICAL_STAGE2.as_bytes()),
+            "a09106a9e5602c89bb44c21e31388f8f26a45233a393a15dd2016d355bb0e9f9"
+        );
+        let manifest: Value = serde_json::from_str(HISTORICAL_STAGE2).unwrap();
+        for dtype in ["bf16", "f32"] {
+            for slot in ["full", "window"] {
+                let expected = &manifest["records"][dtype][slot];
+                let steps: Vec<Value> = ["native_unpadded_conv_transpose", "cropped", "biased"]
+                    .iter()
+                    .map(|name| json!({"name":name,"capture":expected[name]}))
+                    .collect();
+                let mut replay = json!({"sourceInput":expected["sourceInput"],
+                    "replayInput":expected["replayInput"],
+                    "originalOutput":expected["originalOutput"],
+                    "replayOutput":expected["replayOutput"],"substeps":steps});
+                assert!(matches_historical_stage2_slot(&replay, expected));
+                for key in ["sourceInput", "replayInput"] {
+                    replay[key]["sha256"] = json!("paired-new-input");
+                }
+                assert!(!matches_historical_stage2_slot(&replay, expected));
+                for key in ["sourceInput", "replayInput"] {
+                    replay[key] = expected[key].clone();
+                }
+                for key in ["originalOutput", "replayOutput"] {
+                    replay[key]["sha256"] = json!("paired-new-output");
+                }
+                assert!(!matches_historical_stage2_slot(&replay, expected));
+                for key in ["originalOutput", "replayOutput"] {
+                    replay[key] = expected[key].clone();
+                }
+                for index in 0..3 {
+                    replay["substeps"][index]["capture"]["sha256"] = json!("changed-substep");
+                    assert!(!matches_historical_stage2_slot(&replay, expected));
+                    replay["substeps"][index]["capture"] =
+                        expected[replay["substeps"][index]["name"].as_str().unwrap()].clone();
+                }
+            }
+        }
     }
 }

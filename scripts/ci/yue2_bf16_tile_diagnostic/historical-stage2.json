@@ -1,0 +1,331 @@
+{
+  "source_run": 36979353496,
+  "source_control": "4f89f150e13647c53d37dddfa7d36e3f1d28ac85",
+  "engine": "4127a675fc8575555e029e01b7f6867488880a8f",
+  "metrics_zip_sha256": "a26439ced8b5244b75a65d31b565341ff4bf0280cc3d02e6fb982563ccca379c",
+  "report_sha256": "9dd0a4113f43a185e573f79c99c2d3e01eb8525923e271cc56a341e21344301f",
+  "stage": 2,
+  "window": 0,
+  "records": {
+    "bf16": {
+      "full": {
+        "sourceInput": {
+          "file": "bf16-stage-01-full.bf16le",
+          "sha256": "cfa579c4641c6e92b90f917d7ae1f3399c674efdda9698aa3ac943e9695c0c17",
+          "bytes": 307200,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            2048,
+            75
+          ]
+        },
+        "replayInput": {
+          "file": "bf16-replay-stage-02-full-input.bf16le",
+          "sha256": "cfa579c4641c6e92b90f917d7ae1f3399c674efdda9698aa3ac943e9695c0c17",
+          "bytes": 307200,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            2048,
+            75
+          ]
+        },
+        "originalOutput": {
+          "file": "bf16-stage-02-full.bf16le",
+          "sha256": "6adb23d77810c7ff560fcc1b0b1080f409091069e28137682c6417f88d27ba2c",
+          "bytes": 921600,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            450
+          ]
+        },
+        "replayOutput": {
+          "file": "bf16-replay-stage-02-full-output.bf16le",
+          "sha256": "6adb23d77810c7ff560fcc1b0b1080f409091069e28137682c6417f88d27ba2c",
+          "bytes": 921600,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            450
+          ]
+        },
+        "native_unpadded_conv_transpose": {
+          "file": "bf16-replay-stage-02-full-native_unpadded_conv_transpose.bf16le",
+          "sha256": "4fde133de6b247f2f69427cd8f0fa5615d0f61afcf8f98ba0de9f05e9361cd89",
+          "bytes": 933888,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            456
+          ]
+        },
+        "cropped": {
+          "file": "bf16-replay-stage-02-full-cropped.bf16le",
+          "sha256": "bce5522ec7d5160294998cc859d6e85294eceddc8e539c90048bcd93f742848c",
+          "bytes": 921600,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            450
+          ]
+        },
+        "biased": {
+          "file": "bf16-replay-stage-02-full-biased.bf16le",
+          "sha256": "6adb23d77810c7ff560fcc1b0b1080f409091069e28137682c6417f88d27ba2c",
+          "bytes": 921600,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            450
+          ]
+        }
+      },
+      "window": {
+        "sourceInput": {
+          "file": "bf16-stage-01-tile-0.bf16le",
+          "sha256": "c419f3b26f92d2e4f6e16949f2c4152b4f4b846bb22fbdf6a8648f0ef3d843c8",
+          "bytes": 131072,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            2048,
+            32
+          ]
+        },
+        "replayInput": {
+          "file": "bf16-replay-stage-02-tile-0-input.bf16le",
+          "sha256": "c419f3b26f92d2e4f6e16949f2c4152b4f4b846bb22fbdf6a8648f0ef3d843c8",
+          "bytes": 131072,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            2048,
+            32
+          ]
+        },
+        "originalOutput": {
+          "file": "bf16-stage-02-tile-0.bf16le",
+          "sha256": "e47664ad263c4b0bbc5a8538ef82c101390e7eb1123de644daa60c523fa3d817",
+          "bytes": 393216,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            192
+          ]
+        },
+        "replayOutput": {
+          "file": "bf16-replay-stage-02-tile-0-output.bf16le",
+          "sha256": "e47664ad263c4b0bbc5a8538ef82c101390e7eb1123de644daa60c523fa3d817",
+          "bytes": 393216,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            192
+          ]
+        },
+        "native_unpadded_conv_transpose": {
+          "file": "bf16-replay-stage-02-tile-0-native_unpadded_conv_transpose.bf16le",
+          "sha256": "da0015d73f414597d1eb14a02947512287814876e44802e6dd101cd0c6839011",
+          "bytes": 405504,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            198
+          ]
+        },
+        "cropped": {
+          "file": "bf16-replay-stage-02-tile-0-cropped.bf16le",
+          "sha256": "6364e95a1ed9e8afbab3f0fa8b980d88ba3a85a079dfec04e502771cfce658f8",
+          "bytes": 393216,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            192
+          ]
+        },
+        "biased": {
+          "file": "bf16-replay-stage-02-tile-0-biased.bf16le",
+          "sha256": "e47664ad263c4b0bbc5a8538ef82c101390e7eb1123de644daa60c523fa3d817",
+          "bytes": 393216,
+          "dtype": "BF16",
+          "shape": [
+            1,
+            1024,
+            192
+          ]
+        }
+      }
+    },
+    "f32": {
+      "full": {
+        "sourceInput": {
+          "file": "f32-stage-01-full.f32le",
+          "sha256": "f734ec703df0c147f2028f95890434caf6aaecc136cff73c262bcec0df556e73",
+          "bytes": 614400,
+          "dtype": "F32",
+          "shape": [
+            1,
+            2048,
+            75
+          ]
+        },
+        "replayInput": {
+          "file": "f32-replay-stage-02-full-input.f32le",
+          "sha256": "f734ec703df0c147f2028f95890434caf6aaecc136cff73c262bcec0df556e73",
+          "bytes": 614400,
+          "dtype": "F32",
+          "shape": [
+            1,
+            2048,
+            75
+          ]
+        },
+        "originalOutput": {
+          "file": "f32-stage-02-full.f32le",
+          "sha256": "802fd06d4d70af7caa2b237bd3f43d764030d17bf649b329a1237bad89feda0f",
+          "bytes": 1843200,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            450
+          ]
+        },
+        "replayOutput": {
+          "file": "f32-replay-stage-02-full-output.f32le",
+          "sha256": "802fd06d4d70af7caa2b237bd3f43d764030d17bf649b329a1237bad89feda0f",
+          "bytes": 1843200,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            450
+          ]
+        },
+        "native_unpadded_conv_transpose": {
+          "file": "f32-replay-stage-02-full-native_unpadded_conv_transpose.f32le",
+          "sha256": "58f722f073fe2461cfe9aa077fbd9209cdf9d9e0207c351871803bb7298e86af",
+          "bytes": 1867776,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            456
+          ]
+        },
+        "cropped": {
+          "file": "f32-replay-stage-02-full-cropped.f32le",
+          "sha256": "f38be2d3f2378c11e7b5442c5110f8bc8b17db805eda1bfa77db3b72ed5ee39d",
+          "bytes": 1843200,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            450
+          ]
+        },
+        "biased": {
+          "file": "f32-replay-stage-02-full-biased.f32le",
+          "sha256": "802fd06d4d70af7caa2b237bd3f43d764030d17bf649b329a1237bad89feda0f",
+          "bytes": 1843200,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            450
+          ]
+        }
+      },
+      "window": {
+        "sourceInput": {
+          "file": "f32-stage-01-tile-0.f32le",
+          "sha256": "c9bcb79ce4e69b8999b261d7dc91c1278c6881de94d77ae9c06f6f8615c98d0d",
+          "bytes": 262144,
+          "dtype": "F32",
+          "shape": [
+            1,
+            2048,
+            32
+          ]
+        },
+        "replayInput": {
+          "file": "f32-replay-stage-02-tile-0-input.f32le",
+          "sha256": "c9bcb79ce4e69b8999b261d7dc91c1278c6881de94d77ae9c06f6f8615c98d0d",
+          "bytes": 262144,
+          "dtype": "F32",
+          "shape": [
+            1,
+            2048,
+            32
+          ]
+        },
+        "originalOutput": {
+          "file": "f32-stage-02-tile-0.f32le",
+          "sha256": "9dda13b24b0a7a568a36003a2500492e3a3b8207a0255c6816ad0b07f101a701",
+          "bytes": 786432,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            192
+          ]
+        },
+        "replayOutput": {
+          "file": "f32-replay-stage-02-tile-0-output.f32le",
+          "sha256": "9dda13b24b0a7a568a36003a2500492e3a3b8207a0255c6816ad0b07f101a701",
+          "bytes": 786432,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            192
+          ]
+        },
+        "native_unpadded_conv_transpose": {
+          "file": "f32-replay-stage-02-tile-0-native_unpadded_conv_transpose.f32le",
+          "sha256": "4337d439bbff27ec26ab829e451ef978a2326f8df914b7cf0874b6e35f707b59",
+          "bytes": 811008,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            198
+          ]
+        },
+        "cropped": {
+          "file": "f32-replay-stage-02-tile-0-cropped.f32le",
+          "sha256": "bd289404dc7c52e8b6ffbdb5520461952bbf22dd93de1f60f82b60d42fd852c2",
+          "bytes": 786432,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            192
+          ]
+        },
+        "biased": {
+          "file": "f32-replay-stage-02-tile-0-biased.f32le",
+          "sha256": "9dda13b24b0a7a568a36003a2500492e3a3b8207a0255c6816ad0b07f101a701",
+          "bytes": 786432,
+          "dtype": "F32",
+          "shape": [
+            1,
+            1024,
+            192
+          ]
+        }
+      }
+    }
+  }
+}

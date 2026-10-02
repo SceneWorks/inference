@@ -804,5 +804,86 @@ class DiagnosticGuards(unittest.TestCase):
             self.assertFalse((root / "binary.txt").exists())
 
 
+class HistoricalStage2BindingTests(unittest.TestCase):
+    def test_consistent_new_replay_and_old_waveform_claim_cannot_replace_stage2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = json.loads(diag.HISTORICAL_STAGE2_PATH.read_text(encoding="utf-8"))
+            runs = {}
+            stage_runs = {}
+            for dtype in ("bf16", "f32"):
+                slots = {}
+                for slot in ("full", "window"):
+                    records = expected["records"][dtype][slot]
+                    for name, row in records.items():
+                        identity = ("input" if name in {"sourceInput", "replayInput"} else
+                                    "output" if name in {"originalOutput", "replayOutput", "biased"}
+                                    else name)
+                        content = f"{dtype}/{slot}/{identity}".encode()
+                        row.update(file=f"{dtype}-{slot}-{name}.bin", bytes=len(content),
+                                   sha256=hashlib.sha256(content).hexdigest(), shape=[1, 1, len(content)])
+                        (root / row["file"]).write_bytes(content)
+                    slots[slot] = {key: dict(records[key]) for key in
+                                   ("sourceInput", "replayInput", "originalOutput", "replayOutput")}
+                    slots[slot]["substeps"] = [
+                        {"name": key, "capture": dict(records[key])}
+                        for key in ("native_unpadded_conv_transpose", "cropped", "biased")]
+                    slots[slot]["inputBitExact"] = True
+                    slots[slot]["outputBitExact"] = True
+                runs[dtype] = slots
+                stage_runs[dtype] = {"stages": [{},
+                    {"full": dict(expected["records"][dtype]["full"]["sourceInput"]),
+                     "windows": [{"capture": dict(expected["records"][dtype]["window"]["sourceInput"])}]},
+                    {"full": dict(expected["records"][dtype]["full"]["originalOutput"]),
+                     "windows": [{"capture": dict(expected["records"][dtype]["window"]["originalOutput"])}]}]}
+            manifest = root / "historical.json"
+            manifest.write_text(json.dumps(expected), encoding="utf-8")
+            report = {"adaptive": {"runs": runs}, "runs": stage_runs, "waveformParity": True,
+                      "historicalStage2": {
+                          "sourceRunId": expected["source_run"],
+                          "sourceControlSha": expected["source_control"],
+                          "sourceReportSha256": expected["report_sha256"],
+                          "sourceMetricsZipSha256": expected["metrics_zip_sha256"],
+                          "expectedMapSha256": diag.sha256(manifest),
+                          "checks": {"bf16": {"full": True, "window": True},
+                                     "f32": {"full": True, "window": True}},
+                          "matchesHistorical": True}}
+            diag.verify_historical_stage2_data(root, report, manifest)
+            for dtype in ("bf16", "f32"):
+                for slot in ("full", "window"):
+                    for names in (("sourceInput", "replayInput"),
+                                  ("originalOutput", "replayOutput"),
+                                  ("native_unpadded_conv_transpose",), ("cropped",), ("biased",)):
+                        changed = json.loads(json.dumps(report))
+                        prior_bytes = {}
+                        for name in names:
+                            old = expected["records"][dtype][slot][name]
+                            file = root / old["file"]
+                            prior_bytes[name] = file.read_bytes()
+                            new_bytes = bytes([prior_bytes[name][0] ^ 1]) + prior_bytes[name][1:]
+                            file.write_bytes(new_bytes)
+                            new = dict(old, sha256=hashlib.sha256(new_bytes).hexdigest())
+                            if name in {"native_unpadded_conv_transpose", "cropped", "biased"}:
+                                step = next(row for row in changed["adaptive"]["runs"][dtype][slot]["substeps"]
+                                            if row["name"] == name)
+                                step["capture"] = new
+                            else:
+                                changed["adaptive"]["runs"][dtype][slot][name] = new
+                                if name in {"sourceInput", "originalOutput"}:
+                                    stage = 1 if name == "sourceInput" else 2
+                                    stage_record = changed["runs"][dtype]["stages"][stage]
+                                    if slot == "full":
+                                        stage_record["full"] = dict(new)
+                                    else:
+                                        stage_record["windows"][0]["capture"] = dict(new)
+                        if len(names) == 2:
+                            pair = changed["adaptive"]["runs"][dtype][slot]
+                            self.assertEqual(pair[names[0]]["sha256"], pair[names[1]]["sha256"])
+                        with self.assertRaisesRegex(RuntimeError, "historical stage-2 bytes"):
+                            diag.verify_historical_stage2_data(root, changed, manifest)
+                        for name, content in prior_bytes.items():
+                            (root / expected["records"][dtype][slot][name]["file"]).write_bytes(content)
+
+
 if __name__ == "__main__":
     unittest.main()
