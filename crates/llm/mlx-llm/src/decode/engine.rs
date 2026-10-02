@@ -1388,6 +1388,29 @@ fn dispatch_token(id: &Array) -> Result<()> {
     Ok(())
 }
 
+/// Wait for a dispatched look-ahead the run will never read back (no host read): the device work
+/// it enqueued finishes inside the request that enqueued it. Counted ([`drained_tokens`]).
+fn drain_token(token: &SampledToken) -> Result<()> {
+    if let SampledToken::Device(id) = token {
+        eval([id])?;
+    }
+    #[cfg(test)]
+    DRAINED_TOKENS.with(|n| n.set(n.get() + 1));
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Discarded look-aheads [`drain_token`] waited for on this thread.
+    static DRAINED_TOKENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many discarded look-aheads this thread's pipelined loops waited for before returning.
+#[cfg(test)]
+fn drained_tokens() -> u64 {
+    DRAINED_TOKENS.with(std::cell::Cell::get)
+}
+
 /// How many drawn tokens this thread's decode loops handed to the device ahead of their
 /// read-back ([`dispatch_token`]).
 #[cfg(test)]
@@ -1472,8 +1495,13 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
             }
         };
         if let Some(end) = end {
-            if ahead.is_some() {
+            if let Some(ahead) = ahead {
                 stats.discarded += 1; // enqueued, never read back, never emitted
+                                      // An end the loop could not foresee (a stop token, a caller stop, a cancel): the
+                                      // look-ahead is already on the device. Wait for it here so its device time lands
+                                      // in this request rather than in the next request's prefill (sc-24446); it is never
+                                      // read back, and the cache row it wrote is past `committed_cache_len`.
+                drain_token(&ahead)?;
             }
             return Ok(end);
         }
@@ -4169,6 +4197,48 @@ pub(crate) mod tests {
             assert_eq!(target.dispatched.into_inner(), expected, "{pipelining:?}");
             let again = off_run(&model, &top_p(8), pipelining, None);
             assert_eq!(again.output.tokens, run.output.tokens, "{pipelining:?}");
+        }
+    }
+
+    /// sc-24446: a pipelined run never enqueues a forward past its budget, and a run that ends
+    /// where the loop could not foresee it (a stop token, a caller stop, a cancel) waits for its
+    /// discarded look-ahead before returning — no forward it enqueued is left in flight to be
+    /// charged to the next request's prefill. Every draw past the first is one forward, plus the
+    /// discarded look-ahead.
+    #[test]
+    fn a_pipelined_run_returns_with_no_look_ahead_in_flight() {
+        let model = causal();
+        let free = off_run(&model, &top_p(20), Pipelining::Off, None)
+            .output
+            .tokens;
+        let mut stopping = top_p(20);
+        stopping.stop_tokens = vec![free[7]];
+        let ends: [(&str, GenerationConfig, StopAfter); 4] = [
+            ("budget", top_p(6), None),
+            ("stop token", stopping, None),
+            ("stop predicate", top_p(20), Some((5, false))),
+            ("cancel", top_p(20), Some((5, true))),
+        ];
+        for (end, config, stop_after) in ends {
+            let target = DispatchesAtForward::new(&model);
+            let drained = drained_tokens();
+            let run = off_run(&target, &config, Pipelining::Auto, stop_after);
+            let forwards = target.dispatched.into_inner().len();
+            let draws = run.output.tokens.len()
+                + usize::from(run.output.finish_reason == FinishReason::StopToken);
+            let discarded = usize::from(end != "budget");
+            assert_eq!(run.stats.discarded, discarded, "{end}");
+            assert_eq!(
+                forwards,
+                draws + discarded,
+                "{end}: no forward past the end"
+            );
+            assert_eq!(run.stats.forwards, forwards, "{end}");
+            assert_eq!(
+                drained_tokens() - drained,
+                discarded as u64,
+                "{end}: the discarded look-ahead was waited for before returning"
+            );
         }
     }
 

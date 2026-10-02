@@ -259,6 +259,9 @@ impl ContiguousKvCache {
                     .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
+        // Start the copies now: an unevaluated copy would pin the source buffer and run in
+        // whichever request first reads the entry — inside the next request's prefill (sc-24446).
+        mlx_rs::transforms::async_eval(layers.iter().flatten().flat_map(|s| [&s.keys, &s.values]))?;
         Ok(Self {
             layers,
             block: self.block,

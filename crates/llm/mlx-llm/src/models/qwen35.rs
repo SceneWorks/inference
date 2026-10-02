@@ -820,6 +820,12 @@ impl Qwen35Cache {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // The captured conv tails are slices of this forward's conv input: evaluate them with the
+        // KV copies (`prefix` starts those) so the entry holds no pending work for a later request.
+        async_eval(layers.iter().filter_map(|l| match l {
+            Qwen35LayerCache::Delta(c) => c.live_state().map(|(conv, _)| conv),
+            Qwen35LayerCache::Attn(_) => None,
+        }))?;
         Ok(Self { layers })
     }
 

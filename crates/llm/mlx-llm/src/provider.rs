@@ -1933,7 +1933,6 @@ impl TextLlm for LlamaProvider {
         };
 
         let mut prefix_hit = 0usize;
-        let mut prefill_forwards = 1usize;
 
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
@@ -2249,7 +2248,6 @@ impl TextLlm for LlamaProvider {
                             let PrefixPrefill {
                                 mut cache,
                                 logits,
-                                forwards,
                                 fed_tokens,
                                 ..
                             } = prefill_restored(
@@ -2263,7 +2261,6 @@ impl TextLlm for LlamaProvider {
                             .map_err(to_core)?;
                             // Measured, not looked up: the positions the prefill did not feed.
                             prefix_hit = prompt_ids.len() - fed_tokens;
-                            prefill_forwards = forwards;
                             if prefix_hit > 0 {
                                 prefix_path = "hit";
                             }
@@ -2305,7 +2302,6 @@ impl TextLlm for LlamaProvider {
                                 mut cache,
                                 logits,
                                 hidden,
-                                forwards,
                                 fed_tokens,
                                 mtp: resume,
                                 boundary,
@@ -2321,7 +2317,6 @@ impl TextLlm for LlamaProvider {
                             .map_err(to_core)?;
                             // Measured, not looked up: the positions the prefill did not feed.
                             prefix_hit = prompt_ids.len() - fed_tokens;
-                            prefill_forwards = forwards;
                             if prefix_hit > 0 {
                                 prefix_path = "hit";
                             }
@@ -2370,18 +2365,14 @@ impl TextLlm for LlamaProvider {
         let stats = run.stats;
         let mut report = run.report;
         // The request's resolution fallbacks join the engine's measured report (E2/E3), and so
-        // does what the prefix cache restored — the engine counts a caller's prefill as one
-        // forward, and any further forward the prefill ran joins it (none since the boundary
-        // snapshot is taken inside the one prefill forward, sc-24446).
+        // does what the prefix cache restored. The engine counts a caller's prefill as its one
+        // prefill forward: the boundary snapshot is taken inside it (sc-24446).
         report.fallbacks = fallbacks;
         report.prefix_hit_tokens = prefix_hit as u64;
         report.prefix_cache = core_llm::PathReport {
             path: prefix_path.into(),
             reason: prefix_reason.map(str::to_string),
         };
-        let extra_prefill = prefill_forwards.saturating_sub(1);
-        report.target_forwards += extra_prefill as u64;
-        report.prefill_forwards += extra_prefill as u64;
         report.fused_primitives = crate::primitives::fused::fused_tally()
             .since(&fused_start)
             .path_report();
@@ -2484,7 +2475,7 @@ impl TextLlm for LlamaProvider {
             mtp: (report.proposer == ProposerKind::Mtp).then(|| core_llm::MtpStats {
                 proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
                 accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
-                target_forwards: u32::try_from(stats.forwards + extra_prefill).unwrap_or(u32::MAX),
+                target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
             }),
             decode: Some(report),
             finish_reason: Some(finish),

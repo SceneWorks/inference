@@ -391,8 +391,6 @@ pub struct PrefixPrefill<C> {
     pub hidden: Option<Array>,
     /// Leading prompt positions the lookup restored (the prefill starts past them).
     pub reused: usize,
-    /// Target forwards the prefill ran — one: a boundary snapshot is taken inside it (sc-24446).
-    pub forwards: usize,
     /// Prompt tokens the prefill fed through the target — `prompt.len() - reused` when the
     /// restored cache was really prefilled on top of; the provider reports
     /// `prefix_hit_tokens = prompt.len() - fed_tokens`, so the report measures the prefill it ran.
@@ -492,7 +490,6 @@ where
         logits: out.logits,
         hidden: out.hidden,
         reused,
-        forwards: 1,
         fed_tokens: prompt.len() - reused,
         mtp,
         boundary: snapshot,
@@ -1280,7 +1277,6 @@ mod engine_tests {
             )
             .unwrap();
             assert_eq!(counted.calls.get(), 1, "{conv_len}: one forward");
-            assert_eq!(pre.forwards, 1, "{conv_len}");
             assert_eq!(counted.take(), p1.len(), "{conv_len}: the whole prompt");
 
             // The reference: the prefill split at the boundary, snapshotted between the forwards.
