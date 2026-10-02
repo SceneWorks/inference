@@ -9782,7 +9782,7 @@ mod tests {
     /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
     /// proposer does not. On the synthetic Qwen3.5 snapshot `auto` resolves to its MTP head, whose
     /// random weights never draft a token the target accepts (asserted as the premise): `auto` is
-    /// demoted at the end of the probe window and the report says where, while the same proposer
+    /// demoted at the end of its first window and the report says where, while the same proposer
     /// asked for explicitly runs to the end. Both stream exactly `off`'s tokens.
     #[test]
     fn auto_is_monitored_and_an_explicit_proposer_is_not() {
@@ -9795,7 +9795,11 @@ mod tests {
         let prompt = &fixture_prompts()[0];
         let request = |spec| core_llm_testkit::bench_request(prompt, spec, &Sampling::greedy(), 48);
         let (off, _) = token_events(&provider, &request(Speculative::Off));
-        let (auto_events, auto) = token_events(&provider, &request(Speculative::Auto));
+        // Untimed (the static threshold decides, no plain probe): the timed monitor's decisions
+        // are pinned on a deterministic clock in the engine's tests.
+        let (auto_events, auto) = core_llm::with_decode_clock(None, || {
+            token_events(&provider, &request(Speculative::Auto))
+        });
         let auto = auto.decode.unwrap();
         let depth = auto.draft_tokens.expect("auto ran a proposer");
         let explicit = Speculative::proposer(SpeculativeProposer::Mtp, depth);
@@ -9809,7 +9813,7 @@ mod tests {
         );
         assert_eq!(asked.speculative_demoted_at, None, "{asked:?}");
         // The fixture head never pays at this depth (accepted 0 over the whole explicit run), so
-        // `auto` is demoted at the end of the probe window and stops proposing.
+        // `auto` is demoted at the end of its first window and stops proposing.
         assert_eq!(asked.accepted_tokens, 0, "fixture premise: {asked:?}");
         assert_eq!(
             auto.speculative_demoted_at,

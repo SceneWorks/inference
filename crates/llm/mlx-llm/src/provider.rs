@@ -4709,7 +4709,7 @@ mod tests {
 
     /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
     /// proposer does not. The synthetic hybrid's random MTP head never drafts a token the target
-    /// accepts, so `auto` (MTP at the recommended depth) is demoted after the probe window and
+    /// accepts, so `auto` (MTP at the recommended depth) is demoted after its first window and
     /// the report says where, while the same proposer asked for explicitly runs to the end; both
     /// stream exactly `off`'s tokens.
     #[test]
@@ -4721,7 +4721,10 @@ mod tests {
             ..spec_request(speculative)
         };
         let (_, off_ids) = run(&provider, &request(Speculative::Off));
-        let (auto, auto_ids) = run(&provider, &request(Speculative::Auto));
+        // Untimed (the static threshold decides, no plain probe): the timed monitor's decisions
+        // are pinned on a deterministic clock in the engine's tests.
+        let (auto, auto_ids) =
+            core_llm::with_decode_clock(None, || run(&provider, &request(Speculative::Auto)));
         let explicit =
             Speculative::proposer(SpeculativeProposer::Mtp, MLX_ROW.recommended_depths.mtp);
         let (asked, asked_ids) = run(&provider, &request(explicit));

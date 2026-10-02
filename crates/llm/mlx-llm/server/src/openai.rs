@@ -266,9 +266,29 @@ pub fn x_decode(report: &DecodeReport) -> Value {
         "replay_forwards": report.replay_forwards,
         "discarded_forwards": report.discarded_forwards,
         "speculative_demoted_at": report.speculative_demoted_at,
+        "speculative_monitor": report.speculative_monitor.map(monitor),
         "prefix_cache": path(&report.prefix_cache),
         "prefix_hit_tokens": report.prefix_hit_tokens,
         "fallbacks": report.fallbacks,
+    })
+}
+
+/// `auto`'s last judged window (sc-24446,
+/// [`MonitorDecision`](mlx_llm::core_llm::MonitorDecision)): its inputs and the measured verify
+/// cost and gain derived from them (`null` where not measured).
+fn monitor(d: mlx_llm::core_llm::MonitorDecision) -> Value {
+    json!({
+        "window": d.window,
+        "basis": d.basis.label(),
+        "demoted": d.demoted,
+        "verifies": d.verifies,
+        "accepted": d.accepted,
+        "timed_steps": d.timed_steps,
+        "timed_tokens": d.timed_tokens,
+        "timed_ns": d.timed_ns,
+        "plain_step_ns": d.plain_step_ns,
+        "verify_cost_ratio": d.verify_cost_ratio(),
+        "gain": d.gain(),
     })
 }
 

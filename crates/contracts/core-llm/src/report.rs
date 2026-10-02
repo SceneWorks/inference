@@ -174,17 +174,23 @@ pub struct DecodeReport {
     /// emitted. `0` on a loop that does not look ahead (every Candle path).
     pub discarded_forwards: u64,
     /// Where `auto`'s acceptance monitor demoted this request's proposer (sc-24446, E5): the
-    /// generated-token count when the probe window
-    /// ([`ACCEPTANCE_PROBE_VERIFIES`](crate::ACCEPTANCE_PROBE_VERIFIES) verify steps) closed below
-    /// the proposer's break-even ([`AcceptanceMonitor`](crate::AcceptanceMonitor)); every later
-    /// token decoded without a proposer — on MLX through the pipelined token-at-a-time loop.
+    /// generated-token count when the first losing window
+    /// ([`ACCEPTANCE_PROBE_VERIFIES`](crate::ACCEPTANCE_PROBE_VERIFIES) verify steps) closed — its
+    /// measured gain below break-even, or, where timing could not decide, its acceptance below
+    /// the proposer's static threshold ([`AcceptanceMonitor`](crate::AcceptanceMonitor),
+    /// [`speculative_monitor`](Self::speculative_monitor)); every later token decoded without a
+    /// proposer — on MLX through the pipelined token-at-a-time loop.
     /// [`proposer`](Self::proposer) and [`draft_tokens`](Self::draft_tokens) still name the
     /// proposer that ran before it, and the plain steps after it are counted in
     /// [`verify_steps`](Self::verify_steps) (one-token verify passes, as on every path). `None` when
-    /// nothing was demoted — always for `off`, for an explicit `{proposer, depth}` request, and
-    /// for prompt lookup where the plain loop is unpipelined anyway (Candle; MLX under a
-    /// constraint, a penalized sampler or pipelining off — no measured regression there).
+    /// nothing was demoted — always for `off` and for an explicit `{proposer, depth}` request.
     pub speculative_demoted_at: Option<u64>,
+    /// The last window `auto`'s acceptance monitor judged — the demoting one when
+    /// [`speculative_demoted_at`](Self::speculative_demoted_at) is set (sc-24446): its acceptance,
+    /// its timed steps' wall time, the request's measured plain-step cost and what decided it
+    /// ([`MonitorDecision`](crate::MonitorDecision)), so a campaign row can check the decision.
+    /// `None` when no monitor ran or the request ended before its first window.
+    pub speculative_monitor: Option<crate::MonitorDecision>,
     /// Leading prompt tokens whose cache state came from the cross-turn prefix cache instead of a
     /// prefill forward (story sc-24437): the prefill ran only the prompt past them. `0` on a miss,
     /// when the cache is off, and on a request it refuses (a multimodal prompt — its reason is in

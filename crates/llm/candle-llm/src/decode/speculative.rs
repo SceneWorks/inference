@@ -58,4 +58,7 @@ pub struct SpeculativeStats {
     /// Tokens generated when `auto`'s acceptance monitor demoted the run to token-at-a-time
     /// steps (sc-24446); `None` when it was not demoted.
     pub demoted_at: Option<usize>,
+    /// The last window `auto`'s acceptance monitor judged (sc-24446); `None` when no monitor ran
+    /// or the run ended before its first window.
+    pub monitor: Option<core_llm::MonitorDecision>,
 }
