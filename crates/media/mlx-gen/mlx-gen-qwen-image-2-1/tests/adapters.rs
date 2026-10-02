@@ -1317,3 +1317,62 @@ fn unservable_lycoris_lokr_files_are_refused() {
         "a conv tucker LoKr has no Linear form"
     );
 }
+
+/// One LoRA factor spelled twice in a file (`lora_A` beside `lora_A.default`) is refused rather than
+/// keeping whichever key the loader read last.
+#[test]
+fn a_lora_factor_spelled_twice_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut model = dense();
+    let target = "transformer_blocks.0.attn.to_q";
+    let (out, inp) = base_shape(&mut model, target);
+    let file = tmp.path().join("twice.safetensors");
+    write_safetensors_with(
+        &file,
+        &[
+            (
+                format!("transformer.{target}.lora_A.weight"),
+                vec![RANK, inp],
+                None,
+            ),
+            (
+                format!("transformer.{target}.lora_A.default.weight"),
+                vec![RANK, inp],
+                None,
+            ),
+            (
+                format!("transformer.{target}.lora_B.weight"),
+                vec![out, RANK],
+                None,
+            ),
+        ],
+        &[],
+        1.0,
+    );
+    let err = apply_qwen_image_2_1_adapters(&mut model, &[lora(&file, 1.0)])
+        .expect_err("a doubly-spelled factor must refuse the install")
+        .to_string();
+    assert!(err.contains("spelled twice"), "{err}");
+}
+
+/// Two LyCORIS spellings of one Linear in one file (`lycoris_X` beside `lora_unet_X`) are refused
+/// rather than both installing and double-applying the delta.
+#[test]
+fn two_lycoris_spellings_of_one_linear_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut model = dense();
+    let target = "transformer_blocks.0.attn.to_q";
+    let (out, inp) = base_shape(&mut model, target);
+    let mut entries = Vec::new();
+    for key in [lycoris(target), kohya(target)] {
+        entries.push((format!("{key}.lokr_w1"), vec![2, 2], None));
+        entries.push((format!("{key}.lokr_w2"), vec![out / 2, inp / 2], None));
+    }
+    let file = tmp.path().join("both.safetensors");
+    write_safetensors_with(&file, &entries, &[], 1.0);
+    let err = apply_qwen_image_2_1_adapters(&mut model, &[lokr(&file, 1.0)])
+        .expect_err("two spellings of one Linear must refuse the install")
+        .to_string();
+    assert!(err.contains("resolve to the same module"), "{err}");
+    assert_eq!(adapter_count(&mut model, target), 0, "nothing installed");
+}

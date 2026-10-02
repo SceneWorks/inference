@@ -49,7 +49,7 @@
 //!   projection stem, as the MLX `apply_lokr_thirdparty` does.
 //! * **LyCORIS LoHa** — folded (bf16 tier only, see above), under the same key spellings.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
@@ -166,13 +166,19 @@ impl ProjectionTable {
     }
 }
 
-/// The weight-free admission verdict for a stack: which files ride as residuals, and the
-/// `[out, in]` of every projection a LoHa folds into (the fold's load-time transient is sized from
-/// the largest of these).
+/// The weight-free admission verdict for a stack: which LoRA files ride as residuals, how many
+/// Kronecker-factor elements every LoKr keeps resident, and the `[out, in]` of every projection a
+/// LoHa folds into (the fold's load-time transient is sized from the largest of these).
 #[derive(Clone, Debug, Default)]
 pub struct AdapterPlan {
-    /// LoRA / LoKr files, in request order.
+    /// LoRA files, in request order (resident at their safetensors bytes).
     pub additive: Vec<AdapterSpec>,
+    /// Σ over every LoKr module (stamped or LyCORIS) of `a·c + b·d` — the elements of the two small
+    /// Kronecker factors `[a, c]` / `[b, d]` the structured residual keeps on device
+    /// ([`LokrFactors::resident_f32_bytes`] holds them in f32, and a compute-dtype prepared copy
+    /// rides beside them). A low-rank leg is materialized to its full `[b, d]`, so this is not the
+    /// file's byte count.
+    pub lokr_factor_elements: u64,
     /// One entry per `(LoHa file, projection)` fold.
     pub loha_fold_shapes: Vec<(usize, usize)>,
 }
@@ -223,24 +229,24 @@ pub fn plan(table: &ProjectionTable, specs: &[AdapterSpec], tier: Tier) -> Resul
                     .get("networkType")
                     .map(String::as_str),
             );
-            if stamped {
-                if spec.kind == AdapterKind::Lora {
-                    return Err(Error::Msg(format!(
-                        "{MODEL_ID}: adapter {} was declared LoRA but its metadata says \
-                         networkType=lokr",
-                        spec.path.display()
-                    )));
-                }
-                // Key-matched only: a LoKr's Kronecker factor shapes are checked at install.
-                resolve_modules(spec, table, &entries, Format::Lokr)?;
-            } else {
-                for (key, _, factors) in
-                    resolve_modules(spec, table, &entries, Format::LokrThirdParty)?
-                {
-                    check_thirdparty_lokr_factors(spec, &key, &factors)?;
-                }
+            if stamped && spec.kind == AdapterKind::Lora {
+                return Err(Error::Msg(format!(
+                    "{MODEL_ID}: adapter {} was declared LoRA but its metadata says \
+                     networkType=lokr",
+                    spec.path.display()
+                )));
             }
-            plan.additive.push(spec.clone());
+            let format = if stamped {
+                Format::Lokr
+            } else {
+                Format::LokrThirdParty
+            };
+            for (key, shape, factors) in resolve_modules(spec, table, &entries, format)? {
+                check_lokr_factors(spec, &key, &factors)?;
+                plan.lokr_factor_elements = plan
+                    .lokr_factor_elements
+                    .saturating_add(lokr_factor_elements(spec, &key, shape, &factors)?);
+            }
         } else {
             for (key, (out_f, in_f), factors) in
                 resolve_modules(spec, table, &entries, Format::Lora)?
@@ -427,29 +433,54 @@ fn admit_loha(spec: &AdapterSpec, tier: Tier) -> Result<()> {
     Ok(())
 }
 
-/// Header-level shape admission for one third-party LyCORIS LoKr module: each Kronecker factor must
-/// be present (full, or a low-rank `_a`/`_b` pair), every `lokr_w*` factor 2-D, and a tucker
-/// `lokr_t2` the `[r, r, 1, 1]` Linear form — a spatial (`kH·kW > 1`) tucker is a conv LoKr this
-/// DiT has no target for. Whether the factors reconstruct the projection's `[out, in]` is checked
-/// at install, where the structured residual is built.
-fn check_thirdparty_lokr_factors(
+/// Which factors a LoKr module carries — the one factor-set admission both the header-only
+/// [`plan`] and the install ([`LycorisLokr::factors`]) apply, so they cannot disagree.
+fn check_lokr_factor_set(has: impl Fn(&str) -> bool) -> std::result::Result<(), &'static str> {
+    if has("lokr_w1") && (has("lokr_w1_a") || has("lokr_w1_b")) {
+        return Err("carries both a full lokr_w1 and a low-rank lokr_w1_a/lokr_w1_b spelling");
+    }
+    if has("lokr_w2") && (has("lokr_w2_a") || has("lokr_w2_b") || has("lokr_t2")) {
+        return Err(
+            "carries both a full lokr_w2 and a low-rank / tucker lokr_w2_a/lokr_w2_b/lokr_t2 \
+             spelling",
+        );
+    }
+    let w1 = has("lokr_w1") || (has("lokr_w1_a") && has("lokr_w1_b"));
+    let w2 = has("lokr_w2") || (has("lokr_w2_a") && has("lokr_w2_b"));
+    if !w1 || !w2 {
+        return Err(
+            "is missing a Kronecker factor (need lokr_w1 or lokr_w1_a+lokr_w1_b, and lokr_w2, \
+             lokr_w2_a+lokr_w2_b, or lokr_t2+lokr_w2_a+lokr_w2_b)",
+        );
+    }
+    if (has("lokr_w1_a") != has("lokr_w1_b")) || (has("lokr_w2_a") != has("lokr_w2_b")) {
+        return Err("carries half of a low-rank lokr_w*_a/lokr_w*_b pair");
+    }
+    Ok(())
+}
+
+/// Header-level admission for one LoKr module (stamped or LyCORIS): an unambiguous factor set
+/// ([`check_lokr_factor_set`]), every `lokr_w*` factor 2-D, a tucker `lokr_t2` in the
+/// `[r, r, 1, 1]` Linear form — a spatial (`kH·kW > 1`) tucker is a conv LoKr this DiT has no
+/// target for — and a one-element `alpha` (a present-but-empty one is a malformed file, never a
+/// silent fall back to `alpha = rank`).
+fn check_lokr_factors(
     spec: &AdapterSpec,
     key: &str,
     factors: &BTreeMap<&'static str, &[usize]>,
 ) -> Result<()> {
     let file = spec.path.display();
-    let has = |factor: &str| factors.contains_key(factor);
-    let w1 = has("lokr_w1") || (has("lokr_w1_a") && has("lokr_w1_b"));
-    let w2 = has("lokr_w2") || (has("lokr_w2_a") && has("lokr_w2_b"));
-    if !w1 || !w2 {
-        return Err(Error::Msg(format!(
-            "{MODEL_ID}: LyCORIS LoKr `{key}` in {file} is missing a Kronecker factor (need \
-             lokr_w1 or lokr_w1_a+lokr_w1_b, and lokr_w2 or lokr_w2_a+lokr_w2_b)"
-        )));
-    }
+    check_lokr_factor_set(|factor| factors.contains_key(factor))
+        .map_err(|what| Error::Msg(format!("{MODEL_ID}: LoKr `{key}` in {file} {what}")))?;
     for (factor, shape) in factors {
+        if *factor == "alpha" && shape.iter().product::<usize>() == 0 {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: LoKr `{key}` in {file} has a present but empty alpha {shape:?} — a \
+                 malformed file"
+            )));
+        }
         let ok = match *factor {
-            "alpha" => shape.iter().product::<usize>() <= 1,
+            "alpha" => shape.iter().product::<usize>() == 1,
             "lokr_t2" => shape.len() == 4 && shape[2] == 1 && shape[3] == 1,
             _ => shape.len() == 2,
         };
@@ -462,6 +493,45 @@ fn check_thirdparty_lokr_factors(
         }
     }
     Ok(())
+}
+
+/// The Kronecker dimensions `w1 [a, c]` ⊗ `w2 [b, d]` of an admitted LoKr module
+/// ([`check_lokr_factors`]) from its header shapes — `w1_a [a, r]`·`w1_b [r, c]`, `w2_a [b, r]`·
+/// `w2_b [r, d]`, or the tucker `w2_a [r, b]` / `w2_b [r, d]` — refused unless `a·b × c·d` is the
+/// projection's `[out, in]` (so a mis-shaped LoKr fails at the weight-free preflight, not mid-render
+/// under `Sequential`). Returns `a·c + b·d`, the elements the structured residual keeps resident.
+fn lokr_factor_elements(
+    spec: &AdapterSpec,
+    key: &str,
+    (out_f, in_f): (usize, usize),
+    factors: &BTreeMap<&'static str, &[usize]>,
+) -> Result<u64> {
+    let dim = |factor: &str, axis: usize| factors.get(factor).map(|shape| shape[axis]);
+    let (a, c) = match factors.get("lokr_w1") {
+        Some(w1) => (Some(w1[0]), Some(w1[1])),
+        None => (dim("lokr_w1_a", 0), dim("lokr_w1_b", 1)),
+    };
+    let (b, d) = match (factors.get("lokr_w2"), factors.contains_key("lokr_t2")) {
+        (Some(w2), _) => (Some(w2[0]), Some(w2[1])),
+        (None, true) => (dim("lokr_w2_a", 1), dim("lokr_w2_b", 1)),
+        (None, false) => (dim("lokr_w2_a", 0), dim("lokr_w2_b", 1)),
+    };
+    let (Some(a), Some(b), Some(c), Some(d)) = (a, b, c, d) else {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: LoKr `{key}` in {} is missing a Kronecker factor",
+            spec.path.display()
+        )));
+    };
+    if a * b != out_f || c * d != in_f {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: LoKr `{key}` in {} does not reconstruct the projection's [out={out_f}, \
+             in={in_f}]: w1 [{a}, {c}] ⊗ w2 [{b}, {d}] is [{}, {}]",
+            spec.path.display(),
+            a * b,
+            c * d
+        )));
+    }
+    Ok((a * c + b * d) as u64)
 }
 
 /// A LoHa module's factors must reconstruct exactly the projection's `[out, in]` **in orientation**:
@@ -584,7 +654,7 @@ fn fold_loha(
     }
     let table = ProjectionTable::from_config(transformer.config());
     let resolved = resolve_lycoris_groups(spec, &table, "LoHa", parse_loha_thirdparty(file)?)?;
-    let mut folded = 0usize;
+    let mut folded: HashSet<String> = HashSet::new();
     transformer.visit_adaptable_mut(&mut |path, linear| {
         let Some((raw, group)) = resolved.get(path) else {
             return Ok(());
@@ -609,12 +679,39 @@ fn fold_loha(
                 "{MODEL_ID}: LoHa `{raw}` cannot fold into `{path}`: {e}"
             ))
         })?;
-        folded += 1;
+        folded.insert(path.to_owned());
         Ok(())
     })?;
-    // The table is the visitor walk (pinned by a test), so every resolved group was visited.
-    debug_assert_eq!(folded, resolved.len());
-    Ok(folded)
+    require_all_visited(spec, "LoHa", &resolved, &folded)?;
+    Ok(folded.len())
+}
+
+/// Every resolved module must have been reached by the visitor walk: the projection table is
+/// derived from the config the DiT was built from (and pinned equal to the walk by a test), so a
+/// miss is a table / visitor divergence — refused naming the raw keys it would have dropped, never
+/// a silently partial apply.
+fn require_all_visited<G>(
+    spec: &AdapterSpec,
+    kind: &str,
+    resolved: &HashMap<String, (String, G)>,
+    visited: &HashSet<String>,
+) -> Result<()> {
+    let mut missed: Vec<&str> = resolved
+        .iter()
+        .filter(|(path, _)| !visited.contains(*path))
+        .map(|(_, (raw, _))| raw.as_str())
+        .collect();
+    if missed.is_empty() {
+        return Ok(());
+    }
+    missed.sort_unstable();
+    Err(Error::Msg(format!(
+        "{MODEL_ID}: {kind} adapter {} resolved {} module(s) the DiT walk never reached ({}); \
+         refusing a partial apply",
+        spec.path.display(),
+        missed.len(),
+        missed.join(", ")
+    )))
 }
 
 /// Whether `file` is a **third-party** LyCORIS LoKr: `lokr_*` factors without the SceneWorks /
@@ -675,6 +772,16 @@ impl LycorisLokr {
     /// `w2_aᵀ · t2 · w2_b` first, so it is deferrable like any other Linear LoKr. `None` when the
     /// factors do not reconstruct `base_shape`.
     fn factors(&self, strength: f32, base_shape: (usize, usize)) -> Result<Option<LokrFactors>> {
+        let has = |factor: &str| match factor {
+            "lokr_w1" => self.w1.is_some(),
+            "lokr_w1_a" => self.w1_a.is_some(),
+            "lokr_w1_b" => self.w1_b.is_some(),
+            "lokr_w2" => self.w2.is_some(),
+            "lokr_w2_a" => self.w2_a.is_some(),
+            "lokr_w2_b" => self.w2_b.is_some(),
+            _ => self.t2.is_some(),
+        };
+        check_lokr_factor_set(has).map_err(|what| Error::Msg(format!("module {what}")))?;
         let scale = self.scale()? * f64::from(strength);
         let collapsed = match (&self.w2, &self.t2, &self.w2_a, &self.w2_b) {
             (None, Some(t2), Some(w2_a), Some(w2_b)) => {
@@ -732,8 +839,14 @@ fn parse_lycoris_lokr(
     let mut groups: BTreeMap<String, LycorisLokr> = BTreeMap::new();
     for (key, tensor) in &file.tensors {
         if let Some(raw) = key.strip_suffix(".alpha") {
-            let alpha = read_scalar_opt(key, "alpha", tensor)?;
-            groups.entry(raw.to_owned()).or_default().alpha = alpha;
+            let Some(alpha) = read_scalar_opt(key, "alpha", tensor)? else {
+                return Err(Error::Msg(format!(
+                    "{MODEL_ID}: LyCORIS LoKr adapter {} has a present but empty `{key}` — a \
+                     malformed file, not an absent alpha",
+                    spec.path.display()
+                )));
+            };
+            groups.entry(raw.to_owned()).or_default().alpha = Some(alpha);
             continue;
         }
         let Some((raw, factor)) = wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES) else {
@@ -774,7 +887,7 @@ fn install_lycoris_lokr(
         "LyCORIS LoKr",
         parse_lycoris_lokr(spec, file)?,
     )?;
-    let mut attached = 0usize;
+    let mut attached: HashSet<String> = HashSet::new();
     transformer.visit_adaptable_mut(&mut |path, linear: &mut AdaptLinear| {
         let Some((raw, group)) = resolved.get(path) else {
             return Ok(());
@@ -794,11 +907,11 @@ fn install_lycoris_lokr(
         linear
             .push_lokr_structured(factors.to_device(device).map_err(message)?)
             .map_err(message)?;
-        attached += 1;
+        attached.insert(path.to_owned());
         Ok(())
     })?;
-    debug_assert_eq!(attached, resolved.len());
-    Ok(attached)
+    require_all_visited(spec, "LyCORIS LoKr", &resolved, &attached)?;
+    Ok(attached.len())
 }
 
 /// Install `specs` on a loaded DiT: LoHa files fold into the dense weights (bf16 tier only),

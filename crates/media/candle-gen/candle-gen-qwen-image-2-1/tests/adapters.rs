@@ -1073,9 +1073,15 @@ fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
             let report = install(&mut dit, &[spec], Tier::Bf16, &Device::Cpu)
                 .unwrap_or_else(|e| panic!("{} ({kind:?}): install: {e}", layout.name));
             assert_eq!(report.residuals, dense_targets.len(), "{}", layout.name);
+            // Exactly the named projections, in visitor order — never a neighbour.
             assert_eq!(
-                adapted(&mut dit).len(),
-                dense_targets.len(),
+                adapted(&mut dit),
+                [
+                    "txt_in.in_layer",
+                    ATTN_TARGET,
+                    "transformer_blocks.1.img_mlp.gate_layer",
+                    "norm_out.linear",
+                ],
                 "{}",
                 layout.name
             );
@@ -1207,6 +1213,31 @@ fn lycoris_lokr_scale_and_tucker_match_the_equivalent_full_factor_lokr() {
     }
 }
 
+/// The projections whose output on a fixed probe differs between `before` and `after`, in visitor
+/// order — a fold leaves no residual to look for, so compare what each projection computes.
+fn changed_projections(
+    before: &mut QwenImage21Transformer,
+    after: &mut QwenImage21Transformer,
+) -> Vec<String> {
+    let probe = |dit: &mut QwenImage21Transformer| {
+        let mut out = Vec::new();
+        dit.visit_adaptable_mut(&mut |name, linear| {
+            let (_, in_f) = linear.base_shape();
+            let x = ramp((1, 1, in_f), 3);
+            out.push((name.to_string(), linear.forward(&x)?));
+            Ok(())
+        })
+        .unwrap();
+        out
+    };
+    probe(before)
+        .into_iter()
+        .zip(probe(after))
+        .filter(|((_, a), (_, b))| max_abs_diff(a, b) > 0.0)
+        .map(|((name, _), _)| name)
+        .collect()
+}
+
 /// A LoHa folds under its LyCORIS (`lycoris_…`), kohya (`lora_unet_…`), namespaced
 /// (`diffusion_model.…`) and raw PEFT (`base_model.model.…`) spellings alike — the resolution the
 /// MLX twin uses.
@@ -1231,6 +1262,11 @@ fn loha_folds_under_every_key_spelling() {
         let report = install(&mut dit, &[lora(&file, 1.0)], Tier::Bf16, &Device::Cpu)
             .unwrap_or_else(|e| panic!("{module}: install: {e}"));
         assert_eq!(report.loha_folds, 1, "{module}");
+        assert_eq!(
+            changed_projections(&mut dense_dit(), &mut dit),
+            [ATTN_TARGET],
+            "{module}: the fold lands on exactly to_q (txt_in.out_layer, img_mlp.proj, … bare)"
+        );
         assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4, "{module}");
     }
 }
@@ -1405,15 +1441,69 @@ fn unservable_lokr_files_are_typed_refusals() {
         "is not a LoKr factor",
     );
 
-    // `w1 [2, 2] ⊗ w2 [4, 4]` reconstructs [8, 8], not to_q's [32, 32]: refused at install (the
-    // preflight key-matches a LoKr, as it does the stamped one).
+    // `w1 [2, 2] ⊗ w2 [4, 4]` reconstructs [8, 8], not to_q's [32, 32]: refused at the
+    // weight-free preflight (so a `Sequential` load never admits it) and at install — LyCORIS and
+    // stamped alike.
     refuse(
         "misshaped",
         vec![(lycoris(ATTN_TARGET), full_lokr(8, 8, (2, 2)))],
         None,
         AdapterKind::Lokr,
-        "",
         "does not reconstruct",
+        "does not reconstruct",
+    );
+    refuse(
+        "misshaped-stamped",
+        vec![(ATTN_TARGET.to_string(), full_lokr(8, 8, (2, 2)))],
+        Some(lokr_stamp("1", "1")),
+        AdapterKind::Lokr,
+        "does not reconstruct",
+        "",
+    );
+
+    // A present-but-empty alpha is a malformed file, never a silent `alpha = rank`.
+    let mut empty_alpha = low_rank_lokr(DIM, DIM, (2, 2), 1.0);
+    empty_alpha[3].1 = Tensor::zeros(0, candle_core::DType::F32, &Device::Cpu).unwrap();
+    refuse(
+        "empty-alpha",
+        vec![(lycoris(ATTN_TARGET), empty_alpha)],
+        None,
+        AdapterKind::Lokr,
+        "present but empty",
+        "present but empty",
+    );
+
+    // Over-specified / ambiguous factor sets.
+    let mut w1_twice = low_rank_lokr(DIM, DIM, (2, 2), 1.0);
+    w1_twice.push(("lokr_w1_a", filled((2, 1), 1)));
+    w1_twice.push(("lokr_w1_b", filled((1, 2), 2)));
+    refuse(
+        "w1-full-and-low-rank",
+        vec![(lycoris(ATTN_TARGET), w1_twice)],
+        None,
+        AdapterKind::Lokr,
+        "carries both a full lokr_w1",
+        "carries both a full lokr_w1",
+    );
+    let mut t2_and_w2 = tucker_lokr(DIM, DIM, (2, 2), 1.0);
+    t2_and_w2.push(("lokr_w2", filled((DIM / 2, DIM / 2), 4)));
+    refuse(
+        "tucker-and-full-w2",
+        vec![(lycoris(ATTN_TARGET), t2_and_w2)],
+        None,
+        AdapterKind::Lokr,
+        "carries both a full lokr_w2",
+        "carries both a full lokr_w2",
+    );
+    let mut half_tucker = tucker_lokr(DIM, DIM, (2, 2), 1.0);
+    half_tucker.retain(|(factor, _)| *factor != "lokr_w2_b");
+    refuse(
+        "tucker-without-w2_b",
+        vec![(lycoris(ATTN_TARGET), half_tucker)],
+        None,
+        AdapterKind::Lokr,
+        "missing a Kronecker factor",
+        "missing a Kronecker factor",
     );
 
     refuse(
@@ -1424,4 +1514,97 @@ fn unservable_lokr_files_are_typed_refusals() {
         "declared LoRA",
         "declared LoRA",
     );
+}
+
+/// A LoKr prices what the install keeps on device — the two small Kronecker factors in f32 (a
+/// low-rank leg materialized to its full `[b, d]`, a tucker leg collapsed to it) plus their
+/// compute-dtype prepared copy — not its (much smaller) file bytes: the overlay is at least the f32
+/// factors every installed `LokrFactors` retains, for stamped, low-rank LyCORIS and tucker files.
+#[test]
+fn a_lokr_overlay_prices_the_resident_kronecker_factors() {
+    use candle_gen::quant::LokrFactors;
+    use candle_gen_qwen_image_2_1::memory_strategy::adapter_overlay;
+
+    let temp = tempfile::tempdir().unwrap();
+    let get = |module: &LokrModule, name: &str| {
+        module
+            .iter()
+            .find(|(factor, _)| *factor == name)
+            .map(|(_, t)| t.clone())
+    };
+    let low = low_rank_lokr(DIM, DIM, (2, 2), 1.0);
+    let tucker = tucker_lokr(DIM, DIM, (2, 2), 1.0);
+    let stamped = low_rank_lokr(DIM, DIM, (2, 2), 1.0)
+        .into_iter()
+        .filter(|(factor, _)| *factor != "alpha")
+        .collect::<LokrModule>();
+    for (name, module, meta, resident_w2) in [
+        (
+            "lycoris-low-rank",
+            low.clone(),
+            None,
+            get(&low, "lokr_w2_a")
+                .unwrap()
+                .matmul(&get(&low, "lokr_w2_b").unwrap())
+                .unwrap(),
+        ),
+        (
+            "lycoris-tucker",
+            tucker.clone(),
+            None,
+            get(&tucker, "lokr_w2_a")
+                .unwrap()
+                .t()
+                .unwrap()
+                .matmul(&get(&tucker, "lokr_t2").unwrap().reshape((2, 2)).unwrap())
+                .unwrap()
+                .matmul(&get(&tucker, "lokr_w2_b").unwrap())
+                .unwrap(),
+        ),
+        (
+            "stamped-low-rank",
+            stamped.clone(),
+            Some(lokr_stamp("2", "2")),
+            get(&stamped, "lokr_w2_a")
+                .unwrap()
+                .matmul(&get(&stamped, "lokr_w2_b").unwrap())
+                .unwrap(),
+        ),
+    ] {
+        let key = if meta.is_some() {
+            ATTN_TARGET.to_string()
+        } else {
+            lycoris(ATTN_TARGET)
+        };
+        let w1 = get(&module, "lokr_w1").unwrap();
+        let file = temp.path().join(format!("{name}.safetensors"));
+        write_lokr_modules(&file, &[(key, module)], meta);
+        let installed = LokrFactors::build(
+            1.0,
+            (DIM, DIM),
+            Some(&w1),
+            None,
+            None,
+            Some(&resident_w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the factors reconstruct to_q")
+        .resident_f32_bytes() as u64;
+        let spec = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()))
+            .with_adapters(vec![AdapterSpec::new(file.clone(), 1.0, AdapterKind::Lokr)]);
+        let overlay = adapter_overlay(&spec, &tiny_snapshot(), Tier::Bf16).unwrap();
+        let file_bytes = std::fs::metadata(&file).unwrap().len();
+        assert!(
+            overlay.residual_bytes >= installed,
+            "{name}: overlay {} must cover the installed f32 factors {installed}",
+            overlay.residual_bytes
+        );
+        assert!(
+            overlay.residual_bytes > file_bytes,
+            "{name}: a low-rank LoKr is resident above its file bytes ({file_bytes})"
+        );
+    }
 }
