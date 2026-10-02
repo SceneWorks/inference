@@ -875,17 +875,18 @@ fn pinned_dense_kv_element_bytes(
         .filter(|file| file.path.ends_with(".safetensors"))
     {
         let path = snapshot.join(required.path);
-        let mut file = File::open(&path).map_err(|e| format!("read pinned weight header: {e}"))?;
+        let mut file = File::open(&path)
+            .map_err(|e| format!("read pinned weight header {}: {e}", path.display()))?;
         let mut prefix = [0_u8; 8];
         file.read_exact(&mut prefix)
-            .map_err(|e| format!("read pinned weight header length: {e}"))?;
+            .map_err(|e| format!("read pinned weight header length {}: {e}", path.display()))?;
         let len = u64::from_le_bytes(prefix);
         if len > 64 * 1024 * 1024 || len > required.bytes.saturating_sub(8) {
             return Err("pinned safetensors header length is invalid".into());
         }
         let mut bytes = vec![0_u8; len as usize];
         file.read_exact(&mut bytes)
-            .map_err(|e| format!("read pinned weight header: {e}"))?;
+            .map_err(|e| format!("read pinned weight header {}: {e}", path.display()))?;
         let header: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| format!("parse pinned weight header: {e}"))?;
         for (key, tensor) in header
@@ -7410,7 +7411,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             println!("{}", String::from_utf8(bytes).map_err(|e| e.to_string())?);
             Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --out <json> [--prefill-chunk <tokens>] | noise-floor-parent --llama-snapshot <dir> --qwen-snapshot <dir> --prompt-file <file> --safety-policy <json> --resume-dir <dir> --out <dir> [--prefill-chunk <tokens>] [--stop-file <path>]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --out <json> [--prefill-chunk <tokens>] | noise-floor-parent --llama-snapshot <dir> --qwen-snapshot <dir> --llama-fp32-reference-snapshot <dir> --qwen-fp32-reference-snapshot <dir> --prompt-file <file> --safety-policy <json> --resume-dir <dir> --out <dir> [--prefill-chunk <tokens>] [--stop-file <path>]".into()),
     }
 }
 
@@ -7571,6 +7572,35 @@ pub fn noise_floor_summary(rows: &[serde_json::Value]) -> Result<serde_json::Val
     }))
 }
 
+/// Every pinned file of a row's candidate and reference snapshots exists (a cheap check before the
+/// header reads of [`static_row_requirements`]); the error names the first missing path.
+fn pinned_snapshot_files_present(
+    coordinate: &Coordinate,
+    snapshot: &Path,
+    reference_snapshot: &Path,
+) -> Result<(), String> {
+    for (path, spec) in [
+        (snapshot, benchmark_model(coordinate.family, false)?),
+        (
+            reference_snapshot,
+            benchmark_model(coordinate.family, true)?,
+        ),
+    ] {
+        for required in spec.required_files {
+            let file = path.join(required.path);
+            if !file.is_file() {
+                return Err(format!(
+                    "{}: pinned {} file {} is missing",
+                    coordinate_slug(coordinate),
+                    spec.repository,
+                    file.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `noise-floor-parent`: the dense noise floor ([`dense_noise_floor`]) of every scheduled
 /// coordinate, one guarded `noise-floor` worker per row under the campaign safety policy (the
 /// same estimate-plus-reserve admission, child footprint cap, host reserve and row deadline as an
@@ -7587,14 +7617,19 @@ fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
     let policy = load_campaign_safety_policy(&safety_policy)?;
     let prompt_file = PathBuf::from(required_flag(args, "--prompt-file")?);
     let prompt = fs::read_to_string(&prompt_file).map_err(|e| format!("read prompt file: {e}"))?;
+    // (family, measured candidate snapshot, its pinned bf16 reference). The worker loads only the
+    // candidate; the reference is named so the row is admitted on the same static estimate as the
+    // SC-20671 dense row (candidate plus reference), an upper bound for one dense session.
     let snapshots = [
         (
             "llama",
             PathBuf::from(required_flag(args, "--llama-snapshot")?),
+            PathBuf::from(required_flag(args, "--llama-fp32-reference-snapshot")?),
         ),
         (
             "qwen",
             PathBuf::from(required_flag(args, "--qwen-snapshot")?),
+            PathBuf::from(required_flag(args, "--qwen-fp32-reference-snapshot")?),
         ),
     ];
     let prefill_chunk = optional_flag(args, "--prefill-chunk")?;
@@ -7627,14 +7662,19 @@ fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
         )? {
             return Ok(CampaignOutcome::StoppedByOperator(stop));
         }
-        let snapshot = &snapshots
+        let (_, snapshot, reference_snapshot) = snapshots
             .iter()
-            .find(|(family, _)| *family == coordinate.family)
-            .ok_or("noise-floor coordinate family has no snapshot")?
-            .1;
-        // A dense row's requirements bound one dense session over the row's context.
-        let (total_tokens, request_tokens, static_footprint_floor) =
-            static_row_requirements(coordinate, snapshot, snapshot, &prompt, &policy, false)?;
+            .find(|(family, ..)| *family == coordinate.family)
+            .ok_or("noise-floor coordinate family has no snapshot")?;
+        pinned_snapshot_files_present(coordinate, snapshot, reference_snapshot)?;
+        let (total_tokens, request_tokens, static_footprint_floor) = static_row_requirements(
+            coordinate,
+            snapshot,
+            reference_snapshot,
+            &prompt,
+            &policy,
+            false,
+        )?;
         let admission =
             runtime_guarded_admission(&policy, static_footprint_floor, SC20671_ESTIMATE_SOURCE)?;
         let staged = resume_dir.join(format!("{slug}.json.partial"));
@@ -13265,6 +13305,10 @@ pub(crate) mod tests {
                 "/nonexistent/llama",
                 "--qwen-snapshot",
                 "/nonexistent/qwen",
+                "--llama-fp32-reference-snapshot",
+                "/nonexistent/llama-bf16",
+                "--qwen-fp32-reference-snapshot",
+                "/nonexistent/qwen-bf16",
                 "--prompt-file",
                 prompt.to_str().unwrap(),
                 "--safety-policy",
@@ -13300,6 +13344,22 @@ pub(crate) mod tests {
         };
         assert_eq!((stop.before_row, stop.row.as_str()), (1, slugs[1].as_str()));
         fs::remove_file(resume.join(OPERATOR_STOP_FILE_NAME)).unwrap();
+        // A row whose pinned snapshot is absent is refused before admission, naming the path.
+        let missing = sc20671_cli(&args(&[])).unwrap_err();
+        assert!(
+            missing.contains(&slugs[1]) && missing.contains("/nonexistent/llama/"),
+            "{missing}"
+        );
+        // Without a reference snapshot the parent cannot admit a row as the dense row is admitted.
+        let mut unreferenced = args(&[]);
+        let flag = unreferenced
+            .iter()
+            .position(|arg| arg == "--llama-fp32-reference-snapshot")
+            .unwrap();
+        unreferenced.drain(flag..flag + 2);
+        assert!(sc20671_cli(&unreferenced)
+            .unwrap_err()
+            .contains("--llama-fp32-reference-snapshot"));
         for slug in &slugs[1..] {
             seal_row(slug);
         }
