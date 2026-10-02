@@ -108,6 +108,13 @@ pub(crate) fn geometry_refusal(cfg: &ModelConfig) -> Option<String> {
     if cfg.mla.is_some() || cfg.gemma4.is_some() {
         return Some("latent or shared K/V attention has no compressed-domain reader".into());
     }
+    // `qwen3_moe` parses as the Qwen3 architecture; the evidence measured dense decoders only.
+    if cfg.moe.is_some() {
+        return Some(
+            "a mixture-of-experts decoder is outside the dense decoders the evidence measured"
+                .into(),
+        );
+    }
     None
 }
 
@@ -286,8 +293,17 @@ mod tests {
             qwen.min_context_tokens,
             band(&QWEN_CANDIDATE, "memory-material")
         );
-        assert!(qwen.admits(band(&QWEN_CANDIDATE, "fit-boundary")));
-        assert!(!qwen.admits(band(&QWEN_CANDIDATE, "medium")));
+        assert!(qwen.admits(band(&QWEN_CANDIDATE, "fit-boundary"), 0));
+        assert!(!qwen.admits(band(&QWEN_CANDIDATE, "medium"), 0));
+        // The final context is bounded by the evidence model's native window.
+        assert_eq!(
+            qwen.max_context_tokens,
+            Some(QWEN_CANDIDATE.native_context_tokens + 1)
+        );
+        let fit = band(&QWEN_CANDIDATE, "fit-boundary");
+        let headroom = QWEN_CANDIDATE.native_context_tokens - fit;
+        assert!(qwen.admits(fit, headroom));
+        assert!(!qwen.admits(fit, headroom + 1));
 
         let llama = row(KvModelFamily::Llama);
         assert_eq!(family_for(Some(LLAMA_CANDIDATE.family)), Some(llama.family));
@@ -300,13 +316,14 @@ mod tests {
             llama.max_context_tokens,
             Some(band(&LLAMA_CANDIDATE, "fit-boundary"))
         );
-        assert!(!llama.admits(band(&LLAMA_CANDIDATE, "medium")));
+        assert!(!llama.admits(band(&LLAMA_CANDIDATE, "medium"), 0));
         for (spec, short) in [(&QWEN_CANDIDATE, "short"), (&LLAMA_CANDIDATE, "short")] {
             assert_eq!(
                 qualify_kv_compression(
                     KvCompressionPolicy::Qualified,
                     family_for(Some(spec.family)),
                     band(spec, short),
+                    0,
                     1,
                 ),
                 Err(KvCacheFallbackReason::BelowMinimumContext)
@@ -369,6 +386,22 @@ mod tests {
         assert!(geometry_refusal(&cfg).unwrap().contains("square-root"));
         cfg.query_pre_attn_scalar = Some(128);
         assert_eq!(geometry_refusal(&cfg), None);
+
+        // `qwen3_moe` parses as the Qwen3 architecture (the Qwen3 table family) with experts.
+        let moe = ModelConfig::from_json(&serde_json::json!({
+            "architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe",
+            "hidden_size": 128, "intermediate_size": 64, "num_hidden_layers": 2,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+            "vocab_size": 32, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "tie_word_embeddings": false, "num_experts": 4, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+        }))
+        .unwrap();
+        assert_eq!(moe.architecture, crate::config::Architecture::Qwen3);
+        assert!(moe.moe.is_some());
+        assert!(geometry_refusal(&moe)
+            .unwrap()
+            .contains("mixture-of-experts"));
     }
 
     /// Llama-3.2-3B decoder geometry at bf16 (24 query heads, 8 KV heads of 128, 28 layers).
