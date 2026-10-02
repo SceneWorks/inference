@@ -610,23 +610,39 @@ impl TextLlm for LlavaProvider {
             finish_reason: finish,
             usage,
         });
-        Ok(TextLlmOutput {
-            timings: None,
+        // The caption decodes through the shared engine (sc-24138), so it reports its path like
+        // every engine request. The CUDA-graph switch is not wired into this provider (no graph
+        // runner wraps its decoder), so the report says the switch was off here.
+        Ok(caption_output(
             text,
-            thinking: None,
-            // No tool calling on the vision path (its chat template renders captions, not tools).
-            tool_calls: Vec::new(),
             usage,
-            mtp: None,
-            // The caption decodes through the shared engine (sc-24138), so it reports its path
-            // like every engine request. The CUDA-graph switch is not wired into this provider
-            // (no graph runner wraps its decoder), so the report says the switch was off here.
-            decode: Some(gen.record.report(false)),
-            finish_reason: Some(finish),
-            kv_cache: Some(core_llm::KvCacheReport::without_table_family(
-                req.kv_compression,
-            )),
-        })
+            Some(gen.record.report(false)),
+            finish,
+            req.kv_compression,
+        ))
+    }
+}
+
+/// The output of one caption. No tool calling on the vision path (its chat template renders
+/// captions, not tools), and — the LLaVA wrapper having no compressed-KV table family — the dense
+/// KV-cache report for the request's `policy` (sc-20683).
+fn caption_output(
+    text: String,
+    usage: Usage,
+    decode: Option<core_llm::DecodeReport>,
+    finish: CoreFinish,
+    policy: core_llm::KvCompressionPolicy,
+) -> TextLlmOutput {
+    TextLlmOutput {
+        timings: None,
+        text,
+        thinking: None,
+        tool_calls: Vec::new(),
+        usage,
+        mtp: None,
+        decode,
+        finish_reason: Some(finish),
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(policy)),
     }
 }
 
@@ -747,6 +763,27 @@ mod tests {
     use std::cell::Cell;
 
     const IMG: i32 = 128077;
+
+    /// sc-20683: every caption reports the dense KV cache with the shared reason for its policy.
+    #[test]
+    fn caption_output_reports_the_dense_kv_cache_for_the_policy() {
+        use core_llm::{
+            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        };
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let output = caption_output(
+                String::new(),
+                Usage::default(),
+                None,
+                CoreFinish::Stop,
+                policy,
+            );
+            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
+        }
+    }
 
     #[test]
     fn expand_replaces_image_token() {

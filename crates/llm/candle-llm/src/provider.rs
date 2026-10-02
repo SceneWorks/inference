@@ -1829,8 +1829,10 @@ impl LlamaProvider {
             stop_tokens,
             last_decode: Mutex::new(None),
             decode_path: DecodePath::StepModel,
-            // The HF identity the GGUF architecture was reconstructed as.
-            kv_family: kv_family_of(ck.config.architecture, &ck.config_json),
+            // No table family: the HF identity is reconstructed from `general.architecture`, and
+            // llama.cpp labels Mistral and other llama-shaped fine-tunes `"llama"` too, so a GGUF
+            // cannot be told to be the Llama family the evidence measured (as `from_parts`).
+            kv_family: None,
             constraint_table: OnceCell::new(),
             vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
@@ -6549,6 +6551,12 @@ mod tests {
     /// A tiny `qwen3` GGUF (2 layers, hidden 32, vocab 40): Q8_0 matrices, f32 norms, and a
     /// sibling tokenizer. Returns every tensor's element count and the layer projections'.
     fn write_tiny_gguf(path: &std::path::Path) -> (u64, Vec<u64>) {
+        write_tiny_gguf_arch(path, "qwen3")
+    }
+
+    /// [`write_tiny_gguf`] with `general.architecture = arch` (`"qwen3"` or `"llama"`; a llama
+    /// GGUF carries no per-head q/k norms).
+    fn write_tiny_gguf_arch(path: &std::path::Path, arch: &str) -> (u64, Vec<u64>) {
         use crate::primitives::{SplitMix64, TokenRng};
         use candle_core::quantized::gguf_file::{self, Value as Meta};
         use candle_core::quantized::{GgmlDType, QTensor};
@@ -6578,8 +6586,10 @@ mod tests {
             let b = |s: &str| format!("blk.{i}.{s}");
             add(b("attn_norm.weight"), &[hidden], false);
             add(b("ffn_norm.weight"), &[hidden], false);
-            add(b("attn_q_norm.weight"), &[8], false);
-            add(b("attn_k_norm.weight"), &[8], false);
+            if arch == "qwen3" {
+                add(b("attn_q_norm.weight"), &[8], false);
+                add(b("attn_k_norm.weight"), &[8], false);
+            }
             add(b("attn_q.weight"), &[hidden, hidden], true);
             add(b("attn_k.weight"), &[kv, hidden], true);
             add(b("attn_v.weight"), &[kv, hidden], true);
@@ -6588,19 +6598,23 @@ mod tests {
             add(b("ffn_up.weight"), &[inter, hidden], true);
             add(b("ffn_down.weight"), &[hidden, inter], true);
         }
+        let key = |s: &str| format!("{arch}.{s}");
         let metadata = [
-            ("general.architecture", Meta::String("qwen3".into())),
-            ("qwen3.attention.head_count", Meta::U32(4)),
-            ("qwen3.attention.head_count_kv", Meta::U32(2)),
-            ("qwen3.attention.key_length", Meta::U32(8)),
-            ("qwen3.embedding_length", Meta::U32(hidden as u32)),
-            ("qwen3.block_count", Meta::U32(layers as u32)),
-            ("qwen3.feed_forward_length", Meta::U32(inter as u32)),
-            ("qwen3.context_length", Meta::U32(256)),
-            ("qwen3.attention.layer_norm_rms_epsilon", Meta::F32(1e-6)),
-            ("qwen3.rope.freq_base", Meta::F32(1e6)),
+            (
+                "general.architecture".to_string(),
+                Meta::String(arch.into()),
+            ),
+            (key("attention.head_count"), Meta::U32(4)),
+            (key("attention.head_count_kv"), Meta::U32(2)),
+            (key("attention.key_length"), Meta::U32(8)),
+            (key("embedding_length"), Meta::U32(hidden as u32)),
+            (key("block_count"), Meta::U32(layers as u32)),
+            (key("feed_forward_length"), Meta::U32(inter as u32)),
+            (key("context_length"), Meta::U32(256)),
+            (key("attention.layer_norm_rms_epsilon"), Meta::F32(1e-6)),
+            (key("rope.freq_base"), Meta::F32(1e6)),
         ];
-        let metadata: Vec<(&str, &Meta)> = metadata.iter().map(|(k, v)| (*k, v)).collect();
+        let metadata: Vec<(&str, &Meta)> = metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let tensor_refs: Vec<(&str, &QTensor)> =
             tensors.iter().map(|(k, t)| (k.as_str(), t)).collect();
         gguf_file::write(
@@ -6615,6 +6629,31 @@ mod tests {
         )
         .unwrap();
         (total, projections)
+    }
+
+    /// sc-20683 review: a GGUF's HF identity is reconstructed from `general.architecture`, which
+    /// labels Mistral and other llama-shaped fine-tunes `"llama"` too, so no GGUF load names a
+    /// compressed-KV table family — an opted-in request is `UnqualifiedModel`.
+    #[test]
+    fn a_gguf_load_names_no_compressed_kv_family() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        for arch in ["llama", "qwen3"] {
+            let dir = tempfile::Builder::new()
+                .prefix("candle-gguf-kv-family-")
+                .tempdir()
+                .unwrap();
+            let path = dir.path().join(format!("tiny-{arch}.gguf"));
+            write_tiny_gguf_arch(&path, arch);
+            let provider = super::LlamaProvider::load(&spec_at(&path, None)).unwrap();
+            assert_eq!(provider.kv_model_family(), None, "{arch}");
+            assert_eq!(
+                provider
+                    .kv_cache_plan(Policy::Qualified, 40_000, 64, 1, false)
+                    .fallback,
+                Some(Reason::UnqualifiedModel),
+                "{arch}"
+            );
+        }
     }
 
     /// sc-24140 review: a llama-family GGUF load dequantizes every tensor into a dense f32 map on
