@@ -232,6 +232,22 @@ impl Attn {
         self.o.quantize(bits, group)?;
         Ok(())
     }
+
+    /// Collect the four projections' quantized packs (the sc-5360 eval-to-free pass).
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        for linear in [&self.q, &self.k, &self.v, &self.o] {
+            push_linear_quant_arrays(linear, out);
+        }
+    }
+}
+
+/// A quantized linear's packs (`wq`/`scales`/`biases` and any bias); a dense linear contributes
+/// nothing.
+fn push_linear_quant_arrays<'a>(linear: &'a AdaptableLinear, out: &mut Vec<&'a Array>) {
+    if let Some((wq, scales, biases, bias, _, _)) = linear.quantized_params() {
+        out.extend([wq, scales, biases]);
+        out.extend(bias);
+    }
 }
 
 /// The shared Wan block body (self-attn + cross-attn + gated-GELU FFN) used by **both** the main
@@ -277,6 +293,14 @@ impl CoreBlock {
         self.ffn_fc1.quantize(bits, group)?;
         self.ffn_fc2.quantize(bits, group)?;
         Ok(())
+    }
+
+    /// Collect this block's quantized packs (the sc-5360 eval-to-free pass).
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        self.self_attn.push_quant_arrays(out);
+        self.cross_attn.push_quant_arrays(out);
+        push_linear_quant_arrays(&self.ffn_fc1, out);
+        push_linear_quant_arrays(&self.ffn_fc2, out);
     }
 
     /// `x`: `[1, L, dim]` (f32). `e0`: `[1, 1, 6, dim]` (f32, the time modulation). `context`:
@@ -510,7 +534,35 @@ impl WanVaceTransformer {
         for vb in &mut self.vace_blocks {
             vb.quantize(bits, group)?;
         }
+        // sc-5360 / SC-20686: force-materialize the quantized packs now, as the base Wan
+        // transformer does, so the dense bf16 sources free at load instead of at the first denoise
+        // step. Left lazy (D run 37023146895), VACE-Fun's first step evaluated both experts' worth of
+        // packing beside the dense expert and its freed bf16 pooled: 45 GiB at 512x512x17.
+        let mut arrays: Vec<&Array> = Vec::new();
+        for block in &self.blocks {
+            block.push_quant_arrays(&mut arrays);
+        }
+        for vb in &self.vace_blocks {
+            vb.core.push_quant_arrays(&mut arrays);
+        }
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
         Ok(())
+    }
+
+    /// Every quantized pack this transformer retains (tests: the load-time quantization is
+    /// materialized, not left lazy).
+    #[cfg(test)]
+    fn quantized_packs(&self) -> Vec<&Array> {
+        let mut arrays: Vec<&Array> = Vec::new();
+        for block in &self.blocks {
+            block.push_quant_arrays(&mut arrays);
+        }
+        for vb in &self.vace_blocks {
+            vb.core.push_quant_arrays(&mut arrays);
+        }
+        arrays
     }
 
     /// Patchify grid `(f, h, w)` for a latent `[C, F, H, W]`.
@@ -1249,6 +1301,48 @@ mod tests {
             .max(None)
             .unwrap()
             .item::<f32>()
+    }
+
+    const QUANT_CHILD: &str = "WAN_VACE_QUANT_MATERIALIZE_CHILD";
+
+    /// D run 37023146895 (VACE-Fun 512x512x17 measured 45 GiB): a load-time quantize materializes
+    /// every pack and frees the dense sources then, instead of leaving them for the first denoise
+    /// step. Evaluating the packs afterwards allocates nothing. MLX's counters are process-wide, so
+    /// it runs alone in a child process. Sized: the tiny golden fixture (dim 64), < 64 MiB.
+    #[test]
+    fn load_time_quantize_materializes_every_pack() {
+        if std::env::var_os(QUANT_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vace::tests::load_time_quantize_materializes_every_pack",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(QUANT_CHILD, "1")
+                .output()
+                .expect("spawn the isolated quantize child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated quantize child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (weights, config) = tiny_vace_fixture();
+        let mut dit = WanVaceTransformer::from_weights(&weights, &config, Dtype::Bfloat16).unwrap();
+        drop(weights);
+        dit.quantize(4, None).unwrap();
+        let packs = dit.quantized_packs();
+        assert!(!packs.is_empty(), "the fixture quantizes some projection");
+        let before = mlx_rs::memory::get_active_memory();
+        mlx_rs::transforms::eval(packs).unwrap();
+        assert_eq!(
+            mlx_rs::memory::get_active_memory(),
+            before,
+            "a quantize left packs to evaluate at the first forward"
+        );
     }
 
     /// SC-20686: the VACE text context is built exactly as the reference builds it — diffusers

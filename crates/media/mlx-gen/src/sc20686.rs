@@ -47,7 +47,7 @@ use mlx_rs::{Array, Dtype};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{CancelFlag, Error, GenerationRequest, Progress, Result};
+use crate::{CancelFlag, Error, GenerationRequest, LoadPhase, Progress, Result};
 
 /// Backend identity every Metal-lane event carries. The adapter rejects a Metal-lane transcript
 /// without it and a CUDA-lane transcript that claims it.
@@ -717,7 +717,13 @@ pub fn observe_progress(progress: &Progress) {
             }
         }
         Progress::Decoding => open_phase(state, "decode", state.last_step),
-        Progress::Loading(_) => enter_phase(state, "load"),
+        // The prompt encoder's load is part of the conditioning encode: a staged-residency provider
+        // (gen-core `StagedResidency`, e.g. FLUX.2 Klein) announces it before loading and encoding,
+        // and mapping it to `load` left the generation-start `encode` window empty -- an allocator
+        // sample with a zero peak, which the adapter (rightly) refuses as missing evidence -- while
+        // the text encode was misattributed to `load`. The render bundle's load stays `load`.
+        Progress::Loading(LoadPhase::TextEncoder) => enter_phase(state, "encode"),
+        Progress::Loading(LoadPhase::Renderer) => enter_phase(state, "load"),
     });
 }
 

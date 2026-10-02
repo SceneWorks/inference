@@ -673,6 +673,46 @@ fn a_snapshot_without_an_immutable_revision_refuses_activation() {
     assert!(events.borrow().is_empty());
 }
 
+/// D run 37023146895: FLUX.2 Klein's staged residency announces `Loading(TextEncoder)` before its
+/// prompt encode. The text-encoder load and encode belong to the `encode` window, so that window
+/// carries the conditioning peak instead of closing empty (a zero-peak allocator sample the adapter
+/// refuses); the render bundle's `Loading(Renderer)` opens `load`.
+#[test]
+fn a_text_encoder_load_is_attributed_to_the_encode_window() {
+    let h = harness();
+    let scope = h.activate(false);
+    observe_progress(&Progress::Loading(crate::LoadPhase::TextEncoder));
+    h.script.alloc(4096); // the prompt encoder's weights and encode
+    h.script.free(4096);
+    observe_progress(&Progress::Loading(crate::LoadPhase::Renderer));
+    h.script.alloc(8192); // the transformer + VAE
+    mark_denoise();
+    observe_progress(&Progress::Step {
+        current: 1,
+        total: 1,
+    });
+    observe_progress(&Progress::Decoding);
+    observe_generation_end();
+    drop(scope);
+    let windows = h.of("phase-window");
+    let names: Vec<&str> = windows
+        .iter()
+        .map(|w| w["window"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["encode", "load", "denoise-step", "post-denoise", "decode"]
+    );
+    assert_eq!(windows[0]["allocator_high_bytes"], 4096, "{:?}", windows[0]);
+    assert_eq!(windows[1]["allocator_high_bytes"], 8192, "{:?}", windows[1]);
+    for window in &windows {
+        assert!(
+            window["peak_bytes"].as_u64().unwrap() > 0,
+            "every allocator sample carries a positive peak: {window:?}"
+        );
+    }
+}
+
 #[test]
 fn a_mid_denoise_expert_swap_keeps_every_window_unique() {
     let h = harness();

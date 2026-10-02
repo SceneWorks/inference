@@ -517,7 +517,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1476
+              "line": 1481
             }
           ],
           "product_residency": "sequential",
@@ -575,7 +575,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1476
+              "line": 1481
             }
           ],
           "product_residency": "sequential",
@@ -684,7 +684,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 893
+              "line": 898
             }
           ],
           "product_residency": "sequential",

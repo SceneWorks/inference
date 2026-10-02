@@ -9,6 +9,8 @@
 //! * DiT: the generate-time fit gate's resident bytes ([`crate::pipeline::preflight_denoise_memory_guard`]
 //!   inputs: one expert under `Sequential`, both under `Resident`, plus additive adapters) and its
 //!   `72 B · batch · tokens · dim` activation working set;
+//! * load: a load-time quantization (VACE-Fun's forced Q4) builds each expert dense before packing
+//!   it, so its dense bytes are live beside the packs at load;
 //! * VAE encode: the provider's conservative encode working set
 //!   ([`crate::conservative_video_encode_memory_profile`], sc-20686 E8);
 //! * VAE decode: with the admission budget (`available - reserve`), the working set of exactly the
@@ -41,17 +43,24 @@ pub struct WanAdmissionEstimate {
     pub denoise_activation_bytes: u64,
     pub encode_working_set_bytes: u64,
     pub decode_working_set_bytes: u64,
+    /// A load-time quantization's dense expert, live beside its packs while they materialize
+    /// (`load` phase); 0 for a pre-packed tier.
+    pub dit_load_transient_bytes: u64,
     /// The product planner's decode decision at the admission budget; `None` prices the
     /// conservative single pass (no budget given).
     pub decode: Option<crate::pipeline::PlannedDecode>,
 }
 
 impl WanAdmissionEstimate {
-    /// `(phase, bytes)` for the four staged phases.
-    pub fn phases(&self) -> [(&'static str, u64); 4] {
+    /// `(phase, bytes)` for the five staged phases.
+    pub fn phases(&self) -> [(&'static str, u64); 5] {
         let vae_and_dit = self.vae_bytes.saturating_add(self.dit_resident_bytes);
         [
             ("conditioning", self.text_encoder_bytes),
+            (
+                "load",
+                vae_and_dit.saturating_add(self.dit_load_transient_bytes),
+            ),
             (
                 "encode",
                 self.vae_bytes.saturating_add(self.encode_working_set_bytes),
@@ -175,6 +184,7 @@ pub fn product_admission_estimate(
         denoise_activation_bytes,
         encode_working_set_bytes,
         decode_working_set_bytes,
+        dit_load_transient_bytes: facts.load_transient_bytes,
         decode,
     })
 }
@@ -292,9 +302,9 @@ mod tests {
             priced.peak_bytes() < sum,
             "staged phases are a max, not a sum"
         );
-        assert_eq!(phases[3].0, "decode");
+        assert_eq!(phases[4].0, "decode");
         assert_eq!(
-            phases[3].1,
+            phases[4].1,
             priced.vae_bytes + priced.dit_resident_bytes + priced.decode_working_set_bytes
         );
     }
@@ -348,6 +358,70 @@ mod tests {
             crate::pipeline::PlannedDecodeMode::OverBudget
         );
         assert_eq!(starved.peak_bytes(), conservative.peak_bytes());
+    }
+
+    /// The product loads VACE-Fun dense and packs it to Q4 at load: the dense expert is live beside
+    /// its packs then, so the `load` phase prices it (D run 37023146895 measured 45 GiB at
+    /// 512x512x17, above a decode-only estimate). A pre-packed tier has no such transient.
+    #[test]
+    fn a_load_time_quantization_prices_its_dense_expert() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vace_fun");
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"num_attention_heads": 40, "attention_head_dim": 128, "num_layers": 40,
+                "vace_layers": [0, 5, 10, 15, 20, 25, 30, 35]}"#,
+        )
+        .unwrap();
+        let expert = 34_000_000_000_u64;
+        safetensors(&root.join("transformer/shard.safetensors"), expert);
+        safetensors(&root.join("transformer_2/shard.safetensors"), expert);
+        safetensors(&root.join("t5_encoder.safetensors"), 11_361_845_504);
+        safetensors(&root.join("vae.safetensors"), 507_591_212 / 2);
+        let spec = crate::product_load::product_load_spec(
+            MODEL_ID_VACE_FUN,
+            &root,
+            OffloadPolicy::Sequential,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            spec.quantize.is_some(),
+            "the product packs VACE-Fun at load"
+        );
+        let control: Vec<mlx_gen::Image> = (0..17)
+            .map(|_| mlx_gen::Image {
+                width: 512,
+                height: 512,
+                pixels: vec![0; 512 * 512 * 3],
+            })
+            .collect();
+        let req = GenerationRequest {
+            conditioning: vec![Conditioning::ControlClip {
+                frames: control.clone(),
+                mask: control,
+                masking_strength: 1.0,
+                start_frame: 0,
+                mode: Default::default(),
+            }],
+            ..request(512, 512, 17, 5.0)
+        };
+        let priced = product_admission_estimate(MODEL_ID_VACE_FUN, &spec, &req, None).unwrap();
+        assert_eq!(priced.dit_load_transient_bytes, expert);
+        assert!(
+            priced.dit_resident_bytes < expert,
+            "the packed expert is resident"
+        );
+        let load = priced.phases()[1];
+        assert_eq!(load.0, "load");
+        assert_eq!(
+            load.1,
+            priced.vae_bytes + priced.dit_resident_bytes + expert,
+            "the dense expert is live beside its packs at load"
+        );
+        assert!(priced.peak_bytes() >= load.1);
     }
 
     /// The SC-20686 Metal lane's accepted D units (nax-macos-2, run 36907062374): the product

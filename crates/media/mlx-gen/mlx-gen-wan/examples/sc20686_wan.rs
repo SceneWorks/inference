@@ -474,6 +474,7 @@ fn estimate_line(
             "denoiseActivationBytes": priced.denoise_activation_bytes,
             "encodeWorkingSetBytes": priced.encode_working_set_bytes,
             "decodeWorkingSetBytes": priced.decode_working_set_bytes,
+            "ditLoadTransientBytes": priced.dit_load_transient_bytes,
         },
     })
 }

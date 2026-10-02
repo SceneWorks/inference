@@ -723,7 +723,12 @@ impl WanVaceFun {
         let mut transformer =
             WanVaceTransformer::from_weights(&weights, &self.config, Dtype::Bfloat16)?;
         if let Some(q) = self.quantize {
+            // SC-20686: the dense map goes first so the materializing quantize frees each bf16
+            // source as its pack evaluates, then the freed dense buffers leave MLX's pool before
+            // the denoise (else they stay in the process footprint beside the packed expert).
+            drop(weights);
             transformer.quantize(q.bits(), None)?;
+            mlx_gen::memory_probe::clear_cache();
         }
         Ok((transformer, applied))
     }
@@ -1244,8 +1249,24 @@ pub(crate) fn vace_denoise_facts(
     };
     let base = &config.base;
     let frames = req.control_clip().map(|c| c.frames.len()).unwrap_or(1);
+    // A load-time quantization (the product's forced Q4 on VACE-Fun) builds each expert dense
+    // first; its bf16 surface is live beside the packs while they materialize.
+    let load_transient_bytes = if spec.quantize.is_none() {
+        0
+    } else if route == MODEL_ID_VACE {
+        vace_dit_resident_bytes(&vace_transformer_weights_path(root), None)
+    } else {
+        [MoeExpert::Low, MoeExpert::High]
+            .into_iter()
+            .map(|expert| {
+                vace_dit_resident_bytes(&vace_fun_expert_weights_path(root, expert), None)
+            })
+            .max()
+            .unwrap_or(0)
+    };
     Ok(crate::model::DenoiseFacts {
         resident_bytes,
+        load_transient_bytes,
         tokens: vace_denoise_tokens(&config, req)?,
         dim: base.dim,
         // VACE CFG runs cond/uncond as two sequential B=1 forwards (vace.rs F-073).

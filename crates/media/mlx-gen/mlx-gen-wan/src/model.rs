@@ -1179,7 +1179,12 @@ impl Wan14b {
         };
         let mut dit = WanTransformer::from_weights(&w, cfg)?;
         if let Some(q) = self.quant {
+            // SC-20686: as VACE-Fun's staged build -- drop the dense map so the materializing
+            // quantize frees each bf16 source as its pack evaluates, then release the freed dense
+            // buffers from MLX's pool before the denoise.
+            drop(w);
             dit.quantize(q.bits(), None)?;
+            mlx_gen::memory_probe::clear_cache();
         }
         // PRE-QUANTIZED (packed Q4/Q8) snapshot: install this expert's adapters as forward-time
         // residuals AFTER building (the bases stay packed) — mirrors `install_adapters_additive`.
@@ -1969,6 +1974,9 @@ pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DenoiseFacts {
     pub(crate) resident_bytes: u64,
+    /// The dense (pre-packing) bytes of the largest DiT expert a load-time quantization builds
+    /// before packing it -- live beside its packs while they materialize; 0 for a packed tier.
+    pub(crate) load_transient_bytes: u64,
     pub(crate) tokens: usize,
     pub(crate) dim: usize,
     pub(crate) cfg_batched: bool,
@@ -2002,7 +2010,14 @@ pub(crate) fn dense_denoise_facts(
             "{route}: cannot size every additive adapter for the estimate"
         ))
     };
-    let (vae, resident_bytes, cfg_batched) = match route {
+    let dense = |file: &str| {
+        if quant.is_some() {
+            dit_resident_bytes(&[root.join(file)], None)
+        } else {
+            0
+        }
+    };
+    let (vae, resident_bytes, cfg_batched, load_transient_bytes) = match route {
         MODEL_ID => {
             let adapters = adapter_stack_resident_bytes(&spec.adapters, adapter_mode)
                 .ok_or_else(unsized_adapters)?;
@@ -2012,6 +2027,7 @@ pub(crate) fn dense_denoise_facts(
                 dit_resident_bytes(&[root.join("model.safetensors")], quant)
                     .saturating_add(adapters),
                 guidance > 1.0,
+                dense("model.safetensors"),
             )
         }
         MODEL_ID_T2V_14B | MODEL_ID_I2V_14B => {
@@ -2029,6 +2045,7 @@ pub(crate) fn dense_denoise_facts(
                     high.saturating_add(high_adapters),
                 ),
                 true,
+                dense("low_noise_model.safetensors").max(dense("high_noise_model.safetensors")),
             )
         }
         other => {
@@ -2043,6 +2060,7 @@ pub(crate) fn dense_denoise_facts(
     let latent = latent_shape(gen_frames, height, width, cfg.vae_z_dim, stride)?;
     Ok(DenoiseFacts {
         resident_bytes,
+        load_transient_bytes,
         tokens: seq_len(latent, cfg.patch_size),
         dim: cfg.dim,
         cfg_batched,
