@@ -25,6 +25,18 @@ pub struct LlmMemoryGeometry {
     pub recurrent_bytes: u64,
 }
 
+impl LlmMemoryGeometry {
+    /// The K/V cache geometry these terms price.
+    pub fn kv_shape(&self) -> crate::KvCacheShape {
+        crate::KvCacheShape {
+            layers: self.layers,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+            element_bytes: self.element_bytes,
+        }
+    }
+}
+
 /// Conservative checked estimate for request-owned native memory.
 pub fn estimate_request_bytes(
     prompt_tokens: usize,
@@ -165,18 +177,40 @@ pub fn estimate_tiled_request_bytes_with_recurrent_copies(
     attention_workspace_bytes: u64,
     recurrent_copies: u64,
 ) -> Option<u64> {
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let total = prompt.checked_add(u64::from(max_new_tokens))?;
+    let kv = geometry.kv_shape().dense_bytes(total)?;
+    estimate_tiled_request_bytes_with_kv_bytes(
+        prompt_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        attention_workspace_bytes,
+        recurrent_copies,
+        kv,
+    )
+}
+
+/// [`estimate_tiled_request_bytes_with_recurrent_copies`] with the request's K/V cache bytes
+/// supplied by the backend instead of priced dense: for a request the backend serves from a
+/// compressed cache ([`crate::compressed_kv_cache_bytes`]). `kv_cache_bytes` must cover every
+/// position through the requested terminal one; every other term is identical, and
+/// `recurrent_copies == 0` is refused (`None`).
+pub fn estimate_tiled_request_bytes_with_kv_bytes(
+    prompt_tokens: usize,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    attention_workspace_bytes: u64,
+    recurrent_copies: u64,
+    kv_cache_bytes: u64,
+) -> Option<u64> {
     if recurrent_copies == 0 {
         return None;
     }
     let attention = attention_workspace_bytes;
     let prompt = u64::try_from(prompt_tokens).ok()?;
-    let total = prompt.checked_add(u64::from(max_new_tokens))?;
-    let kv = total
-        .checked_mul(geometry.layers)?
-        .checked_mul(geometry.kv_heads)?
-        .checked_mul(geometry.head_dim)?
-        .checked_mul(geometry.element_bytes)?
-        .checked_mul(2)?;
+    let kv = kv_cache_bytes;
     let mtp = if mtp_width > 0 {
         kv.checked_mul(2)?.checked_add(
             u64::from(mtp_width)
@@ -435,6 +469,35 @@ mod tests {
         assert_eq!(tiled(chunked_term + 12_345), chunked + 12_345);
         assert_eq!(
             estimate_tiled_request_bytes_with_recurrent_copies(4096, 16, g, 0, 0, 0, 0),
+            None
+        );
+    }
+
+    /// The supplied-KV estimator differs from the dense one only in the K/V term: dense pricing is
+    /// `(prompt + max_new) · layers · kv_heads · head_dim · element_bytes · 2`.
+    #[test]
+    fn supplied_kv_bytes_replace_only_the_dense_kv_term() {
+        let g = LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 8,
+            head_dim: 128,
+            layers: 28,
+            element_bytes: 2,
+            score_element_bytes: 4,
+            hidden_size: 3072,
+            intermediate_size: 8192,
+            vocab_size: 128_256,
+            recurrent_bytes: 0,
+        };
+        let dense_kv = (4096 + 16) * 28 * 8 * 128 * 2 * 2;
+        assert_eq!(g.kv_shape().dense_bytes(4096 + 16), Some(dense_kv));
+        let dense = estimate_tiled_request_bytes_with_recurrent_copies(4096, 16, g, 0, 0, 77, 1);
+        let supplied =
+            |kv| estimate_tiled_request_bytes_with_kv_bytes(4096, g, 0, 0, 77, 1, kv).unwrap();
+        assert_eq!(dense, Some(supplied(dense_kv)));
+        assert_eq!(supplied(dense_kv) - supplied(1_000), dense_kv - 1_000);
+        assert_eq!(
+            estimate_tiled_request_bytes_with_kv_bytes(4096, g, 0, 0, 77, 0, 1),
             None
         );
     }

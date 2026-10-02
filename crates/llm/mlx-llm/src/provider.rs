@@ -2794,6 +2794,49 @@ impl LlamaProvider {
         }
     }
 
+    /// Native-memory estimate request admission prices (sc-20682): the K/V term at the
+    /// compressed `format`'s bytes ([`crate::kv_policy::compressed_request_kv_bytes`]) when the
+    /// request's plan runs compressed, dense otherwise.
+    fn admission_estimate(
+        &self,
+        format: Option<core_llm::KvCompressionFormat>,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+        vision_workspace: u64,
+        mtp_width: u32,
+    ) -> CoreResult<u64> {
+        let geometry = self.model.memory_geometry();
+        let contract = self.model.workspace_contract();
+        let estimate = match format {
+            None => estimate_mlx_request_bytes(
+                prompt_tokens,
+                max_new_tokens,
+                geometry,
+                vision_workspace,
+                mtp_width,
+                contract,
+            ),
+            Some(format) => u64::try_from(prompt_tokens)
+                .ok()
+                .and_then(|prompt| prompt.checked_add(u64::from(max_new_tokens)))
+                .and_then(|total| {
+                    crate::kv_policy::compressed_request_kv_bytes(format, &geometry, total)
+                })
+                .and_then(|kv| {
+                    estimate_mlx_compressed_request_bytes(
+                        prompt_tokens,
+                        max_new_tokens,
+                        geometry,
+                        vision_workspace,
+                        mtp_width,
+                        contract,
+                        kv,
+                    )
+                }),
+        };
+        estimate.ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))
+    }
+
     fn generate_inner(
         &self,
         req: &TextLlmRequest,
@@ -2886,34 +2929,64 @@ impl LlamaProvider {
             admitted_prompt,
             req.max_new_tokens,
         )?;
-        let required = estimate_mlx_request_bytes(
-            admitted_prompt,
-            req.max_new_tokens,
-            self.model.memory_geometry(),
-            vision_workspace,
-            match req.mtp {
-                MtpMode::Off => 0,
-                MtpMode::Auto => self
-                    .descriptor
-                    .capabilities
-                    .mtp
-                    .map_or(0, |c| c.recommended_draft_tokens),
-                MtpMode::Enabled { draft_tokens } => draft_tokens,
-            },
-            self.model.workspace_contract(),
-        )
-        .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
-        let available = core_llm::effective_memory_budget(
-            core_llm::available_host_memory_bytes(),
-            core_llm::operational_memory_override()?,
-        )?;
-        core_llm::admit_request_memory_with_geometry(
-            admitted_prompt,
-            req.max_new_tokens,
-            self.descriptor.capabilities.max_context_tokens,
-            required,
-            available,
-        )?;
+
+        // sc-20679: the request's KV cache, decided against the qualification table before any
+        // K/V mutation — and, since sc-20682, before admission, so the estimate prices the cache
+        // the request will actually run on. Only the plain text decode below runs a compressed
+        // plan; its prompt is the tokenized prompt (no visual expansion on that path).
+        let kv_plan = if observer.is_some() {
+            KvPlan::Unreported
+        } else {
+            self.plan_kv_cache(
+                req.kv_compression,
+                admitted_prompt,
+                multimodal || gemma4_mm_request,
+            )
+        };
+        let mtp_width = match req.mtp {
+            MtpMode::Off => 0,
+            MtpMode::Auto => self
+                .descriptor
+                .capabilities
+                .mtp
+                .map_or(0, |c| c.recommended_draft_tokens),
+            MtpMode::Enabled { draft_tokens } => draft_tokens,
+        };
+        let geometry = self.model.memory_geometry();
+        let compressed_format = match &kv_plan {
+            KvPlan::Compressed { format, .. } => Some(*format),
+            KvPlan::Unreported | KvPlan::Dense(_) => None,
+        };
+        let estimate = |format| {
+            self.admission_estimate(
+                format,
+                admitted_prompt,
+                req.max_new_tokens,
+                vision_workspace,
+                mtp_width,
+            )
+        };
+        let required = estimate(compressed_format)?;
+        // What a compressed generation that turns dense part-way grows to (its transition is
+        // admitted against this, sc-20682).
+        let dense_final_kv = u64::try_from(admitted_prompt)
+            .ok()
+            .and_then(|prompt| prompt.checked_add(u64::from(req.max_new_tokens)))
+            .and_then(|total| crate::kv_policy::dense_final_kv_bytes(geometry.kv_shape(), total));
+        let admit = |required: u64| -> CoreResult<()> {
+            let available = core_llm::effective_memory_budget(
+                core_llm::available_host_memory_bytes(),
+                core_llm::operational_memory_override()?,
+            )?;
+            core_llm::admit_request_memory_with_geometry(
+                admitted_prompt,
+                req.max_new_tokens,
+                self.descriptor.capabilities.max_context_tokens,
+                required,
+                available,
+            )
+        };
+        admit(required)?;
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
@@ -2939,17 +3012,6 @@ impl LlamaProvider {
             req.max_new_tokens,
         )?;
 
-        // sc-20679: the request's KV cache, decided against the qualification table before any
-        // K/V mutation. Only the plain text decode below runs a compressed plan.
-        let kv_plan = if observer.is_some() {
-            KvPlan::Unreported
-        } else {
-            self.plan_kv_cache(
-                req.kv_compression,
-                prompt_len,
-                multimodal || gemma4_mm_request,
-            )
-        };
         let mut kv_report = match &kv_plan {
             KvPlan::Dense(report) => Some(report.clone()),
             KvPlan::Unreported | KvPlan::Compressed { .. } => None,
@@ -3314,7 +3376,32 @@ impl LlamaProvider {
                                                 model,
                                                 reader.clone(),
                                                 prompt_ids.len(),
+                                                crate::kv_policy::dense_transition_admission(
+                                                    dense_final_kv.ok_or_else(|| {
+                                                        CoreError::InvalidRequest(
+                                                            "request memory estimate overflow"
+                                                                .into(),
+                                                        )
+                                                    })?,
+                                                    core_llm::RequestResourceExhausted {
+                                                        prompt_tokens: admitted_prompt,
+                                                        max_new_tokens: req.max_new_tokens,
+                                                        max_context_tokens: self
+                                                            .descriptor
+                                                            .capabilities
+                                                            .max_context_tokens,
+                                                        required_bytes: 0,
+                                                        available_bytes: 0,
+                                                    },
+                                                ),
                                             );
+                                        // A refused selection runs dense from the start: the
+                                        // request was admitted at the compressed price, so it
+                                        // is admitted again at the dense price before any K/V
+                                        // exists (sc-20682).
+                                        if refused.is_some() {
+                                            admit(estimate(None)?)?;
+                                        }
                                         let timed = generate_with_timings_on(
                                             &self.model,
                                             cache.as_mut(),
@@ -3633,7 +3720,7 @@ enum MlxWorkspaceContract<'a> {
 
 /// MLX permits ten completed command buffers to remain in flight and can be building the next
 /// buffer before applying backpressure. Price that current buffer plus the in-flight set.
-const MLX_EVAL_BUFFER_WINDOW: u64 = 11;
+pub(crate) const MLX_EVAL_BUFFER_WINDOW: u64 = 11;
 /// Apple-Silicon Metal allocations are rounded to 16-KiB VM pages. Gated DeltaNet retains one
 /// independently allocated output row per prompt token until its final concatenate.
 const MLX_ALLOCATION_PAGE_BYTES: u64 = 16 * 1024;
@@ -3824,6 +3911,52 @@ fn estimate_routed_request_bytes(
     )
 }
 
+/// [`estimate_mlx_request_bytes`] for a request the provider serves from the compressed KV cache
+/// (sc-20682): `compressed_kv_bytes` replaces the dense K/V term of the generic fused-attention
+/// estimate. Only that contract's decoders can run compressed (the eager contract is exactly the
+/// soft-cap/latent/shared-K/V geometry the fused reader refuses, and the hybrid decoder has no
+/// compressed cache), so any other contract keeps its dense estimate, which is never smaller.
+fn estimate_mlx_compressed_request_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    contract: MlxWorkspaceContract<'_>,
+    compressed_kv_bytes: u64,
+) -> Option<u64> {
+    match contract {
+        MlxWorkspaceContract::Chunked => {
+            let attention = prefill_attention_tile_bytes(
+                u64::try_from(prompt_tokens).ok()?,
+                geometry.query_heads,
+                geometry.kv_heads,
+                geometry.head_dim,
+                geometry.score_element_bytes,
+            )?;
+            core_llm::estimate_tiled_request_bytes_with_kv_bytes(
+                prompt_tokens,
+                geometry,
+                vision_workspace_bytes,
+                mtp_width,
+                attention,
+                if mtp_width > 0 { 3 } else { 1 },
+                compressed_kv_bytes,
+            )
+        }
+        MlxWorkspaceContract::Eager | MlxWorkspaceContract::Qwen35 { .. } => {
+            estimate_mlx_request_bytes(
+                prompt_tokens,
+                max_new_tokens,
+                geometry,
+                vision_workspace_bytes,
+                mtp_width,
+                contract,
+            )
+        }
+    }
+}
+
 /// Select the estimate matching the complete decoder execution graph. Generic fused attention uses
 /// the shared tiled estimate. Dense Qwen3.5 adds its F32 recurrence, packed-Hadamard, allocator, and
 /// lazy-evaluator lifetimes; eager/otherwise-unbounded implementations retain the quadratic model.
@@ -3925,6 +4058,7 @@ fn to_core(e: crate::Error) -> CoreError {
         crate::Error::Unsupported(m) => CoreError::Unsupported(m),
         crate::Error::MissingTensor(m) => CoreError::Load(format!("missing tensor: {m}")),
         crate::Error::Config(m) => CoreError::Load(m),
+        crate::Error::ResourceExhausted(evidence) => CoreError::RequestResourceExhausted(evidence),
         crate::Error::Io(e) => CoreError::Io(e),
         other => CoreError::backend(other),
     }
@@ -4096,6 +4230,10 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn admit_any_transition() -> crate::primitives::DenseTransitionAdmission {
+        crate::primitives::DenseTransitionAdmission::new(|_| Ok(()))
+    }
 
     #[derive(Default)]
     struct RecordingLifecycleObserver(Vec<(&'static str, u64)>);
@@ -5463,7 +5601,8 @@ mod tests {
         // the attention path still moves the argmax (2-bit K/V flips positions).
         let head = &arrays[0].1 * 4.0f32 + randn(&[32, 128]);
         arrays.push(("lm_head.weight".into(), head));
-        for i in 0..2 {
+        // The identity may deepen the decoder (`num_hidden_layers`); every layer gets weights.
+        for i in 0..config["num_hidden_layers"].as_u64().unwrap() {
             let p = |s: &str| format!("model.layers.{i}.{s}");
             arrays.extend([
                 (
@@ -6220,8 +6359,12 @@ mod tests {
         ) else {
             panic!("the qualified context must plan compressed");
         };
-        let (mut cache, refused) =
-            crate::kv_policy::select_compressed_cache(model, reader, prompt.len());
+        let (mut cache, refused) = crate::kv_policy::select_compressed_cache(
+            model,
+            reader,
+            prompt.len(),
+            admit_any_transition(),
+        );
         assert_eq!(refused, None);
         let compressed = forced_logits(model, cache.as_mut(), &prompt, &stream);
         let report = crate::kv_policy::compressed_report(format, None, cache.as_ref()).unwrap();
@@ -6332,6 +6475,197 @@ mod tests {
         ));
     }
 
+    /// sc-20682: on the generic fused-attention contract the compressed estimate differs from the
+    /// dense one by exactly the K/V term (dense K/V out, the format-derived compressed bytes in);
+    /// a contract that cannot run compressed keeps its dense estimate.
+    #[test]
+    fn compressed_admission_replaces_only_the_kv_term() {
+        let geometry = LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 8,
+            head_dim: 128,
+            layers: 28,
+            element_bytes: 2,
+            score_element_bytes: 4,
+            hidden_size: 3072,
+            intermediate_size: 8192,
+            vocab_size: 128_256,
+            recurrent_bytes: 0,
+        };
+        let format = core_llm::KvCompressionFormat::GroupAffineK8V8;
+        let (prompt, new) = (32_768_usize, 512_u32);
+        let total = prompt as u64 + u64::from(new);
+        let compressed_kv =
+            crate::kv_policy::compressed_request_kv_bytes(format, &geometry, total).unwrap();
+        let dense_kv = geometry.kv_shape().dense_bytes(total).unwrap();
+        assert!(compressed_kv < dense_kv);
+        let dense =
+            estimate_mlx_request_bytes(prompt, new, geometry, 0, 0, MlxWorkspaceContract::Chunked)
+                .unwrap();
+        let compressed = estimate_mlx_compressed_request_bytes(
+            prompt,
+            new,
+            geometry,
+            0,
+            0,
+            MlxWorkspaceContract::Chunked,
+            compressed_kv,
+        )
+        .unwrap();
+        assert_eq!(dense - compressed, dense_kv - compressed_kv);
+        assert_eq!(
+            estimate_mlx_compressed_request_bytes(
+                prompt,
+                new,
+                geometry,
+                0,
+                0,
+                MlxWorkspaceContract::Eager,
+                compressed_kv,
+            ),
+            estimate_mlx_request_bytes(prompt, new, geometry, 0, 0, MlxWorkspaceContract::Eager)
+        );
+    }
+
+    /// A mid-generation admission refusal (a compressed cache's refused dense transition) reaches
+    /// the contract as the typed resource error, not a backend failure.
+    #[test]
+    fn a_typed_engine_refusal_is_the_contract_resource_error() {
+        let evidence = core_llm::RequestResourceExhausted {
+            prompt_tokens: 3,
+            max_new_tokens: 2,
+            max_context_tokens: 9,
+            required_bytes: 8,
+            available_bytes: 7,
+        };
+        assert!(matches!(
+            to_core(crate::Error::ResourceExhausted(evidence)),
+            CoreError::RequestResourceExhausted(mapped) if mapped == evidence
+        ));
+    }
+
+    /// Restores the operational memory budget when a test that pins it ends.
+    struct MemoryBudget;
+
+    impl MemoryBudget {
+        fn pin(bytes: u64) -> Self {
+            std::env::set_var(core_llm::AVAILABLE_MEMORY_OVERRIDE, bytes.to_string());
+            Self
+        }
+    }
+
+    impl Drop for MemoryBudget {
+        fn drop(&mut self) {
+            std::env::remove_var(core_llm::AVAILABLE_MEMORY_OVERRIDE);
+        }
+    }
+
+    /// An 8-bit reader for the K8V8 identity whose backend the cache refuses to bind.
+    #[derive(Debug)]
+    struct UnbindableReader;
+
+    impl crate::primitives::RetainedPackedKernel for UnbindableReader {
+        fn cache_identity(&self) -> &str {
+            crate::primitives::PACKED_METAL_B8_IDENTITY
+        }
+        fn backend(&self) -> &str {
+            "cpu"
+        }
+        fn retained_host_bytes_estimate(&self) -> usize {
+            0
+        }
+        fn dispatch(
+            &self,
+            _args: &crate::primitives::PackedAttentionArgs<'_>,
+        ) -> crate::error::Result<Array> {
+            Err(crate::error::Error::Msg("never dispatched".into()))
+        }
+        fn code_bits(&self) -> crate::primitives::PackedCodeBits {
+            crate::primitives::PackedCodeBits::Eight
+        }
+    }
+
+    /// sc-20682 AC2 through the production entry point: under a budget that holds the compressed
+    /// estimate but not the dense one, the qualified request is admitted and runs compressed,
+    /// while the same request un-opted is refused at the dense price; a request whose selection
+    /// then refuses the compressed cache is admitted again at the dense price before it runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admission_prices_compressed_kv_only_when_the_request_runs_it() {
+        use core_llm::{KvCompressionFormat as Format, KvCompressionPolicy as Policy};
+        let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
+            .iter()
+            .find(|row| row.family == core_llm::KvModelFamily::Qwen3)
+            .unwrap();
+        let words = usize::try_from(row.min_context_tokens).unwrap();
+        // As deep as the evidence model (28 layers): the compressed cache's per-layer transients
+        // amortize over the depth, so a two-layer toy prices above dense.
+        let snapshot = tiny_snapshot(
+            json!({
+                "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+                "num_hidden_layers": 28,
+            }),
+            row.min_context_tokens + 1024,
+            true,
+        );
+        let provider = load_tiny(&snapshot);
+        const NEW: u32 = 8;
+        let prompt = kv_generate(&provider, words, Policy::Off, NEW)
+            .usage
+            .prompt_tokens as usize;
+        let estimate = |format| {
+            provider
+                .admission_estimate(format, prompt, NEW, 0, 0)
+                .unwrap()
+        };
+        let (compressed, dense) = (estimate(Some(Format::GroupAffineK8V8)), estimate(None));
+        assert!(compressed < dense, "{compressed} vs {dense}");
+
+        let budget = MemoryBudget::pin(compressed);
+        let output = kv_generate(&provider, words, Policy::Qualified, NEW);
+        assert!(output.kv_cache.as_ref().unwrap().ran_compressed());
+        let refuse = |provider: &LlamaProvider, policy| {
+            let request = TextLlmRequest {
+                messages: vec![Message::text(
+                    Role::User,
+                    (0..words)
+                        .map(|i| format!("w{}", (i * 7) % 26 + 6))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )],
+                sampling: core_llm::Sampling::greedy(),
+                max_new_tokens: NEW,
+                seed: Some(0),
+                kv_compression: policy,
+                ..Default::default()
+            };
+            match provider.generate(&request, &mut |_| {}) {
+                Err(CoreError::RequestResourceExhausted(evidence)) => evidence,
+                other => panic!("expected a dense-priced refusal, got {other:?}"),
+            }
+        };
+        let evidence = refuse(&provider, Policy::Off);
+        assert_eq!(
+            (evidence.required_bytes, evidence.available_bytes),
+            (dense, compressed)
+        );
+
+        let unbindable = load_tiny(&snapshot);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let reader =
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(UnbindableReader));
+        assert!(unbindable.kv_reader.set(Ok(reader)).is_ok());
+        let evidence = refuse(&unbindable, Policy::Qualified);
+        assert_eq!(evidence.required_bytes, dense);
+        drop(budget);
+        let output = kv_generate(&unbindable, words, Policy::Qualified, NEW);
+        let report = output.kv_cache.unwrap();
+        assert_eq!(
+            report.fallback,
+            Some(core_llm::KvCacheFallbackReason::ReaderUnavailable)
+        );
+    }
+
     /// A reader that binds to the K8V8 cache and faults on every dispatch.
     #[derive(Debug)]
     struct FaultingReader;
@@ -6371,8 +6705,12 @@ mod tests {
             ..Default::default()
         };
         let run = |reader: crate::primitives::CompiledKernelHandle| {
-            let (mut cache, refused) =
-                crate::kv_policy::select_compressed_cache(&model, reader, prompt.len());
+            let (mut cache, refused) = crate::kv_policy::select_compressed_cache(
+                &model,
+                reader,
+                prompt.len(),
+                admit_any_transition(),
+            );
             generate_with_timings_on(
                 &model,
                 cache.as_mut(),
@@ -6449,8 +6787,12 @@ mod tests {
         };
         // Warm every lazily retained model and reader state on a throwaway cache first.
         {
-            let (mut warm, refused) =
-                crate::kv_policy::select_compressed_cache(&model, reader.clone(), prompt.len());
+            let (mut warm, refused) = crate::kv_policy::select_compressed_cache(
+                &model,
+                reader.clone(),
+                prompt.len(),
+                admit_any_transition(),
+            );
             assert_eq!(refused, None);
             step(warm.as_mut(), &prompt, 0);
             step(warm.as_mut(), &[3], prompt.len());
@@ -6459,8 +6801,12 @@ mod tests {
         memory::clear_cache();
         let baseline = memory::get_active_memory() as u64;
 
-        let (mut cache, refused) =
-            crate::kv_policy::select_compressed_cache(&model, reader, prompt.len());
+        let (mut cache, refused) = crate::kv_policy::select_compressed_cache(
+            &model,
+            reader,
+            prompt.len(),
+            admit_any_transition(),
+        );
         assert_eq!(refused, None);
         const SLACK: u64 = 256 * 1024;
         let check = |cache: &dyn KvCache, tokens: u64| {

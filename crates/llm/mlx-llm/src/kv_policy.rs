@@ -15,7 +15,10 @@ use core_llm::{
 use crate::config::ModelConfig;
 use crate::models::CausalLm;
 use crate::primitives::kv_cache::{CacheRoute, KvCache};
-use crate::primitives::packed_group_affine_kv::packed_metal_head_dimension_supported;
+use crate::primitives::packed_group_affine_kv::{
+    packed_metal_head_dimension_supported, DenseFallbackPackedDecoderCache,
+    DenseTransitionAdmission,
+};
 use crate::primitives::{
     packed_metal_identity, CompiledKernelHandle, PackedCodeBits, PackedMetalGpuFamily,
     PackedMetalKernel, PACKED_METAL_QUANT_GROUP_SIZE,
@@ -26,6 +29,49 @@ pub(crate) const fn packed_code_bits(format: KvCompressionFormat) -> PackedCodeB
     match format {
         KvCompressionFormat::GroupAffineK8V8 => PackedCodeBits::Eight,
     }
+}
+
+/// How the MLX packed cache allocates and reads, for request admission (sc-20682):
+///
+/// * the packed arrays grow by [`KV_BLOCK_TOKENS`](crate::primitives::kv_cache::KV_BLOCK_TOKENS)
+///   positions (rounded up to whole groups);
+/// * a step holds at most one per-layer packed transient per in-flight evaluator buffer
+///   ([`MLX_EVAL_BUFFER_WINDOW`](crate::provider::MLX_EVAL_BUFFER_WINDOW)): the prompt step's
+///   flush output before its in-place write, or a decode step's pre-growth arrays beside their
+///   successors;
+/// * a product generation's reader dispatches are one-token decode steps (`query_heads` rows):
+///   its prompt step runs on an empty cache, whose multi-row steps attend their fresh K/V through
+///   dense SDPA (priced by the prefill attention term), and every qualified prompt is far longer
+///   than the fused-SDPA row limit.
+pub(crate) fn mlx_compressed_allocation(
+    query_heads: u64,
+    head_dim: u64,
+) -> Option<core_llm::CompressedKvAllocation> {
+    Some(core_llm::CompressedKvAllocation {
+        growth_block_tokens: u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?,
+        coexisting_layer_transients: crate::provider::MLX_EVAL_BUFFER_WINDOW,
+        reader_scratch_bytes_per_layer:
+            crate::primitives::packed_metal::packed_reader_partial_scratch_bound_bytes(
+                query_heads,
+                head_dim,
+            )?,
+    })
+}
+
+/// K/V bytes admission prices for a generation of `total_tokens` positions (prompt plus every
+/// generated token) on the compressed cache of `format`: the format-derived packed representation
+/// plus the MLX allocation's transients ([`core_llm::compressed_kv_cache_bytes`]).
+pub(crate) fn compressed_request_kv_bytes(
+    format: KvCompressionFormat,
+    geometry: &core_llm::LlmMemoryGeometry,
+    total_tokens: u64,
+) -> Option<u64> {
+    core_llm::compressed_kv_cache_bytes(
+        format,
+        geometry.kv_shape(),
+        total_tokens,
+        mlx_compressed_allocation(geometry.query_heads, geometry.head_dim)?,
+    )
 }
 
 /// The table family of a provider's campaign identity (`"llama"` / `"qwen"`): the same
@@ -91,13 +137,65 @@ pub(crate) fn select_compressed_cache(
     model: &CausalLm,
     reader: CompiledKernelHandle,
     prompt_tokens: usize,
+    transition_admission: DenseTransitionAdmission,
 ) -> (Box<dyn KvCache>, Option<String>) {
     let selection = model.select_cache_with_packed_reader(reader, 1, prompt_tokens, false);
     let refused = match selection.route() {
         CacheRoute::DenseFallback { reason } => Some(reason.clone()),
         CacheRoute::ExperimentalPacked => None,
     };
-    (selection.into_cache(), refused)
+    let mut cache = selection.into_cache();
+    // The request was admitted at the compressed price: a later dense transition is admitted
+    // against fresh memory before it reconstructs the history (sc-20682).
+    if let Some(packed) = cache
+        .as_any_mut()
+        .downcast_mut::<DenseFallbackPackedDecoderCache>()
+    {
+        packed.set_dense_transition_admission(transition_admission);
+    }
+    (cache, refused)
+}
+
+/// The dense-transition admission of a compressed product generation: the transition's own
+/// reconstruction bytes, or — whichever is larger — the dense cache the rest of the generation
+/// grows to (`dense_final_bytes`), must fit the fresh memory budget. A refusal is the request's
+/// typed [`core_llm::RequestResourceExhausted`].
+pub(crate) fn dense_transition_admission(
+    dense_final_bytes: u64,
+    refusal: core_llm::RequestResourceExhausted,
+) -> DenseTransitionAdmission {
+    DenseTransitionAdmission::new(move |reconstruction| {
+        let required = reconstruction.max(dense_final_bytes);
+        let available = core_llm::effective_memory_budget(
+            core_llm::available_host_memory_bytes(),
+            core_llm::operational_memory_override()
+                .map_err(|e| crate::error::Error::Msg(e.to_string()))?,
+        )
+        .map_err(|e| crate::error::Error::Msg(e.to_string()))?;
+        if required > available {
+            return Err(crate::error::Error::ResourceExhausted(
+                core_llm::RequestResourceExhausted {
+                    required_bytes: required,
+                    available_bytes: available,
+                    ..refusal
+                },
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// Dense K/V bytes a generation that turned dense grows to by its last position: every layer's
+/// buffer at the dense cache's block-rounded capacity of `total_tokens`, plus one layer's buffer
+/// again for a block growth's pre-growth copy beside its successor.
+pub(crate) fn dense_final_kv_bytes(
+    shape: core_llm::KvCacheShape,
+    total_tokens: u64,
+) -> Option<u64> {
+    let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
+    let capacity = total_tokens.div_ceil(block).max(1).checked_mul(block)?;
+    let dense = shape.dense_bytes(capacity)?;
+    dense.checked_add(dense.checked_div(shape.layers.max(1))?)
 }
 
 /// The report of a generation that ran on a cache [`select_compressed_cache`] chose, read from the
@@ -271,5 +369,110 @@ mod tests {
         assert!(geometry_refusal(&cfg).unwrap().contains("square-root"));
         cfg.query_pre_attn_scalar = Some(128);
         assert_eq!(geometry_refusal(&cfg), None);
+    }
+
+    /// Llama-3.2-3B decoder geometry at bf16 (24 query heads, 8 KV heads of 128, 28 layers).
+    fn llama_3b_geometry() -> core_llm::LlmMemoryGeometry {
+        core_llm::LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 8,
+            head_dim: 128,
+            layers: 28,
+            element_bytes: 2,
+            score_element_bytes: 4,
+            hidden_size: 3072,
+            intermediate_size: 8192,
+            vocab_size: 128_256,
+            recurrent_bytes: 0,
+        }
+    }
+
+    /// sc-20682: admission prices the MLX cache's own layout — 256-token growth blocks, one
+    /// per-layer transient per in-flight evaluator buffer, and a one-token decode dispatch's
+    /// split-KV partials (at most 128 splits of `D + 2` f32 per query head) for every layer.
+    #[test]
+    fn admission_prices_the_mlx_compressed_layout() {
+        let geometry = llama_3b_geometry();
+        assert_eq!(
+            crate::primitives::packed_metal::packed_reader_partial_scratch_bound_bytes(24, 128),
+            Some(24 * 128 * 130 * 4)
+        );
+        assert_eq!(
+            mlx_compressed_allocation(24, 128),
+            Some(core_llm::CompressedKvAllocation {
+                growth_block_tokens: 256,
+                coexisting_layer_transients: 11,
+                reader_scratch_bytes_per_layer: 24 * 128 * 130 * 4,
+            })
+        );
+        let format = KvCompressionFormat::GroupAffineK8V8;
+        for total in [10_240 + 512, 32_768 + 1_024, 130_559] {
+            let priced = compressed_request_kv_bytes(format, &geometry, total).unwrap();
+            assert_eq!(
+                Some(priced),
+                core_llm::compressed_kv_cache_bytes(
+                    format,
+                    geometry.kv_shape(),
+                    total,
+                    mlx_compressed_allocation(24, 128).unwrap()
+                )
+            );
+            assert!(priced < geometry.kv_shape().dense_bytes(total).unwrap());
+        }
+    }
+
+    /// A generation that turns dense part-way grows to its block-rounded dense cache, plus one
+    /// layer's pre-growth copy.
+    #[test]
+    fn dense_final_bytes_cover_block_capacity_and_one_growth_copy() {
+        let shape = core_llm::KvCacheShape {
+            layers: 2,
+            kv_heads: 1,
+            head_dim: 64,
+            element_bytes: 2,
+        };
+        let layer = 512 * 64 * 2 * 2;
+        assert_eq!(dense_final_kv_bytes(shape, 300), Some(2 * layer + layer));
+        assert_eq!(dense_final_kv_bytes(shape, 512), Some(3 * layer));
+        assert_eq!(dense_final_kv_bytes(shape, u64::MAX), None);
+    }
+
+    /// The dense-transition admission refuses — typed, with the request's own geometry — when the
+    /// larger of the reconstruction and the final dense cache exceeds the fresh budget.
+    #[test]
+    fn a_dense_transition_is_admitted_against_the_fresh_budget() {
+        struct Budget;
+        impl Drop for Budget {
+            fn drop(&mut self) {
+                std::env::remove_var(core_llm::AVAILABLE_MEMORY_OVERRIDE);
+            }
+        }
+        let _budget = Budget;
+        std::env::set_var(core_llm::AVAILABLE_MEMORY_OVERRIDE, "1000");
+        let refusal = core_llm::RequestResourceExhausted {
+            prompt_tokens: 7,
+            max_new_tokens: 3,
+            max_context_tokens: 64,
+            required_bytes: 0,
+            available_bytes: 0,
+        };
+        let check = |final_bytes, reconstruction| {
+            dense_transition_admission(final_bytes, refusal).admit(reconstruction)
+        };
+        assert!(check(500, 400).is_ok());
+        assert!(check(1000, 1000).is_ok());
+        for (final_bytes, reconstruction, required) in [(500, 2_000, 2_000), (5_000, 10, 5_000)] {
+            match check(final_bytes, reconstruction) {
+                Err(crate::error::Error::ResourceExhausted(evidence)) => assert_eq!(
+                    evidence,
+                    core_llm::RequestResourceExhausted {
+                        required_bytes: required,
+                        available_bytes: 1_000,
+                        ..refusal
+                    }
+                ),
+                other => panic!("expected a typed refusal, got {other:?}"),
+            }
+        }
     }
 }

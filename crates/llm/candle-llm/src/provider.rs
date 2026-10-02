@@ -4066,8 +4066,22 @@ impl TextLlm for LlamaProvider {
             mtp: mtp_stats,
             decode: Some(decode_record.report(cuda_graphs_on)),
             finish_reason: Some(finish),
-            kv_cache: None,
+            kv_cache: Some(dense_kv_report(req.kv_compression)),
         })
+    }
+}
+
+/// The KV cache a Candle generation ran on (sc-20682). Candle has no fused compressed-domain
+/// reader, so every generation runs dense: un-opted it says so, opted in it names the missing
+/// reader — the same reason MLX reports when its reader is unavailable.
+fn dense_kv_report(policy: core_llm::KvCompressionPolicy) -> core_llm::KvCacheReport {
+    use core_llm::{KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy};
+    match policy {
+        Policy::Off => KvCacheReport::dense(Reason::PolicyDisabled, None),
+        Policy::Qualified => KvCacheReport::dense(
+            Reason::ReaderUnavailable,
+            Some("the Candle backend has no fused compressed-domain KV reader".into()),
+        ),
     }
 }
 
@@ -4430,6 +4444,42 @@ mod tests {
     use crate::models::CausalLm;
     use candle_core::Tensor;
     use std::collections::HashMap;
+
+    /// sc-20682: every Candle generation reports the dense cache it ran on, with the reason a
+    /// product renders — its opt-out, or (opted in) the missing compressed reader.
+    #[test]
+    fn candle_reports_a_dense_kv_cache_with_its_reason() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        let off = super::dense_kv_report(Policy::Off);
+        assert_eq!(off.fallback, Some(Reason::PolicyDisabled));
+        assert_eq!(off.detail, None);
+        let opted_in = super::dense_kv_report(Policy::Qualified);
+        assert_eq!(opted_in.fallback, Some(Reason::ReaderUnavailable));
+        assert!(opted_in
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("Candle")));
+        for report in [off, opted_in.clone()] {
+            assert!(!report.ran_compressed());
+            assert_eq!(report.format, None);
+            assert_eq!(report.format_version, core_llm::KV_CACHE_FORMAT_VERSION);
+        }
+        // Through the provider: an opted-in generation carries the report on its output.
+        use core_llm::{Message, Quantize, Sampling, TextLlm, TextLlmRequest};
+        let dir = q8_capable_qwen35_snapshot(true);
+        let provider = super::LlamaProvider::load(&spec_at(dir.path(), Some(Quantize::Q8)))
+            .expect("load the snapshot");
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 2,
+            seed: Some(0),
+            kv_compression: Policy::Qualified,
+            ..Default::default()
+        };
+        let out = provider.generate(&request, &mut |_| {}).expect("decode");
+        assert_eq!(out.kv_cache, Some(opted_in));
+    }
 
     #[test]
     fn accelerator_only_selector_is_exact_to_qwen38_and_bonsai() {

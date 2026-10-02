@@ -47,9 +47,9 @@ pub use packed_group_affine_kv::{
     group_affine_kernel_fp32_parity_errors, group_affine_kernel_fp32_parity_errors_at,
     select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
     DecoderCacheSelection, DenseFallbackEvent, DenseFallbackPackedDecoderCache,
-    OpaqueCompiledKernel, PackedCacheRequest, PackedCodeBits, PackedDispatchTelemetry,
-    PackedGroupAffineKvCache, RepresentationMetadata, RetainedPackedKernel,
-    PACKED_METAL_QUANT_GROUP_SIZE,
+    DenseTransitionAdmission, OpaqueCompiledKernel, PackedCacheRequest, PackedCodeBits,
+    PackedDispatchTelemetry, PackedGroupAffineKvCache, RepresentationMetadata,
+    RetainedPackedKernel, PACKED_METAL_QUANT_GROUP_SIZE,
 };
 pub use packed_metal::{
     mlx_nax_available, packed_kernel_path_valid, packed_kv_split_count, packed_metal_identity,
