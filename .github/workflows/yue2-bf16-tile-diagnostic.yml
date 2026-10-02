@@ -1,6 +1,6 @@
 name: YuE2 bounded BF16 tile diagnosis
 
-# CUDA-only waveform or first-Conv7 diagnostic for failed M3 full/tiled comparison; no acceptance, model
+# CUDA-only waveform, first-Conv7, or derivative decoder trace for failed M3 comparison; no acceptance, model
 # generation, app profile, quality sweep, or Metal dispatch. Numerical gates unchanged.
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ on:
         type: choice
         required: true
         default: waveform
-        options: [waveform, first_conv, first_conv_math]
+        options: [waveform, first_conv, first_conv_math, decoder_trace]
         description: One bounded diagnostic, with waveform preserving the existing default
       reference_run_id:
         type: string
@@ -132,12 +132,31 @@ jobs:
         run: |
           set "RUSTC_WRAPPER="
           call "%VCVARS%" || exit /b 1
-          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py prepare-harness --template ..\control\scripts\ci\yue2_bf16_tile_diagnostic --destination "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" || exit /b 1
+          if "%YUE2_DIAGNOSTIC_SELECTOR%"=="decoder_trace" (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_decoder_trace_overlay.py --source . --destination "%RUNNER_TEMP%\yue2-bf16-trace-build\engine-overlay" --patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\decoder-trace-vae.patch --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log" 2>&1
+            if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log"& exit /b 1)
+            set "TRACE_ROOT=%RUNNER_TEMP%\yue2-bf16-trace-build\engine-overlay"
+          ) else (
+            set "TRACE_ROOT="
+          )
+          if defined TRACE_ROOT (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py prepare-harness --template ..\control\scripts\ci\yue2_bf16_tile_diagnostic --destination "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" --overlay-root "%TRACE_ROOT%" || exit /b 1
+          ) else (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py prepare-harness --template ..\control\scripts\ci\yue2_bf16_tile_diagnostic --destination "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" || exit /b 1
+          )
           cargo fetch --locked --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --target x86_64-pc-windows-msvc > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\fetch.log" 2>&1
           if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\fetch.log"& exit /b 1)
-          cargo build --locked --offline --release --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --features cuda --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
+          if not defined TRACE_ROOT (
+            cargo build --locked --offline --release --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --features cuda --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
+          ) else (
+            cargo build --locked --offline --release --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --features cuda,decoder_trace --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
+          )
           if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"& exit /b 1)
-          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" --output "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\binary.txt" || exit /b 1
+          if defined TRACE_ROOT (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" --output "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\binary.txt" --overlay-root "%TRACE_ROOT%" || exit /b 1
+          ) else (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" --output "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\binary.txt" || exit /b 1
+          )
       - name: Run only the bounded same-input VAE diagnostic
         shell: powershell
         env:
@@ -145,7 +164,9 @@ jobs:
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
         run: |
           $binary = (Get-Content "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic\binary.txt" -Raw).Trim()
-          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_bf16_tile_diagnostic.py run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR" --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA"
+          $traceArgs = @()
+          if ($env:YUE2_DIAGNOSTIC_SELECTOR -ceq 'decoder_trace') { $traceArgs = @('--overlay-root', "$env:RUNNER_TEMP\yue2-bf16-trace-build\engine-overlay") }
+          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_bf16_tile_diagnostic.py run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR" --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA" @traceArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload immutable diagnostic output and failures
         if: always()
@@ -153,5 +174,16 @@ jobs:
         with:
           name: yue2-bf16-tile-diagnostic-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/yue2-bf16-tile-diagnostic
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload exact M3 tracked source and declared trace overlay
+        if: always() && inputs.diagnostic == 'decoder_trace'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-decoder-trace-source-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/yue2-bf16-trace-build/m3-tracked-source.tar.gz
+            ${{ runner.temp }}/yue2-bf16-trace-build/decoder-trace-vae.patch
+            ${{ runner.temp }}/yue2-bf16-trace-build/overlay-provenance.json
           if-no-files-found: warn
           retention-days: 30

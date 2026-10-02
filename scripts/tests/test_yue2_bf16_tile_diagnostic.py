@@ -112,12 +112,45 @@ def synthetic_math_report(root: Path, applicable: bool) -> tuple[Path, dict, dic
 
 
 class DiagnosticGuards(unittest.TestCase):
+    def test_decoder_trace_resource_bound_comes_from_all_33_native_stage_shapes(self):
+        expected = diag.decoder_trace_expected_bytes()
+        self.assertEqual(expected["source_lengths"], [75, 32, 48, 48, 43, 27])
+        self.assertEqual(expected["stage_count"], 33)
+        self.assertEqual(expected["bf16_raw_bytes"], 817244160)
+        self.assertEqual(expected["f32_raw_bytes"], 1634488320)
+        self.assertEqual(expected["max_stage_f32_bytes"], 36847616)
+
+    def test_decoder_trace_inventory_refuses_extra_missing_corrupt_and_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            raw = b"\x00\x80\xc0\x3f"
+            (data / "native.bf16le").write_bytes(raw)
+            report = {"capture": {"file": "native.bf16le", "sha256": hashlib.sha256(raw).hexdigest(),
+                                  "bytes": len(raw)}}
+            (data / "report.json").write_text(json.dumps(report), encoding="utf-8")
+            diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
+            with self.assertRaisesRegex(RuntimeError, "coverage incomplete"):
+                diag.verify_decoder_trace_file_set(data, report)
+            (data / "extra.bin").write_bytes(b"extra")
+            with self.assertRaisesRegex(RuntimeError, "unreferenced"):
+                diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
+            (data / "extra.bin").unlink()
+            (data / "native.bf16le").write_bytes(b"wrong")
+            with self.assertRaisesRegex(RuntimeError, "hash/size changed"):
+                diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
+            (data / "native.bf16le").unlink()
+            (data / "native.bf16le").symlink_to(data / "report.json")
+            with self.assertRaisesRegex(RuntimeError, "hash/size changed"):
+                diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
+            (data / "native.bf16le").unlink()
+            with self.assertRaisesRegex(RuntimeError, "hash/size changed"):
+                diag.verify_decoder_trace_file_set(data, report, minimum_files=1)
     def test_explicit_selector_keeps_waveform_default_and_forwards_to_child(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("default: waveform", workflow)
-        self.assertIn("options: [waveform, first_conv, first_conv_math]", workflow)
+        self.assertIn("options: [waveform, first_conv, first_conv_math, decoder_trace]", workflow)
         self.assertIn('run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR"', workflow)
-        self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math"))
+        self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math", "decoder_trace"))
 
     def test_first_conv_math_conditional_arms_and_restore_receipt(self):
         for applicable in (False, True):

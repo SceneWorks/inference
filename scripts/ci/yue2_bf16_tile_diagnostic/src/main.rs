@@ -1,4 +1,4 @@
-//! Same-input waveform or first-Conv7 numerical diagnostic for the frozen M3 YuE2 standard VAE.
+//! Same-input waveform, first-Conv7, or decoder-trace diagnostic for frozen M3.
 //! This reports the original 1/64 bound; it does not change a production gate.
 
 use std::collections::BTreeMap;
@@ -20,6 +20,9 @@ use candle_audio_yue2::SnapshotDirs;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "decoder_trace")]
+mod decoder_trace;
+
 const ENGINE_SHA: &str = "4127a675fc8575555e029e01b7f6867488880a8f";
 const ORIGINAL_BOUND: f32 = 1.0 / 64.0;
 const RATIO: usize = 1920;
@@ -31,6 +34,7 @@ enum Diagnostic {
     Waveform,
     FirstConv,
     FirstConvMath,
+    DecoderTrace,
 }
 
 impl Diagnostic {
@@ -39,6 +43,7 @@ impl Diagnostic {
             "waveform" => Ok(Self::Waveform),
             "first_conv" => Ok(Self::FirstConv),
             "first_conv_math" => Ok(Self::FirstConvMath),
+            "decoder_trace" => Ok(Self::DecoderTrace),
             _ => Err(format!("unsupported diagnostic {value:?}").into()),
         }
     }
@@ -970,6 +975,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             halo,
         );
     }
+    if diagnostic == Diagnostic::DecoderTrace {
+        #[cfg(feature = "decoder_trace")]
+        return decoder_trace::run_decoder_trace(
+            &engine,
+            &out,
+            &source,
+            &verified,
+            &device,
+            &meta,
+            &reference_hash,
+            frames,
+            core,
+            halo,
+        );
+        #[cfg(not(feature = "decoder_trace"))]
+        return Err("decoder_trace requires the verified M3 source overlay build".into());
+    }
     let seams: Vec<usize> = (core..frames).step_by(core).map(|f| f * RATIO).collect();
     let pinned_reference = json!({
         "raw": interleaved(reference.get("standard.long_full_raw").ok_or("missing standard.long_full_raw")?, false)?,
@@ -1073,6 +1095,10 @@ mod tests {
         assert_eq!(
             Diagnostic::parse("first_conv_math").unwrap(),
             Diagnostic::FirstConvMath
+        );
+        assert_eq!(
+            Diagnostic::parse("decoder_trace").unwrap(),
+            Diagnostic::DecoderTrace
         );
         assert!(Diagnostic::parse("full_vae").is_err());
     }

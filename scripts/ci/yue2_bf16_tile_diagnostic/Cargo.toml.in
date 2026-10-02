@@ -16,6 +16,7 @@ sha2 = "0.10"
 [features]
 default = []
 cuda = ["candle-audio/cuda", "candle-audio-yue2/cuda"]
+decoder_trace = []
 
 [profile.dev.package."*"]
 opt-level = 3
