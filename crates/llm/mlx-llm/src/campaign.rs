@@ -118,9 +118,18 @@ pub const REQUIRED_PHASES: [&str; 8] = [
 /// a turn-2 forced continuation), and each arm's per-turn cache record is sealed.
 pub const RECEIPT_SCHEMA_VERSION: u32 = 7;
 pub const RECEIPT_HARNESS_VERSION: &str = "sc-20671-kv-baseline-v7";
-/// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v4).
+/// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v5).
 pub const QUALITY_CONTRACT_HASH: &str =
-    "0a00b520d845d4da4c3da9b904af25e08646d87fba018ed6cf27ff9ecce4cc58";
+    "8461b072e36493f4f4559e7fc858a286a239a43e8ca8d8ea93179bcf33f344ca";
+/// Quality measurements per arm per process (contract v5 `statistics.qualityMeasuredOnce`): every
+/// fixture, forced continuation and teacher-forced pass is deterministic within a process, so a
+/// row measures quality once and gates that one sealed measurement.
+pub const QUALITY_MEASUREMENTS: usize = 1;
+/// Timing repeats (contract `statistics.repeats`): each is the kernel fixture's coordinate
+/// operation and a fixed-length steady decode, feeding the coefficient-of-variation rule.
+pub const TIMING_REPEATS: usize = 5;
+/// Timing warmups of a warm row (contract `statistics.warmups`).
+pub const TIMING_WARMUPS: usize = 2;
 /// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
 pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
 pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
@@ -205,24 +214,31 @@ pub const QUALITY_GATE_METRICS: [QualityGateMetric; 5] = [
     },
 ];
 
-/// Evaluate the compressed quality gate over every measured repeat's metrics, in repeat order.
-pub fn quality_gate_from_repeats(repeats: &[QualityMetrics]) -> ReceiptQualityGate {
+/// Evaluate the compressed quality gate over the row's quality measurement(s), in order (contract
+/// v5: exactly one).
+/// Contract v5: a non-discriminating needle (the same-weights dense run missed it) is an
+/// observation only, so `needleRetrieval` is evaluated only when `needle_discriminating`.
+pub fn quality_gate_from_repeats(
+    repeats: &[QualityMetrics],
+    needle_discriminating: bool,
+) -> ReceiptQualityGate {
     let failures = repeats
         .iter()
         .enumerate()
         .flat_map(|(repeat, metrics)| {
             QUALITY_GATE_METRICS.iter().filter_map(move |spec| {
                 let value = (spec.read)(metrics);
-                spec.comparison
-                    .misses(value, spec.threshold)
-                    .then(|| ReceiptQualityGateFailure {
+                let gated = needle_discriminating || spec.metric != "needleRetrieval";
+                (gated && spec.comparison.misses(value, spec.threshold)).then(|| {
+                    ReceiptQualityGateFailure {
                         metric: spec.metric.into(),
                         fixture: spec.fixture.into(),
                         repeat: repeat as u64,
                         value,
                         threshold: spec.threshold,
                         comparison: spec.comparison.as_str().into(),
-                    })
+                    }
+                })
             })
         })
         .collect::<Vec<_>>();
@@ -1918,12 +1934,26 @@ pub struct ReceiptFixture {
     pub artifact_sidecar_sha256: String,
     pub independent_reference: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The contract v5 `statistics` block every receipt records verbatim.
+pub fn contract_statistics() -> ReceiptQualityStatistics {
+    ReceiptQualityStatistics {
+        repeats: TIMING_REPEATS as u64,
+        warmups: TIMING_WARMUPS as u64,
+        quality_measured_once: QUALITY_MEASUREMENTS == 1,
+        confidence_interval: "95% bootstrap".into(),
+        outlier_policy: "report all samples; no silent deletion".into(),
+        variance_policy: "repeats and warmups are timing measurements (coordinate prefill, time to first token, steady decode); all raw timing repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),
+        max_coefficient_of_variation: 0.05,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ReceiptQualityStatistics {
     pub repeats: u64,
     pub warmups: u64,
+    pub quality_measured_once: bool,
     pub confidence_interval: String,
     pub outlier_policy: String,
     pub variance_policy: String,
@@ -1994,7 +2024,7 @@ pub struct ReceiptQuality {
     pub statistics: ReceiptQualityStatistics,
     #[serde(rename = "fixtureEvidence")]
     pub fixture_evidence: std::collections::BTreeMap<String, ReceiptFixture>,
-    /// Compressed rows only: the frozen-threshold outcome of every measured repeat. A failed gate
+    /// Compressed rows only: the frozen-threshold outcome of the row's quality measurement. A failed gate
     /// is a measured result for the Go/No-Go decision, never a relabelled pass or a refused row.
     /// Dense rows are characterization and carry none.
     #[serde(
@@ -2387,7 +2417,7 @@ pub struct ReceiptCompressionKernelPath {
 }
 
 /// Compressed-row evidence (SC-20676). Present exactly on `compressed` receipts; counts cover
-/// every compressed-arm dispatch of the row (warmups and all five repeats).
+/// every compressed-arm dispatch of the row (every timing run and the quality measurement).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -2617,7 +2647,10 @@ impl ReceiptBuilder {
         {
             return Err("batch disagrees with matrix".into());
         }
-        if self.phases.len() != 8 || self.allocations.is_empty() || self.timings.len() != 5 {
+        if self.phases.len() != 8
+            || self.allocations.is_empty()
+            || self.timings.len() != TIMING_REPEATS
+        {
             return Err("receipt evidence is incomplete".into());
         }
         for (phase, expected) in self.phases.iter().zip(REQUIRED_PHASES) {
@@ -2759,7 +2792,7 @@ impl ReceiptBuilder {
             candidate: self.quality.cache_candidate_turns.clone(),
             reference: self.quality.cache_reference_turns.clone(),
         };
-        // A compressed row's quality is gated per measured repeat; the outcome, pass or fail, is
+        // A compressed row's quality measurement is gated; the outcome, pass or fail, is
         // recorded with the row (dense rows are characterization and carry no gate).
         (
             self.template.quality.quality_gate,
@@ -2767,13 +2800,17 @@ impl ReceiptBuilder {
             self.template.quality.multi_turn_forced_continuation,
             self.template.quality.multi_turn_forced_pass,
         ) = if self.template.mode == "compressed" {
-            if self.quality.repeat_metrics.len() != 5 {
+            if self.quality.repeat_metrics.len() != QUALITY_MEASUREMENTS {
                 return Err(
-                    "a compressed quality gate evaluates exactly the five measured repeats".into(),
+                    "a compressed quality gate evaluates exactly the row's one quality measurement"
+                        .into(),
                 );
             }
             (
-                Some(quality_gate_from_repeats(&self.quality.repeat_metrics)),
+                Some(quality_gate_from_repeats(
+                    &self.quality.repeat_metrics,
+                    self.quality.needle_discriminating,
+                )),
                 self.quality.forced_continuation.clone(),
                 self.quality.multi_turn_forced_continuation.clone(),
                 self.quality.multi_turn_forced_pass.clone(),
@@ -3168,7 +3205,8 @@ fn validate_quality_gate(receipt: &Receipt) -> Result<(), String> {
         if failure.fixture != spec.fixture
             || failure.threshold.to_bits() != spec.threshold.to_bits()
             || failure.comparison != spec.comparison.as_str()
-            || failure.repeat >= 5
+            || failure.repeat >= QUALITY_MEASUREMENTS as u64
+            || (failure.metric == "needleRetrieval" && !quality.needle_discriminating)
             || !failure.value.is_finite()
             || !spec.comparison.misses(failure.value, spec.threshold)
             || previous.is_some_and(|previous| previous >= (failure.repeat, index))
@@ -3223,10 +3261,10 @@ fn validate_quality_gate(receipt: &Receipt) -> Result<(), String> {
             .iter()
             .find(|spec| spec.metric == metric)
             .ok_or("quality gate metric table is incomplete")?;
-        let expected = spec
-            .comparison
-            .misses(value, spec.threshold)
-            .then_some(value.to_bits());
+        // Contract v5: a non-discriminating needle is an observation and never a gate failure.
+        let gated = quality.needle_discriminating || metric != "needleRetrieval";
+        let expected =
+            (gated && spec.comparison.misses(value, spec.threshold)).then_some(value.to_bits());
         if recorded(metric, repeat) != expected {
             return Err(format!(
                 "quality gate does not record {metric} repeat {repeat} = {value} against the frozen {} {} (fixture {}): passed={}",
@@ -3719,7 +3757,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     for sample in &receipt.timings.samples {
         sample.validate_steady_decode(receipt.geometry.context_window_tokens)?;
     }
-    if receipt.timings.samples.len() != 5
+    if receipt.timings.samples.len() != TIMING_REPEATS
         || !receipt.timings.samples.iter().all(|s| {
             [
                 s.load_ms,
@@ -3871,7 +3909,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         );
     }
     let by_repeat = &receipt.quality.greedy_token_agreement_by_repeat;
-    if by_repeat.len() != 5
+    if by_repeat.len() != QUALITY_MEASUREMENTS
         || by_repeat.iter().any(|value| !(0.0..=1.0).contains(value))
         || by_repeat
             .iter()
@@ -3880,7 +3918,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             .to_bits()
             != receipt.quality.greedy_token_agreement.to_bits()
     {
-        return Err("greedy agreement is not the minimum over the five recorded repeats".into());
+        return Err("greedy agreement is not the row's one recorded quality measurement".into());
     }
     if !receipt.quality.parity_max_error.is_finite()
         || !receipt.quality.perplexity_delta.is_finite()
@@ -3908,14 +3946,12 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         ));
     }
     if receipt.quality.fixture_evidence.len() != 4
-        || receipt.quality.statistics.repeats != 5
-        || receipt.quality.statistics.warmups != 2
+        || receipt.quality.statistics != contract_statistics()
     {
         return Err(format!(
-            "quality contract evidence incomplete: fixtures={}, repeats={}, warmups={}",
+            "quality contract evidence incomplete: fixtures={}, statistics={:?}",
             receipt.quality.fixture_evidence.len(),
-            receipt.quality.statistics.repeats,
-            receipt.quality.statistics.warmups
+            receipt.quality.statistics
         ));
     }
     let lowercase_digest = |value: &str| {
@@ -4053,7 +4089,6 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if !receipt.lifecycle.post_run_release {
         return Err("postRunRelease is required".into());
     }
-    if receipt.quality.statistics.variance_policy != "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum" || receipt.quality.statistics.confidence_interval != "95% bootstrap" || receipt.quality.statistics.outlier_policy != "report all samples; no silent deletion" || receipt.quality.statistics.max_coefficient_of_variation != 0.05 { return Err("frozen quality statistics mismatch".into()); }
     match (receipt.mode.as_str(), &receipt.compression) {
         ("compressed", Some(compression)) => validate_receipt_compression(receipt, compression)?,
         ("dense", None) => {}
@@ -4276,8 +4311,11 @@ pub fn validate_artifact_bundle_named(
             return Err("fixture artifact or sidecar is malformed".into());
         }
     }
-    if bundle.fixtures.len() != REQUIRED_FIXTURES.len() * 5 {
-        return Err("complete product evidence requires every fixture for every repeat".into());
+    if bundle.fixtures.len() != REQUIRED_FIXTURES.len() * QUALITY_MEASUREMENTS {
+        return Err(
+            "complete product evidence requires every fixture of the row's quality measurement"
+                .into(),
+        );
     }
     let value: serde_json::Value =
         serde_json::from_slice(&bundle.receipt).map_err(|e| e.to_string())?;
@@ -4305,7 +4343,10 @@ pub fn validate_artifact_bundle_named(
     let timings = object["timings"]
         .as_object()
         .ok_or("timings is not an object")?;
-    if timings["samples"].as_array().is_none_or(|v| v.len() != 5) {
+    if timings["samples"]
+        .as_array()
+        .is_none_or(|v| v.len() != TIMING_REPEATS)
+    {
         return Err("receipt timing samples are incomplete".into());
     }
     let quality = object["quality"]
@@ -4332,8 +4373,8 @@ pub fn validate_artifact_bundle_named(
         }
         validate_fixture_binding(&typed, name, &artifact.bytes, 0)?;
     }
-    let mut repeat_artifacts = Vec::with_capacity(5 * REQUIRED_FIXTURES.len());
-    for repeat in 0..5 {
+    let mut repeat_artifacts = Vec::with_capacity(QUALITY_MEASUREMENTS * REQUIRED_FIXTURES.len());
+    for repeat in 0..QUALITY_MEASUREMENTS {
         for fixture in REQUIRED_FIXTURES {
             let artifact_name = fixture_artifact_name(fixture, repeat);
             let artifact = bundle
@@ -4373,8 +4414,10 @@ fn sealed_repeat_quality_metrics(
     receipt: &Receipt,
     artifacts: &[(&str, &[u8])],
 ) -> Result<Vec<QualityMetrics>, String> {
-    if artifacts.len() != 5 * REQUIRED_FIXTURES.len() {
-        return Err("sealed quality evidence requires every fixture of every repeat".into());
+    if artifacts.len() != QUALITY_MEASUREMENTS * REQUIRED_FIXTURES.len() {
+        return Err(
+            "sealed quality evidence requires every fixture of the quality measurement".into(),
+        );
     }
     artifacts
         .chunks(REQUIRED_FIXTURES.len())
@@ -4594,7 +4637,7 @@ fn validate_sealed_quality_gate(
             ));
         }
     }
-    let expected = quality_gate_from_repeats(repeats);
+    let expected = quality_gate_from_repeats(repeats, quality.needle_discriminating);
     if quality.quality_gate.as_ref() != Some(&expected) {
         return Err(format!(
             "receipt quality gate ({}) is not the gate of its sealed repeats ({})",
@@ -4665,14 +4708,9 @@ fn fixture_discrimination(
         let candidate = flag("candidateRecovered")?;
         let reference = flag("referenceRecovered")?;
         let same_weights_dense = if compressed { reference } else { candidate };
-        (
-            same_weights_dense,
-            if compressed && !same_weights_dense {
-                outputs_match
-            } else {
-                candidate
-            },
-        )
+        // Contract v5: retrieval is the candidate's own recovery either way; a non-discriminating
+        // one is an ungated observation (`outputsMatch` stays recorded beside it).
+        (same_weights_dense, candidate)
     } else {
         let candidate = flag("candidateValid")?;
         let reference = flag("referenceValid")?;
@@ -4971,29 +5009,40 @@ pub const DURATION_REFUSAL_MARGIN: f64 = 1.25;
 /// scales/biases). It converts weight bytes into a parameter count for the attention crossover.
 const CANDIDATE_BITS_PER_PARAMETER: f64 = 4.5;
 
-/// Row shape as it drives work: how many fixture halves run and how many full-context prefills
+/// Row shape as it drives work: how many measurement units run and how many full-context prefills
 /// the row issues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowWork {
-    /// Candidate and reference fixture halves: `2 * (warmups + 5 repeats)`.
-    pub halves: u64,
-    /// Full-context prefills: every half runs 4 fixtures, each a quality request plus the
-    /// coordinate operation (2 sequences for supported-batch, plus the secondary chunked operation
-    /// on a batch+chunked row), then 5 steady decodes and one teacher-forced kernel pass.
+    /// Measurement units (contract v5): the candidate's timing runs (`warmups + 5 repeats`) and
+    /// the two arms' one quality measurement each.
+    pub units: u64,
+    /// Full-context prefills: every timing run is the kernel coordinate operation (2 sequences for
+    /// supported-batch, plus the secondary chunked operation on a batch+chunked row) and a steady
+    /// decode; each arm's quality measurement runs 4 fixtures, each a quality request plus the
+    /// coordinate operation, except the candidate's kernel fixture, which reuses timing repeat 0's
+    /// coordinate operation; then the dense forced continuation and the candidate's teacher-forced
+    /// pass.
     pub prefills: u64,
 }
 
 pub fn row_work(process_temperature: &str, request_mode: &str, prefill_mode: &str) -> RowWork {
-    let warmups = if process_temperature == "warm" { 2 } else { 0 };
-    let halves = 2 * (warmups + 5);
+    let warmups = if process_temperature == "warm" {
+        TIMING_WARMUPS as u64
+    } else {
+        0
+    };
+    let timing_runs = warmups + TIMING_REPEATS as u64;
+    let quality_halves = 2 * QUALITY_MEASUREMENTS as u64;
     let operation_units = match (request_mode, prefill_mode) {
         ("supported-batch", "chunked") => 3,
         ("supported-batch", _) => 2,
         _ => 1,
     };
     RowWork {
-        halves,
-        prefills: halves * 4 * (1 + operation_units) + 5 + 1,
+        units: timing_runs + quality_halves,
+        prefills: timing_runs * (operation_units + 1) + quality_halves * 4 * (1 + operation_units)
+            - operation_units
+            + 2,
     }
 }
 
@@ -5098,7 +5147,7 @@ pub fn estimate_row_seconds(
     let target_tokens = context_band_target(row.context_window_tokens, context_band).ok()? as f64;
     let basis_prefill = row.work.prefills as f64 * row.prefill_seconds;
     let basis_fixed = (row.wall_seconds - basis_prefill).max(0.0);
-    let fixed_seconds = basis_fixed * target.halves as f64 / row.work.halves as f64;
+    let fixed_seconds = basis_fixed * target.units as f64 / row.work.units as f64;
     let prefill_seconds = target.prefills as f64
         * row.prefill_seconds
         * prefill_scale(target_tokens, row.attention_crossover_tokens)
@@ -5738,8 +5787,8 @@ pub fn load_prepared_coordinate_receipt(
     let human_sidecar =
         fs::read_to_string(directory.join("receipt.md.sha256")).map_err(|e| e.to_string())?;
     let _: Receipt = serde_json::from_slice(&receipt).map_err(|e| e.to_string())?;
-    let mut fixtures = Vec::with_capacity(REQUIRED_FIXTURES.len() * 5);
-    for repeat in 0..5 {
+    let mut fixtures = Vec::with_capacity(REQUIRED_FIXTURES.len() * QUALITY_MEASUREMENTS);
+    for repeat in 0..QUALITY_MEASUREMENTS {
         for fixture in REQUIRED_FIXTURES {
             let name = fixture_artifact_name(fixture, repeat);
             let bytes = fs::read(directory.join(&name)).map_err(|e| e.to_string())?;
@@ -6504,7 +6553,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                 "basisCoordinate": estimate.as_ref().map(|e| e.basis_coordinate.clone()),
                 "rowDeadlineSeconds": deadline_seconds,
                 "refusalMargin": DURATION_REFUSAL_MARGIN,
-                "method": "basis wall time split into measured full-context prefills and a fixed remainder; fixed scaled by fixture halves, prefill by count x T(1+T/Tattn) ratio",
+                "method": "basis wall time split into measured full-context prefills and a fixed remainder; fixed scaled by measurement units (timing runs + quality halves), prefill by count x T(1+T/Tattn) ratio",
             });
             fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
             fs::write(
@@ -6901,69 +6950,65 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let candidate_baseline = candidate_session.load_start_sample.mlx_active_bytes;
             // Candidate lifecycle evidence is collected before the reference model exists in the
             // process. This keeps every global MLX phase sample attributable to the candidate.
-            let mut candidate_warmups = Vec::new();
-            if row.coordinate.process_temperature == "warm" {
-                for warmup_index in 0..2 {
-                    let half = run_product_fixture_half_on_session_bounded(
-                        &candidate_session,
-                        &prompt,
-                        &row.coordinate,
-                        policy.max_request_tokens,
-                        true,
-                    )
-                    .map_err(|e| {
-                        format!(
-                            "product warmup {warmup_index} for {}: {e}",
-                            coordinate_slug(&row.coordinate)
-                        )
-                    })?;
-                    eprintln!(
-                        "{}",
-                        fixture_half_attempt_diagnostic(
-                            &half,
-                            &row.coordinate,
-                            &identity_sha256,
-                            "candidate",
-                            "warmup",
-                            warmup_index,
-                        )
-                    );
-                    candidate_warmups.push(half);
-                }
-            }
-            let warmup_cache_state_version =
-                (!candidate_warmups.is_empty()).then(|| candidate_session.cache_state_version());
-            let mut candidate_repeats = Vec::with_capacity(5);
-            let mut repeat_host_states = Vec::with_capacity(5);
-            for repeat in 0..5 {
-                let half = run_product_fixture_half_on_session_bounded(
+            // Contract v5: the timing measurements (a warm row's warmups, then the five repeats)
+            // run first, so a cold row's repeat 0 is the process's first product dispatch; quality
+            // is then measured once per arm, because every fixture is deterministic in-process.
+            let timing_run = |kind: &str, index: usize| {
+                run_timing_on_session(
                     &candidate_session,
                     &prompt,
                     &row.coordinate,
                     policy.max_request_tokens,
-                    true,
                 )
                 .map_err(|e| {
                     format!(
-                        "product fixture repeat {repeat} for {}: {e}",
+                        "timing {kind} {index} for {}: {e}",
                         coordinate_slug(&row.coordinate)
                     )
-                })?;
-                eprintln!(
-                    "{}",
-                    fixture_half_attempt_diagnostic(
-                        &half,
-                        &row.coordinate,
-                        &identity_sha256,
-                        "candidate",
-                        "repeat",
-                        repeat,
-                    )
-                );
-                candidate_repeats.push(half);
+                })
+            };
+            let mut timing_warmups = Vec::new();
+            if row.coordinate.process_temperature == "warm" {
+                for warmup_index in 0..TIMING_WARMUPS {
+                    timing_warmups.push(timing_run("warmup", warmup_index)?);
+                }
+            }
+            let warmup_cache_state_version =
+                (!timing_warmups.is_empty()).then(|| candidate_session.cache_state_version());
+            let mut timing_repeats = Vec::with_capacity(TIMING_REPEATS);
+            let mut repeat_host_states = Vec::with_capacity(TIMING_REPEATS);
+            for repeat in 0..TIMING_REPEATS {
+                timing_repeats.push(timing_run("repeat", repeat)?);
                 // Outside every timed window: recorded so throughput drift is attributable.
                 repeat_host_states.push(capture_host_state(TIMING_SAMPLE_HOST_BOUNDARY)?);
             }
+            // The kernel fixture's coordinate operation is timing repeat 0's: the same prompt,
+            // operation and session, so it is reused rather than dispatched again.
+            let candidate_quality = run_product_fixture_half_on_session_bounded(
+                &candidate_session,
+                &prompt,
+                &row.coordinate,
+                policy.max_request_tokens,
+                Some(timing_repeats[0].coordinate.clone()),
+            )
+            .map_err(|e| {
+                format!(
+                    "candidate quality measurement for {}: {e}",
+                    coordinate_slug(&row.coordinate)
+                )
+            })?;
+            eprintln!(
+                "{}",
+                fixture_half_attempt_diagnostic(
+                    &candidate_quality,
+                    &row.coordinate,
+                    &identity_sha256,
+                    "candidate",
+                    "quality",
+                    0,
+                )
+            );
+            let candidate_repeats = vec![candidate_quality];
             let compressed_parity = candidate_session
                 .compressed()
                 .map(CompressedKvArm::kernel_parity_errors)
@@ -6985,62 +7030,32 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let reference_session = CampaignSession::load(reference_session_snapshot)
                 .map_err(|e| format!("load reference campaign session: {e}"))?;
             let reference_baseline = reference_session.load_start_sample.mlx_active_bytes;
-            let mut reference_warmups = Vec::with_capacity(candidate_warmups.len());
-            for warmup_index in 0..candidate_warmups.len() {
-                let half = run_product_fixture_half_on_session_bounded(
-                    &reference_session,
-                    &prompt,
-                    &row.coordinate,
-                    policy.max_request_tokens,
-                    false,
+            // The reference arm is never timed: its one quality measurement is all it runs.
+            let reference_quality = run_product_fixture_half_on_session_bounded(
+                &reference_session,
+                &prompt,
+                &row.coordinate,
+                policy.max_request_tokens,
+                None,
+            )
+            .map_err(|e| {
+                format!(
+                    "reference quality measurement for {}: {e}",
+                    coordinate_slug(&row.coordinate)
                 )
-                .map_err(|e| {
-                    format!(
-                        "reference warmup {warmup_index} for {}: {e}",
-                        coordinate_slug(&row.coordinate)
-                    )
-                })?;
-                eprintln!(
-                    "{}",
-                    fixture_half_attempt_diagnostic(
-                        &half,
-                        &row.coordinate,
-                        &identity_sha256,
-                        "reference",
-                        "warmup",
-                        warmup_index,
-                    )
-                );
-                reference_warmups.push(half);
-            }
-            let mut reference_repeats = Vec::with_capacity(5);
-            for repeat in 0..5 {
-                let half = run_product_fixture_half_on_session_bounded(
-                    &reference_session,
-                    &prompt,
+            })?;
+            eprintln!(
+                "{}",
+                fixture_half_attempt_diagnostic(
+                    &reference_quality,
                     &row.coordinate,
-                    policy.max_request_tokens,
-                    false,
+                    &identity_sha256,
+                    "reference",
+                    "quality",
+                    0,
                 )
-                .map_err(|e| {
-                    format!(
-                        "reference fixture repeat {repeat} for {}: {e}",
-                        coordinate_slug(&row.coordinate)
-                    )
-                })?;
-                eprintln!(
-                    "{}",
-                    fixture_half_attempt_diagnostic(
-                        &half,
-                        &row.coordinate,
-                        &identity_sha256,
-                        "reference",
-                        "repeat",
-                        repeat,
-                    )
-                );
-                reference_repeats.push(half);
-            }
+            );
+            let reference_repeats = vec![reference_quality];
             // Compressed rows: the same-weights dense-KV session greedily continues the kernel
             // fixture prompt through every stop token, once per row (the stream is deterministic),
             // scoring its own likelihood of every token of that stream.
@@ -7296,24 +7311,6 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 )
             })?;
 
-            let warmup_suites = candidate_warmups
-                .into_iter()
-                .zip(reference_warmups)
-                .enumerate()
-                .map(|(warmup_index, (candidate, reference))| {
-                    let mut suite =
-                        pair_product_fixture_halves(candidate, reference, reference_kind)?;
-                    suite.kernel_parity_errors = compressed_parity.clone();
-                    suite.quality().map_err(|e| {
-                        core_llm::Error::InvalidRequest(format!(
-                            "product warmup {warmup_index} quality for {}: {e}",
-                            coordinate_slug(&row.coordinate)
-                        ))
-                    })?;
-                    Ok(suite)
-                })
-                .collect::<core_llm::Result<Vec<_>>>()
-                .map_err(|e| e.to_string())?;
             let suites = candidate_repeats
                 .into_iter()
                 .zip(reference_repeats)
@@ -7333,7 +7330,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     suite.multi_turn_forced_pass = multi_turn_pass.clone();
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
-                            "product fixture repeat {repeat} quality for {}: {e}",
+                            "product quality measurement {repeat} for {}: {e}",
                             coordinate_slug(&row.coordinate)
                         ))
                     })?;
@@ -7341,23 +7338,18 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 })
                 .collect::<core_llm::Result<Vec<_>>>()
                 .map_err(|e| e.to_string())?;
-            let kernel_runs = suites
+            let kernel_runs = timing_repeats
                 .iter()
-                .map(|suite| &suite.kernel_candidate)
+                .map(|run| &run.coordinate)
                 .collect::<Vec<_>>();
-            let warmup_runs = warmup_suites
+            let warmup_runs = timing_warmups
                 .iter()
-                .map(|suite| &suite.kernel_candidate)
+                .map(|run| &run.coordinate)
                 .collect::<Vec<_>>();
-            let steady_decodes = suites
+            let steady_decodes = timing_repeats
                 .iter()
-                .map(|suite| {
-                    suite
-                        .steady_decode
-                        .as_ref()
-                        .ok_or("candidate repeat has no steady-decode measurement")
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|run| &run.steady_decode)
+                .collect::<Vec<_>>();
             let mut timings = timing_samples_from_product_repeats(
                 &kernel_runs,
                 &steady_decodes,
@@ -7379,7 +7371,16 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 warmup_cache_state_version,
                 &captured_source,
                 admission,
-                compressed.map(|method| (method, warmup_suites.as_slice())),
+                compressed.map(|method| {
+                    (
+                        method,
+                        timing_warmups
+                            .iter()
+                            .chain(&timing_repeats)
+                            .map(|run| &run.coordinate)
+                            .collect::<Vec<_>>(),
+                    )
+                }),
                 &reference_inventory,
                 row_start,
             )?;
@@ -7393,6 +7394,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             .map_err(|e| e.to_string())?;
             Ok(CampaignOutcome::Completed)
         }
+        "noise-floor-parent" => noise_floor_parent(args),
         "noise-floor" => {
             let value = dense_noise_floor(
                 Path::new(&required_flag(args, "--snapshot")?),
@@ -7408,7 +7410,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             println!("{}", String::from_utf8(bytes).map_err(|e| e.to_string())?);
             Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --out <json> [--prefill-chunk <tokens>]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --out <json> [--prefill-chunk <tokens>] | noise-floor-parent --llama-snapshot <dir> --qwen-snapshot <dir> --prompt-file <file> --safety-policy <json> --resume-dir <dir> --out <dir> [--prefill-chunk <tokens>] [--stop-file <path>]".into()),
     }
 }
 
@@ -7499,6 +7501,226 @@ pub fn dense_noise_floor(
             "chunked-prefill": control(&chunked)?,
         },
     }))
+}
+
+/// Kind of the SC-20669 dense noise-floor summary (`summary.json` of a `noise-floor-parent` run).
+pub const NOISE_FLOOR_SUMMARY_KIND: &str = "sc20669-dense-noise-floor-summary";
+
+/// The worst case of each dense noise-floor control over every row (`rows` are
+/// [`dense_noise_floor`] outputs): minimum agreement, maximum flip count and maximum
+/// `|perplexityDelta|`, beside the frozen thresholds and whether the dense arm's own floor already
+/// misses them (a compressed row cannot be held tighter than the dense arm holds itself).
+pub fn noise_floor_summary(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+    if rows.is_empty() {
+        return Err("a noise-floor summary needs at least one row".into());
+    }
+    let mut controls = serde_json::Map::new();
+    for control in ["one-shot-repeat", "chunked-prefill"] {
+        let (mut agreement, mut flips, mut delta) = (f64::INFINITY, 0_u64, 0.0_f64);
+        let mut worst_agreement_row = String::new();
+        let mut worst_delta_row = String::new();
+        for row in rows {
+            let coordinate = row
+                .get("coordinate")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("noise-floor row has no coordinate")?;
+            let measured = row
+                .get("controls")
+                .and_then(|controls| controls.get(control))
+                .ok_or_else(|| format!("noise-floor row {coordinate} has no {control} control"))?;
+            let number = |key: &str| {
+                measured
+                    .get(key)
+                    .and_then(serde_json::Value::as_f64)
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| format!("noise-floor row {coordinate} {control} lacks {key}"))
+            };
+            let row_agreement = number("agreement")?;
+            let row_delta = number("perplexityDelta")?.abs();
+            if row_agreement < agreement {
+                agreement = row_agreement;
+                worst_agreement_row = coordinate.into();
+            }
+            if row_delta > delta || worst_delta_row.is_empty() {
+                delta = delta.max(row_delta);
+                worst_delta_row = coordinate.into();
+            }
+            flips = flips.max(number("flipCount")? as u64);
+        }
+        controls.insert(
+            control.into(),
+            serde_json::json!({
+                "minAgreement": agreement,
+                "minAgreementRow": worst_agreement_row,
+                "maxFlipCount": flips,
+                "maxAbsPerplexityDelta": delta,
+                "maxAbsPerplexityDeltaRow": worst_delta_row,
+                "greedyThresholdWithinDenseFloor": agreement < COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN,
+                "perplexityThresholdWithinDenseFloor": delta > COMPRESSED_PERPLEXITY_DELTA_MAX,
+            }),
+        );
+    }
+    Ok(serde_json::json!({
+        "kind": NOISE_FLOOR_SUMMARY_KIND,
+        "rows": rows.len(),
+        "thresholds": {
+            "greedyTokenAgreement": COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN,
+            "perplexityDelta": COMPRESSED_PERPLEXITY_DELTA_MAX,
+        },
+        "controls": controls,
+    }))
+}
+
+/// `noise-floor-parent`: the dense noise floor ([`dense_noise_floor`]) of every scheduled
+/// coordinate, one guarded `noise-floor` worker per row under the campaign safety policy (the
+/// same estimate-plus-reserve admission, child footprint cap, host reserve and row deadline as an
+/// SC-20671 row). Each finished row is sealed in `--resume-dir` (a rerun skips it); a stop file
+/// halts between rows with exit status 75. When every row is present, `summary.json`
+/// ([`noise_floor_summary`]) is sealed beside them and the directory is renamed to `--out`.
+fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
+    let resume_dir = PathBuf::from(required_flag(args, "--resume-dir")?);
+    let destination = PathBuf::from(required_flag(args, "--out")?);
+    if destination.exists() {
+        return Err("noise-floor destination must be absent".into());
+    }
+    let safety_policy = PathBuf::from(required_flag(args, "--safety-policy")?);
+    let policy = load_campaign_safety_policy(&safety_policy)?;
+    let prompt_file = PathBuf::from(required_flag(args, "--prompt-file")?);
+    let prompt = fs::read_to_string(&prompt_file).map_err(|e| format!("read prompt file: {e}"))?;
+    let snapshots = [
+        (
+            "llama",
+            PathBuf::from(required_flag(args, "--llama-snapshot")?),
+        ),
+        (
+            "qwen",
+            PathBuf::from(required_flag(args, "--qwen-snapshot")?),
+        ),
+    ];
+    let prefill_chunk = optional_flag(args, "--prefill-chunk")?;
+    let stop_files = operator_stop_files(args, &resume_dir)?;
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let logs = resume_dir.join("logs");
+    fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
+    let coordinates = required_coordinates();
+    let mut rows = Vec::with_capacity(coordinates.len());
+    for (index, coordinate) in coordinates.iter().enumerate() {
+        let slug = coordinate_slug(coordinate);
+        let row_path = resume_dir.join(format!("{slug}.json"));
+        if row_path.exists() {
+            let bytes = fs::read(&row_path).map_err(|e| e.to_string())?;
+            let sidecar = fs::read_to_string(resume_dir.join(format!("{slug}.json.sha256")))
+                .map_err(|e| e.to_string())?;
+            if sidecar != format!("{}  {slug}.json\n", seal_bytes(&bytes)) {
+                return Err(format!("noise-floor row {slug} does not match its seal"));
+            }
+            rows.push(serde_json::from_slice(&bytes).map_err(|e| e.to_string())?);
+            continue;
+        }
+        if let Some(stop) = operator_stop_before_row(
+            &stop_files,
+            &logs,
+            "sc-20669-noise-floor-operator-stop",
+            index,
+            &slug,
+            coordinates.len(),
+        )? {
+            return Ok(CampaignOutcome::StoppedByOperator(stop));
+        }
+        let snapshot = &snapshots
+            .iter()
+            .find(|(family, _)| *family == coordinate.family)
+            .ok_or("noise-floor coordinate family has no snapshot")?
+            .1;
+        // A dense row's requirements bound one dense session over the row's context.
+        let (total_tokens, request_tokens, static_footprint_floor) =
+            static_row_requirements(coordinate, snapshot, snapshot, &prompt, &policy, false)?;
+        let admission =
+            runtime_guarded_admission(&policy, static_footprint_floor, SC20671_ESTIMATE_SOURCE)?;
+        let staged = resume_dir.join(format!("{slug}.json.partial"));
+        let _ = fs::remove_file(&staged);
+        let mut command = Command::new(&executable);
+        command
+            .arg("noise-floor")
+            .arg("--snapshot")
+            .arg(snapshot)
+            .arg("--prompt-file")
+            .arg(&prompt_file)
+            .arg("--coordinate")
+            .arg(&slug)
+            .arg("--out")
+            .arg(&staged);
+        if let Some(chunk) = &prefill_chunk {
+            command.arg("--prefill-chunk").arg(chunk);
+        }
+        let prefix =
+            unused_attempt_prefix(&logs, &slug).ok_or("no unused bounded worker log path")?;
+        let request = RunRequest {
+            context_tokens: total_tokens,
+            request_tokens,
+            estimate: admission.estimate(),
+            stdout_path: logs.join(format!("{prefix}.stdout.log")),
+            stderr_path: logs.join(format!("{prefix}.stderr.log")),
+        };
+        eprintln!(
+            "sc20671-kv-baseline: noise floor {}/{} {slug}",
+            index + 1,
+            coordinates.len()
+        );
+        let status = campaign_supervisor::run_guarded(
+            &mut command,
+            &request,
+            &policy.supervisor(),
+            &mut SystemProbe,
+        )
+        .map_err(|failure| {
+            format!(
+                "noise-floor row {slug} stopped ({:?}): {}; earlier rows remain in {}",
+                failure.reason,
+                failure.detail,
+                resume_dir.display()
+            )
+        })?;
+        if !status.success() {
+            return Err(format!(
+                "noise-floor row {slug} failed with {status}; stderr: {}",
+                request.stderr_path.display()
+            ));
+        }
+        let bytes = fs::read(&staged).map_err(|e| e.to_string())?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if value.get("coordinate").and_then(serde_json::Value::as_str) != Some(slug.as_str()) {
+            return Err(format!(
+                "noise-floor row {slug} reported another coordinate"
+            ));
+        }
+        let (sealed, sha256) = seal_json(&value)?;
+        fs::write(&row_path, &sealed).map_err(|e| e.to_string())?;
+        fs::write(
+            resume_dir.join(format!("{slug}.json.sha256")),
+            format!("{sha256}  {slug}.json\n"),
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = fs::remove_file(&staged);
+        rows.push(value);
+    }
+    let summary = noise_floor_summary(&rows)?;
+    let (bytes, sha256) = seal_json(&summary)?;
+    fs::write(resume_dir.join("summary.json"), &bytes).map_err(|e| e.to_string())?;
+    fs::write(
+        resume_dir.join("summary.json.sha256"),
+        format!("{sha256}  summary.json\n"),
+    )
+    .map_err(|e| e.to_string())?;
+    println!("{}", String::from_utf8(bytes).map_err(|e| e.to_string())?);
+    fs::rename(&resume_dir, &destination).map_err(|e| {
+        format!(
+            "publish noise floor {} -> {}: {e}",
+            resume_dir.display(),
+            destination.display()
+        )
+    })?;
+    Ok(CampaignOutcome::Completed)
 }
 
 pub fn required_coordinates() -> Vec<Coordinate> {
@@ -8254,8 +8476,10 @@ fn sealed_product_fixture_artifacts(
     suites: &[ProductFixtureSuite],
     coordinate: &Coordinate,
 ) -> Result<Vec<SealedFixtureArtifact>, String> {
-    if suites.len() != 5 {
-        return Err("complete product evidence requires exactly five repeats".into());
+    if suites.len() != QUALITY_MEASUREMENTS {
+        return Err(
+            "complete product evidence requires exactly the row's one quality measurement".into(),
+        );
     }
     let mut artifacts = Vec::with_capacity(REQUIRED_FIXTURES.len() * suites.len());
     for (repeat, suite) in suites.iter().enumerate() {
@@ -8626,6 +8850,7 @@ impl Default for ProductObserver {
     }
 }
 
+#[derive(Clone)]
 pub struct ProductObservations {
     pub snapshot: SnapshotInventory,
     pub geometry: ProductGeometry,
@@ -9448,6 +9673,7 @@ pub struct ProductFixtureResult {
     pub secondary_coordinate_operation: Option<CoordinateOperationEvidence>,
 }
 
+#[derive(Clone)]
 pub struct CoordinateOperationEvidence {
     pub observation: ProductObservations,
     pub operation: String,
@@ -9456,6 +9682,40 @@ pub struct CoordinateOperationEvidence {
     pub output_sha256: String,
     pub compile_setup_ms: f64,
     pub compile_dispatch_ms: f64,
+}
+
+/// The coordinate operation(s) one fixture prompt runs: the coordinate's primary operation and,
+/// on a supported-batch chunked row, its secondary chunked-prefix-reuse dispatch.
+#[derive(Clone)]
+pub struct CoordinateRun {
+    pub primary: CoordinateOperationEvidence,
+    pub secondary: Option<CoordinateOperationEvidence>,
+}
+
+impl CoordinateRun {
+    /// The coordinate fields of a fixture result (tests and timing over fixture results).
+    pub fn of(result: &ProductFixtureResult) -> Self {
+        Self {
+            primary: CoordinateOperationEvidence {
+                observation: result.observation.clone(),
+                operation: result.coordinate_operation.clone(),
+                generated_tokens: result.coordinate_generated_tokens,
+                prompt_tokens: result.coordinate_prompt_tokens,
+                output_sha256: result.coordinate_output_sha256.clone(),
+                compile_setup_ms: result.compile_setup_ms,
+                compile_dispatch_ms: result.compile_dispatch_ms,
+            },
+            secondary: result.secondary_coordinate_operation.clone(),
+        }
+    }
+}
+
+/// One timing measurement (contract v5 `statistics.repeats` / `warmups`): the kernel fixture
+/// prompt's coordinate operation — prefill, time to first token and the compile probe — and the
+/// fixed-length steady decode. Quality is never re-measured here.
+pub struct TimingRun {
+    pub coordinate: CoordinateRun,
+    pub steady_decode: SteadyDecodeMeasurement,
 }
 
 fn output_has_observed_generation(output: &TextLlmOutput, saw_streamed_token: bool) -> bool {
@@ -9532,6 +9792,12 @@ fn primary_operation_evidence_digest(result: &ProductFixtureResult) -> String {
     canonical_operation_evidence_sha256(&value)
 }
 
+/// [`primary_operation_evidence_digest`] of a timing run's primary coordinate operation (the same
+/// evidence fields, so a reused kernel coordinate operation keeps one digest).
+fn coordinate_run_evidence_digest(run: &CoordinateRun) -> String {
+    operation_evidence_digest(&run.primary)
+}
+
 /// Stable contract binding shared by every repeat for one loaded session. Volatile timings,
 /// outputs, and monotonically advancing cache versions remain bound by each repeat's separate
 /// operation-evidence digest and therefore cannot make the shared coordinate digest incoherent.
@@ -9588,6 +9854,18 @@ fn run_fixture_on_session(
     multi_turn: Option<(&str, TextLlmRequest)>,
     coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureResult> {
+    let run = run_coordinate_on_session(session, prefix_prompt, &request, coordinate)?;
+    run_fixture_quality_on_session(session, run, prefix_prompt, request, multi_turn)
+}
+
+/// The coordinate operation(s) `coordinate` requires over one fixture prompt, each a separately
+/// observed product dispatch.
+fn run_coordinate_on_session(
+    session: &CampaignSession,
+    prefix_prompt: &str,
+    request: &TextLlmRequest,
+    coordinate: &Coordinate,
+) -> core_llm::Result<CoordinateRun> {
     session.validate_coordinate_family(coordinate)?;
     let primary_operation = if coordinate.request_mode == "supported-batch" {
         "supported-batch"
@@ -9613,6 +9891,25 @@ fn run_fixture_on_session(
         } else {
             None
         };
+    Ok(CoordinateRun {
+        primary,
+        secondary: secondary_coordinate_operation,
+    })
+}
+
+/// The fixture's quality request over `run`'s prompt: a separately bound product operation after
+/// the coordinate dispatch(es) `run` already measured on this session.
+fn run_fixture_quality_on_session(
+    session: &CampaignSession,
+    run: CoordinateRun,
+    prefix_prompt: &str,
+    request: TextLlmRequest,
+    multi_turn: Option<(&str, TextLlmRequest)>,
+) -> core_llm::Result<ProductFixtureResult> {
+    let CoordinateRun {
+        primary,
+        secondary: secondary_coordinate_operation,
+    } = run;
     let mut observer = ProductObserver::new();
     let (follow_up, quality_request) = match multi_turn {
         Some((follow_up, turn1)) => (Some(follow_up), turn1),
@@ -10031,7 +10328,8 @@ pub fn quality_from_product_fixtures(
                 "a teacher-forced repeat is scored on the reference stream's likelihood".into(),
             )
         }
-        // Warmups only, like the free-running agreement above: every measured repeat is scored.
+        // Untimed standalone suites only (no teacher-forced pass), like the free-running agreement
+        // above: a receipt's quality measurement always carries its scored stream.
         None => (
             negative_log_likelihood(&kernel_reference.quality_observation.token_probabilities)?,
             negative_log_likelihood(&kernel_candidate.quality_observation.token_probabilities)?,
@@ -10077,7 +10375,8 @@ pub fn quality_from_product_fixtures(
             &cache_reference_stream,
             &forced.stop_tokens,
         ),
-        // Warmups only: every measured repeat requires its teacher-forced turn-2 pass.
+        // Untimed standalone suites only: a receipt's quality measurement requires its
+        // teacher-forced turn-2 pass.
         (None, None) => token_agreement(
             &cache_candidate.quality_observation.token_probabilities,
             &cache_reference.quality_observation.token_probabilities,
@@ -10189,7 +10488,9 @@ fn needle_observation(outcomes: &FixtureOutcomes, reference: QualityReference) -
         QualityReference::DenseKvSameWeights if outcomes.reference_needle_recovered => {
             (outcomes.candidate_needle_recovered, true)
         }
-        QualityReference::DenseKvSameWeights => (outcomes.needle_outputs_match, false),
+        // Contract v5: the dense run missed, so the candidate's own recovery is recorded as an
+        // observation (both outputs stay in the artifact) and the gate never evaluates it.
+        QualityReference::DenseKvSameWeights => (outcomes.candidate_needle_recovered, false),
     }
 }
 
@@ -10238,9 +10539,6 @@ pub struct ProductFixtureSuite {
     /// Compressed rows: the fused reader's parity against its host-fp32 dequantize-then-attend
     /// reference. `None` measures the dense kernel.
     pub kernel_parity_errors: Option<Vec<f64>>,
-    /// The candidate half's dedicated fixed-length steady decode (the reference arm is never
-    /// timed).
-    pub steady_decode: Option<SteadyDecodeMeasurement>,
     /// The candidate's greedy choice at every position of this repeat's reference kernel stream
     /// (teacher-forced). Required for a dense row's measured repeats; warmups do not carry it.
     pub teacher_forced_candidate: Option<TeacherForcedChoices>,
@@ -10297,14 +10595,13 @@ pub fn run_product_fixture_suite(
 ) -> core_llm::Result<ProductFixtureSuite> {
     let candidate = CampaignSession::load(candidate_snapshot)?;
     let candidate_baseline = candidate.load_start_sample.mlx_active_bytes;
-    let candidate_half = run_product_fixture_half_on_session(&candidate, prompt, coordinate, true)?;
+    let candidate_half = run_product_fixture_half_on_session(&candidate, prompt, coordinate)?;
     drop(candidate);
     quiesce_campaign_active_memory(candidate_baseline)?;
 
     let reference = CampaignSession::load(reference_snapshot)?;
     let reference_baseline = reference.load_start_sample.mlx_active_bytes;
-    let reference_half =
-        run_product_fixture_half_on_session(&reference, prompt, coordinate, false)?;
+    let reference_half = run_product_fixture_half_on_session(&reference, prompt, coordinate)?;
     drop(reference);
     quiesce_campaign_active_memory(reference_baseline)?;
     pair_product_fixture_halves(
@@ -10326,7 +10623,6 @@ struct ProductFixtureHalf {
     context_payload_sha256: String,
     fixture_prompt_tokens: [u64; 4],
     fixture_prompt_sha256: [String; 4],
-    steady_decode: Option<SteadyDecodeMeasurement>,
 }
 
 /// A bounded, explicitly unaccepted worker-log record. It survives quality rejection but is never
@@ -10430,23 +10726,10 @@ fn run_product_fixture_half_on_session(
     session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
-    measure_steady_decode: bool,
 ) -> core_llm::Result<ProductFixtureHalf> {
-    run_product_fixture_half_on_session_bounded(
-        session,
-        prompt,
-        coordinate,
-        u64::MAX,
-        measure_steady_decode,
-    )
+    run_product_fixture_half_on_session_bounded(session, prompt, coordinate, u64::MAX, None)
 }
 
-/// One fixture half: the four frozen fixtures, each with its coordinate operation, then — when
-/// `measure_steady_decode` (the timed candidate arm) — one fixed-length steady decode of the row
-/// context. The steady decode runs after every observer of the half has closed, on its own
-/// request-scoped cache that is released before the next half, so no coordinate's memory
-/// attribution sees it; its `prompt + STEADY_DECODE_TOKENS` live tokens are admitted up front by
-/// the preflight live-token bound.
 /// The kernel fixture prompt of `coordinate`'s context band, exactly as the fixture half builds it.
 fn kernel_fixture_prompt(
     session: &CampaignSession,
@@ -10643,12 +10926,18 @@ pub struct TeacherForcedChoices {
     pub stop_tokens: Vec<i32>,
 }
 
+/// One arm's quality measurement (contract v5: once per arm per process): the four frozen
+/// fixtures, each with its coordinate operation. `kernel_coordinate`, when given, is this
+/// session's already measured coordinate operation over the kernel fixture prompt (the candidate's
+/// timing repeat 0) and is reused as the kernel fixture's coordinate evidence instead of being
+/// dispatched again: the same prompt, operation and session, so the evidence is the same
+/// measurement.
 fn run_product_fixture_half_on_session_bounded(
     session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
     max_request_tokens: u64,
-    measure_steady_decode: bool,
+    kernel_coordinate: Option<CoordinateRun>,
 ) -> core_llm::Result<ProductFixtureHalf> {
     session.validate_coordinate_family(coordinate)?;
     let context_window_tokens = session.provider.campaign_context_window()?;
@@ -10686,11 +10975,21 @@ fn run_product_fixture_half_on_session_bounded(
             )));
         }
     }
-    let kernel = run_product_fixture_on_session(
+    let kernel_request = fixture_request(kernel_prompt.clone(), Vec::new());
+    let kernel_coordinate = match kernel_coordinate {
+        Some(run) => {
+            reusable_kernel_coordinate(&run, session.session_id(), coordinate)
+                .map_err(core_llm::Error::InvalidRequest)?;
+            run
+        }
+        None => run_coordinate_on_session(session, &kernel_prompt, &kernel_request, coordinate)?,
+    };
+    let kernel = run_fixture_quality_on_session(
         session,
+        kernel_coordinate,
         &kernel_prompt,
-        fixture_request(kernel_prompt.clone(), Vec::new()),
-        coordinate,
+        kernel_request,
+        None,
     )?;
     let tool = run_product_fixture_on_session(
         session,
@@ -10715,17 +11014,6 @@ fn run_product_fixture_half_on_session_bounded(
         )),
         coordinate,
     )?;
-    // Batch rows are timed as one sequence too: the compressed arm has no batch route, so a
-    // batched steady decode could not compare the two representations at the same boundary.
-    let steady_decode = measure_steady_decode
-        .then(|| {
-            session.provider.campaign_steady_decode(
-                &kernel_prompt,
-                STEADY_DECODE_TOKENS as usize,
-                session.compressed(),
-            )
-        })
-        .transpose()?;
     Ok(ProductFixtureHalf {
         kernel,
         tool,
@@ -10738,6 +11026,73 @@ fn run_product_fixture_half_on_session_bounded(
         context_payload_sha256: seal_bytes(band_payload.as_bytes()),
         fixture_prompt_tokens,
         fixture_prompt_sha256,
+    })
+}
+
+/// A timing run's coordinate operation is reusable as the kernel fixture's only when it is this
+/// session's measurement of the kernel fixture prompt under the coordinate's own operation(s).
+fn reusable_kernel_coordinate(
+    run: &CoordinateRun,
+    session_id: &str,
+    coordinate: &Coordinate,
+) -> Result<(), String> {
+    let expected_operation = if coordinate.request_mode == "supported-batch" {
+        "supported-batch"
+    } else if coordinate.prefill_mode == "chunked" {
+        "chunked-prefix-reuse"
+    } else {
+        "single-shot-generation"
+    };
+    let needs_secondary =
+        coordinate.request_mode == "supported-batch" && coordinate.prefill_mode == "chunked";
+    if run.primary.observation.session_id != session_id
+        || run.primary.operation != expected_operation
+        || run.secondary.is_some() != needs_secondary
+        || run
+            .secondary
+            .as_ref()
+            .is_some_and(|secondary| secondary.observation.session_id != session_id)
+    {
+        return Err(
+            "a reused kernel coordinate operation must be this session's run of the coordinate's operation"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// One timing measurement of the candidate arm (contract v5 `statistics.repeats` / `warmups`):
+/// the coordinate operation over the kernel fixture prompt, then one fixed-length steady decode
+/// of the row context. The steady decode runs after the coordinate observer has closed, on its
+/// own request-scoped cache that is released before the next run, so no coordinate's memory
+/// attribution sees it; its `prompt + STEADY_DECODE_TOKENS` live tokens are admitted up front by
+/// the preflight live-token bound. Batch rows are timed as one sequence too: the compressed arm
+/// has no batch route, so a batched steady decode could not compare the two representations at
+/// the same boundary.
+fn run_timing_on_session(
+    session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+    max_request_tokens: u64,
+) -> core_llm::Result<TimingRun> {
+    session.validate_coordinate_family(coordinate)?;
+    let kernel_prompt = kernel_fixture_prompt(session, prompt, coordinate)?;
+    let tokens = session.provider.campaign_prompt_tokens(&kernel_prompt)?;
+    let context_window_tokens = session.provider.campaign_context_window()?;
+    if tokens > max_request_tokens || tokens > context_window_tokens.saturating_sub(256) {
+        return Err(core_llm::Error::InvalidRequest(format!(
+            "kernel fixture prompt has {tokens} tokens, exceeding the safety ceiling {max_request_tokens} or the loaded context {context_window_tokens}"
+        )));
+    }
+    let request = fixture_request(kernel_prompt.clone(), Vec::new());
+    let coordinate_run = run_coordinate_on_session(session, &kernel_prompt, &request, coordinate)?;
+    let steady_decode = session.provider.campaign_steady_decode(
+        &kernel_prompt,
+        STEADY_DECODE_TOKENS as usize,
+        session.compressed(),
+    )?;
+    Ok(TimingRun {
+        coordinate: coordinate_run,
         steady_decode,
     })
 }
@@ -10773,7 +11128,6 @@ fn pair_product_fixture_halves(
         context_payload_tokens: candidate.context_payload_tokens,
         reference: reference_kind,
         kernel_parity_errors: None,
-        steady_decode: candidate.steady_decode,
         teacher_forced_candidate: None,
         forced_continuation: None,
         teacher_forced_cache: None,
@@ -11122,27 +11476,25 @@ fn warmup_probe_suite_sha256(
 /// five measured warm repeats); otherwise it is recorded as unresolved, never refused. Prefix-reuse probes add only the seed and
 /// observed-hit product calls, excluding allocator reset and footprint instrumentation.
 pub fn timing_samples_from_product_repeats(
-    runs: &[&ProductFixtureResult],
+    runs: &[&CoordinateRun],
     steady_decodes: &[&SteadyDecodeMeasurement],
     coordinate: &Coordinate,
     process_temperature: &str,
-    warmups: &[&ProductFixtureResult],
+    warmups: &[&CoordinateRun],
 ) -> Result<ProductTimingMeasurements, String> {
-    if runs.len() != 5 || steady_decodes.len() != runs.len() {
-        return Err("receipt requires exactly five product repeats and steady decodes".into());
+    if runs.len() != TIMING_REPEATS || steady_decodes.len() != runs.len() {
+        return Err("receipt requires exactly five timing repeats and steady decodes".into());
     }
     let samples = runs
         .iter()
         .zip(steady_decodes)
         .map(|(run, steady)| {
-            timing_from_product_observation(&run.observation, steady, process_temperature)
+            timing_from_product_observation(&run.primary.observation, steady, process_temperature)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let operation = runs[0].coordinate_operation.as_str();
-    if runs.iter().any(|run| run.coordinate_operation != operation)
-        || warmups
-            .iter()
-            .any(|run| run.coordinate_operation != operation)
+    let operation = runs[0].primary.operation.as_str();
+    if runs.iter().any(|run| run.primary.operation != operation)
+        || warmups.iter().any(|run| run.primary.operation != operation)
     {
         return Err("compile attribution mixed coordinate operations".into());
     }
@@ -11157,9 +11509,9 @@ pub fn timing_samples_from_product_repeats(
         .iter()
         .map(|run| {
             (
-                run.compile_setup_ms,
-                run.compile_dispatch_ms,
-                primary_operation_evidence_digest(run),
+                run.primary.compile_setup_ms,
+                run.primary.compile_dispatch_ms,
+                coordinate_run_evidence_digest(run),
             )
         })
         .collect::<Vec<_>>();
@@ -11172,7 +11524,7 @@ pub fn timing_samples_from_product_repeats(
     };
     let measured_dispatch_ms = runs
         .iter()
-        .map(|run| run.compile_dispatch_ms)
+        .map(|run| run.primary.compile_dispatch_ms)
         .collect::<Vec<_>>();
     let compile_attribution =
         compile_attribution_from_probes(operation, &matrix, probes, &measured_dispatch_ms)?;
@@ -11577,11 +11929,17 @@ fn process_thermal_state() -> Result<i64, String> {
     Err("the process thermal state probe requires macOS".into())
 }
 
-/// The primary repeat supplies the receipt metrics; discrimination is the AND over every sealed
-/// repeat, whose own values are recorded in each repeat's fixture artifact.
+/// The receipt quality of the row's quality measurement (contract v5: exactly one per arm, since
+/// every fixture is deterministic in-process); its fixture artifacts record its own values.
 fn receipt_quality_over_repeats(
     suites: &[ProductFixtureSuite],
 ) -> Result<QualityObservation, String> {
+    if suites.len() != QUALITY_MEASUREMENTS {
+        return Err(format!(
+            "a row's quality is measured exactly {QUALITY_MEASUREMENTS} time(s) per arm, not {}",
+            suites.len()
+        ));
+    }
     if suites.iter().any(|suite| {
         suite.teacher_forced_candidate.is_none() && suite.forced_continuation.is_none()
     }) {
@@ -11721,13 +12079,23 @@ pub fn receipt_lifecycle(compressed: bool) -> ReceiptLifecycle {
 
 /// Every candidate-side product observation of a compressed arm: each fixture's coordinate
 /// operation, its lifecycle/quality run, and any secondary coordinate operation.
+/// Every observed product dispatch of a compressed arm: the quality measurement's fixtures (their
+/// coordinate and quality observations) and every timing run's coordinate operation(s). The
+/// kernel fixture's coordinate operation is timing repeat 0's, so it is counted once.
 fn compressed_arm_observations<'a>(
-    suites: impl IntoIterator<Item = &'a ProductFixtureSuite>,
+    suites: &'a [ProductFixtureSuite],
+    timing_runs: &[&'a CoordinateRun],
 ) -> Vec<&'a ProductObservations> {
     let mut observations = Vec::new();
+    for run in timing_runs {
+        observations.push(&run.primary.observation);
+        if let Some(secondary) = &run.secondary {
+            observations.push(&secondary.observation);
+        }
+    }
     for suite in suites {
+        observations.push(&suite.kernel_candidate.quality_observation);
         for result in [
-            &suite.kernel_candidate,
             &suite.tool_candidate,
             &suite.needle_candidate,
             &suite.cache_candidate,
@@ -11908,7 +12276,7 @@ fn product_receipt(
     warmup_cache_state_version: Option<u64>,
     captured_source: &(String, String),
     admission: ReceiptAdmission,
-    compressed: Option<(CompressedKvMethod, &[ProductFixtureSuite])>,
+    compressed: Option<(CompressedKvMethod, Vec<&CoordinateRun>)>,
     reference_model: &SnapshotInventory,
     row_start: ReceiptHostState,
 ) -> Result<Receipt, String> {
@@ -12015,8 +12383,8 @@ fn product_receipt(
     );
     let lifecycle = receipt_lifecycle(compressed.is_some());
     let compression = compressed
-        .map(|(method, warmups)| {
-            if suites.iter().chain(warmups).any(|suite| {
+        .map(|(method, timing_runs)| {
+            if suites.iter().any(|suite| {
                 suite.reference != QualityReference::DenseKvSameWeights
                     || suite.kernel_parity_errors.is_none()
             }) {
@@ -12028,7 +12396,7 @@ fn product_receipt(
             compressed_receipt_block(
                 method,
                 observation,
-                &compressed_arm_observations(suites.iter().chain(warmups)),
+                &compressed_arm_observations(suites, &timing_runs),
             )
         })
         .transpose()?;
@@ -12094,13 +12462,166 @@ fn product_receipt(
         );
     }
     let template = Receipt {
-        schema_version: RECEIPT_SCHEMA_VERSION, harness_version: RECEIPT_HARNESS_VERSION.into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: mode.into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, host_states, thermal_changed_during_row, power_mode_changed_during_row, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: format!("sc20671-kv-baseline --mode {mode}"), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
-        matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
-        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
-        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: release_evidence(weights_loaded, release), admission, dense_kv_share_bps: 0, below_memory_material_share: false },
-        timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:None,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,greedy_token_agreement_by_repeat:Vec::new(),structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,multi_turn_prompt_cache_method:String::new(),multi_turn_free_running_first_divergence:None,multi_turn_matched_prefix_tokens:0,multi_turn_cache:ReceiptMultiTurnCache::default(),multi_turn_forced_continuation:None,multi_turn_forced_pass:None,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence,quality_gate:None,forced_continuation:None}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
+        schema_version: RECEIPT_SCHEMA_VERSION,
+        harness_version: RECEIPT_HARNESS_VERSION.into(),
+        run_id: seal_bytes(
+            format!(
+                "{}:{}:{}",
+                coordinate_slug(coordinate),
+                model.sha256,
+                seal_bytes(transcript.as_bytes())
+            )
+            .as_bytes(),
+        ),
+        captured_at: release.timestamp.clone(),
+        mode: mode.into(),
+        status: "complete".into(),
+        contract_hash: QUALITY_CONTRACT_HASH.into(),
+        receipt_sha256: String::new(),
+        provenance: ReceiptProvenance {
+            scene_works_repository,
+            inference_repository,
+            scene_works_revision,
+            inference_revision,
+            mlx_version: mlx.version,
+            mlx_source: mlx.source,
+            mlx_revision: mlx.revision,
+            dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")),
+            os: std::env::consts::OS.into(),
+            xcode,
+            hardware,
+            model_id: format!(
+                "{}@{};architecture={};inventory={}",
+                candidate_contract.repository,
+                candidate_contract.revision,
+                candidate_contract.architecture,
+                model.sha256
+            ),
+            model_file_sha256: model.sha256.clone(),
+            model_file_bytes: model.bytes,
+            reference_model_id: format!(
+                "{}@{};architecture={};inventory={}",
+                reference_contract.repository,
+                reference_contract.revision,
+                reference_contract.architecture,
+                reference.sha256
+            ),
+            reference_model_sha256: reference.sha256.clone(),
+            reference_model_bytes: reference.bytes,
+            power_mode,
+            thermal_state: normalized_thermal_state,
+            host_states,
+            thermal_changed_during_row,
+            power_mode_changed_during_row,
+            command_template: "sc20671-kv-baseline --mode {mode}".into(),
+            command: format!("sc20671-kv-baseline --mode {mode}"),
+            campaign_session_id: observation.session_id.clone(),
+            campaign_cache_state_version: observation.cache_state_version,
+            coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate),
+        },
+        matrix: ReceiptMatrix {
+            family: coordinate.family.into(),
+            context_band: coordinate.context_band.into(),
+            request_mode: coordinate.request_mode.into(),
+            prefill_mode: coordinate.prefill_mode.into(),
+            process_temperature: coordinate.process_temperature.into(),
+        },
+        geometry: ReceiptGeometry {
+            batch: if coordinate.request_mode == "single" {
+                1
+            } else {
+                2
+            },
+            query_heads: observation.geometry.query_heads,
+            kv_heads: observation.geometry.kv_heads,
+            head_dimension: observation.geometry.head_dimension,
+            query_length: suite.kernel_candidate.coordinate_prompt_tokens,
+            kv_length: observation.cache_live_tokens,
+            layers: observation.geometry.layers,
+            element_bytes: observation.geometry.element_bytes,
+            capacity: observation.cache_capacity_tokens,
+            context_window_tokens: suite.context_window_tokens,
+            context_target_tokens: suite.context_target_tokens,
+            context_payload_tokens: suite.context_payload_tokens,
+        },
+        memory: ReceiptMemory {
+            model_weights_bytes,
+            persistent_kv_bytes: cache_bytes,
+            transient_workspace_bytes: workspace,
+            dense_theoretical_kv_bytes: 0,
+            prefill_peak_window: observation.prefill_peak_window.clone(),
+            phase_samples: vec![],
+            allocation_events: vec![],
+            reconciliation: ReceiptReconciliation {
+                expected_dense_kv_bytes: 0,
+                observed_persistent_kv_bytes: 0,
+                tolerance_bytes: 0,
+            },
+            release: release_evidence(weights_loaded, release),
+            admission,
+            dense_kv_share_bps: 0,
+            below_memory_material_share: false,
+        },
+        timings: ReceiptTimings {
+            load_ms: 0.0,
+            prefill_ms: 0.0,
+            ttft_ms: 0.0,
+            first_token_ms: 0.0,
+            decode_tokens_per_second: 0.0,
+            cold_compile_ms: None,
+            warm_compile_ms: 0.0,
+            compile_attribution: compile_attribution.clone(),
+            samples: vec![],
+            summary: ReceiptTimingSummary {
+                decode_tokens_per_second_mean: 0.0,
+                decode_tokens_per_second_p95: 0.0,
+                decode_tokens_per_second_variance: 0.0,
+                decode_tokens_per_second_coefficient_of_variation: 0.0,
+                confidence_interval_low: 0.0,
+                confidence_interval_high: 0.0,
+            },
+        },
+        quality: ReceiptQuality {
+            parity_max_error: 0.0,
+            perplexity_delta: 0.0,
+            greedy_token_agreement: 0.0,
+            greedy_agreement_method: String::new(),
+            free_running_first_divergence: None,
+            greedy_token_agreement_by_repeat: Vec::new(),
+            structured_tool_agreement: 0.0,
+            needle_retrieval: 0.0,
+            needle_discriminating: false,
+            tool_discriminating: false,
+            multi_turn_prompt_cache: 0.0,
+            multi_turn_prompt_cache_method: String::new(),
+            multi_turn_free_running_first_divergence: None,
+            multi_turn_matched_prefix_tokens: 0,
+            multi_turn_cache: ReceiptMultiTurnCache::default(),
+            multi_turn_forced_continuation: None,
+            multi_turn_forced_pass: None,
+            statistics: contract_statistics(),
+            fixture_evidence,
+            quality_gate: None,
+            forced_continuation: None,
+        },
+        lifecycle,
+        cancellation: ReceiptCancellation {
+            cleanup_verified: true,
+        },
+        warmup: ReceiptWarmup {
+            required: coordinate.process_temperature == "warm",
+            completed: warmup_cache_state_version.is_some(),
+            worker_pid: std::process::id(),
+            suite_sha256: warmup_suite_sha256,
+            session_id: if coordinate.process_temperature == "warm" {
+                observation.session_id.clone()
+            } else {
+                String::new()
+            },
+            cache_state_version: warmup_cache_state_version.unwrap_or_default(),
+        },
+        compression,
+    };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -12289,7 +12810,6 @@ pub(crate) mod tests {
             context_payload_sha256: "d".repeat(64),
             fixture_prompt_tokens: [32; 4],
             fixture_prompt_sha256: std::array::from_fn(|_| "e".repeat(64)),
-            steady_decode: None,
         }
     }
 
@@ -12415,7 +12935,10 @@ pub(crate) mod tests {
         .unwrap()
         .quality()
         .unwrap();
-        assert_eq!(shared_miss.needle_matches, 1, "agreement with dense output");
+        assert_eq!(
+            shared_miss.needle_matches, 0,
+            "contract v5: the candidate's own (failed) recovery, never agreement with the dense miss"
+        );
         assert!(
             !shared_miss.needle_discriminating,
             "a shared miss must be flagged, not silently counted as retrieval"
@@ -12430,7 +12953,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(divergent_miss.needle_matches, 0);
         assert!(!divergent_miss.needle_discriminating);
-        // Receipt discrimination is the AND over repeats, not the primary repeat alone.
+        // Teacher-forced suites, each one arm-pair quality measurement.
         let pair = |compressed: ProductFixtureHalf, dense: ProductFixtureHalf| {
             let mut suite = pair_product_fixture_halves(
                 compressed,
@@ -12492,33 +13015,28 @@ pub(crate) mod tests {
             (reference_stream.len() as u64, reference_stream.len() as u64)
         );
         assert_eq!(forced_quality.free_running_first_divergence, Some(0));
-        let forced = repeats[1].teacher_forced_candidate.take();
-        assert!(receipt_quality_over_repeats(&repeats).is_err());
-        repeats[1].teacher_forced_candidate = forced;
-        // The receipt's greedy agreement is the weakest repeat's; each repeat is recorded.
-        let flipped = repeats[1]
-            .teacher_forced_candidate
-            .clone()
-            .map(|mut forced| {
-                forced.choices[0] += 1000;
-                forced
-            });
-        let original = std::mem::replace(&mut repeats[1].teacher_forced_candidate, flipped);
-        let weakest = receipt_quality_over_repeats(&repeats).unwrap();
-        let total = weakest.greedy_total;
-        assert_eq!(weakest.greedy_matches, total - 1);
+        // Contract v5: the receipt is the row's one quality measurement.
+        let [measured, shared_invalid_tools] = repeats;
+        let mut once = [measured];
+        let forced = once[0].teacher_forced_candidate.take();
+        assert!(receipt_quality_over_repeats(&once).is_err());
+        once[0].teacher_forced_candidate = forced;
+        let original = once[0].teacher_forced_candidate.clone();
+        if let Some(forced) = once[0].teacher_forced_candidate.as_mut() {
+            forced.choices[0] += 1000;
+        }
+        let quality = receipt_quality_over_repeats(&once).unwrap();
+        once[0].teacher_forced_candidate = original;
+        let total = quality.greedy_total;
+        assert_eq!(quality.greedy_matches, total - 1);
         assert_eq!(
-            weakest.greedy_agreement_by_repeat,
-            vec![1.0, (total - 1) as f64 / total as f64]
+            quality.greedy_agreement_by_repeat,
+            vec![(total - 1) as f64 / total as f64]
         );
-        repeats[1].teacher_forced_candidate = original;
-        let anded = receipt_quality_over_repeats(&repeats).unwrap();
-        assert!(!anded.needle_discriminating);
-        assert!(!anded.tool_discriminating);
-        assert_eq!(
-            anded.needle_matches, 1,
-            "metrics still come from the primary repeat"
-        );
+        let recorded = receipt_quality_over_repeats(&once).unwrap();
+        assert!(recorded.needle_discriminating && recorded.tool_discriminating);
+        assert_eq!(recorded.needle_matches, 1);
+        let repeats = [once.into_iter().next().unwrap(), shared_invalid_tools];
         let shared_invalid = repeats[1].quality().unwrap();
         assert_eq!(
             shared_invalid.tool_matches, 1,
@@ -12630,6 +13148,183 @@ pub(crate) mod tests {
         assert!(free.error.is_some() && free.forced_token_probabilities.is_empty());
     }
 
+    /// Contract v5 measures quality once: the candidate's kernel fixture reuses timing repeat 0's
+    /// coordinate operation only when it is this session's run of the coordinate's operation, and
+    /// the compressed arm's evidence counts every timing run's coordinate dispatch and the quality
+    /// measurement's dispatches, the reused kernel coordinate operation once.
+    #[test]
+    fn quality_is_measured_once_beside_the_timing_runs() {
+        let chunked = Coordinate {
+            family: "llama",
+            context_band: "short",
+            request_mode: "single",
+            prefill_mode: "chunked",
+            process_temperature: "cold",
+        };
+        let run = CoordinateRun::of(&test_fixture_result("kernel"));
+        reusable_kernel_coordinate(&run, "session", &chunked).unwrap();
+        assert!(reusable_kernel_coordinate(&run, "another session", &chunked).is_err());
+        let single_shot = Coordinate {
+            prefill_mode: "single-shot",
+            ..chunked.clone()
+        };
+        assert!(reusable_kernel_coordinate(&run, "session", &single_shot).is_err());
+        let batch_chunked = Coordinate {
+            request_mode: "supported-batch",
+            ..chunked.clone()
+        };
+        let mut batch = run.clone();
+        batch.primary.operation = "supported-batch".into();
+        assert!(
+            reusable_kernel_coordinate(&batch, "session", &batch_chunked).is_err(),
+            "a batch+chunked row's reused operation must carry its secondary dispatch"
+        );
+        batch.secondary = Some(run.primary.clone());
+        reusable_kernel_coordinate(&batch, "session", &batch_chunked).unwrap();
+
+        let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS);
+        let suites = compressed_test_suites(&continuation, &[]);
+        let timing = (0..TIMING_REPEATS)
+            .map(|_| CoordinateRun::of(&suites[0].kernel_candidate))
+            .collect::<Vec<_>>();
+        let timing_refs = timing.iter().collect::<Vec<_>>();
+        // 5 timing coordinate dispatches + the kernel quality request + 3 fixtures x (coordinate
+        // + quality request).
+        assert_eq!(
+            compressed_arm_observations(&suites, &timing_refs).len(),
+            TIMING_REPEATS + 1 + 3 * 2
+        );
+        assert_eq!(QUALITY_MEASUREMENTS, 1);
+        assert_eq!(contract_statistics().repeats, TIMING_REPEATS as u64);
+        assert!(contract_statistics().quality_measured_once);
+    }
+
+    fn noise_floor_row(slug: &str, chunked: (f64, u64, f64)) -> serde_json::Value {
+        let control = |(agreement, flips, delta): (f64, u64, f64)| {
+            serde_json::json!({
+                "agreement": agreement,
+                "matches": 0,
+                "flipCount": flips,
+                "firstFlipPositions": [],
+                "referenceNegativeLogLikelihood": 0.5,
+                "controlNegativeLogLikelihood": 0.5 + delta,
+                "perplexityDelta": delta,
+            })
+        };
+        serde_json::json!({
+            "kind": "sc20669-dense-noise-floor",
+            "coordinate": slug,
+            "controls": {
+                "one-shot-repeat": control((1.0, 0, 0.0)),
+                "chunked-prefill": control(chunked),
+            },
+        })
+    }
+
+    /// The SC-20669 dense noise floor: the summary is each control's worst case over the rows and
+    /// says whether the dense arm already misses a frozen threshold against itself.
+    #[test]
+    fn noise_floor_summary_is_each_controls_worst_row() {
+        let rows = [
+            noise_floor_row("a", (0.9995, 1, 0.004)),
+            noise_floor_row("b", (0.998, 2, -0.013)),
+        ];
+        let summary = noise_floor_summary(&rows).unwrap();
+        let chunked = &summary["controls"]["chunked-prefill"];
+        assert_eq!(chunked["minAgreement"], 0.998);
+        assert_eq!(chunked["minAgreementRow"], "b");
+        assert_eq!(chunked["maxFlipCount"], 2);
+        assert_eq!(chunked["maxAbsPerplexityDelta"], 0.013);
+        assert_eq!(chunked["maxAbsPerplexityDeltaRow"], "b");
+        assert_eq!(chunked["greedyThresholdWithinDenseFloor"], true);
+        assert_eq!(chunked["perplexityThresholdWithinDenseFloor"], true);
+        let repeat = &summary["controls"]["one-shot-repeat"];
+        assert_eq!(repeat["minAgreement"], 1.0);
+        assert_eq!(repeat["greedyThresholdWithinDenseFloor"], false);
+        assert_eq!(repeat["perplexityThresholdWithinDenseFloor"], false);
+        assert!(noise_floor_summary(&[]).is_err());
+        assert!(noise_floor_summary(&[serde_json::json!({"coordinate": "a"})]).is_err());
+    }
+
+    /// `noise-floor-parent` resumes sealed rows, stops between rows on a stop file, refuses a row
+    /// that does not match its seal, and publishes the sealed summary by renaming the resume dir.
+    #[test]
+    fn noise_floor_parent_resumes_sealed_rows_and_publishes_the_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let resume = root.path().join("resume");
+        let out = root.path().join("out");
+        fs::create_dir_all(&resume).unwrap();
+        let prompt = root.path().join("prompt.txt");
+        fs::write(&prompt, "baseline").unwrap();
+        let policy =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.github/kv-poc/policies/llm.json");
+        let args = |extra: &[&str]| {
+            let mut args = [
+                "noise-floor-parent",
+                "--llama-snapshot",
+                "/nonexistent/llama",
+                "--qwen-snapshot",
+                "/nonexistent/qwen",
+                "--prompt-file",
+                prompt.to_str().unwrap(),
+                "--safety-policy",
+                policy.to_str().unwrap(),
+                "--resume-dir",
+                resume.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ]
+            .map(String::from)
+            .to_vec();
+            args.extend(extra.iter().map(|arg| arg.to_string()));
+            args
+        };
+        let seal_row = |slug: &str| {
+            let (bytes, sha256) = seal_json(&noise_floor_row(slug, (1.0, 0, 0.001))).unwrap();
+            fs::write(resume.join(format!("{slug}.json")), bytes).unwrap();
+            fs::write(
+                resume.join(format!("{slug}.json.sha256")),
+                format!("{sha256}  {slug}.json\n"),
+            )
+            .unwrap();
+        };
+        let slugs = required_coordinates()
+            .iter()
+            .map(coordinate_slug)
+            .collect::<Vec<_>>();
+        // Row 0 sealed, row 1 missing: a stop file halts before row 1 spawns any worker.
+        seal_row(&slugs[0]);
+        fs::write(resume.join(OPERATOR_STOP_FILE_NAME), b"").unwrap();
+        let CampaignOutcome::StoppedByOperator(stop) = sc20671_cli(&args(&[])).unwrap() else {
+            panic!("a stop file must halt between rows");
+        };
+        assert_eq!((stop.before_row, stop.row.as_str()), (1, slugs[1].as_str()));
+        fs::remove_file(resume.join(OPERATOR_STOP_FILE_NAME)).unwrap();
+        for slug in &slugs[1..] {
+            seal_row(slug);
+        }
+        // A row whose bytes no longer match its seal is refused.
+        fs::write(resume.join(format!("{}.json", slugs[3])), b"{}").unwrap();
+        assert!(sc20671_cli(&args(&[]))
+            .unwrap_err()
+            .contains("does not match its seal"));
+        seal_row(&slugs[3]);
+        assert_eq!(sc20671_cli(&args(&[])).unwrap(), CampaignOutcome::Completed);
+        assert!(!resume.exists());
+        let bytes = fs::read(out.join("summary.json")).unwrap();
+        assert_eq!(
+            fs::read_to_string(out.join("summary.json.sha256")).unwrap(),
+            format!("{}  summary.json\n", seal_bytes(&bytes))
+        );
+        let summary: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(summary["kind"], NOISE_FLOOR_SUMMARY_KIND);
+        assert_eq!(summary["rows"], slugs.len());
+        // A published destination is never overwritten.
+        assert!(sc20671_cli(&args(&[]))
+            .unwrap_err()
+            .contains("must be absent"));
+    }
+
     /// Byte-exact inference copy of SceneWorks `config/kv-baseline-quality-contract.json`: its
     /// hash is the receipt contract identity, so producer wording and thresholds cannot drift.
     #[test]
@@ -12637,7 +13332,26 @@ pub(crate) mod tests {
         let bytes = include_bytes!("../testdata/kv-baseline-quality-contract.json");
         assert_eq!(seal_bytes(bytes), QUALITY_CONTRACT_HASH);
         let contract: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(contract["version"], 4);
+        assert_eq!(contract["version"], 5);
+        // Every receipt records the contract's statistics block verbatim (quality measured once,
+        // repeats and warmups are timing only).
+        assert_eq!(
+            contract["statistics"],
+            serde_json::to_value(contract_statistics()).unwrap()
+        );
+        assert_eq!(contract["statistics"]["qualityMeasuredOnce"], true);
+        assert_eq!(contract["changeRecord"]["thresholdsUnchanged"], true);
+        assert_eq!(
+            contract["changeRecord"]["madeAfterCompressedResultsVisible"],
+            true
+        );
+        assert!(contract["changeRecord"]["from"]
+            .as_str()
+            .is_some_and(|from| from
+                .contains("0a00b520d845d4da4c3da9b904af25e08646d87fba018ed6cf27ff9ecce4cc58")));
+        assert!(contract["gate"]["nonDiscriminatingNeedle"]
+            .as_str()
+            .is_some_and(|rule| rule.contains("observation only")));
         assert_eq!(
             contract["thresholds"]["multiTurnPromptCache"],
             COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN
@@ -12701,8 +13415,14 @@ pub(crate) mod tests {
             needle_observation(&outcomes(false, true, false), Compressed),
             (false, true)
         );
+        // Contract v5: after a shared dense miss, agreement with the dense miss text is no longer
+        // retrieval; the candidate's own recovery is the (ungated) observation.
         assert_eq!(
             needle_observation(&outcomes(false, false, true), Compressed),
+            (false, false)
+        );
+        assert_eq!(
+            needle_observation(&outcomes(true, false, false), Compressed),
             (true, false)
         );
         assert_eq!(
@@ -13954,7 +14674,7 @@ pub(crate) mod tests {
             needle_discriminating: true,
             tool_discriminating: true,
             free_running_first_divergence: None,
-            greedy_agreement_by_repeat: vec![1.0; 5],
+            greedy_agreement_by_repeat: vec![1.0; QUALITY_MEASUREMENTS],
             repeat_metrics: Vec::new(),
             forced_continuation: None,
             cache_free_running_first_divergence: None,
@@ -14177,8 +14897,7 @@ pub(crate) mod tests {
                 },
                 release: ReceiptRelease {
                     verified: true,
-                    phys_footprint_tolerance_bytes:
-                        POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES,
+                    phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES,
                     mlx_active_tolerance_bytes: 0,
                     mlx_cache_tolerance_bytes: 0,
                     mlx_active_residual_bytes: 0,
@@ -14253,7 +14972,7 @@ pub(crate) mod tests {
                 greedy_token_agreement: 1.0,
                 greedy_agreement_method: GREEDY_AGREEMENT_METHOD.into(),
                 free_running_first_divergence: None,
-                greedy_token_agreement_by_repeat: vec![1.0; 5],
+                greedy_token_agreement_by_repeat: vec![1.0; QUALITY_MEASUREMENTS],
                 structured_tool_agreement: 1.0,
                 needle_retrieval: 1.0,
                 needle_discriminating: true,
@@ -14268,14 +14987,7 @@ pub(crate) mod tests {
                 },
                 multi_turn_forced_continuation: None,
                 multi_turn_forced_pass: None,
-                statistics: ReceiptQualityStatistics {
-                    repeats: 5,
-                    warmups: 2,
-                    confidence_interval: "95% bootstrap".into(),
-                    outlier_policy: "report all samples; no silent deletion".into(),
-                    variance_policy: "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),
-                    max_coefficient_of_variation: 0.05,
-                },
+                statistics: contract_statistics(),
                 fixture_evidence: std::collections::BTreeMap::new(),
                 quality_gate: None,
                 forced_continuation: None,
@@ -14438,7 +15150,7 @@ pub(crate) mod tests {
             needle_discriminating: true,
             tool_discriminating: true,
             free_running_first_divergence: None,
-            greedy_agreement_by_repeat: vec![1.0; 5],
+            greedy_agreement_by_repeat: vec![1.0; QUALITY_MEASUREMENTS],
             repeat_metrics: Vec::new(),
             forced_continuation: None,
             cache_free_running_first_divergence: None,
@@ -14661,7 +15373,8 @@ pub(crate) mod tests {
         quality.multi_turn_forced_continuation = Some(multi_turn);
         quality.multi_turn_forced_pass = Some(test_multi_turn_forced_pass());
         quality.greedy_token_agreement = continuation.agreement;
-        quality.greedy_token_agreement_by_repeat = vec![continuation.agreement; 5];
+        quality.greedy_token_agreement_by_repeat =
+            vec![continuation.agreement; QUALITY_MEASUREMENTS];
         let metrics = QualityMetrics {
             parity_max_error: quality.parity_max_error,
             perplexity_delta: quality.perplexity_delta,
@@ -14671,7 +15384,10 @@ pub(crate) mod tests {
             multi_turn_prompt_cache: quality.multi_turn_prompt_cache,
         };
         quality.forced_continuation = Some(continuation);
-        quality.quality_gate = Some(quality_gate_from_repeats(&[metrics; 5]));
+        quality.quality_gate = Some(quality_gate_from_repeats(
+            &[metrics; QUALITY_MEASUREMENTS],
+            quality.needle_discriminating,
+        ));
     }
 
     /// Turn the builder's dense receipt into the same row measured in compressed mode: same-weights
@@ -14980,13 +15696,13 @@ pub(crate) mod tests {
 
     const TEST_NEEDLE: &str = "SC20671-NUMERIC-NEEDLE-9b7a2e";
 
-    /// Five compressed repeats sharing `continuation`; `needle_miss` repeats lose the needle the
+    /// The row's compressed quality measurement(s) sharing `continuation`; `needle_miss` ones lose the needle the
     /// same-weights dense run recovered.
     fn compressed_test_suites(
         continuation: &ReceiptForcedContinuation,
         needle_miss: &[usize],
     ) -> Vec<ProductFixtureSuite> {
-        (0..5)
+        (0..QUALITY_MEASUREMENTS)
             .map(|repeat| {
                 let candidate = test_fixture_half(if needle_miss.contains(&repeat) {
                     "wrong"
@@ -15018,7 +15734,7 @@ pub(crate) mod tests {
     }
 
     fn repeat_pairs(fixtures: &[SealedFixtureArtifact]) -> Vec<(&'static str, &[u8])> {
-        (0..5)
+        (0..QUALITY_MEASUREMENTS)
             .flat_map(|repeat| {
                 REQUIRED_FIXTURES.map(|fixture| {
                     let name = fixture_artifact_name(fixture, repeat);
@@ -15253,17 +15969,13 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .contains("per-turn cache record"));
         }
-        // Every measured repeat requires its teacher-forced turn-2 pass.
+        // The quality measurement requires its teacher-forced turn-2 pass.
         let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS);
         let mut suites = compressed_test_suites(&continuation, &[]);
-        suites[1].multi_turn_forced_continuation = None;
+        suites[0].multi_turn_forced_continuation = None;
         assert!(receipt_quality_over_repeats(&suites)
             .unwrap_err()
             .contains("teacher-forced multi-turn prompt-cache agreement"));
-        suites[1].multi_turn_forced_continuation = Some(test_multi_turn_forced_continuation(1000));
-        assert!(receipt_quality_over_repeats(&suites)
-            .unwrap_err()
-            .contains("one turn-2 forced continuation"));
         // One flip in 1024 meets the 0.999 minimum; two do not.
         for (matches, passes) in [(1023, true), (1022, false)] {
             let suites = compressed_test_suites(&continuation, &[])
@@ -15283,7 +15995,7 @@ pub(crate) mod tests {
                     .iter()
                     .filter(|failure| failure.metric == "multiTurnPromptCache")
                     .count(),
-                if passes { 0 } else { 5 },
+                if passes { 0 } else { QUALITY_MEASUREMENTS },
                 "{gate:?}"
             );
             assert_eq!(
@@ -15445,7 +16157,7 @@ pub(crate) mod tests {
     #[test]
     fn compressed_quality_miss_is_accepted_as_a_measured_gate_failure() {
         let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS - 2);
-        let suites = compressed_test_suites(&continuation, &[3]);
+        let suites = compressed_test_suites(&continuation, &[0]);
         let quality = receipt_quality_over_repeats(&suites).unwrap();
         let receipt = compressed_test_builder(quality)
             .finish()
@@ -15461,25 +16173,17 @@ pub(crate) mod tests {
                 comparison: "minimum".into(),
             }
         };
-        let mut expected = Vec::new();
-        for repeat in 0..5 {
-            expected.push(failure(
+        // The one quality measurement misses greedy agreement and (dense recovered) the needle.
+        let expected = vec![
+            failure(
                 "greedyTokenAgreement",
                 "kernel-fp32-reference",
-                repeat,
+                0,
                 agreement,
                 0.999,
-            ));
-            if repeat == 3 {
-                expected.push(failure(
-                    "needleRetrieval",
-                    "long-context-needle",
-                    3,
-                    0.0,
-                    1.0,
-                ));
-            }
-        }
+            ),
+            failure("needleRetrieval", "long-context-needle", 0, 0.0, 1.0),
+        ];
         assert_eq!(
             receipt.quality.quality_gate,
             Some(ReceiptQualityGate {
@@ -15490,10 +16194,9 @@ pub(crate) mod tests {
         assert_eq!(receipt.quality.greedy_token_agreement, agreement);
         assert_eq!(
             receipt.quality.greedy_token_agreement_by_repeat,
-            vec![agreement; 5]
+            vec![agreement; QUALITY_MEASUREMENTS]
         );
-        // The primary repeat recovered the needle; its receipt-level value is recorded as measured.
-        assert_eq!(receipt.quality.needle_retrieval, 1.0);
+        assert_eq!(receipt.quality.needle_retrieval, 0.0);
         assert_eq!(
             receipt.quality.forced_continuation,
             Some(continuation.clone())
@@ -15512,7 +16215,7 @@ pub(crate) mod tests {
         // The gate is exactly the evaluation of the sealed repeat artifacts.
         let fixtures = sealed_test_repeats(&suites);
         let repeats = sealed_repeat_quality_metrics(&receipt, &repeat_pairs(&fixtures)).unwrap();
-        assert_eq!(repeats[3].needle_retrieval, 0.0);
+        assert_eq!(repeats[0].needle_retrieval, 0.0);
         validate_sealed_quality_gate(&receipt, &repeats).unwrap();
         let bundle = assemble_artifacts_with_fixtures(receipt.clone(), fixtures).unwrap();
         let human = String::from_utf8(bundle.human).unwrap();
@@ -15520,7 +16223,7 @@ pub(crate) mod tests {
             "- Quality gate: FAILED: greedyTokenAgreement repeat 0 = 0.998046875 (minimum 0.999, fixture kernel-fp32-reference);"
         ), "{human}");
         assert!(
-            human.contains("needleRetrieval repeat 3 = 0 (minimum 1, fixture long-context-needle)")
+            human.contains("needleRetrieval repeat 0 = 0 (minimum 1, fixture long-context-needle)")
         );
 
         // A pass can never be claimed over a failing value.
@@ -15536,7 +16239,7 @@ pub(crate) mod tests {
         );
         rejects(
             &|gate| gate.passed = true,
-            "claims passed=true with 6 recorded failure(s)",
+            "claims passed=true with 2 recorded failure(s)",
         );
         rejects(
             &|gate| gate.failures[0].value = 0.5,
@@ -15551,22 +16254,60 @@ pub(crate) mod tests {
             "not an ordered frozen-threshold miss",
         );
         rejects(
-            &|gate| gate.failures[4].fixture = "kernel-fp32-reference".into(),
+            &|gate| gate.failures[1].fixture = "kernel-fp32-reference".into(),
             "not an ordered frozen-threshold miss",
         );
-        // Repeat 3's needle is invisible in the receipt; only its sealed artifact exposes the miss.
-        let mut hidden = receipt.clone();
-        hidden
+        // A discriminating needle miss is visible in the receipt and cannot be dropped.
+        rejects(
+            &|gate| {
+                gate.failures
+                    .retain(|failure| failure.metric != "needleRetrieval")
+            },
+            "does not record needleRetrieval repeat 0",
+        );
+        // Contract v5: when the same-weights dense run missed the needle too, the compressed miss
+        // is an observation: it is recorded (needleRetrieval 0, needleDiscriminating false) and
+        // never gated, and a gate that records it is refused.
+        let mut shared = compressed_test_suites(&continuation, &[0]);
+        shared[0].needle_reference = test_fixture_half("wrong").needle_result;
+        let shared_quality = receipt_quality_over_repeats(&shared).unwrap();
+        assert!(!shared_quality.needle_discriminating);
+        let observed = compressed_test_builder(shared_quality).finish().unwrap();
+        assert_eq!(observed.quality.needle_retrieval, 0.0);
+        assert_eq!(
+            observed
+                .quality
+                .quality_gate
+                .as_ref()
+                .unwrap()
+                .failures
+                .iter()
+                .map(|failure| failure.metric.as_str())
+                .collect::<Vec<_>>(),
+            ["greedyTokenAgreement"]
+        );
+        let mut gated = observed.clone();
+        gated
             .quality
             .quality_gate
             .as_mut()
             .unwrap()
             .failures
-            .retain(|failure| failure.metric != "needleRetrieval");
-        validate_receipt_semantics(&hidden).expect("the receipt alone cannot see repeat 3");
-        assert!(validate_sealed_quality_gate(&hidden, &repeats)
+            .push(failure(
+                "needleRetrieval",
+                "long-context-needle",
+                0,
+                0.0,
+                1.0,
+            ));
+        assert!(validate_receipt_semantics(&gated)
             .unwrap_err()
-            .contains("is not the gate of its sealed repeats"));
+            .contains("not an ordered frozen-threshold miss"));
+        let shared_fixtures = sealed_test_repeats(&shared);
+        let shared_repeats =
+            sealed_repeat_quality_metrics(&observed, &repeat_pairs(&shared_fixtures)).unwrap();
+        validate_sealed_quality_gate(&observed, &shared_repeats).unwrap();
+        validate_repeat_discrimination(&observed, repeat_pairs(&shared_fixtures)).unwrap();
 
         // A row that meets every threshold records passed with no failures.
         let clean = compressed_test_suites(
@@ -15628,19 +16369,25 @@ pub(crate) mod tests {
             error.contains("no forced-continuation greedy agreement"),
             "{error}"
         );
-        // Too few measured repeats to gate.
+        // No quality measurement, or more than the contract's one, cannot be gated.
         let mut partial = quality();
         partial.repeat_metrics.pop();
         assert!(compressed_test_builder(partial)
             .finish()
             .unwrap_err()
-            .contains("five measured repeats"));
-        // Repeats that disagree on the row's one forced continuation.
+            .contains("one quality measurement"));
+        let mut repeated = quality();
+        repeated.repeat_metrics.push(repeated.repeat_metrics[0]);
+        assert!(compressed_test_builder(repeated)
+            .finish()
+            .unwrap_err()
+            .contains("one quality measurement"));
+        // Contract v5: quality is measured once per arm; five quality repeats are refused.
         let mut suites = compressed_test_suites(&continuation, &[]);
-        suites[2].forced_continuation = Some(test_forced_continuation(1000));
+        suites.extend(compressed_test_suites(&continuation, &[]));
         assert!(receipt_quality_over_repeats(&suites)
             .unwrap_err()
-            .contains("one forced continuation"));
+            .contains("measured exactly 1 time(s) per arm"));
         let receipt = compressed_test_builder(quality()).finish().unwrap();
         let refuses = |edit: &dyn Fn(&mut Receipt), expected: &str| {
             let mut forged = receipt.clone();
@@ -15678,8 +16425,8 @@ pub(crate) mod tests {
             "forced continuation evidence is inconsistent",
         );
         refuses(
-            &|r| r.quality.greedy_token_agreement_by_repeat[4] = 0.5,
-            "greedy agreement is not the minimum",
+            &|r| r.quality.greedy_token_agreement_by_repeat[0] = 0.5,
+            "greedy agreement is not the row's one recorded quality measurement",
         );
         // A dense row is characterization: it can carry neither a gate nor a continuation.
         let mut dense = builder_test_receipt();
@@ -15691,13 +16438,13 @@ pub(crate) mod tests {
         let suites = compressed_test_suites(&continuation, &[]);
         let fixtures = sealed_test_repeats(&suites);
         let mut pairs = repeat_pairs(&fixtures);
-        let mut forged: serde_json::Value = serde_json::from_slice(pairs[4].1).unwrap();
+        let mut forged: serde_json::Value = serde_json::from_slice(pairs[0].1).unwrap();
         forged["evidence"]["forcedContinuation"]["matches"] = serde_json::json!(1000);
         let forged = serde_json::to_vec(&forged).unwrap();
-        pairs[4].1 = &forged;
+        pairs[0].1 = &forged;
         assert!(sealed_repeat_quality_metrics(&receipt, &pairs)
             .unwrap_err()
-            .contains("repeat 1 kernel fixture forced continuation"));
+            .contains("repeat 0 kernel fixture forced continuation"));
         let mut miscounted: serde_json::Value =
             serde_json::from_slice(repeat_pairs(&fixtures)[0].1).unwrap();
         miscounted["evidence"]["greedyMatches"] = serde_json::json!(1000);
@@ -15708,15 +16455,15 @@ pub(crate) mod tests {
             .unwrap_err()
             .contains("greedy counts"));
         let mut parity: serde_json::Value =
-            serde_json::from_slice(repeat_pairs(&fixtures)[8].1).unwrap();
+            serde_json::from_slice(repeat_pairs(&fixtures)[0].1).unwrap();
         parity["evidence"]["parityErrors"] = serde_json::json!([0.5]);
         let parity = serde_json::to_vec(&parity).unwrap();
         let mut pairs = repeat_pairs(&fixtures);
-        pairs[8].1 = &parity;
+        pairs[0].1 = &parity;
         let repeats = sealed_repeat_quality_metrics(&receipt, &pairs).unwrap();
         assert!(validate_sealed_quality_gate(&receipt, &repeats)
             .unwrap_err()
-            .contains("kernel parity failed: metric=parityMaxError value=0.5 threshold=0.0001 comparison=maximum fixture=kernel-fp32-reference repeat=2"));
+            .contains("kernel parity failed: metric=parityMaxError value=0.5 threshold=0.0001 comparison=maximum fixture=kernel-fp32-reference repeat=0"));
     }
 
     #[test]
@@ -16632,7 +17379,17 @@ pub(crate) mod tests {
             .unwrap()
         };
         let hit = needle(true, true, true, 1, true);
-        let shared_miss = needle(false, false, true, 1, false);
+        // Contract v5: a shared miss records the candidate's own (failed) recovery, never the
+        // v4 agreement with the dense miss text.
+        let shared_miss = needle(false, false, true, 0, false);
+        assert!(validate_repeat_discrimination(
+            &compressed,
+            [(
+                "long-context-needle",
+                needle(false, false, true, 1, false).as_slice()
+            )],
+        )
+        .is_err());
         let valid_tool = tool(true, true, true, true);
         let shared_invalid_tool = tool(false, false, true, false);
         fn repeats<'a>(
@@ -17463,19 +18220,29 @@ pub(crate) mod tests {
 
     /// The receipt's greedy agreement is the minimum over the repeats; each is recorded.
     #[test]
-    fn greedy_agreement_gates_on_the_weakest_repeat() {
+    fn greedy_agreement_is_the_one_quality_measurement() {
         let mut receipt = builder_test_receipt();
-        receipt.quality.greedy_token_agreement_by_repeat = vec![1.0, 0.9, 1.0, 1.0, 0.95];
+        receipt.quality.greedy_token_agreement_by_repeat = vec![0.9];
         receipt.quality.greedy_token_agreement = 0.9;
-        validate_receipt_semantics(&receipt).expect("minimum recorded");
-        let mut not_min = receipt.clone();
-        not_min.quality.greedy_token_agreement = 1.0;
-        assert!(validate_receipt_semantics(&not_min)
+        validate_receipt_semantics(&receipt).expect("the one measurement recorded");
+        let mut not_it = receipt.clone();
+        not_it.quality.greedy_token_agreement = 1.0;
+        assert!(validate_receipt_semantics(&not_it)
             .unwrap_err()
-            .contains("minimum over the five"));
-        let mut short = receipt.clone();
-        short.quality.greedy_token_agreement_by_repeat.pop();
-        assert!(validate_receipt_semantics(&short).is_err());
+            .contains("one recorded quality measurement"));
+        // Contract v5: five quality repeats are no longer a valid receipt shape.
+        let mut five = receipt.clone();
+        five.quality.greedy_token_agreement_by_repeat = vec![0.9; TIMING_REPEATS];
+        assert!(validate_receipt_semantics(&five).is_err());
+        let mut none = receipt.clone();
+        none.quality.greedy_token_agreement_by_repeat.pop();
+        assert!(validate_receipt_semantics(&none).is_err());
+        // The receipt records the v5 statistics block verbatim: a v4 block (quality re-measured
+        // every repeat) is refused.
+        let mut v4 = receipt.clone();
+        v4.quality.statistics.quality_measured_once = false;
+        let error = validate_receipt_semantics(&v4).unwrap_err();
+        assert!(error.contains("statistics"), "{error}");
     }
 
     // Helpers keep the estimate test's assertions free of clock-shaped names (they read fixture
@@ -17536,15 +18303,15 @@ pub(crate) mod tests {
         assert_eq!(
             row_work("cold", "single", "chunked"),
             RowWork {
-                halves: 10,
-                prefills: 86
+                units: 7,
+                prefills: 27
             }
         );
         assert_eq!(
             row_work("warm", "supported-batch", "single-shot"),
             RowWork {
-                halves: 14,
-                prefills: 174
+                units: 9,
+                prefills: 45
             }
         );
         assert_eq!(predicted("memory-material", &[]), None);
@@ -17559,15 +18326,15 @@ pub(crate) mod tests {
             600.0,
             0.2,
         );
-        // Medium: 174 x 0.2 s of prefill, the other 565.2 s fixed. Memory-material (32768):
-        // fixed 565.2 s (same 14 halves) + 118 prefills x 0.2 s x the scale ratio.
+        // Medium: 45 x 0.2 s of prefill, the other 591 s fixed. Memory-material (32768):
+        // fixed 591 s (same 9 units) + 31 prefills x 0.2 s x the scale ratio.
         let (total, fixed, prefill, basis) =
             predicted("memory-material", std::slice::from_ref(&medium)).unwrap();
         assert_eq!(basis, "llama-medium-supported-batch-single-shot-warm");
-        assert_eq!(fixed, 565);
+        assert_eq!(fixed, 591);
         let ratio = prefill_scale(32_768.0, medium.attention_crossover_tokens)
             / prefill_scale(1_024.0, medium.attention_crossover_tokens);
-        assert_eq!(prefill, (118.0 * 0.2 * ratio).round() as u64);
+        assert_eq!(prefill, (31.0 * 0.2 * ratio).round() as u64);
         assert_eq!(total, fixed + prefill);
         // The rejected whole-row-per-token estimate would have been 600 / 1024 x 32768 = 19200 s.
         assert!(total < 4_000, "{total}");
@@ -17584,11 +18351,11 @@ pub(crate) mod tests {
         let (total, fixed, prefill, basis) =
             predicted("fit-boundary", &[medium, material.clone()]).unwrap();
         assert_eq!(basis, "llama-memory-material-single-single-shot-warm");
-        assert_eq!(fixed, 678);
+        assert_eq!(fixed, 1_461);
         let target = context_band_target(131_072, "fit-boundary").unwrap() as f64;
         let ratio = prefill_scale(target, material.attention_crossover_tokens)
             / prefill_scale(32_768.0, material.attention_crossover_tokens);
-        assert_eq!(prefill, (118.0 * 9.0 * ratio).round() as u64);
+        assert_eq!(prefill, (31.0 * 9.0 * ratio).round() as u64);
         assert_eq!(total, fixed + prefill);
         // A qwen row is never a basis for llama.
         let mut qwen = completed_row("medium", "single", "single-shot", "warm", 1_024, 1.0, 0.001);

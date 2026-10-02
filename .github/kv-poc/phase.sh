@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # One campaign phase for kv-poc-campaign.yml:  phase.sh run <phase>  |  phase.sh collect <phase>
-#   W1 (LLM KV):  a1 | a3 | a2 | b
+#   W1 (LLM KV):  a1 | a3 | a2 | b | nf
+#                 nf = SC-20669 dense noise floor: `sc20671_kv_baseline noise-floor-parent`, the dense
+#                 arm against two exact recomputations of itself (one-shot repeat, chunked prefill)
+#                 on all eight SC-20671 rows, per-row JSON + sealed summary.json
 #   W2 (media):   c  = SC-20684 Krea Realtime six-cell (T2V/I2V/V2V x Q8/Q4 KV), sc20684_krea_realtime_campaign.py
 #                 d  = SC-20686 Metal matrix (18 coordinates x normal/cancel), sc20686_campaign_adapter.py
 #                 d-control = the same matrix's --schedule-control arm (one product-schedule arm each)
@@ -49,7 +52,7 @@ DENSE_BASELINE="$KV_ROOT/$BASELINE_SHA-runs/evidence/sc20671-dense"
 case "$phase" in
   a3) values="${KV_A3_BITS:-2}" ;;
   a2) values="${KV_A2_METHODS:-group-affine}" ;;
-  a1|b|c|d|d-control) values="-" ;;
+  a1|b|nf|c|d|d-control) values="-" ;;
   *) echo "unknown phase $phase" >&2; exit 2 ;;
 esac
 values="${values//,/ }"
@@ -69,6 +72,7 @@ select_value() { # <value>: RESUME, OUT and LABEL of that invocation
       RESUME="$R/sc20671-compressed-$V$ONLY-resume"; OUT="$R/evidence/sc20671-compressed-$V$ONLY"
       LABEL="a2 --kv-method $V${KV_A2_ONLY_COORDINATE:+ --only-coordinate $KV_A2_ONLY_COORDINATE (PARTIAL)}" ;;
     b) RESUME=""; OUT="" ;;
+    nf) RESUME="$R/sc20669-noise-floor-resume"; OUT="$R/evidence/sc20669-noise-floor" ;;
     c) RESUME="$R/sc20684-resume"; OUT="$R/evidence/sc20684-krea" ;;
     d) RESUME="$R/sc20686-mlx-resume"; OUT="$R/evidence/sc20686-mlx" ;;
     d-control) RESUME="$R/sc20686-mlx-control-resume"; OUT="$R/evidence/sc20686-mlx-control" ;;
@@ -149,7 +153,7 @@ problems=""
 # parent admits each unit by estimate-plus-reserve-v1 (available >= that unit's estimate + reserve,
 # recorded in its admission) and refuses, unaccepted, any unit that does not fit at its start.
 case "$phase" in
-  a1|a2|a3) phase_policy="$F/policies/llm.json" ;;
+  a1|a2|a3|nf) phase_policy="$F/policies/llm.json" ;;
   b) phase_policy="$F/policies/capture.json" ;;
   *) phase_policy="$F2/policies/$W2_POLICY" ;;
 esac
@@ -319,6 +323,11 @@ for v in $values; do
       [ -z "${KV_A2_ONLY_COORDINATE:-}" ] || ONLY_ARGS=(--only-coordinate "$KV_A2_ONLY_COORDINATE")
       run_cmd "$F/sc20671_kv_baseline" parent --mode compressed --kv-method "$V" "${LLM_ARGS[@]}" \
         ${ONLY_ARGS[@]+"${ONLY_ARGS[@]}"} --resume-dir "$RESUME" --out "$OUT" || rc=$?
+      ;;
+    nf)
+      run_cmd "$F/sc20671_kv_baseline" noise-floor-parent --llama-snapshot "$LQ" --qwen-snapshot "$QQ" \
+        --prompt-file "$F/inputs/prompt.txt" --safety-policy "$F/policies/llm.json" \
+        --stop-file "$CTL/stop-requested" --resume-dir "$RESUME" --out "$OUT" || rc=$?
       ;;
     b)
       for fam in "llama:$LQ" "qwen:$QQ"; do

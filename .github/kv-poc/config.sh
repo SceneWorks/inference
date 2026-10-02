@@ -65,14 +65,16 @@ case "$label" in
   *) fail "runner_label must be rw-krea or nax, got '$label'" ;;
 esac
 
-# Each mode owns a fixed phase order; an empty list means all of that mode's phases. W2 also takes
-# `none`: run the asset prep and the build only (e.g. to see a host's disk shortfall first).
+# Each mode owns a fixed phase order; an empty list means the mode's default phases (every W2
+# phase; W1's a1,a3,a2,b). W1's `nf` (the SC-20669 dense noise floor, ~30 min) runs only when
+# listed, e.g. "phases": "nf" alone. W2 also takes `none`: run the asset prep and the build only
+# (e.g. to see a host's disk shortfall first).
 case "$mode" in
-  w2) order="c d d-control" ;;
-  *) order="a1 a3 a2 b" ;;
+  w2) order="c d d-control"; default_order="$order" ;;
+  *) order="a1 a3 a2 b nf"; default_order="a1 a3 a2 b" ;;
 esac
 phases="${phases// /}"
-[ -n "$phases" ] || phases="${order// /,}"
+[ -n "$phases" ] || phases="${default_order// /,}"
 canonical=""
 if [ "$mode" = w2 ] && [ "$phases" = none ]; then
   requested=()
@@ -83,7 +85,7 @@ for p in ${requested[@]+"${requested[@]}"}; do
   [ -n "$p" ] || continue
   case " $order " in *" $p "*) ;; *) fail "unknown phase '$p' for mode $mode (allowed: ${order// /,})" ;; esac
 done
-# Run order is fixed (A1 -> A3 -> A2 -> B; C -> D -> D-control) whatever order the list was typed in.
+# Run order is fixed (A1 -> A3 -> A2 -> B -> NF; C -> D -> D-control) whatever order the list was typed in.
 for p in $order; do
   for q in ${requested[@]+"${requested[@]}"}; do [ "$q" = "$p" ] && canonical="$canonical,$p" && break; done
 done

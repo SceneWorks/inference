@@ -13,6 +13,11 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 #     sc20671-compressed-<m>-resume, evidence/sc20671-compressed-<m>). At most 2 values each.
 #     An A3 QUALITY GATE FAILED (recorded evidence, exit 0) never skips the next value; a stop
 #     ends the list (stopped=true); a hard failure ends the list and fails the job.
+#     NF (opt-in: list it, e.g. "phases": "nf") is the SC-20669 dense noise floor: for all eight
+#     SC-20671 rows, `sc20671_kv_baseline noise-floor-parent` measures the dense arm against a
+#     one-shot repeat and a chunked-prefill recomputation of itself with the compressed rows' own
+#     metrics (teacher-forced agreement, stream-scored perplexity delta), one guarded worker per
+#     row under llm.json; per-row JSON + sealed summary.json in evidence/sc20669-noise-floor.
 #   W2 (mode=w2), the media campaigns (docs/architecture/SC_20684_*.md, SC_20686_*.md):
 #     C  SC-20684 Krea Realtime six-cell (T2V/I2V/V2V x Q8/Q4 KV) -> D SC-20686 Metal matrix (18
 #     coordinates incl. the A14B Lightning default, normal + cancel arms) -> D-control (the same
@@ -62,7 +67,7 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 # The SIGINT/SIGTERM trap only touches STOP, best effort. Cancel between jobs, or push the stop
 # branch and wait.
 #
-# TIMEOUTS. Each campaign job has a SOFT budget (KV_SOFT_BUDGET_MIN: a1/a2 330, a3 60, b 60 min;
+# TIMEOUTS. Each campaign job has a SOFT budget (KV_SOFT_BUDGET_MIN: a1/a2 330, a3 60, b 60, nf 120 min;
 # c 240, d 360, d-control 240 min): when it is spent the watcher requests a safe stop, exactly like
 # the stop branch, and a re-dispatch resumes. The HARD `timeout-minutes` is that budget PLUS the
 # policy's own row deadline (llm.json rowDeadlineSeconds 18000 = 300 min; capture.json 1800 = 30 min;
@@ -97,7 +102,7 @@ on:
         options: [rw-krea, nax]
         default: rw-krea
       phases:
-        description: "Empty = all of the mode's phases. w1: subset of a1,a3,a2,b; w2: subset of c,d,d-control, or none (assets + build only). Run order is fixed."
+        description: "Empty = the mode's default phases (w1: a1,a3,a2,b; w2: c,d,d-control). w1: subset of a1,a3,a2,b,nf (nf = dense noise floor, opt-in); w2: subset of c,d,d-control, or none (assets + build only). Run order is fixed."
         type: string
         default: ""
       baseline_evidence_ref:
@@ -364,6 +369,47 @@ jobs:
         with:
           name: kv-poc-b-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kv-poc-artifact/b/
+          if-no-files-found: warn
+          retention-days: 30
+
+  nf:
+    name: "NF dense noise floor (sc20671 noise-floor-parent)"
+    needs: [config, build, a1, a3, a2, b]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',nf,')
+      && needs.build.result == 'success'
+      && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true'
+      && (needs.a3.result == 'success' || needs.a3.result == 'skipped') && needs.a3.outputs.stopped != 'true'
+      && (needs.a2.result == 'success' || needs.a2.result == 'skipped') && needs.a2.outputs.stopped != 'true'
+      && (needs.b.result == 'success' || needs.b.result == 'skipped') && needs.b.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    # 120 soft + 300 row deadline + 20 (TIMEOUTS above).
+    timeout-minutes: 440
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "120"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run NF
+        id: run
+        run: bash .github/kv-poc/phase.sh run nf
+      - name: Collect NF evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect nf
+      - name: Upload NF evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-nf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/nf/
           if-no-files-found: warn
           retention-days: 30
 

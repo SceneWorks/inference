@@ -5,7 +5,8 @@ copy   --src PATH --dest PATH --max-bytes N   copy a file or tree, skipping (and
                                               larger than N so one oversized tensor cannot sink
                                               the upload of every receipt and log beside it.
 report --phase P --root R [--dir D ...]       markdown: receipts produced, unaccepted rows
-                                              (refused / failed / aborted), operator stops.
+                                              (refused / failed / aborted), operator stops, and
+                                              the SC-20669 dense noise floor (phase nf).
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ def report(phase: str, root: Path, dirs: list[Path]) -> None:
             "sc20677-kv-llama", "sc20677-kv-llama.partial", "sc20677-comparison-llama.json",
             "sc20677-kv-qwen", "sc20677-kv-qwen.partial", "sc20677-comparison-qwen.json",
         )]
-    receipts, unaccepted, stops, present = [], [], [], []
+    receipts, unaccepted, stops, present, floors, floor_summary = [], [], [], [], [], None
     for base in dirs:
         if not base.exists():
             continue
@@ -63,6 +64,12 @@ def report(phase: str, root: Path, dirs: list[Path]) -> None:
                 unaccepted.append((path, load(path)))
             elif "operator-stop" in name:
                 stops.append((path, load(path)))
+            else:
+                value = load(path)
+                if value.get("kind") == NOISE_FLOOR_ROW_KIND:
+                    floors.append(value)
+                elif value.get("kind") == NOISE_FLOOR_SUMMARY_KIND:
+                    floor_summary = value
     print(f"\n#### Phase {phase} evidence\n")
     if not present:
         print("_No evidence directories exist yet._")
@@ -82,6 +89,33 @@ def report(phase: str, root: Path, dirs: list[Path]) -> None:
     for path, record in stops:
         print(f"\nOperator stop: before row {record.get('beforeRow', '?')} of {record.get('rowsTotal', '?')} "
               f"(`{record.get('beforeRowSlug', '?')}`), `{path.name}`")
+    if floors or floor_summary:
+        print(noise_floor_markdown(floors, floor_summary))
+
+
+NOISE_FLOOR_ROW_KIND = "sc20669-dense-noise-floor"
+NOISE_FLOOR_SUMMARY_KIND = "sc20669-dense-noise-floor-summary"
+
+
+def noise_floor_markdown(rows: list[dict], summary: dict | None) -> str:
+    """The dense arm against exact recomputations of itself, per row and worst case."""
+    lines = ["\n#### Dense noise floor (SC-20669)\n",
+             "| coordinate | control | agreement | flips | perplexityDelta |", "|---|---|---|---|---|"]
+    for row in sorted(rows, key=lambda row: str(row.get("coordinate", ""))):
+        for control, measured in sorted((row.get("controls") or {}).items()):
+            lines.append(f"| `{row.get('coordinate', '?')}` | {control} | {measured.get('agreement', '?')} | "
+                         f"{measured.get('flipCount', '?')} | {measured.get('perplexityDelta', '?')} |")
+    if summary:
+        thresholds = summary.get("thresholds") or {}
+        lines.append(f"\nWorst case over {summary.get('rows', '?')} rows (frozen thresholds: greedy >= "
+                     f"{thresholds.get('greedyTokenAgreement', '?')}, |perplexityDelta| <= {thresholds.get('perplexityDelta', '?')}):\n")
+        for control, worst in sorted((summary.get("controls") or {}).items()):
+            within = [name for name, key in (("greedy", "greedyThresholdWithinDenseFloor"),
+                                             ("perplexity", "perplexityThresholdWithinDenseFloor")) if worst.get(key)]
+            lines.append(f"- {control}: min agreement {worst.get('minAgreement')} (`{worst.get('minAgreementRow')}`), "
+                         f"max |perplexityDelta| {worst.get('maxAbsPerplexityDelta')} (`{worst.get('maxAbsPerplexityDeltaRow')}`)"
+                         + (f" -- the dense arm itself misses the {' and '.join(within)} threshold" if within else ""))
+    return "\n".join(lines)
 
 
 def main() -> int:

@@ -205,7 +205,7 @@ class PhasePrecheckRamTests(unittest.TestCase):
         phase = (ROOT / ".github/kv-poc/phase.sh").read_text(encoding="utf-8")
         precheck = phase[phase.index("# 2. Precheck."):phase.index('echo "precheck: GO"')]
         self.assertIn('need="$(policy_reserve_gib "$phase_policy"', precheck)
-        for phase_name, policy in (("a1|a2|a3", "$F/policies/llm.json"), ("b", "$F/policies/capture.json"),
+        for phase_name, policy in (("a1|a2|a3|nf", "$F/policies/llm.json"), ("b", "$F/policies/capture.json"),
                                    ("*", "$F2/policies/$W2_POLICY")):
             self.assertIn(f'{phase_name}) phase_policy="{policy}"', precheck)
         for script in (precheck, COMMON.read_text(encoding="utf-8"),

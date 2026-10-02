@@ -292,10 +292,10 @@ pub struct Sc20676Quality {
     pub stepwise_cross_check_matches: u64,
     /// Observation only: first position where the free-running dense and packed streams differ.
     pub free_running_first_divergence: Option<u64>,
-    /// Packed needle outcome relative to the same-weights dense run (quality contract v3).
+    /// The packed arm's exact needle recovery (quality contract v5).
     pub needle_retrieval: bool,
-    /// False when the dense run itself missed the needle; the packed check then measures only
-    /// exact agreement with the dense output and cannot detect KV-induced retrieval loss.
+    /// False when the dense run itself missed the needle: the packed recovery is then an ungated
+    /// observation, since it cannot detect KV-induced retrieval loss.
     pub needle_discriminating: bool,
 }
 
@@ -1410,19 +1410,13 @@ pub fn sc20676_quality_gate(
             threshold: serde_json::json!(receipt.thresholds.min_greedy_token_agreement),
         });
     }
-    if !quality.needle_retrieval {
-        let (metric, threshold) = if quality.needle_discriminating {
-            ("needleRetrieval", serde_json::json!(SC20676_NEEDLE))
-        } else {
-            (
-                "needleAgreementWithDense",
-                serde_json::json!(receipt.dense.output.needle_output),
-            )
-        };
+    // Quality contract v5: a non-discriminating needle (the dense run missed it) is an
+    // observation, never a gate failure.
+    if quality.needle_discriminating && !quality.needle_retrieval {
         failures.push(Sc20676QualityFailure {
-            metric: metric.into(),
+            metric: "needleRetrieval".into(),
             value: serde_json::json!(receipt.packed.output.needle_output),
-            threshold,
+            threshold: serde_json::json!(SC20676_NEEDLE),
         });
     }
     if receipt.throughput_comparison.packed_slower_beyond_noise {
@@ -2373,12 +2367,14 @@ fn sc20676_supervised_admission(
 /// Packed needle outcome relative to the same-weights dense output: exact recovery when the dense
 /// run recovered the needle, otherwise exact agreement with the dense output, flagged as
 /// non-discriminating so a shared miss is never counted as retrieval.
+/// Quality contract v5: retrieval is always the packed arm's own exact recovery; it is
+/// discriminating (and gated) only when the same-weights dense run recovered the needle, and an
+/// ungated observation otherwise.
 fn sc20676_needle_observation(dense_output: &str, packed_output: &str) -> (bool, bool) {
-    if dense_output == SC20676_NEEDLE {
-        (packed_output == SC20676_NEEDLE, true)
-    } else {
-        (packed_output == dense_output, false)
-    }
+    (
+        packed_output == SC20676_NEEDLE,
+        dense_output == SC20676_NEEDLE,
+    )
 }
 
 /// Execute one fresh worker.  This is intentionally the only live model entry point; parent mode
@@ -4670,13 +4666,15 @@ mod tests {
             sc20676_needle_observation(SC20676_NEEDLE, "x"),
             (false, true)
         );
+        // Contract v5: after a dense miss the packed recovery is an observation (agreement with
+        // the dense miss text no longer counts as retrieval).
         assert_eq!(
             sc20676_needle_observation("I cannot help.", "I cannot help."),
-            (true, false)
+            (false, false)
         );
         assert_eq!(
-            sc20676_needle_observation("I cannot help.", "other"),
-            (false, false)
+            sc20676_needle_observation("I cannot help.", SC20676_NEEDLE),
+            (true, false)
         );
         // A dense arm that missed the needle is valid evidence, and the packed arm's identical
         // output is accepted only when flagged non-discriminating.
@@ -4686,6 +4684,7 @@ mod tests {
         }
         let quality = shared_miss.packed.quality.as_mut().unwrap();
         quality.needle_discriminating = false;
+        quality.needle_retrieval = false;
         reseal_arm(&mut shared_miss.dense);
         reseal_arm(&mut shared_miss.packed);
         validate_arm(&shared_miss.dense).unwrap();
@@ -5400,7 +5399,8 @@ mod tests {
                 .iter()
                 .map(|failure| failure.metric.as_str())
                 .collect::<Vec<_>>(),
-            ["greedyTokenAgreement", "needleAgreementWithDense"]
+            ["greedyTokenAgreement"],
+            "contract v5: the non-discriminating needle miss is recorded, never gated"
         );
         assert_eq!(
             llama_gate.failures[0].value,
