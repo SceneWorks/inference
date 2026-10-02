@@ -86,6 +86,12 @@ class PrecisionControlTests(unittest.TestCase):
         for bad in (completed - timedelta(seconds=1), completed + timedelta(hours=12, seconds=1)):
             with self.assertRaisesRegex(RuntimeError, "owner window"):
                 IDLE.check_window(baseline["completedUtc"], bad)
+        IDLE.check_device_selection("nt", "0", "PCI_BUS_ID")
+        for platform, visible, order in (("posix", "0", "PCI_BUS_ID"), ("nt", "1", "PCI_BUS_ID"),
+                                         ("nt", "0", None), ("nt", "0", "FASTEST_FIRST")):
+            with self.subTest(platform=platform, visible=visible, order=order), \
+                 self.assertRaisesRegex(RuntimeError, "PCI-ordered CUDA GPU0"):
+                IDLE.check_device_selection(platform, visible, order)
         IDLE.check_dispatch(IDLE.RUN_ID, IDLE.ENGINE_SHA, "a" * 40, "a" * 40)
         for run_id, engine, control, github in (
             ("other", IDLE.ENGINE_SHA, "a" * 40, "a" * 40),
@@ -102,6 +108,21 @@ class PrecisionControlTests(unittest.TestCase):
                 path.write_text('{"reviewed":false}', encoding="utf-8")
                 with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                     IDLE.verify_artifact(Path(directory))
+
+    def test_reviewed_runner_binding_refuses_other_listener(self):
+        self.assertEqual(IDLE.BASELINE_RUNNER, "cuda-windows-2")
+        manifest = {"completed": True, "targetPid": 38212, "engineSha": IDLE.ENGINE_SHA,
+                    "controlSha": IDLE.BASELINE_CONTROL_SHA, "runner": "cuda-windows"}
+        with patch.object(IDLE, "read_json", return_value=manifest), \
+             self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
+            IDLE.summarize(Path("unused"), baseline=True, pid=38212,
+                           engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
+        manifest["runner"] = IDLE.BASELINE_RUNNER
+        with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows"}), \
+             patch.object(IDLE, "read_json", return_value=manifest), \
+             self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
+            IDLE.summarize(Path("unused"), baseline=False, pid=38212,
+                           engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
 
     def test_shared_census_requires_live_receipt_only_for_mixed_context(self):
         def result(output):
@@ -326,12 +347,15 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertNotIn("registered_loader_generates_a_song_with_every_artifact", source)
         self.assertNotIn("SIGKILL", source)
         app_source = (ROOT / ".github/workflows/yue2-app-precision-profile.yml").read_text(encoding="utf-8")
-        for workflow in (source, app_source):
+        tile_source = (ROOT / ".github/workflows/yue2-bf16-tile-diagnostic.yml").read_text(encoding="utf-8")
+        for workflow in (source, app_source, tile_source):
             self.assertIn("idle_cuda_context_run_id:", workflow)
             self.assertIn("yue2-reviewed-idle-context", workflow)
             self.assertIn("if: inputs.idle_cuda_context_run_id != ''", workflow)
             self.assertIn(f"{IDLE.ENGINE_SHA}-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1", workflow)
             self.assertIn("run-id: ${{ inputs.idle_cuda_context_run_id }}", workflow)
+            self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
+        self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
 
     def test_cuda_diagnostic_is_provenance_guarded_and_cannot_launch_proof(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")

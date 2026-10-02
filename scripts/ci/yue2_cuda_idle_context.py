@@ -17,10 +17,11 @@ import re
 import subprocess
 import tempfile
 
-RUN_ID = "36850466402"
+RUN_ID = "36956986577"
 ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
-BASELINE_CONTROL_SHA = "88b257d1d2e0ef3c153fb3b1bf96bce66edc5f97"
-BASELINE_DIGEST = "692b3d05fd4e569677f638ea74c5bf039d60a59e94bf344c32a669091a2f1498"
+BASELINE_CONTROL_SHA = "3391f854565a5f5ea8eea48d4a8d9bad2e68c02d"
+BASELINE_DIGEST = "be1a8a3d57ea50f5732f6fcec836dff458f38883d8dfa540c527bdd98ff6841a"
+BASELINE_RUNNER = "cuda-windows-2"
 WINDOW = timedelta(hours=12)
 
 
@@ -161,10 +162,10 @@ def _counters(directory: Path, epoch: int, pid: int, luid: str, *, baseline: boo
 
 def summarize(directory: Path, *, baseline: bool, pid: int, engine_sha: str, control_sha: str) -> dict:
     manifest = read_json(directory, "manifest")
-    expected_runner = "cuda-windows" if baseline else os.environ.get("RUNNER_NAME")
+    expected_runner = BASELINE_RUNNER if baseline else os.environ.get("RUNNER_NAME")
     require(manifest.get("completed") is True and manifest.get("targetPid") == pid and
             manifest.get("engineSha") == engine_sha and manifest.get("controlSha") == control_sha and
-            expected_runner in ("cuda-windows", "cuda-windows-2") and
+            expected_runner == BASELINE_RUNNER and
             manifest.get("runner") == expected_runner, "diagnostic manifest/source/runner mismatch")
     catalog = read_json(directory, "windows-counter-catalog")
     listed = {item.get("name"): item for item in catalog.get("sets", [])}
@@ -263,9 +264,14 @@ def verify_artifact(directory: Path) -> None:
             "reviewed diagnostic artifact digest mismatch")
 
 
+def check_device_selection(platform: str, visible: str | None, order: str | None) -> None:
+    require(platform == "nt" and visible == "0" and order == "PCI_BUS_ID",
+            "reviewed context requires Windows and PCI-ordered CUDA GPU0")
+
+
 def reviewed_baseline() -> tuple[dict, Path]:
-    require(os.name == "nt" and os.environ.get("CUDA_VISIBLE_DEVICES") == "0",
-            "reviewed context requires Windows and selected CUDA GPU0")
+    check_device_selection(os.name, os.environ.get("CUDA_VISIBLE_DEVICES"),
+                           os.environ.get("CUDA_DEVICE_ORDER"))
     check_dispatch(os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID"),
                    os.environ.get("EXPECTED_ENGINE_SHA"),
                    os.environ.get("EXPECTED_CONTROL_SHA"), os.environ.get("GITHUB_SHA"))
