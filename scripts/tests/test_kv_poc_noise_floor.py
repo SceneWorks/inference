@@ -80,19 +80,77 @@ class NoiseFloorPhaseTests(unittest.TestCase):
         self.assertIn('a1|b|nf|c|d|d-control) values="-"', phase)
         self.assertIn('nf) RESUME="$R/sc20669-noise-floor-resume"; OUT="$R/evidence/sc20669-noise-floor"', phase)
         self.assertIn('a1|a2|a3|nf) phase_policy="$F/policies/llm.json"', phase)
-        launch = phase[phase.index("    nf)\n      run_cmd"):]
+        launch = phase[phase.index("    nf)\n"):]
         launch = launch[: launch.index(";;")]
         for argument in (
-            '"$F/sc20671_kv_baseline" noise-floor-parent',
-            '--llama-snapshot "$LQ"',
-            '--qwen-snapshot "$QQ"',
-            '--prompt-file "$F/inputs/prompt.txt"',
-            '--safety-policy "$F/policies/llm.json"',
+            '"$F/sc20671_kv_baseline" noise-floor-parent "${LLM_ARGS[@]}"',
             '--stop-file "$CTL/stop-requested"',
             '--resume-dir "$RESUME"',
             '--out "$OUT"',
         ):
             self.assertIn(argument, launch)
+
+    def test_nf_command_line_resolves_every_rows_pinned_snapshots(self):
+        """Run 37003931977: the nf parent admits each row on the dense row's estimate, which
+        reads the bf16 reference's weight headers, so the launch must name the pinned candidate
+        AND reference snapshots of both families, resolved exactly like A1/A2's."""
+        pins = [
+            line.split("\t")
+            for line in (KV_POC / "models.tsv").read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")
+        ]
+        phase = (KV_POC / "phase.sh").read_text(encoding="utf-8")
+        llm_args = next(line for line in phase.splitlines() if line.startswith("LLM_ARGS_TEXT="))
+        launch = phase[phase.index("    nf)\n"):]
+        launch = launch[: launch.index(";;")]
+        launch = "\n".join(line for line in launch.splitlines()[1:] if not line.strip().startswith("#"))
+        with tempfile.TemporaryDirectory() as tmp:
+            hub = Path(tmp) / "hub"
+            for repo, revision, name, *_ in pins:
+                file = hub / f"models--{repo.replace('/', '--')}" / "snapshots" / revision / name
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(b"")
+            script = "\n".join([
+                'source "$KV_POC/common.sh"',
+                llm_args,
+                "LLM_ARGS=($LLM_ARGS_TEXT)",
+                'run_cmd() { printf "%s\\n" "$@"; }',
+                'CTL=/ctl RESUME=/resume OUT=/out',
+                launch,
+            ])
+            env = {
+                **os.environ,
+                "KV_POC": str(KV_POC),
+                "INFERENCE_SHA": "a" * 40,
+                "SCENEWORKS_SHA": "b" * 40,
+                "KV_POC_ROOT": str(Path(tmp) / "root"),
+                "KV_POC_HF_HUB": str(hub),
+                "KV_EXPECTED_RUNNER": "",
+            }
+            done = subprocess.run(
+                ["bash", "-c", script], env=env, capture_output=True, text=True,
+                encoding="utf-8", check=False,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            argv = done.stdout.splitlines()
+            self.assertEqual(argv[1], "noise-floor-parent")
+            flags = dict(zip(argv[2::2], argv[3::2]))
+            expected = {
+                "--llama-snapshot": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                "--llama-fp32-reference-snapshot": "mlx-community/Llama-3.2-3B-Instruct-bf16",
+                "--qwen-snapshot": "mlx-community/Qwen3-1.7B-4bit",
+                "--qwen-fp32-reference-snapshot": "mlx-community/Qwen3-1.7B-bf16",
+            }
+            for flag, repo in expected.items():
+                self.assertIn(flag, flags, f"nf launch lacks {flag}")
+                snapshot = Path(flags[flag])
+                self.assertTrue(snapshot.is_dir(), f"{flag} {snapshot} does not resolve")
+                pinned = [name for pin_repo, _, name, *_ in pins if pin_repo == repo]
+                self.assertTrue(pinned, repo)
+                for name in pinned:
+                    self.assertTrue((snapshot / name).is_file(), f"{flag} lacks pinned {name}")
+            for flag in ("--prompt-file", "--safety-policy", "--stop-file", "--resume-dir", "--out"):
+                self.assertIn(flag, flags)
 
     def test_workflow_runs_collects_and_uploads_nf_after_every_other_w1_phase(self):
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
