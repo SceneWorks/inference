@@ -209,7 +209,7 @@ __device__ void decode_attn_partial(const T* q, const T* k, const T* v,
                                     float scale, float softcap, int window, int n_chunks,
                                     int tile) {
     extern __shared__ float smem[];
-    const int slices = value_slices(dv);
+    const int slices = n_chunks > 4 ? value_slices(dv) : 1;  // MUTATION M2
     const int region = tile * (dk > slices * dv ? dk : slices * dv);
     float* q_s = smem;              // [tile][dk] (score pass)
     float* vred = smem;             // [slices][tile][dv] (value pass; the query rows are done)
@@ -279,7 +279,8 @@ __device__ void decode_attn_partial(const T* q, const T* k, const T* v,
 #pragma unroll
                     for (int u = 0; u < DECODE_ATTN_KEY_UNROLL; ++u) {
 #pragma unroll
-                        for (int e = 0; e < W; ++e) {
+                        for (int e0 = 0; e0 < W; ++e0) {
+                            const int e = kvec ? e0 : W - 1 - e0;  // MUTATION M3
                             if (d0 + e < dk) acc[u][g] = fmaf(qv[e], kv[u][e], acc[u][g]);
                         }
                     }
@@ -421,7 +422,7 @@ __device__ void decode_attn_combine(const float* ws, const unsigned int* start, 
     int lo, hi;
     visible_range(start[0], i, cap, window, &lo, &hi);
     const int c_lo = lo / DECODE_ATTN_CHUNK;
-    const int c_hi = (hi - 1) / DECODE_ATTN_CHUNK;
+    const int c_hi = (hi - 2) / DECODE_ATTN_CHUNK;  // MUTATION M1
     const size_t stride = (size_t)(2 + dv);
     const float* wbase = ws + ((size_t)bm * heads + h) * n_chunks * stride;
 
