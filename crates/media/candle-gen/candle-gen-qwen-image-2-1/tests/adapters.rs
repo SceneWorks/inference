@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{Device, Tensor};
-use candle_gen::gen_core::{AdapterKind, AdapterSpec, GenerationRequest, LoadSpec, WeightsSource};
+use candle_gen::gen_core::{
+    AdapterKind, AdapterSpec, GenerationRequest, LoadSpec, OffloadPolicy, WeightsSource,
+};
 use candle_gen::CandleError;
 use candle_gen_qwen_image_2_1::adapters::{install, loha_on_packed_tier_refusal, preflight};
 use candle_gen_qwen_image_2_1::quant::{Tier, GROUP_SIZE};
@@ -320,7 +322,7 @@ fn loha_folds_into_the_dense_dit() {
             ("transformer_blocks.1.img_mlp.out", HIDDEN, DIM),
         ],
     );
-    preflight(&[lora(&adapter, 1.0)], Tier::Bf16).unwrap();
+    preflight(&tiny_snapshot(), &[lora(&adapter, 1.0)], Tier::Bf16).unwrap();
     let mut dit = dense_dit();
     let report = install(&mut dit, &[lora(&adapter, 0.8)], Tier::Bf16, &Device::Cpu).unwrap();
     assert_eq!(report.loha_folds, 2);
@@ -346,7 +348,7 @@ fn loha_on_a_packed_tier_is_a_typed_refusal() {
         "{expected}"
     );
     for tier in [Tier::Q8, Tier::Q4] {
-        match preflight(&[lora(&adapter, 1.0)], tier) {
+        match preflight(&tiny_snapshot(), &[lora(&adapter, 1.0)], tier) {
             Err(CandleError::Unsupported(message)) => {
                 assert_eq!(message, loha_on_packed_tier_refusal(tier, &adapter));
                 assert!(message.contains(tier.dir_name()));
@@ -448,6 +450,213 @@ fn unmatched_adapter_keys_are_refused() {
     );
 }
 
+/// The weight-free projection table is exactly the visitor walk of a loaded DiT — same keys, same
+/// order, same `[out, in]` — so the header-only preflight resolves against what install will see.
+#[test]
+fn the_weight_free_projection_table_is_the_visitor_walk() {
+    let mut dit = dense_dit();
+    let mut walked = Vec::new();
+    dit.visit_adaptable_mut(&mut |name, linear| {
+        walked.push((name.to_string(), linear.base_shape()));
+        Ok(())
+    })
+    .unwrap();
+    let cfg = dit.config().clone();
+    assert_eq!(QwenImage21Transformer::adaptable_projections(&cfg), walked);
+}
+
+fn refusal<T: std::fmt::Debug>(result: candle_gen::Result<T>) -> String {
+    result.expect_err("must be refused").to_string()
+}
+
+/// A LoHa whose factors have the right element count but the transposed orientation (`[64, 32]`
+/// factors over the `[out=32, in=64]` `img_mlp.out`) is refused — at install, by the provider's own
+/// orientation check, and at the header-only preflight — never folded as scrambled weights.
+#[test]
+fn a_transposed_loha_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let adapter = temp.path().join("transposed.safetensors");
+    write_loha(
+        &adapter,
+        &[("transformer_blocks.1.img_mlp.out", DIM, HIDDEN)],
+    );
+    let mut dit = dense_dit();
+    let base = velocity(&dit);
+    let error = refusal(install(
+        &mut dit,
+        &[lora(&adapter, 1.0)],
+        Tier::Bf16,
+        &Device::Cpu,
+    ));
+    assert!(
+        error.contains("transformer_blocks.1.img_mlp.out")
+            && error.contains("are not oriented for the projection's [out=32, in=64]"),
+        "{error}"
+    );
+    assert!(
+        max_abs_diff(&base, &velocity(&dit)) < 1e-6,
+        "nothing folded"
+    );
+    let error = refusal(preflight(
+        &tiny_snapshot(),
+        &[lora(&adapter, 1.0)],
+        Tier::Bf16,
+    ));
+    assert!(
+        error.contains("transformer_blocks.1.img_mlp.out") && error.contains("not oriented"),
+        "{error}"
+    );
+}
+
+/// Two raw keys that normalize to one module (`transformer.X` beside `X`) are refused rather than
+/// one silently winning, and two spellings of one projection (`X` beside `lora_unet_X`) are
+/// refused rather than folded twice — at install and at preflight.
+#[test]
+fn duplicate_spellings_of_one_projection_are_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let namespaced = temp.path().join("namespaced.safetensors");
+    write_loha(
+        &namespaced,
+        &[
+            (ATTN_TARGET, DIM, DIM),
+            ("transformer.transformer_blocks.0.attn.to_q", DIM, DIM),
+        ],
+    );
+    let error = refusal(install(
+        &mut dense_dit(),
+        &[lora(&namespaced, 1.0)],
+        Tier::Bf16,
+        &Device::Cpu,
+    ));
+    assert!(error.contains("name the same module"), "{error}");
+    let error = refusal(preflight(
+        &tiny_snapshot(),
+        &[lora(&namespaced, 1.0)],
+        Tier::Bf16,
+    ));
+    assert!(error.contains("name the same module"), "{error}");
+
+    let kohya = temp.path().join("kohya.safetensors");
+    write_loha(
+        &kohya,
+        &[
+            (ATTN_TARGET, DIM, DIM),
+            ("lora_unet_transformer_blocks_0_attn_to_q", DIM, DIM),
+        ],
+    );
+    let mut dit = dense_dit();
+    let base = velocity(&dit);
+    let error = refusal(install(
+        &mut dit,
+        &[lora(&kohya, 1.0)],
+        Tier::Bf16,
+        &Device::Cpu,
+    ));
+    assert!(
+        error.contains("target the same projection `transformer_blocks.0.attn.to_q`"),
+        "{error}"
+    );
+    assert!(
+        max_abs_diff(&base, &velocity(&dit)) < 1e-6,
+        "nothing folded"
+    );
+    let error = refusal(preflight(
+        &tiny_snapshot(),
+        &[lora(&kohya, 1.0)],
+        Tier::Bf16,
+    ));
+    assert!(error.contains("target the same projection"), "{error}");
+
+    // The same header-only check covers a LoRA, whose shared install would otherwise keep
+    // whichever spelling it read last.
+    let lora_dup = temp.path().join("lora-dup.safetensors");
+    save(
+        &lora_dup,
+        vec![
+            (format!("{ATTN_TARGET}.lora_A.weight"), filled((2, DIM), 0)),
+            (format!("{ATTN_TARGET}.lora_B.weight"), filled((DIM, 2), 1)),
+            (
+                format!("transformer.{ATTN_TARGET}.lora_A.weight"),
+                filled((2, DIM), 2),
+            ),
+            (
+                format!("transformer.{ATTN_TARGET}.lora_B.weight"),
+                filled((DIM, 2), 3),
+            ),
+        ],
+        None,
+    );
+    let error = refusal(preflight(
+        &tiny_snapshot(),
+        &[lora(&lora_dup, 1.0)],
+        Tier::Bf16,
+    ));
+    assert!(error.contains("name the same module"), "{error}");
+}
+
+/// The header-only preflight refuses what install would — an unmatched LoRA target, a mis-shaped
+/// LoRA factor, a non-factor key — and admits a matching LoRA and LoKr.
+#[test]
+fn preflight_key_matches_and_shape_checks_from_headers() {
+    let temp = tempfile::tempdir().unwrap();
+    let good = temp.path().join("good.safetensors");
+    write_lora(&good, &[(ATTN_TARGET, DIM, DIM)], 0);
+    preflight(&tiny_snapshot(), &[lora(&good, 1.0)], Tier::Bf16).unwrap();
+    let lokr = temp.path().join("lokr.safetensors");
+    write_lokr(&lokr, ATTN_TARGET, (2, 2), (DIM / 2, DIM / 2));
+    preflight(
+        &tiny_snapshot(),
+        &[AdapterSpec::new(lokr, 1.0, AdapterKind::Lokr)],
+        Tier::Bf16,
+    )
+    .unwrap();
+
+    let unmatched = temp.path().join("unmatched.safetensors");
+    write_lora(
+        &unmatched,
+        &[("transformer_blocks.9.attn.to_q", DIM, DIM)],
+        0,
+    );
+    let error = refusal(preflight(
+        &tiny_snapshot(),
+        &[lora(&unmatched, 1.0)],
+        Tier::Bf16,
+    ));
+    assert!(
+        error.contains("transformer_blocks.9.attn.to_q") && error.contains("matches no DiT"),
+        "{error}"
+    );
+
+    let misshaped = temp.path().join("misshaped.safetensors");
+    write_lora(&misshaped, &[("proj_out", DIM, 3)], 0);
+    let error = refusal(preflight(
+        &tiny_snapshot(),
+        &[lora(&misshaped, 1.0)],
+        Tier::Bf16,
+    ));
+    assert!(
+        error.contains("does not reconstruct the projection's"),
+        "{error}"
+    );
+
+    let stray = temp.path().join("stray.safetensors");
+    save(
+        &stray,
+        vec![
+            (format!("{ATTN_TARGET}.lora_A.weight"), filled((2, DIM), 0)),
+            (format!("{ATTN_TARGET}.lora_B.weight"), filled((DIM, 2), 1)),
+            (format!("{ATTN_TARGET}.lora_B.bias"), filled((1, DIM), 2)),
+        ],
+        None,
+    );
+    let error = refusal(preflight(
+        &tiny_snapshot(),
+        &[lora(&stray, 1.0)],
+        Tier::Bf16,
+    ));
+    assert!(error.contains("is not a LoRA factor"), "{error}");
+}
+
 /// `load` admits an adapter stack now (the old blanket refusal is gone) and renders with it; a
 /// zero-match adapter fails the load.
 #[test]
@@ -475,4 +684,38 @@ fn load_wires_adapters_through_the_generator() {
     let spec =
         LoadSpec::new(WeightsSource::Dir(tiny_snapshot())).with_adapters(vec![lora(&missing, 1.0)]);
     assert!(candle_gen_qwen_image_2_1::load(&spec).is_err());
+}
+
+/// Under `Sequential` the DiT — and so the adapter install — is deferred to the first render, so
+/// the weight-free preflight is what refuses a zero-match or mis-oriented adapter at `load`, not
+/// mid-generate.
+#[test]
+fn a_sequential_load_refuses_a_bad_adapter_before_any_render() {
+    let temp = tempfile::tempdir().unwrap();
+    let sequential = |adapter: &Path| {
+        LoadSpec::new(WeightsSource::Dir(tiny_snapshot()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_adapters(vec![lora(adapter, 1.0)])
+    };
+    let missing = temp.path().join("missing.safetensors");
+    write_lora(&missing, &[("transformer_blocks.9.attn.to_q", DIM, DIM)], 0);
+    let error = candle_gen_qwen_image_2_1::load(&sequential(&missing))
+        .err()
+        .expect("a zero-match adapter fails a Sequential load")
+        .to_string();
+    assert!(error.contains("transformer_blocks.9.attn.to_q"), "{error}");
+
+    let transposed = temp.path().join("transposed.safetensors");
+    write_loha(
+        &transposed,
+        &[("transformer_blocks.1.img_mlp.out", DIM, HIDDEN)],
+    );
+    assert!(
+        candle_gen_qwen_image_2_1::load(&sequential(&transposed)).is_err(),
+        "a mis-oriented LoHa fails a Sequential load"
+    );
+
+    let good = temp.path().join("good.safetensors");
+    write_lora(&good, &[(ATTN_TARGET, DIM, DIM)], 0);
+    candle_gen_qwen_image_2_1::load(&sequential(&good)).expect("a matching adapter loads");
 }

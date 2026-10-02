@@ -270,79 +270,125 @@ pub fn memory_strategy_contract(
     // would be served at a different tier than the one it claims.
     let tier = crate::quant::resolve_requested_tier(root, spec.quantize)?;
     contract.asset_facts = asset_facts(root)?;
-    price_adapter_stack(&mut contract, adapter_overlay_bytes(spec, tier)?);
+    price_adapter_stack(&mut contract, adapter_overlay(spec, root, tier)?);
     Ok(contract)
 }
 
-/// Bytes the selected adapter stack keeps resident beside the DiT (sc-24157), priced from the
-/// adapter files on disk and **fail-closed**:
-///
-/// * LoRA / PEFT LoKr ride as forward-time residuals for the whole render
-///   (`AdapterResidencyMode::Additive`) — every file must have a non-zero safetensors size;
-/// * a LyCORIS LoHa is folded into the dense weights, but the fold holds the whole adapter file
-///   (plus one projection's f32 delta) while it runs, so its file bytes are charged too rather
-///   than priced as free; on a packed tier it is the same typed refusal the loader raises.
-///
-/// A non-empty stack therefore always prices above zero, and an unsizable one is refused instead
-/// of being admitted as free.
-pub fn adapter_overlay_bytes(spec: &LoadSpec, tier: crate::quant::Tier) -> gen_core::Result<u64> {
-    if spec.adapters.is_empty() {
-        return Ok(0);
-    }
-    let mut additive = Vec::new();
-    let mut folded = 0_u64;
-    for adapter in &spec.adapters {
-        let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(&adapter.path)?;
-        if gen_core::weightsmeta::keys_contain_loha(headers.iter().map(|h| h.name.as_str())) {
-            if tier != crate::quant::Tier::Bf16 {
-                return Err(gen_core::Error::Unsupported(
-                    crate::adapters::loha_on_packed_tier_refusal(tier, &adapter.path),
-                ));
-            }
-            let bytes = gen_core::weightsmeta::safetensors_path_bytes(&adapter.path);
-            if bytes == 0 {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{MODEL_ID}: LoHa adapter {} has no sizable safetensors residency",
-                    adapter.path.display()
-                )));
-            }
-            folded = folded.saturating_add(bytes);
-        } else {
-            additive.push(adapter.clone());
-        }
-    }
-    let residual =
-        gen_core::adapter_stack_resident_bytes(&additive, gen_core::AdapterResidencyMode::Additive)
-            .ok_or_else(|| {
-                gen_core::Error::Unsupported(format!(
-                    "{MODEL_ID}: every additive adapter must have a non-zero safetensors residency"
-                ))
-            })?;
-    Ok(residual.saturating_add(folded))
+/// The device cost of the selected adapter stack beside the DiT (sc-24157), priced weight-free
+/// from the adapter files' safetensors headers (the same [`crate::adapters::plan`] admission the
+/// loader runs) and **fail-closed**.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdapterOverlay {
+    /// LoRA / PEFT LoKr ride as forward-time residuals for the whole render
+    /// (`AdapterResidencyMode::Additive`): every file's safetensors bytes, each non-zero.
+    pub residual_bytes: u64,
+    /// A LyCORIS LoHa is **folded** into the dense weights (`AdapterResidencyMode::Folded` — zero
+    /// bytes resident once loaded), but each fold is a load-time transient on the DiT's device:
+    /// `AdaptLinear::fold_dense_delta` holds the uploaded f32 delta, the f32 copy of the base
+    /// weight and their f32 sum, plus the sum cast back to the storage dtype, at once — so
+    /// `out·in·(3·4 + storage_width)` for one projection. Folds run one projection at a time (the
+    /// delta is dropped before the next), so this is the **max** over every matched projection of
+    /// every LoHa file, never a sum. The `hada_*` factors and the Hadamard product stay on the host
+    /// (`read_adapter` reads to CPU), so they are not device bytes.
+    pub loha_fold_transient_bytes: u64,
 }
 
-/// Declare a non-zero adapter stack as a typed auxiliary resident component beside the base
-/// components (never inside `base_bytes`), with `OverlayBytes` in the formula — the
-/// `candle-gen-qwen-image` edit-route shape. A zero overlay leaves the contract untouched.
-fn price_adapter_stack(contract: &mut MemoryProviderContract, overlay_bytes: u64) {
-    if overlay_bytes == 0 {
+impl AdapterOverlay {
+    /// `overlay_bytes` — the sum of the declared auxiliary components.
+    pub fn total(&self) -> u64 {
+        self.residual_bytes
+            .saturating_add(self.loha_fold_transient_bytes)
+    }
+}
+
+/// Price `spec`'s adapter stack against the snapshot at `root` on `tier`. A LoHa on a packed tier,
+/// an unmatched or mis-oriented key, and an additive file with no sizable safetensors residency
+/// are all refused rather than admitted as free.
+pub fn adapter_overlay(
+    spec: &LoadSpec,
+    root: &Path,
+    tier: crate::quant::Tier,
+) -> gen_core::Result<AdapterOverlay> {
+    if spec.adapters.is_empty() {
+        return Ok(AdapterOverlay::default());
+    }
+    let plan = crate::adapters::plan(
+        &crate::adapters::ProjectionTable::from_snapshot(root)?,
+        &spec.adapters,
+        tier,
+    )?;
+    let residual_bytes = gen_core::adapter_stack_resident_bytes(
+        &plan.additive,
+        gen_core::AdapterResidencyMode::Additive,
+    )
+    .ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: every additive adapter must have a non-zero safetensors residency"
+        ))
+    })?;
+    let fold_bytes_per_element = 3 * F32_WIDTH + compute_width();
+    let loha_fold_transient_bytes = plan
+        .loha_fold_shapes
+        .iter()
+        .map(|&(out_f, in_f)| (out_f as u64 * in_f as u64).saturating_mul(fold_bytes_per_element))
+        .max()
+        .unwrap_or(0);
+    Ok(AdapterOverlay {
+        residual_bytes,
+        loha_fold_transient_bytes,
+    })
+}
+
+/// Width of the f32 the LoHa fold computes in.
+const F32_WIDTH: u64 = 4;
+
+/// Declare a non-zero adapter stack as typed auxiliary components beside the base components
+/// (never inside `base_bytes`), with `OverlayBytes` in the formula — the `candle-gen-qwen-image`
+/// edit-route shape. The residual stack is resident for the whole render; the LoHa fold transient
+/// is materialized when the DiT loads (the head of `Denoise` under `Sequential`, and inside the
+/// resident load otherwise) and retains nothing. A zero overlay leaves the contract untouched.
+fn price_adapter_stack(contract: &mut MemoryProviderContract, overlay: AdapterOverlay) {
+    if overlay.total() == 0 {
         return;
     }
-    contract.asset_facts.overlay_bytes = overlay_bytes;
+    contract.asset_facts.overlay_bytes = overlay.total();
     let mut variables = contract_variables(&contract.formula);
     if !variables.contains(&MemoryFormulaVariable::OverlayBytes) {
         variables.push(MemoryFormulaVariable::OverlayBytes);
     }
+    let mut resident_components = Vec::new();
+    if overlay.residual_bytes > 0 {
+        resident_components.push(gen_core::MemoryResidentComponent {
+            id: "qwen_image_2_1_adapter_stack".to_owned(),
+            kind: gen_core::MemoryComponentKind::AdapterStack,
+            resident_bytes: overlay.residual_bytes,
+            bounded_by: None,
+            residency: gen_core::MemoryComponentResidency::WholeRender,
+        });
+    }
+    if overlay.loha_fold_transient_bytes > 0 {
+        resident_components.push(gen_core::MemoryResidentComponent {
+            id: "qwen_image_2_1_loha_fold_transient".to_owned(),
+            kind: gen_core::MemoryComponentKind::AdapterStack,
+            resident_bytes: overlay.loha_fold_transient_bytes,
+            bounded_by: None,
+            residency: gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
+                precomputed_in: MemoryPhase::Denoise,
+                retained_bytes: 0,
+                evidence: "crate::adapters::fold_loha folds one projection at a time through \
+                           AdaptLinear::fold_dense_delta, which replaces the dense weight and \
+                           drops the delta before the next projection; LoHa is Folded \
+                           (gen_core::adapter_stack_resident_bytes => 0). \
+                           memory_strategy::tests::a_non_empty_adapter_stack_prices_a_resident_overlay \
+                           pins the max-over-projections transient arithmetic"
+                    .to_owned(),
+            },
+        });
+    }
     contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
         phases: contract.lifecycle.phases.clone(),
         variables,
-        resident_components: vec![gen_core::MemoryResidentComponent {
-            id: "qwen_image_2_1_adapter_stack".to_owned(),
-            kind: gen_core::MemoryComponentKind::AdapterStack,
-            resident_bytes: overlay_bytes,
-            bounded_by: None,
-            residency: gen_core::MemoryComponentResidency::WholeRender,
-        }],
+        resident_components,
     };
 }
 
@@ -1019,8 +1065,9 @@ mod tests {
     }
     /// sc-24157: a non-empty adapter stack is priced, never admitted as free. LoRA rides as a
     /// typed auxiliary `AdapterStack` component worth its file bytes, outside `base_bytes`, with
-    /// `OverlayBytes` in the formula; a LoHa (dense fold) is charged its file bytes too; an
-    /// unsizable adapter and a LoHa on a packed tier are refused.
+    /// `OverlayBytes` in the formula; a LoHa is Folded (zero resident) and charged only its
+    /// load-time fold transient, as an evicted `AdapterStack` component; an unsizable adapter and
+    /// a LoHa on a packed tier are refused.
     #[test]
     fn a_non_empty_adapter_stack_prices_a_resident_overlay() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
@@ -1072,30 +1119,74 @@ mod tests {
             "the adapted load must cost more than the plain one"
         );
 
+        // A LoHa over two projections of different size: `to_k` [32, 32] and `img_mlp.out`
+        // [out=32, in=64]. It is Folded (nothing resident once loaded), and its fold is a
+        // load-time transient of the LARGEST projection's `out·in·(3·4 + storage)` — not its file
+        // bytes, and not a sum over projections.
         let loha = temp.path().join("loha.safetensors");
         let mut loha_tensors = HashMap::new();
-        for (factor, shape) in [
-            ("hada_w1_a", (32, 2)),
-            ("hada_w1_b", (2, 32)),
-            ("hada_w2_a", (32, 2)),
-            ("hada_w2_b", (2, 32)),
+        for (target, out_f, in_f) in [
+            ("transformer_blocks.0.attn.to_k", 32, 32),
+            ("transformer_blocks.0.img_mlp.out", 32, 64),
         ] {
-            loha_tensors.insert(
-                format!("transformer_blocks.0.attn.to_k.{factor}"),
-                candle_core::Tensor::zeros(shape, candle_core::DType::F32, &dev).unwrap(),
-            );
+            for (factor, shape) in [
+                ("hada_w1_a", (out_f, 2)),
+                ("hada_w1_b", (2, in_f)),
+                ("hada_w2_a", (out_f, 2)),
+                ("hada_w2_b", (2, in_f)),
+            ] {
+                loha_tensors.insert(
+                    format!("{target}.{factor}"),
+                    candle_core::Tensor::zeros(shape, candle_core::DType::F32, &dev).unwrap(),
+                );
+            }
         }
         candle_core::safetensors::save(&loha_tensors, &loha).unwrap();
-        let loha_bytes = std::fs::metadata(&loha).unwrap().len();
+        let fold_transient = 32 * 64 * (3 * 4 + compute_width());
         let stacked = plain.clone().with_adapters(vec![
             AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora),
             AdapterSpec::new(loha.clone(), 0.5, AdapterKind::Lora),
         ]);
         assert_eq!(
-            adapter_overlay_bytes(&stacked, crate::quant::Tier::Bf16).unwrap(),
-            lora_bytes + loha_bytes
+            adapter_overlay(&stacked, &tiny, crate::quant::Tier::Bf16).unwrap(),
+            AdapterOverlay {
+                residual_bytes: lora_bytes,
+                loha_fold_transient_bytes: fold_transient,
+            }
         );
-        match adapter_overlay_bytes(&stacked, crate::quant::Tier::Q4) {
+        let contract = memory_strategy_contract(MODEL_ID, &stacked).unwrap();
+        assert_eq!(
+            contract.asset_facts.overlay_bytes,
+            lora_bytes + fold_transient
+        );
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        let components = contract.resident_components();
+        assert_eq!(components.len(), 2, "{components:?}");
+        assert_eq!(
+            components[0].steady_state_bytes(),
+            lora_bytes,
+            "the residual stack stays for the whole render"
+        );
+        assert_eq!(components[1].resident_bytes, fold_transient);
+        assert_eq!(
+            components[1].steady_state_bytes(),
+            0,
+            "a folded LoHa retains nothing once the DiT is loaded"
+        );
+        let loha_only = plain.clone().with_adapters(vec![AdapterSpec::new(
+            loha.clone(),
+            1.0,
+            AdapterKind::Lora,
+        )]);
+        let contract = memory_strategy_contract(MODEL_ID, &loha_only).unwrap();
+        assert_eq!(contract.asset_facts.overlay_bytes, fold_transient);
+        assert!(contract.conformance_errors().is_empty());
+        assert_eq!(contract.evicted_component_bytes(), fold_transient);
+        match adapter_overlay(&stacked, &tiny, crate::quant::Tier::Q4) {
             Err(gen_core::Error::Unsupported(message)) => {
                 assert!(
                     message.contains("LoHa") && message.contains("q4"),

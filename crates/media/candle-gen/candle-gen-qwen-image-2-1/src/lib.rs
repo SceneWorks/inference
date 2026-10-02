@@ -325,17 +325,15 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let tokenizer = loader::load_tokenizer(root)?;
     let drop_count = system_prompt_drop_count(&tokenizer)?;
     let scheduler = loader::load_scheduler_config(root)?;
-    // Adapter admission before any weight is read: a LoHa on a packed tier is a typed refusal here,
-    // not after the text encoder and DiT have been materialized.
-    if !spec.adapters.is_empty() {
-        adapters::preflight(
-            &spec.adapters,
-            quant::resolve_requested_tier(root, spec.quantize)?,
-        )?;
-    }
     // The loaded contract is priced from the snapshot on disk BEFORE any weight is read, so a
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
     // through the memory registration.
+    //
+    // It is also the adapter admission: pricing the stack runs `adapters::plan` (the weight-free
+    // preflight, safetensors headers only), so a LoHa on a packed tier, a key that reaches no DiT
+    // projection and a mis-oriented factor are refused here on EVERY offload policy — under
+    // `Sequential` the DiT (and so `adapters::install`) is deferred to the first render, so without
+    // this a bad adapter would pass `load` and fail mid-generate.
     let memory_strategy = memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     let residency = build_residency(spec, &device)?;
     Ok(Box::new(QwenImage21 {

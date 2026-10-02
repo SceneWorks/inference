@@ -632,6 +632,45 @@ impl QwenImage21Transformer {
         visitor("proj_out", &mut self.proj_out)
     }
 
+    /// The weight-free twin of [`Self::visit_adaptable_mut`]: every adaptable projection's dotted
+    /// key and `[out, in]` base shape, in the same order, derived from `cfg` alone (sc-24157). The
+    /// adapter preflight and the memory contract resolve adapter targets against this before any
+    /// DiT weight is read; a test pins it to the visitor walk of a loaded DiT.
+    pub fn adaptable_projections(cfg: &TransformerConfig) -> Vec<(String, (usize, usize))> {
+        let inner = cfg.inner_dim();
+        let hidden = inner * cfg.mlp_ratio;
+        let mut out = vec![
+            ("img_in".to_owned(), (inner, cfg.in_channels)),
+            ("txt_in.in_layer".to_owned(), (inner, cfg.context_in_dim)),
+            ("txt_in.out_layer".to_owned(), (inner, inner)),
+            (
+                "time_text_embed.timestep_embedder.linear_1".to_owned(),
+                (inner, TIMESTEP_DIM),
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2".to_owned(),
+                (inner, inner),
+            ),
+            ("modulation.1".to_owned(), (4 * inner, inner)),
+        ];
+        for index in 0..cfg.num_layers {
+            for (name, shape) in [
+                ("attn.to_q", (inner, inner)),
+                ("attn.to_k", (inner, inner)),
+                ("attn.to_v", (inner, inner)),
+                ("attn.to_out.0", (inner, inner)),
+                ("img_mlp.gate_layer", (hidden, inner)),
+                ("img_mlp.proj", (hidden, inner)),
+                ("img_mlp.out", (inner, hidden)),
+            ] {
+                out.push((format!("transformer_blocks.{index}.{name}"), shape));
+            }
+        }
+        out.push(("norm_out.linear".to_owned(), (inner, inner)));
+        out.push(("proj_out".to_owned(), (cfg.out_channels, inner)));
+        out
+    }
+
     pub fn config(&self) -> &TransformerConfig {
         &self.cfg
     }
