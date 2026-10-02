@@ -1061,6 +1061,9 @@ fn every_lora_spelling_applies_to_exactly_its_targets_on_dense_and_packed() {
     }
 }
 
+/// One third-party LyCORIS LoKr layout: its name, key spelling and factor set.
+type LycorisLayout = (&'static str, fn(&str) -> String, LycorisFactors);
+
 /// The factor set of one third-party LyCORIS LoKr module.
 #[derive(Clone, Copy)]
 enum LycorisFactors {
@@ -1131,7 +1134,7 @@ fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
         "transformer_blocks.1.img_mlp.gate_layer",
         "norm_out.linear",
     ];
-    let layouts: [(&str, fn(&str) -> String, LycorisFactors); 4] = [
+    let layouts: [LycorisLayout; 4] = [
         ("lycoris_ low-rank", lycoris, LycorisFactors::LowRank),
         ("lora_unet_ full", kohya, LycorisFactors::Full),
         (
