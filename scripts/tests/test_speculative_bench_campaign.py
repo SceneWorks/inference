@@ -801,15 +801,18 @@ OPTIONS = ("off", {"proposer": "mtp", "depth": 3}, "auto")
 
 
 def document(
-    run, *, effective=None, prefix_cache_bytes=0, value=None, epic_sha=EPIC_SHA, row_extra=None,
-    **overrides,
+    run, *, effective=None, switch_env=None, prefix_cache_bytes=0, value=None, epic_sha=EPIC_SHA,
+    row_extra=None, **overrides,
 ):
     """A synthetic benchmark document; ``value(prompt, option, metric)`` gives each in-process
-    mean, ``row_extra(prompt, option)`` extra row fields (e.g. the DecodeReport's ``proposer``)."""
+    mean, ``row_extra(prompt, option)`` extra row fields (e.g. the DecodeReport's ``proposer``);
+    ``effective`` / ``switch_env`` the provenance's effective switch values / their variables."""
     value = value or (lambda prompt, option, metric: 50.0 if metric == "decode_tok_s" else 100.0)
     switches = {name: {"env": None, "effective": None} for name in campaign.SWITCHES}
     for name, state in (effective or {}).items():
         switches[name]["effective"] = state
+    for name, env in (switch_env or {}).items():
+        switches[name]["env"] = env
     rows = []
     for prompt, prompt_class in PROMPTS:
         for option in OPTIONS:
@@ -1430,6 +1433,125 @@ class CompareTests(unittest.TestCase):
                 self.assertEqual(len(decision["unpaired"]), 1)
                 self.assertTrue(decision["unpaired"][0].endswith("/cache-on"))
                 self.assertIn("unpaired, no twin row identical but for the prefix cache", decision["reason"])
+
+    # ---- sc-24446 compare fixes: derived switches, prefix-cache miss / hit samples
+
+    def graphs_twin(self, row_id, graphs, speed, stream_env=None):
+        """A CUDA-graphs row as the harness records it: the stream switch's effective value
+        follows the graph switch (own with graphs on, legacy off) unless ``stream_env`` sets it."""
+        stream = stream_env or ("own" if graphs else "legacy")
+        switches = {"CANDLE_LLM_CUDA_GRAPHS": "1" if graphs else "0"}
+        if stream_env:
+            switches["CANDLE_LLM_CUDA_STREAM"] = stream_env
+
+        def make(run, k):
+            return document(
+                run,
+                effective={"CANDLE_LLM_CUDA_GRAPHS": graphs, "CANDLE_LLM_CUDA_STREAM": stream},
+                switch_env=switches,
+                value=lambda p, o, m: (speed if m == "decode_tok_s" else 100.0) + jitter(k),
+            )
+
+        return {"id": row_id, "runs": ["epic"], "switches": switches, "document": make}
+
+    def test_a_derived_switch_left_unset_does_not_break_the_graphs_twin(self) -> None:
+        # The stream follows the graph switch (own vs legacy) with its variable unset: still twins.
+        decision = self.decisions(
+            [self.graphs_twin("on", True, 60.0), self.graphs_twin("off", False, 50.0)]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual((decision["pairs"], decision["outcome"]), (1, "on"))
+        self.assertEqual(decision["unpaired"], [])
+        self.assertEqual(len(decision["judged"]), 2 * len(PROMPTS) * len(OPTIONS))
+        # Set explicitly to the same stream on both rows, the stream is part of the key and equal.
+        same = self.decisions(
+            [
+                self.graphs_twin("on", True, 60.0, stream_env="own"),
+                self.graphs_twin("off", False, 50.0, stream_env="own"),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual(same["pairs"], 1)
+        # Set explicitly to different streams (or on one row only), the rows measured different
+        # streams on purpose: not twins, both named unpaired.
+        for name, off_row in {
+            "different": self.graphs_twin("off", False, 50.0, stream_env="legacy"),
+            "one side": self.graphs_twin("off", False, 50.0),
+        }.items():
+            with self.subTest(name):
+                decision = self.decisions(
+                    [self.graphs_twin("on", True, 60.0, stream_env="own"), off_row]
+                )["CANDLE_CUDA.cuda_graphs"]
+                self.assertEqual((decision["pairs"], decision["outcome"]), (0, "unmeasured"))
+                self.assertEqual(len(decision["unpaired"]), 2)
+
+    def cache_samples_row(self, row_id, budget, miss_ttft, hit_ttft, *, miss_hit_tokens=0):
+        """A prefix-cache row whose per-sample TTFTs are a miss (sample 0, ``miss_hit_tokens``
+        restored) then a hit (sample 1, the whole prompt but its last token restored); a
+        cache-off row (``budget`` 0) runs two cold samples at ``miss_ttft``."""
+        prompt_tokens = 40
+
+        def make(run, k):
+            def samples(prompt, option):
+                cold = {"prefix_hit_tokens": 0, "ttft_ms": miss_ttft + jitter(k), "decode_tok_s": 50.0 + jitter(k)}
+                if not budget:
+                    return {"samples": [cold, dict(cold)]}
+                miss = {**cold, "prefix_hit_tokens": miss_hit_tokens}
+                hit = {
+                    "prefix_hit_tokens": prompt_tokens - 1,
+                    "ttft_ms": hit_ttft + jitter(k),
+                    "decode_tok_s": 50.0 + jitter(k),
+                }
+                return {"samples": [miss, hit], "prompt_tokens": prompt_tokens}
+
+            def mean(prompt, option, metric):
+                values = [s[metric] for s in samples(prompt, option)["samples"]]
+                return sum(values) / len(values)
+
+            return document(run, prefix_cache_bytes=budget, value=mean, row_extra=samples)
+
+        env = {"SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": str(budget)} if budget else {}
+        return {"id": row_id, "runs": ["epic"], "env": env, "document": make}
+
+    def test_prefix_cache_judges_the_miss_and_hit_samples_separately(self) -> None:
+        off_row = self.cache_samples_row("cache-off", 0, 100.0, 100.0)
+        # A miss that costs 50 % more and a hit that saves 80 %: the mixed mean (105) would be
+        # within noise of the cold 100, the miss path alone is a regression -> off.
+        slower_miss = self.decisions(
+            [self.cache_samples_row("cache-on", 1 << 30, 150.0, 20.0), off_row]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual((slower_miss["pairs"], slower_miss["outcome"]), (1, "off"))
+        by_samples = {
+            samples: {j["verdict"] for j in slower_miss["judged"] if j["samples"] == samples and j["metric"] == "ttft_ms"}
+            for samples in ("miss", "hit")
+        }
+        self.assertEqual(by_samples, {"miss": {"regression"}, "hit": {"pass"}})
+        self.assertIn("[miss samples] ttft_ms +50.0%", slower_miss["reason"])
+        self.assertIn("hit samples: ", slower_miss["reason"])
+        self.assertIn("ttft_ms Δ -80.0..-80.0%", slower_miss["reason"])
+        # A miss as fast as no cache and a hit that saves 80 %: on, the hit's gain reported.
+        free_miss = self.decisions(
+            [self.cache_samples_row("cache-on", 1 << 30, 100.0, 20.0), off_row]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual(free_miss["outcome"], "on")
+        cells = len(PROMPTS) * len(OPTIONS) * len(campaign.METRICS)
+        self.assertIn(f"hit samples: {cells} judged, {cells} pass", free_miss["reason"])
+        self.assertIn("ttft_ms Δ -80.0..-80.0%", free_miss["reason"])
+        # A slower hit is a regression too.
+        slower_hit = self.decisions(
+            [self.cache_samples_row("cache-on", 1 << 30, 100.0, 150.0), off_row]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual(slower_hit["outcome"], "off")
+        self.assertIn("[hit samples] ttft_ms +50.0%", slower_hit["reason"])
+        # A first sample that restored only a few shared template tokens is still a miss.
+        template = self.decisions(
+            [self.cache_samples_row("cache-on", 1 << 30, 150.0, 20.0, miss_hit_tokens=3), off_row]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual(template["outcome"], "off")
+        self.assertIn("[miss samples] ttft_ms +50.0%", template["reason"])
+        # Documents without per-sample hits are judged on their in-process means, unsplit.
+        legacy = self.decisions(
+            [self.cache_row("cache-on", 1 << 30, 140.0), self.cache_row("cache-off", 0, 100.0)]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual({j["samples"] for j in legacy["judged"]}, {None})
 
     def test_a_justified_default_with_a_measured_pair_is_reported_as_informational(self) -> None:
         def pipe_row(row_id, state, ttft):

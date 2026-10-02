@@ -898,13 +898,14 @@ impl SpeculativeRun {
 /// unread token would advance.
 ///
 /// ## Demotion (sc-24446)
-/// Under `auto` ([`EngineOptions::speculative_mode`]), the run's first
-/// [`ACCEPTANCE_PROBE_VERIFIES`](core_llm::ACCEPTANCE_PROBE_VERIFIES) verify steps decide whether
-/// the proposer pays for itself; below its break-even the run is **demoted**: no further step
-/// proposes, asks for hidden rows or commits to the proposer, and — where the draws allow
-/// pipelining — the rest of the run is handed to the pipelined token-at-a-time loop (otherwise it
-/// continues as unpipelined single-token verify steps). The output is unchanged: a step without
-/// drafts is the plain loop's draw. [`DecodeReport::speculative_demoted_at`] records where.
+/// Under `auto` ([`EngineOptions::speculative_mode`]), every window of
+/// [`ACCEPTANCE_PROBE_VERIFIES`](core_llm::ACCEPTANCE_PROBE_VERIFIES) verify steps decides whether
+/// the proposer is paying for itself; at the first window below its break-even the run is
+/// **demoted**: no further step proposes, asks for hidden rows or commits to the proposer, and —
+/// where the draws allow pipelining — the rest of the run is handed to the pipelined
+/// token-at-a-time loop (otherwise it continues as unpipelined single-token verify steps). The
+/// output is unchanged: a step without drafts is the plain loop's draw.
+/// [`DecodeReport::speculative_demoted_at`] records where.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_speculative<T, P>(
     target: &T,
@@ -4181,6 +4182,8 @@ pub(crate) mod tests {
         Wrong,
         /// Nothing: every step is an ordinary single-token draw.
         Empty,
+        /// [`Script::Right`] for the first `n` proposals, [`Script::Wrong`] after: a late loser.
+        RightFor(usize),
     }
 
     /// A test proposer of a chosen kind drafting up to `max_drafts` tokens every step by its
@@ -4237,6 +4240,7 @@ pub(crate) mod tests {
                     .take(ctx.max_drafts)
                     .map(|&t| match script {
                         Script::Right => t,
+                        Script::RightFor(n) if self.proposals <= n => t,
                         _ => (t + 1) % self.vocab,
                     })
                     .collect(),
@@ -4314,8 +4318,8 @@ pub(crate) mod tests {
     const DEMOTED_AT: u64 = 1 + WINDOW as u64;
 
     /// sc-24446: under `auto`, prompt lookup below its break-even on the pipelinable MLX path is
-    /// demoted after the probe window — never proposed to or committed to again — and the rest of
-    /// the run is the pipelined plain loop (one handoff step, then every remaining token
+    /// demoted at the end of its first window — never proposed to or committed to again — and the
+    /// rest of the run is the pipelined plain loop (one handoff step, then every remaining token
     /// pipelined); the output is the plain greedy loop's, the report records the demotion, and
     /// the forward accounting holds — on the causal and the hybrid (checkpoint-ring) targets.
     #[test]
@@ -4425,7 +4429,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A demoted run stops asking the target for hidden rows: the prefill and the probe window's
+    /// A demoted run stops asking the target for hidden rows: the prefill and the first window's
     /// verify steps do (the proposer wants them), no forward after the demotion does — pipelined
     /// or not.
     #[test]
@@ -4566,12 +4570,35 @@ pub(crate) mod tests {
         assert_eq!(run.stats.pipelined, 0);
         assert!(
             run.report.verify_steps > WINDOW as u64,
-            "the run outlasts the probe window: {:?}",
+            "the run outlasts the first window: {:?}",
             run.report
         );
         // Every step proposes but one the budget clamped to no drafts.
         assert!(right.proposals as u64 + 1 >= run.report.verify_steps);
         assert_accounting("paying", &run, &config);
+    }
+
+    /// sc-24446 (rolling windows): a lookup that pays for its first window and then stops
+    /// accepting is demoted at the end of its first failing window — not at the first window (it
+    /// passed), and not never (the one-shot decision kept it) — the rest handed to the pipelined
+    /// plain loop, and the output still the plain greedy loop's.
+    #[test]
+    fn a_late_loser_is_demoted_at_its_first_failing_window() {
+        let model = causal();
+        let config = greedy(120);
+        let expected = plain(&model, &PROMPT, &config, None).tokens;
+        let script = Script::RightFor(WINDOW);
+        let mut late = Scripted::new(&expected, script, ProposerKind::PromptLookup, 24);
+        let run = monitored(&model, &mut late, &config, 4, AUTO, Pipelining::Auto);
+        assert_eq!(run.output.tokens, expected, "demotion changed the output");
+        // The first window commits 5 tokens per step (4 accepted + the bonus), the failing one 1.
+        let demoted_at = 1 + 5 * WINDOW + WINDOW;
+        assert_eq!(run.report.speculative_demoted_at, Some(demoted_at as u64));
+        assert_eq!((late.proposals, late.commits), (2 * WINDOW, 2 * WINDOW));
+        assert_eq!(run.report.accepted_tokens, 4 * WINDOW as u64);
+        // After the handoff step, every remaining token but the last is a pipelined look-ahead.
+        assert_eq!(run.stats.pipelined, 120 - demoted_at - 1);
+        assert_accounting("late loser", &run, &config);
     }
 
     /// An explicit `{proposer, depth}` is the caller's choice: no monitor, so a losing proposer

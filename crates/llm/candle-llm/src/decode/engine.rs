@@ -361,9 +361,11 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
 /// explicit proposer, `off` — is [`generate_speculative_with`].
 ///
 /// ## Demotion (sc-24446)
-/// The run's first [`ACCEPTANCE_PROBE_VERIFIES`](core_llm::ACCEPTANCE_PROBE_VERIFIES) verify steps
-/// decide whether the proposer pays for itself; below its break-even the run is demoted to this
-/// engine's ordinary token-at-a-time steps for the rest of the request — exactly the steps a
+/// Every window of [`ACCEPTANCE_PROBE_VERIFIES`](core_llm::ACCEPTANCE_PROBE_VERIFIES) verify steps
+/// decides whether the proposer is paying for itself; the first window below its break-even
+/// ([`core_llm::demotion_threshold`] against [`PlainDecode::Candle`] — MTP or prompt lookup)
+/// demotes the run to this engine's ordinary token-at-a-time steps for the rest of the request —
+/// exactly the steps a
 /// [`NoProposer`] run takes (`K = 0`, through the same stepper, so a CUDA-graph runner replays
 /// them as it would a plain run's): no further step proposes, asks for hidden rows or commits to
 /// the proposer (an MTP head or a draft model then runs no forward of its own). The output is
@@ -2744,6 +2746,25 @@ mod tests {
         Wrong,
         /// Nothing: every step is an ordinary single-token draw.
         Empty,
+        /// [`Script::Right`] for the first `n` proposals, [`Script::Wrong`] after: a late loser.
+        RightFor(usize),
+        /// On every `every`-th proposal (the first included) the first `right` drafts are the
+        /// plain continuation and the rest wrong — `right` accepted; every other proposal wrong.
+        Partial { every: usize, right: usize },
+    }
+
+    impl Script {
+        /// Whether draft `index` of the `proposal`-th proposal (1-based) is the plain token.
+        fn right(self, proposal: usize, index: usize) -> bool {
+            match self {
+                Script::Right => true,
+                Script::Wrong | Script::Empty => false,
+                Script::RightFor(n) => proposal <= n,
+                Script::Partial { every, right } => {
+                    (proposal - 1).is_multiple_of(every) && index < right
+                }
+            }
+        }
     }
 
     /// A test proposer of a chosen kind drafting up to `max_drafts` tokens every step by its
@@ -2797,9 +2818,13 @@ mod tests {
                 script => self.expected[at.min(self.expected.len())..]
                     .iter()
                     .take(ctx.max_drafts)
-                    .map(|&t| match script {
-                        Script::Right => t,
-                        _ => (t + 1) % self.vocab,
+                    .enumerate()
+                    .map(|(i, &t)| {
+                        if script.right(self.proposals, i) {
+                            t
+                        } else {
+                            (t + 1) % self.vocab
+                        }
                     })
                     .collect(),
             };
@@ -2911,8 +2936,8 @@ mod tests {
         );
     }
 
-    /// sc-24446: under `auto` an MTP-kind proposer below its break-even is demoted after the
-    /// probe window — never proposed to, committed to or asked for hidden rows again — and the
+    /// sc-24446: under `auto` an MTP-kind proposer below its break-even is demoted at the end of
+    /// its first window — never proposed to, committed to or asked for hidden rows again — and the
     /// rest of the run is the engine's ordinary token-at-a-time steps: the reference loop's greedy
     /// tokens, the demotion on the record and its report, the forward accounting intact.
     #[test]
@@ -2949,33 +2974,84 @@ mod tests {
         // Every token after the first is one verify step; every forward is the prefill or one.
         assert_eq!(run.stats.verify_steps, 39);
         assert_forward_accounting("mtp kind", &run);
-        // The prefill and the probe window ask for hidden rows; no step after the demotion does.
+        // The prefill and the first window ask for hidden rows; no step after the demotion does.
         let hidden = logged.hidden.into_inner();
         assert_eq!(hidden.len(), run.stats.forwards);
         assert!(hidden[..1 + WINDOW].iter().all(|&h| h), "{hidden:?}");
         assert!(hidden[1 + WINDOW..].iter().all(|&h| !h), "{hidden:?}");
     }
 
-    /// E5 (sc-24446 review): Candle has no pipelined loop, so a prompt-lookup step forfeits
-    /// nothing a demotion would win back and no campaign measured a lookup regression here — a
-    /// losing lookup under `auto` runs to the end, undemoted, with the reference loop's tokens.
+    /// E5 (sc-24446): prompt lookup under `auto` is demoted on Candle below its measured
+    /// break-even (cuda-campaign-a; 0.21 accepted drafts per verify at depth 4): a never-accepting
+    /// lookup at the end of its first window, with the reference loop's tokens; a lookup accepting
+    /// 3 drafts per 16-verify window (0.1875) is demoted at its first window too, one accepting 4
+    /// (0.25) is kept to the end.
     #[test]
-    fn auto_never_demotes_prompt_lookup_on_candle() {
+    fn auto_demotes_prompt_lookup_on_candle_below_its_threshold() {
         let (_cfg, model) = text_model();
+        let vocab = model.vocab_size();
         let config = greedy(40);
         let expected = reference(&model, &PROMPT, &config).tokens;
-        let mut wrong = Scripted::new(
-            &expected,
-            Script::Wrong,
-            ProposerKind::PromptLookup,
-            model.vocab_size(),
-        );
+        let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, vocab);
         let run = monitored(&model, &mut wrong, &config, 4, AUTO);
         assert_eq!(run.output.tokens, expected);
-        assert_eq!(run.record.speculative_demoted_at, None);
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_eq!((wrong.proposals, wrong.commits), (WINDOW, WINDOW));
         assert_eq!(run.stats.accepted, 0);
-        // Every step but the budget-clamped last one proposes.
-        assert_eq!(wrong.proposals, run.stats.verify_steps - 1);
+        assert_forward_accounting("lookup", &run);
+
+        let config = greedy(96);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        for (right, demoted) in [(3, true), (4, false)] {
+            let script = Script::Partial {
+                every: WINDOW,
+                right,
+            };
+            let mut partial = Scripted::new(&expected, script, ProposerKind::PromptLookup, vocab);
+            let run = monitored(&model, &mut partial, &config, 4, AUTO);
+            assert_eq!(run.output.tokens, expected, "{right} right");
+            // The first window: the right proposal's drafts plus one token per verify step.
+            let first_window = (1 + right + WINDOW) as u64;
+            assert_eq!(
+                run.record.speculative_demoted_at,
+                demoted.then_some(first_window),
+                "{right} right"
+            );
+            if !demoted {
+                assert!(run.stats.verify_steps > 3 * WINDOW, "{:?}", run.stats);
+                assert!(partial.proposals + 1 >= run.stats.verify_steps);
+            }
+            assert_forward_accounting("partial", &run);
+        }
+    }
+
+    /// sc-24446 (rolling windows): a proposer that pays for its first window and then stops
+    /// accepting is demoted at the end of its first failing window — not at the first window (it
+    /// passed), and not never (the one-shot decision kept it) — and the run's tokens are still the
+    /// reference loop's, the steps after the demotion plain.
+    #[test]
+    fn a_late_loser_is_demoted_at_its_first_failing_window() {
+        let (_cfg, model) = text_model();
+        let config = greedy(96);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let logged = HiddenLog {
+            inner: &model,
+            hidden: Default::default(),
+        };
+        let script = Script::RightFor(WINDOW);
+        let mut late = Scripted::new(&expected, script, ProposerKind::Mtp, model.vocab_size());
+        late.wants_hidden = true;
+        let run = monitored(&logged, &mut late, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected, "demotion changed the output");
+        // The first window commits 3 tokens per step (2 accepted + the bonus), the failing one 1.
+        let demoted_at = 1 + 3 * WINDOW + WINDOW;
+        assert_eq!(run.record.speculative_demoted_at, Some(demoted_at as u64));
+        assert_eq!((late.proposals, late.commits), (2 * WINDOW, 2 * WINDOW));
+        assert_eq!(run.stats.accepted, 2 * WINDOW);
+        assert_forward_accounting("late loser", &run);
+        let hidden = logged.hidden.into_inner();
+        assert!(hidden[..1 + 2 * WINDOW].iter().all(|&h| h), "{hidden:?}");
+        assert!(hidden[1 + 2 * WINDOW..].iter().all(|&h| !h), "{hidden:?}");
     }
 
     /// The edges of the demotion: a budget one token past the demotion point (the first plain
@@ -3049,7 +3125,7 @@ mod tests {
     #[test]
     fn auto_keeps_a_proposer_that_pays_for_itself() {
         let (_cfg, model) = text_model();
-        let config = greedy(96);
+        let config = greedy(112);
         let expected = reference(&model, &PROMPT, &config).tokens;
         let mut right = Scripted::new(
             &expected,
@@ -3061,8 +3137,8 @@ mod tests {
         assert_eq!(run.output.tokens, expected);
         assert_eq!(run.record.speculative_demoted_at, None);
         assert!(
-            run.stats.verify_steps > WINDOW,
-            "the run outlasts the probe window: {:?}",
+            run.stats.verify_steps > 2 * WINDOW,
+            "the run outlasts several windows: {:?}",
             run.stats
         );
         // Every step proposes but one the budget clamped to no drafts.

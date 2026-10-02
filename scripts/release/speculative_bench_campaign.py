@@ -130,6 +130,13 @@ MLX_SWITCHES = (
 )
 # `core_llm_testkit::BENCH_SWITCHES`.
 SWITCHES = CANDLE_SWITCHES + MLX_SWITCHES
+# Switches whose *effective* value follows another switch's while their own variable is unset:
+# the CUDA stream is candle's own stream when the CUDA-graph runner is on and the legacy stream
+# when it is off (`crates/llm/candle-llm/src/device.rs`, `CudaStreamKind::resolve`). Two rows that
+# differ only in the graph switch therefore also differ in the stream's effective value, so the
+# E5 twin key leaves a derived switch out while its variable is unset; a derived switch set
+# explicitly stays in the key and still separates twins.
+DERIVED_SWITCHES = {"CANDLE_LLM_CUDA_GRAPHS": ("CANDLE_LLM_CUDA_STREAM",)}
 ROW_KEYS = {
     "id",
     "snapshot",
@@ -1218,6 +1225,50 @@ def metric_values(processes: list[Process], prompt_id: str, option: str, metric:
     return [float(v) for v in values if isinstance(v, (int, float))]
 
 
+def _is_hit(sample: dict[str, Any], prompt_tokens: int) -> bool:
+    """Whether a sample was a prefix-cache **hit**: the restored prefix covered at least half its
+    prompt, so its prefill skipped most of it. Less — nothing, or the few chat-template tokens a
+    different earlier prompt shares (3–4 on the MLX campaigns) — is a miss: its prefill ran
+    (nearly) the whole prompt and it paid whatever the cache costs on that path."""
+    return 2 * sample["prefix_hit_tokens"] >= prompt_tokens > 0
+
+
+def sample_values(
+    processes: list[Process], prompt_id: str, option: str, metric: str, hit: bool
+) -> list[float]:
+    """One value per process: the mean of its per-sample ``metric`` over the samples that hit the
+    cross-turn prefix cache (``hit``, :func:`_is_hit`) or missed it. A process with no such
+    sample contributes nothing."""
+    values = []
+    for process in processes:
+        table, _ = rows_by_key(process)
+        row = table.get((prompt_id, option)) or {}
+        picked = [
+            float(s[metric])
+            for s in row.get("samples") or []
+            if isinstance(s.get(metric), (int, float))
+            and _is_hit(s, row["prompt_tokens"]) == hit
+        ]
+        if picked:
+            values.append(sum(picked) / len(picked))
+    return values
+
+
+def _splits_by_hit(processes: list[Process], prompt_id: str, option: str) -> bool:
+    """Whether every process's row for ``(prompt_id, option)`` records its prompt length and
+    per-sample ``prefix_hit_tokens`` (a document without them is judged on its in-process
+    mean)."""
+    for process in processes:
+        table, _ = rows_by_key(process)
+        row = table.get((prompt_id, option)) or {}
+        samples = row.get("samples") or []
+        if not isinstance(row.get("prompt_tokens"), int) or not samples:
+            return False
+        if not all(isinstance(s.get("prefix_hit_tokens"), int) for s in samples):
+            return False
+    return True
+
+
 def within_process_stddev(
     processes: list[Process], prompt_id: str, option: str, metric: str
 ) -> float | None:
@@ -1404,10 +1455,15 @@ def _context(process: Process, exclude_switch: str | None, include_cache: bool) 
     config.pop("switch_env")
     config["runs"] = process.row_entry.get("runs")
     switches = (process.document.get("provenance") or {}).get("switches") or {}
+    excluded = {exclude_switch} | {
+        derived
+        for derived in DERIVED_SWITCHES.get(exclude_switch or "", ())
+        if (switches.get(derived) or {}).get("env") is None
+    }
     config["effective"] = {
         name: (value or {}).get("effective")
         for name, value in switches.items()
-        if name != exclude_switch
+        if name not in excluded
     }
     if include_cache:
         config["prefix_cache"] = _prefix_cache_on(process)
@@ -1478,6 +1534,7 @@ def _e5_outcome(entry: dict[str, Any], judged: list[dict[str, Any]]) -> dict[str
         f"{count['inconclusive']} inconclusive ({unbanded} of them n<2, no process-level band), "
         f"{count['not_applicable']} not applicable"
     )
+    tally += _sample_split_note(judged)
     regressions = [j for j in judged if j["verdict"] == "regression"]
     if not judged:
         reason = "no on/off pair of this setting in the campaigns"
@@ -1486,8 +1543,9 @@ def _e5_outcome(entry: dict[str, Any], judged: list[dict[str, Any]]) -> dict[str
         return {"outcome": "unmeasured", "recommended_on": None, "reason": reason}
     if regressions:
         where = "; ".join(
-            f"{j['model']} {j['on_row']} vs {j['off_row']} {j['prompt_id']} `{j['option']}` "
-            f"{j['metric']} {j['delta_pct']:+.1f}% (band ±{j['margin_pct']:.1f}%)"
+            f"{j['model']} {j['on_row']} vs {j['off_row']} {j['prompt_id']} `{j['option']}`"
+            f"{_samples_label(j)} {j['metric']} {j['delta_pct']:+.1f}% "
+            f"(band ±{j['margin_pct']:.1f}%)"
             for j in regressions
         )
         return {
@@ -1506,6 +1564,33 @@ def _e5_outcome(entry: dict[str, Any], judged: list[dict[str, Any]]) -> dict[str
         "recommended_on": True,
         "reason": f"no on/off pair resolved and none regressed, so E5 keeps it on ({tally})",
     }
+
+
+def _samples_label(judged: dict[str, Any]) -> str:
+    samples = judged.get("samples")
+    return f" [{samples} samples]" if samples else ""
+
+
+def _sample_split_note(judged: list[dict[str, Any]]) -> str:
+    """The prefix cache's miss and hit samples, each tallied with its measured Δ range per metric
+    (a hit's gain is reported here; a regression on either decides the outcome)."""
+    notes = []
+    for samples in ("miss", "hit"):
+        part = [j for j in judged if j.get("samples") == samples]
+        if not part:
+            continue
+        verdicts = {v: sum(j["verdict"] == v for j in part) for v in VERDICT_ORDER}
+        ranges = []
+        for metric in METRICS:
+            deltas = [j["delta_pct"] for j in part if j["metric"] == metric and j["delta_pct"] is not None]
+            if deltas:
+                ranges.append(f"{metric} Δ {min(deltas):+.1f}..{max(deltas):+.1f}%")
+        notes.append(
+            f"{samples} samples: {len(part)} judged, {verdicts['pass']} pass, "
+            f"{verdicts['regression']} regression, {verdicts['inconclusive']} inconclusive"
+            + (f" ({', '.join(ranges)})" if ranges else "")
+        )
+    return "; " + "; ".join(notes) if notes else ""
 
 
 def decide_defaults(
@@ -1536,15 +1621,30 @@ def decide_defaults(
                     plain = entry["kind"] == "speculative" and _resolved_to_plain_decode(
                         on, prompt_id, on_option
                     )
-                    for metric, higher in METRICS.items():
+                    # A prefix-cache row's samples are a cold miss (the first) and warm hits: a
+                    # mean over both hides a miss-path regression behind the hits' gain, so each
+                    # is judged on its own against the cache-off twin (every sample of which is
+                    # a cold request, so its in-process mean is the reference for both).
+                    splits: tuple[str | None, ...] = (None,)
+                    if entry["kind"] == "prefix_cache" and _splits_by_hit(on, prompt_id, on_option):
+                        splits = ("miss", "hit")
+                    cells = [(m, h, s) for m, h in METRICS.items() for s in splits]
+                    for metric, higher, samples in cells:
                         if plain:
                             result = {
                                 "verdict": "not_applicable",
                                 "reason": f"`{on_option}` resolved to plain decode (no proposer)",
                             }
                         else:
+                            candidate = (
+                                metric_values(on, prompt_id, on_option, metric)
+                                if samples is None
+                                else sample_values(
+                                    on, prompt_id, on_option, metric, samples == "hit"
+                                )
+                            )
                             result = verdict(
-                                metric_values(on, prompt_id, on_option, metric),
+                                candidate,
                                 metric_values(off, prompt_id, off_option, metric),
                                 higher,
                                 max_noise,
@@ -1561,6 +1661,7 @@ def decide_defaults(
                                 if on_option != off_option
                                 else on_option,
                                 "metric": metric,
+                                "samples": samples,
                                 "on_n": len(on),
                                 "off_n": len(off),
                                 "verdict": result["verdict"],
@@ -1717,7 +1818,8 @@ def markdown_report(report: dict[str, Any]) -> str:
         for j in d["judged"]:
             lines.append(
                 f"| `{d['entry']}` | {j['model']} | {j['on_row']} | {j['off_row']} | "
-                f"{j['prompt_id']} | `{j['option']}` | {j['metric']} | {j['on_n']}/{j['off_n']} | "
+                f"{j['prompt_id']} | `{j['option']}`{_samples_label(j)} | {j['metric']} | "
+                f"{j['on_n']}/{j['off_n']} | "
                 f"{_fmt(j['delta_pct'])} | {_fmt(j['margin_pct'])} | {j['verdict']} | {j['reason']} |"
             )
     if report.get("incomplete"):
