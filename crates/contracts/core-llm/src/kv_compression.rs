@@ -322,8 +322,15 @@ pub struct KvCacheCounters {
     /// dequantized that sequence's pages for the one call and kept nothing dense afterwards.
     pub dense_gather_fallbacks: u64,
     /// Device bytes the compressed representation retained at the end of the generation (codes,
-    /// scale/zero metadata and the bounded not-yet-quantized residual).
+    /// scale/zero metadata and the bounded not-yet-quantized residual). For a paged cache this is
+    /// the generation's own live pages, not the shared pool's capacity — see
+    /// [`Self::pool_held_bytes`].
     pub compressed_cache_bytes: u64,
+    /// Device bytes the shared page pool held when the generation finished: every sequence's
+    /// pages plus the pool's unused capacity (sc-20681). What the paged cache actually holds
+    /// resident, as opposed to this generation's live share. `0` for a cache without a shared
+    /// pool.
+    pub pool_held_bytes: u64,
 }
 
 /// The KV cache one generation ran on, carried on

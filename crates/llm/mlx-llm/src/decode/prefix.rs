@@ -35,8 +35,8 @@ use std::rc::Rc;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache, SEQ_AXIS};
 use crate::primitives::sampler::SplitMix64;
 use crate::primitives::{
-    input_ids, CacheRoute, CompiledKernelHandle, PackedPagePool, PagedCacheIdentity,
-    PagedCacheSnapshot, PagedPackedKvCache,
+    input_ids, token_digest, CacheRoute, CompiledKernelHandle, PackedPagePool, PagedCacheIdentity,
+    PagedCacheSnapshot, PagedModelKey, PagedPackedKvCache,
 };
 
 /// Cumulative reuse accounting for a [`PrefixCache`] — the measurable payoff of story 7168.
@@ -564,6 +564,7 @@ struct PagedPrefixEntry {
 /// the page layout version and the page geometry — and the token prefix. A lookup, store or
 /// restore under any other identity is refused and counted, never served from or into this store.
 pub struct PagedPrefixCache {
+    model: PagedModelKey,
     identity: PagedCacheIdentity,
     pool: Rc<RefCell<PackedPagePool>>,
     index: PrefixIndex,
@@ -572,10 +573,12 @@ pub struct PagedPrefixCache {
 }
 
 impl PagedPrefixCache {
-    /// A store of at most `capacity` sequences on `pool`, for caches computed by `model`.
-    pub fn new(pool: Rc<RefCell<PackedPagePool>>, model: &str, capacity: usize) -> Self {
-        let identity = pool.borrow().identity(model);
+    /// A store of at most `capacity` sequences on `pool`, for caches computed by `model` (its
+    /// name and [`crate::models::CausalLm::cache_fingerprint`]).
+    pub fn new(pool: Rc<RefCell<PackedPagePool>>, model: PagedModelKey, capacity: usize) -> Self {
+        let identity = pool.borrow().identity(&model);
         Self {
+            model,
             identity,
             pool,
             index: PrefixIndex::new(capacity),
@@ -613,6 +616,11 @@ impl PagedPrefixCache {
             .flat_map(|entry| entry.cache.page_ids().iter().copied())
             .collect::<std::collections::BTreeSet<_>>()
             .len()
+    }
+
+    /// Count a request whose run could not use this store (another identity, or no identity).
+    pub fn record_refusal(&mut self) {
+        self.stats.refused += 1;
     }
 
     fn refuse(&mut self, identity: &PagedCacheIdentity) -> Option<String> {
@@ -676,38 +684,45 @@ impl PagedPrefixCache {
             return Ok(false);
         }
         let (entry, held) = cache.fork_prefix(held)?;
-        self.store(tokens[..held].to_vec(), entry);
+        self.store(tokens[..held].to_vec(), entry)?;
         Ok(true)
     }
 
-    fn store(&mut self, tokens: Vec<i32>, cache: PagedPackedKvCache) {
+    fn store(&mut self, tokens: Vec<i32>, cache: PagedPackedKvCache) -> Result<()> {
         let outcome = self.index.insert(tokens.clone());
+        let mut released = false;
         for evicted in &outcome.evicted {
-            self.entries.remove(evicted);
+            released |= self.entries.remove(evicted).is_some();
         }
         if self.index.contains(outcome.id) {
-            self.entries
-                .insert(outcome.id, PagedPrefixEntry { tokens, cache });
+            released |= self
+                .entries
+                .insert(outcome.id, PagedPrefixEntry { tokens, cache })
+                .is_some();
         }
         self.stats.stored += 1;
+        if released {
+            // An evicted or replaced entry may have held the pool's top pages.
+            self.pool.borrow_mut().trim()?;
+        }
+        Ok(())
     }
 
-    /// Every stored sequence as `(tokens, snapshot)`, for saving across a process restart.
+    /// Every stored sequence as `(tokens, snapshot)`, each snapshot bound to its tokens
+    /// ([`PagedCacheSnapshot::bound_to`]), for saving across a process restart.
     pub fn snapshots(&self) -> Result<Vec<(Vec<i32>, PagedCacheSnapshot)>> {
         self.entries
             .values()
             .map(|entry| {
-                Ok((
-                    entry.tokens.clone(),
-                    entry.cache.snapshot(&self.identity.model)?,
-                ))
+                let snapshot = entry.cache.snapshot(&self.model)?.bound_to(&entry.tokens)?;
+                Ok((entry.tokens.clone(), snapshot))
             })
             .collect()
     }
 
     /// Restore a saved sequence into the store, read by `reader`. Refused — and counted — unless
-    /// the snapshot carries exactly the store's identity (model, KV format and page layout
-    /// versions, geometry) and holds `tokens.len()` positions.
+    /// the snapshot carries exactly the store's identity (model and fingerprint, KV format and
+    /// page layout versions, geometry) and is bound to exactly these token ids.
     pub fn restore(
         &mut self,
         tokens: Vec<i32>,
@@ -719,25 +734,26 @@ impl PagedPrefixCache {
                 "paged prefix restore refused: {mismatch}"
             )));
         }
-        if snapshot.tokens() != tokens.len() {
+        if snapshot.tokens() != tokens.len()
+            || snapshot.tokens_sha256() != Some(token_digest(&tokens).as_str())
+        {
             self.stats.refused += 1;
             return Err(Error::Unsupported(format!(
-                "paged prefix restore refused: the snapshot holds {} positions, not the {} tokens \
-                 it is stored under",
-                snapshot.tokens(),
-                tokens.len()
+                "paged prefix restore refused: the snapshot is not bound to these {} token ids \
+                 (it holds {} positions)",
+                tokens.len(),
+                snapshot.tokens()
             )));
         }
-        let cache =
-            PagedPackedKvCache::restore(snapshot, self.pool.clone(), reader, &self.identity.model)?;
-        self.store(tokens, cache);
-        Ok(())
+        let cache = PagedPackedKvCache::restore(snapshot, self.pool.clone(), reader, &self.model)?;
+        self.store(tokens, cache)
     }
 
-    /// Drop every entry (and its page references).
-    pub fn clear(&mut self) {
+    /// Drop every entry (and its page references), returning the pool's freed capacity.
+    pub fn clear(&mut self) -> Result<()> {
         self.entries.clear();
         self.index = PrefixIndex::new(self.index.capacity());
+        self.pool.borrow_mut().trim()
     }
 }
 

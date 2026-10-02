@@ -652,6 +652,54 @@ mod compressed_tests {
         assert_eq!(drafted.tokens.len(), reference.tokens.len());
     }
 
+    /// The contiguous compressed cache cannot roll back speculation exactly (it re-stages a cut
+    /// group from its codes), so arming speculation on it moves its history to the explicit dense
+    /// fallback: the run completes position-exact and its report names a runtime fallback for
+    /// speculation instead of claiming a compressed run.
+    #[test]
+    fn speculation_on_the_contiguous_compressed_cache_falls_back_to_dense_and_says_so() {
+        let model = crate::provider::tests::tiny_causal_model(4, 2, 64);
+        let reader = crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap();
+        let (mut cache, refused) =
+            crate::kv_policy::select_compressed_cache(&model, reader, prompt().len());
+        assert_eq!(refused, None, "the request starts on the compressed cache");
+        let (output, _) = generate_prompt_lookup_on(
+            &model,
+            cache.as_mut(),
+            &prompt(),
+            &config(),
+            &SpeculativeConfig {
+                max_ngram: 3,
+                num_draft: 4,
+            },
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            cache.offset() as usize,
+            prompt().len() + output.tokens.len() - 1
+        );
+        let report = crate::kv_policy::compressed_report(
+            core_llm::KvCompressionFormat::GroupAffineK8V8,
+            None,
+            cache.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            report.fallback,
+            Some(core_llm::KvCacheFallbackReason::RuntimeFallback),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("speculation")),
+            "{report:?}"
+        );
+    }
+
     /// Records whether every rollback truncation lands inside an armed speculation window.
     struct Spy {
         inner: crate::primitives::kv_cache::ContiguousKvCache,

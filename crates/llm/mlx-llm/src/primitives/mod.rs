@@ -65,9 +65,9 @@ pub use packed_metal::{
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use paged_packed_kv::{
-    paged_packed_identity, PackedPagePool, PagedCacheIdentity, PagedCacheRequest,
-    PagedCacheSelection, PagedCacheSnapshot, PagedFallbackReason, PagedPackedKvCache,
-    PagedPoolStorage, PAGED_PACKED_LAYOUT_VERSION,
+    paged_packed_identity, token_digest, PackedPagePool, PagedCacheIdentity, PagedCacheRequest,
+    PagedCacheSelection, PagedCacheSnapshot, PagedFallbackReason, PagedModelKey,
+    PagedPackedKvCache, PagedPoolStorage, PAGED_PACKED_LAYOUT_VERSION,
 };
 pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;

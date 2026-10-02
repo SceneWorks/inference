@@ -30,9 +30,12 @@
 //! ## Pool
 //!
 //! Page ids are allocated, recycled and reference-counted by the backend-neutral
-//! [`BlockAllocator`]; freed ids are reused, so a long-running pool fragments and a sequence's page
-//! table is in general a non-contiguous, non-monotonic list of ids. The pool's arrays grow by
-//! doubling (one copy per growth) and keep their capacity, reported by [`PackedPagePool::storage`].
+//! [`BlockAllocator`]; freed ids are reused (lowest first), so a long-running pool fragments and a
+//! sequence's page table is in general a non-contiguous, non-monotonic list of ids. The pool's
+//! arrays grow by a bounded chunk ([`PackedPagePool::growth_chunk`], one copy per growth), a caller
+//! with known demand reserves it exactly ([`PackedPagePool::reserve`]), and
+//! [`PackedPagePool::trim`] returns the capacity above the highest live page (sc-20681). The held
+//! capacity is reported by [`PackedPagePool::storage`].
 //!
 //! ## Cache semantics
 //!
@@ -260,9 +263,10 @@ impl PackedPagePool {
     }
 
     /// The identity a cache of this pool carries for `model` (see [`PagedCacheIdentity`]).
-    pub fn identity(&self, model: &str) -> PagedCacheIdentity {
+    pub fn identity(&self, model: &PagedModelKey) -> PagedCacheIdentity {
         PagedCacheIdentity {
-            model: model.to_owned(),
+            model: model.name.clone(),
+            model_fingerprint: model.fingerprint.clone(),
             format_version: core_llm::KV_CACHE_FORMAT_VERSION,
             layout_version: PAGED_PACKED_LAYOUT_VERSION,
             representation: paged_packed_identity(self.bits).to_owned(),
@@ -324,13 +328,80 @@ impl PackedPagePool {
         }
     }
 
-    /// Grow every layer's arrays so at least `pages` pages fit (doubling, from
-    /// [`MIN_POOL_PAGES`]). Existing pages keep their contents.
+    /// Pages one growth (or a trim's rounding) adds: [`MIN_POOL_PAGES`], or 1/32 of the
+    /// current capacity once that is larger — a bounded over-allocation (≤ ~3 %), unlike doubling,
+    /// which can hold twice the live pages.
+    pub fn growth_chunk(&self) -> usize {
+        MIN_POOL_PAGES.max(self.capacity_pages / 32)
+    }
+
+    /// Grow every layer's arrays so at least `pages` pages fit, by at least one
+    /// [`Self::growth_chunk`]. Existing pages keep their contents.
     fn ensure_capacity(&mut self, pages: usize) -> Result<()> {
         if pages <= self.capacity_pages {
             return Ok(());
         }
-        let capacity = pages.max(self.capacity_pages * 2).max(MIN_POOL_PAGES);
+        let capacity = pages.max(self.capacity_pages + self.growth_chunk());
+        self.grow_to(capacity)
+    }
+
+    /// Grow to exactly `pages` pages when the pool holds fewer (sc-20681): a caller that knows
+    /// its demand (a sequence about to prefill a known prompt) reserves it in one growth instead
+    /// of letting the pool grow chunk by chunk under the prefill.
+    pub fn reserve(&mut self, pages: usize) -> Result<()> {
+        if pages <= self.capacity_pages {
+            return Ok(());
+        }
+        self.grow_to(pages)
+    }
+
+    /// Shrink every layer's arrays to the highest live page plus one, rounded up to the growth
+    /// chunk (to nothing when no page is live), returning the freed capacity's device memory.
+    /// Pages are allocated lowest id first, so retired sequences' pages at the top come back.
+    /// Every kept page keeps its contents; the arrays are copied, so the old buffers are freed.
+    /// Call it between model steps (no sequence may have a step open on the pool).
+    pub fn trim(&mut self) -> Result<()> {
+        let target = match self.alloc.highest_live() {
+            None => 0,
+            Some(highest) => (highest + 1)
+                .next_multiple_of(self.growth_chunk())
+                .min(self.capacity_pages),
+        };
+        if target >= self.capacity_pages {
+            return Ok(());
+        }
+        if target == 0 {
+            self.arrays.clear();
+            self.capacity_pages = 0;
+            return Ok(());
+        }
+        let rows = mlx_i32(target, "pool capacity")?;
+        // An elementwise copy owns a fresh buffer (a slice would keep the old one alive).
+        let owned = |array: &Array| -> Result<Array> {
+            let kept = array.try_index((0..rows, .., .., ..))?;
+            let one = Array::from_int(1).as_dtype(array.dtype())?;
+            Ok(mlx_rs::ops::multiply(&kept, &one)?)
+        };
+        let mut trimmed = Vec::with_capacity(self.arrays.len());
+        for layer in &self.arrays {
+            trimmed.push(PageArrays {
+                key_codes: owned(&layer.key_codes)?,
+                key_scales: owned(&layer.key_scales)?,
+                key_zeros: owned(&layer.key_zeros)?,
+                value_codes: owned(&layer.value_codes)?,
+                value_scales: owned(&layer.value_scales)?,
+                value_zeros: owned(&layer.value_zeros)?,
+            });
+        }
+        mlx_rs::transforms::eval(trimmed.iter().flat_map(PageArrays::all))?;
+        self.arrays = trimmed;
+        self.capacity_pages = target;
+        Ok(())
+    }
+
+    /// Resize every layer's arrays to exactly `capacity` (> the current capacity) pages.
+    fn grow_to(&mut self, capacity: usize) -> Result<()> {
+        let capacity = capacity.max(MIN_POOL_PAGES);
         let extra = capacity - self.capacity_pages;
         let group = PACKED_METAL_QUANT_GROUP_SIZE;
         let (h, d, pt) = (self.kv_heads, self.head_dimension, self.page_tokens);
@@ -384,9 +455,9 @@ impl PackedPagePool {
         Ok(())
     }
 
-    /// Allocate a page (refcount 1), reusing a freed id when one exists.
+    /// Allocate a page (refcount 1), reusing the lowest freed id when one exists.
     fn alloc_page(&mut self) -> Result<usize> {
-        let id = self.alloc.alloc();
+        let id = self.alloc.alloc_lowest();
         if let Err(error) = self.ensure_capacity(id + 1) {
             self.alloc.release(id);
             return Err(error);
@@ -1339,7 +1410,7 @@ impl PagedPackedKvCache {
     }
 
     /// The sequence's identity under `model` (see [`PagedCacheIdentity`]).
-    pub fn identity(&self, model: &str) -> PagedCacheIdentity {
+    pub fn identity(&self, model: &PagedModelKey) -> PagedCacheIdentity {
         self.pool.borrow().identity(model)
     }
 
@@ -1347,7 +1418,7 @@ impl PagedPackedKvCache {
     /// unquantized residual rows — under its identity for `model`. Restorable with
     /// [`Self::restore`] into a pool of the same identity, in this process or (through
     /// [`PagedCacheSnapshot::to_bytes`]) another.
-    pub fn snapshot(&self, model: &str) -> Result<PagedCacheSnapshot> {
+    pub fn snapshot(&self, model: &PagedModelKey) -> Result<PagedCacheSnapshot> {
         if self.pending.is_some() {
             return Err(Error::Config(
                 "paged packed snapshot inside an open step".into(),
@@ -1394,6 +1465,7 @@ impl PagedPackedKvCache {
         Ok(PagedCacheSnapshot {
             identity: pool.identity(model),
             tokens: self.logical_len,
+            tokens_sha256: None,
             layers,
         })
     }
@@ -1406,7 +1478,7 @@ impl PagedPackedKvCache {
         snapshot: &PagedCacheSnapshot,
         pool: Rc<RefCell<PackedPagePool>>,
         reader: CompiledKernelHandle,
-        model: &str,
+        model: &PagedModelKey,
     ) -> Result<Self> {
         let expected = pool.borrow().identity(model);
         if let Some(mismatch) = snapshot.identity.mismatch(&expected) {
@@ -1421,12 +1493,16 @@ impl PagedPackedKvCache {
         };
         let bits = geometry.bits;
         let mut cache = Self::with_pool(pool, reader)?;
+        // Extents are checked before any arithmetic on them: a residual within one group, whole
+        // quantized groups, a non-overflowing total equal to the snapshot's positions, and dtypes
+        // for every layer that holds a position.
         if snapshot.layers.len() != cache.layers.len()
             || snapshot.layers.iter().any(|layer| {
-                layer.packed != snapshot.layers[0].packed
-                    || layer.packed + layer.tail_rows != snapshot.tokens
+                layer.tail_rows >= group
                     || !layer.packed.is_multiple_of(group)
-                    || layer.tail_rows >= group
+                    || layer.packed != snapshot.layers[0].packed
+                    || layer.packed.checked_add(layer.tail_rows) != Some(snapshot.tokens)
+                    || (snapshot.tokens > 0 && layer.dtypes.is_none())
             })
         {
             return Err(Error::Unsupported(
@@ -1885,6 +1961,8 @@ pub struct PagedCacheSelection {
     cache: Box<dyn KvCache>,
     format: Option<KvCompressionFormat>,
     dense: Option<KvCacheReport>,
+    /// The page pool a compressed selection's pages live in (its held bytes are reported).
+    pool: Option<Rc<RefCell<PackedPagePool>>>,
 }
 
 impl PagedCacheSelection {
@@ -1893,11 +1971,13 @@ impl PagedCacheSelection {
             cache: Box::new(cache),
             format: None,
             dense: Some(report),
+            pool: None,
         }
     }
 
     pub(crate) fn compressed(cache: PagedPackedKvCache, format: KvCompressionFormat) -> Self {
         Self {
+            pool: Some(cache.pool().clone()),
             cache: Box::new(cache),
             format: Some(format),
             dense: None,
@@ -1917,6 +1997,7 @@ impl PagedCacheSelection {
                 "a dense paged selection cannot take a compressed prefix".into(),
             ));
         }
+        self.pool = Some(cache.pool().clone());
         self.cache = Box::new(cache);
         Ok(())
     }
@@ -1939,7 +2020,14 @@ impl PagedCacheSelection {
         match (&self.dense, self.format) {
             (Some(report), _) => Ok(report.clone()),
             (None, Some(format)) => {
-                crate::kv_policy::compressed_report(format, None, self.cache.as_ref())
+                let mut report =
+                    crate::kv_policy::compressed_report(format, None, self.cache.as_ref())?;
+                if let Some(pool) = &self.pool {
+                    let storage = pool.borrow().storage();
+                    report.counters.pool_held_bytes =
+                        storage.code_bytes.saturating_add(storage.metadata_bytes);
+                }
+                Ok(report)
             }
             (None, None) => Err(Error::Msg("paged selection without a report".into())),
         }
@@ -2150,6 +2238,24 @@ pub(crate) fn paged_attention_batch(
     Ok(Some(output))
 }
 
+/// Which model a paged cache's K/V belong to (sc-20681): the caller's name for the checkpoint
+/// (and revision) and the loaded decoder's configuration fingerprint
+/// ([`crate::models::CausalLm::cache_fingerprint`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PagedModelKey {
+    pub name: String,
+    pub fingerprint: String,
+}
+
+impl PagedModelKey {
+    pub fn new(name: impl Into<String>, fingerprint: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            fingerprint: fingerprint.into(),
+        }
+    }
+}
+
 /// What a paged compressed cache is, for sharing and restore (sc-20681): the model it was computed
 /// by and the exact representation its pages hold. Two caches may share pages, and a snapshot may
 /// be restored, only under identical identities.
@@ -2157,6 +2263,9 @@ pub(crate) fn paged_attention_batch(
 pub struct PagedCacheIdentity {
     /// The caller's model identity (checkpoint and revision); K/V are only meaningful for it.
     pub model: String,
+    /// [`PagedModelKey::fingerprint`]: the loaded decoder's configuration digest, so two
+    /// checkpoints named alike (or two names for differently configured decoders) never share.
+    pub model_fingerprint: String,
     /// [`core_llm::KV_CACHE_FORMAT_VERSION`] of the codes.
     pub format_version: u32,
     /// [`PAGED_PACKED_LAYOUT_VERSION`] of the pages.
@@ -2175,8 +2284,13 @@ impl PagedCacheIdentity {
     /// The first field in which `self` differs from `expected`, named, or `None` when they are
     /// identical.
     pub fn mismatch(&self, expected: &Self) -> Option<String> {
-        let fields: [(&str, String, String); 10] = [
+        let fields: [(&str, String, String); 11] = [
             ("model", self.model.clone(), expected.model.clone()),
+            (
+                "model fingerprint",
+                self.model_fingerprint.clone(),
+                expected.model_fingerprint.clone(),
+            ),
             (
                 "KV format version",
                 self.format_version.to_string(),
@@ -2272,7 +2386,20 @@ impl LayerSnapshot {
 pub struct PagedCacheSnapshot {
     identity: PagedCacheIdentity,
     tokens: usize,
+    /// SHA-256 of the token ids the positions hold (little-endian i32), when bound
+    /// ([`Self::bound_to`]); a prefix store restores a snapshot only under those tokens.
+    tokens_sha256: Option<String>,
     layers: Vec<LayerSnapshot>,
+}
+
+/// SHA-256 (hex) of `tokens` as little-endian i32s.
+pub fn token_digest(tokens: &[i32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for token in tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Leading bytes of a serialized [`PagedCacheSnapshot`].
@@ -2282,10 +2409,34 @@ const SNAPSHOT_MAGIC: &[u8; 8] = b"SWPKVSN1";
 struct SnapshotHeader {
     identity: PagedCacheIdentity,
     tokens: usize,
+    tokens_sha256: Option<String>,
     layers: Vec<LayerSnapshot>,
     /// Per layer, the byte length of each component, in [`LayerSnapshot::blobs`] order.
     lengths: Vec<[usize; 8]>,
-    payload_sha256: String,
+    /// SHA-256 over this header serialized with an empty digest, then the payload: every byte
+    /// of the snapshot is covered (identity, extents, dtype labels, token digest, components).
+    sha256: String,
+}
+
+impl SnapshotHeader {
+    /// The digest of `self` (with its digest field emptied) followed by `payload`.
+    fn digest(&self, payload: &[u8]) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let canonical = SnapshotHeader {
+            identity: self.identity.clone(),
+            tokens: self.tokens,
+            tokens_sha256: self.tokens_sha256.clone(),
+            layers: self.layers.clone(),
+            lengths: self.lengths.clone(),
+            sha256: String::new(),
+        };
+        let header = serde_json::to_vec(&canonical)
+            .map_err(|error| Error::Msg(format!("paged KV snapshot header: {error}")))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&header);
+        hasher.update(payload);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
 }
 
 impl PagedCacheSnapshot {
@@ -2298,27 +2449,52 @@ impl PagedCacheSnapshot {
         self.tokens
     }
 
+    /// [`token_digest`] of the token ids the snapshot is bound to, if bound.
+    pub fn tokens_sha256(&self) -> Option<&str> {
+        self.tokens_sha256.as_deref()
+    }
+
+    /// Bind the snapshot to the token ids its positions hold (one per position).
+    pub fn bound_to(mut self, tokens: &[i32]) -> Result<Self> {
+        if tokens.len() != self.tokens {
+            return Err(Error::Msg(format!(
+                "a snapshot of {} positions cannot be bound to {} tokens",
+                self.tokens,
+                tokens.len()
+            )));
+        }
+        self.tokens_sha256 = Some(token_digest(tokens));
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_mut(&mut self) -> &mut PagedCacheIdentity {
+        &mut self.identity
+    }
+
     /// The snapshot as bytes for storage across a process restart: a magic, a JSON header (the
-    /// identity, extents, component lengths and the payload's SHA-256), then the components.
+    /// identity, extents, token digest, component lengths and a SHA-256 over the header and the
+    /// payload), then the components.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        use sha2::{Digest, Sha256};
         let mut payload = Vec::new();
         for layer in &self.layers {
             for blob in layer.blobs() {
                 payload.extend_from_slice(blob);
             }
         }
-        let header = SnapshotHeader {
+        let mut header = SnapshotHeader {
             identity: self.identity.clone(),
             tokens: self.tokens,
+            tokens_sha256: self.tokens_sha256.clone(),
             layers: self.layers.clone(),
             lengths: self
                 .layers
                 .iter()
                 .map(|layer| layer.blobs().map(Vec::len))
                 .collect(),
-            payload_sha256: format!("{:x}", Sha256::digest(&payload)),
+            sha256: String::new(),
         };
+        header.sha256 = header.digest(&payload)?;
         let header = serde_json::to_vec(&header)
             .map_err(|error| Error::Msg(format!("paged KV snapshot header: {error}")))?;
         let mut bytes = Vec::with_capacity(16 + header.len() + payload.len());
@@ -2330,10 +2506,9 @@ impl PagedCacheSnapshot {
     }
 
     /// Parse [`Self::to_bytes`]. Refuses anything that is not an intact snapshot (wrong magic,
-    /// truncated, or a payload that does not match its recorded digest); the identity itself is
-    /// checked when the snapshot is restored.
+    /// truncated, or a header or payload that does not match the recorded digest); the identity
+    /// itself is checked when the snapshot is restored.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        use sha2::{Digest, Sha256};
         let refuse = |why: &str| Error::Unsupported(format!("paged KV snapshot refused: {why}"));
         let rest = bytes
             .strip_prefix(SNAPSHOT_MAGIC.as_slice())
@@ -2349,8 +2524,8 @@ impl PagedCacheSnapshot {
         let (header, payload) = rest.split_at(length);
         let header: SnapshotHeader =
             serde_json::from_slice(header).map_err(|_| refuse("unreadable header"))?;
-        if format!("{:x}", Sha256::digest(payload)) != header.payload_sha256 {
-            return Err(refuse("payload digest mismatch"));
+        if header.digest(payload)? != header.sha256 {
+            return Err(refuse("digest mismatch (header or payload altered)"));
         }
         if header.lengths.len() != header.layers.len()
             || header
@@ -2373,6 +2548,7 @@ impl PagedCacheSnapshot {
         Ok(Self {
             identity: header.identity,
             tokens: header.tokens,
+            tokens_sha256: header.tokens_sha256,
             layers,
         })
     }
@@ -3004,6 +3180,10 @@ pub(crate) mod tests {
         PackedPagePool::new(LAYERS, kv_heads, width, page_tokens, PackedCodeBits::Eight).unwrap()
     }
 
+    fn key(name: &str) -> PagedModelKey {
+        PagedModelKey::new(name, "test-decoder")
+    }
+
     fn k8v8_reader() -> CompiledKernelHandle {
         crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap()
     }
@@ -3127,8 +3307,10 @@ pub(crate) mod tests {
     }
 
     /// Page reuse and fragmentation: sequences interleaved on one pool, one freed mid-way and its
-    /// pages recycled by a third, each produce exactly the outputs they produce alone on a fresh
-    /// pool, and the pool returns to zero live pages when every sequence is dropped.
+    /// pages recycled by a third (lowest free id first), the second freed while the third still
+    /// grows — so the third's page table runs back to a lower id — each produce exactly the
+    /// outputs they produce alone on a fresh pool, and the pool returns to zero live pages when
+    /// every sequence is dropped.
     #[test]
     fn interleaved_freed_and_recycled_pages_do_not_change_any_sequence() {
         let dims = (2, 1, 64);
@@ -3146,7 +3328,7 @@ pub(crate) mod tests {
         };
         let a_steps = [40, 1, 30, 1, 1, 33];
         let b_steps = [50, 1, 1, 40, 1, 1];
-        let c_steps = [100, 1, 64, 1, 1, 1];
+        let c_steps = [100, 1, 64, 1, 1, 33];
         let shared = pool(1, 64, 32);
         let mut a = PagedPackedKvCache::with_pool(shared.clone(), handle.clone()).unwrap();
         let mut b = PagedPackedKvCache::with_pool(shared.clone(), handle.clone()).unwrap();
@@ -3178,10 +3360,17 @@ pub(crate) mod tests {
         drop(a);
         assert_eq!(shared.borrow().live_pages(), b.page_ids().len());
         let mut c = PagedPackedKvCache::with_pool(shared.clone(), handle.clone()).unwrap();
+        let mut b = Some(b);
         let c_out = c_steps
             .iter()
             .enumerate()
-            .map(|(i, &step)| attend_step(&mut c, 3000 + i as u64, step, dims, dtype))
+            .map(|(i, &step)| {
+                if i == 3 {
+                    // B's (lower) pages go back; C's next page takes the lowest of them.
+                    drop(b.take());
+                }
+                attend_step(&mut c, 3000 + i as u64, step, dims, dtype)
+            })
             .collect::<Vec<_>>();
         assert_eq!(c_out, alone(3, &c_steps), "C on recycled pages");
         assert!(
@@ -3198,7 +3387,6 @@ pub(crate) mod tests {
             "non-monotonic page order: {:?}",
             c.page_ids()
         );
-        drop(b);
         drop(c);
         assert_eq!(shared.borrow().live_pages(), 0);
     }
@@ -3813,8 +4001,8 @@ pub(crate) mod tests {
 
                 assert_eq!(speculated.offset(), reference.offset());
                 assert_eq!(
-                    speculated.snapshot("m").unwrap(),
-                    reference.snapshot("m").unwrap(),
+                    speculated.snapshot(&key("m")).unwrap(),
+                    reference.snapshot(&key("m")).unwrap(),
                     "{dtype:?} kept {kept}"
                 );
                 assert_eq!(
@@ -3839,8 +4027,8 @@ pub(crate) mod tests {
                     prefill(&mut fresh_reference);
                     attend_rows(&mut fresh_reference, 9, 20, kept, dims, dtype);
                     assert_ne!(
-                        control.snapshot("m").unwrap(),
-                        fresh_reference.snapshot("m").unwrap(),
+                        control.snapshot(&key("m")).unwrap(),
+                        fresh_reference.snapshot(&key("m")).unwrap(),
                         "{dtype:?} kept {kept}: the unarmed cut must be visibly inexact"
                     );
                 }
@@ -3861,17 +4049,17 @@ pub(crate) mod tests {
         for (i, step) in [100, 1, 1].into_iter().enumerate() {
             attend_step(&mut original, i as u64, step, dims, dtype);
         }
-        let snapshot = original.snapshot("model-a").unwrap();
+        let snapshot = original.snapshot(&key("model-a")).unwrap();
         assert_eq!(snapshot.tokens(), 102);
         let bytes = snapshot.to_bytes().unwrap();
         let parsed = PagedCacheSnapshot::from_bytes(&bytes).unwrap();
         assert_eq!(parsed, snapshot);
         let target = pool(1, 64, 32);
         let mut restored =
-            PagedPackedKvCache::restore(&parsed, target.clone(), handle.clone(), "model-a")
+            PagedPackedKvCache::restore(&parsed, target.clone(), handle.clone(), &key("model-a"))
                 .unwrap();
         assert_eq!(restored.offset(), 102);
-        assert_eq!(restored.snapshot("model-a").unwrap(), snapshot);
+        assert_eq!(restored.snapshot(&key("model-a")).unwrap(), snapshot);
         for layer in 0..LAYERS {
             assert_eq!(oracle_kv(&restored, layer), oracle_kv(&original, layer));
         }
@@ -3887,7 +4075,7 @@ pub(crate) mod tests {
         let refused = |snapshot: &PagedCacheSnapshot,
                        pool: Rc<RefCell<PackedPagePool>>,
                        reader: CompiledKernelHandle,
-                       model: &str,
+                       model: &PagedModelKey,
                        field: &str| {
             let error = PagedPackedKvCache::restore(snapshot, pool.clone(), reader, model)
                 .unwrap_err()
@@ -3895,14 +4083,27 @@ pub(crate) mod tests {
             assert!(error.contains(field), "{field}: {error}");
             assert_eq!(pool.borrow().live_pages(), 0, "{field}: nothing allocated");
         };
-        refused(&snapshot, fresh.clone(), handle.clone(), "model-b", "model");
+        refused(
+            &snapshot,
+            fresh.clone(),
+            handle.clone(),
+            &key("model-b"),
+            "model",
+        );
+        refused(
+            &snapshot,
+            fresh.clone(),
+            handle.clone(),
+            &PagedModelKey::new("model-a", "another decoder"),
+            "model fingerprint",
+        );
         let mut format = snapshot.clone();
         format.identity.format_version += 1;
         refused(
             &format,
             fresh.clone(),
             handle.clone(),
-            "model-a",
+            &key("model-a"),
             "KV format version",
         );
         let mut layout = snapshot.clone();
@@ -3911,14 +4112,14 @@ pub(crate) mod tests {
             &layout,
             fresh.clone(),
             handle.clone(),
-            "model-a",
+            &key("model-a"),
             "page layout version",
         );
         refused(
             &snapshot,
             pool(1, 64, 64),
             handle.clone(),
-            "model-a",
+            &key("model-a"),
             "page tokens",
         );
         let four_bit = PackedPagePool::new(LAYERS, 1, 64, 32, PackedCodeBits::Four).unwrap();
@@ -3926,7 +4127,7 @@ pub(crate) mod tests {
             &snapshot,
             four_bit,
             reader(PackedCodeBits::Four, PackedMetalGpuFamily::Apple7OrNewer),
-            "model-a",
+            &key("model-a"),
             "representation",
         );
         // A version-mismatched snapshot is still refused after a trip through bytes.
@@ -3935,7 +4136,7 @@ pub(crate) mod tests {
             &reread,
             fresh.clone(),
             handle.clone(),
-            "model-a",
+            &key("model-a"),
             "KV format version",
         );
 
@@ -3948,6 +4149,67 @@ pub(crate) mod tests {
         assert!(error.contains("digest"), "{error}");
         assert!(PagedCacheSnapshot::from_bytes(b"not a paged KV snapshot").is_err());
         assert!(PagedCacheSnapshot::from_bytes(&bytes[..bytes.len() / 2]).is_err());
+        // The digest covers the header: a dtype label flipped in place (same length, still valid
+        // JSON) is refused, not restored with the wrong residual dtype.
+        let mut relabelled = bytes.clone();
+        let label = br#""Bfloat16""#;
+        let at = relabelled
+            .windows(label.len())
+            .position(|window| window == label)
+            .expect("the header names the residual dtype");
+        relabelled[at..at + label.len()].copy_from_slice(br#""Float16" "#);
+        let error = PagedCacheSnapshot::from_bytes(&relabelled)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("digest"), "{error}");
+
+        // Crafted extents are refused before any arithmetic or allocation: a residual of more
+        // than a group (formerly an overflowing sum), quantized tokens off the group grid, layers
+        // disagreeing on their quantized extent, a layer holding positions without dtypes.
+        type Defect = fn(&mut PagedCacheSnapshot);
+        let defects: [(&str, Defect); 5] = [
+            ("overflowing residual", |s| {
+                s.layers[0].tail_rows = usize::MAX
+            }),
+            ("oversized residual", |s| {
+                s.layers[0].packed -= 32;
+                s.layers[0].tail_rows += 32;
+            }),
+            ("off-grid quantized extent", |s| {
+                s.layers[1].packed += 1;
+                s.layers[1].tail_rows -= 1;
+            }),
+            ("disagreeing layers", |s| s.layers[1].packed -= 32),
+            ("missing dtypes", |s| s.layers[0].dtypes = None),
+        ];
+        // A layer of whole groups and no residual must still name its dtypes.
+        let mut whole = PagedPackedKvCache::with_pool(pool(1, 64, 32), handle.clone()).unwrap();
+        attend_step(&mut whole, 0, 96, dims, dtype);
+        let mut untyped = whole.snapshot(&key("model-a")).unwrap();
+        assert_eq!(untyped.layers[1].tail_rows, 0);
+        untyped.layers[1].dtypes = None;
+        let target = pool(1, 64, 32);
+        let error =
+            PagedPackedKvCache::restore(&untyped, target.clone(), handle.clone(), &key("model-a"))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("refused"), "untyped whole groups: {error}");
+        assert_eq!(target.borrow().live_pages(), 0);
+        for (name, defect) in defects {
+            let mut crafted = snapshot.clone();
+            defect(&mut crafted);
+            let target = pool(1, 64, 32);
+            let result = PagedPackedKvCache::restore(
+                &crafted,
+                target.clone(),
+                handle.clone(),
+                &key("model-a"),
+            );
+            let error = result.map(|_| ()).unwrap_err().to_string();
+            assert!(error.contains("refused"), "{name}: {error}");
+            assert_eq!(target.borrow().live_pages(), 0, "{name}: nothing allocated");
+        }
     }
 
     /// Three jagged sequences on one pool decode through one batched paged dispatch per layer: each
@@ -4062,6 +4324,145 @@ pub(crate) mod tests {
                 assert!(cache.pending.is_none());
             }
         }
+    }
+
+    /// Lowest-id-first allocation and trim: after the first and last of three sequences go, a
+    /// trim returns the capacity above the middle one, and a new sequence takes the lowest freed
+    /// pages instead of growing the pool again. The kept sequence's pages survive the trim's copy
+    /// (its continued outputs equal it alone), and an emptied pool trims to nothing.
+    #[test]
+    fn a_trimmed_pool_reuses_its_lowest_pages_without_growing() {
+        let dims = (2, 1, 64);
+        let dtype = Dtype::Float32;
+        let handle = k8v8_reader();
+        let shared = pool(1, 64, 32);
+        let mut sequences = (0..3)
+            .map(|_| PagedPackedKvCache::with_pool(shared.clone(), handle.clone()).unwrap())
+            .collect::<Vec<_>>();
+        for (i, sequence) in sequences.iter_mut().enumerate() {
+            attend_step(sequence, i as u64, 64, dims, dtype);
+        }
+        assert_eq!(
+            sequences
+                .iter()
+                .map(|s| s.page_ids().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1], vec![2, 3], vec![4, 5]]
+        );
+        let mut middle = sequences.remove(1);
+        drop(sequences);
+        shared.borrow_mut().trim().unwrap();
+        assert_eq!(shared.borrow().capacity_pages(), 4, "pages 4.. went back");
+        let mut late = PagedPackedKvCache::with_pool(shared.clone(), handle.clone()).unwrap();
+        attend_step(&mut late, 9, 64, dims, dtype);
+        assert_eq!(late.page_ids(), &[0, 1], "the lowest freed pages");
+        assert_eq!(shared.borrow().capacity_pages(), 4, "no growth");
+        let (_, middle_alone) = alone(&[(1, 64), (5, 1), (6, 40)], dims, dtype);
+        assert_eq!(attend_step(&mut middle, 5, 1, dims, dtype), middle_alone[1]);
+        assert_eq!(
+            attend_step(&mut middle, 6, 40, dims, dtype),
+            middle_alone[2]
+        );
+        drop((middle, late));
+        shared.borrow_mut().trim().unwrap();
+        assert_eq!(shared.borrow().capacity_pages(), 0);
+        assert_eq!(shared.borrow().storage().code_bytes, 0);
+    }
+
+    /// Copy-on-write inside one batched dispatch: two forks of one 100-token source (sharing its
+    /// half-full second page with it) step together through batched paged dispatches; the step
+    /// that completes their next group has both write into the shared page in the same call, so
+    /// each takes a private copy. Every row equals that fork stepped alone, each fork's
+    /// independently dequantized K/V equals its alone reference, the source never sees either,
+    /// the shared page ends held by the source alone, and dropping everything frees every page.
+    #[test]
+    fn copy_on_write_inside_one_batched_dispatch_keeps_forks_apart() {
+        let dims = (4, 2, 64);
+        let dtype = Dtype::Float32;
+        let scale = (64f32).powf(-0.5);
+        let handle = k8v8_reader();
+        let shared = pool(2, 64, 64);
+        let mut source = PagedPackedKvCache::with_pool(shared.clone(), handle.clone()).unwrap();
+        attend_step(&mut source, 0, 100, dims, dtype);
+        // One single-sequence decode step warms the paged reader (batching needs it warm).
+        attend_step(&mut source, 1, 1, dims, dtype);
+        let (mut first, _) = source.fork_prefix(101).unwrap();
+        let (mut second, _) = source.fork_prefix(101).unwrap();
+        let half_page = source.page_ids()[1];
+        assert_eq!(shared.borrow().refcount(half_page), 3);
+        let mut alone_refs = [
+            alone(&[(0, 100), (1, 1)], dims, dtype).0,
+            alone(&[(0, 100), (1, 1)], dims, dtype).0,
+        ];
+        for step in 0..40u64 {
+            for layer in 0..LAYERS {
+                let rows = (0..2u64)
+                    .map(|b| qkv(7_000 + 100 * step + 10 * b + layer as u64, 1, dims, dtype))
+                    .collect::<Vec<_>>();
+                let stack = |pick: fn(&(Array, Array, Array)) -> &Array| {
+                    concatenate_axis(&rows.iter().map(pick).collect::<Vec<_>>(), 0).unwrap()
+                };
+                let (q, k, v) = (stack(|r| &r.0), stack(|r| &r.1), stack(|r| &r.2));
+                let out = paged_attention_batch(
+                    &mut [&mut first, &mut second],
+                    layer,
+                    &q,
+                    &k,
+                    &v,
+                    PackedAttentionMask::Causal,
+                    scale,
+                )
+                .unwrap()
+                .expect("both forks on one pool: batched");
+                for (b, (qb, kb, vb)) in rows.iter().enumerate() {
+                    let expected = alone_refs[b]
+                        .try_packed_attention(
+                            layer,
+                            qb,
+                            kb,
+                            vb,
+                            PackedAttentionMask::Causal,
+                            scale,
+                            false,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    let row = out.try_index((b as i32..b as i32 + 1, .., .., ..)).unwrap();
+                    assert_eq!(host_f32(&row), host_f32(&expected), "step {step} fork {b}");
+                }
+            }
+        }
+        assert_ne!(
+            first.page_ids()[1],
+            half_page,
+            "the first fork copied the page"
+        );
+        assert_ne!(
+            second.page_ids()[1],
+            half_page,
+            "the second fork copied the page"
+        );
+        assert_ne!(first.page_ids()[1], second.page_ids()[1]);
+        assert_eq!(
+            shared.borrow().refcount(half_page),
+            1,
+            "held by the source alone"
+        );
+        assert_eq!(
+            first.page_ids()[0],
+            source.page_ids()[0],
+            "the full page stays shared"
+        );
+        for layer in 0..LAYERS {
+            assert_eq!(oracle_kv(&first, layer), oracle_kv(&alone_refs[0], layer));
+            assert_eq!(oracle_kv(&second, layer), oracle_kv(&alone_refs[1], layer));
+        }
+        let (source_ref, _) = alone(&[(0, 100), (1, 1)], dims, dtype);
+        for layer in 0..LAYERS {
+            assert_eq!(oracle_kv(&source, layer), oracle_kv(&source_ref, layer));
+        }
+        drop((first, second, source));
+        assert_eq!(shared.borrow().live_pages(), 0);
     }
 
     /// A batched dispatch that faults (here at its second layer, after the step allocated a

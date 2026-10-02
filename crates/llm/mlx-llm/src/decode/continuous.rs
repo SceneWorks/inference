@@ -62,7 +62,7 @@ use crate::primitives::nn::input_ids;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 use crate::primitives::{
     BlockPool, CompiledKernelHandle, PackedCodeBits, PackedPagePool, PagedCacheIdentity,
-    PagedCacheRequest, PagedCacheSelection, PagedKvCache, PagedPackedKvCache,
+    PagedCacheRequest, PagedCacheSelection, PagedKvCache, PagedModelKey, PagedPackedKvCache,
     PACKED_METAL_QUANT_GROUP_SIZE,
 };
 
@@ -118,10 +118,22 @@ pub struct ContinuousKv<'a> {
     /// The fused paged reader; `None` builds the K8V8 reader when the policy is on.
     pub reader: Option<CompiledKernelHandle>,
     /// A shared-prefix store over paged compressed KV, consulted and filled by the compressed
-    /// requests when its identity matches this run's.
+    /// requests when its identity matches this run's (its pool is then the run's pool).
     pub prefix: Option<&'a mut PagedPrefixCache>,
-    /// The model identity (checkpoint and revision) the run's compressed caches are keyed by.
+    /// The page pool to run on when no matching prefix store brings one (a long-lived caller
+    /// keeps one pool across runs); `None` makes one for the run.
+    pub pool: Option<Rc<RefCell<PackedPagePool>>>,
+    /// The model identity (checkpoint and revision) the run's compressed caches are keyed by,
+    /// with the decoder's [`CausalLm::cache_fingerprint`]. Empty means unkeyed: a prefix store
+    /// is then refused, never shared.
     pub model_identity: &'a str,
+    /// Per-request cancellation (one flag per request, or empty for none): a cancelled request
+    /// leaves the batch — finishing [`FinishReason::Cancelled`] with its partial output and its
+    /// pages released — while the others keep decoding. The run's own `cancel` stops them all.
+    pub cancels: &'a [CancelFlag],
+    /// Per-request opt-ins (one per request, or empty to apply [`Self::policy`] to all): a
+    /// server batch mixes requests that opted in with requests that did not.
+    pub policies: &'a [KvCompressionPolicy],
 }
 
 impl Default for ContinuousKv<'_> {
@@ -132,7 +144,10 @@ impl Default for ContinuousKv<'_> {
             page_tokens: 64,
             reader: None,
             prefix: None,
+            pool: None,
             model_identity: "",
+            cancels: &[],
+            policies: &[],
         }
     }
 }
@@ -187,11 +202,15 @@ struct KvRun<'a> {
     reader: Option<CompiledKernelHandle>,
     /// The store and this run's identity, when they match.
     store: Option<(&'a mut PagedPrefixCache, PagedCacheIdentity)>,
-    /// A store refused for its identity: the mismatch, and the store to record each refusal on.
-    refused_store: Option<(&'a mut PagedPrefixCache, PagedCacheIdentity, String)>,
+    /// A store refused for its identity: the store to record each refusal on, and why.
+    refused_store: Option<(&'a mut PagedPrefixCache, String)>,
     /// Per request: the report it finished with and the positions it reused.
     reports: Vec<Option<KvCacheReport>>,
     reused: Vec<usize>,
+    /// Per-request cancellation flags (empty for none).
+    cancels: Vec<CancelFlag>,
+    /// Per-request opt-ins (empty: `policy` for all).
+    policies: Vec<KvCompressionPolicy>,
 }
 
 impl<'a> KvRun<'a> {
@@ -208,8 +227,12 @@ impl<'a> KvRun<'a> {
             refused_store: None,
             reports: vec![None; n],
             reused: vec![0; n],
+            cancels: kv.cancels.to_vec(),
+            policies: kv.policies.to_vec(),
         };
-        if kv.policy == KvCompressionPolicy::Off {
+        let any_opted_in = kv.policy != KvCompressionPolicy::Off
+            || kv.policies.contains(&KvCompressionPolicy::Qualified);
+        if !any_opted_in {
             return run;
         }
         let new_pool = |page_tokens: usize| {
@@ -222,24 +245,34 @@ impl<'a> KvRun<'a> {
             )
         };
         if let Some(store) = kv.prefix {
-            let expected = new_pool(store.identity().page_tokens)
-                .map(|pool| pool.borrow().identity(kv.model_identity));
-            match expected {
-                Ok(identity) => match store.identity().mismatch(&identity) {
-                    None => {
-                        run.packed_pool = Some(store.pool().clone());
-                        run.store = Some((store, identity));
+            let key = PagedModelKey::new(kv.model_identity, model.cache_fingerprint());
+            let verdict = if kv.model_identity.is_empty() {
+                Err(
+                    "the run names no model identity, so its caches cannot be keyed for sharing"
+                        .to_owned(),
+                )
+            } else {
+                match new_pool(store.identity().page_tokens) {
+                    Ok(pool) => {
+                        let identity = pool.borrow().identity(&key);
+                        match store.identity().mismatch(&identity) {
+                            None => Ok(identity),
+                            Some(mismatch) => Err(mismatch),
+                        }
                     }
-                    Some(mismatch) => run.refused_store = Some((store, identity, mismatch)),
-                },
-                Err(error) => {
-                    let identity = store.identity().clone();
-                    run.refused_store = Some((store, identity, error.to_string()));
+                    Err(error) => Err(error.to_string()),
                 }
+            };
+            match verdict {
+                Ok(identity) => {
+                    run.packed_pool = Some(store.pool().clone());
+                    run.store = Some((store, identity));
+                }
+                Err(reason) => run.refused_store = Some((store, reason)),
             }
         }
         if run.packed_pool.is_none() {
-            match new_pool(kv.page_tokens) {
+            match kv.pool.map_or_else(|| new_pool(kv.page_tokens), Ok) {
                 Ok(pool) => run.packed_pool = Some(pool),
                 Err(error) => run.pool_refusal = Some(error.to_string()),
             }
@@ -251,12 +284,13 @@ impl<'a> KvRun<'a> {
     }
 
     /// The cache request `r` runs on, before any K/V mutation.
-    fn select(&self, model: &CausalLm, r: &BatchRequest) -> PagedCacheSelection {
+    fn select(&self, model: &CausalLm, ri: usize, r: &BatchRequest) -> PagedCacheSelection {
+        let policy = self.policies.get(ri).copied().unwrap_or(self.policy);
         let prompt_tokens = u64::try_from(r.prompt_ids.len()).unwrap_or(u64::MAX);
         let max_new_tokens = u64::try_from(r.max_new_tokens).unwrap_or(u64::MAX);
         let Some(packed_pool) = self.packed_pool.as_ref() else {
             let reason = match core_llm::qualify_kv_sequence(
-                self.policy,
+                policy,
                 self.family,
                 prompt_tokens,
                 max_new_tokens,
@@ -273,7 +307,7 @@ impl<'a> KvRun<'a> {
             );
         };
         model.select_paged_cache(PagedCacheRequest {
-            policy: self.policy,
+            policy,
             family: self.family,
             prompt_tokens,
             max_new_tokens,
@@ -284,8 +318,13 @@ impl<'a> KvRun<'a> {
     }
 
     /// The report of a request that never ran (cancelled in the queue, or a zero budget).
-    fn planned_report(&self, model: &CausalLm, r: &BatchRequest) -> Result<KvCacheReport> {
-        self.select(model, r).report()
+    fn planned_report(
+        &self,
+        model: &CausalLm,
+        ri: usize,
+        r: &BatchRequest,
+    ) -> Result<KvCacheReport> {
+        self.select(model, ri, r).report()
     }
 
     /// Start a compressed `selection` on the longest stored prefix of `prompt`; the positions it
@@ -298,9 +337,9 @@ impl<'a> KvRun<'a> {
         if !selection.is_compressed() {
             return Ok(0);
         }
-        if let Some((store, identity, _)) = self.refused_store.as_mut() {
+        if let Some((store, _)) = self.refused_store.as_mut() {
             // Counted on the store; nothing is reused.
-            store.lookup(identity, prompt)?;
+            store.record_refusal();
             return Ok(0);
         }
         let Some((store, identity)) = self.store.as_mut() else {
@@ -326,10 +365,49 @@ impl<'a> KvRun<'a> {
         Ok(())
     }
 
+    /// Whether request `ri` was cancelled on its own.
+    fn cancelled(&self, ri: usize) -> bool {
+        self.cancels.get(ri).is_some_and(CancelFlag::is_cancelled)
+    }
+
     fn prefix_refused(&self) -> Option<String> {
         self.refused_store
             .as_ref()
-            .map(|(_, _, mismatch)| mismatch.clone())
+            .map(|(_, reason)| reason.clone())
+    }
+
+    /// Before a compressed `selection` prefills `prompt_len` positions: reserve its pages in one
+    /// growth (the pool's live pages, the prompt's pages, and one for the first decode group).
+    fn reserve_prefill(&self, selection: &PagedCacheSelection, prompt_len: usize) -> Result<()> {
+        let Some(pool) = self
+            .packed_pool
+            .as_ref()
+            .filter(|_| selection.is_compressed())
+        else {
+            return Ok(());
+        };
+        let mut pool = pool.borrow_mut();
+        let pages = pool.live_pages() + prompt_len.div_ceil(pool.page_tokens()) + 1;
+        pool.reserve(pages)
+    }
+
+    /// Return the pool's capacity above its highest live page (after a sequence retired).
+    fn trim(&self) -> Result<()> {
+        match self.packed_pool.as_ref() {
+            Some(pool) => pool.borrow_mut().trim(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for KvRun<'_> {
+    /// A run that ends — normally, cancelled, or on an error — leaves its pool holding only what
+    /// is still live (a prefix store's entries). The sequences are dropped first (they are
+    /// declared after the run), so their pages are already back.
+    fn drop(&mut self) {
+        if let Err(error) = self.trim() {
+            eprintln!("generate_continuous: trimming the page pool failed: {error}");
+        }
     }
 }
 
@@ -395,6 +473,14 @@ pub fn generate_continuous_kv(
              {PACKED_METAL_QUANT_GROUP_SIZE}"
         )));
     }
+    if ![0, requests.len()].contains(&kv.cancels.len())
+        || ![0, requests.len()].contains(&kv.policies.len())
+    {
+        return Err(Error::Msg(
+            "generate_continuous: per-request cancels and policies need one entry per request"
+                .into(),
+        ));
+    }
     for (i, r) in requests.iter().enumerate() {
         if r.prompt_ids.is_empty() {
             return Err(Error::Msg(format!(
@@ -447,6 +533,35 @@ pub fn generate_continuous_kv(
     while !lanes.is_empty() {
         if cancel.is_cancelled() {
             break;
+        }
+        // A request cancelled on its own leaves the batch before the next step.
+        let mut kept = Vec::with_capacity(lanes.len());
+        for lane in std::mem::take(&mut lanes) {
+            if run.cancelled(lane.req_index) {
+                on_event(
+                    lane.req_index,
+                    StreamEvent::Done {
+                        reason: FinishReason::Cancelled,
+                        generated: sched.generated(lane.seq).len(),
+                    },
+                );
+                retire_lane(&mut run, lane)?;
+            } else {
+                kept.push(lane);
+            }
+        }
+        lanes = kept;
+        if lanes.is_empty() {
+            // Refill below; nothing to step this iteration.
+            while lanes.len() < config.max_batch && next_req < requests.len() {
+                if let Some(lane) = admit_lane(
+                    model, &mut run, requests, &seq_ids, next_req, &mut sched, on_event,
+                )? {
+                    lanes.push(lane);
+                }
+                next_req += 1;
+            }
+            continue;
         }
 
         let per_lane = step_logits(model, &mut lanes, config.exactness)?;
@@ -519,7 +634,7 @@ pub fn generate_continuous_kv(
         .map(|(ri, &seq)| {
             let kv_cache = match run.reports[ri].take() {
                 Some(report) => report,
-                None => run.planned_report(model, &requests[ri])?,
+                None => run.planned_report(model, ri, &requests[ri])?,
             };
             Ok(ContinuousOutput {
                 output: GenerationOutput {
@@ -566,10 +681,22 @@ fn admit_lane(
         );
         return Ok(None);
     }
+    if run.cancelled(ri) {
+        // Cancelled while it waited: never prefilled, never generated.
+        on_event(
+            ri,
+            StreamEvent::Done {
+                reason: FinishReason::Cancelled,
+                generated: 0,
+            },
+        );
+        return Ok(None);
+    }
 
-    let mut selection = run.select(model, r);
+    let mut selection = run.select(model, ri, r);
     let reused = run.reuse_prefix(&mut selection, &r.prompt_ids)?;
     run.reused[ri] = reused;
+    run.reserve_prefill(&selection, r.prompt_ids.len())?;
     // batch-1 prefill of the positions no stored prefix covers
     let logits = model.decode_logits(
         &input_ids(&r.prompt_ids[reused..]),
@@ -604,7 +731,8 @@ fn retire_lane(run: &mut KvRun<'_>, mut lane: Lane) -> Result<()> {
     tokens.truncate(lane.cache().offset().max(0) as usize);
     run.store_sequence(&mut lane, &tokens)?;
     run.reports[lane.req_index] = Some(lane.selection.report()?);
-    Ok(())
+    drop(lane);
+    run.trim()
 }
 
 /// One decode step's logits, one `[1, vocab]` per live lane (in lane order). `Exact` builds each
@@ -674,7 +802,7 @@ fn record_token(
 mod tests {
     use super::*;
     use crate::decode::prefix::PagedPrefixStats;
-    use crate::primitives::PagedCacheSnapshot;
+    use crate::primitives::{PagedCacheSnapshot, PagedModelKey};
     use core_llm::KvCompressionFormat;
 
     const MODEL: &str = "synthetic-tiny@1";
@@ -719,6 +847,7 @@ mod tests {
             reader: Some(reader()),
             prefix,
             model_identity: MODEL,
+            ..ContinuousKv::default()
         }
     }
 
@@ -749,7 +878,18 @@ mod tests {
             PackedCodeBits::Eight,
         )
         .unwrap();
-        PagedPrefixCache::new(pool, identity, 16)
+        PagedPrefixCache::new(
+            pool,
+            PagedModelKey::new(identity, model.cache_fingerprint()),
+            16,
+        )
+    }
+
+    /// A report without the shared pool's held bytes (which depend on what else the pool holds).
+    fn own(report: &KvCacheReport) -> KvCacheReport {
+        let mut report = report.clone();
+        report.counters.pool_held_bytes = 0;
+        report
     }
 
     fn assert_compressed(out: &ContinuousOutput) {
@@ -793,7 +933,7 @@ mod tests {
                 qualified(None),
             );
             assert_eq!(out.output.tokens, alone[0].output.tokens, "request {i}");
-            assert_eq!(out.kv_cache, alone[0].kv_cache, "request {i}");
+            assert_eq!(own(&out.kv_cache), own(&alone[0].kv_cache), "request {i}");
             if i == 2 {
                 assert_eq!(
                     out.kv_cache,
@@ -1016,7 +1156,7 @@ mod tests {
                 store.held_pages(),
                 "only the store's pages"
             );
-            store.clear();
+            store.clear().unwrap();
             assert_eq!(pool.borrow().live_pages(), 0);
         }
     }
@@ -1057,7 +1197,7 @@ mod tests {
             .any(|out| out.output.finish_reason == FinishReason::Cancelled));
         let pool = cancelled_store.pool().clone();
         assert_eq!(pool.borrow().live_pages(), cancelled_store.held_pages());
-        cancelled_store.clear();
+        cancelled_store.clear().unwrap();
         assert_eq!(pool.borrow().live_pages(), 0);
 
         let mut failed_store = store(&model, MODEL);
@@ -1083,7 +1223,7 @@ mod tests {
             "the admitted prompts were stored before the fault"
         );
         assert_eq!(pool.borrow().live_pages(), failed_store.held_pages());
-        failed_store.clear();
+        failed_store.clear().unwrap();
         assert_eq!(pool.borrow().live_pages(), 0);
     }
 
@@ -1121,7 +1261,7 @@ mod tests {
         let held = (primed.len(), primed.held_pages(), primed.stats());
         let other_geometry = PagedPrefixCache::new(
             PackedPagePool::new(2, 1, 64, 64, PackedCodeBits::Eight).unwrap(),
-            MODEL,
+            PagedModelKey::new(MODEL, model.cache_fingerprint()),
             4,
         );
         for (mut store, field) in [(primed, "model"), (other_geometry, "KV heads")] {
@@ -1212,6 +1352,7 @@ mod tests {
             from_restored[0].output.tokens
         );
 
+        // An edited header (here its format version) fails the digest when read back.
         let mut tampered = saved[0].1.clone();
         let needle = br#""format_version":1"#;
         let at = tampered
@@ -1219,17 +1360,34 @@ mod tests {
             .position(|window| window == needle)
             .expect("the header names the format version");
         tampered[at + needle.len() - 1] = b'2';
-        let snapshot = PagedCacheSnapshot::from_bytes(&tampered).unwrap();
+        let error = PagedCacheSnapshot::from_bytes(&tampered)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("digest"), "{error}");
+
+        // A snapshot of another format version, and one bound to other (same-length) tokens, are
+        // refused and counted; nothing is stored or allocated.
         let mut fresh = store(&model, MODEL);
+        let original_snapshot = PagedCacheSnapshot::from_bytes(&saved[0].1).unwrap();
+        let mut other_version = original_snapshot.clone();
+        other_version.identity_mut().format_version += 1;
         let error = fresh
-            .restore(saved[0].0.clone(), &snapshot, reader())
+            .restore(saved[0].0.clone(), &other_version, reader())
             .unwrap_err()
             .to_string();
         assert!(error.contains("KV format version"), "{error}");
+        let mut other_tokens = saved[0].0.clone();
+        other_tokens[0] = other_tokens[0] % 31 + 1;
+        assert_eq!(other_tokens.len(), saved[0].0.len());
+        let error = fresh
+            .restore(other_tokens, &original_snapshot, reader())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("token ids"), "{error}");
         assert_eq!(
             fresh.stats(),
             PagedPrefixStats {
-                refused: 1,
+                refused: 2,
                 ..PagedPrefixStats::default()
             }
         );
@@ -1247,8 +1405,177 @@ mod tests {
             .unwrap();
         let identity = fresh.identity().clone();
         assert!(!fresh.insert(&identity, &prompt, &foreign).unwrap());
-        assert_eq!(fresh.stats().refused, 2);
+        assert_eq!(fresh.stats().refused, 3);
         assert!(fresh.is_empty());
+    }
+
+    /// AC1 pool sizing: four jagged qualified requests (page_tokens 32) admitted together hold no
+    /// more page capacity than their live pages plus one growth chunk while they prefill and
+    /// decode — each prefill reserves exactly its pages (at most two spare while they are
+    /// admitted), growth is bounded — and every report names the pool's held bytes. The last
+    /// request admitted (holding the top pages) retires first and the pool is trimmed right away;
+    /// once every request has retired it is trimmed back to (at most) one growth chunk.
+    #[test]
+    fn continuous_runs_reserve_their_prefill_and_trim_the_pool_on_retirement() {
+        let model = model();
+        let pool = PackedPagePool::new(2, 2, 64, 32, PackedCodeBits::Eight).unwrap();
+        let (page_codes, page_metadata) = pool.borrow().page_bytes();
+        let requests = [10_240, 10_331, 10_478, 10_603]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| request(tokens(len, i), if i == 3 { 2 } else { 6 }))
+            .collect::<Vec<_>>();
+        let mut checked = 0;
+        let (mut first_tokens, mut retired) = (0, 0);
+        let watched = pool.clone();
+        let outputs = generate_continuous_kv(
+            &model,
+            &requests,
+            &config(4, BatchExactness::Throughput),
+            ContinuousKv {
+                page_tokens: 32,
+                pool: Some(pool.clone()),
+                ..qualified(None)
+            },
+            &CancelFlag::new(),
+            &mut |_, event| {
+                match event {
+                    StreamEvent::Done { .. } => retired += 1,
+                    StreamEvent::Token { step: 0, .. } => first_tokens += 1,
+                    StreamEvent::Token { .. } => {}
+                }
+                if retired > 1 {
+                    return;
+                }
+                let pool = watched.borrow();
+                let storage = pool.storage();
+                let live = pool.live_pages() as u64;
+                // Retirement events precede the retirement's trim: check the next event.
+                if retired == 0 || !matches!(event, StreamEvent::Done { .. }) {
+                    // After the first retirement's trim: rounded to the (pre-trim) growth chunk.
+                    let chunk = (4_u64).max(live / 32) * if retired == 0 { 1 } else { 2 };
+                    let bound = (live + chunk) * (page_codes + page_metadata);
+                    assert!(
+                        storage.code_bytes + storage.metadata_bytes <= bound,
+                        "{} pages held for {live} live",
+                        storage.capacity_pages
+                    );
+                    checked += 1;
+                }
+                if retired == 0 && first_tokens < 4 {
+                    // While admitting: exactly the reserved prefill pages, plus one.
+                    assert!(storage.capacity_pages <= live + 2, "{storage:?}");
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            checked >= 4 + 3,
+            "every prefill and decode step was checked"
+        );
+        for out in &outputs {
+            assert_compressed(out);
+            assert!(
+                out.kv_cache.counters.pool_held_bytes
+                    >= out.kv_cache.counters.compressed_cache_bytes
+            );
+        }
+        let pool = pool.borrow();
+        assert_eq!(pool.live_pages(), 0);
+        assert!(
+            pool.capacity_pages() <= pool.growth_chunk(),
+            "{} pages kept after every request retired",
+            pool.capacity_pages()
+        );
+    }
+
+    /// Per-request cancellation in a batch: a request cancelled while it decodes leaves with its
+    /// partial output (`Cancelled`), one cancelled while it waits is never prefilled, and the
+    /// others decode to their budgets, each with exactly one terminal event.
+    #[test]
+    fn a_request_cancelled_on_its_own_leaves_the_batch_and_the_rest_finish() {
+        let model = model();
+        let requests = (0..3)
+            .map(|i| request(tokens(40 + 9 * i, i), 8))
+            .collect::<Vec<_>>();
+        let cancels = [CancelFlag::new(), CancelFlag::new(), CancelFlag::new()];
+        cancels[2].cancel();
+        let mut dones = vec![Vec::new(); 3];
+        let mut tokens_seen = [0usize; 3];
+        let outputs = generate_continuous_kv(
+            &model,
+            &requests,
+            &config(2, BatchExactness::Throughput),
+            ContinuousKv {
+                cancels: &cancels,
+                ..ContinuousKv::default()
+            },
+            &CancelFlag::new(),
+            &mut |i, event| match event {
+                StreamEvent::Token { .. } => {
+                    tokens_seen[i] += 1;
+                    if i == 1 && tokens_seen[i] == 3 {
+                        cancels[1].cancel();
+                    }
+                }
+                StreamEvent::Done { reason, generated } => dones[i].push((reason, generated)),
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].output.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(outputs[0].output.tokens.len(), 8);
+        assert_eq!(outputs[1].output.finish_reason, FinishReason::Cancelled);
+        assert_eq!(outputs[1].output.tokens.len(), 3);
+        assert_eq!(outputs[2].output.finish_reason, FinishReason::Cancelled);
+        assert!(outputs[2].output.tokens.is_empty());
+        assert_eq!(dones[0], vec![(FinishReason::MaxTokens, 8)]);
+        assert_eq!(dones[1], vec![(FinishReason::Cancelled, 3)]);
+        assert_eq!(dones[2], vec![(FinishReason::Cancelled, 0)]);
+    }
+
+    /// AC2 identity: a store keyed by one decoder is refused by another decoder of the same
+    /// geometry and name but another configuration (here its RoPE base), naming the fingerprint;
+    /// and a run with no model identity never consults a store.
+    #[test]
+    fn a_store_of_another_decoder_or_an_unnamed_run_is_refused() {
+        let model = model();
+        let other = crate::provider::tests::synthetic_causal_model_with_rope(128, 2, 4, 2, 64, 5e5);
+        assert_ne!(model.cache_fingerprint(), other.cache_fingerprint());
+        let prompt = tokens(10_240, 12);
+        let with_suffix = |salt: usize| {
+            let mut ids = prompt.clone();
+            ids.extend(tokens(9 + salt, 60 + salt));
+            request(ids, 4)
+        };
+        let mut store = store(&model, MODEL);
+        run(
+            &model,
+            &[with_suffix(0)],
+            &config(1, BatchExactness::Exact),
+            qualified(Some(&mut store)),
+        );
+        let held = store.held_pages();
+        for (decoder, identity, refusal) in [
+            (&other, MODEL, "model fingerprint"),
+            (&model, "", "no model identity"),
+        ] {
+            let refused_before = store.stats().refused;
+            let outputs = run(
+                decoder,
+                &[with_suffix(1)],
+                &config(1, BatchExactness::Exact),
+                ContinuousKv {
+                    model_identity: identity,
+                    ..qualified(Some(&mut store))
+                },
+            );
+            let reason = outputs[0].prefix_refused.as_deref().unwrap_or_default();
+            assert!(reason.contains(refusal), "{refusal}: {reason}");
+            assert_eq!(outputs[0].reused_prefix_tokens, 0);
+            assert_compressed(&outputs[0]);
+            assert_eq!(store.stats().refused, refused_before + 1);
+            assert_eq!(store.held_pages(), held, "nothing stored");
+        }
     }
 
     /// AC3 measurement (not a gate): `Throughput` continuous batching of `B` qualified sequences
@@ -1305,6 +1632,12 @@ mod tests {
                         lane.is_compressed(),
                         policy == KvCompressionPolicy::Qualified
                     );
+                    if lane.is_compressed() {
+                        // What `generate_continuous_kv` reserves before each prefill.
+                        let mut pool = packed_pool.borrow_mut();
+                        let pages = pool.live_pages() + lengths[b].div_ceil(64) + 1;
+                        pool.reserve(pages).unwrap();
+                    }
                     let logits = model
                         .decode_logits(&input_ids(&tokens(lengths[b], b)), lane.cache_mut(), 0)
                         .unwrap();
@@ -1396,11 +1729,16 @@ mod tests {
                 );
             }
             let (compressed, dense) = (&results[0], &results[1]);
+            let held = compressed.1 as f64 / dense.1 as f64;
             eprintln!(
-                "  compressed / dense: memory {:.3}, decode-step peak {:.3}, throughput {:.3}",
-                compressed.1 as f64 / dense.1 as f64,
+                "  compressed / dense: memory {held:.3}, decode-step peak {:.3}, throughput {:.3}",
                 compressed.2 as f64 / dense.2 as f64,
                 compressed.3 / dense.3
+            );
+            // The resident (held) KV, pool capacity included, not only the live pages.
+            assert!(
+                held <= 0.60,
+                "B={batch}: held compressed / held dense {held:.3}"
             );
         }
     }

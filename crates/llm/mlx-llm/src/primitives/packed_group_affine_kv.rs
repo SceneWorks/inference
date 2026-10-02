@@ -1154,6 +1154,18 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         self.transition_to_dense(operation, reason)
     }
 
+    /// The contiguous compressed cache trims a cut group by re-staging it from its codes, which
+    /// is not the unquantized rows a speculative rollback must restore (sc-20681). Speculation on
+    /// it therefore moves the history to the explicit dense fallback first — recorded, so the
+    /// generation reports a runtime fallback — and its rollbacks are then exact dense truncations.
+    fn begin_speculation(&mut self) -> Result<()> {
+        self.transition_to_dense(
+            "speculation",
+            "speculative rollback must restore unquantized rows; the contiguous compressed cache \
+             re-stages a cut group from its codes",
+        )
+    }
+
     fn packed_evidence(&self) -> Option<PackedCacheEvidence> {
         Some(self.model_evidence())
     }

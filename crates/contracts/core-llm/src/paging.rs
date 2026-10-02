@@ -71,6 +71,33 @@ impl BlockAllocator {
         id
     }
 
+    /// Allocate the **lowest** free id (refcount 1), else mint the next dense id — for a backend
+    /// that compacts its id-indexed storage down to the highest live id: filling the lowest holes
+    /// first keeps live ids packed at the bottom.
+    pub fn alloc_lowest(&mut self) -> usize {
+        let Some(slot) = self
+            .free
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &id)| id)
+            .map(|(slot, _)| slot)
+        else {
+            return self.alloc();
+        };
+        let id = self.free.swap_remove(slot);
+        self.refcount[id] = 1;
+        let live = self.live_blocks();
+        if live > self.peak_live {
+            self.peak_live = live;
+        }
+        id
+    }
+
+    /// The highest live id, or `None` when no block is live.
+    pub fn highest_live(&self) -> Option<usize> {
+        self.refcount.iter().rposition(|&r| r > 0)
+    }
+
     /// Add a reference to `id` (a sequence adopting a shared block for copy-on-write reuse).
     ///
     /// Panics if `id` is not currently live.
@@ -129,6 +156,29 @@ impl BlockAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lowest_first_allocation_fills_the_lowest_hole_and_tracks_the_highest_live_id() {
+        let mut a = BlockAllocator::new();
+        let ids = (0..5).map(|_| a.alloc_lowest()).collect::<Vec<_>>();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        assert_eq!(a.highest_live(), Some(4));
+        for id in [3, 1, 4] {
+            a.release(id);
+        }
+        assert_eq!(a.highest_live(), Some(2));
+        // LIFO would hand back 4; lowest-first reuses 1, then 3, then 4, then mints 5.
+        assert_eq!(
+            (0..4).map(|_| a.alloc_lowest()).collect::<Vec<_>>(),
+            vec![1, 3, 4, 5]
+        );
+        assert_eq!(a.live_blocks(), 6);
+        assert_eq!(a.peak_live_blocks(), 6);
+        for id in 0..6 {
+            a.release(id);
+        }
+        assert_eq!(a.highest_live(), None);
+    }
 
     #[test]
     fn alloc_mints_dense_ids() {

@@ -214,6 +214,7 @@ pub(crate) fn compressed_report(
             .unwrap_or(u64::MAX),
         dense_gather_fallbacks,
         compressed_cache_bytes,
+        pool_held_bytes: 0,
     };
     let fell_back = evidence.dense_active
         || !evidence.fallback_reasons.is_empty()

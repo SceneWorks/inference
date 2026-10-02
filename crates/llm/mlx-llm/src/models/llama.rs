@@ -508,6 +508,22 @@ impl CausalLm {
         Self::COMPUTE_DTYPE
     }
 
+    /// SHA-256 (hex) of everything in the loaded decoder that shapes its K/V besides the weights
+    /// (sc-20681): the whole parsed config (geometry, vocabulary, RoPE theta and scaling,
+    /// attention variants, projection quantization spec), the cached K/V dtype and whether the
+    /// projections were quantized on load. Paged prefix stores and snapshots key on it next to the
+    /// caller's model name, so decoders named alike but configured differently never share pages.
+    pub fn cache_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let described = format!(
+            "{:?}|kv={:?}|quantized={}",
+            self.cfg,
+            Self::COMPUTE_DTYPE,
+            self.quantized
+        );
+        format!("{:x}", Sha256::digest(described.as_bytes()))
+    }
+
     /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions
     /// (row-major flat `positions`, length `rows * cols`). Each is `[rows, cols, rope_dim]` in bf16.
     ///

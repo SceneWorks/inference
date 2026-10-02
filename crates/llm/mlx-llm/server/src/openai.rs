@@ -252,6 +252,7 @@ pub fn kv_cache_json(report: &KvCacheReport) -> Value {
             "full_cache_dequantizations": counters.full_cache_dequantizations,
             "dense_gather_fallbacks": counters.dense_gather_fallbacks,
             "compressed_cache_bytes": counters.compressed_cache_bytes,
+            "pool_held_bytes": counters.pool_held_bytes,
         },
     })
 }
