@@ -1323,8 +1323,11 @@ pub struct PagedCacheRequest<'a> {
     pub policy: KvCompressionPolicy,
     /// The decoder's qualification-table family (`None` when it has none).
     pub family: Option<KvModelFamily>,
-    /// The context the request is qualified against (see [`core_llm::qualify_kv_compression`]).
-    pub context_tokens: u64,
+    /// Tokens the sequence prefills before decoding (the qualified minimum bounds it).
+    pub prompt_tokens: u64,
+    /// The most tokens the sequence may generate; the qualified maximum bounds the final context
+    /// `prompt_tokens + max_new_tokens` (see [`core_llm::qualify_kv_compression`]).
+    pub max_new_tokens: u64,
     /// The dense block pool every dense selection draws from.
     pub dense_pool: &'a Rc<RefCell<BlockPool>>,
     /// The packed page pool a compressed selection draws from.

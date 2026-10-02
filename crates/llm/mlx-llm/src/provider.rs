@@ -929,6 +929,10 @@ pub struct LlamaProvider {
     /// identity instead of trusting the matrix row's caller-authored family label.
     architecture: Architecture,
     campaign_family: Option<&'static str>,
+    /// The compressed-KV qualification family (sc-20679). Only a snapshot load names it, from the
+    /// same architecture-name check as `campaign_family`; [`Self::from_parts`] cannot tell a
+    /// Llama checkpoint from a Mistral or dense Qwen2 one sharing its decoder, so it has none.
+    kv_family: Option<core_llm::KvModelFamily>,
     model: Decoder,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
@@ -1736,6 +1740,7 @@ impl LlamaProvider {
             descriptor,
             architecture: arch,
             campaign_family,
+            kv_family: crate::kv_policy::family_for(campaign_family),
             model,
             tokenizer,
             template,
@@ -1799,6 +1804,7 @@ impl LlamaProvider {
             descriptor,
             architecture: Architecture::Qwen35,
             campaign_family: None,
+            kv_family: None,
             model: Decoder::Qwen35(Box::new(model)),
             tokenizer: loaded.tokenizer,
             template: loaded.template,
@@ -1836,6 +1842,7 @@ impl LlamaProvider {
             descriptor: provider_descriptor(),
             architecture,
             campaign_family,
+            kv_family: None,
             model: Decoder::Causal(Box::new(model)),
             tokenizer,
             template: Box::new(Llama3Template),
@@ -2740,21 +2747,28 @@ impl LlamaProvider {
     }
 
     /// Decide the KV cache of one product generation against the qualification table: the
-    /// request's opt-in, this model's table family and the `context_tokens` prefilled before
-    /// decode, then the request shape, the decoder's attention geometry and the retained reader.
-    /// Every refusal is a dense plan with its reason.
+    /// request's opt-in, this model's table family, the `context_tokens` prefilled before decode
+    /// and the final context after up to `max_new_tokens` more, then the request shape, the
+    /// decoder's attention geometry and the retained reader. Every refusal is a dense plan with
+    /// its reason.
     fn plan_kv_cache(
         &self,
         policy: core_llm::KvCompressionPolicy,
         context_tokens: usize,
+        max_new_tokens: u32,
         multimodal: bool,
     ) -> KvPlan {
         use core_llm::{KvCacheFallbackReason as Reason, KvCacheReport};
         let dense =
             |reason, detail: Option<String>| KvPlan::Dense(KvCacheReport::dense(reason, detail));
-        let family = crate::kv_policy::family_for(self.campaign_family);
         let context = u64::try_from(context_tokens).unwrap_or(u64::MAX);
-        let row = match core_llm::qualify_kv_compression(policy, family, context, 1) {
+        let row = match core_llm::qualify_kv_compression(
+            policy,
+            self.kv_family,
+            context,
+            u64::from(max_new_tokens),
+            1,
+        ) {
             Ok(row) => row,
             Err(reason) => return dense(reason, None),
         };
@@ -2947,6 +2961,7 @@ impl LlamaProvider {
             self.plan_kv_cache(
                 req.kv_compression,
                 prompt_len,
+                req.max_new_tokens,
                 multimodal || gemma4_mm_request,
             )
         };
@@ -5414,6 +5429,38 @@ mod tests {
     /// [`tiny_packed_capable_snapshot`] with the config's architecture `identity` keys, a
     /// `window`-token context, and (for Qwen3) unit per-head q/k RMSNorm weights.
     fn tiny_snapshot(identity: serde_json::Value, window: u64, qk_norm: bool) -> tempfile::TempDir {
+        tiny_snapshot_with(identity, window, qk_norm, SnapshotGains::DEFAULT)
+    }
+
+    /// Weight gains of a [`tiny_snapshot_with`] fixture over its unit-scale random draws.
+    #[derive(Clone, Copy, Debug)]
+    struct SnapshotGains {
+        /// Scale of the query/key projections (of the q/k RMSNorm weights on a Qwen3 fixture):
+        /// sharper attention.
+        qk: f32,
+        /// Scale of the value/output projections: attention's share of the residual.
+        vo: f32,
+        /// Weight of the embeddings in the output head: how strongly the current token decides
+        /// the next one.
+        head_align: f32,
+    }
+
+    impl SnapshotGains {
+        const DEFAULT: Self = Self {
+            qk: 1.0,
+            vo: 1.0,
+            head_align: 4.0,
+        };
+    }
+
+    /// [`tiny_snapshot`] with explicit weight `gains`; the random draws are the same for every
+    /// gain, so [`SnapshotGains::DEFAULT`] reproduces [`tiny_snapshot`] exactly.
+    fn tiny_snapshot_with(
+        identity: serde_json::Value,
+        window: u64,
+        qk_norm: bool,
+        gains: SnapshotGains,
+    ) -> tempfile::TempDir {
         use crate::primitives::sampler::{SplitMix64, TokenRng};
         let dir = tempfile::tempdir().unwrap();
         let mut vocab = serde_json::Map::new();
@@ -5461,7 +5508,7 @@ mod tests {
         // A head partly aligned with the embeddings gives decisive next-token margins (a random
         // head over 32 words leaves bf16-rounding ties that flip even dense against dense), while
         // the attention path still moves the argmax (2-bit K/V flips positions).
-        let head = &arrays[0].1 * 4.0f32 + randn(&[32, 128]);
+        let head = &arrays[0].1 * gains.head_align + randn(&[32, 128]);
         arrays.push(("lm_head.weight".into(), head));
         for i in 0..2 {
             let p = |s: &str| format!("model.layers.{i}.{s}");
@@ -5474,10 +5521,10 @@ mod tests {
                     p("post_attention_layernorm.weight"),
                     Array::ones::<f32>(&[128]).unwrap(),
                 ),
-                (p("self_attn.q_proj.weight"), randn(&[128, 128])),
-                (p("self_attn.k_proj.weight"), randn(&[64, 128])),
-                (p("self_attn.v_proj.weight"), randn(&[64, 128])),
-                (p("self_attn.o_proj.weight"), randn(&[128, 128])),
+                (p("self_attn.q_proj.weight"), randn(&[128, 128]) * gains.qk),
+                (p("self_attn.k_proj.weight"), randn(&[64, 128]) * gains.qk),
+                (p("self_attn.v_proj.weight"), randn(&[64, 128]) * gains.vo),
+                (p("self_attn.o_proj.weight"), randn(&[128, 128]) * gains.vo),
                 (p("mlp.gate_proj.weight"), randn(&[64, 128])),
                 (p("mlp.up_proj.weight"), randn(&[64, 128])),
                 (p("mlp.down_proj.weight"), randn(&[128, 64])),
@@ -5486,11 +5533,11 @@ mod tests {
                 arrays.extend([
                     (
                         p("self_attn.q_norm.weight"),
-                        Array::ones::<f32>(&[64]).unwrap(),
+                        Array::ones::<f32>(&[64]).unwrap() * gains.qk,
                     ),
                     (
                         p("self_attn.k_norm.weight"),
-                        Array::ones::<f32>(&[64]).unwrap(),
+                        Array::ones::<f32>(&[64]).unwrap() * gains.qk,
                     ),
                 ]);
             }
@@ -6076,8 +6123,20 @@ mod tests {
         policy: core_llm::KvCompressionPolicy,
         max_new_tokens: u32,
     ) -> TextLlmOutput {
+        kv_generate_words(provider, words, (7, 26), policy, max_new_tokens).0
+    }
+
+    /// [`kv_generate`] over the word pattern `w{(i · step) % modulo + 6}`, also returning the
+    /// rendered prompt ids and the generated token ids as the stream emitted them.
+    fn kv_generate_words(
+        provider: &LlamaProvider,
+        words: usize,
+        (step, modulo): (usize, usize),
+        policy: core_llm::KvCompressionPolicy,
+        max_new_tokens: u32,
+    ) -> (TextLlmOutput, Vec<i32>, Vec<i32>) {
         let text = (0..words)
-            .map(|i| format!("w{}", (i * 7) % 26 + 6))
+            .map(|i| format!("w{}", (i * step) % modulo + 6))
             .collect::<Vec<_>>()
             .join(" ");
         let request = TextLlmRequest {
@@ -6088,7 +6147,16 @@ mod tests {
             kv_compression: policy,
             ..Default::default()
         };
-        provider.generate(&request, &mut |_| {}).unwrap()
+        let (_, prompt_ids) = provider.render_prompt(&request, &request.messages).unwrap();
+        let mut stream = Vec::new();
+        let output = provider
+            .generate(&request, &mut |event| {
+                if let CoreEvent::Token { id, .. } = event {
+                    stream.push(id as i32);
+                }
+            })
+            .unwrap();
+        (output, prompt_ids, stream)
     }
 
     fn load_tiny(snapshot: &tempfile::TempDir) -> LlamaProvider {
@@ -6098,10 +6166,22 @@ mod tests {
         .unwrap()
     }
 
+    /// Gains that make the tiny fixture's generation depend on its context: sharp attention whose
+    /// output dominates the residual, and a head only weakly tied to the current token. With the
+    /// default gains every prompt decodes the same single token, which no reader could get wrong.
+    /// Sharper attention (qk ≥ 3) amplifies 8-bit key rounding past the parity bound, so the
+    /// gains stay in the band where 8 bits holds and 2/4 bits do not.
+    const CONTEXT_SENSITIVE_GAINS: SnapshotGains = SnapshotGains {
+        qk: 2.0,
+        vo: 3.0,
+        head_align: 1.0,
+    };
+
     /// AC3: a request at the family's qualified minimum context runs wholly on the fused
-    /// compressed reader through the production entry point and generates exactly what the dense
-    /// cache does; the same provider keeps a short request, and an un-opted request, dense with
-    /// their reasons.
+    /// compressed reader through the production entry point, and every token it emits is the
+    /// dense model's choice at that position (its dense logit within 8-bit rounding of the dense
+    /// maximum) — on a fixture whose dense output demonstrably depends on the context. The same
+    /// provider keeps a short request, and an un-opted request, dense with their reasons.
     fn assert_compressed_matches_dense(
         identity: serde_json::Value,
         qk_norm: bool,
@@ -6113,12 +6193,61 @@ mod tests {
             .find(|row| row.family == family)
             .unwrap();
         let min = usize::try_from(row.min_context_tokens).unwrap();
-        let snapshot = tiny_snapshot(identity, row.min_context_tokens + 1024, qk_norm);
+        let snapshot = tiny_snapshot_with(
+            identity,
+            row.min_context_tokens + 1024,
+            qk_norm,
+            CONTEXT_SENSITIVE_GAINS,
+        );
         let provider = load_tiny(&snapshot);
         const NEW: u32 = 24;
+        const PATTERN: (usize, usize) = (7, 26);
 
         let dense = kv_generate(&provider, min, Policy::Off, NEW);
-        let compressed = kv_generate(&provider, min, Policy::Qualified, NEW);
+        let (compressed, prompt_ids, stream) =
+            kv_generate_words(&provider, min, PATTERN, Policy::Qualified, NEW);
+
+        // Sensitivity control: the dense output is context-dependent and varied, so a reader
+        // that corrupts the history changes what it should emit.
+        let control = kv_generate_words(&provider, min, (5, 13), Policy::Off, NEW).0;
+        assert_ne!(control.text, dense.text, "the fixture ignores its context");
+        let distinct = |text: &str| {
+            text.split_whitespace()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
+        assert!(distinct(&dense.text) >= 4, "{}", dense.text);
+        assert!(distinct(&compressed.text) >= 4, "{}", compressed.text);
+
+        // Per-step parity on the stream the production compressed generation emitted: the dense
+        // model, teacher-forced on that stream, scores every emitted token within 8-bit rounding
+        // of its best. With every logit within 0.02 of the dense range (the logit-parity bound),
+        // a near-tie the compressed cache resolves the other way costs at most two such errors:
+        // 0.04. Measured ≤ 0.004 here at 8 bits; 4-bit codes reach 0.15 and 2-bit 0.3–0.55.
+        assert_eq!(stream.len(), NEW as usize);
+        let Decoder::Causal(model) = &provider.model else {
+            panic!("a qualified family is a causal decoder");
+        };
+        let mut dense_cache = model.make_cache();
+        let rows = forced_logits(
+            model,
+            dense_cache.as_mut(),
+            &prompt_ids,
+            &stream[..stream.len() - 1],
+        );
+        let range = rows
+            .iter()
+            .flatten()
+            .fold(0.0f32, |max, value| max.max(value.abs()));
+        for (position, (logits, &token)) in rows.iter().zip(&stream).enumerate() {
+            let best = logits.iter().copied().fold(f32::MIN, f32::max);
+            let gap = (best - logits[token as usize]) / range;
+            assert!(
+                gap <= 0.04,
+                "position {position}: compressed emitted {token}, {gap} of the dense logit \
+                 range below the dense choice"
+            );
+        }
         assert!(
             u64::from(compressed.usage.prompt_tokens) >= row.min_context_tokens,
             "{:?}",
@@ -6149,12 +6278,6 @@ mod tests {
             report.counters.compressed_cache_bytes < tokens * 2 * 2 * 64 * 2,
             "{report:?}"
         );
-        assert_eq!(
-            compressed.text, dense.text,
-            "compressed vs dense generation"
-        );
-        assert!(!dense.text.is_empty());
-
         // The same provider keeps a short request dense: short contexts decode slower compressed.
         let short = kv_generate(&provider, 64, Policy::Qualified, 8);
         assert_eq!(
@@ -6216,6 +6339,7 @@ mod tests {
         let KvPlan::Compressed { format, reader } = provider.plan_kv_cache(
             core_llm::KvCompressionPolicy::Qualified,
             prompt.len(),
+            stream.len() as u32,
             false,
         ) else {
             panic!("the qualified context must plan compressed");
@@ -6318,17 +6442,85 @@ mod tests {
             40_960,
             true,
         ));
-        let KvPlan::Dense(report) = qwen.plan_kv_cache(Policy::Qualified, 20_000, true) else {
+        let KvPlan::Dense(report) = qwen.plan_kv_cache(Policy::Qualified, 20_000, 0, true) else {
             panic!("a multimodal request must plan dense");
         };
         assert_eq!(report.fallback, Some(Reason::UnsupportedRequest));
         assert!(matches!(
-            qwen.plan_kv_cache(Policy::Qualified, 20_000, false),
+            qwen.plan_kv_cache(Policy::Qualified, 20_000, 64, false),
             KvPlan::Compressed { .. }
         ));
         assert!(matches!(
-            qwen.plan_kv_cache(Policy::Off, 20_000, false),
+            qwen.plan_kv_cache(Policy::Off, 20_000, 64, false),
             KvPlan::Dense(report) if report.fallback == Some(Reason::PolicyDisabled)
+        ));
+        // The plan bounds the final context, not just the prompt: a fit-boundary prompt whose
+        // budget runs past the evidenced 40 960-token window stays dense.
+        assert!(matches!(
+            qwen.plan_kv_cache(Policy::Qualified, 40_448, 512, false),
+            KvPlan::Compressed { .. }
+        ));
+        assert!(matches!(
+            qwen.plan_kv_cache(Policy::Qualified, 40_448, 513, false),
+            KvPlan::Dense(report) if report.fallback == Some(Reason::AboveQualifiedContext)
+        ));
+    }
+
+    /// AC1 at the production entry point: the request's token budget counts against the
+    /// qualified range. A Qwen3 prompt that fits the evidenced 40 960-token window runs compressed
+    /// only while prompt + `max_new_tokens` stays inside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_final_context_bounds_a_production_compressed_request() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        let provider = load_tiny(&tiny_snapshot(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            41_472,
+            true,
+        ));
+        // The chat template's own tokens, so the prompt lands 8 tokens inside the window.
+        let one_word = TextLlmRequest {
+            messages: vec![Message::text(Role::User, "w6")],
+            ..Default::default()
+        };
+        let overhead = provider
+            .render_prompt(&one_word, &one_word.messages)
+            .unwrap()
+            .1
+            .len()
+            - 1;
+        let words = 40_960 - overhead - 8;
+        let (inside, prompt_ids, _) =
+            kv_generate_words(&provider, words, (7, 26), Policy::Qualified, 1);
+        let headroom = u32::try_from(40_960 - prompt_ids.len()).unwrap();
+        assert_eq!(headroom, 8);
+        assert!(inside.kv_cache.unwrap().ran_compressed());
+        let fits = kv_generate(&provider, words, Policy::Qualified, headroom);
+        assert!(fits.kv_cache.unwrap().ran_compressed());
+        let past = kv_generate(&provider, words, Policy::Qualified, headroom + 1);
+        assert_eq!(
+            past.kv_cache,
+            Some(core_llm::KvCacheReport::dense(
+                Reason::AboveQualifiedContext,
+                None
+            ))
+        );
+    }
+
+    /// A provider assembled from parts cannot tell Llama from a Mistral or dense Qwen2 checkpoint
+    /// sharing its decoder, so it never qualifies as a table family.
+    #[test]
+    fn a_provider_from_parts_is_never_a_qualified_family() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        let snapshot = tiny_packed_capable_snapshot();
+        let tokenizer = Tokenizer::from_file(snapshot.path().join("tokenizer.json")).unwrap();
+        // A Mistral-shaped decoder: `Architecture::Llama`, exactly what `from_parts` receives.
+        let model = tiny_packed_capable_model();
+        assert_eq!(model.config().architecture, Architecture::Llama);
+        let provider = LlamaProvider::from_parts(model, tokenizer, vec![99]);
+        assert!(matches!(
+            provider.plan_kv_cache(Policy::Qualified, 40_000, 64, false),
+            KvPlan::Dense(report) if report.fallback == Some(Reason::UnqualifiedModel)
         ));
     }
 
@@ -6528,7 +6720,8 @@ mod tests {
         )
     }
 
-    /// A paged request at a context the Qwen3 row admits (the synthetic decode itself is short).
+    /// A paged request whose prompt and final context the Qwen3 row admits (the synthetic decode
+    /// itself is short).
     fn paged_request<'a>(
         policy: core_llm::KvCompressionPolicy,
         dense_pool: &'a std::rc::Rc<std::cell::RefCell<crate::primitives::BlockPool>>,
@@ -6538,7 +6731,8 @@ mod tests {
         crate::primitives::PagedCacheRequest {
             policy,
             family: Some(core_llm::KvModelFamily::Qwen3),
-            context_tokens: 20_000,
+            prompt_tokens: 20_000,
+            max_new_tokens: 1_024,
             dense_pool,
             packed_pool,
             reader,
@@ -6654,10 +6848,18 @@ mod tests {
             || paged_request(Policy::Qualified, &dense_pool, &packed_pool, Some(&reader));
         assert_eq!(
             reason(crate::primitives::PagedCacheRequest {
-                context_tokens: 100,
+                prompt_tokens: 100,
                 ..qualified()
             }),
             Some(Reason::BelowMinimumContext)
+        );
+        assert_eq!(
+            reason(crate::primitives::PagedCacheRequest {
+                max_new_tokens: 40_000,
+                ..qualified()
+            }),
+            Some(Reason::AboveQualifiedContext),
+            "the final context bounds the qualified maximum"
         );
         assert_eq!(
             reason(crate::primitives::PagedCacheRequest {
@@ -6710,16 +6912,9 @@ mod tests {
         let reader =
             crate::kv_policy::group_affine_reader(crate::primitives::PackedCodeBits::Eight)
                 .unwrap();
-        let prompts = [40, 75, 120].map(|len| {
-            (0..len)
-                .map(|i| ((i * 7 + len) % 31 + 1) as i32)
-                .collect::<Vec<_>>()
-        });
-        let streams = [0, 1, 2].map(|r| {
-            (0..50)
-                .map(|i| ((i * 5 + r) % 31 + 1) as i32)
-                .collect::<Vec<_>>()
-        });
+        let prompts =
+            [40, 75, 120].map(|len| (0..len).map(|i| (i * 7 + len) % 31 + 1).collect::<Vec<_>>());
+        let streams = [0, 1, 2].map(|r| (0..50).map(|i| (i * 5 + r) % 31 + 1).collect::<Vec<_>>());
         let alone = |r: usize, tokens: usize| {
             let (dense_pool, packed_pool) = paged_pools(&model, 32);
             let mut selection = model.select_paged_cache(paged_request(
@@ -6760,6 +6955,7 @@ mod tests {
             ));
         }
         // Interleaved decode; A is cancelled (dropped) after 30 tokens, C then takes its pages.
+        #[allow(clippy::needless_range_loop)] // `i` indexes both requests' streams
         for i in 0..50 {
             for (r, selection) in [(0, &mut a), (1, &mut b)] {
                 if r == 0 && i >= 30 {
