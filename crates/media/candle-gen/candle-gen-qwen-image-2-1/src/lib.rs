@@ -51,6 +51,12 @@
 //! LyCORIS LoHa folds into the dense weights on the bf16 tier and is a typed refusal on a packed
 //! one. See [`mod@adapters`].
 //!
+//! Training (sc-24160): the text-to-image LoRA/LoKr trainer [`QwenImage21Trainer`], registered as
+//! trainer id [`TRAINER_ID`] (`qwen_image_2_1`) — staged caption/latent caching, a snapshot-derived
+//! memory preflight, optional per-block gradient checkpointing, checkpoints + resume, previews, and
+//! adapters that load back strictly through [`mod@adapters`] with the MLX trainer's key layout. See
+//! [`mod@training`].
+//!
 //! ## Deliberate differences from the MLX twin
 //!
 //! * `backend = "candle"`, `mac_only = false`.
@@ -92,6 +98,7 @@ pub mod quant;
 pub mod reference;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -139,7 +146,10 @@ pub use text_encoder::{
     image_pad_token_id, prompt_template, prompt_template_ti2i, system_prefix,
     system_prompt_drop_count, QwenImage21TextEncoder, TextConditioning, IMAGE_PAD_TOKEN,
 };
-pub use transformer::{JointLayout, QwenImage21Transformer, Segment};
+pub use training::{QwenImage21Trainer, ADAPTER_PROVENANCE, TRAINER_ID};
+pub use transformer::{
+    JointLayout, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS, GLOBAL_ADAPTER_TARGETS,
+};
 pub use vae::QwenImage21Vae;
 
 /// Registry id for Qwen-Image 2.1 (the SceneWorks worker's `payload.model`).
@@ -640,11 +650,16 @@ candle_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
 
-/// Add the Candle Qwen-Image 2.1 generator to an explicit media registry builder.
+/// Add the Candle Qwen-Image 2.1 generator and its LoRA/LoKr trainer (sc-24160) to an explicit
+/// media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(registry.register_generator(REGISTRATION))
+    register_memory_contract_surfaces(
+        registry
+            .register_generator(REGISTRATION)
+            .register_trainer(training::TRAINER_REGISTRATION),
+    )
 }
 
 /// The shared-ladder registrations (sc-24112). Split out the way the sibling Candle providers do so
