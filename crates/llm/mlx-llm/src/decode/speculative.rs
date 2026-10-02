@@ -83,11 +83,35 @@ pub fn generate_prompt_lookup(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
+    let mut cache = model.new_cache();
+    generate_prompt_lookup_on(
+        model, &mut cache, prompt_ids, config, spec, cancel, on_event,
+    )
+}
+
+/// [`generate_prompt_lookup`] on a caller-chosen empty `cache` — a paged compressed cache
+/// included (sc-20681). Each verify forward is preceded by [`KvCache::begin_speculation`], so the
+/// rollback of rejected drafts leaves the cache exactly as if only the kept tokens had been
+/// appended, on a quantizing cache too.
+pub fn generate_prompt_lookup_on(
+    model: &CausalLm,
+    cache: &mut dyn KvCache,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    spec: &SpeculativeConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> Result<(GenerationOutput, SpeculativeStats)> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
     }
     if prompt_ids.is_empty() {
         return Err(Error::Msg("generate_prompt_lookup: empty prompt".into()));
+    }
+    if cache.offset() != 0 {
+        return Err(Error::Msg(
+            "generate_prompt_lookup: the cache must start empty".into(),
+        ));
     }
 
     let mut stats = SpeculativeStats::default();
@@ -109,11 +133,10 @@ pub fn generate_prompt_lookup(
     }
 
     let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let mut cache = model.new_cache();
     let greedy = config.sampling.temperature <= 0.0;
 
     // ---- Prefill: logits for the last prompt position; the first token is sampled as usual. ----
-    let logits_last = model.decode_logits(&input_ids(prompt_ids), &mut cache, 0)?;
+    let logits_last = model.decode_logits(&input_ids(prompt_ids), cache, 0)?;
     stats.forwards += 1;
     let mut history: Vec<i32> = prompt_ids.to_vec();
 
@@ -164,7 +187,8 @@ pub fn generate_prompt_lookup(
         verify.push(cur);
         verify.extend_from_slice(&drafts);
         let base_offset = cache.offset();
-        let logits_all = model.decode_logits_all(&input_ids(&verify), &mut cache, base_offset)?;
+        cache.begin_speculation()?;
+        let logits_all = model.decode_logits_all(&input_ids(&verify), cache, base_offset)?;
         stats.forwards += 1;
 
         let (committed, accepted) = if greedy {
@@ -237,8 +261,43 @@ pub fn generate_draft_speculative(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
+    let mut target_cache = target.new_cache();
+    let mut draft_cache = draft.new_cache();
+    generate_draft_speculative_on(
+        target,
+        &mut target_cache,
+        draft,
+        &mut draft_cache,
+        prompt_ids,
+        config,
+        spec,
+        cancel,
+        on_event,
+    )
+}
+
+/// [`generate_draft_speculative`] on caller-chosen empty caches — one per model, never shared
+/// (each holds its own model's K/V) — including paged compressed caches (sc-20681). Both caches
+/// arm [`KvCache::begin_speculation`] before each speculative step, so their rollbacks are exact.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_draft_speculative_on(
+    target: &CausalLm,
+    target_cache: &mut dyn KvCache,
+    draft: &CausalLm,
+    draft_cache: &mut dyn KvCache,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    spec: &SpeculativeConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> Result<(GenerationOutput, SpeculativeStats)> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
+    }
+    if target_cache.offset() != 0 || draft_cache.offset() != 0 {
+        return Err(Error::Msg(
+            "generate_draft_speculative: both caches must start empty".into(),
+        ));
     }
     if prompt_ids.is_empty() {
         return Err(Error::Msg(
@@ -272,13 +331,11 @@ pub fn generate_draft_speculative(
     }
 
     let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let mut target_cache = target.new_cache();
-    let mut draft_cache = draft.new_cache();
     let greedy = config.sampling.temperature <= 0.0;
 
     // ---- Prefill both models; first token from the target's last-position logits. ----
-    let logits_last = target.decode_logits(&input_ids(prompt_ids), &mut target_cache, 0)?;
-    let draft_logits_last = draft.decode_logits(&input_ids(prompt_ids), &mut draft_cache, 0)?;
+    let logits_last = target.decode_logits(&input_ids(prompt_ids), target_cache, 0)?;
+    let draft_logits_last = draft.decode_logits(&input_ids(prompt_ids), draft_cache, 0)?;
     stats.forwards += 1;
     let mut history: Vec<i32> = prompt_ids.to_vec();
 
@@ -319,6 +376,8 @@ pub fn generate_draft_speculative(
         let k = spec.num_draft.min(remaining.saturating_sub(1));
         let base_target = target_cache.offset();
         let base_draft = draft_cache.offset();
+        target_cache.begin_speculation()?;
+        draft_cache.begin_speculation()?;
 
         // ---- Draft proposes K tokens; feed [cur, d₁…dₖ] so the draft cache stays target-synced. ----
         let mut drafts: Vec<i32> = Vec::with_capacity(k);
@@ -327,7 +386,7 @@ pub fn generate_draft_speculative(
         let mut feed = cur;
         for step in 0..=k {
             let off = draft_cache.offset();
-            let dl = draft.decode_logits(&input_ids(&[feed]), &mut draft_cache, off)?;
+            let dl = draft.decode_logits(&input_ids(&[feed]), draft_cache, off)?;
             if step < k {
                 if !greedy {
                     draft_dists.push(shaped_candidates(&dl, &draft_hist, &config.sampling, None)?);
@@ -345,7 +404,7 @@ pub fn generate_draft_speculative(
         verify.push(cur);
         verify.extend_from_slice(&drafts);
         let logits_all =
-            target.decode_logits_all(&input_ids(&verify), &mut target_cache, base_target)?;
+            target.decode_logits_all(&input_ids(&verify), target_cache, base_target)?;
         stats.forwards += 1;
 
         let (committed, accepted) = if greedy {

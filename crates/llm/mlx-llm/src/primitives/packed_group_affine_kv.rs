@@ -1887,7 +1887,7 @@ impl PackedGeometry {
             .div_ceil(self.group)
             * self.group
     }
-    fn shape(self, tokens: usize, width: usize) -> Result<[i32; 4]> {
+    pub(super) fn shape(self, tokens: usize, width: usize) -> Result<[i32; 4]> {
         mlx_shape([self.batch, self.heads, tokens, width])
     }
 }

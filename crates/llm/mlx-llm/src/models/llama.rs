@@ -66,8 +66,9 @@ use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{
     select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
     ContiguousKvCache, DecoderCacheSelection, PackedCacheRequest, PagedCacheRequest,
-    PagedCacheSelection, PagedKvCache, Weights, PACKED_METAL_QUANT_GROUP_SIZE,
+    PagedCacheSelection, PagedKvCache, PagedPackedKvCache, Weights, PACKED_METAL_QUANT_GROUP_SIZE,
 };
+use crate::primitives::paged_packed_kv::paged_attention_batch;
 
 /// Cached decode runs in bf16 (matching the reference engines).
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
@@ -801,6 +802,23 @@ impl CausalLm {
         caches: &mut [&mut PagedKvCache],
         positions: &[i32],
     ) -> Result<Array> {
+        let mut caches = caches
+            .iter_mut()
+            .map(|cache| &mut **cache as &mut dyn KvCache)
+            .collect::<Vec<_>>();
+        self.decode_logits_per_seq_dyn(input_ids, &mut caches, positions)
+    }
+
+    /// [`CausalLm::decode_logits_per_seq`] over any per-sequence caches (sc-20681): a batch may mix
+    /// dense paged sequences with paged compressed ones. The compressed sequences of one page pool
+    /// attend through one fused paged dispatch per layer (a page table and per-sequence lengths,
+    /// no padding mask); every other sequence attends on its own as before.
+    pub fn decode_logits_per_seq_dyn(
+        &self,
+        input_ids: &Array,
+        caches: &mut [&mut dyn KvCache],
+        positions: &[i32],
+    ) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
         if caches.len() != b as usize {
@@ -1201,7 +1219,7 @@ impl LlamaLayer {
         &self,
         x: &Array,
         ropes: &RopeTables,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         let (cos, sin) = ropes.get(self.rope_slot);
@@ -1273,7 +1291,7 @@ impl Attention {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         match self {
@@ -1497,7 +1515,7 @@ impl LlamaAttention {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         let q = self.project_q(x, cos, sin)?;
@@ -1509,15 +1527,88 @@ impl LlamaAttention {
             )
         })?;
         let (k, v) = self.project_kv(kv, x, cos, sin)?;
-        let mut outs = Vec::with_capacity(caches.len());
+        let mut outs: Vec<Option<Array>> = (0..caches.len()).map(|_| None).collect();
+        let packed_mask = match self.sliding_window {
+            Some(window) => PackedAttentionMask::SlidingWindow(window.max(0) as usize),
+            None => PackedAttentionMask::Causal,
+        };
+        // The paged compressed sequences of one pool attend in one fused dispatch (sc-20681).
+        if self.softcap.is_none() && !self.stores_kv {
+            let mut group = caches
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, cache)| {
+                    cache
+                        .as_any_mut()
+                        .downcast_mut::<PagedPackedKvCache>()
+                        .map(|cache| (i, cache))
+                })
+                .collect::<Vec<_>>();
+            if group.len() > 1 {
+                let rows = group.iter().map(|(i, _)| *i as i32).collect::<Vec<_>>();
+                let rows = Array::from_slice(&rows, &[rows.len() as i32]);
+                let (qg, kg, vg) = (
+                    q.take_axis(&rows, 0)?,
+                    k.take_axis(&rows, 0)?,
+                    v.take_axis(&rows, 0)?,
+                );
+                let batched = {
+                    let mut members = group
+                        .iter_mut()
+                        .map(|(_, cache)| &mut **cache)
+                        .collect::<Vec<_>>();
+                    paged_attention_batch(
+                        &mut members,
+                        layer_idx,
+                        &qg,
+                        &kg,
+                        &vg,
+                        packed_mask,
+                        self.scale,
+                    )?
+                };
+                if let Some(out) = batched {
+                    for (j, (i, _)) in group.iter().enumerate() {
+                        outs[*i] = Some(row_axis0(&out, j as i32)?);
+                    }
+                }
+            }
+        }
         for (i, cache) in caches.iter_mut().enumerate() {
-            let i = i as i32;
-            let (qi, ki, vi) = (row_axis0(&q, i)?, row_axis0(&k, i)?, row_axis0(&v, i)?);
+            if outs[i].is_some() {
+                continue;
+            }
+            let row = i as i32;
+            let (qi, ki, vi) = (
+                row_axis0(&q, row)?,
+                row_axis0(&k, row)?,
+                row_axis0(&v, row)?,
+            );
+            if self.softcap.is_none() {
+                if let Some(out) = cache.try_packed_attention(
+                    layer_idx,
+                    &qi,
+                    &ki,
+                    &vi,
+                    packed_mask,
+                    self.scale,
+                    self.stores_kv,
+                )? {
+                    outs[i] = Some(out);
+                    continue;
+                }
+            } else if let Some(softcap) = self.softcap {
+                let reason = format!(
+                    "attention score softcap c={softcap} requires tanh before softmax; the packed \
+                     reader implements uncapped scaled dot-product attention"
+                );
+                cache.prepare_dense_fallback("score-softcap", &reason)?;
+            }
             let (k_all, v_all) = cache.update(layer_idx, &ki, &vi)?;
             let mut buf = None;
             let mask =
                 self.windowed(AttnMask::Causal, qi.shape()[2], k_all.shape()[2], &mut buf)?;
-            outs.push(sdpa_capped(
+            outs[i] = Some(sdpa_capped(
                 &qi,
                 &k_all,
                 &v_all,
@@ -1526,6 +1617,10 @@ impl LlamaAttention {
                 mask,
             )?);
         }
+        let outs = outs
+            .into_iter()
+            .map(|out| out.ok_or_else(|| Error::Msg("a sequence produced no attention".into())))
+            .collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Array> = outs.iter().collect();
         let out = concatenate_axis(&refs, 0)?; // [b, heads, s, head_dim]
         self.output(&out)

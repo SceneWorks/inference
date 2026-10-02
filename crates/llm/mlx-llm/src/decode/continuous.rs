@@ -25,6 +25,18 @@
 //! Both modes get iteration-level admission (admit-on-retire) and per-sequence paged attention (no
 //! padding mask, no max-context reservation). The bit-exact equality assertion in `tests/batch.rs`
 //! runs against `Exact`.
+//!
+//! ## Compressed KV (story sc-20681)
+//! [`generate_continuous_kv`] runs the same loop under the product's compressed-KV policy
+//! ([`ContinuousKv`]). Each request is qualified on its own
+//! ([`core_llm::qualify_kv_sequence`]): a qualified request decodes on K8V8 pages of one shared
+//! [`PackedPagePool`] read in place by the fused paged reader, every other request on the dense
+//! paged cache beside it, and each output carries its own [`KvCacheReport`] saying which it ran
+//! and why. In `Throughput` mode the compressed sequences of a step attend through one fused paged
+//! dispatch per layer — a page table and per-sequence lengths, no padding mask — so jagged
+//! sequences batch compressed. With a [`PagedPrefixCache`] a request starts on the longest stored
+//! prefix's pages (reference-counted, copy-on-write) and stores its own sequence back; a store of
+//! another cache identity is refused and never consulted.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -33,10 +45,14 @@ use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use core_llm::schedule::{Scheduler, SeqId, SeqSpec};
-use core_llm::FinishReason as CoreFinish;
+use core_llm::{
+    FinishReason as CoreFinish, KvCacheFallbackReason, KvCacheReport, KvCompressionPolicy,
+    KvModelFamily,
+};
 
 use crate::decode::batch::BatchRequest;
 use crate::decode::cancel::CancelFlag;
+use crate::decode::prefix::{PagedPrefixCache, PagedPrefixLookup};
 use crate::decode::stream::{default_seed, FinishReason, GenerationOutput, StreamEvent};
 use crate::decode::{record_lane_token, BufferRelease, LaneStep};
 use crate::error::{Error, Result};
@@ -44,7 +60,11 @@ use crate::models::CausalLm;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::input_ids;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
-use crate::primitives::{BlockPool, PagedKvCache};
+use crate::primitives::{
+    BlockPool, CompiledKernelHandle, PackedCodeBits, PackedPagePool, PagedCacheIdentity,
+    PagedCacheRequest, PagedCacheSelection, PagedKvCache, PagedPackedKvCache,
+    PACKED_METAL_QUANT_GROUP_SIZE,
+};
 
 /// Numerical mode for [`generate_continuous`]'s decode forward — a throughput/exactness tradeoff
 /// that is fundamental, not an implementation choice (see the module docs).
@@ -85,18 +105,228 @@ impl Default for ContinuousConfig {
     }
 }
 
+/// The compressed-KV policy of one [`generate_continuous_kv`] run (sc-20681).
+pub struct ContinuousKv<'a> {
+    /// The product's opt-in; [`KvCompressionPolicy::Off`] (the default) runs every request on the
+    /// dense paged cache exactly as [`generate_continuous`] does.
+    pub policy: KvCompressionPolicy,
+    /// The loaded decoder's qualification-table family (`None` when it has none).
+    pub family: Option<KvModelFamily>,
+    /// Tokens per packed page (a positive multiple of the 32-token quantization group) of the
+    /// run's own page pool; a prefix store brings its own pool.
+    pub page_tokens: usize,
+    /// The fused paged reader; `None` builds the K8V8 reader when the policy is on.
+    pub reader: Option<CompiledKernelHandle>,
+    /// A shared-prefix store over paged compressed KV, consulted and filled by the compressed
+    /// requests when its identity matches this run's.
+    pub prefix: Option<&'a mut PagedPrefixCache>,
+    /// The model identity (checkpoint and revision) the run's compressed caches are keyed by.
+    pub model_identity: &'a str,
+}
+
+impl Default for ContinuousKv<'_> {
+    fn default() -> Self {
+        Self {
+            policy: KvCompressionPolicy::Off,
+            family: None,
+            page_tokens: 64,
+            reader: None,
+            prefix: None,
+            model_identity: "",
+        }
+    }
+}
+
+/// One request's result from [`generate_continuous_kv`].
+#[derive(Clone, Debug)]
+pub struct ContinuousOutput {
+    pub output: GenerationOutput,
+    /// The KV cache the request ran on: compressed, or dense with its reason.
+    pub kv_cache: KvCacheReport,
+    /// Prompt positions started from a stored prefix instead of prefilled.
+    pub reused_prefix_tokens: usize,
+    /// Why the run's prefix store was not consulted for this request (an identity mismatch).
+    pub prefix_refused: Option<String>,
+}
+
 /// Per-sequence host state for one in-flight slot, alongside its own paged cache.
 struct Lane {
     seq: SeqId,
     /// Request index == admission index == `seq.0`; kept explicit for the `on_event` callback.
     req_index: usize,
-    cache: PagedKvCache,
+    selection: PagedCacheSelection,
     rng: SplitMix64,
     params: SamplingParams,
     /// Prompt + generated tokens (the repetition-penalty window the sampler reads).
     history: Vec<i32>,
     /// The token to feed at the next decode step (the most recently sampled token).
     next_token: i32,
+}
+
+impl Lane {
+    fn cache(&mut self) -> &mut dyn KvCache {
+        self.selection.cache_mut()
+    }
+
+    fn packed(&mut self) -> Option<&mut PagedPackedKvCache> {
+        self.selection
+            .cache_mut()
+            .as_any_mut()
+            .downcast_mut::<PagedPackedKvCache>()
+    }
+}
+
+/// The caches, pools and prefix store one run draws from.
+struct KvRun<'a> {
+    policy: KvCompressionPolicy,
+    family: Option<KvModelFamily>,
+    dense_pool: Rc<RefCell<BlockPool>>,
+    /// `None` when the policy is off, or when no pool fits this decoder (`pool_refusal`).
+    packed_pool: Option<Rc<RefCell<PackedPagePool>>>,
+    pool_refusal: Option<String>,
+    reader: Option<CompiledKernelHandle>,
+    /// The store and this run's identity, when they match.
+    store: Option<(&'a mut PagedPrefixCache, PagedCacheIdentity)>,
+    /// A store refused for its identity: the mismatch, and the store to record each refusal on.
+    refused_store: Option<(&'a mut PagedPrefixCache, PagedCacheIdentity, String)>,
+    /// Per request: the report it finished with and the positions it reused.
+    reports: Vec<Option<KvCacheReport>>,
+    reused: Vec<usize>,
+}
+
+impl<'a> KvRun<'a> {
+    fn new(model: &CausalLm, config: &ContinuousConfig, kv: ContinuousKv<'a>, n: usize) -> Self {
+        let cfg = model.config();
+        let mut run = Self {
+            policy: kv.policy,
+            family: kv.family,
+            dense_pool: BlockPool::new(config.block_size),
+            packed_pool: None,
+            pool_refusal: None,
+            reader: None,
+            store: None,
+            refused_store: None,
+            reports: vec![None; n],
+            reused: vec![0; n],
+        };
+        if kv.policy == KvCompressionPolicy::Off {
+            return run;
+        }
+        let new_pool = |page_tokens: usize| {
+            PackedPagePool::new(
+                cfg.num_layers,
+                usize::try_from(cfg.num_kv_heads).unwrap_or(0),
+                usize::try_from(cfg.head_dim).unwrap_or(0),
+                page_tokens,
+                PackedCodeBits::Eight,
+            )
+        };
+        if let Some(store) = kv.prefix {
+            let expected = new_pool(store.identity().page_tokens)
+                .map(|pool| pool.borrow().identity(kv.model_identity));
+            match expected {
+                Ok(identity) => match store.identity().mismatch(&identity) {
+                    None => {
+                        run.packed_pool = Some(store.pool().clone());
+                        run.store = Some((store, identity));
+                    }
+                    Some(mismatch) => run.refused_store = Some((store, identity, mismatch)),
+                },
+                Err(error) => {
+                    let identity = store.identity().clone();
+                    run.refused_store = Some((store, identity, error.to_string()));
+                }
+            }
+        }
+        if run.packed_pool.is_none() {
+            match new_pool(kv.page_tokens) {
+                Ok(pool) => run.packed_pool = Some(pool),
+                Err(error) => run.pool_refusal = Some(error.to_string()),
+            }
+        }
+        run.reader = kv.reader.or_else(|| {
+            crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).ok()
+        });
+        run
+    }
+
+    /// The cache request `r` runs on, before any K/V mutation.
+    fn select(&self, model: &CausalLm, r: &BatchRequest) -> PagedCacheSelection {
+        let prompt_tokens = u64::try_from(r.prompt_ids.len()).unwrap_or(u64::MAX);
+        let max_new_tokens = u64::try_from(r.max_new_tokens).unwrap_or(u64::MAX);
+        let Some(packed_pool) = self.packed_pool.as_ref() else {
+            let reason = match core_llm::qualify_kv_sequence(
+                self.policy,
+                self.family,
+                prompt_tokens,
+                max_new_tokens,
+            ) {
+                Err(reason) => KvCacheReport::dense(reason, None),
+                Ok(_) => KvCacheReport::dense(
+                    KvCacheFallbackReason::UnsupportedGeometry,
+                    self.pool_refusal.clone(),
+                ),
+            };
+            return PagedCacheSelection::dense(
+                PagedKvCache::with_pool(self.dense_pool.clone(), model.config().num_layers),
+                reason,
+            );
+        };
+        model.select_paged_cache(PagedCacheRequest {
+            policy: self.policy,
+            family: self.family,
+            prompt_tokens,
+            max_new_tokens,
+            dense_pool: &self.dense_pool,
+            packed_pool,
+            reader: self.reader.as_ref(),
+        })
+    }
+
+    /// The report of a request that never ran (cancelled in the queue, or a zero budget).
+    fn planned_report(&self, model: &CausalLm, r: &BatchRequest) -> Result<KvCacheReport> {
+        self.select(model, r).report()
+    }
+
+    /// Start a compressed `selection` on the longest stored prefix of `prompt`; the positions it
+    /// already holds.
+    fn reuse_prefix(&mut self, selection: &mut PagedCacheSelection, prompt: &[i32]) -> Result<usize> {
+        if !selection.is_compressed() {
+            return Ok(0);
+        }
+        if let Some((store, identity, _)) = self.refused_store.as_mut() {
+            // Counted on the store; nothing is reused.
+            store.lookup(identity, prompt)?;
+            return Ok(0);
+        }
+        let Some((store, identity)) = self.store.as_mut() else {
+            return Ok(0);
+        };
+        match store.lookup(identity, prompt)? {
+            PagedPrefixLookup::Hit { cache, tokens } => {
+                selection.replace_compressed(cache)?;
+                Ok(tokens)
+            }
+            PagedPrefixLookup::Miss | PagedPrefixLookup::Refused(_) => Ok(0),
+        }
+    }
+
+    /// Offer the sequence `lane` holds (`tokens` truncated to its offset) to the prefix store.
+    fn store_sequence(&mut self, lane: &mut Lane, tokens: &[i32]) -> Result<()> {
+        let Some((store, identity)) = self.store.as_mut() else {
+            return Ok(());
+        };
+        if let Some(cache) = lane.packed() {
+            store.insert(identity, tokens, cache)?;
+        }
+        Ok(())
+    }
+
+    fn prefix_refused(&self) -> Option<String> {
+        self.refused_store
+            .as_ref()
+            .map(|(_, _, mismatch)| mismatch.clone())
+    }
 }
 
 /// Generate for many requests with **iteration-level continuous batching**: up to
@@ -116,6 +346,32 @@ pub fn generate_continuous(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(usize, StreamEvent),
 ) -> Result<Vec<GenerationOutput>> {
+    Ok(generate_continuous_kv(
+        model,
+        requests,
+        config,
+        ContinuousKv::default(),
+        cancel,
+        on_event,
+    )?
+    .into_iter()
+    .map(|out| out.output)
+    .collect())
+}
+
+/// [`generate_continuous`] under the compressed-KV policy `kv` (sc-20681; see the module docs):
+/// each request runs compressed or dense on its own qualification and reports which, and
+/// compressed requests may share prefixes through `kv.prefix`. With the policy off this is
+/// exactly [`generate_continuous`]. A step that fails returns the error with every sequence's
+/// pages released (a prefix store keeps only the entries it already held).
+pub fn generate_continuous_kv(
+    model: &CausalLm,
+    requests: &[BatchRequest],
+    config: &ContinuousConfig,
+    kv: ContinuousKv<'_>,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(usize, StreamEvent),
+) -> Result<Vec<ContinuousOutput>> {
     if requests.is_empty() {
         return Err(Error::Msg("generate_continuous: no requests".into()));
     }
@@ -129,6 +385,12 @@ pub fn generate_continuous(
             "generate_continuous: block_size must be > 0".into(),
         ));
     }
+    if kv.page_tokens == 0 || !kv.page_tokens.is_multiple_of(PACKED_METAL_QUANT_GROUP_SIZE) {
+        return Err(Error::Msg(format!(
+            "generate_continuous: page_tokens must be a positive multiple of \
+             {PACKED_METAL_QUANT_GROUP_SIZE}"
+        )));
+    }
     for (i, r) in requests.iter().enumerate() {
         if r.prompt_ids.is_empty() {
             return Err(Error::Msg(format!(
@@ -140,8 +402,7 @@ pub fn generate_continuous(
         return Err(Error::Canceled); // typed pre-inference cancel
     }
 
-    let pool = BlockPool::new(config.block_size);
-    let num_layers = model.config().num_layers;
+    let mut run = KvRun::new(model, config, kv, requests.len());
 
     // Admit every request to the scheduler up front (stable SeqId == request index); only `max_batch`
     // are prefilled into a live lane at a time, the rest wait at `next_req`.
@@ -163,7 +424,7 @@ pub fn generate_continuous(
     // Fill the initial slots (prefill is per-sequence: each prompt at its own length, no left-pad).
     while lanes.len() < config.max_batch && next_req < requests.len() {
         if let Some(lane) = admit_lane(
-            model, &pool, num_layers, requests, &seq_ids, next_req, &mut sched, on_event,
+            model, &mut run, requests, &seq_ids, next_req, &mut sched, on_event,
         )? {
             lanes.push(lane);
         }
@@ -189,8 +450,9 @@ pub fn generate_continuous(
         let mut survivors: Vec<Lane> = Vec::with_capacity(lanes.len());
         for (mut lane, logits) in std::mem::take(&mut lanes).into_iter().zip(per_lane) {
             let tok = sample(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
-            if let LaneStep::Continue = record_token(&mut sched, &mut lane, tok, on_event) {
-                survivors.push(lane);
+            match record_token(&mut sched, &mut lane, tok, on_event) {
+                LaneStep::Continue => survivors.push(lane),
+                LaneStep::Done => retire_lane(&mut run, lane)?,
             }
         }
         lanes = survivors;
@@ -200,7 +462,7 @@ pub fn generate_continuous(
         // Admit-on-retire: refill every freed slot from the waiting requests.
         while lanes.len() < config.max_batch && next_req < requests.len() {
             if let Some(lane) = admit_lane(
-                model, &pool, num_layers, requests, &seq_ids, next_req, &mut sched, on_event,
+                model, &mut run, requests, &seq_ids, next_req, &mut sched, on_event,
             )? {
                 lanes.push(lane);
             }
@@ -240,20 +502,37 @@ pub fn generate_continuous(
             );
         }
     }
+    // Cancelled lanes report what they ran; their pages go back as they drop.
+    for lane in lanes {
+        run.reports[lane.req_index] = Some(lane.selection.report()?);
+    }
 
     // Assemble per-request outputs in request order from the scheduler's record.
-    Ok(seq_ids
+    let prefix_refused = run.prefix_refused();
+    seq_ids
         .iter()
-        .map(|&seq| GenerationOutput {
-            tokens: sched.generated(seq).to_vec(),
-            finish_reason: match sched.finish_reason(seq) {
-                Some(CoreFinish::Stop) => FinishReason::StopToken,
-                Some(CoreFinish::Length) => FinishReason::MaxTokens,
-                // `None` ⇒ still active when a cancel broke the loop (or never admitted).
-                _ => FinishReason::Cancelled,
-            },
+        .enumerate()
+        .map(|(ri, &seq)| {
+            let kv_cache = match run.reports[ri].take() {
+                Some(report) => report,
+                None => run.planned_report(model, &requests[ri])?,
+            };
+            Ok(ContinuousOutput {
+                output: GenerationOutput {
+                    tokens: sched.generated(seq).to_vec(),
+                    finish_reason: match sched.finish_reason(seq) {
+                        Some(CoreFinish::Stop) => FinishReason::StopToken,
+                        Some(CoreFinish::Length) => FinishReason::MaxTokens,
+                        // `None` ⇒ still active when a cancel broke the loop (or never admitted).
+                        _ => FinishReason::Cancelled,
+                    },
+                },
+                kv_cache,
+                reused_prefix_tokens: run.reused[ri],
+                prefix_refused: prefix_refused.clone(),
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Prefill request `ri` into a fresh lane and sample its first token. Returns `None` if the request
@@ -262,8 +541,7 @@ pub fn generate_continuous(
 #[allow(clippy::too_many_arguments)]
 fn admit_lane(
     model: &CausalLm,
-    pool: &Rc<RefCell<BlockPool>>,
-    num_layers: usize,
+    run: &mut KvRun<'_>,
     requests: &[BatchRequest],
     seq_ids: &[SeqId],
     ri: usize,
@@ -285,22 +563,44 @@ fn admit_lane(
         return Ok(None);
     }
 
-    let mut cache = PagedKvCache::with_pool(pool.clone(), num_layers);
-    let logits = model.decode_logits(&input_ids(&r.prompt_ids), &mut cache, 0)?; // batch-1 prefill
+    let mut selection = run.select(model, r);
+    let reused = run.reuse_prefix(&mut selection, &r.prompt_ids)?;
+    run.reused[ri] = reused;
+    // batch-1 prefill of the positions no stored prefix covers
+    let logits = model.decode_logits(
+        &input_ids(&r.prompt_ids[reused..]),
+        selection.cache_mut(),
+        reused as i32,
+    )?;
     let mut lane = Lane {
         seq,
         req_index: ri,
-        cache,
+        selection,
         rng: SplitMix64::new(r.seed.unwrap_or_else(default_seed)),
         params: r.sampling,
         history: r.prompt_ids.clone(),
         next_token: 0,
     };
     let tok = sample(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
+    // Later requests sharing this prompt's prefix start on its pages while it decodes.
+    run.store_sequence(&mut lane, &r.prompt_ids)?;
     Ok(match record_token(sched, &mut lane, tok, on_event) {
         LaneStep::Continue => Some(lane),
-        LaneStep::Done => None,
+        LaneStep::Done => {
+            retire_lane(run, lane)?;
+            None
+        }
     })
+}
+
+/// A finished lane: offer its sequence to the prefix store, record its report, release its pages.
+fn retire_lane(run: &mut KvRun<'_>, mut lane: Lane) -> Result<()> {
+    // The cache holds the prompt and every fed token: the history up to its offset.
+    let mut tokens = lane.history.clone();
+    tokens.truncate(lane.cache().offset().max(0) as usize);
+    run.store_sequence(&mut lane, &tokens)?;
+    run.reports[lane.req_index] = Some(lane.selection.report()?);
+    Ok(())
 }
 
 /// One decode step's logits, one `[1, vocab]` per live lane (in lane order). `Exact` builds each
@@ -315,10 +615,10 @@ fn step_logits(
         BatchExactness::Exact => {
             let mut logits = Vec::with_capacity(lanes.len());
             for lane in lanes.iter_mut() {
-                let off = lane.cache.offset();
+                let off = lane.cache().offset();
                 logits.push(model.decode_logits(
                     &input_ids(&[lane.next_token]),
-                    &mut lane.cache,
+                    lane.cache(),
                     off,
                 )?);
             }
@@ -329,10 +629,13 @@ fn step_logits(
             let b = lanes.len();
             let feed: Vec<i32> = lanes.iter().map(|l| l.next_token).collect();
             let ids = Array::from_slice(&feed, &[b as i32, 1]);
-            let positions: Vec<i32> = lanes.iter().map(|l| l.cache.offset()).collect();
-            let mut caches: Vec<&mut PagedKvCache> =
-                lanes.iter_mut().map(|l| &mut l.cache).collect();
-            let logits = model.decode_logits_per_seq(&ids, &mut caches, &positions)?; // [b, vocab]
+            let positions: Vec<i32> = lanes
+                .iter_mut()
+                .map(|lane| lane.cache().offset())
+                .collect();
+            let mut caches: Vec<&mut dyn KvCache> =
+                lanes.iter_mut().map(|lane| lane.cache()).collect();
+            let logits = model.decode_logits_per_seq_dyn(&ids, &mut caches, &positions)?; // [b, vocab]
             (0..b as i32)
                 .map(|i| {
                     let idx = Array::from_slice(&[i], &[1]);

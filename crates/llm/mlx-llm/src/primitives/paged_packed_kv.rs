@@ -42,6 +42,29 @@
 //! the pages the step allocated, so the pool's live pages return to their pre-step count. Trim
 //! re-stages the retained prefix of a cut group from its quantized values (as the contiguous cache
 //! does), and reset/drop return every page.
+//!
+//! ## Serving lifecycles (story sc-20681)
+//!
+//! * **Batched decode.** [`paged_attention_batch`] serves one layer of several sequences on one
+//!   pool with a single fused dispatch: a `[B, max_pages]` page table and per-sequence lengths
+//!   replace the padding mask a padded batch would need, so jagged sequences decode together
+//!   compressed. Each sequence's step stays its own whole-step transaction.
+//! * **Prefix sharing with copy-on-write pages.** [`PagedPackedKvCache::fork_prefix`] starts a
+//!   sequence on another's quantized prefix by retaining its pages (the pool's reference counts,
+//!   [`PackedPagePool::refcount`]); nothing is copied. A sequence about to write into a page it
+//!   shares first copies that page into a private one (all layers), so a shared page is never
+//!   written in place. Inside a step the copy is provisional: the step's rollback returns the copy
+//!   and restores the shared page, its commit drops the shared reference.
+//! * **Exact speculative rollback.** [`KvCache::begin_speculation`] arms a window that keeps the
+//!   unquantized rows appended from the current position on; the next truncation back into the
+//!   window restores the residual from those rows, so the kept state is byte- and
+//!   position-identical to having appended only the kept rows (quantization is per group, so
+//!   every group completed inside the kept range has the codes it would have had anyway).
+//! * **Identity and restore.** A [`PagedCacheIdentity`] names the model, the KV format version,
+//!   the page layout version and the page geometry. A [`PagedCacheSnapshot`] carries one
+//!   sequence's codes, metadata and residual under its identity, survives a process restart as
+//!   bytes, and restores only into a pool of the same identity: any mismatch is refused, never
+//!   reused.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -226,6 +249,32 @@ impl PackedPagePool {
         self.alloc.is_live(id)
     }
 
+    /// Sequences (and prefix-store entries) referencing page `id`; `0` when it is free.
+    pub fn refcount(&self, id: usize) -> usize {
+        self.alloc.refcount(id)
+    }
+
+    /// Pages referenced by more than one sequence: copy-on-write prefix sharing.
+    pub fn shared_pages(&self) -> usize {
+        self.alloc.shared_blocks()
+    }
+
+    /// The identity a cache of this pool carries for `model` (see [`PagedCacheIdentity`]).
+    pub fn identity(&self, model: &str) -> PagedCacheIdentity {
+        PagedCacheIdentity {
+            model: model.to_owned(),
+            format_version: core_llm::KV_CACHE_FORMAT_VERSION,
+            layout_version: PAGED_PACKED_LAYOUT_VERSION,
+            representation: paged_packed_identity(self.bits).to_owned(),
+            code_bits: self.bits.bits(),
+            group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+            page_tokens: self.page_tokens,
+            layers: self.layers,
+            kv_heads: self.kv_heads,
+            head_dimension: self.head_dimension,
+        }
+    }
+
     fn geometry(&self) -> PackedGeometry {
         PackedGeometry {
             batch: 1,
@@ -349,6 +398,54 @@ impl PackedPagePool {
         self.alloc.release(id);
     }
 
+    fn retain(&mut self, id: usize) {
+        self.alloc.retain(id);
+    }
+
+    /// Copy page `from` into page `to` in every layer (the copy of copy-on-write).
+    fn copy_page(&mut self, from: usize, to: usize) -> Result<()> {
+        let (from, to) = (mlx_i32(from, "page id")?, mlx_i32(to, "page id")?);
+        for layer in &mut self.arrays {
+            for array in [
+                &mut layer.key_codes,
+                &mut layer.key_scales,
+                &mut layer.key_zeros,
+                &mut layer.value_codes,
+                &mut layer.value_scales,
+                &mut layer.value_zeros,
+            ] {
+                let page = array.try_index((from..from + 1, .., .., ..))?;
+                array.try_index_mut((to..to + 1, .., .., ..), &page)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `layer`'s component arrays over `pages` (in position order), each `[n, Hkv, rows, width]`
+    /// page stack as one sequence `[1, Hkv, n · rows, width]`, in [`PageArrays::all`] order.
+    fn sequence_arrays(&self, layer: usize, pages: &[usize]) -> Result<[Array; 6]> {
+        let ids = pages
+            .iter()
+            .map(|&id| mlx_i32(id, "page id"))
+            .collect::<Result<Vec<_>>>()?;
+        let index = Array::from_slice(&ids, &[mlx_i32(ids.len(), "page count")?]);
+        let heads = mlx_i32(self.kv_heads, "KV heads")?;
+        let sequence = |array: &Array| -> Result<Array> {
+            let shape = array.shape();
+            let gathered = array.take_axis(&index, 0)?.transpose_axes(&[1, 0, 2, 3])?;
+            Ok(gathered.reshape(&[1, heads, -1, shape[3]])?)
+        };
+        let [kc, ks, kz, vc, vs, vz] = self.arrays[layer].all();
+        Ok([
+            sequence(kc)?,
+            sequence(ks)?,
+            sequence(kz)?,
+            sequence(vc)?,
+            sequence(vs)?,
+            sequence(vz)?,
+        ])
+    }
+
     /// Write `key` (`n` groups: codes, scales, zeros `[1, Hkv, n, ·]`) and `value` (`n · 32` rows)
     /// into `layer`'s page `page`, starting at the page's local group `group`.
     fn write(
@@ -392,31 +489,19 @@ impl PackedPagePool {
     fn gather_dense(&self, layer: usize, pages: &[usize], packed: usize) -> Result<(Array, Array)> {
         let group = PACKED_METAL_QUANT_GROUP_SIZE;
         let geometry = self.geometry();
-        let arrays = &self.arrays[layer];
-        let ids = pages
-            .iter()
-            .map(|&id| mlx_i32(id, "page id"))
-            .collect::<Result<Vec<_>>>()?;
-        let index = Array::from_slice(&ids, &[mlx_i32(ids.len(), "page count")?]);
-        let heads = mlx_i32(self.kv_heads, "KV heads")?;
-        // `[n, Hkv, rows, width]` pages → `[1, Hkv, n · rows, width]` in position order.
-        let sequence = |array: &Array| -> Result<Array> {
-            let shape = array.shape();
-            let gathered = array.take_axis(&index, 0)?.transpose_axes(&[1, 0, 2, 3])?;
-            Ok(gathered.reshape(&[1, heads, -1, shape[3]])?)
-        };
+        let [kc, ks, kz, vc, vs, vz] = self.sequence_arrays(layer, pages)?;
         let groups = packed / group;
         let keys = dequantize_key_groups(
             geometry,
-            &rows_range(&sequence(&arrays.key_codes)?, 0, groups)?,
-            &rows_range(&sequence(&arrays.key_scales)?, 0, groups)?,
-            &rows_range(&sequence(&arrays.key_zeros)?, 0, groups)?,
+            &rows_range(&kc, 0, groups)?,
+            &rows_range(&ks, 0, groups)?,
+            &rows_range(&kz, 0, groups)?,
         )?;
         let values = dequantize_value_rows(
             geometry,
-            &rows_range(&sequence(&arrays.value_codes)?, 0, packed)?,
-            &rows_range(&sequence(&arrays.value_scales)?, 0, packed)?,
-            &rows_range(&sequence(&arrays.value_zeros)?, 0, packed)?,
+            &rows_range(&vc, 0, packed)?,
+            &rows_range(&vs, 0, packed)?,
+            &rows_range(&vz, 0, packed)?,
         )?;
         Ok((keys, values))
     }
@@ -479,6 +564,32 @@ struct LayerState {
     value_tail: Option<Array>,
     /// K/V dtypes, fixed by the first append.
     dtypes: Option<(Dtype, Dtype)>,
+    /// The armed speculation window (see [`KvCache::begin_speculation`]).
+    window: Option<SpeculationWindow>,
+}
+
+/// One layer's unquantized rows from the group-aligned position `start` to the logical end, kept
+/// while speculation is armed so a rollback into them restores the residual exactly.
+#[derive(Clone, Debug)]
+struct SpeculationWindow {
+    start: usize,
+    rows: usize,
+    /// `[1, Hkv, rows, D]` keys and values; `None` while `rows == 0`.
+    kv: Option<(Array, Array)>,
+}
+
+impl SpeculationWindow {
+    fn extend(&mut self, keys: &Array, values: &Array) -> Result<()> {
+        self.kv = Some(match self.kv.take() {
+            None => (keys.clone(), values.clone()),
+            Some((k, v)) => (
+                concatenate_axis(&[&k, keys], 2)?,
+                concatenate_axis(&[&v, values], 2)?,
+            ),
+        });
+        self.rows += keys.shape()[2] as usize;
+        Ok(())
+    }
 }
 
 /// Calls accepted in committed steps; restored by a whole-step rollback.
@@ -500,6 +611,9 @@ struct PendingStep {
     /// A layer attended its fresh K/V through dense SDPA, so no output reads its pages: the commit
     /// evaluates the store, or the step's dense K/V would stay alive behind the lazy writes.
     store_unread: bool,
+    /// Copy-on-write swaps of this step: `(column, shared page, private copy)`. The commit drops
+    /// the shared references; a rollback returns the copies and restores the shared pages.
+    cow: Vec<(usize, usize, usize)>,
 }
 
 /// A single sequence's quantized paged KV cache over a shared [`PackedPagePool`], read in place by
@@ -522,6 +636,8 @@ pub struct PagedPackedKvCache {
     accepted: AcceptedCalls,
     dispatch_attempts: u64,
     failed_dispatches: u64,
+    /// Logical length at which speculation was armed; consumed by the next truncate.
+    speculation_base: Option<usize>,
 }
 
 impl PagedPackedKvCache {
@@ -554,6 +670,7 @@ impl PagedPackedKvCache {
             accepted: AcceptedCalls::default(),
             dispatch_attempts: 0,
             failed_dispatches: 0,
+            speculation_base: None,
         })
     }
 
@@ -590,6 +707,23 @@ impl PagedPackedKvCache {
                 .key_tail
                 .as_ref()
                 .map_or(0, |_| PACKED_METAL_QUANT_GROUP_SIZE - state.tail_rows)
+    }
+
+    /// Rebuild the device page table from `page_ids` (a fork, a restore, or a rolled-back
+    /// copy-on-write swap leaves it unset).
+    fn rebuild_table(&mut self) -> Result<()> {
+        let columns = self.page_ids.len().max(MIN_TABLE_COLUMNS);
+        let mut ids = self
+            .page_ids
+            .iter()
+            .map(|&id| mlx_i32(id, "page id"))
+            .collect::<Result<Vec<_>>>()?;
+        ids.resize(columns, 0);
+        self.page_table = Some(Array::from_slice(
+            &ids,
+            &[1, mlx_i32(columns, "page table")?],
+        ));
+        Ok(())
     }
 
     /// Write page `self.page_ids[column]` into the device page table, growing it by doubling.
@@ -650,10 +784,7 @@ impl PagedPackedKvCache {
     /// on the GPU and written straight into the sequence's page slots (allocating pages as the
     /// quantized extent crosses a page boundary); the incomplete remainder stays in the residual.
     fn append(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<()> {
-        let (geometry, page_tokens) = {
-            let pool = self.pool.borrow();
-            (pool.geometry(), pool.page_tokens)
-        };
+        let geometry = self.pool.borrow().geometry();
         let group = PACKED_METAL_QUANT_GROUP_SIZE;
         let step = keys.shape()[2] as usize;
         let tail_shape = [
@@ -670,6 +801,9 @@ impl PagedPackedKvCache {
             return Err(Error::Config(
                 "paged packed K/V dtype must remain stable for each layer".into(),
             ));
+        }
+        if let Some(window) = state.window.as_mut() {
+            window.extend(keys, values)?;
         }
         let residual = state.tail_rows;
         let total = residual + step;
@@ -705,38 +839,13 @@ impl PagedPackedKvCache {
                 geometry.bits,
             )?;
         let new_packed = packed + groups * group;
-        self.cover(new_packed, page_tokens)?;
-        let page_groups = page_tokens / group;
-        let mut done = 0;
-        while done < groups {
-            let global = packed / group + done;
-            let page = self.page_ids[global / page_groups];
-            let local = global % page_groups;
-            let count = (groups - done).min(page_groups - local);
-            let slice = |array: &Array, unit: usize| -> Result<Array> {
-                if count == groups {
-                    Ok(array.clone())
-                } else {
-                    rows_range(array, done * unit, (done + count) * unit)
-                }
-            };
-            self.pool.borrow_mut().write(
-                layer,
-                page,
-                local,
-                [
-                    &slice(&key_codes, 1)?,
-                    &slice(&key_scales, 1)?,
-                    &slice(&key_zeros, 1)?,
-                ],
-                [
-                    &slice(&value_codes, group)?,
-                    &slice(&value_scales, group)?,
-                    &slice(&value_zeros, group)?,
-                ],
-            )?;
-            done += count;
-        }
+        self.write_groups(
+            layer,
+            packed / group,
+            groups,
+            [&key_codes, &key_scales, &key_zeros],
+            [&value_codes, &value_scales, &value_zeros],
+        )?;
         let (key_tail, value_tail) = if remainder > 0 {
             // The flush consumed the whole residual, so the remainder is the fresh suffix.
             let from = step - remainder;
@@ -753,6 +862,76 @@ impl PagedPackedKvCache {
         state.key_tail = Some(key_tail);
         state.value_tail = Some(value_tail);
         Ok(())
+    }
+
+    /// Write `groups` quantized groups (K: codes, scales, zeros `[1, Hkv, groups, ·]`; V: the
+    /// `groups · 32` rows) into `layer`'s pages from sequence group `first`, allocating pages as
+    /// the extent crosses a page boundary and copying a shared page before writing into it.
+    fn write_groups(
+        &mut self,
+        layer: usize,
+        first: usize,
+        groups: usize,
+        key: [&Array; 3],
+        value: [&Array; 3],
+    ) -> Result<()> {
+        let group = PACKED_METAL_QUANT_GROUP_SIZE;
+        let page_tokens = self.pool.borrow().page_tokens;
+        self.cover((first + groups) * group, page_tokens)?;
+        let page_groups = page_tokens / group;
+        let mut done = 0;
+        while done < groups {
+            let global = first + done;
+            let page = self.private_page(global / page_groups)?;
+            let local = global % page_groups;
+            let count = (groups - done).min(page_groups - local);
+            let slice = |array: &Array, unit: usize| -> Result<Array> {
+                if count == groups {
+                    Ok(array.clone())
+                } else {
+                    rows_range(array, done * unit, (done + count) * unit)
+                }
+            };
+            self.pool.borrow_mut().write(
+                layer,
+                page,
+                local,
+                [&slice(key[0], 1)?, &slice(key[1], 1)?, &slice(key[2], 1)?],
+                [
+                    &slice(value[0], group)?,
+                    &slice(value[1], group)?,
+                    &slice(value[2], group)?,
+                ],
+            )?;
+            done += count;
+        }
+        Ok(())
+    }
+
+    /// The page at `column`, made private first when another sequence (or a prefix-store entry)
+    /// also references it: copy-on-write. Inside a step the swap is provisional (see
+    /// [`PendingStep::cow`]); outside one the shared reference is dropped at once.
+    fn private_page(&mut self, column: usize) -> Result<usize> {
+        let shared = self.page_ids[column];
+        if self.pool.borrow().refcount(shared) <= 1 {
+            return Ok(shared);
+        }
+        let copy = self.pool.borrow_mut().alloc_page()?;
+        if let Err(error) = self.pool.borrow_mut().copy_page(shared, copy) {
+            self.pool.borrow_mut().release(copy);
+            return Err(error);
+        }
+        self.page_ids[column] = copy;
+        match self.pending.as_mut() {
+            Some(pending) => pending.cow.push((column, shared, copy)),
+            None => self.pool.borrow_mut().release(shared),
+        }
+        if let Err(error) = self.sync_table(column) {
+            // The table is rebuilt from `page_ids` before its next read.
+            self.page_table = None;
+            return Err(error);
+        }
+        Ok(copy)
     }
 
     /// The dense gather fallback's read: `layer`'s whole sequence dequantized from its pages plus
@@ -801,10 +980,7 @@ impl PagedPackedKvCache {
             .ok_or_else(|| Error::Unsupported("no paged packed reader is bound".into()))?;
         self.pool.borrow_mut().ensure_capacity(1)?;
         if self.page_table.is_none() {
-            self.page_table = Some(Array::from_slice(
-                &[0_i32; MIN_TABLE_COLUMNS],
-                &[1, MIN_TABLE_COLUMNS as i32],
-            ));
+            self.rebuild_table()?;
         }
         let pool = self.pool.clone();
         let pool = pool.borrow();
@@ -884,6 +1060,7 @@ impl PagedPackedKvCache {
                     pages_before: self.page_ids.len(),
                     accepted: self.accepted.clone(),
                     store_unread: false,
+                    cow: Vec::new(),
                 });
                 Ok(())
             }
@@ -929,6 +1106,10 @@ impl PagedPackedKvCache {
             }
         }
         self.logical_len = pending.original_len + pending.step;
+        let mut pool = self.pool.borrow_mut();
+        for &(_, shared, _) in &pending.cow {
+            pool.release(shared);
+        }
         Ok(())
     }
 
@@ -937,6 +1118,16 @@ impl PagedPackedKvCache {
         if let Some(pending) = self.pending.take() {
             self.layers = pending.marks;
             self.release_pages_from(pending.pages_before);
+            if !pending.cow.is_empty() {
+                let mut pool = self.pool.borrow_mut();
+                for &(column, shared, copy) in pending.cow.iter().rev() {
+                    pool.release(copy);
+                    self.page_ids[column] = shared;
+                }
+                drop(pool);
+                // Rebuilt from `page_ids` before the next read.
+                self.page_table = None;
+            }
             self.accepted = pending.accepted;
         }
     }
@@ -1021,6 +1212,306 @@ impl PagedPackedKvCache {
         state.key_tail = Some(key_tail);
         state.value_tail = Some(value_tail);
         Ok(())
+    }
+
+    /// Close every layer's speculation window.
+    fn close_windows(&mut self) {
+        for state in &mut self.layers {
+            state.window = None;
+        }
+    }
+
+    /// Truncate to `len` inside the armed speculation window: every group completed below `len`
+    /// keeps its pages (its codes came from exactly the window's rows), the residual is rebuilt
+    /// from the window's unquantized rows, and the pages past the kept groups are released.
+    fn truncate_into_window(&mut self, len: usize) -> Result<()> {
+        let group = PACKED_METAL_QUANT_GROUP_SIZE;
+        let (geometry, page_tokens) = {
+            let pool = self.pool.borrow();
+            (pool.geometry(), pool.page_tokens)
+        };
+        let keep = len / group * group;
+        let rows = len - keep;
+        let mut next = Vec::with_capacity(self.layers.len());
+        for state in &self.layers {
+            let window = state
+                .window
+                .as_ref()
+                .ok_or_else(|| Error::Msg("speculation window missing on a layer".into()))?;
+            let (key_dtype, value_dtype) = state
+                .dtypes
+                .ok_or_else(|| Error::Msg("speculation window over an empty layer".into()))?;
+            let tails = match window.kv.as_ref() {
+                Some((keys, values)) if rows > 0 => {
+                    let (from, to) = (keep - window.start, len - window.start);
+                    (
+                        padded_residual(geometry, &rows_range(keys, from, to)?, rows)?,
+                        padded_residual(geometry, &rows_range(values, from, to)?, rows)?,
+                    )
+                }
+                _ => {
+                    let shape = geometry.shape(group, geometry.dim)?;
+                    (
+                        zeros_dtype(&shape, key_dtype)?,
+                        zeros_dtype(&shape, value_dtype)?,
+                    )
+                }
+            };
+            next.push(tails);
+        }
+        for (state, (key_tail, value_tail)) in self.layers.iter_mut().zip(next) {
+            state.packed = keep;
+            state.tail_rows = rows;
+            state.key_tail = Some(key_tail);
+            state.value_tail = Some(value_tail);
+            state.window = None;
+        }
+        self.release_pages_from(keep.div_ceil(page_tokens));
+        self.logical_len = len;
+        Ok(())
+    }
+
+    /// A new sequence on the same pool starting with this sequence's first `tokens` positions,
+    /// sharing its pages (reference-counted, copy-on-write) instead of copying them. Returns the
+    /// fork and the positions it holds: all `tokens` when they reach into this sequence's
+    /// unquantized residual (whose rows the fork copies), else `tokens` rounded down to the
+    /// quantization group, so the fork never re-quantizes a cut group from its codes — its state
+    /// is exactly what appending the same K/V to an empty cache would have produced. The fork has
+    /// its own evidence counters and no armed speculation.
+    pub fn fork_prefix(&self, tokens: usize) -> Result<(Self, usize)> {
+        if self.pending.is_some() {
+            return Err(Error::Config(
+                "paged packed fork inside an open step".into(),
+            ));
+        }
+        let group = PACKED_METAL_QUANT_GROUP_SIZE;
+        let tokens = tokens.min(self.logical_len);
+        let packed = self.layers.first().map_or(0, |state| state.packed);
+        let (shared_packed, rows) = if tokens > packed {
+            (packed, tokens - packed)
+        } else {
+            (tokens / group * group, 0)
+        };
+        let page_tokens = self.pool.borrow().page_tokens;
+        let pages = self.page_ids[..shared_packed.div_ceil(page_tokens)].to_vec();
+        {
+            let mut pool = self.pool.borrow_mut();
+            for &id in &pages {
+                pool.retain(id);
+            }
+        }
+        let layers = self
+            .layers
+            .iter()
+            .map(|state| LayerState {
+                packed: shared_packed,
+                tail_rows: rows,
+                key_tail: (rows > 0).then(|| state.key_tail.clone()).flatten(),
+                value_tail: (rows > 0).then(|| state.value_tail.clone()).flatten(),
+                dtypes: state.dtypes,
+                window: None,
+            })
+            .collect();
+        let fork = Self {
+            pool: self.pool.clone(),
+            handle: self.handle.clone(),
+            reader_refusal: self.reader_refusal.clone(),
+            page_ids: pages,
+            page_table: None,
+            logical_len: shared_packed + rows,
+            layers,
+            pending: None,
+            pending_gather: None,
+            accepted: AcceptedCalls::default(),
+            dispatch_attempts: 0,
+            failed_dispatches: 0,
+            speculation_base: None,
+        };
+        Ok((fork, shared_packed + rows))
+    }
+
+    /// The sequence's identity under `model` (see [`PagedCacheIdentity`]).
+    pub fn identity(&self, model: &str) -> PagedCacheIdentity {
+        self.pool.borrow().identity(model)
+    }
+
+    /// A host copy of the sequence — its codes and scale/zero metadata in position order and its
+    /// unquantized residual rows — under its identity for `model`. Restorable with
+    /// [`Self::restore`] into a pool of the same identity, in this process or (through
+    /// [`PagedCacheSnapshot::to_bytes`]) another.
+    pub fn snapshot(&self, model: &str) -> Result<PagedCacheSnapshot> {
+        if self.pending.is_some() {
+            return Err(Error::Config(
+                "paged packed snapshot inside an open step".into(),
+            ));
+        }
+        let group = PACKED_METAL_QUANT_GROUP_SIZE;
+        let pool = self.pool.borrow();
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (layer, state) in self.layers.iter().enumerate() {
+            let mut snapshot = LayerSnapshot {
+                packed: state.packed,
+                tail_rows: state.tail_rows,
+                dtypes: state
+                    .dtypes
+                    .map(|(key, value)| (dtype_label(key), dtype_label(value))),
+                ..LayerSnapshot::default()
+            };
+            if state.packed > 0 {
+                let pages = &self.page_ids[..state.packed.div_ceil(pool.page_tokens)];
+                let [kc, ks, kz, vc, vs, vz] = pool.sequence_arrays(layer, pages)?;
+                let groups = state.packed / group;
+                snapshot.key = [
+                    host_bytes(&rows_range(&kc, 0, groups)?)?,
+                    host_bytes(&rows_range(&ks, 0, groups)?)?,
+                    host_bytes(&rows_range(&kz, 0, groups)?)?,
+                ];
+                snapshot.value = [
+                    host_bytes(&rows_range(&vc, 0, state.packed)?)?,
+                    host_bytes(&rows_range(&vs, 0, state.packed)?)?,
+                    host_bytes(&rows_range(&vz, 0, state.packed)?)?,
+                ];
+            }
+            if state.tail_rows > 0 {
+                let (Some(keys), Some(values)) = (&state.key_tail, &state.value_tail) else {
+                    return Err(Error::Msg("residual rows without a residual".into()));
+                };
+                snapshot.residual = [
+                    host_bytes(&rows_range(keys, 0, state.tail_rows)?)?,
+                    host_bytes(&rows_range(values, 0, state.tail_rows)?)?,
+                ];
+            }
+            layers.push(snapshot);
+        }
+        Ok(PagedCacheSnapshot {
+            identity: pool.identity(model),
+            tokens: self.logical_len,
+            layers,
+        })
+    }
+
+    /// Rebuild a snapshot as a new sequence on `pool`, read by `reader`. Refused — nothing
+    /// allocated — unless the snapshot's identity is exactly `pool`'s identity for `model`: a
+    /// different model, KV format version, page layout version, code width or page geometry is
+    /// never reused.
+    pub fn restore(
+        snapshot: &PagedCacheSnapshot,
+        pool: Rc<RefCell<PackedPagePool>>,
+        reader: CompiledKernelHandle,
+        model: &str,
+    ) -> Result<Self> {
+        let expected = pool.borrow().identity(model);
+        if let Some(mismatch) = snapshot.identity.mismatch(&expected) {
+            return Err(Error::Unsupported(format!(
+                "paged KV snapshot refused: {mismatch}"
+            )));
+        }
+        let group = PACKED_METAL_QUANT_GROUP_SIZE;
+        let (geometry, kv_heads, width) = {
+            let pool = pool.borrow();
+            (pool.geometry(), pool.kv_heads, pool.head_dimension)
+        };
+        let bits = geometry.bits;
+        let mut cache = Self::with_pool(pool, reader)?;
+        if snapshot.layers.len() != cache.layers.len()
+            || snapshot.layers.iter().any(|layer| {
+                layer.packed != snapshot.layers[0].packed
+                    || layer.packed + layer.tail_rows != snapshot.tokens
+                    || !layer.packed.is_multiple_of(group)
+                    || layer.tail_rows >= group
+            })
+        {
+            return Err(Error::Unsupported(
+                "paged KV snapshot refused: inconsistent layer extents".into(),
+            ));
+        }
+        let heads = mlx_i32(kv_heads, "KV heads")?;
+        let array = |bytes: &[u8], rows: usize, width: usize, dtype: Dtype| -> Result<Array> {
+            let element = dtype_bytes(dtype);
+            let shape = [
+                1,
+                heads,
+                mlx_i32(rows, "snapshot rows")?,
+                mlx_i32(width * element, "snapshot width")?,
+            ];
+            if bytes.len() != kv_heads * rows * width * element {
+                return Err(Error::Unsupported(
+                    "paged KV snapshot refused: a component has the wrong size".into(),
+                ));
+            }
+            let raw = Array::from_slice(bytes, &shape);
+            Ok(if dtype == Dtype::Uint8 {
+                raw
+            } else {
+                raw.view_dtype(dtype)?
+            })
+        };
+        for (layer, snapshot) in snapshot.layers.iter().enumerate() {
+            let dtypes = match &snapshot.dtypes {
+                Some((key, value)) => Some((parse_dtype(key)?, parse_dtype(value)?)),
+                None => None,
+            };
+            let groups = snapshot.packed / group;
+            if groups > 0 {
+                let key = [
+                    array(
+                        &snapshot.key[0],
+                        groups,
+                        bits.code_bytes(group * width),
+                        Dtype::Uint8,
+                    )?,
+                    array(&snapshot.key[1], groups, width, Dtype::Float16)?,
+                    array(&snapshot.key[2], groups, width, Dtype::Float16)?,
+                ];
+                let value = [
+                    array(
+                        &snapshot.value[0],
+                        snapshot.packed,
+                        bits.code_bytes(width),
+                        Dtype::Uint8,
+                    )?,
+                    array(
+                        &snapshot.value[1],
+                        snapshot.packed,
+                        width.div_ceil(group),
+                        Dtype::Float16,
+                    )?,
+                    array(
+                        &snapshot.value[2],
+                        snapshot.packed,
+                        width.div_ceil(group),
+                        Dtype::Float16,
+                    )?,
+                ];
+                cache.write_groups(
+                    layer,
+                    0,
+                    groups,
+                    [&key[0], &key[1], &key[2]],
+                    [&value[0], &value[1], &value[2]],
+                )?;
+            }
+            let state = &mut cache.layers[layer];
+            state.packed = snapshot.packed;
+            state.tail_rows = snapshot.tail_rows;
+            state.dtypes = dtypes;
+            if snapshot.tail_rows > 0 {
+                let (key_dtype, value_dtype) = dtypes.ok_or_else(|| {
+                    Error::Unsupported("paged KV snapshot refused: residual without dtype".into())
+                })?;
+                let keys = array(&snapshot.residual[0], snapshot.tail_rows, width, key_dtype)?;
+                let values = array(
+                    &snapshot.residual[1],
+                    snapshot.tail_rows,
+                    width,
+                    value_dtype,
+                )?;
+                state.key_tail = Some(padded_residual(geometry, &keys, snapshot.tail_rows)?);
+                state.value_tail = Some(padded_residual(geometry, &values, snapshot.tail_rows)?);
+            }
+        }
+        cache.logical_len = snapshot.tokens;
+        Ok(cache)
     }
 
     /// Model-boundary evidence (see [`KvCache::packed_evidence`]).
@@ -1226,7 +1717,15 @@ impl KvCache for PagedPackedKvCache {
         let residuals = self
             .layers
             .iter()
-            .flat_map(|state| [state.key_tail.as_ref(), state.value_tail.as_ref()])
+            .flat_map(|state| {
+                let window = state.window.as_ref().and_then(|window| window.kv.as_ref());
+                [
+                    state.key_tail.as_ref(),
+                    state.value_tail.as_ref(),
+                    window.map(|(keys, _)| keys),
+                    window.map(|(_, values)| values),
+                ]
+            })
             .flatten()
             .map(array_bytes)
             .sum::<u64>();
@@ -1268,11 +1767,17 @@ impl KvCache for PagedPackedKvCache {
 
     fn truncate(&mut self, len: i32) -> Result<()> {
         self.rollback();
+        let base = self.speculation_base.take();
         let len = usize::try_from(len)
             .map_err(|_| Error::Msg(format!("truncate: negative len {len}")))?;
         if len >= self.logical_len {
+            self.close_windows();
             return Ok(());
         }
+        if base.is_some_and(|base| len >= base) {
+            return self.truncate_into_window(len);
+        }
+        self.close_windows();
         let group = PACKED_METAL_QUANT_GROUP_SIZE;
         let packed = self.layers[0].packed;
         if len >= packed {
@@ -1302,7 +1807,32 @@ impl KvCache for PagedPackedKvCache {
         self.layers = vec![LayerState::default(); self.layers.len()];
         self.page_table = None;
         self.pending_gather = None;
+        self.speculation_base = None;
         self.logical_len = 0;
+        Ok(())
+    }
+
+    fn begin_speculation(&mut self) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(Error::Config(
+                "paged packed speculation armed inside an open step".into(),
+            ));
+        }
+        for state in &mut self.layers {
+            let kv = match (&state.key_tail, &state.value_tail) {
+                (Some(keys), Some(values)) if state.tail_rows > 0 => Some((
+                    rows_range(keys, 0, state.tail_rows)?,
+                    rows_range(values, 0, state.tail_rows)?,
+                )),
+                _ => None,
+            };
+            state.window = Some(SpeculationWindow {
+                start: state.packed,
+                rows: state.tail_rows,
+                kv,
+            });
+        }
+        self.speculation_base = Some(self.logical_len);
         Ok(())
     }
 
@@ -1365,6 +1895,18 @@ impl PagedCacheSelection {
         self.format.is_some()
     }
 
+    /// Run a compressed selection on `cache` instead — a sequence started on a stored prefix
+    /// (sc-20681). The fresh cache it replaces holds no pages yet.
+    pub(crate) fn replace_compressed(&mut self, cache: PagedPackedKvCache) -> Result<()> {
+        if self.format.is_none() {
+            return Err(Error::Msg(
+                "a dense paged selection cannot take a compressed prefix".into(),
+            ));
+        }
+        self.cache = Box::new(cache);
+        Ok(())
+    }
+
     pub fn cache(&self) -> &dyn KvCache {
         self.cache.as_ref()
     }
@@ -1388,6 +1930,455 @@ impl PagedCacheSelection {
             (None, None) => Err(Error::Msg("paged selection without a report".into())),
         }
     }
+}
+
+/// One layer of several sequences on one page pool through a single fused paged dispatch
+/// (sc-20681): `query` `[B, Hq, S, D]`, `keys`/`values` `[B, Hkv, S, D]`, row `b` belonging to
+/// `caches[b]`. Each sequence appends its row inside its own step transaction and the reader walks
+/// a `[B, max_pages]` page table with per-sequence lengths, so jagged sequences need no padding
+/// mask. Returns `None` — nothing mutated — when the call is outside the batched reader (a
+/// sequence without a bound or warmed reader, sequences on different pools, an additive mask, a
+/// scale, shape or geometry the reader does not implement, or a fresh multi-row step); the caller
+/// then serves each sequence on its own. A fault rolls back every sequence's step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paged_attention_batch(
+    caches: &mut [&mut PagedPackedKvCache],
+    layer: usize,
+    query: &Array,
+    keys: &Array,
+    values: &Array,
+    mask: PackedAttentionMask,
+    scale: f32,
+) -> Result<Option<Array>> {
+    let Some(first) = caches.first() else {
+        return Ok(None);
+    };
+    let pool = first.pool.clone();
+    let Some(handle) = first.handle.clone() else {
+        return Ok(None);
+    };
+    let batch = caches.len();
+    let (Ok(q), Ok(k), Ok(v)) = (
+        packed_input_shape(query.shape(), "query"),
+        packed_input_shape(keys.shape(), "key"),
+        packed_input_shape(values.shape(), "value"),
+    ) else {
+        return Ok(None);
+    };
+    let packed_mask = match mask {
+        PackedAttentionMask::None => PackedMask::None,
+        PackedAttentionMask::Causal => PackedMask::Causal,
+        PackedAttentionMask::SlidingWindow(window)
+            if window > 0 && i32::try_from(window).is_ok() =>
+        {
+            PackedMask::SlidingWindow(window)
+        }
+        _ => return Ok(None),
+    };
+    let (kv_heads, head_dimension) = {
+        let pool = pool.borrow();
+        (pool.kv_heads, pool.head_dimension)
+    };
+    let step = k[2];
+    let float = |dtype| matches!(dtype, Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32);
+    let supported = handle.is_warmed()
+        && k == v
+        && k[0] == batch
+        && q[0] == batch
+        && k[1] == kv_heads
+        && k[3] == head_dimension
+        && step != 0
+        && q[1] != 0
+        && q[1].is_multiple_of(kv_heads)
+        && q[2] == step
+        && q[3] == head_dimension
+        && float(query.dtype())
+        && float(keys.dtype())
+        && float(values.dtype())
+        && scale.to_bits() == (head_dimension as f32).powf(-0.5).to_bits()
+        && caches.iter().all(|cache| {
+            Rc::ptr_eq(&cache.pool, &pool)
+                && cache.handle.is_some()
+                && cache.pending.as_ref().is_none_or(|pending| {
+                    pending.next_layer == layer && pending.step == step
+                })
+                && layer < cache.layers.len()
+                && cache.layers[layer]
+                    .dtypes
+                    .is_none_or(|dtypes| dtypes == (keys.dtype(), values.dtype()))
+                // A fresh multi-row step attends its own K/V densely (see `try_packed_attention`).
+                && !(cache.logical_len == 0
+                    && cache.pending.is_none()
+                    && step > SDPA_MAX_FUSED_QLEN as usize)
+        });
+    if !supported {
+        return Ok(None);
+    }
+    let row = |array: &Array, b: usize| -> Result<Array> {
+        let b = mlx_i32(b, "batch row")?;
+        Ok(array.try_index((b..b + 1, .., .., ..))?)
+    };
+    let (mut begun, mut dispatched) = (0, false);
+    let outcome = (|| -> Result<(Array, Option<PackedKernelSelection>)> {
+        for (b, cache) in caches.iter_mut().enumerate() {
+            cache.begin_layer(layer, step)?;
+            begun = b + 1;
+            cache.append(layer, &row(keys, b)?, &row(values, b)?)?;
+        }
+        let tails = |pick: fn(&LayerState) -> Option<&Array>| -> Result<Array> {
+            let parts = caches
+                .iter()
+                .map(|cache| {
+                    pick(&cache.layers[layer])
+                        .ok_or_else(|| Error::Msg("batched dispatch before an append".into()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(concatenate_axis(&parts, 0)?)
+        };
+        let key_tail = tails(|state| state.key_tail.as_ref())?;
+        let value_tail = tails(|state| state.value_tail.as_ref())?;
+        let columns = caches
+            .iter()
+            .map(|cache| cache.page_ids.len())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mut table = Vec::with_capacity(batch * columns);
+        for cache in caches.iter() {
+            for column in 0..columns {
+                table.push(mlx_i32(
+                    cache.page_ids.get(column).copied().unwrap_or(0),
+                    "page id",
+                )?);
+            }
+        }
+        let page_table = Array::from_slice(
+            &table,
+            &[mlx_i32(batch, "batch")?, mlx_i32(columns, "page table")?],
+        );
+        let sequences = caches
+            .iter()
+            .map(|cache| {
+                let state = &cache.layers[layer];
+                PagedSequenceExtent {
+                    packed_tokens: state.packed,
+                    kv_tokens: state.packed + state.tail_rows,
+                }
+            })
+            .collect::<Vec<_>>();
+        pool.borrow_mut().ensure_capacity(1)?;
+        let pool = pool.borrow();
+        let arrays = &pool.arrays[layer];
+        let args = PagedPackedAttentionArgs {
+            query,
+            key_codes: &arrays.key_codes,
+            key_scales: &arrays.key_scales,
+            key_zeros: &arrays.key_zeros,
+            key_tail: &key_tail,
+            value_codes: &arrays.value_codes,
+            value_scales: &arrays.value_scales,
+            value_zeros: &arrays.value_zeros,
+            value_tail: &value_tail,
+            page_table: &page_table,
+            page_tokens: pool.page_tokens,
+            sequences: &sequences,
+            code_bits: pool.bits,
+            mask: packed_mask,
+        };
+        let selection = handle.paged_kernel_selection(&args);
+        dispatched = true;
+        let output = handle.dispatch_paged(&args)?;
+        Ok((output, selection))
+    })();
+    let (output, selection) = match outcome {
+        Ok(done) => done,
+        Err(error) => {
+            if dispatched {
+                for cache in caches.iter_mut() {
+                    cache.dispatch_attempts += 1;
+                    cache.failed_dispatches += 1;
+                }
+            }
+            for cache in caches.iter_mut().take(begun) {
+                cache.rollback();
+            }
+            return Err(error);
+        }
+    };
+    for cache in caches.iter_mut() {
+        cache.dispatch_attempts += 1;
+        cache.accepted.fused += 1;
+        if let Some(selection) = selection {
+            match cache
+                .accepted
+                .kernel_paths
+                .iter_mut()
+                .find(|(recorded, _)| *recorded == selection)
+            {
+                Some((_, calls)) => *calls += 1,
+                None => cache.accepted.kernel_paths.push((selection, 1)),
+            }
+        }
+    }
+    for index in 0..batch {
+        if let Err(error) = caches[index].finish_layer() {
+            for cache in caches.iter_mut() {
+                cache.rollback();
+            }
+            return Err(error);
+        }
+    }
+    Ok(Some(output))
+}
+
+/// What a paged compressed cache is, for sharing and restore (sc-20681): the model it was computed
+/// by and the exact representation its pages hold. Two caches may share pages, and a snapshot may
+/// be restored, only under identical identities.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct PagedCacheIdentity {
+    /// The caller's model identity (checkpoint and revision); K/V are only meaningful for it.
+    pub model: String,
+    /// [`core_llm::KV_CACHE_FORMAT_VERSION`] of the codes.
+    pub format_version: u32,
+    /// [`PAGED_PACKED_LAYOUT_VERSION`] of the pages.
+    pub layout_version: u32,
+    /// [`paged_packed_identity`] of the code width.
+    pub representation: String,
+    pub code_bits: u8,
+    pub group_size: usize,
+    pub page_tokens: usize,
+    pub layers: usize,
+    pub kv_heads: usize,
+    pub head_dimension: usize,
+}
+
+impl PagedCacheIdentity {
+    /// The first field in which `self` differs from `expected`, named, or `None` when they are
+    /// identical.
+    pub fn mismatch(&self, expected: &Self) -> Option<String> {
+        let fields: [(&str, String, String); 10] = [
+            ("model", self.model.clone(), expected.model.clone()),
+            (
+                "KV format version",
+                self.format_version.to_string(),
+                expected.format_version.to_string(),
+            ),
+            (
+                "page layout version",
+                self.layout_version.to_string(),
+                expected.layout_version.to_string(),
+            ),
+            (
+                "representation",
+                self.representation.clone(),
+                expected.representation.clone(),
+            ),
+            (
+                "code bits",
+                self.code_bits.to_string(),
+                expected.code_bits.to_string(),
+            ),
+            (
+                "group size",
+                self.group_size.to_string(),
+                expected.group_size.to_string(),
+            ),
+            (
+                "page tokens",
+                self.page_tokens.to_string(),
+                expected.page_tokens.to_string(),
+            ),
+            (
+                "layers",
+                self.layers.to_string(),
+                expected.layers.to_string(),
+            ),
+            (
+                "KV heads",
+                self.kv_heads.to_string(),
+                expected.kv_heads.to_string(),
+            ),
+            (
+                "head dimension",
+                self.head_dimension.to_string(),
+                expected.head_dimension.to_string(),
+            ),
+        ];
+        fields
+            .into_iter()
+            .find(|(_, got, want)| got != want)
+            .map(|(field, got, want)| format!("{field} {got:?} does not match {want:?}"))
+    }
+}
+
+/// One layer of a [`PagedCacheSnapshot`]: raw little-endian bytes of each component.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct LayerSnapshot {
+    packed: usize,
+    tail_rows: usize,
+    dtypes: Option<(String, String)>,
+    #[serde(skip)]
+    key: [Vec<u8>; 3],
+    #[serde(skip)]
+    value: [Vec<u8>; 3],
+    #[serde(skip)]
+    residual: [Vec<u8>; 2],
+}
+
+impl LayerSnapshot {
+    fn blobs(&self) -> [&Vec<u8>; 8] {
+        [
+            &self.key[0],
+            &self.key[1],
+            &self.key[2],
+            &self.value[0],
+            &self.value[1],
+            &self.value[2],
+            &self.residual[0],
+            &self.residual[1],
+        ]
+    }
+
+    fn blobs_mut(&mut self) -> [&mut Vec<u8>; 8] {
+        let [k0, k1, k2] = &mut self.key;
+        let [v0, v1, v2] = &mut self.value;
+        let [r0, r1] = &mut self.residual;
+        [k0, k1, k2, v0, v1, v2, r0, r1]
+    }
+}
+
+/// A host copy of one paged compressed sequence under its [`PagedCacheIdentity`]
+/// ([`PagedPackedKvCache::snapshot`] / [`PagedPackedKvCache::restore`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PagedCacheSnapshot {
+    identity: PagedCacheIdentity,
+    tokens: usize,
+    layers: Vec<LayerSnapshot>,
+}
+
+/// Leading bytes of a serialized [`PagedCacheSnapshot`].
+const SNAPSHOT_MAGIC: &[u8; 8] = b"SWPKVSN1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotHeader {
+    identity: PagedCacheIdentity,
+    tokens: usize,
+    layers: Vec<LayerSnapshot>,
+    /// Per layer, the byte length of each component, in [`LayerSnapshot::blobs`] order.
+    lengths: Vec<[usize; 8]>,
+    payload_sha256: String,
+}
+
+impl PagedCacheSnapshot {
+    pub fn identity(&self) -> &PagedCacheIdentity {
+        &self.identity
+    }
+
+    /// Positions the snapshot holds.
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// The snapshot as bytes for storage across a process restart: a magic, a JSON header (the
+    /// identity, extents, component lengths and the payload's SHA-256), then the components.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        use sha2::{Digest, Sha256};
+        let mut payload = Vec::new();
+        for layer in &self.layers {
+            for blob in layer.blobs() {
+                payload.extend_from_slice(blob);
+            }
+        }
+        let header = SnapshotHeader {
+            identity: self.identity.clone(),
+            tokens: self.tokens,
+            layers: self.layers.clone(),
+            lengths: self
+                .layers
+                .iter()
+                .map(|layer| layer.blobs().map(Vec::len))
+                .collect(),
+            payload_sha256: format!("{:x}", Sha256::digest(&payload)),
+        };
+        let header = serde_json::to_vec(&header)
+            .map_err(|error| Error::Msg(format!("paged KV snapshot header: {error}")))?;
+        let mut bytes = Vec::with_capacity(16 + header.len() + payload.len());
+        bytes.extend_from_slice(SNAPSHOT_MAGIC);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
+    }
+
+    /// Parse [`Self::to_bytes`]. Refuses anything that is not an intact snapshot (wrong magic,
+    /// truncated, or a payload that does not match its recorded digest); the identity itself is
+    /// checked when the snapshot is restored.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        use sha2::{Digest, Sha256};
+        let refuse = |why: &str| Error::Unsupported(format!("paged KV snapshot refused: {why}"));
+        let rest = bytes
+            .strip_prefix(SNAPSHOT_MAGIC.as_slice())
+            .ok_or_else(|| refuse("not a paged KV snapshot"))?;
+        let (length, rest) = rest
+            .split_first_chunk::<8>()
+            .ok_or_else(|| refuse("truncated header"))?;
+        let length = usize::try_from(u64::from_le_bytes(*length))
+            .map_err(|_| refuse("header length out of range"))?;
+        if rest.len() < length {
+            return Err(refuse("truncated header"));
+        }
+        let (header, payload) = rest.split_at(length);
+        let header: SnapshotHeader =
+            serde_json::from_slice(header).map_err(|_| refuse("unreadable header"))?;
+        if format!("{:x}", Sha256::digest(payload)) != header.payload_sha256 {
+            return Err(refuse("payload digest mismatch"));
+        }
+        if header.lengths.len() != header.layers.len()
+            || header
+                .lengths
+                .iter()
+                .flatten()
+                .try_fold(0_usize, |total, &len| total.checked_add(len))
+                != Some(payload.len())
+        {
+            return Err(refuse("component lengths do not match the payload"));
+        }
+        let mut layers = header.layers;
+        let mut offset = 0;
+        for (layer, lengths) in layers.iter_mut().zip(&header.lengths) {
+            for (blob, &len) in layer.blobs_mut().into_iter().zip(lengths) {
+                *blob = payload[offset..offset + len].to_vec();
+                offset += len;
+            }
+        }
+        Ok(Self {
+            identity: header.identity,
+            tokens: header.tokens,
+            layers,
+        })
+    }
+}
+
+fn dtype_label(dtype: Dtype) -> String {
+    format!("{dtype:?}")
+}
+
+fn parse_dtype(label: &str) -> Result<Dtype> {
+    [Dtype::Float16, Dtype::Bfloat16, Dtype::Float32]
+        .into_iter()
+        .find(|dtype| dtype_label(*dtype) == label)
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "paged KV snapshot refused: residual dtype {label:?}"
+            ))
+        })
+}
+
+/// The bytes of `array`'s elements in row-major order.
+fn host_bytes(array: &Array) -> Result<Vec<u8>> {
+    let bytes = crate::primitives::nn::contiguous(array)?.view_dtype(Dtype::Uint8)?;
+    bytes.eval()?;
+    Ok(bytes.as_slice::<u8>().to_vec())
 }
 
 #[cfg(all(test, target_os = "macos"))]
