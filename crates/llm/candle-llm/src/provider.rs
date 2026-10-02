@@ -6894,11 +6894,11 @@ mod tests {
             [Decoder::Causal(causal), Decoder::Qwen35(hybrid)]
         };
         // (prompt, budget, K, the device-positions bytes). Positions = prompt + budget; the
-        // cache spans positions + K; 256-key chunks.
+        // cache spans positions + K; 64-key chunks (sc-24446).
         let cases = [
-            (40usize, 24u32, 3u32, 776u64),
+            (40usize, 24u32, 3u32, 1_416u64),
             (40, 24, 0, 296),
-            (300, 24, 3, 1_416),
+            (300, 24, 3, 3_976),
         ];
         for (off, on) in decoders(false).iter().zip(decoders(true).iter()) {
             for &(prompt, budget, k, bytes) in &cases {
@@ -6947,7 +6947,7 @@ mod tests {
             // 4 queries over 40 + 24 + 4 positions.
             assert_eq!(
                 super::draft_request_bytes(on, 40, 24, 3).unwrap(),
-                super::draft_request_bytes(off, 40, 24, 3).unwrap() + 776
+                super::draft_request_bytes(off, 40, 24, 3).unwrap() + 1_416
             );
         }
     }
