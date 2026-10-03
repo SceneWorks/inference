@@ -199,6 +199,13 @@ def verify_record(record_path: Path, backend: str, name: str) -> dict:
     for key, wanted in (("engineComputePolicy", policy), ("engineModelDtype", model_dtype),
                         ("engineVaeDtype", vae_dtype)):
         require(outcome.get(key) == wanted, f"effective {key} does not match {wanted}")
+    math_policy = "disallow_reduced_precision_reduction_v1" if backend == "cuda" and policy == "bf16" else None
+    if math_policy is None:
+        require("engineVaeCudaBf16MathPolicy" not in outcome,
+                "effective CUDA BF16 VAE math policy is present on another backend or compute policy")
+    else:
+        require(outcome.get("engineVaeCudaBf16MathPolicy") == math_policy,
+                f"effective CUDA BF16 VAE math policy does not match {math_policy}")
     measured = row.get("measured", {})
     require(measured.get("peakBytes", 0) > 0, "profile has no overall measured peak")
     stages = measured.get("stages", {})
@@ -207,7 +214,8 @@ def verify_record(record_path: Path, backend: str, name: str) -> dict:
             "profile lacks a sampled stage")
     return {"case_id": row["caseId"], "backend": backend, "admission": "admitted",
             "effective_compute_policy": policy, "effective_model_dtype": model_dtype,
-            "effective_vae_dtype": vae_dtype, "peak_bytes": measured["peakBytes"],
+            "effective_vae_dtype": vae_dtype, "effective_vae_cuda_bf16_math_policy": math_policy,
+            "peak_bytes": measured["peakBytes"],
             "stage_samples": {stage: stages[stage]["samples"] for stage in STAGES},
             "record_sha256": sha256(record_path)}
 

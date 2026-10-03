@@ -55,7 +55,8 @@ class PrecisionControlTests(unittest.TestCase):
                 "request": {"name": "strict-bf16-legacy", "computePolicy": "bf16"},
                 "admission": {"outcome": "admitted"},
                 "outcome": {"status": "completed", "engineComputePolicy": "bf16",
-                            "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16"},
+                            "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16",
+                            "engineVaeCudaBf16MathPolicy": "disallow_reduced_precision_reduction_v1"},
                 "measured": {"peakBytes": 1024, "stages": stages},
             }
             record.write_text(json.dumps(body), encoding="utf-8")
@@ -69,6 +70,48 @@ class PrecisionControlTests(unittest.TestCase):
             record.write_text(json.dumps(body), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "decoder identity"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy")
+
+    def test_effective_cuda_bf16_vae_math_policy_is_required_only_for_cuda_bf16(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            for backend, name in (("cuda", "strict-bf16-standard"),
+                                  ("cuda", "strict-fp32-standard"),
+                                  ("metal", "strict-bf16-standard")):
+                _, case_name, decoder, policy, model_dtype, vae_dtype = control.CASES[name]
+                body = {
+                    "caseId": control.case_id(backend, name), "backend": backend,
+                    "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
+                    "request": {"name": case_name, "computePolicy": policy},
+                    "admission": {"outcome": "admitted"},
+                    "outcome": {"status": "completed", "engineComputePolicy": policy,
+                                "engineModelDtype": model_dtype, "engineVaeDtype": vae_dtype},
+                    "measured": {"peakBytes": 1024, "stages": {
+                        stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
+                }
+                wanted = "disallow_reduced_precision_reduction_v1"
+                if backend == "cuda" and policy == "bf16":
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                        control.verify_record(record, backend, name)
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = "stale"
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                        control.verify_record(record, backend, name)
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = wanted
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    self.assertEqual(
+                        control.verify_record(record, backend, name)["effective_vae_cuda_bf16_math_policy"],
+                        wanted,
+                    )
+                else:
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    self.assertIsNone(
+                        control.verify_record(record, backend, name)["effective_vae_cuda_bf16_math_policy"]
+                    )
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = wanted
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "present on another backend"):
+                        control.verify_record(record, backend, name)
 
     def test_exact_app_pin_and_clean_sources_required(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -204,6 +247,8 @@ class PrecisionControlTests(unittest.TestCase):
                     "measured": {"peakBytes": 1024, "stages": {
                         stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
                 }
+                if policy == "bf16":
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = "disallow_reduced_precision_reduction_v1"
                 (run.parent / "record.json").write_text(json.dumps(body), encoding="utf-8")
             verdict = control.collect(profile, evidence, "cuda")
             self.assertEqual(len(verdict["listening_audio"]), 7)
