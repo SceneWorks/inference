@@ -283,15 +283,21 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
-      - name: Build only the YuE2 precision integration test
+      - name: Build the two tiny CUDA smoke tests and YuE2 precision integration test
         shell: cmd
         run: |
           set "RUSTC_WRAPPER="
           call "%VCVARS%" || exit /b 1
           cargo test --locked --release -p candle-audio-yue2 --features cuda --test precision_real_weights --no-run --message-format=json > "%RUNNER_TEMP%\yue2-precision-proof\build.jsonl" 2> "%RUNNER_TEMP%\yue2-precision-proof\build.log"
           if errorlevel 1 (type "%RUNNER_TEMP%\yue2-precision-proof\build.log"& exit /b 1)
-          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-precision-proof\build.jsonl" --output "%RUNNER_TEMP%\yue2-precision-proof\binary.txt" || exit /b 1
-      - name: Run exactly one CUDA precision test with external sampling
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py resolve-binary --target precision --build-json "%RUNNER_TEMP%\yue2-precision-proof\build.jsonl" --output "%RUNNER_TEMP%\yue2-precision-proof\binary.txt" || exit /b 1
+          cargo test --locked --release -p candle-quant-kernels --features cuda --lib --no-run --message-format=json > "%RUNNER_TEMP%\yue2-precision-proof\quant-build.jsonl" 2> "%RUNNER_TEMP%\yue2-precision-proof\quant-build.log"
+          if errorlevel 1 (type "%RUNNER_TEMP%\yue2-precision-proof\quant-build.log"& exit /b 1)
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py resolve-binary --target quant --build-json "%RUNNER_TEMP%\yue2-precision-proof\quant-build.jsonl" --output "%RUNNER_TEMP%\yue2-precision-proof\quant-binary.txt" || exit /b 1
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --lib --no-run --message-format=json > "%RUNNER_TEMP%\yue2-precision-proof\vae-build.jsonl" 2> "%RUNNER_TEMP%\yue2-precision-proof\vae-build.log"
+          if errorlevel 1 (type "%RUNNER_TEMP%\yue2-precision-proof\vae-build.log"& exit /b 1)
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py resolve-binary --target vae --build-json "%RUNNER_TEMP%\yue2-precision-proof\vae-build.jsonl" --output "%RUNNER_TEMP%\yue2-precision-proof\vae-binary.txt" || exit /b 1
+      - name: Run two exact CUDA smokes then the unchanged precision test with external sampling
         shell: powershell
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
@@ -300,7 +306,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $binary = (Get-Content "$env:RUNNER_TEMP\yue2-precision-proof\binary.txt" -Raw).Trim()
-          $proofArgs = @('run', '--backend', 'cuda', '--binary', $binary, '--reference', "$env:RUNNER_TEMP\yue2-precision-reference", '--evidence', "$env:RUNNER_TEMP\yue2-precision-proof", '--work-dir', $env:YUE2_PRECISION_WORK_DIR, '--engine-sha', $env:EXPECTED_ENGINE_SHA, '--control-sha', $env:EXPECTED_CONTROL_SHA, '--cuda-scheduling-mode', $env:YUE2_CUDA_SCHEDULING_MODE)
+          $quantBinary = (Get-Content "$env:RUNNER_TEMP\yue2-precision-proof\quant-binary.txt" -Raw).Trim()
+          $vaeBinary = (Get-Content "$env:RUNNER_TEMP\yue2-precision-proof\vae-binary.txt" -Raw).Trim()
+          $proofArgs = @('run', '--backend', 'cuda', '--binary', $binary, '--quant-smoke-binary', $quantBinary, '--vae-smoke-binary', $vaeBinary, '--reference', "$env:RUNNER_TEMP\yue2-precision-reference", '--evidence', "$env:RUNNER_TEMP\yue2-precision-proof", '--work-dir', $env:YUE2_PRECISION_WORK_DIR, '--engine-sha', $env:EXPECTED_ENGINE_SHA, '--control-sha', $env:EXPECTED_CONTROL_SHA, '--cuda-scheduling-mode', $env:YUE2_CUDA_SCHEDULING_MODE)
           if ($env:EXPECTED_APP_SHA) { $proofArgs += @('--app-sha', $env:EXPECTED_APP_SHA) }
           & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_precision_proof.py @proofArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

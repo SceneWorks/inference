@@ -26,6 +26,15 @@ CUDA_CHILD_TIMEOUT_SECONDS = 180 * 60  # Operational cap, not a measured runtime
 CUDA_POSTFLIGHT_SECONDS = 600
 CUDA_JOB_TIMEOUT_SECONDS = 240 * 60
 TEST_NAME = "explicit_stage_precision_real_weights"
+CUDA_SMOKES = (
+    ("quant", "yue2_stable_conv::cuda_tests::bf16_conv_and_transpose_match_same_input_prefix_across_lengths"),
+    ("vae", "vae::tests::bf16_cuda_both_vae_variants_decode_full_tiled_and_encode"),
+)
+BUILD_TARGETS = {
+    "precision": ("candle-audio-yue2", "precision_real_weights", "test", "crates/audio/candle-audio-yue2/Cargo.toml", "crates/audio/candle-audio-yue2/tests/precision_real_weights.rs"),
+    "quant": ("candle-quant-kernels", "candle_quant_kernels", "lib", "crates/kernels/candle-quant-kernels/Cargo.toml", "crates/kernels/candle-quant-kernels/src/lib.rs"),
+    "vae": ("candle-audio-yue2", "candle_audio_yue2", "lib", "crates/audio/candle-audio-yue2/Cargo.toml", "crates/audio/candle-audio-yue2/src/lib.rs"),
+}
 DECODER_SHA256 = {
     "standard": "807ce9d5149fa27c5ad3e6582058469852e908f6c5acc8c8aa338e7ab7751346",
     "legacy": "b6d283628913bb41145ba99e2314eef613905ee95f690eb70e8212d5f4965044",
@@ -58,6 +67,15 @@ def verify_revisions(engine_sha: str, control_sha: str) -> None:
 
 
 def resolve_binary(args: argparse.Namespace) -> None:
+    package_name, target_name, target_kind, manifest, source = BUILD_TARGETS[args.target]
+    root = Path.cwd().resolve()
+    metadata = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
+                              capture_output=True, text=True, encoding="utf-8", check=True, timeout=60)
+    packages = [package for package in json.loads(metadata.stdout)["packages"]
+                if package.get("name") == package_name and
+                Path(package.get("manifest_path", "")).resolve() == root / manifest]
+    require(len(packages) == 1, f"expected one exact workspace package {package_name}: {packages}")
+    package_id = packages[0]["id"]
     candidates = []
     for line in args.build_json.read_text(encoding="utf-8").splitlines():
         try:
@@ -65,13 +83,38 @@ def resolve_binary(args: argparse.Namespace) -> None:
         except json.JSONDecodeError:
             continue
         target = row.get("target") or {}
-        if row.get("reason") == "compiler-artifact" and target.get("name") == "precision_real_weights":
+        if (row.get("reason") == "compiler-artifact" and row.get("package_id") == package_id and
+                target.get("name") == target_name and target.get("kind") == [target_kind] and
+                Path(target.get("src_path", "")).resolve() == root / source and
+                row.get("profile", {}).get("test") is True):
             executable = row.get("executable")
             if executable:
                 candidates.append(Path(executable))
-    require(len(candidates) == 1, f"expected exactly one precision test executable; got {candidates}")
+    require(len(candidates) == 1, f"expected exactly one {args.target} test executable; got {candidates}")
     require(candidates[0].is_file(), f"missing compiled test binary: {candidates[0]}")
     args.output.write_text(str(candidates[0].resolve()) + "\n", encoding="utf-8")
+    write_json(Path(str(args.output) + ".identity.json"), {
+        "target": args.target, "package_id": package_id, "target_name": target_name,
+        "target_kind": target_kind, "manifest": str((root / manifest).resolve()),
+        "source": str((root / source).resolve()),
+        "build_json_sha256": sha256(args.build_json), "build_json": str(args.build_json.resolve()),
+        "binary": str(candidates[0].resolve()), "binary_sha256": sha256(candidates[0]),
+    })
+
+
+def verify_binary_identity(binary: Path, label: str, evidence: Path) -> dict:
+    stem = "binary.txt" if label == "precision" else f"{label}-binary.txt"
+    identity = evidence / f"{stem}.identity.json"
+    row = json.loads(identity.read_text(encoding="utf-8"))
+    package, target, kind, manifest, source = BUILD_TARGETS[label]
+    require(row.get("target") == label and row.get("target_name") == target and
+            row.get("target_kind") == kind and row.get("manifest") == str((Path.cwd() / manifest).resolve()) and
+            row.get("source") == str((Path.cwd() / source).resolve()) and
+            row.get("binary") == str(binary.resolve()) and row.get("binary_sha256") == sha256(binary) and
+            Path(row.get("build_json", "")).resolve().parent == evidence.resolve() and
+            sha256(Path(row["build_json"])) == row.get("build_json_sha256") and
+            package in row.get("package_id", ""), f"{label} build/binary identity changed after resolution")
+    return row
 
 
 def verify_reference(args: argparse.Namespace) -> None:
@@ -330,10 +373,11 @@ def sample_metal(pid: int) -> dict:
                 "phys_footprint_bytes": value}
 
 
-def wait_owned_child(child: subprocess.Popen, backend: str) -> tuple[int | None, bool, str | None]:
+def wait_owned_child(child: subprocess.Popen, backend: str, timeout: float | None = None) -> tuple[int | None, bool, str | None]:
     """Bound only the Popen-owned precision test, leaving other processes untouched."""
     try:
-        return child.wait(timeout=CUDA_CHILD_TIMEOUT_SECONDS if backend == "cuda" else None), False, None
+        return child.wait(timeout=(CUDA_CHILD_TIMEOUT_SECONDS if timeout is None else timeout)
+                          if backend == "cuda" else None), False, None
     except subprocess.TimeoutExpired:
         code, cleanup_error = reap_owned_child(child)
         return code, True, cleanup_error
@@ -353,8 +397,97 @@ def reap_owned_child(child: subprocess.Popen) -> tuple[int | None, str | None]:
 
 
 def one_test_executed(output: str) -> bool:
-    return (f"test {TEST_NAME} ..." in output and
-            "test result: ok. 1 passed; 0 failed; 0 ignored" in output)
+    return exact_one_test_executed(output, TEST_NAME)
+
+
+def exact_one_test_executed(output: str, name: str) -> bool:
+    passed = re.findall(r"^test (.+) \.\.\. ok\s*$", output, re.MULTILINE)
+    verdicts = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", output, re.MULTILINE)
+    return passed == [name] and verdicts == [("1", "0", "0")]
+
+
+def remaining_cuda_budget(total_deadline: float, job_start_ns: int) -> float:
+    remaining = total_deadline - time.monotonic()
+    require(remaining > 0, "combined CUDA child deadline expired before next exact test")
+    from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
+    require_remaining_window(remaining + CUDA_POSTFLIGHT_SECONDS)
+    require(time.time_ns() + (remaining + CUDA_POSTFLIGHT_SECONDS) * 1_000_000_000 <=
+            job_start_ns + CUDA_JOB_TIMEOUT_SECONDS * 1_000_000_000,
+            "combined CUDA child cannot finish before workflow upload tail")
+    return remaining
+
+
+def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
+                   evidence: Path, timeout: float | None, owner_guard) -> tuple[dict, list[dict], list[str]]:
+    """Run and reap one owned test before another child may enter the device."""
+    identity = verify_binary_identity(binary, label, evidence)
+    command = [str(binary), "--ignored", "--exact", name, "--nocapture", "--test-threads", "1"]
+    samples: list[dict] = []
+    faults: list[str] = []
+    stop = threading.Event()
+    started = time.time_ns()
+    log_path = evidence / ("test.log" if label == "precision" else f"{label}-smoke.log")
+    with log_path.open("w", encoding="utf-8") as log:
+        if owner_guard is not None:
+            owner_guard.arm()
+            if owner_guard.failed.is_set():
+                owner_guard.finish()  # Restores signal handlers even before Popen.
+                raise RuntimeError("owner canceled before test child creation")
+        try:
+            child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
+        except BaseException:
+            if owner_guard is not None:
+                owner_guard.finish()
+            raise
+        def loop() -> None:
+            while not stop.is_set() and child.poll() is None:
+                try:
+                    samples.append(sample_cuda() if backend == "cuda" else sample_metal(child.pid))
+                except Exception as error:
+                    if child.poll() is None:
+                        faults.append(f"{time.time_ns()}: {error}")
+                stop.wait(0.25 if backend == "cuda" else 1.0)
+        thread = threading.Thread(target=loop, daemon=True)
+        try:
+            thread.start()
+            if owner_guard is not None:
+                from yue2_gpu0_owner_guard import wait
+                owner_guard.start(child)
+                code, timed_out, wait_error = wait(child, owner_guard, timeout or 0)
+            else:
+                code, timed_out, wait_error = wait_owned_child(child, backend, timeout)
+        except BaseException as error:
+            if owner_guard is None and not isinstance(error, Exception):
+                raise
+            if owner_guard is not None:
+                from yue2_gpu0_owner_guard import reap_tree
+                code, cleanup_error = reap_tree(child)
+            else:
+                code, cleanup_error = reap_owned_child(child)
+            timed_out = False
+            wait_error = f"sampler startup: {error}; cleanup: {cleanup_error}"
+        finally:
+            stop.set()
+            if thread.is_alive():
+                thread.join(timeout=25)
+                if thread.is_alive():
+                    faults.append("external sampler thread did not release")
+    if owner_guard is not None:
+        try:
+            owner_guard.finish()
+        except BaseException as error:
+            wait_error = f"{wait_error}; final holder: {error}"
+    ended = time.time_ns()
+    output = log_path.read_text(encoding="utf-8", errors="replace")
+    result = {"label": label, "name": name, "binary_sha256": sha256(binary), "build_identity": identity,
+              "command": command, "log": log_path.name, "pid": child.pid,
+              "started_utc_ns": started, "ended_utc_ns": ended, "exit_code": code,
+              "timed_out": timed_out, "wait_error": wait_error,
+              "released": child.poll() is not None,
+              "exact_one_test_passed": exact_one_test_executed(output, name),
+              "sample_count": len(samples), "sampler_faults": faults,
+              "scheduling": owner_guard.summary() if owner_guard is not None else {"mode": "shared-host"}}
+    return result, samples, faults
 
 
 def stage_markers(output: str) -> list[dict]:
@@ -459,6 +592,10 @@ def execute(args: argparse.Namespace) -> None:
     reference = args.reference / "vae_real_reference.safetensors"
     require(reference.is_file() and sha256(reference) == REFERENCE_SHA256, "pinned external reference not verified")
     require(args.binary.is_file(), f"test binary missing: {args.binary}")
+    smoke_binaries = (getattr(args, "quant_smoke_binary", None), getattr(args, "vae_smoke_binary", None))
+    if args.backend == "cuda":
+        require(all(path is not None and path.is_file() for path in smoke_binaries),
+                "both exact CUDA smoke binaries are required before the real-weight test")
     require(not args.work_dir.exists(), "refuse to reuse an earlier precision listening directory")
     require(args.work_dir.parent.is_dir(), "persistent listening parent is unavailable")
     verify_revisions(args.engine_sha, args.control_sha)
@@ -486,71 +623,68 @@ def execute(args: argparse.Namespace) -> None:
         baseline, baseline_dir = require_remaining_window(
             CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS)
         baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
+    total_deadline = time.monotonic() + CUDA_CHILD_TIMEOUT_SECONDS if args.backend == "cuda" else None
     before_raw, before_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
     (evidence / "census-before.txt").write_text(before_raw, encoding="utf-8")
     require(not before_busy, physical_busy_message(before_raw, before_busy, "foreign/lingering accelerator executables before test"))
     before_files = retain_cuda_physical_evidence(evidence, "before", before_raw) if args.backend == "cuda" else None
-    if scheduling == "owner-gpu0":
-        from yue2_gpu0_owner_guard import OwnerGuard
-        owner_guard = OwnerGuard(evidence, args.engine_sha, args.control_sha)
-        owner_guard.preflight()
-        # API/source authentication consumes time; retain the original deadline
-        # reservation at the actual model boundary rather than extending its clock.
-        require_remaining_window(CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS)
-        require(time.time_ns() + (CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS) * 1_000_000_000 <=
-                int(job_start) + CUDA_JOB_TIMEOUT_SECONDS * 1_000_000_000,
-                "owner preflight consumed bounded CUDA job upload tail")
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     env["YUE2_VAE_REFERENCE_DIR"] = str(args.reference)
     env["YUE2_PRECISION_RECEIPT"] = str(evidence / "precision-receipt.json")
     env["YUE2_PRECISION_WORK_DIR"] = str(args.work_dir)
-    command = [str(args.binary), "--ignored", "--exact", TEST_NAME, "--nocapture", "--test-threads", "1"]
     started = time.time_ns()
     samples: list[dict] = []
     faults: list[str] = []
-    stop = threading.Event()
-    with (evidence / "test.log").open("w", encoding="utf-8") as log:
-        if owner_guard is not None:
-            owner_guard.arm()
-            require(not owner_guard.failed.is_set(), "owner canceled before precision child creation")
-        child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
-        def loop() -> None:
-            while not stop.is_set() and child.poll() is None:
-                try:
-                    samples.append(sample_cuda() if args.backend == "cuda" else sample_metal(child.pid))
-                except Exception as error:  # keep raw failure, never turn missing telemetry green
-                    if child.poll() is None:
-                        faults.append(f"{time.time_ns()}: {error}")
-                stop.wait(0.25 if args.backend == "cuda" else 1.0)
-        thread = threading.Thread(target=loop, daemon=True)
+    child_results = []
+    handoff_files = []
+    stage_refusals = []
+    stages = ([(label, name, path) for (label, name), path in zip(CUDA_SMOKES, smoke_binaries)]
+              if args.backend == "cuda" else []) + [("precision", TEST_NAME, args.binary)]
+    for label, name, binary in stages:
         try:
-            thread.start()
-            if owner_guard is not None:
-                from yue2_gpu0_owner_guard import wait
-                owner_guard.start(child)
-                code, timed_out, wait_error = wait(child, owner_guard, CUDA_CHILD_TIMEOUT_SECONDS)
-            else:
-                code, timed_out, wait_error = wait_owned_child(child, args.backend)
-        except BaseException as error:
-            if owner_guard is None and not isinstance(error, Exception):
-                raise
-            if owner_guard is not None:
-                from yue2_gpu0_owner_guard import reap_tree
-                code, cleanup_error = reap_tree(child)
-            else:
-                code, cleanup_error = reap_owned_child(child)
-            timed_out = False
-            wait_error = f"sampler startup: {error}; cleanup: {cleanup_error}"
-        finally:
-            stop.set()
-            if thread.is_alive():
-                thread.join(timeout=25)
-    if owner_guard is not None:
-        try:
-            owner_guard.finish()
-        except BaseException as error:
-            wait_error = f"{wait_error}; final holder: {error}"
+            remaining = remaining_cuda_budget(total_deadline, int(job_start)) if total_deadline is not None else None
+            if scheduling == "owner-gpu0":
+                from yue2_gpu0_owner_guard import OwnerGuard
+                owner_guard = OwnerGuard(evidence, args.engine_sha, args.control_sha)
+                owner_guard.preflight()
+            if args.backend == "cuda":
+                # The preceding child's tree and watchdog have released; the
+                # fresh physical census is the last action before Popen.
+                handoff_raw, handoff_busy = cuda_physical_census()
+                (evidence / f"census-pre-{label}.txt").write_text(handoff_raw, encoding="utf-8")
+                require(not handoff_busy, physical_busy_message(
+                    handoff_raw, handoff_busy, f"foreign process at {label} handoff"))
+                handoff_files.append(retain_cuda_physical_evidence(evidence, f"pre-{label}", handoff_raw))
+            result, stage_samples, stage_faults = run_test_child(
+                binary, name, label, args.backend, env, evidence, remaining, owner_guard)
+        except Exception as error:
+            stage_refusals.append({"label": label, "name": name, "error": str(error),
+                                   "observed_utc_ns": time.time_ns()})
+            break
+        child_results.append(result)
+        samples.extend(stage_samples)
+        faults.extend(stage_faults)
+        if args.backend == "cuda":
+            try:
+                release_raw, release_busy = cuda_physical_census()
+                (evidence / f"census-post-{label}.txt").write_text(release_raw, encoding="utf-8")
+                result["post_census_files"] = retain_cuda_physical_evidence(
+                    evidence, f"post-{label}", release_raw) if not release_busy else None
+                result["post_census_busy"] = release_busy
+                result["post_census_error"] = None
+            except Exception as error:
+                result["post_census_error"] = str(error)
+                result["post_census_busy"] = []
+        # A failed or ambiguous smoke never advances to the next child.
+        if (result["exit_code"] != 0 or result["timed_out"] or result["wait_error"] or
+                not result["released"] or not result["exact_one_test_passed"] or stage_faults or
+                result.get("post_census_error") or result.get("post_census_busy")):
+            break
     ended = time.time_ns()
+    last_child = child_results[-1] if child_results else None
+    code = last_child["exit_code"] if last_child else None
+    timed_out = bool(last_child and last_child["timed_out"])
+    wait_error = last_child["wait_error"] if last_child else "no owned test child launched"
     post_census_error = None
     try:
         after_raw, after_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
@@ -565,7 +699,7 @@ def execute(args: argparse.Namespace) -> None:
         except Exception as error:
             post_census_error = str(error)
     write_json(evidence / "external-samples.json", {"backend": args.backend, "samples": samples, "faults": faults})
-    output = (evidence / "test.log").read_text(encoding="utf-8", errors="replace")
+    output = (evidence / "test.log").read_text(encoding="utf-8", errors="replace") if (evidence / "test.log").is_file() else ""
     markers = stage_markers(output)
     missing_markers = missing_stage_markers(markers)
     coverage = stage_sample_coverage(markers, samples)
@@ -602,19 +736,28 @@ def execute(args: argparse.Namespace) -> None:
               "missing_stage_markers": missing_markers,
               "stage_sample_coverage": coverage,
               "external_peak_unit": "MiB global device used" if args.backend == "cuda" else "bytes owned phys_footprint",
-              "sampler_faults": faults, "owned_test_pid": child.pid,
-              "owned_test_released": child.poll() is not None,
+              "sampler_faults": faults, "owned_test_pid": last_child["pid"] if last_child else None,
+              "owned_test_released": bool(last_child and last_child["released"]),
               "owned_test_timed_out": timed_out, "owned_test_wait_error": wait_error,
               "cuda_child_timeout_seconds": CUDA_CHILD_TIMEOUT_SECONDS if args.backend == "cuda" else None,
               "reviewed_baseline": baseline if args.backend == "cuda" else None,
               "reviewed_baseline_files": baseline_files,
               "fresh_physical_before_files": before_files, "fresh_physical_after_files": after_files,
+              "handoff_files": handoff_files, "owned_children": child_results,
+              "stage_refusals": stage_refusals,
+              "combined_cuda_child_timeout_seconds": CUDA_CHILD_TIMEOUT_SECONDS if args.backend == "cuda" else None,
               "post_census_busy": after_busy, "post_census_error": post_census_error,
               "receipt_sha256": sha256(receipt) if receipt.is_file() else None,
               "receipt_schema_error": receipt_schema_error,
               "scheduling": owner_guard.summary() if owner_guard is not None else {"mode": "shared-host"}}
     write_json(evidence / "control.json", report)
     print(json.dumps(report, indent=2), flush=True)
+    require(len(child_results) == len(stages) and all(
+        row["exit_code"] == 0 and not row["timed_out"] and row["wait_error"] is None and
+        row["released"] and row["exact_one_test_passed"] and not row["sampler_faults"] and
+        not row.get("post_census_error") and not row.get("post_census_busy") for row in child_results),
+            f"owned exact-test sequence failed, timed out, or incomplete: {child_results}; "
+            f"stage refusals: {stage_refusals}; see per-child logs")
     require(not timed_out and wait_error is None and code == 0,
             f"precision test timed out or exited {code}; wait error: {wait_error}; see test.log")
     require(one_test_executed(output), "one exact ignored test did not execute")
@@ -625,7 +768,8 @@ def execute(args: argparse.Namespace) -> None:
     require(not missing_markers, f"precision stage markers incomplete: {missing_markers}")
     require(samples and not faults, "external sampler had no valid sample or suffered a fault")
     require(post_census_error is None, f"post-test release census failed: {post_census_error}")
-    require(child.poll() is not None and not after_busy, physical_busy_message(after_raw, after_busy, "owned test/process cleanup uncertain"))
+    require(last_child is not None and last_child["released"] and not after_busy,
+            physical_busy_message(after_raw, after_busy, "owned test/process cleanup uncertain"))
 
 
 def main() -> None:
@@ -634,6 +778,7 @@ def main() -> None:
     p = sub.add_parser("resolve-binary")
     p.add_argument("--build-json", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--target", choices=tuple(BUILD_TARGETS), default="precision")
     p = sub.add_parser("verify-reference")
     p.add_argument("--directory", type=Path, required=True)
     p.add_argument("--engine-sha", required=True)
@@ -642,6 +787,8 @@ def main() -> None:
     p = sub.add_parser("run")
     p.add_argument("--backend", choices=("cuda", "metal"), required=True)
     p.add_argument("--binary", type=Path, required=True)
+    p.add_argument("--quant-smoke-binary", type=Path)
+    p.add_argument("--vae-smoke-binary", type=Path)
     p.add_argument("--reference", type=Path, required=True)
     p.add_argument("--evidence", type=Path, required=True)
     p.add_argument("--work-dir", type=Path, required=True)
