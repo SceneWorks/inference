@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import copy
 import base64
+import os
 import subprocess
 import time
 import sys
@@ -23,6 +24,54 @@ WORKFLOW = ROOT / ".github/workflows/yue2-precision-proof.yml"
 
 
 class PrecisionControlTests(unittest.TestCase):
+    def test_optional_app_sha_is_absent_when_empty_and_one_argument_when_set(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        cuda = workflow.split("      - name: Run exactly one CUDA precision test with external sampling\n", 1)[1].split("      - name: Upload raw CUDA proof", 1)[0]
+        metal = workflow.split("      - name: Run exactly one Metal precision test with external sampling\n", 1)[1].split("      - name: Upload raw Metal proof", 1)[0]
+
+        def conditional_flags(cuda_source, metal_source):
+            self.assertRegex(cuda_source, r"\$proofArgs = @\('run', '--backend', 'cuda'[^\n]*\)")
+            self.assertIn("if ($env:EXPECTED_APP_SHA) { $proofArgs += @('--app-sha', $env:EXPECTED_APP_SHA) }", cuda_source)
+            self.assertIn("yue2_precision_proof.py @proofArgs", cuda_source)
+            self.assertRegex(metal_source, r"proof_args=\(run --backend metal[^\n]*\)")
+            self.assertIn('if [[ -n "$EXPECTED_APP_SHA" ]]; then proof_args+=(--app-sha "$EXPECTED_APP_SHA"); fi', metal_source)
+            self.assertIn('yue2_precision_proof.py "${proof_args[@]}"', metal_source)
+
+        conditional_flags(cuda, metal)
+        with self.assertRaises(AssertionError):
+            conditional_flags(cuda.replace("if ($env:EXPECTED_APP_SHA) { ", "", 1), metal)
+        with self.assertRaises(AssertionError):
+            conditional_flags(cuda, metal.replace('if [[ -n "$EXPECTED_APP_SHA" ]]; then ', "", 1))
+
+        # Execute the Bash workflow body with a fake Python entrypoint to inspect
+        # its real argument vector without loading a model or running the controller.
+        lines = metal.split("        run: |\n", 1)[1].splitlines()
+        script = "\n".join(line[10:] for line in lines if line.startswith("          ")) + "\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "yue2-precision-proof").mkdir()
+            (root / "yue2-precision-proof/binary.txt").write_text("test-binary\n", encoding="utf-8")
+            stub = root / "python3.12"
+            stub.write_text("#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+            stub.chmod(0o755)
+            base = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "RUNNER_TEMP": directory,
+                    "YUE2_PRECISION_WORK_DIR": str(root / "listening"), "EXPECTED_ENGINE_SHA": "a" * 40,
+                    "EXPECTED_CONTROL_SHA": "b" * 40}
+            for app_sha in ("", "c" * 40):
+                result = subprocess.run(["bash", "-e"], input=script, text=True, encoding="utf-8", capture_output=True,
+                                        env={**base, "EXPECTED_APP_SHA": app_sha}, check=True)
+                argv = json.loads(result.stdout)
+                self.assertEqual(argv.pop(0), "../control/scripts/ci/yue2_precision_proof.py")
+                self.assertEqual(argv.count("--app-sha"), bool(app_sha))
+                if app_sha:
+                    self.assertEqual(argv[-2:], ["--app-sha", app_sha])
+                else:
+                    self.assertEqual(argv[-2:], ["--control-sha", "b" * 40])
+                with patch.object(CONTROL, "execute") as execute, \
+                     patch.object(sys, "argv", ["yue2_precision_proof.py", *argv]):
+                    CONTROL.main()
+                self.assertEqual(execute.call_args.args[0].app_sha, app_sha)
+
     def test_workflow_control_and_engine_revisions_are_independent_and_exact(self):
         engine, control = "a" * 40, "b" * 40
         result = type("Result", (), {"stdout": engine + "\n"})()
@@ -201,6 +250,38 @@ class PrecisionControlTests(unittest.TestCase):
         changed["diagnosticFileBytesB64"]["sample-0.json"] = base64.b64encode(b"wrong").decode()
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, "raw bytes disagree"):
             CONTROL.retain_cuda_physical_evidence(Path(directory), "before", json.dumps(changed))
+
+    def test_fresh_physical_files_preserve_windows_bom_and_crlf_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            original = {}
+            for index in range(29):
+                name = f"sample-{index:02d}.json"
+                data = (b"\xef\xbb\xbf{\r\n  \"epoch\": 1\r\n}\r\n" if index % 2 == 0
+                        else b"{\n  \"epoch\": 1\n}\n")
+                (source / name).write_bytes(data)
+                original[name] = data
+            files, encoded = IDLE.diagnostic_file_pairs(source)
+            self.assertEqual(files["sample-00.json"], '{\r\n  "epoch": 1\r\n}\r\n')
+            self.assertEqual(files["sample-01.json"], '{\n  "epoch": 1\n}\n')
+            self.assertEqual({name: base64.b64decode(value) for name, value in encoded.items()}, original)
+            probe = {"diagnosticFiles": files, "diagnosticFileBytesB64": encoded}
+            inventory = CONTROL.retain_cuda_physical_evidence(root, "before", json.dumps(probe))
+            self.assertEqual(len(inventory), 29)
+            for name, data in original.items():
+                self.assertEqual((root / "physical-before" / name).read_bytes(), data)
+
+            normalized = copy.deepcopy(probe)
+            normalized["diagnosticFiles"]["sample-00.json"] = files["sample-00.json"].replace("\r\n", "\n")
+            with self.assertRaisesRegex(RuntimeError, "raw bytes disagree"):
+                CONTROL.retain_cuda_physical_evidence(root, "normalized", json.dumps(normalized))
+            changed = copy.deepcopy(probe)
+            changed["diagnosticFileBytesB64"]["sample-00.json"] = base64.b64encode(
+                original["sample-00.json"].replace(b"1", b"2", 1)).decode("ascii")
+            with self.assertRaisesRegex(RuntimeError, "raw bytes disagree"):
+                CONTROL.retain_cuda_physical_evidence(root, "mutated", json.dumps(changed))
 
     def test_reviewed_baseline_copy_remains_byte_bound_to_original_28_files(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -306,6 +306,13 @@ def require_remaining_window(seconds: int) -> tuple[dict, Path]:
     return baseline, directory
 
 
+def diagnostic_file_pairs(directory: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Retain the original probe bytes and an exact decoded view of those bytes."""
+    files = {item.name: item.read_bytes() for item in sorted(directory.iterdir()) if item.is_file()}
+    return ({name: data.decode("utf-8-sig") for name, data in files.items()},
+            {name: base64.b64encode(data).decode("ascii") for name, data in files.items()})
+
+
 def census_mixed_context(pid: int, initial_pmon: str) -> tuple[str, bool]:
     baseline, _ = reviewed_baseline()
     require(pid == baseline["identity"][0], "unreviewed mixed-context PID")
@@ -318,12 +325,11 @@ def census_mixed_context(pid: int, initial_pmon: str) -> tuple[str, bool]:
                    "-File", str(script), "-TargetPid", str(pid), "-OutputDirectory", str(output),
                    "-EngineSha", runtime_engine_sha, "-ControlSha", os.environ["GITHUB_SHA"]]
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=180)
+        diagnostic_files, diagnostic_file_bytes = diagnostic_file_pairs(output)
         raw = {"initialPmon": initial_pmon, "reviewedBaseline": baseline,
                "commandExit": result.returncode,
-               "diagnosticFiles": {item.name: item.read_text(encoding="utf-8-sig")
-                                   for item in sorted(output.iterdir()) if item.is_file()},
-               "diagnosticFileBytesB64": {item.name: base64.b64encode(item.read_bytes()).decode("ascii")
-                                          for item in sorted(output.iterdir()) if item.is_file()}}
+               "diagnosticFiles": diagnostic_files,
+               "diagnosticFileBytesB64": diagnostic_file_bytes}
         try:
             require(result.returncode == 0, f"fresh WDDM counter probe failed: {result.stderr.strip()}")
             current = summarize(output, baseline=False, pid=pid, engine_sha=runtime_engine_sha,

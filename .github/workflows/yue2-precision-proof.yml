@@ -277,7 +277,9 @@ jobs:
           EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
         run: |
           $binary = (Get-Content "$env:RUNNER_TEMP\yue2-precision-proof\binary.txt" -Raw).Trim()
-          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_precision_proof.py run --backend cuda --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-precision-proof" --work-dir "$env:YUE2_PRECISION_WORK_DIR" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA" --app-sha "$env:EXPECTED_APP_SHA"
+          $proofArgs = @('run', '--backend', 'cuda', '--binary', $binary, '--reference', "$env:RUNNER_TEMP\yue2-precision-reference", '--evidence', "$env:RUNNER_TEMP\yue2-precision-proof", '--work-dir', $env:YUE2_PRECISION_WORK_DIR, '--engine-sha', $env:EXPECTED_ENGINE_SHA, '--control-sha', $env:EXPECTED_CONTROL_SHA)
+          if ($env:EXPECTED_APP_SHA) { $proofArgs += @('--app-sha', $env:EXPECTED_APP_SHA) }
+          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_precision_proof.py @proofArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload raw CUDA proof and failures
         if: always()
@@ -379,7 +381,9 @@ jobs:
         run: |
           set -euo pipefail
           binary="$(cat "$RUNNER_TEMP/yue2-precision-proof/binary.txt")"
-          python3.12 ../control/scripts/ci/yue2_precision_proof.py run --backend metal --binary "$binary" --reference "$RUNNER_TEMP/yue2-precision-reference" --evidence "$RUNNER_TEMP/yue2-precision-proof" --work-dir "$YUE2_PRECISION_WORK_DIR" --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" --app-sha "$EXPECTED_APP_SHA"
+          proof_args=(run --backend metal --binary "$binary" --reference "$RUNNER_TEMP/yue2-precision-reference" --evidence "$RUNNER_TEMP/yue2-precision-proof" --work-dir "$YUE2_PRECISION_WORK_DIR" --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA")
+          if [[ -n "$EXPECTED_APP_SHA" ]]; then proof_args+=(--app-sha "$EXPECTED_APP_SHA"); fi
+          python3.12 ../control/scripts/ci/yue2_precision_proof.py "${proof_args[@]}"
       - name: Upload raw Metal proof and failures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
