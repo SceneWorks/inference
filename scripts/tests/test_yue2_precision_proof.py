@@ -96,9 +96,9 @@ class PrecisionControlTests(unittest.TestCase):
             with self.subTest(platform=platform, visible=visible, order=order), \
                  self.assertRaisesRegex(RuntimeError, "PCI-ordered CUDA GPU0"):
                 IDLE.check_device_selection(platform, visible, order)
-        self.assertEqual(IDLE.RUN_ID, "37073714206")
+        self.assertEqual(IDLE.RUN_ID, "37106146499")
         self.assertEqual(IDLE.BASELINE_DIGEST,
-                         "a05afe09223020d39f698f9ec5ed9bc4f2258a1fa8950e69ee4fa9e2769339a1")
+                         "1b6f2d9588b2e25da62f22eec80d406a8b8aeea578d913aefb74e4cc971ae112")
         IDLE.check_dispatch(IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40)
         for run_id, engine, control, github in (
             ("36956986577", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
