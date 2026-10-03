@@ -7294,8 +7294,12 @@ mod tests {
             ((prompt.len() + stream.len()) / 32 * 32).div_ceil(64)
         );
 
-        let (mut contiguous, refused) =
-            crate::kv_policy::select_compressed_cache(&model, reader, prompt.len());
+        let (mut contiguous, refused) = crate::kv_policy::select_compressed_cache(
+            &model,
+            reader,
+            prompt.len(),
+            admit_any_transition(),
+        );
         assert_eq!(refused, None);
         let contiguous = forced_logits(&model, contiguous.as_mut(), &prompt, &stream);
         assert_eq!(paged, contiguous, "paged and contiguous compressed logits");
