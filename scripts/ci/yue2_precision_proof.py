@@ -432,7 +432,7 @@ def child_stage_succeeded(row: dict) -> bool:
 
 
 def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
-                   evidence: Path, timeout: float | None, owner_guard,
+                   evidence: Path, total_deadline: float | None, owner_guard,
                    identity: dict) -> tuple[dict, list[dict], list[str]]:
     """Run and reap one owned test before another child may enter the device."""
     command = [str(binary), "--ignored", "--exact", name, "--nocapture", "--test-threads", "1"]
@@ -440,7 +440,6 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
     faults: list[str] = []
     stop = threading.Event()
     started = time.time_ns()
-    launched = time.monotonic()
     log_path = evidence / ("test.log" if label == "precision" else f"{label}-smoke.log")
     with log_path.open("w", encoding="utf-8") as log:
         if owner_guard is not None:
@@ -448,6 +447,10 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
             if owner_guard.failed.is_set():
                 owner_guard.finish()  # Restores signal handlers even before Popen.
                 raise RuntimeError("owner canceled before test child creation")
+        if total_deadline is not None and time.monotonic() >= total_deadline:
+            if owner_guard is not None:
+                owner_guard.finish()
+            raise RuntimeError("combined CUDA child deadline expired before Popen")
         try:
             child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
         except BaseException:
@@ -477,7 +480,7 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
                     if child.poll() is None:
                         faults.append(f"{time.time_ns()}: {error}")
             thread.start()
-            wait_budget = max(0.0, timeout - (time.monotonic() - launched)) if timeout is not None else None
+            wait_budget = max(0.0, total_deadline - time.monotonic()) if total_deadline is not None else None
             if owner_guard is not None:
                 from yue2_gpu0_owner_guard import wait
                 code, timed_out, wait_error = wait(child, owner_guard, wait_budget or 0)
@@ -671,7 +674,8 @@ def execute(args: argparse.Namespace) -> None:
               if args.backend == "cuda" else []) + [("precision", TEST_NAME, args.binary)]
     for label, name, binary in stages:
         try:
-            remaining = remaining_cuda_budget(total_deadline, int(job_start)) if total_deadline is not None else None
+            if total_deadline is not None:
+                remaining_cuda_budget(total_deadline, int(job_start))
             identity = verify_binary_identity(binary, label, evidence)
             if scheduling == "owner-gpu0":
                 from yue2_gpu0_owner_guard import OwnerGuard
@@ -686,7 +690,7 @@ def execute(args: argparse.Namespace) -> None:
                     handoff_raw, handoff_busy, f"foreign process at {label} handoff"))
                 handoff_files.append(retain_cuda_physical_evidence(evidence, f"pre-{label}", handoff_raw))
             result, stage_samples, stage_faults = run_test_child(
-                binary, name, label, args.backend, env, evidence, remaining, owner_guard, identity)
+                binary, name, label, args.backend, env, evidence, total_deadline, owner_guard, identity)
         except Exception as error:
             stage_refusals.append({"label": label, "name": name, "error": str(error),
                                    "observed_utc_ns": time.time_ns()})

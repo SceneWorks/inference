@@ -547,9 +547,9 @@ class PrecisionControlTests(unittest.TestCase):
             def physical_census():
                 events.append("physical-census")
                 return census, []
-            def fake_child(path, name, label, backend, env, out, timeout, guard, identity):
+            def fake_child(path, name, label, backend, env, out, total_deadline, guard, identity):
                 events.append(f"launch-{label}")
-                launched.append((label, name, timeout))
+                launched.append((label, name, total_deadline))
                 (out / ("test.log" if label == "precision" else f"{label}-smoke.log")).write_text(
                     f"running 1 test\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n",
                     encoding="utf-8")
@@ -587,8 +587,8 @@ class PrecisionControlTests(unittest.TestCase):
                     CONTROL.execute(args)
             self.assertEqual([row[0] for row in launched], ["quant"] if zero_quant else ["quant", "vae", "precision"])
             if not zero_quant:
-                self.assertGreater(launched[0][2], launched[1][2])
-                self.assertGreater(launched[1][2], launched[2][2])
+                self.assertEqual(launched[0][2], launched[1][2])
+                self.assertEqual(launched[1][2], launched[2][2])
             report = json.loads((evidence / "control.json").read_text(encoding="utf-8"))
             self.assertEqual([row["label"] for row in report["owned_children"]],
                              ["quant"] if zero_quant else ["quant", "vae", "precision"])
@@ -774,6 +774,25 @@ class PrecisionControlTests(unittest.TestCase):
         with patch.object(CONTROL.time, "monotonic", return_value=201.0), \
              self.assertRaisesRegex(RuntimeError, "combined CUDA child deadline"):
             CONTROL.remaining_cuda_budget(200.0, job_start)
+
+    def test_slow_prelaunch_checks_cannot_renew_absolute_child_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "test.exe"
+            binary.write_bytes(b"binary")
+            job_start = time.time_ns()
+            with patch.object(IDLE, "require_remaining_window", return_value=({}, root)), \
+                 patch.object(CONTROL.time, "monotonic", return_value=100.0):
+                self.assertEqual(CONTROL.remaining_cuda_budget(200.0, job_start), 100.0)
+            # Identity, owner preflight, and the 29-file census can consume the
+            # provisional budget. The child must recheck the same deadline at
+            # the final Popen boundary, without giving those seconds back.
+            with patch.object(CONTROL.time, "monotonic", return_value=201.0), \
+                 patch.object(CONTROL.subprocess, "Popen") as launch, \
+                 self.assertRaisesRegex(RuntimeError, "expired before Popen"):
+                CONTROL.run_test_child(binary, "exact::test", "quant", "cuda", {}, root,
+                                       200.0, None, {"binary_sha256": CONTROL.sha256(binary)})
+            launch.assert_not_called()
 
     def test_stage_markers_remain_machine_readable(self):
         line = 'test explicit_stage_precision_real_weights ... YUE2_PRECISION_STAGE {"stage":"Bf16:standard:encoder","event":"start","unixMs":100}'
