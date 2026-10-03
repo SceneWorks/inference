@@ -139,8 +139,11 @@ pub fn product_admission_estimate(
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| Error::Msg(format!("{route}: transformer config lacks {key}")))
         };
-        // K and V, every double- and single-stream block, every reference token, bf16.
+        // K and V, every double- and single-stream block, every reference token, bf16 — once
+        // per live CFG branch: true CFG keeps one reference cache per branch (the reference K/V
+        // depend on the branch's text conditioning), so both are resident through the denoise.
         [
+            cfg_forwards,
             2,
             field("num_layers")?
                 .checked_add(field("num_single_layers")?)
@@ -276,8 +279,17 @@ mod tests {
             &request(768, 512, 2, 2.0),
         )
         .unwrap();
-        assert_eq!(kv.reference_kv_bytes, 2 * 32 * 32 * 128 * 3072 * 2);
+        // True CFG (guidance 2.0) keeps one reference cache per branch: both are priced.
+        assert_eq!(kv.reference_kv_bytes, 2 * (2 * 32 * 32 * 128 * 3072 * 2));
         assert_eq!(kv.peak_bytes(), large.peak_bytes() + kv.reference_kv_bytes);
+        // Without true CFG there is one branch and one cache.
+        let single = product_admission_estimate(
+            FLUX2_KLEIN_9B_KV_EDIT_ID,
+            &spec(FLUX2_KLEIN_9B_KV_EDIT_ID),
+            &request(768, 512, 2, 1.0),
+        )
+        .unwrap();
+        assert_eq!(single.reference_kv_bytes, 2 * 32 * 32 * 128 * 3072 * 2);
         // The encoder's footprint carries into the denoise (measured), so the denoise phase binds.
         assert_eq!(small.peak_bytes(), small.phases()[1].1);
         assert!(small.phases()[1].1 >= small.text_encoder_bytes + small.activation_bytes);

@@ -789,7 +789,7 @@ pub struct LlamaProvider {
     /// oracle. Selected with [`LlamaProvider::set_decode_path`].
     decode_path: DecodePath,
     /// The loaded decoder's compressed-KV table family (sc-20683), named by the same
-    /// [`core_llm::kv_model_family`] rule the MLX backend uses, so a request reaches the same
+    /// [`core_llm::qualified_kv_model_family`] rule the MLX backend uses, so a request reaches the same
     /// policy decision on both backends. Candle has no fused compressed-domain reader, so every
     /// generation runs dense and reports why ([`LlamaProvider::kv_cache_plan`]).
     kv_family: Option<core_llm::KvModelFamily>,
@@ -1135,20 +1135,26 @@ pub(crate) fn write_test_snapshot_tensors(dir: &Path, names: &[&str], index: boo
 }
 
 /// The compressed-KV table family of a decoder dispatched as `arch` from `config` (sc-20683): the
-/// shared [`core_llm::kv_model_family`] rule over the (text) decoder config's identity, exactly as
-/// the MLX backend names it.
+/// shared [`core_llm::qualified_kv_model_family`] rule — the (text) decoder config's identity, and
+/// only for a measured row's exact architecture (sc-20688 review) — exactly as the MLX backend
+/// names it.
 fn kv_family_of(arch: Architecture, config: &Value) -> Option<core_llm::KvModelFamily> {
-    let decoder = config.get("text_config").unwrap_or(config);
-    let field = |key: &str| {
-        decoder
-            .get(key)
-            .and_then(|value| match value {
-                Value::Array(values) => values.first().and_then(Value::as_str),
-                value => value.as_str(),
-            })
-            .unwrap_or("")
-    };
-    core_llm::kv_model_family(arch.family(), field("architectures"), field("model_type"))
+    core_llm::qualified_kv_model_family(arch.family(), config)
+}
+
+/// The attention geometry of a causal decoder for the shared compressed-KV plan's geometry stage
+/// ([`core_llm::KvAttentionGeometry`]; the MLX backend fills the same fields from its config), so
+/// a decoder outside the fused reader's geometry reports `UnsupportedGeometry` on both backends.
+fn kv_attention_geometry(cfg: &crate::config::ModelConfig) -> core_llm::KvAttentionGeometry {
+    core_llm::KvAttentionGeometry {
+        head_dim: u64::try_from(cfg.head_dim).unwrap_or(0),
+        attention_softcap: cfg.attn_logit_softcap.is_some(),
+        query_pre_attn_scalar: cfg
+            .query_pre_attn_scalar
+            .map(|scalar| u64::try_from(scalar).unwrap_or(0)),
+        latent_or_shared_kv: cfg.mla.is_some() || cfg.gemma4.is_some(),
+        mixture_of_experts: cfg.moe.is_some(),
+    }
 }
 
 /// Why a snapshot's family cannot hold NVFP4 projections, or `None` when it can (the family half of
@@ -1881,19 +1887,31 @@ impl LlamaProvider {
     }
 
     /// The loaded decoder's compressed-KV table family (sc-20683); `None` for a model the
-    /// qualification table cannot name.
+    /// qualification table did not measure.
     pub fn kv_model_family(&self) -> Option<core_llm::KvModelFamily> {
         self.kv_family
+    }
+
+    /// Test seam (sc-20688 review): plan this provider's KV cache as `family`, as if its loaded
+    /// checkpoint were that family's measured architecture, so the shared policy can be exercised
+    /// on synthetic weights. Production loads name a family only for a measured architecture.
+    /// Compiled only with the `test-kv-arm` feature, which this crate's own integration tests
+    /// enable; a product build cannot arm a family.
+    #[cfg(any(test, feature = "test-kv-arm"))]
+    #[doc(hidden)]
+    pub fn arm_kv_model_family_for_tests(&mut self, family: Option<core_llm::KvModelFamily>) {
+        self.kv_family = family;
     }
 
     /// The KV cache a generation of `context_tokens` prefilled tokens and up to `max_new_tokens`
     /// more, in a `batch`-sequence decode, runs on (sc-20683) — what [`TextLlm::generate`] reports
     /// on [`TextLlmOutput::kv_cache`]. The same shared policy decision as the MLX backend
     /// ([`core_llm::plan_kv_cache`]: policy, batch, family, prompt minimum, final-context maximum,
-    /// request shape), always dense: Candle has no fused compressed-domain reader on any device,
-    /// so a request MLX would run compressed reports
-    /// [`core_llm::KvCacheFallbackReason::ReaderUnavailable`] (as does one MLX's reader stage
-    /// refuses for its own geometry).
+    /// request shape, the shared geometry stage), always dense: Candle has no fused
+    /// compressed-domain reader on any device, so a request MLX would run compressed reports
+    /// [`core_llm::KvCacheFallbackReason::ReaderUnavailable`], and a decoder outside the fused
+    /// reader's geometry reports [`core_llm::KvCacheFallbackReason::UnsupportedGeometry`] on both
+    /// backends.
     pub fn kv_cache_plan(
         &self,
         policy: core_llm::KvCompressionPolicy,
@@ -1917,6 +1935,11 @@ impl LlamaProvider {
                 max_new_tokens: u64::from(max_new_tokens),
                 batch,
                 unsupported_request,
+                // The hybrid decoder is refused by the request-shape stage before geometry.
+                geometry: match &self.model {
+                    Decoder::Causal(model) => kv_attention_geometry(model.config()),
+                    _ => core_llm::KvAttentionGeometry::default(),
+                },
             },
             "the Candle backend",
         )

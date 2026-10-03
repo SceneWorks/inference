@@ -954,7 +954,11 @@ fn phase_boundaries_release_the_text_encoder_and_the_denoise_cache() {
     );
 
     // Denoise -> decode boundary: a 64 MiB buffer the denoise freed, which no VAE shape can reuse,
-    // must not survive into (or past) the decode.
+    // must leave MLX's cache BEFORE the VAE builds its working set. The VAE's own per-block releases
+    // would also empty the cache, but only after its first block had allocated beside the scratch, so
+    // reading the cache after a full decode cannot tell the two apart. A pre-cancelled request stops
+    // the decode at its first action (the cancel check in `decode_to_frames`, before any VAE work or
+    // VAE release): the cache reading there sits between this boundary's clear and the VAE's first.
     let vae = tiny_vae();
     let latents = det_fill(&[16, 3, 5, 6], 123, 1.0, 0.0, Dtype::Float32);
     mlx_rs::transforms::eval([&latents]).unwrap();
@@ -966,10 +970,17 @@ fn phase_boundaries_release_the_text_encoder_and_the_denoise_cache() {
         get_cache_memory() >= 64 * MIB,
         "the freed denoise scratch must start in MLX's cache"
     );
-    decode_latents_to_video(&vae, &latents, 24, None, None, &CancelFlag::default()).unwrap();
+    let cancelled = CancelFlag::default();
+    cancelled.cancel();
+    let refused = decode_latents_to_video(&vae, &latents, 24, None, None, &cancelled);
+    assert!(
+        matches!(refused, Err(mlx_gen::Error::Canceled)),
+        "the probe must stop before the VAE runs: {:?}",
+        refused.err()
+    );
     assert!(
         get_cache_memory() < 64 * MIB,
-        "the decode must return the denoise's cached buffers first: {} cached bytes",
+        "the decode must return the denoise's cached buffers before the VAE runs: {} cached bytes",
         get_cache_memory()
     );
 }

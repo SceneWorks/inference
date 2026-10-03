@@ -1456,6 +1456,12 @@ impl PagedPackedKvCache {
         Ok(())
     }
 
+    /// Whether this sequence lost its fused reader to a cold dispatch fault, so every later call
+    /// is a dense gather. A prefix store never keeps such a sequence.
+    pub(crate) fn reader_faulted(&self) -> bool {
+        self.handle.is_none()
+    }
+
     /// A new sequence on the same pool starting with this sequence's first `tokens` positions,
     /// sharing its pages (reference-counted, copy-on-write) instead of copying them. Returns the
     /// fork and the positions it holds: all `tokens` when they reach into this sequence's
@@ -2054,6 +2060,11 @@ pub struct PagedCacheRequest<'a> {
     /// The most tokens the sequence may generate; the qualified maximum bounds the final context
     /// `prompt_tokens + max_new_tokens` (see [`core_llm::qualify_kv_compression`]).
     pub max_new_tokens: u64,
+    /// The sequences the qualification counts as decoding together: more than one is
+    /// [`core_llm::KvCacheFallbackReason::BatchedDecode`] (the table's evidence is single-sequence).
+    /// Only this crate's test-armed per-sequence experiment qualifies a sequence of a batch as
+    /// `1`.
+    pub batch: u64,
     /// The dense block pool every dense selection draws from.
     pub dense_pool: &'a Rc<RefCell<BlockPool>>,
     /// The packed page pool a compressed selection draws from.
@@ -3812,6 +3823,54 @@ pub(crate) mod tests {
         );
         assert!(cache.handle.is_none());
         assert_eq!(cache.offset(), 45);
+    }
+
+    /// sc-20688 review (finding 8): a sequence whose reader faulted is never stored in the
+    /// long-lived prefix store, so a later hit never inherits the faulted reader and its dense
+    /// gathers; the healthy sequence's prefix is stored and a hit on it reads its pages fused.
+    #[test]
+    fn a_prefix_store_never_keeps_a_sequence_whose_reader_faulted() {
+        let dims = (2, 1, 64);
+        let dtype = Dtype::Float32;
+        let shared = pool(1, 64, 32);
+        let model = key("faulted-prefix");
+        let mut store = crate::decode::PagedPrefixCache::new(shared.clone(), model.clone(), 4);
+        let identity = store.identity().clone();
+        let tokens = (0..71).collect::<Vec<i32>>();
+        // A prompt step, then a decode step whose cold paged dispatch faults.
+        let mut faulted =
+            PagedPackedKvCache::with_pool(shared.clone(), interrupting(0, false)).unwrap();
+        attend_step(&mut faulted, 0, 70, dims, dtype);
+        attend_step(&mut faulted, 1, 1, dims, dtype);
+        assert!(faulted.reader_faulted());
+        assert!(!store.insert(&identity, &tokens, &faulted).unwrap());
+        assert!(store.is_empty(), "the faulted sequence was not stored");
+        assert!(matches!(
+            store.lookup(&identity, &tokens).unwrap(),
+            crate::decode::PagedPrefixLookup::Miss
+        ));
+
+        let mut healthy = PagedPackedKvCache::with_pool(shared.clone(), k8v8_reader()).unwrap();
+        attend_step(&mut healthy, 0, 70, dims, dtype);
+        attend_step(&mut healthy, 1, 1, dims, dtype);
+        assert!(!healthy.reader_faulted());
+        assert!(store.insert(&identity, &tokens, &healthy).unwrap());
+        let crate::decode::PagedPrefixLookup::Hit {
+            mut cache,
+            tokens: held,
+        } = store.lookup(&identity, &tokens).unwrap()
+        else {
+            panic!("the healthy prefix is stored");
+        };
+        assert_eq!(held, 70, "the stored prefix, up to the prompt's last token");
+        assert!(!cache.reader_faulted());
+        attend_step(cache.as_mut(), 2, 1, dims, dtype);
+        assert_eq!(
+            cache.fused_calls(),
+            LAYERS as u64,
+            "the hit reads its pages fused"
+        );
+        assert!(cache.dense_gathers().is_empty());
     }
 
     /// Synthetic decode timing (measurement, not a gate): one decode token's attention over a

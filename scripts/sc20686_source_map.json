@@ -517,7 +517,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1481
+              "line": 1476
             }
           ],
           "product_residency": "sequential",
@@ -575,7 +575,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1481
+              "line": 1476
             }
           ],
           "product_residency": "sequential",

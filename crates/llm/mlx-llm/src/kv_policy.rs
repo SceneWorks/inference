@@ -16,8 +16,7 @@ use crate::config::ModelConfig;
 use crate::models::CausalLm;
 use crate::primitives::kv_cache::{CacheRoute, KvCache};
 use crate::primitives::packed_group_affine_kv::{
-    packed_metal_head_dimension_supported, DenseFallbackPackedDecoderCache,
-    DenseTransitionAdmission,
+    DenseFallbackPackedDecoderCache, DenseTransitionAdmission,
 };
 use crate::primitives::{
     packed_metal_identity, CompiledKernelHandle, PackedCodeBits, PackedMetalGpuFamily,
@@ -83,8 +82,11 @@ pub(crate) fn compressed_request_kv_bytes(
 }
 
 /// The table family of a provider's campaign identity (`"llama"` / `"qwen"`): the same
-/// architecture check that names the SC-20671 evidence models, so a qualification row only ever
-/// applies to the decoder family it was measured on.
+/// architecture check that names the SC-20671 evidence models. Test-only since the sc-20688
+/// review: a production load's family also requires the measured architecture
+/// ([`core_llm::qualified_kv_model_family`]); tests use this to arm a tiny fixture as its
+/// dispatch family.
+#[cfg(test)]
 pub(crate) fn family_for(campaign_family: Option<&str>) -> Option<KvModelFamily> {
     match campaign_family? {
         "llama" => Some(KvModelFamily::Llama),
@@ -101,37 +103,25 @@ pub(crate) const fn campaign_family(family: KvModelFamily) -> &'static str {
     }
 }
 
-/// Why the fused reader cannot serve this decoder's attention, before any cache is built.
+/// This decoder's attention geometry for the shared plan's geometry stage
+/// ([`core_llm::KvAttentionGeometry`]; the Candle backend fills the same fields from its config).
+pub(crate) fn attention_geometry(cfg: &ModelConfig) -> core_llm::KvAttentionGeometry {
+    core_llm::KvAttentionGeometry {
+        head_dim: u64::try_from(cfg.head_dim).unwrap_or(0),
+        attention_softcap: cfg.attn_logit_softcap.is_some(),
+        query_pre_attn_scalar: cfg
+            .query_pre_attn_scalar
+            .map(|scalar| u64::try_from(scalar).unwrap_or(0)),
+        latent_or_shared_kv: cfg.mla.is_some() || cfg.gemma4.is_some(),
+        // `qwen3_moe` parses as the Qwen3 architecture; the evidence measured dense decoders only.
+        mixture_of_experts: cfg.moe.is_some(),
+    }
+}
+
+/// Why the fused reader cannot serve this decoder's attention, before any cache is built: the
+/// shared geometry stage ([`core_llm::KvAttentionGeometry::refusal`]) over this decoder's config.
 pub(crate) fn geometry_refusal(cfg: &ModelConfig) -> Option<String> {
-    let head_dim = usize::try_from(cfg.head_dim).unwrap_or(0);
-    if !packed_metal_head_dimension_supported(head_dim) {
-        return Some(format!(
-            "the fused compressed reader supports head dimension 64, 128 or 256, not {}",
-            cfg.head_dim
-        ));
-    }
-    if cfg.attn_logit_softcap.is_some() {
-        return Some("attention-score soft-cap needs tanh before softmax".into());
-    }
-    if cfg
-        .query_pre_attn_scalar
-        .is_some_and(|scalar| scalar != cfg.head_dim)
-    {
-        return Some(
-            "the fused reader scales scores by the inverse square-root head dimension".into(),
-        );
-    }
-    if cfg.mla.is_some() || cfg.gemma4.is_some() {
-        return Some("latent or shared K/V attention has no compressed-domain reader".into());
-    }
-    // `qwen3_moe` parses as the Qwen3 architecture; the evidence measured dense decoders only.
-    if cfg.moe.is_some() {
-        return Some(
-            "a mixture-of-experts decoder is outside the dense decoders the evidence measured"
-                .into(),
-        );
-    }
-    None
+    attention_geometry(cfg).refusal()
 }
 
 /// Build the retained fused group-affine Metal reader for `bits` (the decode kernels are compiled
@@ -152,20 +142,29 @@ pub(crate) fn group_affine_reader(bits: PackedCodeBits) -> Result<CompiledKernel
     Ok(CompiledKernelHandle::new(kernel))
 }
 
+/// A refused compressed selection: the reason the report carries and the backend's detail.
+pub(crate) type SelectionRefusal = (KvCacheFallbackReason, String);
+
 /// The request's compressed cache, chosen before any K/V mutation: the packed group-affine cache
 /// of `reader`'s width bound to `reader`, for one sequence prefilling `prompt_tokens` tokens with
-/// the implicit causal mask. `Err` carries the selection's refusal with the dense cache that then
-/// serves the request.
+/// the implicit causal mask. A refusal comes back with the dense cache that then serves the
+/// request, typed with its true reason: a decoder outside the fused reader's geometry is
+/// [`KvCacheFallbackReason::UnsupportedGeometry`] (decided by the shared geometry stage before the
+/// packed cache is built); every other refusal of the packed selection — a reader that does not
+/// bind or preflight — is [`KvCacheFallbackReason::ReaderUnavailable`].
 pub(crate) fn select_compressed_cache(
     model: &CausalLm,
     reader: CompiledKernelHandle,
     prompt_tokens: usize,
     transition_admission: DenseTransitionAdmission,
-) -> (Box<dyn KvCache>, Option<String>) {
+) -> (Box<dyn KvCache>, Option<SelectionRefusal>) {
     let selection = model.select_cache_with_packed_reader(reader, 1, prompt_tokens, false);
-    let refused = match selection.route() {
-        CacheRoute::DenseFallback { reason } => Some(reason.clone()),
-        CacheRoute::ExperimentalPacked => None,
+    let refused = match (geometry_refusal(model.config()), selection.route()) {
+        (Some(geometry), _) => Some((KvCacheFallbackReason::UnsupportedGeometry, geometry)),
+        (None, CacheRoute::DenseFallback { reason }) => {
+            Some((KvCacheFallbackReason::ReaderUnavailable, reason.clone()))
+        }
+        (None, CacheRoute::ExperimentalPacked) => None,
     };
     let mut cache = selection.into_cache();
     // The request was admitted at the compressed price: a later dense transition is admitted
@@ -243,13 +242,14 @@ pub(crate) fn select_paged_cache(
             KvCacheReport::dense(reason, detail),
         )
     };
-    // Each paged sequence owns its pages and is read through its own page-table row and length,
-    // so a sequence decoding beside others qualifies on its own (sc-20681).
-    let row = match core_llm::qualify_kv_sequence(
+    // The same qualification as the contiguous plan: a sequence decoding in a batch of more than
+    // one is `BatchedDecode` (sc-20688 review: the evidence is single-sequence).
+    let row = match core_llm::qualify_kv_compression(
         request.policy,
         request.family,
         request.prompt_tokens,
         request.max_new_tokens,
+        request.batch,
     ) {
         Ok(row) => row,
         Err(reason) => return dense(reason, None),
@@ -287,19 +287,17 @@ pub(crate) fn select_paged_cache(
 }
 
 /// The report of a generation that ran on a cache [`select_compressed_cache`] chose, read from the
-/// cache's own evidence before it is reset. A refused selection ran dense from the start; any
+/// cache's own evidence before it is reset. A refused selection ran dense from the start, with the
+/// reason [`select_compressed_cache`] typed it with; any
 /// explicit dense transition, recorded fallback or full-cache reconstruction afterwards makes it a
 /// [`KvCacheFallbackReason::RuntimeFallback`].
 pub(crate) fn compressed_report(
     format: KvCompressionFormat,
-    refused: Option<String>,
+    refused: Option<SelectionRefusal>,
     cache: &dyn KvCache,
 ) -> crate::error::Result<KvCacheReport> {
-    if let Some(reason) = refused {
-        return Ok(KvCacheReport::dense(
-            KvCacheFallbackReason::ReaderUnavailable,
-            Some(reason),
-        ));
+    if let Some((reason, detail)) = refused {
+        return Ok(KvCacheReport::dense(reason, Some(detail)));
     }
     let Some(evidence) = cache.packed_evidence() else {
         return Ok(KvCacheReport::dense(
@@ -473,6 +471,20 @@ mod tests {
         assert_eq!(packed_code_bits(format).bits(), format.key_bits());
         assert_eq!(packed_code_bits(format).bits(), format.value_bits());
         assert_eq!(format.group_size(), PACKED_METAL_QUANT_GROUP_SIZE);
+    }
+
+    /// The shared geometry stage's head dimensions are exactly the ones the Metal reader
+    /// implements.
+    #[test]
+    fn the_shared_head_dimensions_are_the_metal_readers() {
+        use crate::primitives::packed_group_affine_kv::packed_metal_head_dimension_supported;
+        for head_dim in 0..=512_u64 {
+            assert_eq!(
+                core_llm::KV_FUSED_READER_HEAD_DIMS.contains(&head_dim),
+                packed_metal_head_dimension_supported(head_dim as usize),
+                "{head_dim}"
+            );
+        }
     }
 
     #[test]

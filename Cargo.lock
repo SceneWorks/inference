@@ -1083,6 +1083,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-flash-attn",
+ "candle-llm",
  "candle-nn",
  "candle-quant-kernels",
  "core-llm",

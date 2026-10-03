@@ -1842,6 +1842,25 @@ impl PackedTensor {
             + (self.scales.capacity() + self.zeros.capacity()) * std::mem::size_of::<f16>()
     }
 
+    /// [`Self::reserve_rows`] for an untrusted row count (a restored snapshot's capacity): `Err`
+    /// on overflow or a failed allocation instead of a panic.
+    fn try_reserve_rows(&mut self, rows: usize) -> Result<()> {
+        let refused = || Error::Config("snapshot capacity cannot be reserved".into());
+        let codes = rows
+            .checked_mul(self.bits.code_bytes(self.width))
+            .ok_or_else(refused)?;
+        let metadata = rows.checked_mul(self.groups).ok_or_else(refused)?;
+        self.codes
+            .try_reserve(codes.saturating_sub(self.codes.len()))
+            .map_err(|_| refused())?;
+        self.scales
+            .try_reserve(metadata.saturating_sub(self.scales.len()))
+            .map_err(|_| refused())?;
+        self.zeros
+            .try_reserve(metadata.saturating_sub(self.zeros.len()))
+            .map_err(|_| refused())
+    }
+
     fn reserve_rows(&mut self, rows: usize) {
         self.codes.reserve(
             rows.saturating_mul(self.bits.code_bytes(self.width))
@@ -2049,6 +2068,29 @@ impl TokenGroupKeyTensor {
         self.codes.capacity()
             + (self.scales.capacity() + self.zeros.capacity()) * std::mem::size_of::<f16>()
             + self.pending.capacity() * std::mem::size_of::<f32>()
+    }
+
+    /// [`Self::reserve_tokens`] for an untrusted token count (a restored snapshot's capacity):
+    /// `Err` on overflow or a failed allocation instead of a panic.
+    fn try_reserve_tokens(&mut self, tokens: usize) -> Result<()> {
+        let refused = || Error::Config("snapshot capacity cannot be reserved".into());
+        let groups = self
+            .rows
+            .checked_mul(tokens.div_ceil(self.group_size))
+            .ok_or_else(refused)?;
+        let codes = groups
+            .checked_mul(self.code_bytes_per_group())
+            .ok_or_else(refused)?;
+        let metadata = groups.checked_mul(self.width).ok_or_else(refused)?;
+        self.codes
+            .try_reserve(codes.saturating_sub(self.codes.len()))
+            .map_err(|_| refused())?;
+        self.scales
+            .try_reserve(metadata.saturating_sub(self.scales.len()))
+            .map_err(|_| refused())?;
+        self.zeros
+            .try_reserve(metadata.saturating_sub(self.zeros.len()))
+            .map_err(|_| refused())
     }
 
     fn reserve_tokens(&mut self, tokens: usize) {
@@ -4057,11 +4099,23 @@ impl PackedGroupAffineKvCache {
                 "snapshot quantization or shape mismatch".into(),
             ));
         }
-        if nums[5] > nums[4] {
+        // The capacity is a reservation the cache's own growth produced: zero, or a power of two
+        // (`grow` doubles from one) holding at least the declared logical length. Anything else is
+        // refused. A cache trimmed after growing legitimately carries more than its length needs,
+        // so the reservation restored is bounded by what growth produces for the restored length
+        // — `grow` from empty yields the next power of two at or above it, and at least two —
+        // never the header's own figure (sc-20688 review: a crafted capacity must not reach an
+        // unbounded or overcommitted reservation).
+        let declared = nums[4] as usize;
+        if nums[5] > nums[4] || (declared != 0 && !declared.is_power_of_two()) {
             return Err(Error::Config(
                 "snapshot capacity/logical bounds mismatch".into(),
             ));
         }
+        let capacity = match nums[5] as usize {
+            0 => 0,
+            len => declared.min(len.next_power_of_two().max(2)),
+        };
         let mut restored = Vec::with_capacity(self.layers.len());
         let rows = self.rows();
         for _ in 0..self.layers.len() {
@@ -4198,13 +4252,21 @@ impl PackedGroupAffineKvCache {
         if p != bytes.len() {
             return Err(Error::Config("snapshot trailing bytes".into()));
         }
-        self.capacity = nums[4] as usize;
+        // Reserve the declared capacity before installing anything: a capacity no allocation can
+        // hold is an `Err`, and the cache is left as it was.
+        let capacity_rows = rows
+            .checked_mul(capacity)
+            .ok_or_else(|| Error::Config("snapshot capacity cannot be reserved".into()))?;
+        for layer in restored.iter_mut().flatten() {
+            layer.keys.try_reserve_tokens(capacity)?;
+            layer.values.try_reserve_rows(capacity_rows)?;
+        }
+        self.capacity = capacity;
         self.logical_len = nums[5] as usize;
         self.absolute_offset = nums[6] as usize;
         self.layers = restored;
         self.device_layers = vec![None; self.layers.len()];
         self.telemetry.retained_device_packed_logical_bytes = 0;
-        self.reserve_storage_for_capacity();
         Ok(())
     }
 }
@@ -4900,6 +4962,63 @@ mod tests {
         trailing.push(0);
         assert!(c.restore(&trailing).is_err());
         assert_eq!(c.representation(), before);
+    }
+
+    /// sc-20688 review (findings 10 and round-2 5): a crafted snapshot whose header declares a
+    /// capacity the cache's doubling growth never produces is refused with `Err` (never a
+    /// capacity-overflow panic), leaving the cache untouched; a huge power-of-two capacity is
+    /// restored with only the reservation growth gives its logical length, not an overcommitted
+    /// one.
+    #[test]
+    fn a_crafted_snapshot_capacity_is_refused_not_reserved() {
+        let mut c = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
+        let x = data(2, 1, 8, -3.0);
+        c.append(0, &x, &x, 2).unwrap();
+        let before = c.representation();
+        let honest = c.save().unwrap();
+        // magic, version, identity length and bytes, then group size, batch, KV heads and head
+        // dimension before the capacity.
+        let capacity_at = 8 + 4 + 4 + "m".len() + 4 * 8;
+        assert_eq!(
+            u64::from_le_bytes(honest[capacity_at..capacity_at + 8].try_into().unwrap()),
+            c.capacity as u64
+        );
+        let craft = |capacity: u64| {
+            let mut crafted = honest[..honest.len() - 8].to_vec();
+            crafted[capacity_at..capacity_at + 8].copy_from_slice(&capacity.to_le_bytes());
+            let sum = checksum(&crafted);
+            crafted.extend(sum.to_le_bytes());
+            crafted
+        };
+        for capacity in [u64::MAX, 3, (1 << 34) + 1] {
+            let crafted = craft(capacity);
+            let restored =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.restore(&crafted)));
+            let error = restored
+                .unwrap_or_else(|_| panic!("capacity {capacity} panicked"))
+                .expect_err("a crafted capacity is refused");
+            assert!(error.to_string().contains("capacity"), "{error}");
+            assert_eq!(c.representation(), before);
+        }
+        // Huge powers of two parse, but reserve only what growth gives the two restored tokens.
+        let mut reference = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
+        reference.restore(&honest).unwrap();
+        for capacity in [1_u64 << 34, 1 << 62] {
+            let mut restored = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
+            restored.restore(&craft(capacity)).unwrap();
+            assert_eq!(restored.capacity, 2, "capacity {capacity}");
+            assert_eq!(
+                restored.representation(),
+                reference.representation(),
+                "capacity {capacity}: the honest snapshot's reservation"
+            );
+        }
+        c.restore(&honest).unwrap();
+        assert_eq!(
+            c.save().unwrap(),
+            honest,
+            "the honest snapshot still restores"
+        );
     }
 
     #[test]

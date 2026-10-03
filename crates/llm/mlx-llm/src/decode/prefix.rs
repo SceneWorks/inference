@@ -670,7 +670,9 @@ impl PagedPrefixCache {
 
     /// Store the sequence `cache` holds — whose positions are `tokens` (truncated to what the
     /// cache holds) — by referencing its pages. Returns `false`, storing nothing, when the
-    /// identity is not the store's or the cache lives on another pool.
+    /// identity is not the store's, the cache lives on another pool, or its fused reader faulted
+    /// (sc-20688 review): a stored entry outlives the sequence, and every sequence started from
+    /// it would inherit the faulted reader state and run on dense gathers.
     pub fn insert(
         &mut self,
         identity: &PagedCacheIdentity,
@@ -678,6 +680,9 @@ impl PagedPrefixCache {
         cache: &PagedPackedKvCache,
     ) -> Result<bool> {
         if self.refuse(identity).is_some() {
+            return Ok(false);
+        }
+        if cache.reader_faulted() {
             return Ok(false);
         }
         if !Rc::ptr_eq(cache.pool(), &self.pool) {
