@@ -77,7 +77,8 @@ def resolve_binary(args: argparse.Namespace) -> None:
 def verify_reference(args: argparse.Namespace) -> None:
     from yue2_precision_reference_transfer import (  # type: ignore[import-not-found]
         LICENSE_SHA256, SOURCE_ARTIFACT_ID, SOURCE_ENGINE_SHA, SOURCE_METADATA_SHA256,
-        SOURCE_RUN_ID, SOURCE_ZIP_SHA256,
+        SOURCE_RUN_ID, SOURCE_ZIP_SHA256, RELAY_ARTIFACT_ID, RELAY_CONTROL_SHA,
+        RELAY_ENGINE_SHA, RELAY_METADATA_SHA256, RELAY_RUN_ID, RELAY_ZIP_SHA256,
     )
     metadata = json.loads((args.directory / "reference-provenance.json").read_text(encoding="utf-8"))
     source = args.directory / "vae_real_reference.safetensors"
@@ -95,6 +96,18 @@ def verify_reference(args: argparse.Namespace) -> None:
             metadata.get("noncommercial_sha256") == LICENSE_SHA256,
             "reference transfer provenance differs from reviewed source/run")
     require(source.is_file(), "reference artifact is absent")
+    relay_keys = {"reference_source_mode", "relay_run_id", "relay_artifact_id",
+                  "relay_engine_sha", "relay_control_sha", "relay_artifact_zip_sha256",
+                  "relay_provenance_sha256"}
+    if relay_keys & metadata.keys():
+        require({key: metadata.get(key) for key in relay_keys} == {
+            "reference_source_mode": "relay", "relay_run_id": RELAY_RUN_ID,
+            "relay_artifact_id": RELAY_ARTIFACT_ID,
+            "relay_engine_sha": RELAY_ENGINE_SHA,
+            "relay_control_sha": RELAY_CONTROL_SHA,
+            "relay_artifact_zip_sha256": RELAY_ZIP_SHA256,
+            "relay_provenance_sha256": RELAY_METADATA_SHA256,
+        }, "reference relay identity differs from reviewed artifact")
     require(sha256(args.directory / "NONCOMMERCIAL.txt") == LICENSE_SHA256,
             "reference noncommercial notice differs from reviewed source")
     digest = sha256(source)

@@ -30,6 +30,12 @@ on:
         required: false
         default: ""
         description: "Successful fixture-stage run ID at the same exact engine SHA (cuda/metal)"
+      reference_source:
+        type: choice
+        required: false
+        default: direct
+        options: [direct, relay]
+        description: "fixture only: direct immutable M3 artifact, or exact reviewed M4 CPU relay when M3 expires"
       expected_app_sha:
         type: string
         required: false
@@ -140,6 +146,7 @@ jobs:
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          REFERENCE_SOURCE: ${{ inputs.reference_source }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -154,12 +161,17 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=normal)"
           source_dir="$RUNNER_TEMP/yue2-precision-reference-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -m 700 "$source_dir"
-          gh api repos/SceneWorks/inference/actions/runs/36748416547 > "$source_dir/run.json"
-          gh api repos/SceneWorks/inference/actions/artifacts/11116254689 > "$source_dir/artifact.json"
-          gh api repos/SceneWorks/inference/actions/artifacts/11116254689/zip > "$source_dir/original-artifact.zip"
+          case "$REFERENCE_SOURCE" in
+            direct) source_run=36748416547; source_artifact=11116254689 ;;
+            relay) source_run=37138394196; source_artifact=11279267367 ;;
+            *) echo 'unreviewed reference source' >&2; exit 1 ;;
+          esac
+          gh api "repos/SceneWorks/inference/actions/runs/$source_run" > "$source_dir/run.json"
+          gh api "repos/SceneWorks/inference/actions/artifacts/$source_artifact" > "$source_dir/artifact.json"
+          gh api "repos/SceneWorks/inference/actions/artifacts/$source_artifact/zip" > "$source_dir/source-artifact.zip"
           out="$RUNNER_TEMP/yue2-precision-reference-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           python3 ../control/scripts/ci/yue2_precision_reference_transfer.py \
-            --source-zip "$source_dir/original-artifact.zip" \
+            --source-zip "$source_dir/source-artifact.zip" --source-mode "$REFERENCE_SOURCE" \
             --run-json "$source_dir/run.json" --artifact-json "$source_dir/artifact.json" \
             --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" \
             --transfer-run-id "$GITHUB_RUN_ID" --transfer-attempt "$GITHUB_RUN_ATTEMPT" \

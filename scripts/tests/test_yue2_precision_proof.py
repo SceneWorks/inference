@@ -670,6 +670,26 @@ class PrecisionControlTests(unittest.TestCase):
             args.control_sha = "d" * 40
             with self.assertRaisesRegex(RuntimeError, "transfer provenance"):
                 CONTROL.verify_reference(args)
+            args.control_sha = "c" * 40
+            metadata.update({"reference_source_mode": "relay",
+                             "relay_run_id": TRANSFER.RELAY_RUN_ID,
+                             "relay_artifact_id": TRANSFER.RELAY_ARTIFACT_ID,
+                             "relay_engine_sha": TRANSFER.RELAY_ENGINE_SHA,
+                             "relay_control_sha": TRANSFER.RELAY_CONTROL_SHA,
+                             "relay_artifact_zip_sha256": TRANSFER.RELAY_ZIP_SHA256,
+                             "relay_provenance_sha256": TRANSFER.RELAY_METADATA_SHA256})
+            (root / "reference-provenance.json").write_text(json.dumps(metadata), encoding="utf-8")
+            with patch.object(CONTROL, "sha256", side_effect=lambda path:
+                              TRANSFER.LICENSE_SHA256 if path.name == "NONCOMMERCIAL.txt" else actual_sha(path)):
+                with self.assertRaisesRegex(RuntimeError, "digest differs"):
+                    CONTROL.verify_reference(args)
+            for field, wrong in (("relay_run_id", 1),
+                                 ("relay_artifact_zip_sha256", "0" * 64),
+                                 ("relay_provenance_sha256", None)):
+                changed = dict(metadata, **{field: wrong})
+                (root / "reference-provenance.json").write_text(json.dumps(changed), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "relay identity"):
+                    CONTROL.verify_reference(args)
 
     def test_actual_rust_receipt_shape_and_cross_policy_mutations(self):
         def decoder(variant, dtype):
