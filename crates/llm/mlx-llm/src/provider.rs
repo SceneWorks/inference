@@ -1933,7 +1933,6 @@ impl TextLlm for LlamaProvider {
         };
 
         let mut prefix_hit = 0usize;
-        let mut prefill_forwards = 1usize;
 
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
@@ -2249,7 +2248,6 @@ impl TextLlm for LlamaProvider {
                             let PrefixPrefill {
                                 mut cache,
                                 logits,
-                                forwards,
                                 fed_tokens,
                                 ..
                             } = prefill_restored(
@@ -2263,7 +2261,6 @@ impl TextLlm for LlamaProvider {
                             .map_err(to_core)?;
                             // Measured, not looked up: the positions the prefill did not feed.
                             prefix_hit = prompt_ids.len() - fed_tokens;
-                            prefill_forwards = forwards;
                             if prefix_hit > 0 {
                                 prefix_path = "hit";
                             }
@@ -2305,7 +2302,6 @@ impl TextLlm for LlamaProvider {
                                 mut cache,
                                 logits,
                                 hidden,
-                                forwards,
                                 fed_tokens,
                                 mtp: resume,
                                 boundary,
@@ -2321,7 +2317,6 @@ impl TextLlm for LlamaProvider {
                             .map_err(to_core)?;
                             // Measured, not looked up: the positions the prefill did not feed.
                             prefix_hit = prompt_ids.len() - fed_tokens;
-                            prefill_forwards = forwards;
                             if prefix_hit > 0 {
                                 prefix_path = "hit";
                             }
@@ -2370,17 +2365,14 @@ impl TextLlm for LlamaProvider {
         let stats = run.stats;
         let mut report = run.report;
         // The request's resolution fallbacks join the engine's measured report (E2/E3), and so
-        // does what the prefix cache restored — the engine counts a caller's prefill as one
-        // forward, so a prefill split at the conversation boundary adds its second.
+        // does what the prefix cache restored. The engine counts a caller's prefill as its one
+        // prefill forward: the boundary snapshot is taken inside it (sc-24446).
         report.fallbacks = fallbacks;
         report.prefix_hit_tokens = prefix_hit as u64;
         report.prefix_cache = core_llm::PathReport {
             path: prefix_path.into(),
             reason: prefix_reason.map(str::to_string),
         };
-        let extra_prefill = prefill_forwards.saturating_sub(1);
-        report.target_forwards += extra_prefill as u64;
-        report.prefill_forwards += extra_prefill as u64;
         report.fused_primitives = crate::primitives::fused::fused_tally()
             .since(&fused_start)
             .path_report();
@@ -2483,7 +2475,7 @@ impl TextLlm for LlamaProvider {
             mtp: (report.proposer == ProposerKind::Mtp).then(|| core_llm::MtpStats {
                 proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
                 accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
-                target_forwards: u32::try_from(stats.forwards + extra_prefill).unwrap_or(u32::MAX),
+                target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
             }),
             decode: Some(report),
             finish_reason: Some(finish),
@@ -4586,8 +4578,8 @@ mod tests {
         use core_llm::Speculative;
         // The absolute accounting of a budget-bound run without stop tokens: the first token
         // comes from the prefill and each verify step commits its accepted drafts plus one; every
-        // forward is a prefill forward (two when the hybrid's prefill split at the prefix cache's
-        // conversation boundary, sc-24437), a verify step or a recovery replay.
+        // forward is the prefill forward (one, also when the hybrid's prefix cache snapshots its
+        // conversation boundary inside it, sc-24446), a verify step or a recovery replay.
         let accounting = |label: &str, ids: &[u32], report: &core_llm::DecodeReport| {
             assert_eq!(
                 ids.len() as u64,
@@ -4717,7 +4709,7 @@ mod tests {
 
     /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
     /// proposer does not. The synthetic hybrid's random MTP head never drafts a token the target
-    /// accepts, so `auto` (MTP at the recommended depth) is demoted after the probe window and
+    /// accepts, so `auto` (MTP at the recommended depth) is demoted after its first window and
     /// the report says where, while the same proposer asked for explicitly runs to the end; both
     /// stream exactly `off`'s tokens.
     #[test]
@@ -4729,7 +4721,10 @@ mod tests {
             ..spec_request(speculative)
         };
         let (_, off_ids) = run(&provider, &request(Speculative::Off));
-        let (auto, auto_ids) = run(&provider, &request(Speculative::Auto));
+        // Untimed (the static threshold decides, no plain probe): the timed monitor's decisions
+        // are pinned on a deterministic clock in the engine's tests.
+        let (auto, auto_ids) =
+            core_llm::with_decode_clock(None, || run(&provider, &request(Speculative::Auto)));
         let explicit =
             Speculative::proposer(SpeculativeProposer::Mtp, MLX_ROW.recommended_depths.mtp);
         let (asked, asked_ids) = run(&provider, &request(explicit));
@@ -5369,7 +5364,11 @@ mod tests {
                 ("explicit 3", explicit(3)),
                 ("explicit max", explicit(mtp.max_depth)),
                 ("legacy", (3, legacy)),
-                ("auto", (3, spec_request(Speculative::Auto))),
+                // `auto` runs at the advertised recommended depth (sc-24446), not a literal.
+                (
+                    "auto",
+                    (mtp.recommended_depth, spec_request(Speculative::Auto)),
+                ),
             ] {
                 provider.validate(&req).unwrap();
                 let (out, ids) = run(&provider, &req);

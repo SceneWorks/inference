@@ -455,20 +455,25 @@ impl GatedDeltaNet {
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel), run by
         // the cache so every token's post-step state (conv tail + SSM state) lands in its
-        // checkpoint ring (sc-24131). GQA (q/k from Hk key heads → Hv value heads) is handled
-        // inside the recurrence primitive.
+        // checkpoint ring (sc-24131) — except in a prompt prefill, whose positions are never
+        // rolled back to: it runs final-state-only and rings just its last state (sc-24446).
+        // GQA (q/k from Hk key heads → Hv value heads) is handled inside the recurrence
+        // primitive.
         let beta = sigmoid(&b_in)?;
         let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
         let f = DType::F32;
-        let y = cache.advance_at(
-            &conv_trace,
-            &qn.to_dtype(f)?,
-            &kn.to_dtype(f)?,
-            &vc.to_dtype(f)?,
-            &g.to_dtype(f)?,
-            &beta.to_dtype(f)?,
-            positions,
-        )?;
+        let (q, k, v, g, beta) = (
+            qn.to_dtype(f)?,
+            kn.to_dtype(f)?,
+            vc.to_dtype(f)?,
+            g.to_dtype(f)?,
+            beta.to_dtype(f)?,
+        );
+        let y = if crate::primitives::in_prefill() {
+            cache.advance_prefill(&conv_trace, &q, &k, &v, &g, &beta)?
+        } else {
+            cache.advance_at(&conv_trace, &q, &k, &v, &g, &beta, positions)?
+        };
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
         let out = rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
@@ -1248,6 +1253,28 @@ impl Qwen35PrefixState {
         self.len == 0
     }
 
+    /// Every held tensor on the host, in layer order (`(K, V)` or `(conv, ssm)` per layer).
+    #[cfg(test)]
+    pub(crate) fn host_tensors(&self) -> Vec<Vec<f32>> {
+        self.layers
+            .iter()
+            .flat_map(|l| match l {
+                Qwen35PrefixLayer::Attn(Some((a, b))) | Qwen35PrefixLayer::Delta(Some((a, b))) => {
+                    vec![a.clone(), b.clone()]
+                }
+                _ => Vec::new(),
+            })
+            .map(|t| {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
     /// Bytes the held tensors occupy.
     pub fn bytes(&self) -> usize {
         self.layers.iter().fold(0usize, |acc, l| {
@@ -1266,7 +1293,44 @@ impl Qwen35Cache {
     /// Copy the cache's whole state — it must hold exactly the positions a later request resumes
     /// at, because a recurrent state exists only at the position it was taken (story sc-24437).
     pub fn prefix_snapshot(&self) -> Result<Qwen35PrefixState> {
-        let len = self.offset().max(0) as usize;
+        self.prefix_snapshot_at(self.offset().max(0) as usize)
+    }
+
+    /// Ask the next prefill forward to capture every linear layer's state after `position` — a
+    /// boundary strictly inside that prefill — so [`prefix_snapshot_at`](Self::prefix_snapshot_at)
+    /// can copy the cache as it was there without splitting the prefill into two forwards
+    /// (sc-24446).
+    pub fn capture_boundary(&mut self, position: i32) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.capture_at(position);
+            }
+        }
+    }
+
+    /// Drop every linear layer's pending [`capture_boundary`](Self::capture_boundary) — after a
+    /// forward that failed part-way, whose later layers never consumed it.
+    pub fn clear_boundary_capture(&mut self) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.clear_capture();
+            }
+        }
+    }
+
+    /// [`prefix_snapshot`](Self::prefix_snapshot) of the cache's first `len` positions: at the
+    /// cache length, its live state; before it, the attention KV narrowed to `len` (causal: no
+    /// later position wrote it) and the linear states the last prefill captured at `len`
+    /// ([`capture_boundary`](Self::capture_boundary)) — the state a prefill that stopped at `len`
+    /// would have left. A linear layer holding no state at `len` is an error.
+    pub fn prefix_snapshot_at(&self, len: usize) -> Result<Qwen35PrefixState> {
+        let offset = self.offset().max(0) as usize;
+        if len > offset {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: no snapshot at {len} past the cache length {offset}"
+            )));
+        }
+        let position = len as i32;
         let copy_kv = |k: &Tensor, v: &Tensor| -> Result<(Tensor, Tensor)> {
             // Compact copies of exactly `len` positions: `Tensor::copy` would keep the view's
             // layout over a clone of the whole static buffer — the cache's full capacity, pinned
@@ -1281,6 +1345,16 @@ impl Qwen35Cache {
             .iter()
             .map(|l| {
                 Ok(match l {
+                    Qwen35LayerCache::Delta(c) if len < offset => {
+                        let (conv, ssm) = c.captured(position).ok_or_else(|| {
+                            Error::Msg(format!(
+                                "Qwen35Cache: no recurrent state captured at {len} (the cache is \
+                                 at {offset})"
+                            ))
+                        })?;
+                        // Already compact copies the cache owns: shared, never written.
+                        Qwen35PrefixLayer::Delta(Some((conv.clone(), ssm.clone())))
+                    }
                     Qwen35LayerCache::Delta(c) => {
                         Qwen35PrefixLayer::Delta(match (c.conv_state(), c.ssm_state()) {
                             // Compact copies: the live state may be a slot view of the
@@ -2815,6 +2889,8 @@ impl Qwen35Model {
         positions: [&[i32]; 3],
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -2837,6 +2913,8 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<Tensor> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -2868,6 +2946,8 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<(Tensor, Tensor)> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -2899,6 +2979,8 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<(Tensor, Tensor)> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -3280,17 +3362,41 @@ impl StepModel for Qwen35Model {
         // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
         let offset = cache.offset() + cache.rope_delta();
         let ids = request.tokens.ids(&self.device)?;
-        let _prefill = crate::primitives::prefill_scope(request.prefill);
-        let (logits, hidden) = match (request.scope, request.want_hidden) {
-            (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
-            (LogitsScope::Last, true) => {
-                let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
-                (logits, Some(hidden))
+        if let Some(b) = request.snapshot_at {
+            // The boundary snapshot (sc-24446): a prefill keeps every linear layer's state after
+            // its first `b` tokens; the attention KV is narrowed there afterwards.
+            let n = request.len()?;
+            if !request.prefill || b == 0 || b >= n {
+                return Err(Error::Msg(format!(
+                    "Qwen35Model::forward_step: a snapshot after {b} of {n} tokens needs a \
+                     prefill step that continues past it"
+                )));
             }
-            (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
-            (LogitsScope::All, true) => {
-                let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
-                (logits, Some(hidden))
+            cache.capture_boundary(cache.offset() + b as i32);
+        }
+        let _prefill = crate::primitives::prefill_scope(request.prefill);
+        let run = (|| -> Result<(Tensor, Option<Tensor>)> {
+            Ok(match (request.scope, request.want_hidden) {
+                (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
+                (LogitsScope::Last, true) => {
+                    let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+                (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
+                (LogitsScope::All, true) => {
+                    let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+            })
+        })();
+        let (logits, hidden) = match run {
+            Ok(out) => out,
+            Err(e) => {
+                // A forward that failed part-way leaves the boundary capture (sc-24446) pending
+                // in the linear layers it never reached: drop it, so no later prefill on this
+                // cache captures a stale boundary.
+                cache.clear_boundary_capture();
+                return Err(e);
             }
         };
         Ok(StepOutput { logits, hidden })
@@ -5392,6 +5498,70 @@ pub(crate) mod tests {
         }
     }
 
+    /// sc-24446 (defect A) on the model: a prompt prefill takes no per-token Gated DeltaNet step
+    /// and writes one ring slot per linear layer whatever the request's draft depth, so its
+    /// logits are bit-identical for every depth; a verify step after it still rolls back to its
+    /// start (the prefill's state, bit for bit) and to each of its positions.
+    #[test]
+    fn a_prompt_prefill_rings_only_its_final_state_at_every_draft_depth() {
+        use crate::primitives::gated_delta::counters;
+        let (_cfg, model) = text_model();
+        let linear = model
+            .new_cache()
+            .layers
+            .iter()
+            .filter(|l| matches!(l, Qwen35LayerCache::Delta(_)))
+            .count();
+        let prompt: Vec<i32> = (0..100).map(|i| (i * 7 % 49) + 1).collect();
+        let p = prompt.len() as i32;
+        let states = |cache: &Qwen35Cache| -> Vec<(Vec<f32>, Vec<f32>)> {
+            cache
+                .layers
+                .iter()
+                .filter_map(|l| match l {
+                    Qwen35LayerCache::Delta(c) => {
+                        Some((host(c.conv_state().unwrap()), host(c.ssm_state().unwrap())))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut logits = Vec::new();
+        for k in [0usize, 2, 6] {
+            let mut cache = model.new_cache_for(prompt.len() + 8, k).unwrap();
+            let (out, steps, writes) = counters::counting(|| {
+                model
+                    .forward_step(&mut cache, StepRequest::last(&prompt).as_prefill())
+                    .unwrap()
+            });
+            assert_eq!(
+                (steps, writes),
+                (0, linear),
+                "K={k}: one write per linear layer"
+            );
+            assert!(cache.checkpoint_offsets().is_empty(), "K={k}");
+            logits.push(host(&out.logits));
+            let at_prompt = states(&cache);
+            let verify: Vec<i32> = (0..=k as i32).map(|i| i + 3).collect();
+            model
+                .forward_step(&mut cache, StepRequest::all(&verify))
+                .unwrap();
+            assert_eq!(
+                cache.checkpoint_offsets(),
+                (p..p + k as i32 + 1).collect::<Vec<_>>(),
+                "K={k}: the step start and every verify position are restorable"
+            );
+            for j in (0..=k as i32 + 1).rev() {
+                cache.rollback_to(p + j).unwrap();
+            }
+            assert_eq!(states(&cache), at_prompt, "K={k}: back at the step start");
+        }
+        assert!(
+            logits.windows(2).all(|w| w[0] == w[1]),
+            "bit-identical logits"
+        );
+    }
+
     /// **AC1 (tiny config).** After one verify forward of `K + 1` tokens, rolling back to any
     /// `j in 0..=K + 1` positions into it leaves every linear layer's conv and SSM state equal to
     /// a fresh decode of that many tokens (max abs error `<= 1e-6`; exact on CPU), for every
@@ -5441,6 +5611,7 @@ pub(crate) mod tests {
                         scope: LogitsScope::All,
                         want_hidden: false,
                         prefill: false,
+                        snapshot_at: None,
                     },
                 )
                 .unwrap();

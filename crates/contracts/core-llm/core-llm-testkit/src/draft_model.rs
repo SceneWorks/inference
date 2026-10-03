@@ -29,14 +29,19 @@
 //! * **Short draft context** ([`check_draft_model_short_context`]): a draft whose context window
 //!   is shorter than a request's reach is not driven past it — the request runs `auto` with the
 //!   reason named — while a request within it runs the draft.
+//! * **Qwen3-VL multimodal** ([`write_qwen3vl_draft_fixture`],
+//!   [`check_draft_model_qwen3vl_multimodal`]): a tiny Qwen3-VL target (interleaved M-RoPE, a
+//!   one-block ViT with a DeepStack tap) beside a tiny Qwen3 draft over its tokenizer; an image
+//!   request's `draft_model` rows — the draft proposing over the image-expanded history — emit
+//!   exactly `off`'s greedy stream on both backends (sc-24446).
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use core_llm::{
-    FinishReason, LoadSpec, ProposerCapabilities, ProposerKind, Sampling, Speculative,
-    SpeculativeProposer, StreamEvent, TextLlm, TextLlmRequest,
+    Content, FinishReason, ImageRef, LoadSpec, Message, ProposerCapabilities, ProposerKind, Role,
+    Sampling, Speculative, SpeculativeProposer, StreamEvent, TextLlm, TextLlmRequest,
 };
 use serde_json::{json, Map, Value};
 
@@ -186,6 +191,10 @@ enum Arch {
     /// block (fused Qwen3.6 expert layout), with an MTP head (`mtp`) whose predictor layer's FFN
     /// follows the body's.
     Qwen35 { moe: bool, mtp: bool },
+    /// `Qwen3VLForConditionalGeneration` (`qwen3_vl`): the Causal decoder under
+    /// `model.language_model.*` with interleaved M-RoPE, beside a one-block ViT tower
+    /// ([`vision_tower`]) carrying one DeepStack tap.
+    Qwen3Vl,
 }
 
 /// One tiny decoder's geometry and layer-weight scale.
@@ -225,7 +234,7 @@ impl Shape {
     /// The weight-name root the decoder's layers, embedding and final norm live under.
     fn root(&self) -> &'static str {
         match self.arch {
-            Arch::Qwen35 { .. } => "model.language_model",
+            Arch::Qwen35 { .. } | Arch::Qwen3Vl => "model.language_model",
             _ => "model",
         }
     }
@@ -273,6 +282,28 @@ impl Shape {
                 );
                 extend(&mut config, &moe);
                 config
+            }
+            Arch::Qwen3Vl => {
+                extend(
+                    &mut config,
+                    &json!({
+                        "model_type": "qwen3_vl_text",
+                        "rope_scaling": {
+                            "mrope_interleaved": true,
+                            "mrope_section": VL_MROPE_SECTION,
+                            "rope_type": "default",
+                        },
+                    }),
+                );
+                json!({
+                    "architectures": ["Qwen3VLForConditionalGeneration"],
+                    "model_type": "qwen3_vl",
+                    "image_token_id": VL_IMAGE_PAD,
+                    "eos_token_id": 999,
+                    "tie_word_embeddings": false,
+                    "text_config": config,
+                    "vision_config": vision_config(),
+                })
             }
             Arch::Qwen35 { moe: sparse, mtp } => {
                 extend(
@@ -395,7 +426,7 @@ impl Shape {
             push(format!("{at}.down_proj.weight"), vec![HIDDEN, inter]);
         };
         let sparse = match self.arch {
-            Arch::Qwen3 | Arch::Qwen35 { moe: false, .. } => {
+            Arch::Qwen3 | Arch::Qwen3Vl | Arch::Qwen35 { moe: false, .. } => {
                 return triple(&mut push, &format!("{prefix}.mlp"), self.intermediate);
             }
             Arch::Qwen2Moe => false,
@@ -427,9 +458,19 @@ fn write_snapshot(
     shared: &[Tensor],
     tokenizer_prefix: &str,
 ) -> io::Result<()> {
+    write_snapshot_with(dir, shape, shared, &tokenizer_json(tokenizer_prefix))
+}
+
+/// [`write_snapshot`] over an explicit `tokenizer.json`.
+fn write_snapshot_with(
+    dir: &Path,
+    shape: &Shape,
+    shared: &[Tensor],
+    tokenizer: &str,
+) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     fs::write(dir.join("config.json"), shape.config().to_string())?;
-    fs::write(dir.join("tokenizer.json"), tokenizer_json(tokenizer_prefix))?;
+    fs::write(dir.join("tokenizer.json"), tokenizer)?;
 
     let mut rng = Stream(shape.seed);
     let root = shape.root();
@@ -473,18 +514,16 @@ fn write_snapshot(
         shape.attention(prefix, &mut rng, &mut tensors);
         shape.ffn(prefix, &mut rng, &mut tensors);
     }
+    if shape.arch == Arch::Qwen3Vl {
+        vision_tower(&mut rng, &mut tensors);
+    }
     write_safetensors(&dir.join("model.safetensors"), &tensors)
 }
 
-/// Write the draft-model fixture under `root` (which must exist): one snapshot directory per
-/// [`DraftModelFixture`] field, each `config.json` + `tokenizer.json` + `model.safetensors`, all
-/// `F32`. Deterministic: the same bytes on every call.
-pub fn write_draft_model_fixture(root: &Path) -> io::Result<DraftModelFixture> {
-    // Embedding and output projection are shared, so every model sees the same token geometry and
-    // their argmax agrees where the layers do not overturn it; a draft's fewer, weaker layers
-    // overturn it less often than a target's, which is where drafts get rejected.
+/// The embedding, output projection and final norm every fixture model shares.
+fn shared_tensors() -> Vec<Tensor> {
     let mut rng = Stream(0x5EED_2443_6000);
-    let shared: Vec<Tensor> = vec![
+    vec![
         (
             "model.embed_tokens.weight".into(),
             vec![DRAFT_FIXTURE_VOCAB, HIDDEN],
@@ -496,7 +535,17 @@ pub fn write_draft_model_fixture(root: &Path) -> io::Result<DraftModelFixture> {
             rng.uniform(DRAFT_FIXTURE_VOCAB * HIDDEN, 1.0),
         ),
         ("model.norm.weight".into(), vec![HIDDEN], vec![1.0; HIDDEN]),
-    ];
+    ]
+}
+
+/// Write the draft-model fixture under `root` (which must exist): one snapshot directory per
+/// [`DraftModelFixture`] field, each `config.json` + `tokenizer.json` + `model.safetensors`, all
+/// `F32`. Deterministic: the same bytes on every call.
+pub fn write_draft_model_fixture(root: &Path) -> io::Result<DraftModelFixture> {
+    // Embedding and output projection are shared, so every model sees the same token geometry and
+    // their argmax agrees where the layers do not overturn it; a draft's fewer, weaker layers
+    // overturn it less often than a target's, which is where drafts get rejected.
+    let shared = shared_tensors();
     let target = Shape {
         arch: Arch::Qwen3,
         layers: 2,
@@ -901,6 +950,289 @@ pub fn check_draft_model_refused(
 
 /// Loads a provider for a [`LoadSpec`] — the backend-specific half of the fixture-editing checks.
 pub type DraftLoader<'a> = &'a dyn Fn(&LoadSpec) -> Result<Box<dyn TextLlm>, String>;
+
+/// The Qwen-VL vision specials' ids in the VL fixture tokenizer: the vocabulary's last three
+/// pieces (`<|vision_start|>`, `<|image_pad|>`, `<|vision_end|>`).
+const VL_VISION_START: usize = DRAFT_FIXTURE_VOCAB - 3;
+const VL_IMAGE_PAD: usize = DRAFT_FIXTURE_VOCAB - 2;
+const VL_VISION_END: usize = DRAFT_FIXTURE_VOCAB - 1;
+/// The Qwen3-VL decoder's interleaved M-RoPE sections (t, h, w): half its head dim.
+const VL_MROPE_SECTION: [usize; 3] = [2, 1, 1];
+/// The Qwen3-VL decoder's attention head dim (`2 · Σ VL_MROPE_SECTION`).
+const VL_HEAD_DIM: usize = 8;
+/// The ViT tower: width, MLP width, heads, learned position grid, and the merged patch row width
+/// (`spatial_merge_size² · width`).
+const VIT_HIDDEN: usize = 16;
+const VIT_INTERMEDIATE: usize = 32;
+const VIT_HEADS: usize = 2;
+const VIT_POSITIONS: usize = 16;
+const VIT_MERGED: usize = 4 * VIT_HIDDEN;
+
+/// [`tokenizer_json`]`("t")` with the Qwen-VL vision specials in place of the vocabulary's last
+/// three pieces, as added tokens so the placeholder a provider renders for an image tokenizes to
+/// exactly those ids.
+fn vl_tokenizer_json() -> String {
+    let specials = [
+        (VL_VISION_START, "<|vision_start|>"),
+        (VL_IMAGE_PAD, "<|image_pad|>"),
+        (VL_VISION_END, "<|vision_end|>"),
+    ];
+    let piece = |i: usize| {
+        specials
+            .iter()
+            .find(|(id, _)| *id == i)
+            .map_or_else(|| format!("t{i}"), |(_, s)| s.to_string())
+    };
+    let vocab: Map<String, Value> = (0..DRAFT_FIXTURE_VOCAB)
+        .map(|i| (piece(i), json!(i)))
+        .collect();
+    let added: Vec<Value> = specials
+        .iter()
+        .map(|(id, content)| {
+            json!({
+                "id": id, "content": content, "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true,
+            })
+        })
+        .collect();
+    json!({
+        "version": "1.0",
+        "added_tokens": added,
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": null,
+        "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "t0" },
+    })
+    .to_string()
+}
+
+/// The Qwen3-VL ViT's `vision_config`: the image processor's own geometry (patch 16, temporal
+/// patch 2, merge 2) — a 256 × 256 image is 64 language tokens — one block, a DeepStack tap after
+/// it, and a merger emitting decoder-width rows.
+fn vision_config() -> Value {
+    json!({
+        "model_type": "qwen3_vl",
+        "depth": 1, "hidden_size": VIT_HIDDEN, "num_heads": VIT_HEADS,
+        "intermediate_size": VIT_INTERMEDIATE, "in_channels": 3,
+        "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2,
+        "out_hidden_size": HIDDEN, "num_position_embeddings": VIT_POSITIONS,
+        "deepstack_visual_indexes": [0],
+    })
+}
+
+/// The seeded ViT tower [`vision_config`] describes (`model.visual.*`), appended to `tensors`.
+fn vision_tower(rng: &mut Stream, tensors: &mut Vec<Tensor>) {
+    let mut put = |key: &str, dims: &[usize]| {
+        let n = dims.iter().product();
+        tensors.push((
+            format!("model.visual.{key}"),
+            dims.to_vec(),
+            rng.uniform(n, 0.5),
+        ));
+    };
+    put("patch_embed.proj.weight", &[VIT_HIDDEN, 3, 2, 16, 16]);
+    put("patch_embed.proj.bias", &[VIT_HIDDEN]);
+    put("pos_embed.weight", &[VIT_POSITIONS, VIT_HIDDEN]);
+    for (key, dims) in [
+        ("norm1.weight", vec![VIT_HIDDEN]),
+        ("norm1.bias", vec![VIT_HIDDEN]),
+        ("norm2.weight", vec![VIT_HIDDEN]),
+        ("norm2.bias", vec![VIT_HIDDEN]),
+        ("attn.qkv.weight", vec![3 * VIT_HIDDEN, VIT_HIDDEN]),
+        ("attn.qkv.bias", vec![3 * VIT_HIDDEN]),
+        ("attn.proj.weight", vec![VIT_HIDDEN, VIT_HIDDEN]),
+        ("attn.proj.bias", vec![VIT_HIDDEN]),
+        ("mlp.linear_fc1.weight", vec![VIT_INTERMEDIATE, VIT_HIDDEN]),
+        ("mlp.linear_fc1.bias", vec![VIT_INTERMEDIATE]),
+        ("mlp.linear_fc2.weight", vec![VIT_HIDDEN, VIT_INTERMEDIATE]),
+        ("mlp.linear_fc2.bias", vec![VIT_HIDDEN]),
+    ] {
+        put(&format!("blocks.0.{key}"), &dims);
+    }
+    // The final merger normalizes each patch before the 2 × 2 shuffle; a DeepStack merger after it.
+    for (merger, norm) in [
+        ("merger", VIT_HIDDEN),
+        ("deepstack_merger_list.0", VIT_MERGED),
+    ] {
+        put(&format!("{merger}.norm.weight"), &[norm]);
+        put(&format!("{merger}.norm.bias"), &[norm]);
+        put(
+            &format!("{merger}.linear_fc1.weight"),
+            &[VIT_MERGED, VIT_MERGED],
+        );
+        put(&format!("{merger}.linear_fc1.bias"), &[VIT_MERGED]);
+        put(
+            &format!("{merger}.linear_fc2.weight"),
+            &[HIDDEN, VIT_MERGED],
+        );
+        put(&format!("{merger}.linear_fc2.bias"), &[HIDDEN]);
+    }
+}
+
+/// The snapshots [`write_qwen3vl_draft_fixture`] writes.
+#[derive(Clone, Debug)]
+pub struct Qwen3VlDraftFixture {
+    /// The tiny Qwen3-VL target (2 layers, interleaved M-RoPE, a one-block ViT with a DeepStack
+    /// tap) over the VL tokenizer.
+    pub target: PathBuf,
+    /// The tiny Qwen3 text draft over the target's tokenizer.
+    pub draft: PathBuf,
+}
+
+impl Qwen3VlDraftFixture {
+    /// The target load naming the draft.
+    pub fn spec_with_draft(&self) -> LoadSpec {
+        LoadSpec::dense(self.target.to_string_lossy()).with_draft(self.draft.to_string_lossy())
+    }
+}
+
+/// Write the Qwen3-VL draft-model fixture under `root` (which must exist): a tiny Qwen3-VL target
+/// and a tiny Qwen3 draft, sharing the draft-model fixture's embedding and output projection and
+/// one tokenizer carrying the Qwen-VL vision specials. Deterministic, `F32`, no real weights.
+pub fn write_qwen3vl_draft_fixture(root: &Path) -> io::Result<Qwen3VlDraftFixture> {
+    let shared = shared_tensors();
+    let tokenizer = vl_tokenizer_json();
+    let target = Shape {
+        arch: Arch::Qwen3Vl,
+        layers: 2,
+        heads: 2,
+        kv_heads: 1,
+        head_dim: VL_HEAD_DIM,
+        intermediate: 32,
+        layer_scale: 0.25,
+        seed: 0x7A26_E73F,
+    };
+    let draft = Shape {
+        arch: Arch::Qwen3,
+        layers: 1,
+        heads: 2,
+        kv_heads: 1,
+        head_dim: HEAD_DIM,
+        intermediate: 16,
+        layer_scale: 0.1,
+        seed: 0xD2AF_703F,
+    };
+    let fixture = Qwen3VlDraftFixture {
+        target: root.join("qwen3vl_target"),
+        draft: root.join("qwen3vl_draft"),
+    };
+    write_snapshot_with(&fixture.target, &target, &shared, &tokenizer)?;
+    write_snapshot_with(&fixture.draft, &draft, &shared, &tokenizer)?;
+    Ok(fixture)
+}
+
+/// The Qwen3-VL fixture's image prompts: a 256 × 256 gradient (64 language tokens) then a
+/// repetitive text turn, and the text turn then the image (the image run mid-prompt).
+pub fn qwen3vl_image_prompts() -> Vec<BenchPrompt> {
+    let (w, h) = (256u32, 256u32);
+    let pixels = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            [x as u8, y as u8, ((x + y) / 2) as u8]
+        })
+        .collect();
+    let image = ImageRef::new(w, h, pixels).expect("a 256 × 256 RGB image");
+    let text = "t3 t9 t4 t11 t3 t9 t4 t11 t3 t9";
+    let prompt = |id: &str, content: Vec<Content>| BenchPrompt {
+        id: id.into(),
+        class: PromptClass::Predictable,
+        messages: vec![Message {
+            role: Role::User,
+            content,
+            thinking: None,
+            tool_calls: Vec::new(),
+        }],
+    };
+    vec![
+        prompt(
+            "image_then_text",
+            vec![Content::Image(image.clone()), Content::text(text)],
+        ),
+        prompt(
+            "text_then_image",
+            vec![Content::text(text), Content::Image(image)],
+        ),
+    ]
+}
+
+/// The Qwen3-VL multimodal `draft_model` check (sc-24446, epic sc-24432 E1/E8): the fixture's
+/// Qwen3-VL target loaded through `load` beside its Qwen3 draft advertises vision and
+/// `draft_model`; on both image prompts every [`draft_model_parity_cases`] row emits exactly
+/// `off`'s greedy stream with a report naming `draft_model` at the row's depth and no fallback;
+/// the draft proposed and had drafts accepted; and the rows ran the multimodal prefill (the 64
+/// image tokens are in the prompt).
+pub fn check_draft_model_qwen3vl_multimodal(
+    fixture: &Qwen3VlDraftFixture,
+    load: DraftLoader<'_>,
+) -> Result<(), String> {
+    let provider = load(&fixture.spec_with_draft())?;
+    let caps = &provider.descriptor().capabilities;
+    if !caps.supports_vision {
+        return Err("the Qwen3-VL target does not advertise vision".into());
+    }
+    let advertised = caps
+        .proposer(SpeculativeProposer::DraftModel)
+        .ok_or("the Qwen3-VL target with a resident draft does not advertise `draft_model`")?;
+    let prompts = qwen3vl_image_prompts();
+    let cases = draft_model_parity_cases(&advertised);
+    let rows =
+        check_speculative_greedy_parity(provider.as_ref(), &prompts, &cases, MAX_NEW_TOKENS)?;
+    if rows.len() != prompts.len() * cases.len() {
+        return Err(format!(
+            "{} parity rows, expected {}",
+            rows.len(),
+            prompts.len() * cases.len()
+        ));
+    }
+    let mut failures = Vec::new();
+    for row in &rows {
+        let depth = match row.speculative {
+            Speculative::Proposer { depth, .. } => Some(depth),
+            _ => None,
+        };
+        if row.report.path != ProposerKind::DraftModel.label()
+            || !row.report.fallbacks.is_empty()
+            || row.report.draft_tokens != depth
+        {
+            failures.push(format!(
+                "[{}] {:?}: path {}, depth {:?}, fallbacks {:?}",
+                row.prompt_id,
+                row.speculative,
+                row.report.path,
+                row.report.draft_tokens,
+                row.report.fallbacks
+            ));
+        }
+    }
+    let (proposed, accepted) = rows.iter().fold((0, 0), |(p, a), r| {
+        (p + r.report.proposed_tokens, a + r.report.accepted_tokens)
+    });
+    if proposed == 0 || accepted == 0 {
+        failures.push(format!(
+            "the draft must propose and be accepted: {accepted} of {proposed} drafts accepted"
+        ));
+    }
+    for prompt in &prompts {
+        let out = provider
+            .generate(
+                &bench_request(prompt, Speculative::Off, &Sampling::greedy(), 4),
+                &mut |_| {},
+            )
+            .map_err(|e| e.to_string())?;
+        if out.usage.prompt_tokens <= 64 {
+            failures.push(format!(
+                "{}: {} prompt tokens, so the image was not expanded",
+                prompt.id, out.usage.prompt_tokens
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
 
 /// Copy the snapshot directory `from` to `to` (created), applying `edit` to its `config.json`.
 fn derive_snapshot(from: &Path, to: &Path, edit: impl FnOnce(&mut Value)) -> Result<(), String> {

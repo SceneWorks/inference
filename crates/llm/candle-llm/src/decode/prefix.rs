@@ -106,8 +106,8 @@ impl PrefixEntry {
 pub trait PrefixSnapshot {
     /// How a stored copy may be reused.
     const REUSE: PrefixReuse;
-    /// Copy the first `len` positions (the hybrid only ever copies its whole state: `len` must be
-    /// its length).
+    /// Copy the first `len` positions (the hybrid copies its whole state, or the boundary its last
+    /// prefill captured: `len` must be one of those).
     fn snapshot(&self, len: usize) -> Result<PrefixEntry>;
     /// Write the entry's first `len` positions into this **empty** cache.
     fn restore(&mut self, entry: &PrefixEntry, len: usize) -> Result<()>;
@@ -204,15 +204,11 @@ impl PrefixSnapshot for ContiguousKvCache {
 impl PrefixSnapshot for Qwen35Cache {
     const REUSE: PrefixReuse = PrefixReuse::WholeEntry;
 
+    /// The cache at its length, or at a boundary its last prefill captured
+    /// ([`StepRequest::snapshot_at`]): a recurrent state exists only where it was taken.
     fn snapshot(&self, len: usize) -> Result<PrefixEntry> {
-        if len != self.offset().max(0) as usize {
-            return Err(Error::Msg(format!(
-                "prefix cache: a recurrent state exists only at the cache length {}, not {len}",
-                self.offset()
-            )));
-        }
         Ok(PrefixEntry::Hybrid {
-            state: self.prefix_snapshot()?,
+            state: self.prefix_snapshot_at(len)?,
             mtp: None,
         })
     }
@@ -410,8 +406,6 @@ pub struct PrefixPrefill {
     pub hidden: Option<Tensor>,
     /// Leading prompt positions the lookup restored (the prefill starts past them).
     pub reused: usize,
-    /// Target forwards the prefill ran (two when it split at the boundary).
-    pub forwards: usize,
     /// Prompt tokens the prefill fed through the model — `prompt.len() - reused` when the
     /// restored cache was really prefilled on top of; the provider reports
     /// `prefix_hit_tokens = prompt.len() - fed_tokens`, so the report measures the prefill it ran.
@@ -424,11 +418,12 @@ pub struct PrefixPrefill {
 }
 
 /// Prefill `prompt` through `model` into `cache`, which holds the `restored` prefix (or is empty
-/// on a miss): only `prompt[reused..]` runs. `boundary` is a prompt length to snapshot at —
-/// honoured for a [`PrefixReuse::WholeEntry`] cache when it falls strictly inside the prefilled
-/// span, by splitting the prefill there (a softmax cache is copied after the run instead).
+/// on a miss): only `prompt[reused..]` runs, in **one** forward. `boundary` is a prompt length to
+/// snapshot at — honoured for a [`PrefixReuse::WholeEntry`] cache when it falls strictly inside
+/// the prefilled span, by capturing the state there inside the forward
+/// ([`StepRequest::snapshot_at`], sc-24446; a softmax cache is copied after the run instead).
 /// `want_hidden` returns the target's hidden rows for the prefilled positions (the MTP warm-up).
-/// The cancel flag is checked before every forward; a cancelled prefill returns
+/// The cancel flag is checked before and after the forward; a cancelled prefill returns
 /// [`Error::Canceled`] and snapshots nothing.
 pub fn prefill_restored<M>(
     model: &M,
@@ -456,50 +451,38 @@ where
             && b > reused
             && b < prompt.len()
     });
-    let mut segments = Vec::with_capacity(2);
-    let mut from = reused;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    // One forward over everything past the restored prefix (sc-24446): a boundary inside it is
+    // captured on the way — the recurrent state there kept by the forward, the attention KV
+    // narrowed to it afterwards — instead of splitting the prefill into two forwards. A prefill
+    // (sc-24441): from a restored, non-empty cache it still attends as a cold prefill does,
+    // never on the decode step's device-positions path.
+    let mut request = StepRequest::last(&prompt[reused..])
+        .with_hidden(want_hidden)
+        .as_prefill();
     if let Some(b) = split {
-        segments.push(from..b);
-        from = b;
+        request = request.with_snapshot_at(b - reused);
     }
-    segments.push(from..prompt.len());
-    let forwards = segments.len();
-    let fed_tokens = segments.iter().map(ExactSizeIterator::len).sum();
-    let mut hidden_rows = Vec::new();
-    let mut logits = None;
-    let mut snapshot = None;
-    for segment in segments {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        // A prefill segment (sc-24441): from a restored, non-empty cache it still attends as a
-        // cold prefill does, never on the decode step's device-positions path.
-        let out = model.forward_step(
-            cache,
-            StepRequest::last(&prompt[segment.clone()])
-                .with_hidden(want_hidden)
-                .as_prefill(),
-        )?;
-        hidden_rows.extend(out.hidden);
-        logits = Some(out.logits);
-        if split == Some(segment.end) {
-            snapshot = Some(Boundary {
-                len: segment.end,
-                entry: cache.snapshot(segment.end)?,
-            });
-        }
+    let out = model.forward_step(cache, request)?;
+    if cancel.is_cancelled() {
+        // Cancelled while the forward ran: no snapshot of a prefill the request abandons.
+        return Err(Error::Canceled);
     }
-    let hidden = match hidden_rows.len() {
-        0 => None,
-        1 => hidden_rows.pop(),
-        _ => Some(Tensor::cat(&hidden_rows, 1)?),
-    };
+    // A boundary the forward could not capture costs the cache entry, never the request: the
+    // prefill and its output stand, and the boundary is simply not stored.
+    let snapshot = split.and_then(|b| {
+        cache
+            .snapshot(b)
+            .ok()
+            .map(|entry| Boundary { len: b, entry })
+    });
     Ok(PrefixPrefill {
-        logits: logits.expect("at least one segment"),
-        hidden,
+        logits: out.logits,
+        hidden: out.hidden,
         reused,
-        forwards,
-        fed_tokens,
+        fed_tokens: prompt.len() - reused,
         mtp,
         boundary: snapshot,
     })
@@ -659,7 +642,10 @@ mod engine_tests {
     struct Counted<'a, M> {
         inner: &'a M,
         fed: Cell<usize>,
+        calls: Cell<usize>,
         cancel_in_forward: Option<&'a CancelFlag>,
+        /// Run every step without its boundary snapshot: a model that captures nothing.
+        drop_snapshot: bool,
     }
 
     impl<'a, M> Counted<'a, M> {
@@ -667,7 +653,9 @@ mod engine_tests {
             Self {
                 inner,
                 fed: Cell::new(0),
+                calls: Cell::new(0),
                 cancel_in_forward: None,
+                drop_snapshot: false,
             }
         }
 
@@ -696,9 +684,18 @@ mod engine_tests {
             request: StepRequest<'_>,
         ) -> Result<StepOutput> {
             self.fed.set(self.fed.get() + request.len()?);
+            self.calls.set(self.calls.get() + 1);
             if let Some(cancel) = self.cancel_in_forward {
                 cancel.cancel();
             }
+            let request = if self.drop_snapshot {
+                StepRequest {
+                    snapshot_at: None,
+                    ..request
+                }
+            } else {
+                request
+            };
             self.inner.forward_step(cache, request)
         }
     }
@@ -1080,6 +1077,49 @@ mod engine_tests {
         assert_eq!(gen2, cold(&model, &mut NoProposer, &p2, 8).0);
     }
 
+    /// sc-24446 (epic E1): on both decoder families, a prefix-cache hit on the boundary entry a
+    /// single-forward miss stored decodes exactly the greedy tokens a plain, cache-free run of the
+    /// same prompt decodes — over conversations shorter than one Gated DeltaNet chunk and past
+    /// it, each continued by two different turns (ids below each fixture's vocabulary `v`). Sensitive to the boundary: a recurrent state
+    /// captured one position off changes the hybrid's greedy stream here.
+    #[test]
+    fn a_hit_after_a_single_forward_miss_decodes_the_plain_run() {
+        fn check<M>(model: &M, family: &str, v: i32)
+        where
+            M: StepModel,
+            M::Cache: PrefixSnapshot,
+        {
+            const NEW: usize = 24;
+            for conv_len in [5usize, 8, 13, 21, 34, 55, 70, 90] {
+                let conversation: Vec<i32> = (0..conv_len as i32)
+                    .map(|i| (i * 7 % (v - 4)) + 1)
+                    .collect();
+                let mut pc = PrefixCache::with_budget(1 << 30);
+                let mut p1 = conversation.clone();
+                p1.extend_from_slice(&[v - 2, v - 1]);
+                let (_, reused1, _) =
+                    turn(model, &mut NoProposer, &mut pc, &p1, Some(conv_len), NEW);
+                assert_eq!(reused1, 0, "{family} {conv_len}: a miss");
+                for next in [
+                    [v - 7, v - 6, v - 5, v - 2, v - 1],
+                    [3, 7, v - 3, v - 2, v - 1],
+                ] {
+                    let mut p = conversation.clone();
+                    p.extend_from_slice(&next);
+                    let (tokens, reused, _) = turn(model, &mut NoProposer, &mut pc, &p, None, NEW);
+                    assert!(reused >= conv_len, "{family} {conv_len}: a hit ({reused})");
+                    assert_eq!(
+                        tokens,
+                        cold(model, &mut NoProposer, &p, NEW).0,
+                        "{family} {conv_len} {next:?}"
+                    );
+                }
+            }
+        }
+        check(&tiny_llama(), "causal", 24);
+        check(&text_model().1, "hybrid", 50);
+    }
+
     /// AC2: the hybrid restores the recurrent state snapshotted at the boundary (through the
     /// checkpoint ring), prefills only past it, and matches a cold run; a third turn restores the
     /// same entry after the second decoded past it (the entry is an immutable copy).
@@ -1339,13 +1379,147 @@ mod engine_tests {
         let err = prefill_restored(&counted, &mut cache, None, &prompt, Some(6), false, &cancel)
             .expect_err("cancelled");
         assert!(matches!(err, Error::Canceled), "{err}");
-        assert_eq!(counted.take(), 6, "the second segment never ran");
+        assert_eq!(
+            counted.take(),
+            7,
+            "one forward, past the boundary (sc-24446)"
+        );
         assert!(pc.is_empty());
 
         let (tokens, reused, _) = turn(&model, &mut NoProposer, &mut pc, &prompt, Some(6), 4);
         assert_eq!(reused, 0);
         assert_eq!(tokens, cold(&model, &mut NoProposer, &prompt, 4).0);
         assert_eq!(pc.len(), 1);
+    }
+
+    /// sc-24446: a prefill whose forward fails part-way drops the boundary capture its linear
+    /// layers never consumed, so a later prefill on the same cache captures nothing there.
+    #[test]
+    fn a_failed_prefill_leaves_no_stale_boundary_capture() {
+        let (_, model) = text_model();
+        let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
+        let mut bad = prompt.clone();
+        bad[3] = model.vocab_size() as i32 + 5; // past the embedding: the forward fails
+        let mut cache = model.new_cache_for(prompt.len() + 8, 2).unwrap();
+        let step = |tokens| StepRequest::last(tokens).as_prefill();
+        assert!(model
+            .forward_step(&mut cache, step(&bad).with_snapshot_at(8))
+            .is_err());
+        assert_eq!(cache.positions(), 0, "the failed prefill fed nothing");
+        model.forward_step(&mut cache, step(&prompt)).unwrap();
+        assert!(
+            cache.prefix_snapshot_at(8).is_err(),
+            "a stale boundary was captured by a later prefill"
+        );
+    }
+
+    /// sc-24446: a boundary the forward does not capture costs the prefix-cache entry, never the
+    /// request: the prefill returns its output with no boundary snapshot.
+    #[test]
+    fn an_uncaptured_boundary_skips_the_snapshot_not_the_request() {
+        let (_, model) = text_model();
+        let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
+        let mut uncaptured = Counted::new(&model);
+        uncaptured.drop_snapshot = true;
+        let mut cache = model.new_cache_for(prompt.len() + 8, 2).unwrap();
+        let pre = prefill_restored(
+            &uncaptured,
+            &mut cache,
+            None,
+            &prompt,
+            Some(8),
+            false,
+            &CancelFlag::new(),
+        )
+        .expect("the request survives an uncaptured boundary");
+        assert!(pre.boundary.is_none());
+        assert_eq!(pre.fed_tokens, prompt.len());
+        assert_eq!(cache.positions(), prompt.len());
+    }
+
+    /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward,
+    /// and the snapshot it stores is the one a prefill split at the boundary into two forwards
+    /// stores (to the GEMM's reduction order); a later hit restoring it decodes the same greedy
+    /// tokens as a hit on the split prefill's snapshot.
+    /// A conversation shorter than one Gated DeltaNet chunk and one long enough to run chunkwise.
+    #[test]
+    fn a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state() {
+        let (_, model) = text_model();
+        for conv_len in [8usize, 100] {
+            let conversation: Vec<i32> = (0..conv_len as i32).map(|i| (i * 7 % 49) + 1).collect();
+            let mut p1 = conversation.clone();
+            p1.extend_from_slice(&[40, 41, 42, 43, 44]);
+            let counted = Counted::new(&model);
+            let mut cache = counted.new_cache_for(p1.len() + 8, 2).unwrap();
+            let pre = prefill_restored(
+                &counted,
+                &mut cache,
+                None,
+                &p1,
+                Some(conv_len),
+                false,
+                &CancelFlag::new(),
+            )
+            .unwrap();
+            assert_eq!(counted.calls.get(), 1, "{conv_len}: one forward");
+            assert_eq!(counted.take(), p1.len(), "{conv_len}: the whole prompt");
+
+            // The reference: the prefill split at the boundary, snapshotted between the forwards.
+            let mut split = model.new_cache_for(p1.len() + 8, 2).unwrap();
+            model
+                .forward_step(&mut split, StepRequest::last(&p1[..conv_len]).as_prefill())
+                .unwrap();
+            let reference = split.prefix_snapshot().unwrap();
+            let split_logits = model
+                .forward_step(&mut split, StepRequest::last(&p1[conv_len..]).as_prefill())
+                .unwrap()
+                .logits;
+            let boundary = pre.boundary.expect("a boundary snapshot");
+            assert_eq!(boundary.len(), conv_len);
+            let PrefixEntry::Hybrid { state, .. } = &boundary.entry else {
+                panic!("a hybrid entry");
+            };
+            assert_eq!(state.len(), conv_len);
+            // Equal up to the GEMM's row-count-dependent reduction order: one forward of `T` rows
+            // vs `b` then `T - b` (bit-identical on the Apple CPU; last-ulp on x86, the S2
+            // finding). The recurrence itself is split exactly where the two forwards split it.
+            let close = |g: &[f32], w: &[f32], what: &str| {
+                assert_eq!(g.len(), w.len(), "{conv_len}: {what}");
+                let scale = w.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+                let diff = g
+                    .iter()
+                    .zip(w)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(diff <= 1e-5 * scale, "{conv_len}: {what} differs by {diff}");
+            };
+            let (got, want) = (state.host_tensors(), reference.host_tensors());
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                close(g, w, &format!("snapshot tensor {i}"));
+            }
+            let host = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            close(&host(&pre.logits), &host(&split_logits), "logits");
+
+            // A later hit on each snapshot decodes the same.
+            let mut p2 = conversation.clone();
+            p2.extend_from_slice(&[30, 31, 32, 40, 41]);
+            let mut runs = Vec::new();
+            for entry in [
+                boundary.entry.clone(),
+                PrefixEntry::Hybrid {
+                    state: reference.clone(),
+                    mtp: None,
+                },
+            ] {
+                let mut pc = PrefixCache::with_budget(1 << 30);
+                pc.insert(conversation.clone(), entry);
+                let (tokens, reused, _) = turn(&model, &mut NoProposer, &mut pc, &p2, None, 6);
+                assert_eq!(reused, conv_len);
+                runs.push(tokens);
+            }
+            assert_eq!(runs[0], runs[1], "{conv_len}: decode after the hit");
+        }
     }
 
     /// AC3 on real entries: past the budget the least-recently-used entry is evicted, and resident

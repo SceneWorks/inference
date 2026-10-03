@@ -160,6 +160,7 @@ fn ac1_verify_step_rollback_to_every_position_matches_a_fresh_decode() {
                     scope: LogitsScope::All,
                     want_hidden: false,
                     prefill: false,
+                    snapshot_at: None,
                 },
             )
             .unwrap();

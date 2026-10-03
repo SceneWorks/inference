@@ -38,7 +38,9 @@
 //! relies on). The live state is a *view* of the newest slot, so [`DeltaNetCache::rollback_to`] is
 //! a slot-index change: no copy, no allocation. The per-token write is an output of the recurrence
 //! step ([`gated_delta_recurrence_with_sink`]): a fused decode kernel (sc-24000) produces the same
-//! thing by writing each token's state into its ring slot directly.
+//! thing by writing each token's state into its ring slot directly. A prompt **prefill** is never
+//! rolled into, so it checkpoints nothing but its final state ([`DeltaNetCache::advance_prefill`],
+//! sc-24446): its recurrence runs chunkwise over the whole prompt whatever the ring's depth.
 //!
 //! ## Device-indexed slots (story sc-24441)
 //!
@@ -169,6 +171,28 @@ pub fn gated_delta_recurrence_with_sink(
     Ok((Tensor::cat(&[&y_head, &y_tail], 1)?, s_tail))
 }
 
+/// Test-only counts of the recurrence's per-token steps and the checkpoint ring's slot writes
+/// on this thread — what a prefill must not pay beyond its final state (sc-24446).
+#[cfg(test)]
+pub(crate) mod counters {
+    thread_local! {
+        pub(crate) static PER_TOKEN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(crate) static RING_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Run `f`, returning `(per-token steps, ring slot writes)` it made on this thread.
+    pub(crate) fn counting<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
+        let steps = PER_TOKEN_STEPS.with(std::cell::Cell::get);
+        let writes = RING_WRITES.with(std::cell::Cell::get);
+        let out = f();
+        (
+            out,
+            PER_TOKEN_STEPS.with(std::cell::Cell::get) - steps,
+            RING_WRITES.with(std::cell::Cell::get) - writes,
+        )
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only switch routing [`gated_delta_recurrence_with_sink`] to the per-token reference on
@@ -203,6 +227,23 @@ pub fn gated_delta_recurrence_per_token(
     state: Option<&Tensor>,
     sink: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
 ) -> Result<(Tensor, Tensor)> {
+    per_token(q, k, v, g, beta, state, false, sink)
+}
+
+/// [`gated_delta_recurrence_per_token`], from a `state` that already carries the first token's
+/// decay when `first_decayed` — the device-indexed step's fused ring read
+/// ([`candle_quant_kernels::read_slot_scaled`], sc-24446) — so the first step skips its multiply.
+#[allow(clippy::too_many_arguments)]
+fn per_token(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Option<&Tensor>,
+    first_decayed: bool,
+    sink: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
+) -> Result<(Tensor, Tensor)> {
     let (b, t, hk, dk) = q.dims4()?;
     let (_, _, hv, dv) = v.dims4()?;
 
@@ -226,7 +267,10 @@ pub fn gated_delta_recurrence_per_token(
         let vt = v.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?; // [B,Hv,Dv]
         let gt = g.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?; // [B,Hv]
         let bt = beta.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?; // [B,Hv]
-        let (y, next) = delta_step(&qt, &kt, &vt, &gt, &bt, &state, b, hv, dk, dv)?;
+        let decay = !(first_decayed && ti == 0);
+        let (y, next) = delta_step(&qt, &kt, &vt, &gt, &bt, &state, decay, b, hv, dk, dv)?;
+        #[cfg(test)]
+        counters::PER_TOKEN_STEPS.with(|c| c.set(c.get() + 1));
         sink(ti, &next)?;
         state = next;
         ys.push(y.unsqueeze(1)?); // [B,1,Hv,Dv]
@@ -625,6 +669,8 @@ impl StateRing {
     }
 
     fn write(&self, position: i32, conv: &Tensor, ssm: &Tensor) -> Result<()> {
+        #[cfg(test)]
+        counters::RING_WRITES.with(|c| c.set(c.get() + 1));
         let slot = self.slot(position);
         self.conv
             .slice_set(&conv.contiguous()?.unsqueeze(0)?, 0, slot)?;
@@ -635,6 +681,8 @@ impl StateRing {
 
     /// [`write`](Self::write) into the slot the device `u32` `slot` names (sc-24441).
     fn write_at(&self, slot: &Tensor, conv: &Tensor, ssm: &Tensor) -> Result<()> {
+        #[cfg(test)]
+        counters::RING_WRITES.with(|c| c.set(c.get() + 1));
         candle_quant_kernels::write_rows_at(
             &self.conv,
             &conv.contiguous()?.unsqueeze(0)?,
@@ -678,6 +726,12 @@ pub struct DeltaNetCache {
     /// [`preallocate`](Self::preallocate) or the first [`advance`](Self::advance)).
     spec: Option<RingSpec>,
     ring: Option<StateRing>,
+    /// The position the next [`advance_prefill`](Self::advance_prefill) captures its state at
+    /// ([`capture_at`](Self::capture_at)), if any.
+    capture: Option<i32>,
+    /// `(position, conv tail, SSM state)` the last prefill captured — compact copies, never views
+    /// of the ring ([`captured`](Self::captured)).
+    captured: Option<(i32, Tensor, Tensor)>,
 }
 
 impl DeltaNetCache {
@@ -761,6 +815,8 @@ impl DeltaNetCache {
                 offset: self.offset,
                 spec: None,
                 ring: None,
+                capture: None,
+                captured: None,
             });
         };
         spec.validate()?;
@@ -770,6 +826,8 @@ impl DeltaNetCache {
             offset: self.offset,
             spec: Some(spec),
             ring: None,
+            capture: None,
+            captured: None,
         };
         if self.ring.is_none() && self.conv_state.is_none() {
             // Nothing to carry: only the geometry changes (still lazily allocated).
@@ -964,19 +1022,52 @@ impl DeltaNetCache {
                     }
                 };
                 // Device-indexed: the live state is a copy of the slot the device index names
-                // (the slot `ssm_state` is a view of), taken before any write.
+                // (the slot `ssm_state` is a view of), taken before any write. On the per-token
+                // recurrence an F32 state takes the first token's decay in the same pass
+                // (`read_slot_scaled`: the bits of the read then the step's multiply, sc-24446).
+                let per_token_step = first_write.min(t) < CHUNKED_PREFILL_MIN_TOKENS;
+                let scaled = per_token_step
+                    && ring.ssm.dtype() == candle_core::DType::F32
+                    && g.dtype() == candle_core::DType::F32;
                 let live = match positions {
+                    Some(p) if offset > 0 && scaled => {
+                        Some(candle_quant_kernels::read_slot_scaled(
+                            &ring.ssm,
+                            &p.ring_read()?,
+                            &g.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?,
+                        )?)
+                    }
                     Some(p) if offset > 0 => {
                         Some(candle_quant_kernels::read_slot(&ring.ssm, &p.ring_read()?)?)
                     }
                     _ => None,
                 };
-                let state = match positions {
-                    Some(_) => live.as_ref(),
-                    None => self.ssm_state.as_ref(),
-                };
-                gated_delta_recurrence_with_sink(q, k, v, g, beta, state, first_write, &mut sink)
-                    .and_then(|(y, _)| Ok((y, ring.views(next)?)))
+                match positions {
+                    Some(_) if live.is_some() && scaled => {
+                        per_token(q, k, v, g, beta, live.as_ref(), true, &mut sink)
+                    }
+                    Some(_) => gated_delta_recurrence_with_sink(
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        live.as_ref(),
+                        first_write,
+                        &mut sink,
+                    ),
+                    None => gated_delta_recurrence_with_sink(
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        self.ssm_state.as_ref(),
+                        first_write,
+                        &mut sink,
+                    ),
+                }
+                .and_then(|(y, _)| Ok((y, ring.views(next)?)))
             }
             None => gated_delta_recurrence(q, k, v, g, beta, self.ssm_state.as_ref()).and_then(
                 |(y, final_state)| Ok((y, (conv.tail_after(t - 1)?.contiguous()?, final_state))),
@@ -998,6 +1089,143 @@ impl DeltaNetCache {
         }
         self.conv_state = Some(conv_state);
         self.ssm_state = Some(ssm_state);
+        self.offset = next;
+        Ok(y)
+    }
+
+    /// Ask the next [`advance_prefill`](Self::advance_prefill) to capture the state after
+    /// `position` (strictly inside that prefill: past the current position, before its end) —
+    /// the prefix cache's boundary snapshot taken inside one prefill forward (sc-24446). Read it
+    /// back with [`captured`](Self::captured).
+    pub fn capture_at(&mut self, position: i32) {
+        self.capture = Some(position);
+    }
+
+    /// Drop a pending [`capture_at`](Self::capture_at) the last forward did not consume (it
+    /// failed before reaching this layer): a later prefill must never capture a stale boundary.
+    pub fn clear_capture(&mut self) {
+        self.capture = None;
+    }
+
+    /// The `(conv tail, SSM state)` the last prefill captured at `position`
+    /// ([`capture_at`](Self::capture_at)), or `None` when it captured none there. Compact copies,
+    /// never views of the ring.
+    pub fn captured(&self, position: i32) -> Option<(&Tensor, &Tensor)> {
+        self.captured
+            .as_ref()
+            .filter(|(p, _, _)| *p == position)
+            .map(|(_, conv, ssm)| (conv, ssm))
+    }
+
+    /// [`advance`](Self::advance) for a prompt **prefill** (sc-24446): no position inside a
+    /// prefill is ever rolled back to — the speculative engine's rollbacks stop at the start of a
+    /// verify step, which is past the prompt — so the recurrence runs over all `T` tokens in its
+    /// final-state form ([`gated_delta_recurrence`]: chunkwise once `T` reaches
+    /// [`CHUNKED_PREFILL_MIN_TOKENS`]) and the ring takes only the state after the last token,
+    /// in that position's slot. The prefill's arithmetic is therefore the same whatever the
+    /// ring's depth (a speculative request's or a plain one's). Afterwards the restorable window
+    /// holds only the new position (a one-token prefill keeps the earlier ones, exactly as
+    /// [`advance`](Self::advance) would). A pending [`capture_at`](Self::capture_at) inside the
+    /// prefill splits the recurrence there — the head's final state is the captured one and the
+    /// tail continues from it, the arithmetic of two prefill forwards split at that position.
+    ///
+    /// A failure part-way leaves the position unadvanced; when the slot written is the live one
+    /// (`T` a multiple of the ring's slots) it also drops the live state, as
+    /// [`advance`](Self::advance) does.
+    pub fn advance_prefill(
+        &mut self,
+        conv: &ConvTrace,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+    ) -> Result<Tensor> {
+        self.preallocate()?;
+        let t = q.dim(1)?;
+        if conv.tokens() != t {
+            return Err(Error::Msg(format!(
+                "DeltaNetCache::advance_prefill: conv trace covers {} tokens, recurrence {t}",
+                conv.tokens()
+            )));
+        }
+        if self.offset > 0 && self.ssm_state.is_none() {
+            return Err(Error::Msg(format!(
+                "DeltaNetCache::advance_prefill: the live state at position {} was lost to a \
+                 failed forward; reset the cache first",
+                self.offset
+            )));
+        }
+        let offset = self.offset;
+        let next = offset + t as i32;
+        self.captured = None;
+        let split = self
+            .capture
+            .take()
+            .filter(|&p| p > offset && p < next)
+            .map(|p| (p - offset) as usize);
+        let state = self.ssm_state.as_ref();
+        let (y, last, captured) = match split {
+            None => {
+                let (y, last) = gated_delta_recurrence(q, k, v, g, beta, state)?;
+                (y, last, None)
+            }
+            Some(b) => {
+                let head = |x: &Tensor| x.narrow(1, 0, b);
+                let tail = |x: &Tensor| x.narrow(1, b, t - b);
+                let (y_head, at) = gated_delta_recurrence(
+                    &head(q)?,
+                    &head(k)?,
+                    &head(v)?,
+                    &head(g)?,
+                    &head(beta)?,
+                    state,
+                )?;
+                let (y_tail, last) = gated_delta_recurrence(
+                    &tail(q)?,
+                    &tail(k)?,
+                    &tail(v)?,
+                    &tail(g)?,
+                    &tail(beta)?,
+                    Some(&at),
+                )?;
+                let captured = (
+                    offset + b as i32,
+                    conv.tail_after(b - 1)?.force_contiguous()?,
+                    at.force_contiguous()?,
+                );
+                (Tensor::cat(&[&y_head, &y_tail], 1)?, last, Some(captured))
+            }
+        };
+        let conv_tail = conv.tail_after(t - 1)?;
+        match self.ring.as_mut() {
+            Some(ring) => {
+                // The write reuses the slot of position `next - slots`: stop listing it first.
+                let slots = ring.slots as i32;
+                ring.lo = ring.lo.max((next + 1 - slots).min(offset + 1));
+                if let Err(e) = ring.write(next, &conv_tail, &last) {
+                    if ring.slot(next) == ring.slot(offset) {
+                        // The live slot may hold part of this forward's state now.
+                        self.conv_state = None;
+                        self.ssm_state = None;
+                    }
+                    return Err(e);
+                }
+                ring.lo = if t == 1 {
+                    ring.lo.max(next + 1 - slots).max(1)
+                } else {
+                    next
+                };
+                let (conv_state, ssm_state) = ring.views(next)?;
+                self.conv_state = Some(conv_state);
+                self.ssm_state = Some(ssm_state);
+            }
+            None => {
+                self.conv_state = Some(conv_tail.contiguous()?);
+                self.ssm_state = Some(last);
+            }
+        }
+        self.captured = captured;
         self.offset = next;
         Ok(y)
     }
@@ -1099,6 +1327,8 @@ impl DeltaNetCache {
         self.conv_state = None;
         self.ssm_state = None;
         self.offset = 0;
+        self.capture = None;
+        self.captured = None;
         if let Some(ring) = self.ring.as_mut() {
             ring.lo = 1;
         }
@@ -1130,6 +1360,8 @@ impl DeltaNetCache {
             offset: self.offset,
             spec: self.spec.clone(),
             ring,
+            capture: None,
+            captured: self.captured.clone(),
         })
     }
 
@@ -1174,13 +1406,18 @@ fn delta_step(
     g: &Tensor,
     beta: &Tensor,
     state: &Tensor,
+    decay: bool,
     b: usize,
     hv: usize,
     dk: usize,
     dv: usize,
 ) -> Result<(Tensor, Tensor)> {
-    let decay = g.reshape((b, hv, 1, 1))?; // [B,Hv,1,1]
-    let state = state.broadcast_mul(&decay)?; // S · g
+    // S · g — unless the caller's state already carries this step's decay.
+    let state = if decay {
+        state.broadcast_mul(&g.reshape((b, hv, 1, 1))?)? // [B,Hv,1,1]
+    } else {
+        state.clone()
+    };
     let k_r = k.reshape((b, hv, 1, dk))?; // [B,Hv,1,Dk]
     let kv_mem = state_read(&state, k, &k_r, b, hv, dk)?; // S·k → [B,Hv,Dv]
     let delta = v
@@ -2459,6 +2696,140 @@ mod tests {
             cache.restorable(),
             vec![2, 3],
             "the window recovers after a reset"
+        );
+    }
+
+    /// Feed tokens `start..start+len` of the fixture through `cache` as one **prefill**
+    /// ([`DeltaNetCache::advance_prefill`]).
+    fn feed_prefill(
+        cache: &mut DeltaNetCache,
+        fixture: &Fixture,
+        start: usize,
+        len: usize,
+    ) -> Tensor {
+        let (q, k, v, g, beta, x) = fixture;
+        let weight = Tensor::from_slice(CW, (RC, RK), x.device()).unwrap();
+        let conv_state = match cache.conv_state() {
+            Some(c) => c.clone(),
+            None => Tensor::zeros((RB, RK - 1, RC), DType::F32, x.device()).unwrap(),
+        };
+        let (_out, trace) =
+            causal_depthwise_conv_traced(&narrow_t(x, start, len), &weight, &conv_state).unwrap();
+        cache
+            .advance_prefill(
+                &trace,
+                &narrow_t(q, start, len),
+                &narrow_t(k, start, len),
+                &narrow_t(v, start, len),
+                &narrow_t(g, start, len),
+                &narrow_t(beta, start, len),
+            )
+            .unwrap()
+    }
+
+    /// sc-24446 (defect A): a prefill takes no per-token step and writes exactly one ring slot —
+    /// its final state — whatever the ring's depth, so its outputs and state are bit-identical
+    /// for every depth (a plain request's ring and a speculative one's) and equal the
+    /// final-state recurrence over the whole prompt. Only the new position is restorable.
+    #[test]
+    fn a_prefill_rings_only_its_final_state_whatever_the_ring_depth() {
+        let fixture = ring_inputs(150, 3);
+        let (q, k, v, g, beta, _) = &fixture;
+        let (y_ref, s_ref) = gated_delta_recurrence(q, k, v, g, beta, None).unwrap();
+        for slots in [2, 5, 9] {
+            let mut cache = DeltaNetCache::with_ring(ring_spec(slots)).unwrap();
+            let (y, steps, writes) =
+                counters::counting(|| feed_prefill(&mut cache, &fixture, 0, 150));
+            assert_eq!(
+                (steps, writes),
+                (0, 1),
+                "slots {slots}: no per-token step, one write"
+            );
+            assert_eq!(cache.offset(), 150);
+            assert!(cache.restorable().is_empty(), "slots {slots}");
+            assert_eq!(host(&y), host(&y_ref), "slots {slots}: outputs");
+            assert_eq!(
+                host(cache.ssm_state().unwrap()),
+                host(&s_ref),
+                "slots {slots}: state"
+            );
+            // The live conv tail is the prompt's last `K - 1` conv inputs.
+            let x = &fixture.5;
+            assert_eq!(
+                host(cache.conv_state().unwrap()),
+                host(&narrow_t(x, 150 - (RK - 1), RK - 1)),
+                "slots {slots}: conv tail"
+            );
+        }
+    }
+
+    /// sc-24446: a speculative verify step after a prefill still checkpoints every token, and
+    /// rolls back to its start — the prefill's final state, bit for bit — and to each of its
+    /// positions.
+    #[test]
+    fn a_verify_step_after_a_prefill_rolls_back_to_every_position() {
+        let fixture = ring_inputs(153, 4);
+        // K = 2 drafts: a ring of K + 2 slots, a verify of K + 1 tokens.
+        let mut cache = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+        feed_prefill(&mut cache, &fixture, 0, 150);
+        let at_prefill = live(&cache);
+        let (_, steps, writes) = counters::counting(|| feed(&mut cache, &fixture, 150, 3));
+        assert_eq!(
+            (steps, writes),
+            (3, 3),
+            "the verify step checkpoints every token"
+        );
+        assert_eq!(cache.restorable(), vec![150, 151, 152]);
+        for n in [153, 152, 151, 150] {
+            cache.rollback_to(n).unwrap();
+            let mut oracle = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+            feed_prefill(&mut oracle, &fixture, 0, 150);
+            for i in 150..n as usize {
+                feed(&mut oracle, &fixture, i, 1);
+            }
+            assert_eq!(live(&cache), live(&oracle), "rolled back to {n}");
+        }
+        assert_eq!(live(&cache), at_prefill);
+    }
+
+    /// sc-24446 (defect B): a capture inside a prefill keeps the state at that position — equal,
+    /// bit for bit, to the state a prefill split there into two forwards leaves after its first —
+    /// and the prefill's outputs and final state are those of the split prefill too. A capture
+    /// outside the prefill captures nothing.
+    #[test]
+    fn a_captured_boundary_equals_a_prefill_split_there() {
+        for (b, t) in [(3usize, 8usize), (100, 105), (70, 150)] {
+            let fixture = ring_inputs(t, 5);
+            let mut one = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+            one.capture_at(b as i32);
+            let y_one = feed_prefill(&mut one, &fixture, 0, t);
+
+            let mut split = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+            let y_head = feed_prefill(&mut split, &fixture, 0, b);
+            let at_b = live(&split).unwrap();
+            let y_tail = feed_prefill(&mut split, &fixture, b, t - b);
+
+            let (conv, ssm) = one.captured(b as i32).expect("captured");
+            assert_eq!(
+                (host(conv), host(ssm)),
+                at_b,
+                "b={b} t={t}: the boundary state"
+            );
+            assert!(one.captured(b as i32 + 1).is_none());
+            assert_eq!(
+                host(&y_one),
+                host(&Tensor::cat(&[&y_head, &y_tail], 1).unwrap()),
+                "b={b} t={t}: outputs"
+            );
+            assert_eq!(live(&one), live(&split), "b={b} t={t}: final state");
+        }
+        let fixture = ring_inputs(6, 6);
+        let mut cache = DeltaNetCache::new();
+        cache.capture_at(6);
+        feed_prefill(&mut cache, &fixture, 0, 6);
+        assert!(
+            cache.captured(6).is_none(),
+            "the prefill's end is not inside it"
         );
     }
 }

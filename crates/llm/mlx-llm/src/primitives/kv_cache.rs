@@ -230,6 +230,44 @@ impl ContiguousKvCache {
             .collect()
     }
 
+    /// A copy of the cache's first `len` positions, each layer in its own buffer of the block
+    /// capacity `len` rounds up to (at most the layer's own): what a cache that had stopped at
+    /// `len` would hold, as the prefix cache's boundary snapshot taken after a prefill that ran
+    /// past it (sc-24446). Positions past `len` in the copy are padding no attention reads (the
+    /// next update writes from `len`). Never shares a buffer with `self`. A layer holding fewer
+    /// than `len` positions is an error.
+    pub fn prefix(&self, len: i32) -> Result<Self> {
+        let layers = self
+            .layers
+            .iter()
+            .map(|slot| {
+                slot.as_ref()
+                    .map(|s| {
+                        if len > s.offset {
+                            return Err(crate::error::Error::Msg(format!(
+                                "ContiguousKvCache::prefix: {len} positions of a layer holding {}",
+                                s.offset
+                            )));
+                        }
+                        let capacity = self.blocks_for(len).min(s.capacity());
+                        Ok(LayerSlot {
+                            keys: materialize(&s.keys.try_index((.., .., ..capacity, ..))?)?,
+                            values: materialize(&s.values.try_index((.., .., ..capacity, ..))?)?,
+                            offset: len,
+                        })
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Start the copies now: an unevaluated copy would pin the source buffer and run in
+        // whichever request first reads the entry — inside the next request's prefill (sc-24446).
+        mlx_rs::transforms::async_eval(layers.iter().flatten().flat_map(|s| [&s.keys, &s.values]))?;
+        Ok(Self {
+            layers,
+            block: self.block,
+        })
+    }
+
     /// Bytes the cache's block buffers hold (padding included) — what the prefix cache charges an
     /// entry that keeps this cache (story sc-24437).
     pub fn bytes(&self) -> u64 {

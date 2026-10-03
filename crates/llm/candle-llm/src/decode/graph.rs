@@ -536,9 +536,16 @@ pub const PARAM_CACHE_ADMISSION_BYTES: u64 = 1 << 20;
 /// candle's parameter cache (sc-24441, E7): [`PARAM_CACHE_ADMISSION_BYTES`] for every step shape
 /// the runner can capture — each token count up to
 /// [`MAX_DEVICE_STEP_TOKENS`](crate::primitives::MAX_DEVICE_STEP_TOKENS) (the runner's
-/// [`GraphRunner::MAX_CAPTURED_TOKENS`]) in both logits scopes.
-pub fn graph_param_cache_load_bytes() -> u64 {
-    crate::primitives::MAX_DEVICE_STEP_TOKENS as u64 * 2 * PARAM_CACHE_ADMISSION_BYTES
+/// [`GraphRunner::MAX_CAPTURED_TOKENS`]) in both logits scopes, and, when the load can run steps
+/// that ask for hidden rows (`want_hidden`: an MTP head, native or companion), each of those again
+/// with hidden rows — the runner keys a shape on `want_hidden` too (`ShapeKey`), and a
+/// hidden-row step stages a hidden output the plain one does not (sc-24446).
+pub fn graph_param_cache_load_bytes(want_hidden: bool) -> u64 {
+    let hidden_variants = if want_hidden { 2 } else { 1 };
+    crate::primitives::MAX_DEVICE_STEP_TOKENS as u64
+        * 2
+        * hidden_variants
+        * PARAM_CACHE_ADMISSION_BYTES
 }
 
 /// What a captured graph is made of — the node census the runner takes before instantiating it,
@@ -1561,6 +1568,7 @@ mod cuda {
                             scope: request.scope,
                             want_hidden: request.want_hidden,
                             prefill: request.prefill,
+                            snapshot_at: request.snapshot_at,
                         },
                     )?;
                     stage_outputs(&logits, hidden.as_ref(), out)
@@ -1684,6 +1692,7 @@ mod cuda {
             scope: request.scope,
             want_hidden: request.want_hidden,
             prefill: request.prefill,
+            snapshot_at: request.snapshot_at,
         }
     }
 
@@ -1906,11 +1915,24 @@ mod tests {
     }
 
     /// sc-24441 (E7): a load under the graph runner prices the parameter cache its captures
-    /// leave resident — 1 MiB for each of the 16 token counts in both logits scopes.
+    /// leave resident — 1 MiB for each of the 16 token counts in both logits scopes, and twice
+    /// that for a load whose steps can also ask for hidden rows (sc-24446: `want_hidden` is part
+    /// of the shape key, so those are distinct captures).
     #[test]
     fn a_load_prices_the_parameter_cache_its_captures_leave_resident() {
         assert_eq!(PARAM_CACHE_ADMISSION_BYTES, 1 << 20);
-        assert_eq!(graph_param_cache_load_bytes(), 32 << 20);
+        assert_eq!(graph_param_cache_load_bytes(false), 32 << 20);
+        assert_eq!(graph_param_cache_load_bytes(true), 64 << 20);
+        let shape = |want_hidden| ShapeKey {
+            tokens: 1,
+            scope: LogitsScope::All,
+            want_hidden,
+        };
+        assert_ne!(
+            shape(true),
+            shape(false),
+            "want_hidden keys a distinct capture"
+        );
     }
 
     #[test]
@@ -1926,27 +1948,27 @@ mod tests {
             vocab_size: 50,
             recurrent_bytes: 0,
         };
-        // The decode attention's workspace (sc-24441): 4 heads × 1 chunk (100 positions fit one
-        // 256-key chunk) × (8 + 2) f32.
+        // The decode attention's workspace (sc-24441): 4 heads × 2 chunks (100 positions span two
+        // 64-key chunks, sc-24446) × (8 + 2) f32.
         let decode_attention =
             4 * 100u64.div_ceil(candle_quant_kernels::DECODE_ATTN_CHUNK as u64) * (8 + 2) * 4;
         let per_token =
             (3 * 64 + 8 * 32 + 50) * 4 + 4 * 100 * 4 * 3 + decode_attention + 4 + (50 + 32) * 4;
         assert_eq!(
-            decode_attention, 160,
+            decode_attention, 320,
             "the decode attention's workspace, literally"
         );
-        assert_eq!(per_token, 7_284, "one token-row, literally");
+        assert_eq!(per_token, 7_444, "one token-row, literally");
         // A decode-only request (one 1-token shape, two scopes). The parameter cache is a load's,
         // not a request's (`graph_param_cache_load_bytes`).
         assert_eq!(
             graph_workspace_admission_bytes(&geometry, 100, 1),
-            Some(2 * 7_284)
+            Some(2 * 7_444)
         );
         // K = 3: token counts 1..=4 → 10 token-rows per scope.
         assert_eq!(
             graph_workspace_admission_bytes(&geometry, 100, 4),
-            Some(2 * 10 * 7_284)
+            Some(2 * 10 * 7_444)
         );
         assert_eq!(graph_workspace_admission_bytes(&geometry, 100, 0), Some(0));
         let huge = core_llm::LlmMemoryGeometry {

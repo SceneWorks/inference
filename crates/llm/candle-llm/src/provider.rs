@@ -1969,7 +1969,9 @@ impl LlamaProvider {
     ///
     /// A CUDA load whose decoder the CUDA-graph runner wraps (its policy: `spec.cuda_graphs`,
     /// else the process switch) also prices the parameter cache the runner's captures leave
-    /// resident for the process ([`LoadMemoryEstimate::graph_param_cache_bytes`], sc-24441).
+    /// resident for the process ([`LoadMemoryEstimate::graph_param_cache_bytes`], sc-24441) —
+    /// doubled for a load with an MTP head, whose hidden-row steps are captures of their own
+    /// (sc-24446).
     pub fn load_memory_estimate(spec: &LoadSpec, cuda: bool) -> CoreResult<LoadMemoryEstimate> {
         Self::load_memory_estimate_as(spec, cuda, true)
     }
@@ -1996,6 +1998,10 @@ impl LlamaProvider {
         let requested = CopyFormat::requested(spec.quantize);
         // What the load holds on its device while it builds the decoder.
         let mut moe_tables = 0u64;
+        // Whether the load can run steps that ask for hidden rows — an MTP head, native (a
+        // Qwen3.5 snapshot configuring one) or a companion — which the graph runner captures as
+        // shapes of their own (sc-24446).
+        let mut hidden_steps = spec.mtp_head_source.is_some();
         let working = if crate::gguf::is_gguf_path(&spec.source) {
             if crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(source).map_err(to_core)? {
                 // Prism GGUF: packed blocks the loader wraps, never re-quantized.
@@ -2007,6 +2013,8 @@ impl LlamaProvider {
             let config = read_json(source, "config.json");
             let decoder = PricedDecoder::from_config(config.as_ref());
             moe_tables = decoder.moe_indexed_table_bytes();
+            hidden_steps |=
+                matches!(&decoder, PricedDecoder::Qwen35(cfg, _) if cfg.mtp_num_hidden_layers > 0);
             let format = decoder.format(requested);
             let builds = matches!(
                 decoder,
@@ -2041,7 +2049,7 @@ impl LlamaProvider {
         let on_device = |bytes: u64| if cuda { bytes } else { 0 };
         let graphs = target && spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
         let graph_param_cache = if graphs {
-            on_device(crate::decode::graph_param_cache_load_bytes())
+            on_device(crate::decode::graph_param_cache_load_bytes(hidden_steps))
         } else {
             0
         };
@@ -4277,7 +4285,6 @@ impl TextLlm for LlamaProvider {
         )?;
         let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
         let mut prefix_hit = 0usize;
-        let mut prefill_forwards = 1usize;
 
         self.model
             .device()
@@ -4639,7 +4646,6 @@ impl TextLlm for LlamaProvider {
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         // Measured, not looked up: the positions the prefill did not feed.
                         prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
-                        prefill_forwards = prefilled.forwards;
                         if prefix_hit > 0 {
                             prefix_path = "hit";
                         }
@@ -4709,10 +4715,7 @@ impl TextLlm for LlamaProvider {
                     mtp_stats = Some(MtpStats {
                         proposed_tokens: u32::try_from(run.stats.proposed).unwrap_or(u32::MAX),
                         accepted_tokens: u32::try_from(run.stats.accepted).unwrap_or(u32::MAX),
-                        target_forwards: u32::try_from(
-                            run.stats.forwards + prefill_forwards.saturating_sub(1),
-                        )
-                        .unwrap_or(u32::MAX),
+                        target_forwards: u32::try_from(run.stats.forwards).unwrap_or(u32::MAX),
                     });
                 }
                 engine_record = Some(run.record);
@@ -4916,7 +4919,6 @@ impl TextLlm for LlamaProvider {
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         // Measured, not looked up: the positions the prefill did not feed.
                         prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
-                        prefill_forwards = prefilled.forwards;
                         if prefix_hit > 0 {
                             prefix_path = "hit";
                         }
@@ -5148,15 +5150,10 @@ impl TextLlm for LlamaProvider {
         // prefill — supplies the host-side counters and every tally. Both records name the
         // proposer that ran: `none` for a request whose speculation is off, including one whose
         // option resolved to no proposer (AC3, sc-24130) — the reference loop never runs one.
-        // The engine counts a caller's prefill as one forward; a prefill split at the
-        // conversation boundary (sc-24437) ran two.
-        let extra_prefill = prefill_forwards.saturating_sub(1) as u64;
+        // The engine counts a caller's prefill as its one prefill forward: the prefix cache's
+        // boundary snapshot is taken inside it (sc-24446).
         let mut decode_record = match engine_record {
-            Some(mut record) => {
-                record.target_forwards += extra_prefill;
-                record.prefill_forwards += extra_prefill;
-                record.with_request_span(&request_span)
-            }
+            Some(record) => record.with_request_span(&request_span),
             None => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
@@ -6894,11 +6891,11 @@ mod tests {
             [Decoder::Causal(causal), Decoder::Qwen35(hybrid)]
         };
         // (prompt, budget, K, the device-positions bytes). Positions = prompt + budget; the
-        // cache spans positions + K; 256-key chunks.
+        // cache spans positions + K; 64-key chunks (sc-24446).
         let cases = [
-            (40usize, 24u32, 3u32, 776u64),
+            (40usize, 24u32, 3u32, 1_416u64),
             (40, 24, 0, 296),
-            (300, 24, 3, 1_416),
+            (300, 24, 3, 3_976),
         ];
         for (off, on) in decoders(false).iter().zip(decoders(true).iter()) {
             for &(prompt, budget, k, bytes) in &cases {
@@ -6947,7 +6944,7 @@ mod tests {
             // 4 queries over 40 + 24 + 4 positions.
             assert_eq!(
                 super::draft_request_bytes(on, 40, 24, 3).unwrap(),
-                super::draft_request_bytes(off, 40, 24, 3).unwrap() + 776
+                super::draft_request_bytes(off, 40, 24, 3).unwrap() + 1_416
             );
         }
     }
@@ -8725,6 +8722,30 @@ mod tests {
         );
     }
 
+    /// sc-24446: a load whose steps can ask for hidden rows — a Qwen3.5 snapshot with a native
+    /// MTP head, or any load naming a companion head — prices the hidden-row captures on top of
+    /// the plain ones (the runner keys a shape on `want_hidden`); one without a head does not.
+    #[test]
+    fn a_load_with_an_mtp_head_prices_its_hidden_row_captures() {
+        let estimate = |dir: &tempfile::TempDir, companion: bool| {
+            let spec = core_llm::LoadSpec {
+                cuda_graphs: Some(true),
+                mtp_head_source: companion.then(|| "companion-head".to_string()),
+                ..core_llm::LoadSpec::dense(dir.path().display().to_string())
+            };
+            super::LlamaProvider::load_memory_estimate(&spec, true)
+                .unwrap()
+                .graph_param_cache_bytes
+        };
+        let (plain, headed) = (
+            qwen35_snapshot(false, false, false),
+            qwen35_snapshot(false, true, false),
+        );
+        assert_eq!(estimate(&plain, false), 32 << 20);
+        assert_eq!(estimate(&headed, false), 64 << 20);
+        assert_eq!(estimate(&plain, true), 64 << 20);
+    }
+
     /// sc-24441 (E7): a CUDA load the graph runner wraps prices the parameter cache its
     /// captures leave resident for the process — 32 MiB, once per load — and nothing with the
     /// runner off or off CUDA; a resident draft is never wrapped, so its admission beside the
@@ -9072,13 +9093,15 @@ mod tests {
         assert_eq!(report.proposer, ProposerKind::None);
         // `Auto` on a snapshot without a head: the engine with no proposer, since sc-24140.
         assert_eq!(report.path, "step_model");
-        // The prefill forward plus one per generated token after the first — and one more: the
-        // prefill splits at the end of the rendered conversation, where the prefix cache
-        // snapshots the hybrid's recurrent state (sc-24437).
+        // The prefill forward plus one per generated token after the first: the prefix cache's
+        // snapshot of the hybrid's recurrent state at the end of the rendered conversation
+        // (sc-24437) is captured inside that one prefill forward, not by splitting it
+        // (sc-24446).
         assert_eq!(report.prefix_cache.path, "miss");
+        assert_eq!(report.prefill_forwards, 1);
         assert_eq!(
             report.target_forwards,
-            u64::from(out.usage.generated_tokens) + 1
+            u64::from(out.usage.generated_tokens)
         );
 
         // `None` keeps the process switch at load (off here); the report says so.
@@ -9689,9 +9712,15 @@ mod tests {
             .iter()
             .filter(|r| r.speculative == Speculative::Auto)
             .collect();
-        assert!(auto
-            .iter()
-            .all(|r| r.report.proposer == ProposerKind::Mtp && r.report.draft_tokens == Some(3)));
+        // `auto` runs the head at the depth the snapshot advertises as recommended, whatever the
+        // backend default currently is (sc-24446).
+        let recommended = core_llm::TextLlm::descriptor(&with_head)
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .expect("the head is advertised")
+            .recommended_depth;
+        assert!(auto.iter().all(|r| r.report.proposer == ProposerKind::Mtp
+            && r.report.draft_tokens == Some(recommended)));
     }
 
     /// sc-24438 AC1: the advertised max depth is finite and backend-true — the widest verify the
@@ -9791,7 +9820,7 @@ mod tests {
     /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
     /// proposer does not. On the synthetic Qwen3.5 snapshot `auto` resolves to its MTP head, whose
     /// random weights never draft a token the target accepts (asserted as the premise): `auto` is
-    /// demoted at the end of the probe window and the report says where, while the same proposer
+    /// demoted at the end of its first window and the report says where, while the same proposer
     /// asked for explicitly runs to the end. Both stream exactly `off`'s tokens.
     #[test]
     fn auto_is_monitored_and_an_explicit_proposer_is_not() {
@@ -9804,7 +9833,11 @@ mod tests {
         let prompt = &fixture_prompts()[0];
         let request = |spec| core_llm_testkit::bench_request(prompt, spec, &Sampling::greedy(), 48);
         let (off, _) = token_events(&provider, &request(Speculative::Off));
-        let (auto_events, auto) = token_events(&provider, &request(Speculative::Auto));
+        // Untimed (the static threshold decides, no plain probe): the timed monitor's decisions
+        // are pinned on a deterministic clock in the engine's tests.
+        let (auto_events, auto) = core_llm::with_decode_clock(None, || {
+            token_events(&provider, &request(Speculative::Auto))
+        });
         let auto = auto.decode.unwrap();
         let depth = auto.draft_tokens.expect("auto ran a proposer");
         let explicit = Speculative::proposer(SpeculativeProposer::Mtp, depth);
@@ -9818,7 +9851,7 @@ mod tests {
         );
         assert_eq!(asked.speculative_demoted_at, None, "{asked:?}");
         // The fixture head never pays at this depth (accepted 0 over the whole explicit run), so
-        // `auto` is demoted at the end of the probe window and stops proposing.
+        // `auto` is demoted at the end of its first window and stops proposing.
         assert_eq!(asked.accepted_tokens, 0, "fixture premise: {asked:?}");
         assert_eq!(
             auto.speculative_demoted_at,
@@ -9886,7 +9919,8 @@ mod tests {
                 ("explicit 3", explicit(3)),
                 ("explicit max", explicit(mtp.max_depth)),
                 ("legacy", (3, legacy)),
-                ("auto", (3, request(Speculative::Auto))),
+                // `auto` runs at the advertised recommended depth (sc-24446), not a literal.
+                ("auto", (mtp.recommended_depth, request(Speculative::Auto))),
             ] {
                 provider.validate(&req).expect(case);
                 let (events, out) = token_events(&provider, &req);

@@ -344,6 +344,7 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
                         scope: LogitsScope::All,
                         want_hidden: false,
                         prefill: false,
+                        snapshot_at: None,
                     },
                 )
                 .unwrap()
@@ -562,6 +563,7 @@ fn llama_teacher_forced(
                         scope: LogitsScope::All,
                         want_hidden: false,
                         prefill: false,
+                        snapshot_at: None,
                     },
                 )
                 .unwrap()

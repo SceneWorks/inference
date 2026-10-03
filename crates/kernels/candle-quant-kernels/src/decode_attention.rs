@@ -33,40 +33,62 @@ use crate::nvrtc::KernelSource;
 
 /// The decode-attention kernel source; compiled once per device on first use.
 pub const DECODE_ATTENTION_SRC: KernelSource = KernelSource {
-    name: "candle_quant_kernels_decode_attention_v1",
+    name: "candle_quant_kernels_decode_attention_v2",
     src: include_str!("decode_attention.cu"),
     // Builtins, warp shuffles and software bf16 conversions only.
     cc_floor: (7, 0),
 };
 
 /// Keys per chunk of the partial pass — the fixed chunking the reduction order depends on. Must
-/// equal `DECODE_ATTN_CHUNK` in `decode_attention.cu`.
-pub const DECODE_ATTN_CHUNK: usize = 256;
+/// equal `DECODE_ATTN_CHUNK` in `decode_attention.cu`. Small (sc-24446): at decode shapes the
+/// attention is latency-bound, and a smaller chunk puts more blocks in flight over a short cache.
+pub const DECODE_ATTN_CHUNK: usize = 64;
 
 /// Threads per block of both passes (`DECODE_ATTN_THREADS` in the source).
-const DECODE_ATTN_THREADS: u32 = 128;
+const DECODE_ATTN_THREADS: u32 = 256;
 
 /// Widest key or value head the kernel serves (its per-block query row lives in shared memory).
 pub const DECODE_ATTN_MAX_HEAD_DIM: usize = 1024;
 
 /// Most query heads one partial block serves (`DECODE_ATTN_MAX_GROUP_TILE` in the source): the
 /// query heads sharing a KV head are split into tiles of at most this many, and each tile reads
-/// the KV head's chunk once.
-pub const DECODE_ATTN_MAX_GROUP_TILE: usize = 16;
+/// the KV head's chunk once. Bounded by the per-thread accumulators of the score pass (one per
+/// head for each of the keys a warp has in flight).
+pub const DECODE_ATTN_MAX_GROUP_TILE: usize = 8;
 
 /// The shared memory a partial block may take without opting in to more (48 KiB, every device).
 const DECODE_ATTN_SHARED_LIMIT: usize = 48 * 1024;
 
+/// The value pass's key slices at value width `value_dim` (`value_slices` in the source): a
+/// thread owns one pair of value elements, so `ceil(dv / 2)` threads cover a value row and the
+/// block's other threads take further slices of the chunk's keys. The slice sums are added in a
+/// fixed order, so this is part of the arithmetic — a function of the value width only.
+fn value_slices(value_dim: usize) -> usize {
+    let pairs = value_dim.div_ceil(2).max(1);
+    let threads = DECODE_ATTN_THREADS as usize;
+    if pairs >= threads {
+        1
+    } else {
+        threads / pairs
+    }
+}
+
+/// Dynamic shared memory of a partial block serving `tile` query heads: per head, the query row
+/// (whose region the value pass then reuses for its per-slice sums) and the chunk's scores —
+/// `tile·(max(dk, S·dv) + chunk)` f32.
+fn partial_shared_bytes(tile: usize, key_dim: usize, value_dim: usize) -> usize {
+    let region = key_dim.max(value_slices(value_dim) * value_dim);
+    tile * (region + DECODE_ATTN_CHUNK) * 4
+}
+
 /// How many of the `groups` query heads sharing one KV head a partial block serves at key width
-/// `key_dim`: as many as fit [`DECODE_ATTN_MAX_GROUP_TILE`] and the block's shared memory — each
-/// head holds its query row and its chunk's scores there (`(tile·(dk + chunk) + threads)` f32).
-/// The result never depends on it (every head's reductions run in one fixed order, see
-/// `decode_attention.cu`); only how often a K/V chunk is read does. At least `1`.
-pub fn group_tile(groups: usize, key_dim: usize) -> usize {
-    let shared =
-        |tile: usize| (tile * (key_dim + DECODE_ATTN_CHUNK) + DECODE_ATTN_THREADS as usize) * 4;
+/// `key_dim` and value width `value_dim`: as many as fit [`DECODE_ATTN_MAX_GROUP_TILE`] and the
+/// block's shared memory (see `partial_shared_bytes`). The result never depends on it (every
+/// head's reductions run in one fixed order, see `decode_attention.cu`); only how often a K/V
+/// chunk is read does. At least `1`.
+pub fn group_tile(groups: usize, key_dim: usize, value_dim: usize) -> usize {
     let mut tile = groups.clamp(1, DECODE_ATTN_MAX_GROUP_TILE);
-    while tile > 1 && shared(tile) > DECODE_ATTN_SHARED_LIMIT {
+    while tile > 1 && partial_shared_bytes(tile, key_dim, value_dim) > DECODE_ATTN_SHARED_LIMIT {
         tile -= 1;
     }
     tile
@@ -443,6 +465,39 @@ pub fn read_slot(src: &Tensor, index: &Tensor) -> candle_core::Result<Tensor> {
     }
 }
 
+/// [`read_slot`] times a per-row scale in one pass (sc-24446): slot `index[0]` of the `F32`
+/// `src: [slots, ...]`, each element multiplied by `g` — an `F32` tensor whose shape is a leading
+/// prefix of the slot's (`[B, H]` over a `[B, H, Dv, Dk]` state), broadcast over the rest. The
+/// bits of `read_slot(src, index)?.broadcast_mul(g)` (one IEEE multiply per element) without the
+/// intermediate copy: a Gated DeltaNet step's first state decay fused into its checkpoint-ring
+/// read. Errors as [`read_slot`] does, and on a dtype or shape `g` cannot scale.
+pub fn read_slot_scaled(src: &Tensor, index: &Tensor, g: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = src.dims();
+    if src.dtype() != DType::F32 || g.dtype() != DType::F32 || !g.is_contiguous() {
+        return Err(msg(
+            "read_slot_scaled: src and a contiguous g must both be F32".into(),
+        ));
+    }
+    if dims.is_empty() || g.rank() >= dims.len() || g.dims() != &dims[1..=g.rank()] {
+        return Err(msg(format!(
+            "read_slot_scaled: g {:?} is not a leading prefix of the slot {:?}",
+            g.dims(),
+            dims.get(1..).unwrap_or(&[])
+        )));
+    }
+    match src.device() {
+        Device::Cpu => {
+            let slot = read_slot(src, index)?;
+            let mut shape = g.dims().to_vec();
+            shape.resize(slot.rank(), 1);
+            slot.broadcast_mul(&g.reshape(shape)?)
+        }
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => cuda_impl::read_slot_scaled(src, index, g),
+        other => Err(msg(format!("read_slot_scaled: no kernel for {other:?}"))),
+    }
+}
+
 /// Whether these primitives serve `device`: the CPU (the host reference) always; CUDA when the
 /// kernels compile and load there (the reason is the nvrtc seam's cached error); nothing else.
 pub fn available(device: &Device) -> Result<(), String> {
@@ -540,9 +595,9 @@ mod cuda_impl {
         let partial = function(&dev, &format!("decode_attn_partial_{suffix}"))?;
         // One block per (chunk, KV head × tile of the query heads sharing it, batch·query).
         let groups = plan.heads / plan.kv_heads;
-        let tile = group_tile(groups, plan.key_dim);
+        let tile = group_tile(groups, plan.key_dim, plan.value_dim);
         let tiles = groups.div_ceil(tile);
-        let shared = (tile * (plan.key_dim + DECODE_ATTN_CHUNK) + DECODE_ATTN_THREADS as usize) * 4;
+        let shared = partial_shared_bytes(tile, plan.key_dim, plan.value_dim);
         let cfg = LaunchConfig {
             grid_dim: (
                 plan.chunks as u32,
@@ -740,6 +795,55 @@ mod cuda_impl {
             other => Err(msg(format!("read_slot: dtype {other:?} is not served"))),
         }
     }
+
+    pub(super) fn read_slot_scaled(
+        src: &Tensor,
+        index: &Tensor,
+        g: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        if !src.is_contiguous() {
+            return Err(msg(
+                "read_slot_scaled: src must be a contiguous [slots, ...] tensor".into(),
+            ));
+        }
+        if index.dtype() != DType::U32 || index.elem_count() == 0 {
+            return Err(msg(
+                "read_slot_scaled: the index must be a non-empty U32 tensor".into(),
+            ));
+        }
+        let (ss, sl) = src.storage_and_layout();
+        let (is, il) = index.storage_and_layout();
+        let (gs, gl) = g.storage_and_layout();
+        let (sc, ic, gc) = (cuda_storage(&ss)?, cuda_storage(&is)?, cuda_storage(&gs)?);
+        let dev = sc.device.clone();
+        let dims = src.dims();
+        let n: usize = dims[1..].iter().product();
+        let inner = n / g.elem_count().max(1);
+        let s = sc.as_cuda_slice::<f32>()?.slice(sl.start_offset()..);
+        let index = ic.as_cuda_slice::<u32>()?.slice(il.start_offset()..);
+        let gv = gc.as_cuda_slice::<f32>()?.slice(gl.start_offset()..);
+        let (n64, slots64, inner64) = (n as u64, dims[0] as u64, inner as u64);
+        // SAFETY: the kernel writes every element.
+        let out = unsafe { dev.alloc::<f32>(n) }?;
+        let f = function(&dev, "read_slot_scaled_f32")?;
+        let stream = dev.cuda_stream();
+        let mut b = stream.launch_builder(&f);
+        b.arg(&s)
+            .arg(&index)
+            .arg(&gv)
+            .arg(&out)
+            .arg(&n64)
+            .arg(&slots64)
+            .arg(&inner64);
+        // SAFETY: argument list matches `read_slot_scaled_f32`.
+        unsafe { b.launch(grid(n)) }.map_err(drv)?;
+        Ok(Tensor::from_storage(
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
+            Shape::from(&dims[1..]),
+            BackpropOp::none(),
+            false,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -875,7 +979,7 @@ mod tests {
                 DecodeAttnSpec {
                     scale: 0.3,
                     softcap: None,
-                    window: Some(300),
+                    window: Some(100),
                 },
             ),
         ];
@@ -968,29 +1072,52 @@ mod tests {
         .is_err());
     }
 
-    /// The partial pass's head tile: the whole group up to 16 heads, fewer where the query rows
-    /// and scores would overflow 48 KiB of shared memory, never zero.
+    /// The partial pass's head tile: the whole group up to the register bound of 8 heads, and —
+    /// with a 64-key chunk — every served width fits 48 KiB of shared memory at that bound.
     #[test]
-    fn group_tile_takes_the_whole_group_within_the_shared_memory() {
-        assert_eq!(group_tile(1, 128), 1);
-        assert_eq!(group_tile(4, 128), 4);
-        assert_eq!(group_tile(8, 128), 8);
-        assert_eq!(group_tile(16, 128), 16);
-        assert_eq!(group_tile(24, 128), 16, "tiled past the register bound");
+    fn group_tile_takes_the_whole_group_within_the_bounds() {
+        assert_eq!(group_tile(1, 128, 128), 1);
+        assert_eq!(group_tile(4, 128, 128), 4);
+        assert_eq!(group_tile(6, 256, 256), 6, "Qwen3.8: one tile of six");
+        assert_eq!(group_tile(8, 128, 128), 8);
+        assert_eq!(group_tile(16, 128, 128), 8, "tiled past the register bound");
         assert_eq!(
-            group_tile(16, 512),
-            15,
-            "15 × (512 + 256) + 128 f32 fit 48 KiB"
+            group_tile(16, 1024, 1024),
+            8,
+            "8 × (1024 + 64) f32 fit 48 KiB"
         );
-        assert_eq!(
-            group_tile(16, 1024),
-            9,
-            "9 × (1024 + 256) + 128 f32 fit 48 KiB"
-        );
-        assert_eq!(group_tile(0, 1024), 1);
-        for (groups, dk) in [(16, 1024), (16, 512), (8, 256)] {
-            let tile = group_tile(groups, dk);
-            assert!((tile * (dk + DECODE_ATTN_CHUNK) + 128) * 4 <= 48 * 1024);
+        assert_eq!(group_tile(0, 1024, 64), 1);
+        for (dk, dv) in [
+            (1024, 1024),
+            (1024, 64),
+            (64, 1024),
+            (512, 512),
+            (96, 64),
+            (1, 1),
+        ] {
+            let tile = group_tile(16, dk, dv);
+            assert!(partial_shared_bytes(tile, dk, dv) <= 48 * 1024, "{dk}/{dv}");
+        }
+    }
+
+    /// The value pass's key slices: a value row's element pairs, then as many slices of the
+    /// chunk as the block's remaining threads cover; the slice sums never outgrow the query
+    /// rows' region by more than twice the block's threads.
+    #[test]
+    fn value_slices_cover_the_block() {
+        assert_eq!(value_slices(256), 2, "Qwen3.8 head dim");
+        assert_eq!(value_slices(128), 4);
+        assert_eq!(value_slices(96), 5);
+        assert_eq!(value_slices(64), 8);
+        assert_eq!(value_slices(511), 1);
+        assert_eq!(value_slices(512), 1);
+        assert_eq!(value_slices(1024), 1);
+        assert_eq!(value_slices(1), 256);
+        for dv in 1..=DECODE_ATTN_MAX_HEAD_DIM {
+            assert!(
+                value_slices(dv) * dv <= 2 * 256 || value_slices(dv) == 1,
+                "{dv}"
+            );
         }
     }
 
@@ -1037,6 +1164,33 @@ mod tests {
                 .unwrap()
         );
         assert!(read_slot(&ring, &start(4)).is_err());
+    }
+
+    /// sc-24446: `read_slot_scaled` is `read_slot` then a broadcast multiply by the leading
+    /// `[B, H]` scale, bit for bit, and refuses a scale that is not a leading prefix or not F32.
+    #[test]
+    fn a_scaled_slot_read_is_the_read_times_the_scale() {
+        let ring = ramp(&[3, 2, 4, 5, 6], 31, 1.0);
+        let g = ramp(&[2, 4], 7, 1.0);
+        let at = Tensor::new(&[1u32], &Device::Cpu).unwrap();
+        let got = read_slot_scaled(&ring, &at, &g).unwrap();
+        let want = read_slot(&ring, &at)
+            .unwrap()
+            .broadcast_mul(&g.reshape((2, 4, 1, 1)).unwrap())
+            .unwrap();
+        assert_eq!(got.dims(), &[2, 4, 5, 6]);
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect()
+        };
+        assert_eq!(bits(&got), bits(&want));
+        assert!(read_slot_scaled(&ring, &at, &ramp(&[4, 2], 7, 1.0)).is_err());
+        assert!(read_slot_scaled(&ring, &at, &g.to_dtype(DType::BF16).unwrap()).is_err());
     }
 }
 
@@ -1116,7 +1270,7 @@ mod cuda_tests {
                     DecodeAttnSpec {
                         scale: 0.1,
                         softcap: None,
-                        window: Some(200),
+                        window: Some(70),
                     },
                 ),
                 (
@@ -1201,7 +1355,7 @@ mod cuda_tests {
     /// sc-24441: a partial block serving a tile of the query heads that share a KV head runs
     /// every head's reductions in the order a one-head block does, so a grouped launch is
     /// bit-identical to launching each query head alone against its KV head — groups 1, 4, 8,
-    /// and 16 at the widest head (two tiles of 9 + 7), with a soft-cap and a sliding window.
+    /// and 16 at the widest head (two tiles of 8), with a soft-cap and a sliding window.
     #[test]
     fn grouped_heads_are_bit_identical_to_one_head_per_launch() {
         let Some(dev) = device() else { return };
@@ -1216,7 +1370,7 @@ mod cuda_tests {
                 let spec = DecodeAttnSpec {
                     scale: 0.07,
                     softcap: spec,
-                    window: Some(300),
+                    window: Some(90),
                 };
                 let q = ramp(&[1, h, m, dk], 11, &dev, dtype);
                 let k = ramp(&[1, hkv, cap, dk], 13, &dev, dtype);
@@ -1245,6 +1399,133 @@ mod cuda_tests {
         }
     }
 
+    /// The kernel against the reference at every chunk boundary (sc-24446): a step whose last
+    /// query sees 1, C − 1, C, C + 1, 2C − 1, 2C, 2C + 1 keys, at the Qwen3.8 decode shape (24
+    /// query heads over 4 KV heads, head dim 256, one query) and at a short multi-query step,
+    /// both dtypes; plus widths the 16-byte loads do not divide (key 100, value 37), which take
+    /// the scalar fallback.
+    #[test]
+    fn kernel_matches_the_reference_at_every_chunk_boundary() {
+        let Some(dev) = device() else { return };
+        let c = DECODE_ATTN_CHUNK;
+        let cap = 3 * c + 7;
+        for dtype in [DType::F32, DType::BF16] {
+            for (h, hkv, m, dk, dv, window) in [
+                (24usize, 4usize, 1usize, 256usize, 256usize, None),
+                (24, 4, 3, 256, 256, None),
+                (4, 2, 2, 100, 37, Some(c + 5)),
+            ] {
+                let spec = DecodeAttnSpec {
+                    scale: (dk as f32).powf(-0.5),
+                    softcap: None,
+                    window,
+                };
+                let q = ramp(&[1, h, m, dk], 19, &dev, dtype);
+                let k = ramp(&[1, hkv, cap, dk], 23, &dev, dtype);
+                let v = ramp(&[1, hkv, cap, dv], 29, &dev, dtype);
+                let (qc, kc, vc) = (
+                    q.to_device(&Device::Cpu).unwrap(),
+                    k.to_device(&Device::Cpu).unwrap(),
+                    v.to_device(&Device::Cpu).unwrap(),
+                );
+                // The last query sees `len` keys: `at = len - m`.
+                for len in [1, c - 1, c, c + 1, 2 * c - 1, 2 * c, 2 * c + 1, cap] {
+                    if len < m {
+                        continue;
+                    }
+                    let at = len - m;
+                    let s = Tensor::new(&[at as u32], &dev).unwrap();
+                    let got = host(&decode_attention(&q, &k, &v, &s, spec).unwrap());
+                    let want = host(&decode_attention_reference(&qc, &kc, &vc, at, spec).unwrap());
+                    let tol = if dtype == DType::F32 { 1e-5 } else { 1e-2 };
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            (g - w).abs() <= tol * (1.0 + w.abs()),
+                            "{dtype:?} h={h} m={m} dk={dk} dv={dv} len={len} [{i}] {g} vs {w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The chunking is aligned to absolute key positions (sc-24446), so the result does not
+    /// depend on the cache's capacity: attention over a wide static buffer is bit-identical to
+    /// the same step over a buffer exactly as long as the step's last position (the growing
+    /// cache's concat with device positions) — at chunk boundaries and mid-chunk, with a window.
+    #[test]
+    fn the_result_does_not_depend_on_the_capacity() {
+        let Some(dev) = device() else { return };
+        let c = DECODE_ATTN_CHUNK;
+        let cap = 4 * c + 11;
+        for dtype in [DType::F32, DType::BF16] {
+            for (h, hkv, m, dk, dv, window) in [
+                (24usize, 4usize, 1usize, 256usize, 256usize, None),
+                (8, 2, 3, 128, 96, Some(2 * c + 1)),
+            ] {
+                let spec = DecodeAttnSpec {
+                    scale: 0.06,
+                    softcap: None,
+                    window,
+                };
+                let q = ramp(&[1, h, m, dk], 31, &dev, dtype);
+                let k = ramp(&[1, hkv, cap, dk], 37, &dev, dtype);
+                let v = ramp(&[1, hkv, cap, dv], 41, &dev, dtype);
+                for at in [0usize, c - 1, c, 2 * c + 5, 3 * c] {
+                    let s = Tensor::new(&[at as u32], &dev).unwrap();
+                    let wide = host(&decode_attention(&q, &k, &v, &s, spec).unwrap());
+                    let tight = |t: &Tensor| t.narrow(2, 0, at + m).unwrap().contiguous().unwrap();
+                    let narrow =
+                        host(&decode_attention(&q, &tight(&k), &tight(&v), &s, spec).unwrap());
+                    assert_eq!(wide, narrow, "{dtype:?} h={h} m={m} at={at}");
+                }
+            }
+        }
+    }
+
+    /// The 16-byte (key) and pair (value) loads and their scalar fallback run one fma sequence
+    /// (sc-24446): K/V buffers that start one element past an aligned address — the scalar path —
+    /// give bit-identical output to the same values aligned.
+    #[test]
+    fn vector_and_scalar_loads_are_bit_identical() {
+        let Some(dev) = device() else { return };
+        let cap = 3 * DECODE_ATTN_CHUNK + 3;
+        // `[n + 1]` narrowed past its first element: contiguous, misaligned by one element.
+        let misaligned = |t: &Tensor| {
+            let flat = t.flatten_all().unwrap();
+            let pad = Tensor::zeros(1, t.dtype(), &dev).unwrap();
+            Tensor::cat(&[&pad, &flat], 0)
+                .unwrap()
+                .narrow(0, 1, flat.elem_count())
+                .unwrap()
+                .reshape(t.dims())
+                .unwrap()
+        };
+        for dtype in [DType::F32, DType::BF16] {
+            for (h, hkv, m, dk, dv) in [
+                (24usize, 4usize, 1usize, 256usize, 256usize),
+                (4, 1, 2, 64, 128),
+            ] {
+                let spec = DecodeAttnSpec {
+                    scale: 0.07,
+                    softcap: None,
+                    window: None,
+                };
+                let q = ramp(&[1, h, m, dk], 43, &dev, dtype);
+                let k = ramp(&[1, hkv, cap, dk], 47, &dev, dtype);
+                let v = ramp(&[1, hkv, cap, dv], 53, &dev, dtype);
+                let (km, vm) = (misaligned(&k), misaligned(&v));
+                assert!(km.is_contiguous() && km.layout().start_offset() == 1);
+                for at in [0usize, DECODE_ATTN_CHUNK, cap - m] {
+                    let s = Tensor::new(&[at as u32], &dev).unwrap();
+                    let aligned = host(&decode_attention(&q, &k, &v, &s, spec).unwrap());
+                    let scalar = host(&decode_attention(&q, &km, &vm, &s, spec).unwrap());
+                    assert_eq!(aligned, scalar, "{dtype:?} h={h} dk={dk} at={at}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn indexed_copies_follow_the_device_index() {
         let Some(dev) = device() else { return };
@@ -1260,6 +1541,41 @@ mod cuda_tests {
             let ring = ramp(&[3, 5, 7], 21, &dev, dtype);
             let slot = read_slot(&ring, &Tensor::new(&[1u32], &dev).unwrap()).unwrap();
             assert_eq!(host(&slot), host(&ring.get(1).unwrap()));
+        }
+    }
+
+    /// sc-24446: the fused scaled slot read is bit-identical to `read_slot` then the ops path's
+    /// broadcast multiply — the first decay of a Gated DeltaNet step — at a Qwen3.8 state shape
+    /// and an odd one, at every slot.
+    #[test]
+    fn the_scaled_slot_read_is_bit_identical_to_the_ops_path() {
+        let Some(dev) = device() else { return };
+        for (dims, g_dims) in [
+            (vec![4usize, 1, 48, 128, 128], vec![1usize, 48]),
+            (vec![3, 2, 3, 5, 7], vec![2, 3]),
+        ] {
+            let ring = ramp(&dims, 17, &dev, DType::F32);
+            let g = ramp(&g_dims, 5, &dev, DType::F32);
+            let mut shape = g_dims.clone();
+            shape.resize(dims.len() - 1, 1);
+            for slot in 0..dims[0] as u32 {
+                let at = Tensor::new(&[slot], &dev).unwrap();
+                let fused = read_slot_scaled(&ring, &at, &g).unwrap();
+                let ops = read_slot(&ring, &at)
+                    .unwrap()
+                    .broadcast_mul(&g.reshape(shape.clone()).unwrap())
+                    .unwrap();
+                let bits = |t: &Tensor| -> Vec<u32> {
+                    t.flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect()
+                };
+                assert_eq!(bits(&fused), bits(&ops), "{dims:?} slot {slot}");
+            }
         }
     }
 }

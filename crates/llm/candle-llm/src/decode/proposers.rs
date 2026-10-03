@@ -310,6 +310,25 @@ impl Proposer for MtpProposer<'_> {
         }
         Ok(())
     }
+
+    fn catch_up(
+        &mut self,
+        tokens: &[i32],
+        preceding_hidden: Option<&Tensor>,
+        position: i32,
+    ) -> Result<()> {
+        // The probed tokens were fed to the target without a draft step, so the head never paired
+        // them with their predecessor rows: seed them as the warm-up and an accepted run do.
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let preceding = preceding_hidden.ok_or_else(|| {
+            Error::Msg("MtpProposer: no target hidden rows for the probed tokens".into())
+        })?;
+        self.after_cur = None;
+        self.mtp
+            .warm_sequence(tokens, preceding, position, &mut self.cache)
+    }
 }
 
 /// Prompt lookup: propose the continuation that followed the most recent earlier occurrence of
@@ -447,8 +466,9 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
         // The K + 1 single-token draft steps each start a forward; the step start they must
         // roll back to has to survive them.
         cache.retain_checkpoints(self.max_drafts + 2)?;
+        // A prompt prefill: every rollback stops at a proposal's start, past it (sc-24446).
         self.draft
-            .forward_step(&mut cache, StepRequest::last(prompt))?;
+            .forward_step(&mut cache, StepRequest::last(prompt).as_prefill())?;
         self.draft_forwards += 1;
         self.cache = Some(cache);
         Ok(())

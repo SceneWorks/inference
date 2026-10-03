@@ -681,6 +681,23 @@ class RunTests(unittest.TestCase):
             summary["builds"], {"epic": {"status": "ok"}, "baseline": {"status": "ok"}}
         )
 
+    def test_a_without_mtp_row_is_prepared_once_and_both_runs_measure_the_copy(self) -> None:
+        source = write_hf_snapshot(self.directory / "huggingface")
+        copy_path = campaign.without_mtp_path(str(source))
+        row = {"snapshot": str(source), "options": ["off"], "without_mtp": True, "process_repeats": 1}
+        code, _, summary, records = self.run_plan([{**row, "id": "a"}, {**row, "id": "b"}])
+        self.assertEqual(code, 0, summary)
+        runs = [r for r in records if not r["build"]]
+        self.assertEqual([r["run"] for r in runs], ["epic", "baseline", "epic", "baseline"])
+        self.assertEqual({r["env"]["SPECULATIVE_BENCH_SNAPSHOT"] for r in runs}, {copy_path})
+        identity = campaign.snapshot_identity(copy_path)["sha256"]
+        for entry in summary["rows"]:
+            self.assertEqual(
+                entry["snapshot"],
+                {"path": copy_path, "identity": identity, "prepared_from": str(source)},
+            )
+        self.assertNotIn("mtp.fc.weight", read_safetensors(Path(copy_path) / "model-00002-of-00002.safetensors")[0])
+
     def test_the_guard_wraps_every_benchmark_process_and_no_build(self) -> None:
         code, _, _, records = self.run_plan(
             [{"id": "a", "snapshot": "qwen38", "process_repeats": 1}],
@@ -801,15 +818,18 @@ OPTIONS = ("off", {"proposer": "mtp", "depth": 3}, "auto")
 
 
 def document(
-    run, *, effective=None, prefix_cache_bytes=0, value=None, epic_sha=EPIC_SHA, row_extra=None,
-    **overrides,
+    run, *, effective=None, switch_env=None, prefix_cache_bytes=0, value=None, epic_sha=EPIC_SHA,
+    row_extra=None, **overrides,
 ):
     """A synthetic benchmark document; ``value(prompt, option, metric)`` gives each in-process
-    mean, ``row_extra(prompt, option)`` extra row fields (e.g. the DecodeReport's ``proposer``)."""
+    mean, ``row_extra(prompt, option)`` extra row fields (e.g. the DecodeReport's ``proposer``);
+    ``effective`` / ``switch_env`` the provenance's effective switch values / their variables."""
     value = value or (lambda prompt, option, metric: 50.0 if metric == "decode_tok_s" else 100.0)
     switches = {name: {"env": None, "effective": None} for name in campaign.SWITCHES}
     for name, state in (effective or {}).items():
         switches[name]["effective"] = state
+    for name, env in (switch_env or {}).items():
+        switches[name]["env"] = env
     rows = []
     for prompt, prompt_class in PROMPTS:
         for option in OPTIONS:
@@ -1431,6 +1451,125 @@ class CompareTests(unittest.TestCase):
                 self.assertTrue(decision["unpaired"][0].endswith("/cache-on"))
                 self.assertIn("unpaired, no twin row identical but for the prefix cache", decision["reason"])
 
+    # ---- sc-24446 compare fixes: derived switches, prefix-cache miss / hit samples
+
+    def graphs_twin(self, row_id, graphs, speed, stream_env=None):
+        """A CUDA-graphs row as the harness records it: the stream switch's effective value
+        follows the graph switch (own with graphs on, legacy off) unless ``stream_env`` sets it."""
+        stream = stream_env or ("own" if graphs else "legacy")
+        switches = {"CANDLE_LLM_CUDA_GRAPHS": "1" if graphs else "0"}
+        if stream_env:
+            switches["CANDLE_LLM_CUDA_STREAM"] = stream_env
+
+        def make(run, k):
+            return document(
+                run,
+                effective={"CANDLE_LLM_CUDA_GRAPHS": graphs, "CANDLE_LLM_CUDA_STREAM": stream},
+                switch_env=switches,
+                value=lambda p, o, m: (speed if m == "decode_tok_s" else 100.0) + jitter(k),
+            )
+
+        return {"id": row_id, "runs": ["epic"], "switches": switches, "document": make}
+
+    def test_a_derived_switch_left_unset_does_not_break_the_graphs_twin(self) -> None:
+        # The stream follows the graph switch (own vs legacy) with its variable unset: still twins.
+        decision = self.decisions(
+            [self.graphs_twin("on", True, 60.0), self.graphs_twin("off", False, 50.0)]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual((decision["pairs"], decision["outcome"]), (1, "on"))
+        self.assertEqual(decision["unpaired"], [])
+        self.assertEqual(len(decision["judged"]), 2 * len(PROMPTS) * len(OPTIONS))
+        # Set explicitly to the same stream on both rows, the stream is part of the key and equal.
+        same = self.decisions(
+            [
+                self.graphs_twin("on", True, 60.0, stream_env="own"),
+                self.graphs_twin("off", False, 50.0, stream_env="own"),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual(same["pairs"], 1)
+        # Set explicitly to different streams (or on one row only), the rows measured different
+        # streams on purpose: not twins, both named unpaired.
+        for name, off_row in {
+            "different": self.graphs_twin("off", False, 50.0, stream_env="legacy"),
+            "one side": self.graphs_twin("off", False, 50.0),
+        }.items():
+            with self.subTest(name):
+                decision = self.decisions(
+                    [self.graphs_twin("on", True, 60.0, stream_env="own"), off_row]
+                )["CANDLE_CUDA.cuda_graphs"]
+                self.assertEqual((decision["pairs"], decision["outcome"]), (0, "unmeasured"))
+                self.assertEqual(len(decision["unpaired"]), 2)
+
+    def cache_samples_row(self, row_id, budget, miss_ttft, hit_ttft, *, miss_hit_tokens=0):
+        """A prefix-cache row whose per-sample TTFTs are a miss (sample 0, ``miss_hit_tokens``
+        restored) then a hit (sample 1, the whole prompt but its last token restored); a
+        cache-off row (``budget`` 0) runs two cold samples at ``miss_ttft``."""
+        prompt_tokens = 40
+
+        def make(run, k):
+            def samples(prompt, option):
+                cold = {"prefix_hit_tokens": 0, "ttft_ms": miss_ttft + jitter(k), "decode_tok_s": 50.0 + jitter(k)}
+                if not budget:
+                    return {"samples": [cold, dict(cold)]}
+                miss = {**cold, "prefix_hit_tokens": miss_hit_tokens}
+                hit = {
+                    "prefix_hit_tokens": prompt_tokens - 1,
+                    "ttft_ms": hit_ttft + jitter(k),
+                    "decode_tok_s": 50.0 + jitter(k),
+                }
+                return {"samples": [miss, hit], "prompt_tokens": prompt_tokens}
+
+            def mean(prompt, option, metric):
+                values = [s[metric] for s in samples(prompt, option)["samples"]]
+                return sum(values) / len(values)
+
+            return document(run, prefix_cache_bytes=budget, value=mean, row_extra=samples)
+
+        env = {"SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": str(budget)} if budget else {}
+        return {"id": row_id, "runs": ["epic"], "env": env, "document": make}
+
+    def test_prefix_cache_judges_the_miss_and_hit_samples_separately(self) -> None:
+        off_row = self.cache_samples_row("cache-off", 0, 100.0, 100.0)
+        # A miss that costs 50 % more and a hit that saves 80 %: the mixed mean (105) would be
+        # within noise of the cold 100, the miss path alone is a regression -> off.
+        slower_miss = self.decisions(
+            [self.cache_samples_row("cache-on", 1 << 30, 150.0, 20.0), off_row]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual((slower_miss["pairs"], slower_miss["outcome"]), (1, "off"))
+        by_samples = {
+            samples: {j["verdict"] for j in slower_miss["judged"] if j["samples"] == samples and j["metric"] == "ttft_ms"}
+            for samples in ("miss", "hit")
+        }
+        self.assertEqual(by_samples, {"miss": {"regression"}, "hit": {"pass"}})
+        self.assertIn("[miss samples] ttft_ms +50.0%", slower_miss["reason"])
+        self.assertIn("hit samples: ", slower_miss["reason"])
+        self.assertIn("ttft_ms Δ -80.0..-80.0%", slower_miss["reason"])
+        # A miss as fast as no cache and a hit that saves 80 %: on, the hit's gain reported.
+        free_miss = self.decisions(
+            [self.cache_samples_row("cache-on", 1 << 30, 100.0, 20.0), off_row]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual(free_miss["outcome"], "on")
+        cells = len(PROMPTS) * len(OPTIONS) * len(campaign.METRICS)
+        self.assertIn(f"hit samples: {cells} judged, {cells} pass", free_miss["reason"])
+        self.assertIn("ttft_ms Δ -80.0..-80.0%", free_miss["reason"])
+        # A slower hit is a regression too.
+        slower_hit = self.decisions(
+            [self.cache_samples_row("cache-on", 1 << 30, 100.0, 150.0), off_row]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual(slower_hit["outcome"], "off")
+        self.assertIn("[hit samples] ttft_ms +50.0%", slower_hit["reason"])
+        # A first sample that restored only a few shared template tokens is still a miss.
+        template = self.decisions(
+            [self.cache_samples_row("cache-on", 1 << 30, 150.0, 20.0, miss_hit_tokens=3), off_row]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual(template["outcome"], "off")
+        self.assertIn("[miss samples] ttft_ms +50.0%", template["reason"])
+        # Documents without per-sample hits are judged on their in-process means, unsplit.
+        legacy = self.decisions(
+            [self.cache_row("cache-on", 1 << 30, 140.0), self.cache_row("cache-off", 0, 100.0)]
+        )["CANDLE_CUDA.prefix_cache_bytes"]
+        self.assertEqual({j["samples"] for j in legacy["judged"]}, {None})
+
     def test_a_justified_default_with_a_measured_pair_is_reported_as_informational(self) -> None:
         def pipe_row(row_id, state, ttft):
             def make(run, k):
@@ -1487,6 +1626,193 @@ class CompareTests(unittest.TestCase):
             {e["model"] for e in self.compare(directory)["e6"]},
             {"prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"},
         )
+
+def write_safetensors(path: Path, tensors: dict[str, bytes], metadata=None) -> None:
+    """A safetensors file of 1-D U8 tensors, stored in the given order."""
+    header, offset, data = {}, 0, b""
+    if metadata is not None:
+        header["__metadata__"] = metadata
+    for name, payload in tensors.items():
+        header[name] = {"dtype": "U8", "shape": [len(payload)], "data_offsets": [offset, offset + len(payload)]}
+        offset += len(payload)
+        data += payload
+    blob = json.dumps(header).encode("utf-8")
+    path.write_bytes(len(blob).to_bytes(8, "little") + blob + data)
+
+
+def read_safetensors(path: Path) -> tuple[dict[str, bytes], dict]:
+    raw = path.read_bytes()
+    length = int.from_bytes(raw[:8], "little")
+    header = json.loads(raw[8 : 8 + length])
+    metadata = header.pop("__metadata__", None)
+    data = raw[8 + length :]
+    tensors = {}
+    for name, info in header.items():
+        begin, end = info["data_offsets"]
+        assert 0 <= begin <= end <= len(data), (name, info)
+        tensors[name] = data[begin:end]
+    return tensors, {"metadata": metadata, "aligned": (8 + length) % 8 == 0, "size": len(data)}
+
+
+QWEN36_SHARD_1 = {
+    "model.language_model.embed_tokens.weight": b"E" * 24,
+    "model.language_model.layers.0.mlp.experts.gate_up_proj": b"G" * 40,
+}
+QWEN36_SHARD_2 = {
+    "model.language_model.norm.weight": b"N" * 8,
+    "mtp.fc.weight": b"F" * 16,
+    "lm_head.weight": b"L" * 32,
+    "mtp.layers.0.mlp.experts.down_proj": b"D" * 12,
+}
+QWEN36_CONFIG = {
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
+    "text_config": {
+        "model_type": "qwen3_5_moe_text",
+        "num_experts": 256,
+        "mtp_num_hidden_layers": 1,
+        "mtp_use_dedicated_embeddings": False,
+    },
+}
+
+
+def write_hf_snapshot(cache: Path, revision: str = "995ad96e") -> Path:
+    """A Hugging Face cache snapshot of a Qwen3.6-shaped MoE: every file a symlink into `blobs`,
+    the MTP head split across the last shard as the real checkpoint stores it."""
+    repo = cache / "hub" / "models--Qwen--Qwen3.6-35B-A3B"
+    blobs, snapshot = repo / "blobs", repo / "snapshots" / revision
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    staged = blobs / "staging"
+    staged.mkdir()
+    write_safetensors(staged / "1", QWEN36_SHARD_1)
+    write_safetensors(staged / "2", QWEN36_SHARD_2, {"format": "pt"})
+    weight_map = {k: "model-00001-of-00002.safetensors" for k in QWEN36_SHARD_1}
+    weight_map.update({k: "model-00002-of-00002.safetensors" for k in QWEN36_SHARD_2})
+    sizes = sum(len(v) for v in {**QWEN36_SHARD_1, **QWEN36_SHARD_2}.values())
+    files = {
+        "config.json": json.dumps(QWEN36_CONFIG).encode(),
+        "tokenizer.json": b'{"model": {"vocab": {}}}',
+        "chat_template.jinja": b"{{ messages }}",
+        "model.safetensors.index.json": json.dumps(
+            # A float, as the real Qwen3.6-35B-A3B index stores it.
+            {"metadata": {"total_size": float(sizes)}, "weight_map": weight_map}
+        ).encode(),
+        "model-00001-of-00002.safetensors": (staged / "1").read_bytes(),
+        "model-00002-of-00002.safetensors": (staged / "2").read_bytes(),
+    }
+    shutil.rmtree(staged)
+    for i, (name, payload) in enumerate(files.items()):
+        blob = blobs / f"blob{i}"
+        blob.write_bytes(payload)
+        (snapshot / name).symlink_to(Path("..") / ".." / "blobs" / blob.name)
+    return snapshot
+
+
+class WithoutMtpTests(unittest.TestCase):
+    """sc-24446: the Candle lanes' MTP-free snapshot, so the pre-epic loader (which refuses
+    Qwen3.6-35B-A3B's MoE MTP head) can measure that model's `off` baseline."""
+
+    def setUp(self) -> None:
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.source = write_hf_snapshot(self.directory / "huggingface")
+        self.destination = Path(campaign.without_mtp_path(str(self.source)))
+
+    def test_the_copy_lives_beside_the_hub_in_the_cache_layout(self) -> None:
+        self.assertEqual(
+            self.destination,
+            self.directory / "huggingface" / "prepared-without-mtp"
+            / "models--Qwen--Qwen3.6-35B-A3B" / "snapshots" / "995ad96e",
+        )
+        self.assertEqual(
+            campaign.without_mtp_path(
+                "E:\\huggingface\\hub\\models--Qwen--Qwen3.6-35B-A3B\\snapshots\\995ad\\"
+            ),
+            "E:\\huggingface\\prepared-without-mtp\\models--Qwen--Qwen3.6-35B-A3B\\snapshots\\995ad",
+        )
+        self.assertIsNone(campaign.without_mtp_path("E:\\models\\qwen36"))
+        self.assertIsNone(campaign.without_mtp_path("/models/models--a--b"))
+
+    def test_every_mtp_tensor_is_dropped_and_everything_else_is_kept_byte_for_byte(self) -> None:
+        self.assertTrue(campaign.prepare_without_mtp(str(self.source), str(self.destination)))
+        out = self.destination
+        one, one_info = read_safetensors(out / "model-00001-of-00002.safetensors")
+        two, two_info = read_safetensors(out / "model-00002-of-00002.safetensors")
+        self.assertEqual(one, QWEN36_SHARD_1)
+        self.assertEqual(two, {k: v for k, v in QWEN36_SHARD_2.items() if not k.startswith("mtp.")})
+        self.assertEqual((two_info["metadata"], two_info["aligned"]), ({"format": "pt"}, True))
+        self.assertEqual(two_info["size"], 40)  # no dropped tensor's bytes left behind
+        # The shard without a head tensor is the cache's own bytes, hard-linked, not copied.
+        self.assertEqual(
+            (out / "model-00001-of-00002.safetensors").stat().st_ino,
+            (self.source / "model-00001-of-00002.safetensors").resolve().stat().st_ino,
+        )
+        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        expected = copy.deepcopy(QWEN36_CONFIG)
+        expected["text_config"]["mtp_num_hidden_layers"] = 0
+        self.assertEqual(config, expected)
+        index = json.loads((out / "model.safetensors.index.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            index["weight_map"],
+            {
+                **{k: "model-00001-of-00002.safetensors" for k in QWEN36_SHARD_1},
+                **{
+                    k: "model-00002-of-00002.safetensors"
+                    for k in QWEN36_SHARD_2
+                    if not k.startswith("mtp.")
+                },
+            },
+        )
+        self.assertEqual(index["metadata"]["total_size"], 24.0 + 40 + 8 + 32)
+        self.assertIsInstance(index["metadata"]["total_size"], float)
+        for name in ("tokenizer.json", "chat_template.jinja"):
+            self.assertEqual((out / name).read_bytes(), (self.source / name).read_bytes())
+        self.assertFalse(out.with_name(out.name + ".partial").exists())
+        self.assertNotEqual(
+            campaign.snapshot_identity(str(out))["sha256"],
+            campaign.snapshot_identity(str(self.source))["sha256"],
+        )
+
+    def test_a_flat_config_has_its_own_mtp_layers_zeroed(self) -> None:
+        text = campaign._config_without_mtp('{"model_type": "qwen3_5_text", "mtp_num_hidden_layers": 1}')
+        self.assertEqual(json.loads(text), {"model_type": "qwen3_5_text", "mtp_num_hidden_layers": 0})
+
+    def test_preparing_again_reuses_the_copy_and_never_overwrites_another(self) -> None:
+        self.assertTrue(campaign.prepare_without_mtp(str(self.source), str(self.destination)))
+        shard = self.destination / "model-00002-of-00002.safetensors"
+        before = shard.stat()
+        self.assertFalse(campaign.prepare_without_mtp(str(self.source), str(self.destination)))
+        self.assertEqual((shard.stat().st_ino, shard.stat().st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+        # Another source's content (or a hand-made directory) at the path is refused, untouched.
+        (self.source / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(campaign.CampaignError, "not this preparer's"):
+            campaign.prepare_without_mtp(str(self.source), str(self.destination))
+        self.assertTrue(shard.exists())
+        # A preparation stopped part-way is discarded and redone, never taken as finished.
+        shutil.rmtree(self.destination)
+        partial = self.destination.with_name(self.destination.name + ".partial")
+        partial.mkdir()
+        (partial / "model-00002-of-00002.safetensors").write_bytes(b"half")
+        self.assertTrue(campaign.prepare_without_mtp(str(self.source), str(self.destination)))
+        self.assertNotIn(
+            "mtp.fc.weight", read_safetensors(self.destination / "model-00002-of-00002.safetensors")[0]
+        )
+
+    def test_the_plan_points_both_runs_at_the_copy_on_candle_lanes_only(self) -> None:
+        row = {"id": "f5", "snapshot": str(self.source), "options": ["off"], "without_mtp": True}
+        planned = plan({"rows": [row]})["rows"][0]
+        self.assertEqual(planned["env"]["SPECULATIVE_BENCH_SNAPSHOT"], str(self.destination))
+        self.assertEqual(planned["prepare"], {"without_mtp": str(self.source)})
+        self.assertEqual(planned["runs"], ["epic", "baseline"])
+        self.assertNotIn("prepare", plan({"rows": [{**row, "without_mtp": False}]})["rows"][0])
+        for name, bad, lane in (
+            ("mlx lane", row, "mlx"),
+            ("not a cache snapshot", {**row, "snapshot": "/models/qwen36"}, "cuda"),
+            ("not a boolean", {**row, "without_mtp": "yes"}, "cuda"),
+        ):
+            with self.subTest(name), self.assertRaises(campaign.MatrixError):
+                plan({"rows": [bad]}, lane=lane)
+
 
 if __name__ == "__main__":
     unittest.main()
