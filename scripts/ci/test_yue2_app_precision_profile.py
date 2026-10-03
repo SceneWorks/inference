@@ -214,6 +214,7 @@ class PrecisionControlTests(unittest.TestCase):
             evidence = Path(directory) / "evidence"
             census = types.SimpleNamespace(cuda_physical_census=lambda: ("typed pmon rows", ["123 C worker"]),
                                            metal_census=lambda: ("", []),
+                                           physical_busy_message=lambda raw, busy, context: f"{context}: {busy}",
                                            retain_cuda_physical_evidence=lambda *_: [],
                                            retain_reviewed_baseline=lambda *_: [])
             with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
@@ -224,9 +225,33 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertFalse(record["admitted"])
             self.assertEqual(record["competing_processes"], ["123 C worker"])
 
+    def test_cuda_preflight_surfaces_original_physical_refusal(self):
+        proof_spec = importlib.util.spec_from_file_location(
+            "physical_message_control", MODULE_PATH.with_name("yue2_precision_proof.py"))
+        proof = importlib.util.module_from_spec(proof_spec)
+        proof_spec.loader.exec_module(proof)
+        raw = json.dumps({"commandExit": 0, "refusal": "adapterDedicated rose over reviewed baseline"})
+        busy = ["0 38212 C+G - - ChatGPT.exe"]
+        census = types.SimpleNamespace(cuda_physical_census=lambda: (raw, busy),
+                    metal_census=Mock(), physical_busy_message=proof.physical_busy_message,
+                    retain_cuda_physical_evidence=Mock(), retain_reviewed_baseline=Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence"
+            with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
+                 patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)):
+                with self.assertRaisesRegex(ValueError, "adapterDedicated rose over reviewed baseline"):
+                    control.preflight("cuda", evidence, "before-test")
+            record = json.loads((evidence / "preflight-before-test.json").read_text(encoding="utf-8"))
+            self.assertFalse(record["admitted"])
+            self.assertEqual(record["competing_processes"], busy)
+            self.assertEqual(record["census"], raw)
+            census.retain_cuda_physical_evidence.assert_not_called()
+            census.metal_census.assert_not_called()
+
     def test_cuda_initial_preflight_refuses_short_owner_window_before_capture(self):
         with tempfile.TemporaryDirectory() as directory:
             census = types.SimpleNamespace(cuda_physical_census=Mock(), metal_census=Mock(),
+                                           physical_busy_message=Mock(),
                                            retain_cuda_physical_evidence=Mock(),
                                            retain_reviewed_baseline=Mock())
             guard = types.SimpleNamespace(require_remaining_window=Mock(

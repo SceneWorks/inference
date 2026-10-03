@@ -181,6 +181,20 @@ def cuda_census() -> tuple[str, list[str]]:
             query_compute_apps_rows(fallback.stdout))
 
 
+def physical_busy_message(raw: str, busy: list[str], context: str) -> str:
+    """Display a saved guard refusal without changing the busy decision."""
+    message = f"{context}: {busy}"
+    try:
+        probe = json.loads(raw)
+    except (ValueError, TypeError):
+        return message
+    if isinstance(probe, dict):
+        refusal = probe.get("refusal")
+        if isinstance(refusal, str) and refusal.strip():
+            message += f"; physical guard refused: {refusal}"
+    return message
+
+
 def cuda_physical_census() -> tuple[str, list[str]]:
     """Require the complete reviewed-owner fresh probe for production acceptance.
 
@@ -461,7 +475,7 @@ def execute(args: argparse.Namespace) -> None:
         baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
     before_raw, before_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
     (evidence / "census-before.txt").write_text(before_raw, encoding="utf-8")
-    require(not before_busy, f"foreign/lingering accelerator executables before test: {before_busy}")
+    require(not before_busy, physical_busy_message(before_raw, before_busy, "foreign/lingering accelerator executables before test"))
     before_files = retain_cuda_physical_evidence(evidence, "before", before_raw) if args.backend == "cuda" else None
     if scheduling == "owner-gpu0":
         from yue2_gpu0_owner_guard import OwnerGuard
@@ -598,7 +612,7 @@ def execute(args: argparse.Namespace) -> None:
     require(not missing_markers, f"precision stage markers incomplete: {missing_markers}")
     require(samples and not faults, "external sampler had no valid sample or suffered a fault")
     require(post_census_error is None, f"post-test release census failed: {post_census_error}")
-    require(child.poll() is not None and not after_busy, f"owned test/process cleanup uncertain: {after_busy}")
+    require(child.poll() is not None and not after_busy, physical_busy_message(after_raw, after_busy, "owned test/process cleanup uncertain"))
 
 
 def main() -> None:

@@ -145,7 +145,7 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
     # The merged engine control owns the typed process census. Refuse if absent;
     # a generic process-name guess would weaken the shared physical-host lock.
     from yue2_precision_proof import (  # type: ignore[import-not-found]
-        cuda_physical_census, metal_census, retain_cuda_physical_evidence,
+        cuda_physical_census, metal_census, physical_busy_message, retain_cuda_physical_evidence,
         retain_reviewed_baseline,
     )
 
@@ -174,7 +174,7 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
         available = int(page.group(1)) * sum(int(value) for _, value in counts)
     errors = []
     if busy:
-        errors.append(f"competing physical-device processes: {busy}")
+        errors.append(physical_busy_message(census, busy, "competing physical-device processes"))
     if disk < MIN_FREE_DISK:
         errors.append(f"disk free {disk} below fresh-install/build floor {MIN_FREE_DISK}")
     if backend == "metal" and (memory < REFERENCE_PEAK or available < REFERENCE_PEAK):

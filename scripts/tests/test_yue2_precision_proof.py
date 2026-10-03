@@ -303,6 +303,25 @@ class PrecisionControlTests(unittest.TestCase):
                 self.assertEqual(len(CONTROL.cuda_census()[1]), 1)
                 attestation.assert_not_called()
 
+    def test_saved_physical_refusal_is_visible_without_exempting_pid(self):
+        busy = ["0 38212 C+G - - ChatGPT.exe"]
+        for reason in ("adapterDedicated rose over reviewed baseline",
+                       "target GPU Engine activity", "process identity changed"):
+            raw = json.dumps({"commandExit": 0, "refusal": reason})
+            with patch.object(CONTROL, "cuda_census", return_value=(raw, busy)):
+                saved, refused = CONTROL.cuda_physical_census()
+            self.assertEqual(refused, busy)
+            message = CONTROL.physical_busy_message(saved, refused, "before test")
+            self.assertIn(reason, message)
+            self.assertIn("38212", message)
+        for raw in ("typed pmon rows", "[]", '{"refusal": true}', '{"refusal": ""}'):
+            self.assertEqual(CONTROL.physical_busy_message(raw, busy, "before test"),
+                             f"before test: {busy}")
+        for pid in (38213, 123):
+            foreign = [f"0 {pid} C+G - - ChatGPT.exe"]
+            with patch.object(CONTROL, "cuda_census", return_value=("typed rows", foreign)):
+                self.assertEqual(CONTROL.cuda_physical_census()[1], foreign)
+
     def test_full_cuda_proof_refuses_bare_pmon_and_requires_all_fresh_files(self):
         for raw, busy in (("# gpu pid type\n0 - -\n", []),
                           ("typed busy", ["0 123 C 0 0"])):
