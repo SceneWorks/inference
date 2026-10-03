@@ -1,0 +1,74 @@
+--- a/crates/audio/candle-audio-yue2/src/vae.rs
++++ b/crates/audio/candle-audio-yue2/src/vae.rs
+@@ -1186,0 +1187,47 @@ impl Yue2Vae {
++    /// Diagnostic-only prefix input for native stage-2 ConvTranspose. This runs exactly the
++    /// source decoder's first Conv7 and Snake with the verified BF16 latent and no new math.
++    pub fn diagnostic_stage2_input(&self, z: &Tensor, left: usize, right: usize) -> Result<Tensor> {
++        self.check_latent(z)?;
++        if left >= right || right > z.dim(2)? || self.decoder.len() <= 2 {
++            return Err(VaeError::Input(
++                "diagnostic stage-2 latent window is invalid".into(),
++            ));
++        }
++        Ok(forward_all(
++            &self.decoder[..2],
++            &z.narrow(2, left, right - left)?.to_device(&self.device)?,
++        )?)
++    }
++
++    /// Borrow the same immutable folded resident weight used by the native stage-2 call.
++    pub fn diagnostic_stage2_weight(&self) -> Result<&Tensor> {
++        match self.decoder.get(2) {
++            Some(Layer::ConvT(layer)) => Ok(&layer.weight),
++            _ => Err(VaeError::Input(
++                "diagnostic stage 2 is not ConvTranspose".into(),
++            )),
++        }
++    }
++
++    /// One native source ConvTranspose call. The diagnostic controls its private cuBLAS handle;
++    /// this method intentionally bypasses the production mode-16 entry guard and is never used
++    /// by generation, decoding, or the registered provider.
++    pub fn diagnostic_stage2_forward(&self, input: &Tensor) -> Result<Tensor> {
++        if input.dtype() != self.dtype
++            || !input.device().same_device(&self.device)
++            || input.dims().len() != 3
++        {
++            return Err(VaeError::Input(
++                "diagnostic stage-2 input dtype/device/shape differs".into(),
++            ));
++        }
++        match self.decoder.get(2) {
++            Some(Layer::ConvT(layer)) if input.dim(1)? == layer.weight.dim(0)? => {
++                Ok(layer.forward(input)?)
++            }
++            _ => Err(VaeError::Input(
++                "diagnostic stage-2 input channels or layer differ".into(),
++            )),
++        }
++    }
++
+@@ -1895,0 +1943,23 @@ pub(crate) mod tests {
++
++    #[test]
++    fn diagnostic_stage2_matches_native_prefix_and_refuses_wrong_input() {
++        let vae = tiny(VaeVariant::Standard, VaeParts::DecoderOnly);
++        let z = latent_bct();
++        let input = vae
++            .diagnostic_stage2_input(&z, 0, z.dim(2).unwrap())
++            .unwrap();
++        let direct = forward_all(&vae.decoder[..2], &z).unwrap();
++        assert_eq!(
++            input.to_vec3::<f32>().unwrap(),
++            direct.to_vec3::<f32>().unwrap()
++        );
++        let output = vae.diagnostic_stage2_forward(&input).unwrap();
++        let direct_output = forward_all(&vae.decoder[..=2], &z).unwrap();
++        assert_eq!(
++            output.to_vec3::<f32>().unwrap(),
++            direct_output.to_vec3::<f32>().unwrap()
++        );
++        assert_eq!(vae.diagnostic_stage2_weight().unwrap().dtype(), DType::F32);
++        assert!(vae.diagnostic_stage2_input(&z, 1, 1).is_err());
++        assert!(vae.diagnostic_stage2_forward(&z).is_err());
++    }
