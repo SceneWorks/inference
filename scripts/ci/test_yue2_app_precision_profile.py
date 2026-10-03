@@ -16,34 +16,45 @@ MODULE_PATH = Path(__file__).with_name("yue2_app_precision_profile.py")
 spec = importlib.util.spec_from_file_location("yue2_app_precision_profile", MODULE_PATH)
 control = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(control)
+M4_SHA = "825341ff8d0110ea448213485891b39d57806fa4"
+M4_POLICY = control.SUPPORTED_RUNTIME_POLICIES[M4_SHA]
+M5_SHA = "190e20e7c6b5bac006194c729baabd22c0c44a5d"
+M5_POLICY = "fixed_order_bf16_convolution_v1"
 
 
 class PrecisionControlTests(unittest.TestCase):
-    def test_seven_fixed_cases_copy_outside_repo_and_only_change_backend_id(self):
+    def test_eight_cuda_cases_and_seven_metal_cases_keep_exact_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             templates = MODULE_PATH.parent / "yue2-app-precision-cases"
-            prepared = control.prepare_cases(templates, root / "metal-cases", "metal")
-            self.assertEqual(len(prepared["cases"]), 7)
-            for name in control.NAMES:
-                original = json.loads((templates / f"{name}.json").read_text(encoding="utf-8"))
-                copied = json.loads((root / "metal-cases" / f"{name}.json").read_text(encoding="utf-8"))
-                self.assertEqual(copied.pop("id"), original.pop("id").replace(":cuda:", ":metal:"))
-                self.assertEqual(copied, original)
-            with self.assertRaisesRegex(ValueError, "already exists"):
-                control.prepare_cases(templates, root / "metal-cases", "metal")
+            for backend, count in (("cuda", 8), ("metal", 7)):
+                destination = root / f"{backend}-cases"
+                prepared = control.prepare_cases(templates, destination, backend)
+                self.assertEqual(len(prepared["cases"]), count)
+                self.assertEqual([row["name"] for row in prepared["cases"]],
+                                 list(control.names_for_backend(backend)))
+                for name in control.names_for_backend(backend):
+                    original = json.loads((templates / f"{name}.json").read_text(encoding="utf-8"))
+                    copied = json.loads((destination / f"{name}.json").read_text(encoding="utf-8"))
+                    self.assertEqual(copied.pop("id"), original.pop("id").replace(":cuda:", f":{backend}:"))
+                    self.assertEqual(copied, original)
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    control.prepare_cases(templates, destination, backend)
+            self.assertFalse((root / "metal-cases" / "experimental-fp8-auto.json").exists())
 
     def test_changed_fixed_source_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            root.joinpath("templates").mkdir()
-            for name in control.NAMES:
-                source = MODULE_PATH.parent / "yue2-app-precision-cases" / f"{name}.json"
-                root.joinpath("templates", f"{name}.json").write_bytes(source.read_bytes())
-            target = root / "templates" / "strict-bf16-standard.json"
-            target.write_text(target.read_text(encoding="utf-8").replace("831004", "831005"), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "changed"):
-                control.prepare_cases(root / "templates", root / "cases", "cuda")
+            for changed_name in ("strict-bf16-standard", "experimental-fp8-auto"):
+                templates = root / changed_name
+                templates.mkdir()
+                for name in control.NAMES:
+                    source = MODULE_PATH.parent / "yue2-app-precision-cases" / f"{name}.json"
+                    (templates / f"{name}.json").write_bytes(source.read_bytes())
+                target = templates / f"{changed_name}.json"
+                target.write_text(target.read_text(encoding="utf-8").replace("831004", "831005"), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    control.prepare_cases(templates, root / f"cases-{changed_name}", "cuda")
 
     def test_effective_dtype_and_decoder_are_proven_from_record(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -56,20 +67,20 @@ class PrecisionControlTests(unittest.TestCase):
                 "admission": {"outcome": "admitted"},
                 "outcome": {"status": "completed", "engineComputePolicy": "bf16",
                             "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16",
-                            "engineVaeCudaBf16MathPolicy": "disallow_reduced_precision_reduction_v1"},
+                            "engineVaeCudaBf16MathPolicy": M4_POLICY},
                 "measured": {"peakBytes": 1024, "stages": stages},
             }
             record.write_text(json.dumps(body), encoding="utf-8")
-            self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy")["effective_vae_dtype"], "bfloat16")
+            self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)["effective_vae_dtype"], "bfloat16")
             body["outcome"]["engineVaeDtype"] = "float32"
             record.write_text(json.dumps(body), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "effective engineVaeDtype"):
-                control.verify_record(record, "cuda", "strict-bf16-legacy")
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
             body["outcome"]["engineVaeDtype"] = "bfloat16"
             body["identity"]["decoder"]["repo"] = "m-a-p/YuE2-Vae"
             record.write_text(json.dumps(body), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "decoder identity"):
-                control.verify_record(record, "cuda", "strict-bf16-legacy")
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
 
     def test_effective_cuda_bf16_vae_math_policy_is_required_only_for_cuda_bf16(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -88,30 +99,82 @@ class PrecisionControlTests(unittest.TestCase):
                     "measured": {"peakBytes": 1024, "stages": {
                         stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
                 }
-                wanted = "disallow_reduced_precision_reduction_v1"
+                wanted = M4_POLICY
                 if backend == "cuda" and policy == "bf16":
                     record.write_text(json.dumps(body), encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
-                        control.verify_record(record, backend, name)
-                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = "stale"
-                    record.write_text(json.dumps(body), encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
-                        control.verify_record(record, backend, name)
+                        control.verify_record(record, backend, name, M4_POLICY)
+                    for wrong in ("stale", "fixed_order_bf16_convolution_v1"):
+                        body["outcome"]["engineVaeCudaBf16MathPolicy"] = wrong
+                        record.write_text(json.dumps(body), encoding="utf-8")
+                        with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                            control.verify_record(record, backend, name, M4_POLICY)
                     body["outcome"]["engineVaeCudaBf16MathPolicy"] = wanted
                     record.write_text(json.dumps(body), encoding="utf-8")
                     self.assertEqual(
-                        control.verify_record(record, backend, name)["effective_vae_cuda_bf16_math_policy"],
+                        control.verify_record(record, backend, name, M4_POLICY)["effective_vae_cuda_bf16_math_policy"],
                         wanted,
                     )
                 else:
                     record.write_text(json.dumps(body), encoding="utf-8")
                     self.assertIsNone(
-                        control.verify_record(record, backend, name)["effective_vae_cuda_bf16_math_policy"]
+                        control.verify_record(record, backend, name, M4_POLICY)["effective_vae_cuda_bf16_math_policy"]
                     )
                     body["outcome"]["engineVaeCudaBf16MathPolicy"] = wanted
                     record.write_text(json.dumps(body), encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, "present on another backend"):
-                        control.verify_record(record, backend, name)
+                        control.verify_record(record, backend, name, M4_POLICY)
+
+    def test_fp8_auto_record_requires_actual_fp8_and_retained_host_originals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            name = "experimental-fp8-auto"
+            body = {
+                "caseId": control.case_id("cuda", name), "backend": "cuda",
+                "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
+                "request": {"name": name, "computePolicy": "auto", "arMode": "experimentalFp8"},
+                "admission": {"outcome": "admitted", "estimate": {"weights": {"hostBytes": 2 * 1024 ** 3}}},
+                "outcome": {"status": "completed", "engineComputePolicy": "auto",
+                            "engineModelDtype": "bfloat16", "engineVaeDtype": "float32",
+                            "engineQuantization": "fp8"},
+                "measured": {"peakBytes": 1024, "stages": {
+                    stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
+            }
+            def check():
+                record.write_text(json.dumps(body), encoding="utf-8")
+                return control.verify_record(record, "cuda", name, M4_POLICY)
+            self.assertEqual(check()["effective_compute_policy"], "auto")
+            self.assertEqual(check()["effective_ar_quantization"], "fp8")
+            self.assertEqual(check()["host_original_bytes"], 2 * 1024 ** 3)
+            for field, value, error in (
+                ("arMode", "native", "record AR mode"),
+                ("computePolicy", "bf16", "record request name/policy"),
+            ):
+                original = body["request"][field]
+                body["request"][field] = value
+                with self.assertRaisesRegex(ValueError, error):
+                    check()
+                body["request"][field] = original
+            for field, value, error in (
+                ("engineQuantization", "bf16", "experimental FP8 AR did not execute"),
+                ("engineModelDtype", "float32", "effective engineModelDtype"),
+                ("engineVaeDtype", "bfloat16", "effective engineVaeDtype"),
+                ("engineVaeCudaBf16MathPolicy", M4_POLICY,
+                 "present on another backend"),
+            ):
+                body["outcome"][field] = value
+                with self.assertRaisesRegex(ValueError, error):
+                    check()
+                if field == "engineVaeCudaBf16MathPolicy":
+                    del body["outcome"][field]
+                else:
+                    body["outcome"][field] = "fp8" if field == "engineQuantization" else (
+                        "bfloat16" if field == "engineModelDtype" else "float32")
+            body["admission"]["estimate"]["weights"]["hostBytes"] -= 1
+            with self.assertRaisesRegex(ValueError, "retained BF16 AR originals"):
+                check()
+            with self.assertRaisesRegex(ValueError, "unknown case/backend"):
+                control.verify_record(record, "metal", name, M4_POLICY)
 
     def test_exact_app_pin_and_clean_sources_required(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -151,11 +214,198 @@ class PrecisionControlTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "pin"):
                     control.verify_sources(app, engine, source_control, app_sha, engine_sha, control_sha)
 
+    def test_runtime_math_policy_requires_the_verified_exact_engine_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, engine, evidence = (root / name for name in ("app", "engine", "evidence"))
+            for path in (app, engine, evidence):
+                path.mkdir()
+            app_sha, control_sha = "a" * 40, "c" * 40
+            source_control = MODULE_PATH.parents[2]
+            (app / "Cargo.toml").write_text(
+                f'candle-kernels = {{ git = "https://github.com/SceneWorks/inference", rev = "{M4_SHA}" }}\n',
+                encoding="utf-8",
+            )
+            checked_out = {app: app_sha, engine: M4_SHA, source_control: control_sha}
+            def fake_git(path, *args):
+                return checked_out[path] if args[0] == "rev-parse" else ""
+            with patch.dict("os.environ", {"GITHUB_SHA": control_sha}), \
+                 patch.object(control, "git", side_effect=fake_git):
+                with self.assertRaises(FileNotFoundError):
+                    control.verified_runtime_policy(app, engine, evidence)
+                source = control.verify_sources(app, engine, source_control,
+                                                app_sha, M4_SHA, control_sha)
+                (evidence / "sources.json").write_text(json.dumps(source), encoding="utf-8")
+                self.assertEqual(control.verified_runtime_policy(app, engine, evidence),
+                                 (M4_SHA, M4_POLICY))
+                checked_out[engine] = "d" * 40
+                with self.assertRaisesRegex(ValueError, "engine checkout SHA"):
+                    control.verified_runtime_policy(app, engine, evidence)
+                checked_out[engine] = M4_SHA
+                (evidence / "sources.json").write_text(json.dumps({**source, "app_pins": []}), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "source manifest differs"):
+                    control.verified_runtime_policy(app, engine, evidence)
+                (evidence / "sources.json").write_text(json.dumps(source), encoding="utf-8")
+                unknown_sha = "e" * 40
+                checked_out[engine] = unknown_sha
+                (app / "Cargo.toml").write_text(
+                    (app / "Cargo.toml").read_text(encoding="utf-8").replace(M4_SHA, unknown_sha),
+                    encoding="utf-8",
+                )
+                unknown_source = control.verify_sources(app, engine, source_control,
+                                                        app_sha, unknown_sha, control_sha)
+                (evidence / "sources.json").write_text(json.dumps(unknown_source), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "unsupported engine revision"):
+                    control.verified_runtime_policy(app, engine, evidence)
+                # A future policy can be tested without adding an unknown SHA to production.
+                new_policy = "fixed_order_bf16_convolution_v1"
+                self.assertEqual(control.verified_runtime_policy(
+                    app, engine, evidence, supported={unknown_sha: new_policy}),
+                    (unknown_sha, new_policy))
+
+    def test_future_policy_rejects_an_old_cuda_record_and_other_backend_leak(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            stages = {stage: {"peakBytes": 1, "samples": 1} for stage in control.STAGES}
+            body = {
+                "caseId": control.case_id("cuda", "strict-bf16-standard"), "backend": "cuda",
+                "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
+                "request": {"name": "strict-bf16-standard", "computePolicy": "bf16"},
+                "admission": {"outcome": "admitted"},
+                "outcome": {"status": "completed", "engineComputePolicy": "bf16",
+                            "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16",
+                            "engineVaeCudaBf16MathPolicy": M4_POLICY},
+                "measured": {"peakBytes": 1, "stages": stages},
+            }
+            record.write_text(json.dumps(body), encoding="utf-8")
+            new_policy = "fixed_order_bf16_convolution_v1"
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                control.verify_record(record, "cuda", "strict-bf16-standard", new_policy)
+            body["outcome"]["engineVaeCudaBf16MathPolicy"] = new_policy
+            record.write_text(json.dumps(body), encoding="utf-8")
+            self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-standard", new_policy)
+                             ["effective_vae_cuda_bf16_math_policy"], new_policy)
+            body["caseId"] = control.case_id("metal", "strict-bf16-standard")
+            body["backend"] = "metal"
+            record.write_text(json.dumps(body), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "present on another backend"):
+                control.verify_record(record, "metal", "strict-bf16-standard", new_policy)
+
+    def test_m5_policy_requires_verified_clean_source_and_pin(self):
+        self.assertEqual(control.SUPPORTED_RUNTIME_POLICIES[M5_SHA], M5_POLICY)
+        self.assertEqual(control.SUPPORTED_RUNTIME_POLICIES[M4_SHA],
+                         "disallow_reduced_precision_reduction_v1")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, engine, evidence = (root / name for name in ("app", "engine", "evidence"))
+            for path in (app, engine, evidence):
+                path.mkdir()
+            app_sha, control_sha = "a" * 40, "c" * 40
+            source_control = MODULE_PATH.parents[2]
+            pin = app / "Cargo.toml"
+            pin.write_text(
+                f'candle-kernels = {{ git = "https://github.com/SceneWorks/inference", rev = "{M5_SHA}" }}\n',
+                encoding="utf-8",
+            )
+            checked_out = {app: app_sha, engine: M5_SHA, source_control: control_sha}
+            dirty = set()
+
+            def fake_git(path, *args):
+                return checked_out[path] if args[0] == "rev-parse" else (" M changed" if path in dirty else "")
+
+            with patch.dict("os.environ", {"GITHUB_SHA": control_sha}), patch.object(
+                control, "git", side_effect=fake_git
+            ):
+                source = control.verify_sources(app, engine, source_control,
+                                                app_sha, M5_SHA, control_sha)
+                (evidence / "sources.json").write_text(json.dumps(source), encoding="utf-8")
+                self.assertEqual(control.verified_runtime_policy(app, engine, evidence),
+                                 (M5_SHA, M5_POLICY))
+
+                dirty.add(engine)
+                with self.assertRaisesRegex(ValueError, "engine checkout is dirty"):
+                    control.verified_runtime_policy(app, engine, evidence)
+                dirty.clear()
+                pin.write_text(pin.read_text(encoding="utf-8").replace(M5_SHA, M4_SHA),
+                               encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "pin"):
+                    control.verified_runtime_policy(app, engine, evidence)
+                pin.write_text(pin.read_text(encoding="utf-8").replace(M4_SHA, M5_SHA),
+                               encoding="utf-8")
+                (evidence / "sources.json").write_text(
+                    json.dumps({**source, "control_sha": "d" * 40}), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, "workflow control SHA"):
+                    control.verified_runtime_policy(app, engine, evidence)
+
+                unknown_sha = "e" * 40
+                checked_out[engine] = unknown_sha
+                pin.write_text(pin.read_text(encoding="utf-8").replace(M5_SHA, unknown_sha),
+                               encoding="utf-8")
+                unknown_source = control.verify_sources(app, engine, source_control,
+                                                        app_sha, unknown_sha, control_sha)
+                (evidence / "sources.json").write_text(json.dumps(unknown_source), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "unsupported engine revision"):
+                    control.verified_runtime_policy(app, engine, evidence)
+
+    def test_m5_cuda_bf16_record_refuses_old_unknown_or_leaked_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            for name in ("strict-bf16-standard", "strict-bf16-legacy",
+                         "strict-bf16-q8-standard", "strict-bf16-q4-standard"):
+                _, case_name, decoder, policy, model_dtype, vae_dtype = control.CASES[name]
+                body = {
+                    "caseId": control.case_id("cuda", name), "backend": "cuda",
+                    "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae" + ("-legacy" if decoder == "legacy" else "")}},
+                    "request": {"name": case_name, "computePolicy": policy},
+                    "admission": {"outcome": "admitted"},
+                    "outcome": {"status": "completed", "engineComputePolicy": policy,
+                                "engineModelDtype": model_dtype, "engineVaeDtype": vae_dtype,
+                                "engineVaeCudaBf16MathPolicy": M5_POLICY},
+                    "measured": {"peakBytes": 1, "stages": {
+                        stage: {"peakBytes": 1, "samples": 1} for stage in control.STAGES}},
+                }
+
+                def check(backend="cuda"):
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    return control.verify_record(record, backend, name, M5_POLICY)
+
+                with self.subTest(name=name):
+                    self.assertEqual(check()["effective_vae_cuda_bf16_math_policy"], M5_POLICY)
+                    del body["outcome"]["engineVaeCudaBf16MathPolicy"]
+                    with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                        check()
+                    for wrong in (M4_POLICY, "unknown_policy"):
+                        body["outcome"]["engineVaeCudaBf16MathPolicy"] = wrong
+                        with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                            check()
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = M5_POLICY
+
+            body["caseId"] = control.case_id("metal", name)
+            body["backend"] = "metal"
+            with self.assertRaisesRegex(ValueError, "present on another backend"):
+                check("metal")
+            del body["outcome"]["engineVaeCudaBf16MathPolicy"]
+            self.assertIsNone(check("metal")["effective_vae_cuda_bf16_math_policy"])
+
+            name = "strict-fp32-standard"
+            _, case_name, _, policy, model_dtype, vae_dtype = control.CASES[name]
+            body["caseId"] = control.case_id("cuda", name)
+            body["backend"] = "cuda"
+            body["request"] = {"name": case_name, "computePolicy": policy}
+            body["outcome"].update(engineComputePolicy=policy, engineModelDtype=model_dtype,
+                                   engineVaeDtype=vae_dtype)
+            self.assertIsNone(check()["effective_vae_cuda_bf16_math_policy"])
+            body["outcome"]["engineVaeCudaBf16MathPolicy"] = M5_POLICY
+            with self.assertRaisesRegex(ValueError, "present on another backend"):
+                check()
+
     def test_busy_cuda_preflight_refuses_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence"
             census = types.SimpleNamespace(cuda_physical_census=lambda: ("typed pmon rows", ["123 C worker"]),
                                            metal_census=lambda: ("", []),
+                                           physical_busy_message=lambda raw, busy, context: f"{context}: {busy}",
                                            retain_cuda_physical_evidence=lambda *_: [],
                                            retain_reviewed_baseline=lambda *_: [])
             with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
@@ -166,9 +416,33 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertFalse(record["admitted"])
             self.assertEqual(record["competing_processes"], ["123 C worker"])
 
+    def test_cuda_preflight_surfaces_original_physical_refusal(self):
+        proof_spec = importlib.util.spec_from_file_location(
+            "physical_message_control", MODULE_PATH.with_name("yue2_precision_proof.py"))
+        proof = importlib.util.module_from_spec(proof_spec)
+        proof_spec.loader.exec_module(proof)
+        raw = json.dumps({"commandExit": 0, "refusal": "adapterDedicated rose over reviewed baseline"})
+        busy = ["0 38212 C+G - - ChatGPT.exe"]
+        census = types.SimpleNamespace(cuda_physical_census=lambda: (raw, busy),
+                    metal_census=Mock(), physical_busy_message=proof.physical_busy_message,
+                    retain_cuda_physical_evidence=Mock(), retain_reviewed_baseline=Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence"
+            with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
+                 patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)):
+                with self.assertRaisesRegex(ValueError, "adapterDedicated rose over reviewed baseline"):
+                    control.preflight("cuda", evidence, "before-test")
+            record = json.loads((evidence / "preflight-before-test.json").read_text(encoding="utf-8"))
+            self.assertFalse(record["admitted"])
+            self.assertEqual(record["competing_processes"], busy)
+            self.assertEqual(record["census"], raw)
+            census.retain_cuda_physical_evidence.assert_not_called()
+            census.metal_census.assert_not_called()
+
     def test_cuda_initial_preflight_refuses_short_owner_window_before_capture(self):
         with tempfile.TemporaryDirectory() as directory:
             census = types.SimpleNamespace(cuda_physical_census=Mock(), metal_census=Mock(),
+                                           physical_busy_message=Mock(),
                                            retain_cuda_physical_evidence=Mock(),
                                            retain_reviewed_baseline=Mock())
             guard = types.SimpleNamespace(require_remaining_window=Mock(
@@ -180,7 +454,7 @@ class PrecisionControlTests(unittest.TestCase):
             guard.require_remaining_window.assert_called_once_with(480 * 60 + 600)
             census.cuda_physical_census.assert_not_called()
 
-    def test_seven_case_verdict_requires_final_physical_release_census(self):
+    def test_eight_cuda_case_verdict_requires_final_physical_release_census(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cases = root / "cases"
@@ -191,6 +465,7 @@ class PrecisionControlTests(unittest.TestCase):
                 if label == "after-cases":
                     raise ValueError("post-case physical owner changed")
             with patch.object(control, "preflight", side_effect=preflight), \
+                 patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)), \
                  patch.object(control.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)), \
                  patch.object(control, "verify_record"), \
                  patch.object(control, "verify_audio", return_value={"sha256": "a" * 64}), \
@@ -199,7 +474,7 @@ class PrecisionControlTests(unittest.TestCase):
                     control.run_captures(root, root, root / "data", root / "profile",
                                          root / "evidence", cases, "cuda")
                 collect.assert_not_called()
-            self.assertEqual(len([label for label in labels if label.startswith("before-")]), 7)
+            self.assertEqual(len([label for label in labels if label.startswith("before-")]), 8)
             self.assertEqual(labels[-1], "after-cases")
             self.assertTrue((root / "evidence" / "cases-manifest.json").is_file())
 
@@ -232,7 +507,8 @@ class PrecisionControlTests(unittest.TestCase):
             profile = root / "profile"
             evidence = root / "evidence"
             wav = b"RIFF" + (48).to_bytes(4, "little") + b"WAVE" + b"\0" * 48
-            for name, (_, case_name, decoder, policy, model_dtype, vae_dtype) in control.CASES.items():
+            for name in control.names_for_backend("cuda"):
+                _, case_name, decoder, policy, model_dtype, vae_dtype = control.CASES[name]
                 run = profile / control.case_id("cuda", name).replace(":", "__") / "run"
                 run.mkdir(parents=True)
                 (run / "audio.wav").write_bytes(wav)
@@ -248,11 +524,18 @@ class PrecisionControlTests(unittest.TestCase):
                         stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
                 }
                 if policy == "bf16":
-                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = "disallow_reduced_precision_reduction_v1"
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = M4_POLICY
+                if name == "experimental-fp8-auto":
+                    body["request"]["arMode"] = "experimentalFp8"
+                    body["outcome"]["engineQuantization"] = "fp8"
+                    body["admission"]["estimate"] = {"weights": {"hostBytes": 2 * 1024 ** 3}}
                 (run.parent / "record.json").write_text(json.dumps(body), encoding="utf-8")
-            verdict = control.collect(profile, evidence, "cuda")
-            self.assertEqual(len(verdict["listening_audio"]), 7)
-            self.assertEqual(len(json.loads((evidence / "audio-inventory.json").read_text(encoding="utf-8"))["cases"]), 7)
+            with patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)):
+                verdict = control.collect(profile, evidence, "cuda", root, root)
+            self.assertEqual(len(verdict["listening_audio"]), 8)
+            self.assertEqual(verdict["engine_sha"], M4_SHA)
+            self.assertEqual(verdict["expected_cuda_bf16_vae_math_policy"], M4_POLICY)
+            self.assertEqual(len(json.loads((evidence / "audio-inventory.json").read_text(encoding="utf-8"))["cases"]), 8)
             self.assertEqual(list(evidence.rglob("*.wav")), [])
 
     def test_wav_artifacts_use_only_fresh_run_owned_profile_glob(self):

@@ -18,11 +18,11 @@ import re
 import subprocess
 import tempfile
 
-RUN_ID = "37106146499"
+RUN_ID = "37145909196"
 BASELINE_ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
-BASELINE_CONTROL_SHA = "3391f854565a5f5ea8eea48d4a8d9bad2e68c02d"
-BASELINE_DIGEST = "1b6f2d9588b2e25da62f22eec80d406a8b8aeea578d913aefb74e4cc971ae112"
-BASELINE_RUNNER = "cuda-windows-2"
+BASELINE_CONTROL_SHA = "e538120368ac279cc42176c44f9d88fa5af9c9b4"
+BASELINE_DIGEST = "d67f8d2c7cd79040bbe48ada71e6e27722237a3316bf622e69808ca341f77a2c"
+BASELINE_RUNNER = "cuda-windows"
 WINDOW = timedelta(hours=12)
 
 
@@ -306,6 +306,13 @@ def require_remaining_window(seconds: int) -> tuple[dict, Path]:
     return baseline, directory
 
 
+def diagnostic_file_pairs(directory: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Retain the original probe bytes and an exact decoded view of those bytes."""
+    files = {item.name: item.read_bytes() for item in sorted(directory.iterdir()) if item.is_file()}
+    return ({name: data.decode("utf-8-sig") for name, data in files.items()},
+            {name: base64.b64encode(data).decode("ascii") for name, data in files.items()})
+
+
 def census_mixed_context(pid: int, initial_pmon: str) -> tuple[str, bool]:
     baseline, _ = reviewed_baseline()
     require(pid == baseline["identity"][0], "unreviewed mixed-context PID")
@@ -318,12 +325,11 @@ def census_mixed_context(pid: int, initial_pmon: str) -> tuple[str, bool]:
                    "-File", str(script), "-TargetPid", str(pid), "-OutputDirectory", str(output),
                    "-EngineSha", runtime_engine_sha, "-ControlSha", os.environ["GITHUB_SHA"]]
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=180)
+        diagnostic_files, diagnostic_file_bytes = diagnostic_file_pairs(output)
         raw = {"initialPmon": initial_pmon, "reviewedBaseline": baseline,
                "commandExit": result.returncode,
-               "diagnosticFiles": {item.name: item.read_text(encoding="utf-8-sig")
-                                   for item in sorted(output.iterdir()) if item.is_file()},
-               "diagnosticFileBytesB64": {item.name: base64.b64encode(item.read_bytes()).decode("ascii")
-                                          for item in sorted(output.iterdir()) if item.is_file()}}
+               "diagnosticFiles": diagnostic_files,
+               "diagnosticFileBytesB64": diagnostic_file_bytes}
         try:
             require(result.returncode == 0, f"fresh WDDM counter probe failed: {result.stderr.strip()}")
             current = summarize(output, baseline=False, pid=pid, engine_sha=runtime_engine_sha,
