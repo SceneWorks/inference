@@ -4128,8 +4128,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         """Everything `test_qwen_image_2_1_mlx_lane_…` below binds, as a list of findings."""
         errors: list[str] = []
         inputs = workflow[True]["workflow_dispatch"]["inputs"]
-        if "qwen-image-2-1" not in inputs["profile"]["options"]:
-            errors.append("`qwen-image-2-1` is not a dispatchable profile")
+        if "qwen-image-2-1-lora-mlx" not in inputs["profile"]["options"]:
+            errors.append("`qwen-image-2-1-lora-mlx` is not a dispatchable profile")
         hook = inputs.get("qwen_image_2_1_third_party_lora")
         if hook is None or hook.get("default") != "" or hook.get("type") != "string":
             errors.append(
@@ -4138,7 +4138,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         job = workflow["jobs"].get("mlx-qwen-image-2-1")
         if job is None:
             return errors + ["no `mlx-qwen-image-2-1` job"]
-        if job["if"] != "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'":
+        # Its OWN profile: dispatching it must not also schedule the CUDA lane.
+        if job["if"] != (
+            "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'"
+        ):
             errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
         # The Qwen-Image weight-set label (nax-macos-2), never the privileged `real-weights` one.
         if job["runs-on"] != ["self-hosted", "macOS", "ARM64", "rw-mage"]:
@@ -4236,7 +4239,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(workflow, added))
         for mutate in (
             lambda job: job.update(
-                {"if": "inputs.profile == 'all' || inputs.profile == 'qwen-image-2-1'"}
+                {"if": "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'"}
             ),
             lambda job: job.update({"runs-on": ["self-hosted", "macOS", "ARM64", "real-weights"]}),
             lambda job: job["env"].update(

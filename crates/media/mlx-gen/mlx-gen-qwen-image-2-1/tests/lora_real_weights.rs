@@ -8,9 +8,9 @@
 //! * `QWEN_IMAGE_2_1_RENDER_OUT` — the evidence directory (PNGs, adapters, one JSON per test).
 //!
 //! Inference never self-fetches or derives a cache location (epic 13657): the dispatch-only
-//! `qwen-image-2-1` profile of `.github/workflows/real-weights.yml` (job `mlx-qwen-image-2-1`)
-//! materializes both snapshots and runs every test here by name, in this order — the stacking test
-//! consumes the two adapters the training tests write:
+//! `qwen-image-2-1-lora-mlx` profile of `.github/workflows/real-weights.yml` (job
+//! `mlx-qwen-image-2-1`) materializes both snapshots and runs every test here by name, in this
+//! order — the stacking test consumes the two adapters the training tests write:
 //!
 //! 1. [`t2i_lora_trains_reloads_and_moves_every_tier`] — a short text-to-image **LoRA** run on a
 //!    synthetic single-palette style, saved, reloaded through `LoadSpec::adapters`, and rendered
