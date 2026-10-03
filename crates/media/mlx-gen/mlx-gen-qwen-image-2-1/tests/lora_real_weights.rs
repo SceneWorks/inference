@@ -98,6 +98,14 @@ const RENDER_EDGE: u32 = 768;
 const RENDER_STEPS: u32 = 8;
 const SEED: u64 = 24163;
 const TRAIN_EDGE: u32 = 512;
+/// Learning rate of both training runs: the product presets' rate for every Qwen-Image 2.1 target
+/// (`qwen_image_2_1_lora.*` / `qwen_image_2_1_edit_lora.*` balanced = 1e-4). The first real-weight
+/// run (inference run 37122808826) trained the T2I LoRA at 1e-3 and DIVERGED within five AdamW
+/// updates — loss 0.26 / 0.06 / 0.23 at steps 1-3, then 4.77 and 8.02 at steps 6-7, then a flat
+/// ~1.7-1.9 (the "predict nothing" level of a flow-matching velocity) to step 100 — and its adapter
+/// rendered the same white field with green blobs at every tier (pixel std 35.7 vs the base's 77.4,
+/// mean |Δ| 134/255, palette fraction 0.00003). The evidence trains at the rate a user gets.
+const TRAIN_LR: f32 = 1e-4;
 const T2I_ADAPTER: &str = "qwen21_t2i_lora.safetensors";
 const EDIT_ADAPTER: &str = "qwen21_edit_lokr.safetensors";
 
@@ -274,6 +282,28 @@ fn static_row_fraction(img: &Image) -> f64 {
         })
         .count();
     rows as f64 / img.height.max(1) as f64
+}
+
+/// Mean RGB distance from each pixel to its nearest [`PALETTE`] colour — the continuous twin of
+/// [`palette_fraction`]: it moves with every partial shift toward the style, not only once a pixel
+/// lands inside [`PALETTE_RADIUS`].
+fn palette_distance(img: &Image) -> f64 {
+    let px = img.pixels.chunks_exact(3);
+    let n = px.len().max(1) as f64;
+    px.map(|px| {
+        PALETTE
+            .iter()
+            .map(|c| {
+                px.iter()
+                    .zip(c)
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .fold(f64::INFINITY, f64::min)
+    })
+    .sum::<f64>()
+        / n
 }
 
 fn palette_fraction(img: &Image) -> f64 {
@@ -519,7 +549,7 @@ struct Trained {
 /// Run `req` on a fresh trainer through the registry, recording the caching-phase and the
 /// step-phase MLX peaks separately (the phases never overlap), the losses and the wall time; copy
 /// the adapter to `canonical` if the trainer wrote it elsewhere.
-fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path) -> Trained {
+fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: u32) -> Trained {
     let (predicted_message, predicted_train_gib) = predicted_training_footprint(req);
     eprintln!("preflight (forced 1 KiB budget): {predicted_message}");
 
@@ -534,21 +564,68 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path) -> Trained 
     let started = Instant::now();
     let mut losses: Vec<f32> = Vec::new();
     let mut caching_peaks: Option<(u64, u64)> = None;
+    // MLX active memory right after step 1 returns: the run's resident set (DiT + adapter and
+    // optimizer state + caches) with no step in flight. `train_peak − resident` is the step's own
+    // transient, so an under-prediction splits into "resident" vs "working set".
+    let mut resident_after_first_step: Option<u64> = None;
+    let mut samples: Vec<Value> = Vec::new();
     let output = trainer
         .train(req, &mut |p| {
-            if let TrainingProgress::Training { step, loss, .. } = p {
-                if caching_peaks.is_none() {
-                    // First step reported: everything before it was the staged caching.
-                    caching_peaks = Some(guard.end());
-                    guard.begin();
+            let memory = || {
+                (
+                    mlx_rs::memory::get_active_memory() as u64,
+                    mlx_rs::memory::get_cache_memory() as u64,
+                    mlx_rs::memory::get_peak_memory() as u64,
+                    phys_footprint().0,
+                )
+            };
+            match p {
+                TrainingProgress::Training { step, loss, .. } => {
+                    if caching_peaks.is_none() {
+                        // First step reported: everything before it was the staged caching (and
+                        // step 1 itself).
+                        caching_peaks = Some(guard.end());
+                        resident_after_first_step =
+                            Some(mlx_rs::memory::get_active_memory() as u64);
+                        guard.begin();
+                    }
+                    losses.push(loss);
+                    if step == 1 || step % log_every == 0 {
+                        let (active, cache, peak, footprint) = memory();
+                        eprintln!(
+                            "step {step}: loss {loss:.4} ({:.0}s) active={:.2} cache={:.2} \
+                             phase_peak={:.2} footprint={:.2} GiB",
+                            started.elapsed().as_secs_f64(),
+                            gib(active),
+                            gib(cache),
+                            gib(peak),
+                            gib(footprint)
+                        );
+                        samples.push(json!({
+                            "step": step,
+                            "loss": loss,
+                            "seconds": started.elapsed().as_secs_f64(),
+                            "activeBytes": active,
+                            "cacheBytes": cache,
+                            "phasePeakBytes": peak,
+                            "physFootprintBytes": footprint,
+                        }));
+                    }
                 }
-                losses.push(loss);
-                if step % 10 == 0 {
+                TrainingProgress::Preparing
+                | TrainingProgress::LoadingModel
+                | TrainingProgress::Caching { .. } => {
+                    let (active, cache, peak, footprint) = memory();
                     eprintln!(
-                        "step {step}: loss {loss:.4} ({:.0}s)",
-                        started.elapsed().as_secs_f64()
+                        "{p:?} ({:.0}s) active={:.2} cache={:.2} peak={:.2} footprint={:.2} GiB",
+                        started.elapsed().as_secs_f64(),
+                        gib(active),
+                        gib(cache),
+                        gib(peak),
+                        gib(footprint)
                     );
                 }
+                _ => {}
             }
         })
         .unwrap_or_else(|e| panic!("training failed: {e}"));
@@ -557,6 +634,7 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path) -> Trained 
     drop(trainer);
     mlx_rs::memory::clear_cache();
     let (caching_peak, caching_footprint) = caching_peaks.unwrap_or((0, 0));
+    let resident = resident_after_first_step.unwrap_or(0);
 
     if output.adapter_path != canonical {
         std::fs::copy(&output.adapter_path, canonical).unwrap_or_else(|e| {
@@ -587,6 +665,9 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path) -> Trained 
         "cachingPhysFootprintMaxBytes": caching_footprint,
         "trainMlxActivePeakBytes": train_peak,
         "trainPhysFootprintMaxBytes": train_footprint,
+        "residentAfterFirstStepBytes": resident,
+        "stepTransientPeakBytes": train_peak.saturating_sub(resident),
+        "stepSamples": samples,
         "predictedPreflight": predicted_message,
         "predictedTrainPhaseGiB": predicted_train_gib,
         "metadata": metadata,
@@ -681,7 +762,8 @@ fn t2i_request() -> GenerationRequest {
 /// nondeterminism). The run itself must complete every step with finite losses, carry the 2.1
 /// provenance, and peak inside its own preflight's derived train phase.
 ///
-/// `QWEN_IMAGE_2_1_LORA_T2I_STEPS` (default 100) scales the run without a code edit.
+/// `QWEN_IMAGE_2_1_LORA_T2I_STEPS` (default 300 — at the product rate [`TRAIN_LR`]; ~1.5 s a step
+/// on an M5 Max at 512 px) scales the run without a code edit.
 #[test]
 #[ignore]
 fn t2i_lora_trains_reloads_and_moves_every_tier() {
@@ -715,13 +797,13 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
             )
         })
         .collect();
-    let steps = env_u32("QWEN_IMAGE_2_1_LORA_T2I_STEPS", 100);
+    let steps = env_u32("QWEN_IMAGE_2_1_LORA_T2I_STEPS", 300);
     let req = TrainingRequest {
         items,
         config: TrainingConfig {
             rank: 16,
             alpha: 16.0,
-            learning_rate: 1e-3,
+            learning_rate: TRAIN_LR,
             steps,
             gradient_checkpointing: true,
             resolution: TRAIN_EDGE,
@@ -736,7 +818,7 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
-    let trained = train(&req, &guard, &adapters.join(T2I_ADAPTER));
+    let trained = train(&req, &guard, &adapters.join(T2I_ADAPTER), 10);
 
     let request = t2i_request();
     let mut cases = Vec::new();
@@ -774,6 +856,8 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
             "meanAbsDiff": mean_abs_diff(&adapted, &base),
             "paletteFractionBase": palette_fraction(&base),
             "paletteFractionAdapted": palette_fraction(&adapted),
+            "paletteDistanceBase": palette_distance(&base),
+            "paletteDistanceAdapted": palette_distance(&adapted),
             "scale0IdenticalToBase": zero.as_ref().map(|(img, _)| img.pixels == base.pixels),
         }));
         images.push((tier, base, adapted));
@@ -859,7 +943,7 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
         config: TrainingConfig {
             rank: 16,
             alpha: 16.0,
-            learning_rate: 1e-3,
+            learning_rate: TRAIN_LR,
             steps,
             gradient_checkpointing: true,
             resolution: TRAIN_EDGE,
@@ -874,7 +958,7 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
-    let trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER));
+    let trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
 
     // The held-out edit: a source the run never saw, the same key, the same instruction.
     let eval_src = edit_source(99, RENDER_EDGE);
