@@ -183,11 +183,17 @@ pub enum KvCacheFallbackReason {
     /// The generation started compressed and the cache explicitly transitioned to dense part-way
     /// (for example a reader dispatch fault); the backend's detail names the operation.
     RuntimeFallback,
+    /// The generation ran on a paged compressed cache that kept its history compressed, but some
+    /// attention calls were outside the fused paged reader (an additive mask, an attention scale
+    /// or shape it does not implement, a caller that needs dense K/V) and were served by the
+    /// cache's dense gather fallback: the sequence's pages dequantized for that one call. The
+    /// backend's detail names each reason and its call count.
+    DenseGather,
 }
 
 impl KvCacheFallbackReason {
     /// Every reason, in declaration order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::PolicyDisabled,
         Self::UnqualifiedModel,
         Self::UnsupportedRequest,
@@ -197,6 +203,7 @@ impl KvCacheFallbackReason {
         Self::UnsupportedGeometry,
         Self::ReaderUnavailable,
         Self::RuntimeFallback,
+        Self::DenseGather,
     ];
 
     /// Stable lower-case label a product renders as-is.
@@ -211,6 +218,7 @@ impl KvCacheFallbackReason {
             Self::UnsupportedGeometry => "unsupported_geometry",
             Self::ReaderUnavailable => "reader_unavailable",
             Self::RuntimeFallback => "runtime_fallback",
+            Self::DenseGather => "dense_gather",
         }
     }
 }
@@ -285,6 +293,9 @@ pub struct KvCacheCounters {
     pub dense_fallback_events: u64,
     /// Full-cache dense reconstructions (a dense transition rebuilding resident history).
     pub full_cache_dequantizations: u64,
+    /// Attention calls a paged compressed cache served through its dense gather fallback; each
+    /// dequantized that sequence's pages for the one call and kept nothing dense afterwards.
+    pub dense_gather_fallbacks: u64,
     /// Device bytes the compressed representation retained at the end of the generation (codes,
     /// scale/zero metadata and the bounded not-yet-quantized residual).
     pub compressed_cache_bytes: u64,
@@ -584,6 +595,7 @@ mod tests {
             KvCacheFallbackReason::PolicyDisabled.id(),
             "policy_disabled"
         );
+        assert_eq!(KvCacheFallbackReason::DenseGather.id(), "dense_gather");
         assert_eq!(
             KvCompressionFormat::GroupAffineK8V8.id(),
             "group-affine-k8v8"

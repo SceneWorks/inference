@@ -65,8 +65,8 @@ use crate::primitives::quant::{QuantizedEmbedding, QuantizedLinear};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{
     select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
-    ContiguousKvCache, DecoderCacheSelection, PackedCacheRequest, PagedKvCache, Weights,
-    PACKED_METAL_QUANT_GROUP_SIZE,
+    ContiguousKvCache, DecoderCacheSelection, PackedCacheRequest, PagedCacheRequest,
+    PagedCacheSelection, PagedKvCache, Weights, PACKED_METAL_QUANT_GROUP_SIZE,
 };
 
 /// Cached decode runs in bf16 (matching the reference engines).
@@ -488,6 +488,15 @@ impl CausalLm {
     /// `block_size`-token blocks.
     pub fn new_paged_cache(&self, block_size: usize) -> PagedKvCache {
         PagedKvCache::new(self.cfg.num_layers, block_size)
+    }
+
+    /// A single-sequence paged cache under the compressed-KV policy (sc-20680): with the
+    /// qualified opt-in, a request the qualification table admits runs on K8V8 pages of
+    /// `request.packed_pool` read in place by the fused paged reader; every other request runs the
+    /// established dense [`PagedKvCache`] on `request.dense_pool`, with its reason in
+    /// [`PagedCacheSelection::report`].
+    pub fn select_paged_cache(&self, request: PagedCacheRequest<'_>) -> PagedCacheSelection {
+        crate::kv_policy::select_paged_cache(self, request)
     }
 
     /// The engine's cached-decode compute dtype (bf16): activations, logits and the K/V cache.
