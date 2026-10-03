@@ -33,9 +33,14 @@ HOLDER_NAME = "Decode-speedups benchmark campaign (Candle/CUDA)"
 HOLDER_RUNNER = "cuda-windows-2"
 IS_WINDOWS = os.name == "nt"
 API_TIMEOUT = 3
+# Cold Windows PowerShell startup + CIM/AuthCode + one 1s counter sample.
+# This is a bounded harness query, not a waiver of identity/activity evidence.
+PHYSICAL_QUERY_TIMEOUT = 15
 POLL_SECONDS = 10
 METADATA_SECONDS = 60
-CYCLE_LIMIT_SECONDS = 15
+# Full metadata: four HTTP calls, one pmon, at most two Windows queries
+# (app lineage and signed background), plus bounded processing overhead.
+CYCLE_LIMIT_SECONDS = 5 * API_TIMEOUT + 2 * PHYSICAL_QUERY_TIMEOUT + 10
 SOURCE_HASHES = {
     ".github/workflows/real-weights.yml": "6d586177edd06a208d0bc72ed86e16eb207e2bf82b2c259ff7217a1d8a21f757",
     "scripts/ci/real-weights/candle-decode-speedups-bench/run-every-matrix-row.cmd": "157eb7ad92dcb1330e9dcbf8194ead42a262baf2723a3ab0b0f21a15b8a64756",
@@ -117,7 +122,7 @@ def owned_descendants(root_pid: int, record=None) -> set[int]:
     # Parent-chain ownership only; no executable-name whitelist or foreign signals.
     result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                              "Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,@{Name='CreatedUtc';Expression={if ($_.CreationDate) {$_.CreationDate.ToUniversalTime().ToString('o')} else {$null}}} | ConvertTo-Json -Compress"],
-                            capture_output=True, text=True, encoding="utf-8", timeout=API_TIMEOUT)
+                            capture_output=True, text=True, encoding="utf-8", timeout=PHYSICAL_QUERY_TIMEOUT)
     require(result.returncode == 0, "owned descendant census failed")
     rows = json.loads(result.stdout)
     require(isinstance(rows, list), "incomplete descendant census")
@@ -195,7 +200,7 @@ $samples = @($set.CounterSamples | Where-Object {$_.InstanceName -match '(^|_)pi
   counter=@{counter='\GPU Engine(*)\Utilization Percentage'; timestamp=[string]$set.Timestamp; samples=$samples}} | ConvertTo-Json -Depth 8 -Compress
 """
     result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                            capture_output=True, text=True, encoding="utf-8", timeout=API_TIMEOUT)
+                            capture_output=True, text=True, encoding="utf-8", timeout=PHYSICAL_QUERY_TIMEOUT)
     if record is not None:
         record({"event": "background_activity", "returncode": result.returncode,
                 "raw": result.stdout, "stderr": result.stderr})
@@ -401,6 +406,7 @@ class OwnerGuard:
                 "holder_run_id": HOLDER_RUN, "holder_job_id": HOLDER_JOB, "holder_attempt": 1,
                 "holder_sha": HOLDER_SHA, "proof_job": self.proof_job, "fault": self.fault,
                 "poll_seconds": POLL_SECONDS, "api_timeout_seconds": API_TIMEOUT,
+                "physical_query_timeout_seconds": PHYSICAL_QUERY_TIMEOUT,
                 "cycle_limit_seconds": CYCLE_LIMIT_SECONDS,
                 "metadata_interval_seconds": METADATA_SECONDS,
                 "maximum_group_detection_seconds": METADATA_SECONDS + POLL_SECONDS + CYCLE_LIMIT_SECONDS,

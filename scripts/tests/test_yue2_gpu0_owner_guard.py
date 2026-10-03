@@ -189,10 +189,68 @@ class OwnerGuardTests(unittest.TestCase):
     def test_bounded_background_probe_uses_collector_schema_and_retains_failure_raw(self):
         with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=json.dumps(background_sample()), stderr="")) as probe:
             guard.sample_background(background())
-            self.assertEqual(probe.call_args.kwargs["timeout"], guard.API_TIMEOUT)
+            self.assertEqual(probe.call_args.kwargs["timeout"], guard.PHYSICAL_QUERY_TIMEOUT)
             self.assertIn("Get-Counter", probe.call_args.args[0][-1])
         with patch.object(guard.subprocess, "run", return_value=Mock(returncode=1, stdout="", stderr="missing counters")), self.assertRaises(RuntimeError):
             guard.sample_background(background())
+
+    def test_cold_physical_queries_have_independent_bounded_budget(self):
+        self.assertEqual(guard.API_TIMEOUT, 3)
+        self.assertEqual(guard.PHYSICAL_QUERY_TIMEOUT, 15)
+        self.assertEqual(guard.CYCLE_LIMIT_SECONDS, 55)
+        def cold_query(argv, **kwargs):
+            # A four-second cold start exceeded the original API-derived bound.
+            if kwargs["timeout"] < 4:
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            self.assertEqual(kwargs["timeout"], 15)
+            if "Get-AuthenticodeSignature" in argv[-1]:
+                self.assertIn("-SampleInterval 1 -MaxSamples 1", argv[-1])
+                output = background_sample()
+            else:
+                output = [{"ProcessId": 777, "ParentProcessId": 10,
+                           "CreatedUtc": "2026-10-03T10:00:00Z"}]
+            return Mock(returncode=0, stdout=json.dumps(output), stderr="")
+        with patch.object(guard.subprocess, "run", side_effect=cold_query):
+            guard.sample_background(background())
+            self.assertEqual(guard.owned_descendants(777), {777})
+
+    def test_physical_query_timeout_before_launch_never_creates_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            owner = guard.OwnerGuard(evidence, guard.ENGINE, "a" * 40, "app")
+            with patch.dict(os.environ, {"EXPECTED_ENGINE_SHA": guard.ENGINE, "EXPECTED_CONTROL_SHA": "a" * 40}), \
+                 patch.object(guard, "OwnerGuard", return_value=owner), \
+                 patch.object(owner, "_preflight", side_effect=lambda: guard.sample_background(background())), \
+                 patch.object(guard.subprocess, "run", side_effect=subprocess.TimeoutExpired("powershell", 15)), \
+                 patch.object(guard.subprocess, "Popen") as launch:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    guard.guarded_command(["node", "unchanged-case"], evidence, {}, None, evidence, "case")
+            launch.assert_not_called()
+            self.assertIn("preflight_refusal", owner.path.read_text(encoding="utf-8"))
+
+    def test_physical_query_timeout_during_child_refuses_and_reaps_own_tree(self):
+        child = Owned()
+        def query_or_reap(argv, **kwargs):
+            if argv[0] == "powershell":
+                self.assertEqual(kwargs["timeout"], 15)
+                raise subprocess.TimeoutExpired(argv, 15)
+            self.assertEqual(argv, ["taskkill", "/PID", "777", "/T", "/F"])
+            child.code = -9
+            return Mock(returncode=0)
+        with tempfile.TemporaryDirectory() as directory:
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40)
+            with patch.object(owner, "holder", side_effect=lambda *_: guard.sample_background(background())), \
+                 patch.object(guard.subprocess, "run", side_effect=query_or_reap) as calls:
+                owner.start(child)
+                self.assertTrue(owner.failed.wait(1))
+                code, timed_out, error = guard.wait(child, owner, 100)
+                self.assertEqual(code, -9)
+                self.assertFalse(timed_out)
+                self.assertIn("15 seconds", error)
+                with self.assertRaises(RuntimeError): owner.finish()
+                self.assertEqual(sum(call.args[0][0] == "taskkill" for call in calls.call_args_list), 1)
+            self.assertFalse(owner.thread.is_alive())
+            self.assertFalse(owner.signals)
 
     def test_descendants_are_parent_chain_only_not_names(self):
         rows = [{"ProcessId": 777, "ParentProcessId": 10}, {"ProcessId": 888, "ParentProcessId": 777},
@@ -430,8 +488,8 @@ class OwnerGuardTests(unittest.TestCase):
             summary = owner.summary()
             self.assertEqual(summary["acceptance"], "provisional-holder-chronology")
             self.assertIn("completed_at strictly after proof job completed_at", summary["final_acceptance_requires"])
-            self.assertEqual(summary["maximum_detection_seconds"], 25)
-            self.assertEqual(summary["maximum_group_detection_seconds"], 85)
+            self.assertEqual(summary["maximum_detection_seconds"], 65)
+            self.assertEqual(summary["maximum_group_detection_seconds"], 125)
             self.assertEqual(summary["steady_requests_per_hour_upper_bound"], 540)
 
 
