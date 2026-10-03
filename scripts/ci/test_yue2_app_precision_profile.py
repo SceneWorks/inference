@@ -19,31 +19,38 @@ spec.loader.exec_module(control)
 
 
 class PrecisionControlTests(unittest.TestCase):
-    def test_seven_fixed_cases_copy_outside_repo_and_only_change_backend_id(self):
+    def test_eight_cuda_cases_and_seven_metal_cases_keep_exact_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             templates = MODULE_PATH.parent / "yue2-app-precision-cases"
-            prepared = control.prepare_cases(templates, root / "metal-cases", "metal")
-            self.assertEqual(len(prepared["cases"]), 7)
-            for name in control.NAMES:
-                original = json.loads((templates / f"{name}.json").read_text(encoding="utf-8"))
-                copied = json.loads((root / "metal-cases" / f"{name}.json").read_text(encoding="utf-8"))
-                self.assertEqual(copied.pop("id"), original.pop("id").replace(":cuda:", ":metal:"))
-                self.assertEqual(copied, original)
-            with self.assertRaisesRegex(ValueError, "already exists"):
-                control.prepare_cases(templates, root / "metal-cases", "metal")
+            for backend, count in (("cuda", 8), ("metal", 7)):
+                destination = root / f"{backend}-cases"
+                prepared = control.prepare_cases(templates, destination, backend)
+                self.assertEqual(len(prepared["cases"]), count)
+                self.assertEqual([row["name"] for row in prepared["cases"]],
+                                 list(control.names_for_backend(backend)))
+                for name in control.names_for_backend(backend):
+                    original = json.loads((templates / f"{name}.json").read_text(encoding="utf-8"))
+                    copied = json.loads((destination / f"{name}.json").read_text(encoding="utf-8"))
+                    self.assertEqual(copied.pop("id"), original.pop("id").replace(":cuda:", f":{backend}:"))
+                    self.assertEqual(copied, original)
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    control.prepare_cases(templates, destination, backend)
+            self.assertFalse((root / "metal-cases" / "experimental-fp8-auto.json").exists())
 
     def test_changed_fixed_source_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            root.joinpath("templates").mkdir()
-            for name in control.NAMES:
-                source = MODULE_PATH.parent / "yue2-app-precision-cases" / f"{name}.json"
-                root.joinpath("templates", f"{name}.json").write_bytes(source.read_bytes())
-            target = root / "templates" / "strict-bf16-standard.json"
-            target.write_text(target.read_text(encoding="utf-8").replace("831004", "831005"), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "changed"):
-                control.prepare_cases(root / "templates", root / "cases", "cuda")
+            for changed_name in ("strict-bf16-standard", "experimental-fp8-auto"):
+                templates = root / changed_name
+                templates.mkdir()
+                for name in control.NAMES:
+                    source = MODULE_PATH.parent / "yue2-app-precision-cases" / f"{name}.json"
+                    (templates / f"{name}.json").write_bytes(source.read_bytes())
+                target = templates / f"{changed_name}.json"
+                target.write_text(target.read_text(encoding="utf-8").replace("831004", "831005"), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    control.prepare_cases(templates, root / f"cases-{changed_name}", "cuda")
 
     def test_effective_dtype_and_decoder_are_proven_from_record(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -113,6 +120,57 @@ class PrecisionControlTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "present on another backend"):
                         control.verify_record(record, backend, name)
 
+    def test_fp8_auto_record_requires_actual_fp8_and_retained_host_originals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            name = "experimental-fp8-auto"
+            body = {
+                "caseId": control.case_id("cuda", name), "backend": "cuda",
+                "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
+                "request": {"name": name, "computePolicy": "auto", "arMode": "experimentalFp8"},
+                "admission": {"outcome": "admitted", "estimate": {"weights": {"hostBytes": 2 * 1024 ** 3}}},
+                "outcome": {"status": "completed", "engineComputePolicy": "auto",
+                            "engineModelDtype": "bfloat16", "engineVaeDtype": "float32",
+                            "engineQuantization": "fp8"},
+                "measured": {"peakBytes": 1024, "stages": {
+                    stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
+            }
+            def check():
+                record.write_text(json.dumps(body), encoding="utf-8")
+                return control.verify_record(record, "cuda", name)
+            self.assertEqual(check()["effective_compute_policy"], "auto")
+            self.assertEqual(check()["effective_ar_quantization"], "fp8")
+            self.assertEqual(check()["host_original_bytes"], 2 * 1024 ** 3)
+            for field, value, error in (
+                ("arMode", "native", "record AR mode"),
+                ("computePolicy", "bf16", "record request name/policy"),
+            ):
+                original = body["request"][field]
+                body["request"][field] = value
+                with self.assertRaisesRegex(ValueError, error):
+                    check()
+                body["request"][field] = original
+            for field, value, error in (
+                ("engineQuantization", "bf16", "experimental FP8 AR did not execute"),
+                ("engineModelDtype", "float32", "effective engineModelDtype"),
+                ("engineVaeDtype", "bfloat16", "effective engineVaeDtype"),
+                ("engineVaeCudaBf16MathPolicy", "disallow_reduced_precision_reduction_v1",
+                 "present on another backend"),
+            ):
+                body["outcome"][field] = value
+                with self.assertRaisesRegex(ValueError, error):
+                    check()
+                if field == "engineVaeCudaBf16MathPolicy":
+                    del body["outcome"][field]
+                else:
+                    body["outcome"][field] = "fp8" if field == "engineQuantization" else (
+                        "bfloat16" if field == "engineModelDtype" else "float32")
+            body["admission"]["estimate"]["weights"]["hostBytes"] -= 1
+            with self.assertRaisesRegex(ValueError, "retained BF16 AR originals"):
+                check()
+            with self.assertRaisesRegex(ValueError, "unknown case/backend"):
+                control.verify_record(record, "metal", name)
+
     def test_exact_app_pin_and_clean_sources_required(self):
         with tempfile.TemporaryDirectory() as directory:
             app = Path(directory) / "app"
@@ -180,7 +238,7 @@ class PrecisionControlTests(unittest.TestCase):
             guard.require_remaining_window.assert_called_once_with(480 * 60 + 600)
             census.cuda_physical_census.assert_not_called()
 
-    def test_seven_case_verdict_requires_final_physical_release_census(self):
+    def test_eight_cuda_case_verdict_requires_final_physical_release_census(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cases = root / "cases"
@@ -199,7 +257,7 @@ class PrecisionControlTests(unittest.TestCase):
                     control.run_captures(root, root, root / "data", root / "profile",
                                          root / "evidence", cases, "cuda")
                 collect.assert_not_called()
-            self.assertEqual(len([label for label in labels if label.startswith("before-")]), 7)
+            self.assertEqual(len([label for label in labels if label.startswith("before-")]), 8)
             self.assertEqual(labels[-1], "after-cases")
             self.assertTrue((root / "evidence" / "cases-manifest.json").is_file())
 
@@ -232,7 +290,8 @@ class PrecisionControlTests(unittest.TestCase):
             profile = root / "profile"
             evidence = root / "evidence"
             wav = b"RIFF" + (48).to_bytes(4, "little") + b"WAVE" + b"\0" * 48
-            for name, (_, case_name, decoder, policy, model_dtype, vae_dtype) in control.CASES.items():
+            for name in control.names_for_backend("cuda"):
+                _, case_name, decoder, policy, model_dtype, vae_dtype = control.CASES[name]
                 run = profile / control.case_id("cuda", name).replace(":", "__") / "run"
                 run.mkdir(parents=True)
                 (run / "audio.wav").write_bytes(wav)
@@ -249,10 +308,14 @@ class PrecisionControlTests(unittest.TestCase):
                 }
                 if policy == "bf16":
                     body["outcome"]["engineVaeCudaBf16MathPolicy"] = "disallow_reduced_precision_reduction_v1"
+                if name == "experimental-fp8-auto":
+                    body["request"]["arMode"] = "experimentalFp8"
+                    body["outcome"]["engineQuantization"] = "fp8"
+                    body["admission"]["estimate"] = {"weights": {"hostBytes": 2 * 1024 ** 3}}
                 (run.parent / "record.json").write_text(json.dumps(body), encoding="utf-8")
             verdict = control.collect(profile, evidence, "cuda")
-            self.assertEqual(len(verdict["listening_audio"]), 7)
-            self.assertEqual(len(json.loads((evidence / "audio-inventory.json").read_text(encoding="utf-8"))["cases"]), 7)
+            self.assertEqual(len(verdict["listening_audio"]), 8)
+            self.assertEqual(len(json.loads((evidence / "audio-inventory.json").read_text(encoding="utf-8"))["cases"]), 8)
             self.assertEqual(list(evidence.rglob("*.wav")), [])
 
     def test_wav_artifacts_use_only_fresh_run_owned_profile_glob(self):

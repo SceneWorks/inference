@@ -1,0 +1,17 @@
+{
+  "id": "yue2:bf16:cuda:experimental-fp8-auto",
+  "tier": "bf16",
+  "decoder": "standard",
+  "computePolicy": "auto",
+  "request": {
+    "planning": "off",
+    "style": "indie pop, female vocal, acoustic guitar, bass, steady drums",
+    "lyrics": "[verse]\nMorning light, I hear your song\n\n[chorus]\nHold on, sing along",
+    "seed": 831004,
+    "semanticSampling": {
+      "minTokens": 200,
+      "maxTokens": 200
+    }
+  },
+  "arMode": "experimentalFp8"
+}

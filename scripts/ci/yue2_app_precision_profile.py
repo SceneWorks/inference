@@ -21,8 +21,10 @@ CASES = {
     "strict-bf16-q4-standard": ("q4", "strict-bf16-standard", "standard", "bf16", "bfloat16", "bfloat16"),
     "strict-fp32-q8-standard": ("q8", "strict-fp32-standard", "standard", "fp32", "float32", "float32"),
     "strict-fp32-q4-standard": ("q4", "strict-fp32-standard", "standard", "fp32", "float32", "float32"),
+    "experimental-fp8-auto": ("bf16", "experimental-fp8-auto", "standard", "auto", "bfloat16", "float32"),
 }
 NAMES = tuple(CASES)
+CUDA_ONLY_CASES = frozenset({"experimental-fp8-auto"})
 STAGES = ("load", "plan", "semantic", "acoustic", "decode")
 CASE_SOURCE_SHA256 = {
     "strict-bf16-standard": "a43f2b1c3f8c288a4963885a924a91c6449d8d654db8a0c59619fba74c7f88bc",
@@ -32,7 +34,13 @@ CASE_SOURCE_SHA256 = {
     "strict-bf16-q4-standard": "a5cdad80a36c95db51eca85961701f6b2ee4208c4ebbd5b244ef013e6bde3492",
     "strict-fp32-q8-standard": "68534c2b050e8147b804b7053c5b9b7b71ba18fa1377716d60d69c253525c4ba",
     "strict-fp32-q4-standard": "3162d290206e8c16e24c1361f6f5abbe1ee738e6652a08bf3da47ee12aba1910",
+    "experimental-fp8-auto": "56d5dee367c86ae4ff142dcd30c1f9a194201cddb4f0d4afad7440f15e4f36d7",
 }
+
+
+def names_for_backend(backend: str) -> tuple[str, ...]:
+    require(backend in ("cuda", "metal"), "unsupported backend")
+    return tuple(name for name in NAMES if backend == "cuda" or name not in CUDA_ONLY_CASES)
 
 
 def case_id(backend: str, name: str) -> str:
@@ -108,11 +116,11 @@ def verify_sources(app: Path, engine: Path, control: Path, app_sha: str, engine_
 
 
 def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
-    require(backend in ("cuda", "metal"), "unsupported backend")
+    names = names_for_backend(backend)
     require(not destination.exists(), "run-owned case directory already exists")
     destination.mkdir(parents=True)
     rows = []
-    for name in NAMES:
+    for name in names:
         source = template_dir / f"{name}.json"
         require(source.is_file(), f"missing fixed case {name}")
         require(sha256(source) == CASE_SOURCE_SHA256[name], f"fixed case {name} changed")
@@ -121,6 +129,8 @@ def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
         require(body.get("id") == case_id("cuda", name), f"unexpected source ID in {name}")
         require(body.get("tier") == tier and body.get("decoder") == decoder and
                 body.get("computePolicy") == policy, f"unexpected fixed case fields in {name}")
+        expected_ar_mode = "experimentalFp8" if name in CUDA_ONLY_CASES else None
+        require(body.get("arMode") == expected_ar_mode, f"unexpected AR mode in {name}")
         body["id"] = case_id(backend, name)
         target = destination / f"{name}.json"
         target.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
@@ -182,7 +192,7 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
 
 
 def verify_record(record_path: Path, backend: str, name: str) -> dict:
-    require(name in NAMES and backend in ("cuda", "metal"), "unknown case/backend")
+    require(name in names_for_backend(backend), "unknown case/backend")
     row = json.loads(record_path.read_text(encoding="utf-8"))
     _, case_name, decoder, policy, model_dtype, vae_dtype = CASES[name]
     require(row.get("caseId") == case_id(backend, name) and row.get("backend") == backend,
@@ -193,6 +203,9 @@ def verify_record(record_path: Path, backend: str, name: str) -> dict:
     require(row.get("request", {}).get("name") == case_name and
             row.get("request", {}).get("computePolicy") == policy,
             "record request name/policy mismatch")
+    expected_ar_mode = "experimentalFp8" if name in CUDA_ONLY_CASES else None
+    require(row.get("request", {}).get("arMode") == expected_ar_mode,
+            "record AR mode mismatch")
     require(row.get("admission", {}).get("outcome") == "admitted", "profile was not admitted")
     outcome = row.get("outcome", {})
     require(outcome.get("status") == "completed", "profile did not complete")
@@ -206,23 +219,32 @@ def verify_record(record_path: Path, backend: str, name: str) -> dict:
     else:
         require(outcome.get("engineVaeCudaBf16MathPolicy") == math_policy,
                 f"effective CUDA BF16 VAE math policy does not match {math_policy}")
+    if name in CUDA_ONLY_CASES:
+        require(outcome.get("engineQuantization") == "fp8", "experimental FP8 AR did not execute")
+        host_bytes = row.get("admission", {}).get("estimate", {}).get("weights", {}).get("hostBytes")
+        require(type(host_bytes) is int and host_bytes >= 2 * 1024 ** 3,
+                "FP8 admission omitted retained BF16 AR originals")
     measured = row.get("measured", {})
     require(measured.get("peakBytes", 0) > 0, "profile has no overall measured peak")
     stages = measured.get("stages", {})
     require(all(stages.get(stage, {}).get("samples", 0) > 0 and
                 stages[stage].get("peakBytes", 0) > 0 for stage in STAGES),
             "profile lacks a sampled stage")
-    return {"case_id": row["caseId"], "backend": backend, "admission": "admitted",
-            "effective_compute_policy": policy, "effective_model_dtype": model_dtype,
-            "effective_vae_dtype": vae_dtype, "effective_vae_cuda_bf16_math_policy": math_policy,
-            "peak_bytes": measured["peakBytes"],
-            "stage_samples": {stage: stages[stage]["samples"] for stage in STAGES},
-            "record_sha256": sha256(record_path)}
+    result = {"case_id": row["caseId"], "backend": backend, "admission": "admitted",
+              "effective_compute_policy": policy, "effective_model_dtype": model_dtype,
+              "effective_vae_dtype": vae_dtype, "effective_vae_cuda_bf16_math_policy": math_policy,
+              "peak_bytes": measured["peakBytes"],
+              "stage_samples": {stage: stages[stage]["samples"] for stage in STAGES},
+              "record_sha256": sha256(record_path)}
+    if name in CUDA_ONLY_CASES:
+        result["effective_ar_quantization"] = "fp8"
+        result["host_original_bytes"] = host_bytes
+    return result
 
 
 def verify_audio(profile_dir: Path, backend: str, name: str) -> dict:
     require(profile_dir.is_absolute(), "profile root must be an absolute run-owned path")
-    require(name in NAMES and backend in ("cuda", "metal"), "unknown audio case/backend")
+    require(name in names_for_backend(backend), "unknown audio case/backend")
     root = profile_dir.resolve(strict=True)
     candidate = profile_dir / case_id(backend, name).replace(":", "__") / "run" / "audio.wav"
     audio = candidate.resolve(strict=True)
@@ -239,7 +261,7 @@ def verify_audio(profile_dir: Path, backend: str, name: str) -> dict:
 def collect(profile_dir: Path, evidence: Path, backend: str) -> dict:
     require(not (evidence / "profile").exists(), "profile receipts were already collected")
     rows = []
-    for name in NAMES:
+    for name in names_for_backend(backend):
         source = profile_dir / case_id(backend, name).replace(":", "__")
         row = verify_record(source / "record.json", backend, name)
         row["listening_audio"] = verify_audio(profile_dir, backend, name)
@@ -267,7 +289,7 @@ def collect(profile_dir: Path, evidence: Path, backend: str) -> dict:
 
 def copy_partial(profile_dir: Path, evidence: Path, backend: str) -> None:
     """Retain known JSON/log receipts on a failed case, without audio or tensors."""
-    for name in NAMES:
+    for name in names_for_backend(backend):
         source = profile_dir / case_id(backend, name).replace(":", "__")
         if not source.is_dir():
             continue
@@ -294,7 +316,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
     environment.pop("HUGGINGFACE_HUB_CACHE", None)
     manifest = json.loads((cases / "manifest.json").read_text(encoding="utf-8"))
     require(manifest.get("backend") == backend and
-            [row.get("name") for row in manifest.get("cases", [])] == list(NAMES),
+            [row.get("name") for row in manifest.get("cases", [])] == list(names_for_backend(backend)),
             "run-owned case manifest/backend mismatch")
     shutil.copy2(cases / "manifest.json", evidence / "cases-manifest.json")
     completed_audio = []
