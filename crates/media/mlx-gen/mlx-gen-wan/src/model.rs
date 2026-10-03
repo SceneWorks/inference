@@ -1179,12 +1179,7 @@ impl Wan14b {
         };
         let mut dit = WanTransformer::from_weights(&w, cfg)?;
         if let Some(q) = self.quant {
-            // SC-20686: as VACE-Fun's staged build -- drop the dense map so the materializing
-            // quantize frees each bf16 source as its pack evaluates, then release the freed dense
-            // buffers from MLX's pool before the denoise.
-            drop(w);
             dit.quantize(q.bits(), None)?;
-            mlx_gen::memory_probe::clear_cache();
         }
         // PRE-QUANTIZED (packed Q4/Q8) snapshot: install this expert's adapters as forward-time
         // residuals AFTER building (the bases stay packed) — mirrors `install_adapters_additive`.

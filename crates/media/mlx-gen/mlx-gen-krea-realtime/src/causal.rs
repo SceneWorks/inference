@@ -483,7 +483,8 @@ pub struct CausalKvCache {
     packed_metal_append_count: usize,
     /// Largest logical old-plus-successor payload simultaneously alive at an immutable MLX append
     /// barrier. Process receipts still measure allocator high water; this prevents retained-only
-    /// accounting from concealing full-history concat residency.
+    /// accounting from concealing full-history concat residency. Recorded only by the armed
+    /// packed-Metal POC (the only path with that barrier); stays 0 on the production cache.
     peak_append_coexistence_bytes: usize,
     /// Test-only switch for the real-weight before/after oracle. `false` reproduces the pre-sc-17894
     /// eager max-window eviction exactly; production builds do not carry this field or branch.
@@ -1032,10 +1033,11 @@ impl CausalKvCache {
             .committed_tokens
             .checked_add(s_new)
             .ok_or_else(|| Error::Msg("krea causal: committed token count overflow".into()))?;
-        let previous_retained_bytes = self.retained_bytes();
 
         // Build every layer's packed/concatenated successor without touching observable cache state.
-        // A late pack/concat failure therefore leaves all layers and counters at the old boundary.
+        // A pack/concat construction failure therefore leaves all layers and counters at the old
+        // boundary. These are lazy MLX graphs (the same take + concat the cache always built); on the
+        // production path nothing is evaluated here and the successors become the cache as-is.
         let mut staged_layers = Vec::with_capacity(self.layers.len());
         for (slot, kv) in self.layers.iter().zip(new_kv) {
             let incoming = StoredKv::store(kv, self.quant)?;
@@ -1045,24 +1047,26 @@ impl CausalKvCache {
             };
             staged_layers.push(Some(staged));
         }
-        let staged_retained_bytes = staged_layers
-            .iter()
-            .flatten()
-            .map(StoredKv::nbytes)
-            .sum::<usize>();
-        let append_coexistence_bytes =
-            previous_retained_bytes.saturating_add(staged_retained_bytes);
 
-        // Concatenation and quantization only build lazy MLX graphs. Evaluate every successor
-        // before publishing any layer so a late fault leaves the old cache intact for retry. The
-        // immutable old+new graphs coexist during this bounded barrier and therefore represent
-        // the real transient/residency cost of the append.
-        for staged in staged_layers.iter().flatten() {
-            staged.eval()?;
+        // Experimental packed-Metal POC only: evaluate every successor before publishing any layer
+        // so a late device fault leaves the old cache intact for the dense retry, and record the
+        // old-plus-successor payload that coexists at that barrier. The production cache never
+        // arms the POC, so it never pays this per-append eval or the coexistence residency.
+        if self.packed_metal_kernel.is_some() {
+            let append_coexistence_bytes = self.retained_bytes().saturating_add(
+                staged_layers
+                    .iter()
+                    .flatten()
+                    .map(StoredKv::nbytes)
+                    .sum::<usize>(),
+            );
+            for staged in staged_layers.iter().flatten() {
+                staged.eval()?;
+            }
+            self.peak_append_coexistence_bytes = self
+                .peak_append_coexistence_bytes
+                .max(append_coexistence_bytes);
         }
-        self.peak_append_coexistence_bytes = self
-            .peak_append_coexistence_bytes
-            .max(append_coexistence_bytes);
 
         #[cfg(test)]
         let (tail_base_old, committed_before) = (self.tail_base, self.committed_tokens);
@@ -2162,6 +2166,7 @@ mod tests {
     #[test]
     fn immutable_append_reports_old_plus_successor_coexistence() {
         let mut cache = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        cache.enable_experimental_packed_metal(false).unwrap();
         cache
             .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
             .unwrap();
@@ -2171,6 +2176,43 @@ mod tests {
             .unwrap();
         assert!(cache.peak_append_coexistence_bytes() >= first_retained + cache.retained_bytes());
         assert!(cache.peak_append_coexistence_bytes() > cache.retained_bytes());
+    }
+
+    /// The production cache (packed-Metal POC never armed) appends exactly as it always has: a lazy
+    /// concat/pack graph with no per-append eval barrier and no old-plus-successor coexistence. Only
+    /// the armed POC materializes its successors before publishing them.
+    #[test]
+    fn only_the_armed_packed_poc_evaluates_its_append_successor() {
+        use mlx_gen::array::is_materialized;
+        for quant in [None, Some(KvCacheQuant::Q8)] {
+            let mut cache = CausalKvCache::new(1, 16, 0, quant);
+            cache
+                .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
+                .unwrap();
+            cache
+                .append(wide_kv_block(&[4, 5], Dtype::Bfloat16))
+                .unwrap();
+            let stored = cache.layers[0].as_ref().unwrap();
+            let materialized = match stored {
+                StoredKv::Dense { k, v } => is_materialized(k) || is_materialized(v),
+                StoredKv::Packed { k, v } => is_materialized(&k.w) || is_materialized(&v.w),
+            };
+            assert!(
+                !materialized,
+                "production append ({quant:?}) must stay a lazy graph, not an eval barrier"
+            );
+            assert_eq!(cache.peak_append_coexistence_bytes(), 0);
+        }
+
+        let mut armed = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        armed.enable_experimental_packed_metal(false).unwrap();
+        armed
+            .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
+            .unwrap();
+        let Some(StoredKv::Packed { k, v }) = armed.layers[0].as_ref() else {
+            panic!("armed Q8 cache must store packed layers");
+        };
+        assert!(is_materialized(&k.w) && is_materialized(&v.w));
     }
 
     /// A group size that does not divide `head_dim` is a **config** error, and must be reported as one
