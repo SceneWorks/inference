@@ -10,7 +10,7 @@
 # a2_methods (optional, default "group-affine"): comma list of A2 `--kv-method` values
 # (group-affine, group-affine-4, group-affine-8), run in list order. At most 2 values each: the
 # a3/a2 jobs' hard timeouts are sized for two sequential invocations (kv-poc-campaign.yml TIMEOUTS).
-# a2_only_coordinate (optional, default ""): run A2 as `--only-coordinate <name>`, one of the eight
+# a2_only_coordinate (optional, default ""): run A2 as `--only-coordinate <name>`, one of the sixteen
 # scheduled SC-20671 coordinates. The run publishes a partial, non-publishable manifest (never a
 # campaign) into its own `-only-<name>` resume + evidence dirs, so it never touches a full A2.
 # nf_only_coordinate (optional, default ""): run the nf dense noise floor as `--only-coordinate
@@ -70,13 +70,19 @@ case "$label" in
 esac
 
 # Each mode owns a fixed phase order; an empty list means the mode's default phases (every W2
-# phase; W1's a1,a3,a2,b). W1's `nf` (the SC-20669 dense noise floor, ~30 min) runs only when
+# phase; W1's a2,b). W1's `nf` (the SC-20669 dense noise floor, ~30 min) runs only when
 # listed, e.g. "phases": "nf" alone. W2 also takes `none`: run the asset prep and the build only
 # (e.g. to see a host's disk shortfall first).
 case "$mode" in
   w2) order="c d d-control"; default_order="$order" ;;
-  *) order="a1 a3 a2 b nf"; default_order="a1 a3 a2 b" ;;
+  *) order="a1 a3 a2 b nf"; default_order="a2 b" ;;
 esac
+# Schedule v3 (sc-20688): A1 loads each row's bf16 reference, which for llama8b-fit-boundary prices
+# 71.5 GiB against llm.json's 68 GiB child cap, so an A1 campaign refuses that row and never
+# publishes; it stays listable (the other fifteen rows still run) but is no default. A3 binds a
+# PUBLISHED A1 at the identical SC-20671 source closure (sc20676 SC20676_BASELINE_CLOSURE_PATHSPECS),
+# which a v3 A1 cannot produce and no earlier A1 matches, so it is refused here, before a self-hosted
+# job queues.
 phases="${phases// /}"
 [ -n "$phases" ] || phases="${default_order// /,}"
 canonical=""
@@ -88,6 +94,7 @@ fi
 for p in ${requested[@]+"${requested[@]}"}; do
   [ -n "$p" ] || continue
   case " $order " in *" $p "*) ;; *) fail "unknown phase '$p' for mode $mode (allowed: ${order// /,})" ;; esac
+  [ "$mode" != w1 ] || [ "$p" != a3 ] || fail "phase a3 cannot run at SC-20671 schedule v3: it binds a published A1 at the same source closure, and an A1 campaign cannot complete (llama8b-fit-boundary's bf16 reference exceeds the 68 GiB child cap)"
 done
 # Run order is fixed (A1 -> A3 -> A2 -> B -> NF; C -> D -> D-control) whatever order the list was typed in.
 for p in $order; do
@@ -120,7 +127,11 @@ only_coordinate() { # <key> <value>: empty or one scheduled coordinate; sets $li
     "  "|" llama-short-single-chunked-cold "|" llama-medium-supported-batch-single-shot-warm "\
     |" llama-memory-material-single-single-shot-warm "|" llama-fit-boundary-single-chunked-cold "\
     |" qwen-short-single-single-shot-cold "|" qwen-medium-supported-batch-chunked-warm "\
-    |" qwen-memory-material-single-single-shot-warm "|" qwen-fit-boundary-single-chunked-cold ") ;;
+    |" qwen-memory-material-single-single-shot-warm "|" qwen-fit-boundary-single-chunked-cold "\
+    |" llama8b-short-single-chunked-cold "|" llama8b-medium-supported-batch-single-shot-warm "\
+    |" llama8b-memory-material-single-single-shot-warm "|" llama8b-fit-boundary-single-chunked-cold "\
+    |" qwen8b-short-single-single-shot-cold "|" qwen8b-medium-supported-batch-chunked-warm "\
+    |" qwen8b-memory-material-single-single-shot-warm "|" qwen8b-fit-boundary-single-chunked-cold ") ;;
     *) fail "$1 must be empty or one scheduled SC-20671 coordinate, got '$value'" ;;
   esac
   listed="$value"
@@ -159,7 +170,7 @@ runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l 
   echo "| phases | \`${canonical#,}\` |"
   echo "| A3 --kv-bits | \`$a3_bits\` |"
   echo "| A2 --kv-method | \`$a2_methods\` |"
-  echo "| A2 --only-coordinate | ${a2_only_coordinate:+\`$a2_only_coordinate\` (PARTIAL, non-publishable)}${a2_only_coordinate:-all eight rows} |"
-  echo "| NF --only-coordinate | ${nf_only_coordinate:+\`$nf_only_coordinate\`}${nf_only_coordinate:-all eight rows} |"
+  echo "| A2 --only-coordinate | ${a2_only_coordinate:+\`$a2_only_coordinate\` (PARTIAL, non-publishable)}${a2_only_coordinate:-all sixteen rows} |"
+  echo "| NF --only-coordinate | ${nf_only_coordinate:+\`$nf_only_coordinate\`}${nf_only_coordinate:-all sixteen rows} |"
 } >> "$GITHUB_STEP_SUMMARY"
 cat "$GITHUB_STEP_SUMMARY"

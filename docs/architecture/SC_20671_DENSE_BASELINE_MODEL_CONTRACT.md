@@ -1,10 +1,12 @@
 # SC-20671 dense-baseline model contract
 
-The dense-baseline parent and every worker select only the four identities below. A path supplied
+The dense-baseline parent and every worker select only the eight identities below (four families,
+each a 4-bit candidate and its bf16 reference). A path supplied
 at launch is a local storage location, never a model selector: before `LlamaProvider` loads it,
 the harness verifies the required files' byte lengths and SHA-256 digests plus `config.json` family,
 architecture, exact native context, and candidate/reference precision role. The source contract is
-`mlx_llm::campaign::{LLAMA_CANDIDATE, LLAMA_REFERENCE, QWEN_CANDIDATE, QWEN_REFERENCE}`.
+`mlx_llm::campaign::{LLAMA_CANDIDATE, LLAMA_REFERENCE, QWEN_CANDIDATE, QWEN_REFERENCE,
+LLAMA8B_CANDIDATE, LLAMA8B_REFERENCE, QWEN8B_CANDIDATE, QWEN8B_REFERENCE}`.
 
 | family | role | immutable Hugging Face repository and revision | native context |
 | --- | --- | --- | --- |
@@ -12,6 +14,21 @@ architecture, exact native context, and candidate/reference precision role. The 
 | Llama | bf16 reference | `mlx-community/Llama-3.2-3B-Instruct-bf16@6d88ba43024fef71b10e52e101c7cd4598322601` | 131,072 |
 | Qwen | 4-bit candidate | `mlx-community/Qwen3-1.7B-4bit@3b1b1768f8f8cf8351c712464f906e86c2b8269e` | 40,960 |
 | Qwen | bf16 reference | `mlx-community/Qwen3-1.7B-bf16@9cd6692855d3e06772228e9a962b2606359b2d24` | 40,960 |
+| Llama 8B (`llama8b`) | 4-bit candidate | `mlx-community/Llama-3.1-8B-Instruct-4bit@90215b22ec18e72f623dde2ea7af4097025160e2` | 131,072 |
+| Llama 8B (`llama8b`) | bf16 reference | `mlx-community/Meta-Llama-3.1-8B-Instruct-bf16@f8311090f9ee47782b6f094984a20c856eb841d6` | 131,072 |
+| Qwen 8B (`qwen8b`) | 4-bit candidate | `mlx-community/Qwen3-8B-4bit@545dc4251c05440727734bcd94334791f6ab0192` | 40,960 |
+| Qwen 8B (`qwen8b`) | bf16 reference | `mlx-community/Qwen3-8B-bf16@85dd0f16bfe491befbc9cf0b4e966664236e5050` | 40,960 |
+
+Schedule v3 (sc-20688) runs every family on the same four rows (sixteen in all). Each band's
+target derives from the native window (short 32, medium 1,024, memory-material window/4, fit-boundary
+window−512), except `llama8b`'s fit-boundary row. A compressed row is priced on the candidate it
+loads, scaled by the measured A2 v5 peak ratio (`COMPRESSED_MEASURED_PEAK_SCALE_BPS`, 1.27). At
+130,560 tokens that is 75.2 GiB, over the 68 GiB child footprint cap of
+`.github/kv-poc/policies/llm.json`, so `llama8b` is measured at 106,496 tokens
+(`LLAMA8B_FIT_WINDOW_TOKENS` 107,008): 63.5 GiB, 4.5 GiB under the cap. A dense (A1) row also
+prices its bf16 reference, 71.5 GiB for that row, so A1 refuses `llama8b-fit-boundary` before
+spawn and an A1 campaign cannot complete at schedule v3; A1 is therefore opt-in and A3 (which binds
+a complete A1 at the same source closure) is refused by the workflow's config (sc-20688).
 
 The required inventory includes every published weights shard, `config.json`, and the published
 model/index and tokenizer configuration files. The contract records every required file's
