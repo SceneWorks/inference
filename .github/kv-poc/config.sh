@@ -10,7 +10,7 @@
 # a2_methods (optional, default "group-affine"): comma list of A2 `--kv-method` values
 # (group-affine, group-affine-4, group-affine-8), run in list order. At most 2 values each: the
 # a3/a2 jobs' hard timeouts are sized for two sequential invocations (kv-poc-campaign.yml TIMEOUTS).
-# a2_only_coordinate (optional, default ""): run A2 as `--only-coordinate <name>`, one of the eight
+# a2_only_coordinate (optional, default ""): run A2 as `--only-coordinate <name>`, one of the sixteen
 # scheduled SC-20671 coordinates. The run publishes a partial, non-publishable manifest (never a
 # campaign) into its own `-only-<name>` resume + evidence dirs, so it never touches a full A2.
 # nf_only_coordinate (optional, default ""): run the nf dense noise floor as `--only-coordinate
@@ -120,7 +120,11 @@ only_coordinate() { # <key> <value>: empty or one scheduled coordinate; sets $li
     "  "|" llama-short-single-chunked-cold "|" llama-medium-supported-batch-single-shot-warm "\
     |" llama-memory-material-single-single-shot-warm "|" llama-fit-boundary-single-chunked-cold "\
     |" qwen-short-single-single-shot-cold "|" qwen-medium-supported-batch-chunked-warm "\
-    |" qwen-memory-material-single-single-shot-warm "|" qwen-fit-boundary-single-chunked-cold ") ;;
+    |" qwen-memory-material-single-single-shot-warm "|" qwen-fit-boundary-single-chunked-cold "\
+    |" llama8b-short-single-chunked-cold "|" llama8b-medium-supported-batch-single-shot-warm "\
+    |" llama8b-memory-material-single-single-shot-warm "|" llama8b-fit-boundary-single-chunked-cold "\
+    |" qwen8b-short-single-single-shot-cold "|" qwen8b-medium-supported-batch-chunked-warm "\
+    |" qwen8b-memory-material-single-single-shot-warm "|" qwen8b-fit-boundary-single-chunked-cold ") ;;
     *) fail "$1 must be empty or one scheduled SC-20671 coordinate, got '$value'" ;;
   esac
   listed="$value"
@@ -159,7 +163,7 @@ runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l 
   echo "| phases | \`${canonical#,}\` |"
   echo "| A3 --kv-bits | \`$a3_bits\` |"
   echo "| A2 --kv-method | \`$a2_methods\` |"
-  echo "| A2 --only-coordinate | ${a2_only_coordinate:+\`$a2_only_coordinate\` (PARTIAL, non-publishable)}${a2_only_coordinate:-all eight rows} |"
-  echo "| NF --only-coordinate | ${nf_only_coordinate:+\`$nf_only_coordinate\`}${nf_only_coordinate:-all eight rows} |"
+  echo "| A2 --only-coordinate | ${a2_only_coordinate:+\`$a2_only_coordinate\` (PARTIAL, non-publishable)}${a2_only_coordinate:-all sixteen rows} |"
+  echo "| NF --only-coordinate | ${nf_only_coordinate:+\`$nf_only_coordinate\`}${nf_only_coordinate:-all sixteen rows} |"
 } >> "$GITHUB_STEP_SUMMARY"
 cat "$GITHUB_STEP_SUMMARY"

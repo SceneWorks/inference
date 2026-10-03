@@ -1047,13 +1047,18 @@ impl LlamaProvider {
             .map_err(|_| CoreError::Load("campaign prompt token count overflows u64".into()))
     }
 
+    /// The `context_band` payload of at most `target` tokens (the coordinate's
+    /// [`crate::campaign::family_band_target`]), which must fit the loaded window.
     pub(crate) fn campaign_context_band_measurement(
         &self,
         context_band: &str,
+        target: u64,
     ) -> CoreResult<(String, u64, u64)> {
-        let context_window = self.campaign_context_window()?;
-        let target = crate::campaign::context_band_target(context_window, context_band)
-            .map_err(CoreError::Load)?;
+        if target > self.campaign_context_window()? {
+            return Err(CoreError::Load(format!(
+                "SC-20671 {context_band} target {target} exceeds the loaded window"
+            )));
+        }
         self.campaign_band_payload(context_band, target)
     }
 
@@ -1063,10 +1068,9 @@ impl LlamaProvider {
     pub(crate) fn campaign_multi_turn_payload(
         &self,
         context_band: &str,
+        band: u64,
     ) -> CoreResult<(String, u64, u64)> {
         let context_window = self.campaign_context_window()?;
-        let band = crate::campaign::context_band_target(context_window, context_band)
-            .map_err(CoreError::Load)?;
         let target = crate::campaign::multi_turn_payload_target(context_window, band)
             .map_err(CoreError::Load)?;
         self.campaign_band_payload(context_band, target)

@@ -164,7 +164,7 @@ class NoiseFloorPhaseTests(unittest.TestCase):
             )
             self.assertEqual(done.returncode, 0, done.stderr)
             argv = done.stdout.splitlines()
-            self.assertNotIn("--only-coordinate", argv, "all eight rows by default")
+            self.assertNotIn("--only-coordinate", argv, "all sixteen rows by default")
             self.assertEqual(argv[1], "noise-floor-parent")
             flags = dict(zip(argv[2::2], argv[3::2]))
             expected = {
@@ -172,6 +172,10 @@ class NoiseFloorPhaseTests(unittest.TestCase):
                 "--llama-fp32-reference-snapshot": "mlx-community/Llama-3.2-3B-Instruct-bf16",
                 "--qwen-snapshot": "mlx-community/Qwen3-1.7B-4bit",
                 "--qwen-fp32-reference-snapshot": "mlx-community/Qwen3-1.7B-bf16",
+                "--llama8b-snapshot": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+                "--llama8b-fp32-reference-snapshot": "mlx-community/Meta-Llama-3.1-8B-Instruct-bf16",
+                "--qwen8b-snapshot": "mlx-community/Qwen3-8B-4bit",
+                "--qwen8b-fp32-reference-snapshot": "mlx-community/Qwen3-8B-bf16",
             }
             for flag, repo in expected.items():
                 self.assertIn(flag, flags, f"nf launch lacks {flag}")
@@ -199,8 +203,37 @@ class NoiseFloorPhaseTests(unittest.TestCase):
         self.assertEqual(upload["with"]["path"], "${{ runner.temp }}/kv-poc-artifact/nf/")
         self.assertEqual(upload["if"], "${{ always() }}")
         # Soft budget + the llm.json row deadline + 20 minutes, like every W1 job.
-        self.assertEqual(job["env"]["KV_SOFT_BUDGET_MIN"], "120")
-        self.assertEqual(job["timeout-minutes"], 120 + 300 + 20)
+        self.assertEqual(job["env"]["KV_SOFT_BUDGET_MIN"], "240")
+        self.assertEqual(job["timeout-minutes"], 240 + 300 + 20)
+
+    def test_models_tsv_mirrors_every_campaign_pin(self):
+        """build.sh provisions exactly models.tsv on the Mac, and the campaign parent refuses any
+        snapshot that lacks one of campaign.rs's pinned files, so the two must list the same
+        (repository, revision, path, bytes, sha256) rows for every scheduled family."""
+        import re
+
+        source = (ROOT / "crates/llm/mlx-llm/src/campaign.rs").read_text(encoding="utf-8")
+        files = {
+            name: re.findall(r'path: "([^"]+)",\s*bytes: ([\d_]+),\s*sha256: "([0-9a-f]{64})"', body)
+            for name, body in re.findall(
+                r"const ([A-Z0-9_]+_FILES): &\[PinnedSnapshotFile\] = &\[(.*?)\n\];", source, re.S
+            )
+        }
+        specs = re.findall(
+            r'repository: "([^"]+)",\s*revision: "([0-9a-f]{40})",(?:.|\n)*?required_files: ([A-Z0-9_]+_FILES),',
+            source,
+        )
+        expected = set()
+        for repo, revision, files_name in specs:
+            for path, size, sha256 in files[files_name]:
+                expected.add((repo, revision, path, size.replace("_", ""), sha256))
+        pins = {
+            tuple(line.split("\t"))
+            for line in (KV_POC / "models.tsv").read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")
+        }
+        self.assertEqual(len({(repo, revision) for repo, revision, *_ in expected}), 8)
+        self.assertEqual(pins, expected)
 
     def test_summary_renders_rows_and_the_worst_case(self):
         summarize = load_summarize()

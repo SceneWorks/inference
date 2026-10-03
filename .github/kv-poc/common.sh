@@ -48,11 +48,16 @@ F2="$KV_ROOT/$INFERENCE_SHA/frozen-w2"
 W2_INPUTS="$KV_ROOT/w2-inputs"
 W2_BINS="sc20686_wan sc20686_flux2_edit krea-integration"
 
-# The four pinned snapshots the W1 commands name (hub-cache layout on both Macs).
+# The eight pinned snapshots the W1 commands name (hub-cache layout on both Macs): each family's
+# 4-bit candidate and bf16 reference (campaign.rs benchmark_model; models.tsv).
 LQ="$KV_HF_HUB/models--mlx-community--Llama-3.2-3B-Instruct-4bit/snapshots/7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
 LB="$KV_HF_HUB/models--mlx-community--Llama-3.2-3B-Instruct-bf16/snapshots/6d88ba43024fef71b10e52e101c7cd4598322601"
 QQ="$KV_HF_HUB/models--mlx-community--Qwen3-1.7B-4bit/snapshots/3b1b1768f8f8cf8351c712464f906e86c2b8269e"
 QB="$KV_HF_HUB/models--mlx-community--Qwen3-1.7B-bf16/snapshots/9cd6692855d3e06772228e9a962b2606359b2d24"
+L8Q="$KV_HF_HUB/models--mlx-community--Llama-3.1-8B-Instruct-4bit/snapshots/90215b22ec18e72f623dde2ea7af4097025160e2"
+L8B="$KV_HF_HUB/models--mlx-community--Meta-Llama-3.1-8B-Instruct-bf16/snapshots/f8311090f9ee47782b6f094984a20c856eb841d6"
+Q8Q="$KV_HF_HUB/models--mlx-community--Qwen3-8B-4bit/snapshots/545dc4251c05440727734bcd94334791f6ab0192"
+Q8B="$KV_HF_HUB/models--mlx-community--Qwen3-8B-bf16/snapshots/85dd0f16bfe491befbc9cf0b4e966664236e5050"
 
 # The W2 (media) snapshots, pinned file-by-file in models-w2.tsv. The q4 tier roots are passed as
 # is; the two VACE routes take the worker-assembled layout under $W2_INPUTS (build.sh w2-inputs).

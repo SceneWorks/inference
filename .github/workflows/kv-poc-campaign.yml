@@ -13,8 +13,8 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 #     sc20671-compressed-<m>-resume, evidence/sc20671-compressed-<m>). At most 2 values each.
 #     An A3 QUALITY GATE FAILED (recorded evidence, exit 0) never skips the next value; a stop
 #     ends the list (stopped=true); a hard failure ends the list and fails the job.
-#     NF (opt-in: list it, e.g. "phases": "nf") is the SC-20669 dense noise floor: for all eight
-#     SC-20671 rows, `sc20671_kv_baseline noise-floor-parent` measures the dense arm against a
+#     NF (opt-in: list it, e.g. "phases": "nf") is the SC-20669 dense noise floor: for all sixteen
+#     SC-20671 rows (llama, qwen, llama8b, qwen8b x four bands), `sc20671_kv_baseline noise-floor-parent` measures the dense arm against a
 #     one-shot repeat and a chunked-prefill recomputation of itself with the compressed rows' own
 #     metrics (teacher-forced agreement, stream-scored perplexity delta), one guarded worker per
 #     row under llm.json; per-row JSON + sealed summary.json in evidence/sc20669-noise-floor.
@@ -35,7 +35,7 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 #     baseline_evidence_ref: the inference SHA whose A1 evidence A3 binds, default inference_ref;
 #     a3_bits: comma list of 2|4|8, default "2"; a2_methods: comma list of
 #     group-affine|group-affine-4|group-affine-8, default "group-affine"; a2_only_coordinate: one
-#     scheduled SC-20671 coordinate, default "" = all eight rows. A single-coordinate A2 publishes
+#     scheduled SC-20671 coordinate, default "" = all sixteen rows. A single-coordinate A2 publishes
 #     a partial, non-publishable manifest into its own `-only-<name>` dirs, never a campaign).
 #     This is how the campaign runs before this file reaches `main` (a workflow_dispatch workflow
 #     must exist on the default branch to be dispatched). Start W1 by flipping "mode" to "w1" in
@@ -68,7 +68,7 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 # The SIGINT/SIGTERM trap only touches STOP, best effort. Cancel between jobs, or push the stop
 # branch and wait.
 #
-# TIMEOUTS. Each campaign job has a SOFT budget (KV_SOFT_BUDGET_MIN: a1/a2 330, a3 60, b 60, nf 120 min;
+# TIMEOUTS. Each campaign job has a SOFT budget (KV_SOFT_BUDGET_MIN: a1/a2 330, a3 60, b 60, nf 240 min;
 # c 240, d 360, d-control 240 min): when it is spent the watcher requests a safe stop, exactly like
 # the stop branch, and a re-dispatch resumes. The HARD `timeout-minutes` is that budget PLUS the
 # policy's own row deadline (llm.json rowDeadlineSeconds 18000 = 300 min; capture.json 1800 = 30 min;
@@ -119,11 +119,11 @@ on:
         type: string
         default: "group-affine"
       a2_only_coordinate:
-        description: "Empty = all eight A2 rows. One SC-20671 coordinate (e.g. llama-memory-material-single-single-shot-warm) = that row only, published as a PARTIAL non-publishable run in its own dirs"
+        description: "Empty = all sixteen A2 rows. One SC-20671 coordinate (e.g. llama-memory-material-single-single-shot-warm) = that row only, published as a PARTIAL non-publishable run in its own dirs"
         type: string
         default: ""
       nf_only_coordinate:
-        description: "Empty = all eight nf rows. One SC-20671 coordinate = that row's dense noise floor only, in its own -only-<name> dirs"
+        description: "Empty = all sixteen nf rows. One SC-20671 coordinate = that row's dense noise floor only, in its own -only-<name> dirs"
         type: string
         default: ""
 
@@ -390,8 +390,9 @@ jobs:
       && (needs.a2.result == 'success' || needs.a2.result == 'skipped') && needs.a2.outputs.stopped != 'true'
       && (needs.b.result == 'success' || needs.b.result == 'skipped') && needs.b.outputs.stopped != 'true' }}
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
-    # 120 soft + 300 row deadline + 20 (TIMEOUTS above).
-    timeout-minutes: 440
+    # 240 soft + 300 row deadline + 20 (TIMEOUTS above). 240: the sixteen-row floor (the 8B rows
+    # roughly double the 3B/1.7B rows' ~40 min).
+    timeout-minutes: 560
     outputs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
@@ -399,7 +400,7 @@ jobs:
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_NF_ONLY_COORDINATE: ${{ needs.config.outputs.nf_only_coordinate }}
-      KV_SOFT_BUDGET_MIN: "120"
+      KV_SOFT_BUDGET_MIN: "240"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
