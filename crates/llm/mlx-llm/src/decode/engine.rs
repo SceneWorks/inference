@@ -1427,6 +1427,13 @@ where
         }
     }
     stats.monitor = monitor.as_ref().and_then(AcceptanceMonitor::last_decision);
+    // A window that demotes on the step that also ends the run (its budget, a stop token, the
+    // caller's stop, a cancel) leaves the loop before the demotion is recorded above: the run was
+    // still demoted there, so the report's `speculative_demoted_at` and its monitor decision
+    // agree (sc-24446).
+    if stats.demoted_at.is_none() && stats.monitor.is_some_and(|d| d.demoted) {
+        stats.demoted_at = Some(generated.len());
+    }
 
     Ok(finished(
         generated, finish, stats, sampler, timer, start_len, on_event,
@@ -4607,7 +4614,48 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(ids, run.output.tokens, "streamed ids == returned tokens");
+        assert_demotion_agrees(&run);
         run
+    }
+
+    /// The report's two demotion fields agree: `speculative_demoted_at` is set exactly when the
+    /// monitor's last decision demoted (sc-24446).
+    fn assert_demotion_agrees(run: &SpeculativeRun) {
+        let r = &run.report;
+        assert_eq!(
+            r.speculative_demoted_at.is_some(),
+            r.speculative_monitor.is_some_and(|d| d.demoted),
+            "demoted_at vs monitor: {r:?}"
+        );
+    }
+
+    /// sc-24446: a run whose budget, or a stop token, ends it on the very step that closes the
+    /// demoting window still reports where it was demoted — `speculative_demoted_at` agrees with
+    /// the monitor's demoting decision — pipelined (lookup) or not (MTP kind).
+    #[test]
+    fn a_demotion_on_the_runs_last_step_is_reported() {
+        let model = causal();
+        for (pipelining, kind) in [
+            (Pipelining::Auto, ProposerKind::PromptLookup),
+            (Pipelining::Off, ProposerKind::Mtp),
+        ] {
+            let label = format!("{pipelining:?} {kind:?}");
+            let config = greedy(DEMOTED_AT as usize);
+            let expected = plain(&model, &PROMPT, &config, None).tokens;
+            let mut wrong = Scripted::new(&expected, Script::Wrong, kind, 24);
+            let run = monitored(&model, &mut wrong, &config, 4, AUTO, pipelining);
+            assert_eq!(run.output.tokens, expected, "{label}");
+            assert_eq!(run.output.finish_reason, FinishReason::MaxTokens, "{label}");
+            assert!(
+                run.report.speculative_monitor.is_some_and(|d| d.demoted),
+                "{label}: the last window demoted"
+            );
+            assert_eq!(
+                run.report.speculative_demoted_at,
+                Some(DEMOTED_AT),
+                "{label}"
+            );
+        }
     }
 
     /// A deterministic decode clock (sc-24446): time moves only when [`Timed`] runs a forward.
@@ -5004,8 +5052,8 @@ pub(crate) mod tests {
     const PROBE: usize = core_llm::PLAIN_PROBE_MAX_STEPS as usize;
 
     /// sc-24446 (cost-aware) on MLX's unpipelined path: at the same scale of acceptance, a
-    /// request whose verify steps are dear (Bonsai-like: r = 2.4, mal 0.75) is demoted on its
-    /// measured gain at the end of its first window, one whose verify steps are cheap
+    /// request whose verify steps are dear (r = 2.0, mal 0.75: gain 0.875, a loser but not a
+    /// clear one) is demoted on its measured gain at the end of its first window, one whose verify steps are cheap
     /// (Qwen3.8-like: r = 1.5, mal 1.25) keeps its proposer — both after the plain probe, the
     /// proposer caught up on the probed tokens, the plain loop's tokens throughout. Prompt lookup
     /// (no static threshold here) is judged the same way.
@@ -5017,7 +5065,7 @@ pub(crate) mod tests {
         let bonsai = Script::Pattern(|n| if n % 4 == 1 { 3 } else { 0 });
         let mut dear = Scripted::new(&expected, bonsai, ProposerKind::Mtp, 50);
         dear.wants_hidden = true;
-        let run = timed_run(&model, &mut dear, &config, 3, 2.4, Pipelining::Off);
+        let run = timed_run(&model, &mut dear, &config, 3, 2.0, Pipelining::Off);
         assert_eq!(
             run.output.tokens, expected,
             "the probe and the demotion are output-neutral"
@@ -5030,7 +5078,7 @@ pub(crate) mod tests {
             (d.basis, d.demoted, d.window),
             (core_llm::DemotionBasis::Measured, true, 1)
         );
-        assert!((d.verify_cost_ratio().unwrap() - 2.4).abs() < 1e-9, "{d:?}");
+        assert!((d.verify_cost_ratio().unwrap() - 2.0).abs() < 1e-9, "{d:?}");
         assert_eq!(
             dear.caught_up,
             vec![(
@@ -5053,12 +5101,13 @@ pub(crate) mod tests {
             (core_llm::DemotionBasis::Measured, false)
         );
 
-        // Unpipelined lookup, never demoted by a static threshold, is demoted by its cost.
+        // Unpipelined lookup, never demoted by a static threshold, is demoted by its cost (gain
+        // 1 / 1.15 = 0.87: at its window's end).
         let causal = causal();
         let config = greedy(40);
         let expected = plain(&causal, &PROMPT, &config, None).tokens;
         let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, 24);
-        let run = timed_run(&causal, &mut wrong, &config, 4, 2.4, Pipelining::Off);
+        let run = timed_run(&causal, &mut wrong, &config, 4, 1.15, Pipelining::Off);
         assert_eq!(run.output.tokens, expected);
         assert_eq!(
             run.report.speculative_demoted_at,
@@ -5071,6 +5120,76 @@ pub(crate) mod tests {
         assert_eq!(
             wrong.caught_up,
             vec![(expected[..PROBE].to_vec(), None, PROMPT.len() as i32)]
+        );
+    }
+
+    /// sc-24446 (cuda-campaign-b4): on the deterministic decode clock a clear loser — measured
+    /// gain below [`core_llm::CLEAR_LOSS_GAIN`] (a lookup accepting nothing at r = 2.4, gain
+    /// 0.42; an MTP-kind proposer at mal 0.75, r = 2.6, gain 0.67) — is demoted by the end of the
+    /// probe and its first window: at the first step its measurement holds
+    /// [`core_llm::MIN_TIMED_WINDOW_STEPS`] timed steps past its shape's warm-up. A winner (every
+    /// draft accepted, r = 1.5) is never demoted. Pipelined and not, the plain loop's tokens.
+    #[test]
+    fn a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never() {
+        let first =
+            core_llm::SHAPE_WARMUP_STEPS as usize + core_llm::MIN_TIMED_WINDOW_STEPS as usize;
+        let model = causal();
+        let config = greedy(64);
+        let expected = plain(&model, &PROMPT, &config, None).tokens;
+        for pipelining in [Pipelining::Auto, Pipelining::Off] {
+            let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, 24);
+            let run = timed_run(&model, &mut wrong, &config, 4, 2.4, pipelining);
+            assert_eq!(run.output.tokens, expected, "{pipelining:?}");
+            let at = run.report.speculative_demoted_at.expect("demoted") as usize;
+            assert_eq!(at, 1 + PROBE + first, "{pipelining:?}");
+            assert!(
+                at <= 1 + PROBE + WINDOW,
+                "{pipelining:?}: within the first window"
+            );
+            let d = run.report.speculative_monitor.unwrap();
+            assert_eq!(
+                (d.basis, d.demoted, d.window),
+                (core_llm::DemotionBasis::Measured, true, 1),
+                "{pipelining:?}"
+            );
+            assert!(d.gain().unwrap() < core_llm::CLEAR_LOSS_GAIN, "{d:?}");
+            assert_eq!(wrong.proposals, first, "{pipelining:?}");
+        }
+
+        let hybrid = qwen35(false);
+        let config = greedy(96);
+        let expected = plain(&hybrid, &PROMPT, &config, None).tokens;
+        let mut head = Scripted::new(
+            &expected,
+            Script::Pattern(|n| if n % 4 == 1 { 3 } else { 0 }),
+            ProposerKind::Mtp,
+            50,
+        );
+        head.wants_hidden = true;
+        let run = timed_run(&hybrid, &mut head, &config, 3, 2.6, Pipelining::Off);
+        assert_eq!(run.output.tokens, expected);
+        let at = run.report.speculative_demoted_at.expect("demoted") as usize;
+        assert!(
+            at <= 1 + PROBE + WINDOW + 12,
+            "within the first window: {at}"
+        );
+        assert_eq!(head.proposals, first);
+
+        // Qwen3.8-like: mal 1.0 at r = 1.71 (the dearest measured depth-3 MTP verify), gain 1.17.
+        let mut right = Scripted::new(
+            &expected,
+            Script::Pattern(|n| if n % 2 == 1 { 2 } else { 0 }),
+            ProposerKind::Mtp,
+            50,
+        );
+        right.wants_hidden = true;
+        let run = timed_run(&hybrid, &mut right, &config, 3, 1.71, Pipelining::Off);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.report.speculative_demoted_at, None);
+        let d = run.report.speculative_monitor.expect("a judged window");
+        assert_eq!(
+            (d.basis, d.demoted),
+            (core_llm::DemotionBasis::Measured, false)
         );
     }
 

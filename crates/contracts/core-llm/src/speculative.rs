@@ -697,6 +697,26 @@ pub const MIN_TIMED_WINDOW_STEPS: u32 = ACCEPTANCE_PROBE_VERIFIES / 2;
 /// left to gain.
 pub const MEASURED_GAIN_MARGIN: f64 = 0.05;
 
+/// A measured gain below which `auto`'s proposer is a **clear** loser, demoted at the first step
+/// its measurement can decide (sc-24446) — after [`MIN_TIMED_WINDOW_STEPS`] timed speculative
+/// steps — rather than at the end of a [`ACCEPTANCE_PROBE_VERIFIES`]-step window.
+///
+/// Why (cuda-campaign-b4 @0826a16cf, attached to Shortcut epic 24432): under CUDA graphs Bonsai's
+/// `auto` prompt lookup lost 5.6–18.3 % on every prompt against its `off` twin even though each
+/// request was demoted on a measured gain of 0.66–0.87 — the window's 16 slow verify steps (at
+/// 2.0–3.1 plain steps each) and their shapes' warm-ups are most of that loss. Where the verify
+/// widths keep changing (a lookup's draft count), the first window's steps are mostly shape
+/// warm-ups, so it had too few timed steps to measure and fell back to the static 0.21 the
+/// grounded `rag_answer` passed (mal 1.31) — demoted one window later (step 78) at gain 0.66.
+///
+/// 0.8 is four times [`MEASURED_GAIN_MARGIN`] below break-even, so in-process timing noise
+/// (CUDA p95 2.2 %, MLX p95 10 %) cannot reach it from a winner. A request whose verify step
+/// costs `r` measures a gain of at least `1 / r`, so no proposer with `r < 1.25` can fall below
+/// it — the campaigns' measured winners (Qwen3-8B lookup on Candle, `r` 1.02–1.18, gain
+/// 1.13–1.24; Qwen3.8 MTP, gain 1.16–1.56; Qwen3.6 MTP, gain 1.08–1.72) sit at or above 1.08;
+/// every request between 0.8 and 0.95 is still judged on its whole window.
+pub const CLEAR_LOSS_GAIN: f64 = 0.8;
+
 /// One engine step as the monitor sees it (sc-24446).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepObservation {
@@ -792,8 +812,11 @@ impl MonitorDecision {
 /// runs a short plain probe ([`probing`](Self::probing), [`PLAIN_PROBE_MAX_STEPS`] steps) and
 /// then decides each window on its **measured gain** against the request's own plain-step cost
 /// (see the cost-aware notes above [`SHAPE_WARMUP_STEPS`]); where timing cannot decide, and for
-/// an untimed monitor, a window below the proposer's static [`demotion_threshold`] demotes. The
-/// first demoting window ends the proposer for the request — no more proposals, no more draft
+/// an untimed monitor, a window below the proposer's static [`demotion_threshold`] demotes. A
+/// clear loser — measured gain below [`CLEAR_LOSS_GAIN`] over the timed steps since the last
+/// measured window — is demoted at the first step that measurement holds
+/// [`MIN_TIMED_WINDOW_STEPS`] timed steps, without waiting for its window to close. The
+/// first demoting decision ends the proposer for the request — no more proposals, no more draft
 /// rows, the rest decoded token-at-a-time (on MLX through the pipelined loop) — and the report
 /// records where ([`DecodeReport::speculative_demoted_at`](crate::DecodeReport::speculative_demoted_at))
 /// and on what ([`last_decision`](Self::last_decision)). The demotion is irreversible for the
@@ -838,6 +861,12 @@ pub struct AcceptanceMonitor {
     timed_steps: u32,
     timed_tokens: u64,
     timed_ns: u64,
+    /// The timed speculative steps since the last window that decided on its measured gain — a
+    /// window with too few to measure carries its own forward — the tokens they committed and
+    /// their wall time: what [`CLEAR_LOSS_GAIN`] is checked against after every step.
+    clear_steps: u32,
+    clear_tokens: u64,
+    clear_ns: u64,
     demoted: bool,
     last: Option<MonitorDecision>,
 }
@@ -893,6 +922,9 @@ impl AcceptanceMonitor {
             timed_steps: 0,
             timed_tokens: 0,
             timed_ns: 0,
+            clear_steps: 0,
+            clear_tokens: 0,
+            clear_ns: 0,
             demoted: false,
             last: None,
         }
@@ -930,7 +962,8 @@ impl AcceptanceMonitor {
     }
 
     /// Observe one engine step. Returns `true` exactly once — on the step that closes the first
-    /// demoting window — when the engine must demote; `false` otherwise, including every probe
+    /// demoting window, or the earlier step at which a clear loser's measured gain falls below
+    /// [`CLEAR_LOSS_GAIN`] — when the engine must demote; `false` otherwise, including every probe
     /// step and every step after the demotion.
     pub fn observe_step(&mut self, step: StepObservation) -> bool {
         if self.demoted {
@@ -965,11 +998,22 @@ impl AcceptanceMonitor {
             self.timed_steps += 1;
             self.timed_tokens += 1 + step.accepted as u64;
             self.timed_ns = self.timed_ns.saturating_add(ns);
+            self.clear_steps += 1;
+            self.clear_tokens += 1 + step.accepted as u64;
+            self.clear_ns = self.clear_ns.saturating_add(ns);
         }
-        if self.verifies < ACCEPTANCE_PROBE_VERIFIES {
+        let decision = if let Some(clear) = self.clear_loss() {
+            clear
+        } else if self.verifies < ACCEPTANCE_PROBE_VERIFIES {
             return false;
+        } else {
+            self.decide()
+        };
+        if decision.basis == DemotionBasis::Measured {
+            self.clear_steps = 0;
+            self.clear_tokens = 0;
+            self.clear_ns = 0;
         }
-        let decision = self.decide();
         self.last = Some(decision);
         self.demoted = decision.demoted;
         self.verifies = 0;
@@ -980,14 +1024,47 @@ impl AcceptanceMonitor {
         self.demoted
     }
 
-    /// Judge the window just closed (see the cost-aware notes above [`SHAPE_WARMUP_STEPS`]).
-    fn decide(&mut self) -> MonitorDecision {
-        self.windows += 1;
-        let plain_step_ns = (self.plain_ns.len() >= PLAIN_PROBE_STEPS as usize).then(|| {
+    /// The request's plain-step cost: the median timed single-token step, once it holds
+    /// [`PLAIN_PROBE_STEPS`] samples.
+    fn plain_step_ns(&self) -> Option<u64> {
+        (self.plain_ns.len() >= PLAIN_PROBE_STEPS as usize).then(|| {
             let mut sorted = self.plain_ns.clone();
             sorted.sort_unstable();
             sorted[sorted.len() / 2]
-        });
+        })
+    }
+
+    /// The demoting decision for a **clear** loser ([`CLEAR_LOSS_GAIN`]): `Some` as soon as the
+    /// timed steps since the last measured window number [`MIN_TIMED_WINDOW_STEPS`] and their
+    /// gain is below it — mid-window, the current window's verify and acceptance counts with the
+    /// timed steps that decided. `None` otherwise (the window decides at its end as usual).
+    fn clear_loss(&mut self) -> Option<MonitorDecision> {
+        if self.clear_steps < MIN_TIMED_WINDOW_STEPS {
+            return None;
+        }
+        let plain_step_ns = self.plain_step_ns()?;
+        let decision = MonitorDecision {
+            window: self.windows + 1,
+            verifies: self.verifies,
+            accepted: self.accepted,
+            timed_steps: self.clear_steps,
+            timed_tokens: self.clear_tokens,
+            timed_ns: self.clear_ns,
+            plain_step_ns: Some(plain_step_ns),
+            basis: DemotionBasis::Measured,
+            demoted: true,
+        };
+        if !decision.gain().is_some_and(|gain| gain < CLEAR_LOSS_GAIN) {
+            return None;
+        }
+        self.windows += 1;
+        Some(decision)
+    }
+
+    /// Judge the window just closed (see the cost-aware notes above [`SHAPE_WARMUP_STEPS`]).
+    fn decide(&mut self) -> MonitorDecision {
+        self.windows += 1;
+        let plain_step_ns = self.plain_step_ns();
         let mut decision = MonitorDecision {
             window: self.windows,
             verifies: self.verifies,
@@ -1822,8 +1899,9 @@ mod tests {
     }
 
     /// The decision the coordinator's evidence asks for: a Bonsai-like request (verify r = 2.4,
-    /// mal 0.75 — above Candle's static 0.5 at depth 3) is demoted on its measured gain at the
-    /// end of its first window; a Qwen3.8-like one (r = 1.5, mal 1.25) keeps its proposer for
+    /// mal 0.75 — above Candle's static 0.5 at depth 3; gain 0.73, a clear loser) is demoted on
+    /// its measured gain as soon as it holds [`MIN_TIMED_WINDOW_STEPS`] timed steps, inside its
+    /// first window; a Qwen3.8-like one (r = 1.5, mal 1.25) keeps its proposer for
     /// every window — on Candle and on MLX's unpipelined path alike.
     #[test]
     fn a_dear_verify_demotes_and_a_cheap_one_keeps_at_the_same_scale_of_acceptance() {
@@ -1844,24 +1922,23 @@ mod tests {
                     }
                 },
             );
-            assert_eq!(at, Some(window - 1), "{plain:?}");
+            // The first three depth-3 steps are the shape's warm-up, then eight timed steps.
+            let first = (SHAPE_WARMUP_STEPS + MIN_TIMED_WINDOW_STEPS) as usize;
+            assert_eq!(at, Some(first - 1), "{plain:?}");
             let d = bonsai.last_decision().unwrap();
             assert_eq!(
                 (d.basis, d.demoted, d.window),
                 (DemotionBasis::Measured, true, 1)
             );
-            assert!((d.mean_accepted_length() - 0.75).abs() < 1e-12);
+            // Steps 3 and 7 of the eleven accepted 3 each.
+            assert_eq!((d.verifies, d.accepted), (first as u32, 6));
             assert_eq!(d.plain_step_ns, Some(10 * MS));
-            // The first three depth-3 steps are the shape's warm-up: 13 timed steps.
-            assert_eq!(
-                d.timed_steps,
-                ACCEPTANCE_PROBE_VERIFIES - SHAPE_WARMUP_STEPS
-            );
+            assert_eq!(d.timed_steps, MIN_TIMED_WINDOW_STEPS);
             assert!((d.verify_cost_ratio().unwrap() - 2.4).abs() < 1e-9);
-            assert!(d.gain().unwrap() < 1.0 - MEASURED_GAIN_MARGIN);
+            assert!(d.gain().unwrap() < CLEAR_LOSS_GAIN);
             // The static threshold alone would have kept it.
             if plain == PlainDecode::Candle {
-                assert!(d.mean_accepted_length() >= bonsai.threshold().unwrap());
+                assert!(0.75 >= bonsai.threshold().unwrap());
             }
             // Qwen3.8-like: mal 1.25 at r = 1.5 — gain 1.5, kept to the end.
             let (at, qwen) = drive(
@@ -2034,6 +2111,160 @@ mod tests {
         }
         // 4 probe samples at 2 ms, 16 window samples at 4 ms: the median is 4 ms.
         assert_eq!(m.last_decision().unwrap().plain_step_ns, Some(4 * MS));
+    }
+
+    /// sc-24446 (cuda-campaign-b4): a clear loser is demoted by the end of the probe and its first
+    /// window — at the first step its measurement holds [`MIN_TIMED_WINDOW_STEPS`] timed steps —
+    /// on every plain loop; one between [`CLEAR_LOSS_GAIN`] and break-even is still judged on its
+    /// whole window. Bonsai-like lookup under CUDA graphs: verify `r` 2.0–3.1, mal 0.44–1.5.
+    #[test]
+    fn a_clear_loser_is_demoted_within_its_first_window() {
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        let first = (SHAPE_WARMUP_STEPS + MIN_TIMED_WINDOW_STEPS) as usize;
+        for plain in [
+            PlainDecode::Candle,
+            PlainDecode::MlxUnpipelined,
+            PlainDecode::MlxPipelined,
+        ] {
+            for (proposer, depth, ratio, accepted) in [
+                // code_edit: mal 0.44 at r 2.25 — gain 0.64.
+                (
+                    ProposerKind::PromptLookup,
+                    4,
+                    2.25,
+                    [1, 0, 0, 1, 0, 1, 0, 0],
+                ),
+                // chat: mal 1.375 at r 3.1 — gain 0.77.
+                (ProposerKind::PromptLookup, 4, 3.1, [2, 1, 1, 2, 1, 2, 1, 1]),
+                // A companion MTP head: mal 0.75 at r 2.6 — gain 0.67.
+                (ProposerKind::Mtp, 3, 2.6, [3, 0, 0, 0, 3, 0, 0, 0]),
+            ] {
+                let label = format!("{plain:?} {proposer:?} r {ratio}");
+                let (at, m) = drive(
+                    timed(proposer, depth, plain),
+                    50 * MS,
+                    ratio,
+                    depth as usize,
+                    4 * window,
+                    |i| accepted[i % 8],
+                );
+                assert_eq!(at, Some(first - 1), "{label}");
+                assert!(first <= window, "{label}: inside the first window");
+                let d = m.last_decision().unwrap();
+                assert_eq!(
+                    (d.basis, d.demoted, d.window),
+                    (DemotionBasis::Measured, true, 1),
+                    "{label}"
+                );
+                assert!(d.gain().unwrap() < CLEAR_LOSS_GAIN, "{label}: {d:?}");
+            }
+            // gain 0.83 (mal 1.0 at r 2.4): a loser, but not a clear one — its window decides.
+            let (at, m) = drive(
+                timed(ProposerKind::PromptLookup, 4, plain),
+                50 * MS,
+                2.4,
+                4,
+                4 * window,
+                |_| 1,
+            );
+            assert_eq!(at, Some(window - 1), "{plain:?}");
+            assert_eq!(
+                m.last_decision().unwrap().verifies,
+                ACCEPTANCE_PROBE_VERIFIES
+            );
+        }
+    }
+
+    /// sc-24446 (cuda-campaign-b4 `rag_answer`): a lookup whose draft count keeps changing shape
+    /// spends its first window mostly on shape warm-ups — too few timed steps to measure, so the
+    /// window falls back to its static threshold (mal 1.0 passes Candle's 0.21) — but its timed
+    /// steps carry forward, and it is demoted as soon as they number
+    /// [`MIN_TIMED_WINDOW_STEPS`] (gain 2 / 3 = 0.67), not at the end of its second window.
+    #[test]
+    fn a_clear_losers_timed_steps_carry_past_an_unmeasured_window() {
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        let mut m = timed(ProposerKind::PromptLookup, 4, PlainDecode::Candle);
+        while m.probing() {
+            m.observe_step(plain_step(Some(10 * MS)));
+        }
+        // Widths 2..=5 in turn, each step 3 plain steps, one draft accepted.
+        let at = (0..4 * window).find(|&i| {
+            m.observe_step(StepObservation {
+                accepted: 1,
+                drafts: 1 + i % 4,
+                elapsed: Some(Duration::from_millis(30)),
+            })
+        });
+        // Four widths in turn, three warm-ups each: steps 12..16 are the first window's only
+        // timed steps (static: kept), and the eighth timed step is step 19 — the second window's
+        // fourth, where the old window-end decision waited for step 31.
+        assert_eq!(at, Some(19));
+        let d = m.last_decision().unwrap();
+        assert_eq!(
+            (d.basis, d.demoted, d.window, d.timed_steps),
+            (DemotionBasis::Measured, true, 2, MIN_TIMED_WINDOW_STEPS)
+        );
+        assert!((d.gain().unwrap() - 2.0 / 3.0).abs() < 1e-9, "{d:?}");
+    }
+
+    /// sc-24446: the campaigns' measured winners are never demoted — not by the clear-loss check
+    /// on any eight-step stretch, nor by a window — over a long request with lumpy acceptance:
+    /// Qwen3-8B summary lookup on Candle (`r` 1.18, gain ≈ 1.22), Qwen3.8 MTP at depth 3 (`r` 1.71,
+    /// the dearest measured, gain ≈ 1.17) and Qwen3.6 MTP (`r` 2.0, gain ≈ 1.13).
+    #[test]
+    fn measured_winners_are_never_demoted() {
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        type Pattern = [usize; 16];
+        type Case<'a> = (&'a str, ProposerKind, u32, f64, Pattern, &'a [PlainDecode]);
+        let cases: [Case<'_>; 3] = [
+            (
+                "qwen3-8b summary lookup",
+                ProposerKind::PromptLookup,
+                4,
+                1.18,
+                // mal 0.44: a 4-token run, then long stretches of nothing.
+                [4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0],
+                &[PlainDecode::Candle],
+            ),
+            (
+                "qwen3.8 mtp",
+                ProposerKind::Mtp,
+                3,
+                1.71,
+                // mal 1.0.
+                [3, 0, 0, 1, 3, 0, 0, 1, 3, 0, 0, 1, 3, 0, 0, 1],
+                &[PlainDecode::Candle, PlainDecode::MlxUnpipelined],
+            ),
+            (
+                "qwen3.6 mtp",
+                ProposerKind::Mtp,
+                3,
+                2.0,
+                // mal 1.25.
+                [3, 0, 2, 0, 3, 0, 2, 0, 3, 0, 2, 0, 3, 0, 2, 0],
+                &[PlainDecode::MlxUnpipelined, PlainDecode::MlxPipelined],
+            ),
+        ];
+        for (label, proposer, depth, ratio, pattern, plains) in cases {
+            for &plain in plains {
+                let (at, m) = drive(
+                    timed(proposer, depth, plain),
+                    10 * MS,
+                    ratio,
+                    depth as usize,
+                    16 * window,
+                    |i| pattern[i % 16],
+                );
+                assert_eq!(at, None, "{label} {plain:?}");
+                let d = m.last_decision().unwrap();
+                assert_eq!(
+                    (d.basis, d.demoted, d.window),
+                    (DemotionBasis::Measured, false, 16),
+                    "{label} {plain:?}"
+                );
+                assert!(d.gain().unwrap() > 1.05, "{label} {plain:?}: {d:?}");
+            }
+        }
     }
 
     #[test]

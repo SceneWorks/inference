@@ -932,6 +932,13 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         }
     }
     stats.monitor = monitor.as_ref().and_then(AcceptanceMonitor::last_decision);
+    // A window that demotes on the step that also ends the run (its budget, a stop token, the
+    // caller's stop, a cancel) leaves the loop before the demotion is recorded above: the run was
+    // still demoted there, so the report's `speculative_demoted_at` and its monitor decision
+    // agree (sc-24446).
+    if stats.demoted_at.is_none() && stats.monitor.is_some_and(|d| d.demoted) {
+        stats.demoted_at = Some(generated.len());
+    }
 
     Ok(done(
         generated,
@@ -3050,6 +3057,7 @@ mod tests {
                 AUTO,
             )
         })
+        .inspect(assert_demotion_agrees)
         .unwrap()
     }
 
@@ -3115,7 +3123,19 @@ mod tests {
                 mode,
             )
         })
+        .inspect(assert_demotion_agrees)
         .unwrap()
+    }
+
+    /// The record's two demotion fields agree: `speculative_demoted_at` is set exactly when the
+    /// monitor's last decision demoted (sc-24446).
+    fn assert_demotion_agrees(run: &SpeculativeRun) {
+        let r = run.record.report(false);
+        assert_eq!(
+            r.speculative_demoted_at.is_some(),
+            r.speculative_monitor.is_some_and(|d| d.demoted),
+            "demoted_at vs monitor: {r:?}"
+        );
     }
 
     fn monitored<M: StepModel, P: Proposer + ?Sized>(
@@ -3144,6 +3164,32 @@ mod tests {
     /// The token count at which a never-accepting proposer is demoted: the first token plus one
     /// committed token per probe-window verify step.
     const DEMOTED_AT: usize = 1 + WINDOW;
+
+    /// sc-24446: a run whose budget ends it on the very step that closes the demoting window
+    /// still records where it was demoted — `speculative_demoted_at` agrees with the monitor's
+    /// demoting decision.
+    #[test]
+    fn a_demotion_on_the_runs_last_step_is_recorded() {
+        let (_cfg, model) = text_model();
+        let config = greedy(DEMOTED_AT);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut wrong = Scripted::new(
+            &expected,
+            Script::Wrong,
+            ProposerKind::Mtp,
+            model.vocab_size(),
+        );
+        let run = monitored(&model, &mut wrong, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.output.finish_reason, FinishReason::MaxTokens);
+        let report = run.record.report(false);
+        assert!(
+            report.speculative_monitor.is_some_and(|d| d.demoted),
+            "the last window demoted: {report:?}"
+        );
+        assert_eq!(run.stats.demoted_at, Some(DEMOTED_AT));
+        assert_eq!(report.speculative_demoted_at, Some(DEMOTED_AT as u64));
+    }
 
     fn assert_forward_accounting(label: &str, run: &SpeculativeRun) {
         assert_eq!(
@@ -3388,8 +3434,8 @@ mod tests {
     const PROBE: usize = core_llm::PLAIN_PROBE_MAX_STEPS as usize;
 
     /// sc-24446 (cost-aware): at the same scale of acceptance, a request whose verify steps are
-    /// dear (Bonsai-like: r = 2.4, mal 0.75 — above Candle's static 0.5 at depth 3) is demoted
-    /// on its measured gain at the end of its first window, and one whose verify steps are cheap
+    /// dear (r = 2.0, mal 0.75 — above Candle's static 0.5 at depth 3; gain 0.875, a loser but
+    /// not a clear one) is demoted on its measured gain at the end of its first window, and one whose verify steps are cheap
     /// (Qwen3.8-like: r = 1.5, mal 1.25) keeps its proposer to the end. Both first run the plain
     /// probe — no proposal, the proposer caught up on the probed tokens before its first proposal
     /// — and both decode the reference loop's tokens; the report carries the decision's inputs.
@@ -3403,7 +3449,7 @@ mod tests {
         let bonsai = Script::Pattern(|n| if n % 4 == 1 { 3 } else { 0 });
         let mut dear = Scripted::new(&expected, bonsai, ProposerKind::Mtp, vocab);
         dear.wants_hidden = true;
-        let run = timed_run(&model, &mut dear, &config, 3, 2.4);
+        let run = timed_run(&model, &mut dear, &config, 3, 2.0);
         assert_eq!(
             run.output.tokens, expected,
             "the probe and the demotion are output-neutral"
@@ -3423,8 +3469,9 @@ mod tests {
         );
         assert!((d.mean_accepted_length() - 0.75).abs() < 1e-12);
         assert_eq!(d.plain_step_ns, Some(10_000_000));
-        assert!((d.verify_cost_ratio().unwrap() - 2.4).abs() < 1e-9, "{d:?}");
+        assert!((d.verify_cost_ratio().unwrap() - 2.0).abs() < 1e-9, "{d:?}");
         assert!(d.gain().unwrap() < 1.0 - core_llm::MEASURED_GAIN_MARGIN);
+        assert!(d.gain().unwrap() >= core_llm::CLEAR_LOSS_GAIN);
         // The head was caught up once, on the probed tokens at their positions, with one
         // preceding hidden row each.
         assert_eq!(
@@ -3450,7 +3497,8 @@ mod tests {
     }
 
     /// The timed monitor on Candle prompt lookup: a lookup accepting nothing is demoted on its
-    /// measured gain when its verify step costs 2.4 plain steps and kept when it costs one (the
+    /// measured gain at its window's end when its verify step costs 1.15 plain steps (gain 0.87)
+    /// and kept when it costs one (the
     /// static 0.21 would have demoted both) — and, being history-only, needs no hidden rows to
     /// catch up.
     #[test]
@@ -3459,7 +3507,7 @@ mod tests {
         let vocab = model.vocab_size();
         let config = greedy(64);
         let expected = reference(&model, &PROMPT, &config).tokens;
-        for (ratio, demoted) in [(2.4, true), (1.0, false)] {
+        for (ratio, demoted) in [(1.15, true), (1.0, false)] {
             let mut wrong =
                 Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, vocab);
             let run = timed_run(&model, &mut wrong, &config, 4, ratio);
@@ -3481,6 +3529,68 @@ mod tests {
         }
     }
 
+    /// sc-24446 (cuda-campaign-b4): on the deterministic decode clock a clear loser — measured
+    /// gain below [`core_llm::CLEAR_LOSS_GAIN`] (Bonsai-like lookup under CUDA graphs: accepting
+    /// nothing at r = 2.4, gain 0.42; a companion MTP head at mal 0.75, r = 2.6, gain 0.67) — is
+    /// demoted by the end of the probe and its first window: at the first step its measurement
+    /// holds [`core_llm::MIN_TIMED_WINDOW_STEPS`] timed steps past its shape's warm-up. A winner
+    /// (Qwen3.8-like: mal 1.0 at r = 1.71, gain 1.17) is never demoted. The reference loop's tokens throughout.
+    #[test]
+    fn a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never() {
+        let (_cfg, model) = text_model();
+        let vocab = model.vocab_size();
+        let first =
+            core_llm::SHAPE_WARMUP_STEPS as usize + core_llm::MIN_TIMED_WINDOW_STEPS as usize;
+        let config = greedy(64);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+
+        let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, vocab);
+        let run = timed_run(&model, &mut wrong, &config, 4, 2.4);
+        assert_eq!(run.output.tokens, expected);
+        let at = run.record.speculative_demoted_at.expect("demoted") as usize;
+        assert_eq!(at, 1 + PROBE + first);
+        assert!(at <= 1 + PROBE + WINDOW, "within the first window");
+        let d = run.record.speculative_monitor.unwrap();
+        assert_eq!(
+            (d.basis, d.demoted, d.window),
+            (core_llm::DemotionBasis::Measured, true, 1)
+        );
+        assert!(d.gain().unwrap() < core_llm::CLEAR_LOSS_GAIN, "{d:?}");
+        assert_eq!(wrong.proposals, first);
+        assert_forward_accounting("clear lookup loser", &run);
+
+        let config = greedy(96);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let bonsai = Script::Pattern(|n| if n % 4 == 1 { 3 } else { 0 });
+        let mut head = Scripted::new(&expected, bonsai, ProposerKind::Mtp, vocab);
+        head.wants_hidden = true;
+        let run = timed_run(&model, &mut head, &config, 3, 2.6);
+        assert_eq!(run.output.tokens, expected);
+        let at = run.record.speculative_demoted_at.expect("demoted") as usize;
+        assert!(
+            at <= 1 + PROBE + WINDOW + 12,
+            "within the first window: {at}"
+        );
+        assert_eq!(head.proposals, first);
+
+        // Qwen3.8-like: mal 1.0 at r = 1.71 (the dearest measured depth-3 MTP verify), gain 1.17.
+        let mut right = Scripted::new(
+            &expected,
+            Script::Pattern(|n| if n % 2 == 1 { 2 } else { 0 }),
+            ProposerKind::Mtp,
+            vocab,
+        );
+        right.wants_hidden = true;
+        let run = timed_run(&model, &mut right, &config, 3, 1.71);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.record.speculative_demoted_at, None);
+        let d = run.record.speculative_monitor.expect("a judged window");
+        assert_eq!(
+            (d.basis, d.demoted),
+            (core_llm::DemotionBasis::Measured, false)
+        );
+    }
+
     /// The real MTP head through a timed run: the plain probe, the head's catch-up on the probed
     /// tokens, then its proposals — the reference loop's tokens throughout, and (the random
     /// head never pays, its verify dear) a measured demotion.
@@ -3490,7 +3600,8 @@ mod tests {
         let config = greedy(48);
         let expected = reference(&model, &PROMPT, &config).tokens;
         let mut head = MtpProposer::new(&mtp);
-        let run = timed_run(&model, &mut head, &config, 2, 2.4);
+        // r = 1.15: gain 0.87, judged at its window's end.
+        let run = timed_run(&model, &mut head, &config, 2, 1.15);
         assert_eq!(run.output.tokens, expected);
         assert_eq!(
             run.stats.accepted, 0,
