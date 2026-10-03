@@ -4,6 +4,10 @@ use super::*;
 use std::io::{BufWriter, Read};
 
 const STAGES: usize = 33;
+#[cfg(feature = "native_convt_columns")]
+const HISTORICAL_STAGE2: &str = include_str!("../historical-stage2.json");
+#[cfg(not(feature = "native_convt_columns"))]
+const HISTORICAL_STAGE2: &str = "{}";
 const ORIGINAL_RAW: [[&str; 2]; 2] = [
     [
         "c12b2b7dca34ee4810536fcee12872674376c24ba484fa600c47fcb35317a908",
@@ -116,6 +120,161 @@ fn raw_values(out: &Path, record: &Value) -> Result<Vec<(u32, f32)>, Box<dyn Err
             Ok((bits, value))
         })
         .collect()
+}
+
+#[cfg(feature = "native_convt_columns")]
+fn weight_record(
+    vae: &Yue2Vae,
+    out: &Path,
+    label: &str,
+    dtype: DType,
+) -> Result<Value, Box<dyn Error>> {
+    let weight = vae
+        .trace_conv_transpose_weight(2)
+        .ok_or("native column trace lost stage-2 folded weight")?;
+    if weight.dtype() != dtype || weight.dims() != [2048, 1024, 12] {
+        return Err("native ConvT weight dtype/shape changed".into());
+    }
+    let suffix = if dtype == DType::BF16 {
+        "bf16le"
+    } else {
+        "f32le"
+    };
+    let file = format!("{label}-stage-02-folded-weight.{suffix}");
+    let mut writer = BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(out.join(&file))?,
+    );
+    let mut digest = Sha256::new();
+    let values = weight
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    for value in values {
+        if !value.is_finite() {
+            return Err("native ConvT folded weight is non-finite".into());
+        }
+        let encoded = encode_native(value, dtype);
+        writer.write_all(&encoded)?;
+        digest.update(&encoded);
+    }
+    writer.flush()?;
+    Ok(
+        json!({"file":file,"sha256":format!("{:x}",digest.finalize()),
+        "bytes":2048*1024*12*if dtype==DType::BF16{2}else{4},
+        "layout":format!("cick_{suffix}"),"dtype":format!("{dtype:?}"),
+        "shape":[2048,1024,12]}),
+    )
+}
+
+#[cfg(all(feature = "native_convt_columns", feature = "cuda"))]
+fn native_column_record(
+    capture: candle_core::cuda::Yue2NativeConvtColumn,
+    out: &Path,
+    label: &str,
+    slot: &str,
+    expected_length: usize,
+    weight_sha256: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let dtype = capture.dtype;
+    if !matches!(dtype, DType::BF16 | DType::F32)
+        || capture.shape != [1, expected_length, 1024, 12]
+        || capture.gemm != [1, expected_length, 12288, 2048]
+        || capture.kernel_layout_strides != [0, 12288, 1]
+        || capture.branch != "native_col2im"
+        || capture.bytes.len()
+            != expected_length * 1024 * 12 * if dtype == DType::BF16 { 2 } else { 4 }
+    {
+        return Err("captured native column branch, shape, or GEMM layout changed".into());
+    }
+    let suffix = if dtype == DType::BF16 {
+        "bf16le"
+    } else {
+        "f32le"
+    };
+    let file = format!("{label}-stage-02-{slot}-native-column.{suffix}");
+    let bytes = capture.bytes.len();
+    let hash = sha256(&capture.bytes);
+    let mut writer = BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(out.join(&file))?,
+    );
+    writer.write_all(&capture.bytes)?;
+    writer.flush()?;
+    let raw = json!({"file":file,"sha256":hash,"bytes":bytes,"layout":format!("blck_{suffix}"),
+        "dtype":format!("{dtype:?}"),"shape":capture.shape});
+    let _ = raw_values(out, &raw)?;
+    Ok(
+        json!({"raw":raw,"branch":capture.branch,"gemm":capture.gemm,
+        "kernelLayoutStrides":capture.kernel_layout_strides,
+        "mathModeReadback":capture.math_mode_readback,"captureCount":1,
+        "weightSha256":weight_sha256}),
+    )
+}
+
+#[cfg(feature = "native_convt_columns")]
+fn compare_native_contributors(
+    out: &Path,
+    full: &Value,
+    tile: &Value,
+) -> Result<Value, Box<dyn Error>> {
+    let a = &full["raw"];
+    let b = &tile["raw"];
+    let dtype = a["dtype"].as_str().ok_or("native column dtype absent")?;
+    if b["dtype"] != dtype
+        || a["shape"] != json!([1, 75, 1024, 12])
+        || b["shape"] != json!([1, 32, 1024, 12])
+    {
+        return Err("native column comparison shape/dtype changed".into());
+    }
+    let (a, b) = (raw_values(out, a)?, raw_values(out, b)?);
+    let mut compared = 0usize;
+    let mut bit_differences = 0usize;
+    let mut positive_differences = 0usize;
+    let mut signed_zero_only = 0usize;
+    let mut max_abs = 0f32;
+    let mut first = Value::Null;
+    for raw_frame in 3usize..=173 {
+        let current = raw_frame / 6;
+        let tap = raw_frame % 6;
+        for channel in 0..1024 {
+            for (row, kernel_tap) in [(current, tap), (current.saturating_sub(1), tap + 6)] {
+                if kernel_tap >= 6 && current == 0 {
+                    continue;
+                }
+                let at = (row * 1024 + channel) * 12 + kernel_tap;
+                let (x, y) = (a[at], b[at]);
+                let delta = (x.1 - y.1).abs();
+                compared += 1;
+                max_abs = max_abs.max(delta);
+                if x.0 != y.0 {
+                    bit_differences += 1;
+                    if delta > 0.0 {
+                        positive_differences += 1;
+                    }
+                    if x.1 == 0.0 && y.1 == 0.0 {
+                        signed_zero_only += 1;
+                    }
+                    if first.is_null() {
+                        first = json!({"rawFrame":raw_frame,"inputRow":row,
+                            "kernelTap":kernel_tap,"channel":channel,
+                            "full":x.1,"tile":y.1,"absError":delta});
+                    }
+                }
+            }
+        }
+    }
+    Ok(
+        json!({"rawValidInclusive":[3,173],"comparedContributors":compared,
+        "bitDifferences":bit_differences,"positiveDifferences":positive_differences,
+        "signedZeroOnly":signed_zero_only,"maxAbs":max_abs,"firstDifferent":first}),
+    )
 }
 
 fn first_true(mut lo: usize, mut hi: usize, mut predicate: impl FnMut(usize) -> bool) -> usize {
@@ -328,6 +487,7 @@ fn replay_one(
     stage: usize,
     window: Option<usize>,
     observed: &[Value],
+    native_weight_sha256: Option<&str>,
 ) -> Result<Value, Box<dyn Error>> {
     let (slot, left, right) = if let Some(index) = window {
         let row = &observed[stage]["windows"][index];
@@ -375,25 +535,47 @@ fn replay_one(
     let stage_origin = target_record["origin"]
         .as_i64()
         .ok_or("stage origin absent")?;
-    let output = vae.trace_replay_stage(stage, &input, &mut |name, tensor| {
-        let mut record = tensor_record(
-            tensor,
-            out,
-            &format!("{label}-replay-stage-{stage:02}-{slot}-{name}"),
-            stage_origin,
-        )
-        .map_err(io_candle)?;
-        if name == "native_unpadded_conv_transpose" {
-            record["coordinateSystem"] = json!("native_uncropped_conv_transpose");
-            record["cropPadding"] = json!(vae
-                .trace_conv_transpose_padding(stage)
-                .ok_or_else(|| io_candle("ConvT padding absent"))?);
-        } else {
-            record["coordinateSystem"] = json!("cropped_stage");
+    let mut replay = || {
+        vae.trace_replay_stage(stage, &input, &mut |name, tensor| {
+            let mut record = tensor_record(
+                tensor,
+                out,
+                &format!("{label}-replay-stage-{stage:02}-{slot}-{name}"),
+                stage_origin,
+            )
+            .map_err(io_candle)?;
+            if name == "native_unpadded_conv_transpose" {
+                record["coordinateSystem"] = json!("native_uncropped_conv_transpose");
+                record["cropPadding"] = json!(vae
+                    .trace_conv_transpose_padding(stage)
+                    .ok_or_else(|| io_candle("ConvT padding absent"))?);
+            } else {
+                record["coordinateSystem"] = json!("cropped_stage");
+            }
+            substeps.push(json!({"name":name,"capture":record}));
+            Ok(())
+        })
+    };
+    let (output, native_column) = if let Some(weight_sha256) = native_weight_sha256 {
+        #[cfg(all(feature = "native_convt_columns", feature = "cuda"))]
+        {
+            let (output, capture) = candle_core::cuda::with_yue2_native_convt_column(
+                vae.dtype(),
+                [1, right - left, 1024, 12],
+                || replay().map_err(io_candle),
+            )?;
+            let record =
+                native_column_record(capture, out, label, &slot, right - left, weight_sha256)?;
+            (output, Some(record))
         }
-        substeps.push(json!({"name":name,"capture":record}));
-        Ok(())
-    })?;
+        #[cfg(not(all(feature = "native_convt_columns", feature = "cuda")))]
+        {
+            let _ = weight_sha256;
+            return Err("native column capture requires the CUDA derivative build".into());
+        }
+    } else {
+        (replay()?, None)
+    };
     let output_capture = tensor_record(
         &output,
         out,
@@ -401,11 +583,50 @@ fn replay_one(
         stage_origin,
     )?;
     let output_exact = output_capture["sha256"] == target_record["sha256"];
-    Ok(
-        json!({"slot":slot,"sourceInput":source_record,"replayInput":input_capture,
+    let mut result = json!({"slot":slot,"sourceInput":source_record,"replayInput":input_capture,
         "originalOutput":target_record,"replayOutput":output_capture,"inputBitExact":input_exact,
-        "outputBitExact":output_exact,"substeps":substeps}),
-    )
+        "outputBitExact":output_exact,"substeps":substeps});
+    if let Some(record) = native_column {
+        result["nativeColumn"] = record;
+    }
+    Ok(result)
+}
+
+fn matches_historical_record(actual: &Value, expected: &Value) -> bool {
+    ["file", "sha256", "bytes", "dtype", "shape"]
+        .iter()
+        .all(|key| !expected[key].is_null() && actual[key] == expected[key])
+}
+
+fn matches_historical_stage2_slot(replay: &Value, expected: &Value) -> bool {
+    for key in [
+        "sourceInput",
+        "replayInput",
+        "originalOutput",
+        "replayOutput",
+    ] {
+        if !matches_historical_record(&replay[key], &expected[key]) {
+            return false;
+        }
+    }
+    let Some(steps) = replay["substeps"].as_array() else {
+        return false;
+    };
+    if steps.len() != 3 {
+        return false;
+    }
+    for name in ["native_unpadded_conv_transpose", "cropped", "biased"] {
+        let mut matching = steps.iter().filter(|step| step["name"] == name);
+        let Some(step) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some()
+            || !matches_historical_record(&step["capture"], &expected[name])
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -420,6 +641,7 @@ pub(super) fn run_decoder_trace(
     frames: usize,
     core: usize,
     halo: usize,
+    native_columns: bool,
 ) -> Result<(), Box<dyn Error>> {
     if (frames, core, halo) != (75, 16, 16) {
         return Err("decoder trace geometry changed".into());
@@ -437,6 +659,22 @@ pub(super) fn run_decoder_trace(
     let mut earliest = None;
     let mut first_window = None;
     let mut adaptive_runs = BTreeMap::new();
+    let historical: Value = serde_json::from_str(HISTORICAL_STAGE2)?;
+    if native_columns
+        && (historical["source_run"] != 36979353496u64
+            || historical["source_control"] != "4f89f150e13647c53d37dddfa7d36e3f1d28ac85"
+            || historical["engine"] != ENGINE_SHA
+            || historical["report_sha256"]
+                != "9dd0a4113f43a185e573f79c99c2d3e01eb8525923e271cc56a341e21344301f"
+            || historical["metrics_zip_sha256"]
+                != "a26439ced8b5244b75a65d31b565341ff4bf0280cc3d02e6fb982563ccca379c"
+            || historical["stage"] != 2
+            || historical["window"] != 0)
+    {
+        return Err("historical stage-2 receipt identity changed".into());
+    }
+    let mut historical_checks = BTreeMap::new();
+    let mut native_runs = BTreeMap::<&str, Value>::new();
     let mut bf16_clamped_peak = None;
     for (rank, (label, dtype)) in [("bf16", DType::BF16), ("f32", DType::F32)]
         .into_iter()
@@ -449,6 +687,18 @@ pub(super) fn run_decoder_trace(
         {
             return Err("resident decoder identity/dtype/halo changed".into());
         }
+        let native_weight: Option<Value> = if native_columns {
+            #[cfg(feature = "native_convt_columns")]
+            {
+                Some(weight_record(&vae, out, label, dtype)?)
+            }
+            #[cfg(not(feature = "native_convt_columns"))]
+            {
+                return Err("native column capture requires a derivative harness".into());
+            }
+        } else {
+            None
+        };
         let z = source.to_decoder_input(device)?.to_dtype(dtype)?;
         let mut stages = Vec::<Value>::new();
         let full = vae.trace_decode_full(&z, &mut |stage, _, output| {
@@ -542,9 +792,51 @@ pub(super) fn run_decoder_trace(
         if dtype == DType::BF16 {
             bf16_clamped_peak = Some(waveform_peak(out, &full_wave, &tiled_wave)?);
         }
+        if native_columns && (earliest, first_window) != (Some(2), Some(0)) {
+            return Err(
+                "native column selector requires the observed first stage-2 tile-0 divergence"
+                    .into(),
+            );
+        }
         if let (Some(stage), Some(window)) = (earliest, first_window) {
-            let full_replay = replay_one(&vae, &z, out, label, stage, None, &stages)?;
-            let tile_replay = replay_one(&vae, &z, out, label, stage, Some(window), &stages)?;
+            let weight_sha256 = native_weight
+                .as_ref()
+                .and_then(|weight| weight["sha256"].as_str());
+            let full_replay =
+                replay_one(&vae, &z, out, label, stage, None, &stages, weight_sha256)?;
+            let tile_replay = replay_one(
+                &vae,
+                &z,
+                out,
+                label,
+                stage,
+                Some(window),
+                &stages,
+                weight_sha256,
+            )?;
+            if native_columns {
+                let expected = &historical["records"][label];
+                historical_checks.insert(
+                    label,
+                    json!({
+                        "full": matches_historical_stage2_slot(&full_replay, &expected["full"]),
+                        "window": matches_historical_stage2_slot(&tile_replay, &expected["window"]),
+                    }),
+                );
+            }
+            if native_columns {
+                #[cfg(feature = "native_convt_columns")]
+                {
+                    let full = &full_replay["nativeColumn"];
+                    let window = &tile_replay["nativeColumn"];
+                    let comparison = compare_native_contributors(out, full, window)?;
+                    native_runs.insert(
+                        label,
+                        json!({"weight":native_weight,
+                        "full":full,"window":window,"comparison":comparison}),
+                    );
+                }
+            }
             adaptive_runs.insert(label, json!({"full":full_replay,"window":tile_replay}));
         }
         runs.insert(
@@ -564,6 +856,10 @@ pub(super) fn run_decoder_trace(
             && run["window"]["inputBitExact"] == true
             && run["window"]["outputBitExact"] == true
     });
+    let historical_exact = historical_checks.len() == 2
+        && historical_checks
+            .values()
+            .all(|check: &Value| check["full"] == true && check["window"] == true);
     let adaptive = if let (Some(stage), Some(window)) = (earliest, first_window) {
         json!({"status":if replay_exact{"collected"}else{"inconclusive_replay_mismatch"},
             "source":"single_native_layer_replay","stage":stage,"window":window,
@@ -576,7 +872,8 @@ pub(super) fn run_decoder_trace(
     if derivative_source["engine_sha"] != ENGINE_SHA {
         return Err("derivative provenance lost M3 source".into());
     }
-    let report = json!({"schemaVersion":4,"selector":"decoder_trace",
+    let mut report = json!({"schemaVersion":if native_columns {5} else {4},
+        "selector":if native_columns {"native_convt_columns"} else {"decoder_trace"},
         "purpose":"diagnostic_only_no_gate_change","engineSha":ENGINE_SHA,
         "derivativeSource":derivative_source,
         "referenceSha256":reference_hash,
@@ -589,14 +886,33 @@ pub(super) fn run_decoder_trace(
         "originalWaveformRunId":"36884387320","originalBound":ORIGINAL_BOUND,
         "waveformParity":parity,"bf16ClampedMaxAbs":bf16_clamped_peak,
         "earliestBf16Stage":earliest,"adaptive":adaptive,"runs":runs});
+    if native_columns {
+        report["historicalStage2"] = json!({
+            "sourceRunId":historical["source_run"],
+            "sourceControlSha":historical["source_control"],
+            "sourceReportSha256":historical["report_sha256"],
+            "sourceMetricsZipSha256":historical["metrics_zip_sha256"],
+            "expectedMapSha256":sha256(HISTORICAL_STAGE2.as_bytes()),
+            "checks":historical_checks,
+            "matchesHistorical":historical_exact,
+        });
+        report["nativeColumns"] = json!({"status":if parity && replay_exact && historical_exact {"collected"}
+            else {"inconclusive_parity"},"stage":2,"window":0,
+            "geometry":{"stride":6,"kernel":12,"cropPadding":3,
+                "rawValidInclusive":[3,173],"inputValidInclusive":[0,28]},
+            "runs":native_runs});
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(out.join("report.json"))?;
     file.write_all(serde_json::to_string_pretty(&report)?.as_bytes())?;
     file.write_all(b"\n")?;
-    if !parity {
-        return Err("traced final waveform differs from original M3: inconclusive".into());
+    if !parity || (native_columns && (!replay_exact || !historical_exact)) {
+        return Err(
+            "trace failed original waveform, replay, or historical stage-2 identity: inconclusive"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -622,5 +938,49 @@ mod tests {
         assert_eq!(first_true(0, 100, |x| x >= 19), 19);
         assert_eq!(first_true(19, 100, |x| x >= 61), 61);
         assert_eq!(first_true(0, 100, |_| false), 100);
+    }
+
+    #[cfg(feature = "native_convt_columns")]
+    #[test]
+    fn historical_stage2_rejects_consistent_current_run_mutations() {
+        assert_eq!(
+            sha256(HISTORICAL_STAGE2.as_bytes()),
+            "a09106a9e5602c89bb44c21e31388f8f26a45233a393a15dd2016d355bb0e9f9"
+        );
+        let manifest: Value = serde_json::from_str(HISTORICAL_STAGE2).unwrap();
+        for dtype in ["bf16", "f32"] {
+            for slot in ["full", "window"] {
+                let expected = &manifest["records"][dtype][slot];
+                let steps: Vec<Value> = ["native_unpadded_conv_transpose", "cropped", "biased"]
+                    .iter()
+                    .map(|name| json!({"name":name,"capture":expected[name]}))
+                    .collect();
+                let mut replay = json!({"sourceInput":expected["sourceInput"],
+                    "replayInput":expected["replayInput"],
+                    "originalOutput":expected["originalOutput"],
+                    "replayOutput":expected["replayOutput"],"substeps":steps});
+                assert!(matches_historical_stage2_slot(&replay, expected));
+                for key in ["sourceInput", "replayInput"] {
+                    replay[key]["sha256"] = json!("paired-new-input");
+                }
+                assert!(!matches_historical_stage2_slot(&replay, expected));
+                for key in ["sourceInput", "replayInput"] {
+                    replay[key] = expected[key].clone();
+                }
+                for key in ["originalOutput", "replayOutput"] {
+                    replay[key]["sha256"] = json!("paired-new-output");
+                }
+                assert!(!matches_historical_stage2_slot(&replay, expected));
+                for key in ["originalOutput", "replayOutput"] {
+                    replay[key] = expected[key].clone();
+                }
+                for index in 0..3 {
+                    replay["substeps"][index]["capture"]["sha256"] = json!("changed-substep");
+                    assert!(!matches_historical_stage2_slot(&replay, expected));
+                    replay["substeps"][index]["capture"] =
+                        expected[replay["substeps"][index]["name"].as_str().unwrap()].clone();
+                }
+            }
+        }
     }
 }

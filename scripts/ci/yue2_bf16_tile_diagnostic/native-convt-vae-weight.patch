@@ -1,0 +1,14 @@
+--- a/crates/audio/candle-audio-yue2/src/vae.rs
++++ b/crates/audio/candle-audio-yue2/src/vae.rs
+@@ -1173,3 +1173,11 @@
++    /// Diagnostic-only borrowed resident weight for the exact native ConvT stage.
++    pub fn trace_conv_transpose_weight(&self, stage: usize) -> Option<&Tensor> {
++        match self.decoder.get(stage)? {
++            Layer::ConvT(c) => Some(&c.weight),
++            _ => None,
++        }
++    }
++
+     /// Replay only one native M3 layer from independently verified, same-dtype checkpoint input.
+     /// A caller must check replay input/output bits against the original observations.
+     pub fn trace_replay_stage(

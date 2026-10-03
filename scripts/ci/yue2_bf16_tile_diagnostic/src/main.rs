@@ -35,6 +35,7 @@ enum Diagnostic {
     FirstConv,
     FirstConvMath,
     DecoderTrace,
+    NativeConvtColumns,
 }
 
 impl Diagnostic {
@@ -44,6 +45,7 @@ impl Diagnostic {
             "first_conv" => Ok(Self::FirstConv),
             "first_conv_math" => Ok(Self::FirstConvMath),
             "decoder_trace" => Ok(Self::DecoderTrace),
+            "native_convt_columns" => Ok(Self::NativeConvtColumns),
             _ => Err(format!("unsupported diagnostic {value:?}").into()),
         }
     }
@@ -975,7 +977,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             halo,
         );
     }
-    if diagnostic == Diagnostic::DecoderTrace {
+    if matches!(
+        diagnostic,
+        Diagnostic::DecoderTrace | Diagnostic::NativeConvtColumns
+    ) {
         #[cfg(feature = "decoder_trace")]
         return decoder_trace::run_decoder_trace(
             &engine,
@@ -988,6 +993,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             frames,
             core,
             halo,
+            diagnostic == Diagnostic::NativeConvtColumns,
         );
         #[cfg(not(feature = "decoder_trace"))]
         return Err("decoder_trace requires the verified M3 source overlay build".into());
@@ -1099,6 +1105,10 @@ mod tests {
         assert_eq!(
             Diagnostic::parse("decoder_trace").unwrap(),
             Diagnostic::DecoderTrace
+        );
+        assert_eq!(
+            Diagnostic::parse("native_convt_columns").unwrap(),
+            Diagnostic::NativeConvtColumns
         );
         assert!(Diagnostic::parse("full_vae").is_err());
     }
