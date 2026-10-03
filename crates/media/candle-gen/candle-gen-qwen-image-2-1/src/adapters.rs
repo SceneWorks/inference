@@ -173,12 +173,13 @@ impl ProjectionTable {
 pub struct AdapterPlan {
     /// LoRA files, in request order (resident at their safetensors bytes).
     pub additive: Vec<AdapterSpec>,
-    /// Σ over every LoKr module (stamped or LyCORIS) of `a·c + b·d` — the elements of the two small
-    /// Kronecker factors `[a, c]` / `[b, d]` the structured residual keeps on device
-    /// ([`LokrFactors::resident_f32_bytes`] holds them in f32, and a compute-dtype prepared copy
-    /// rides beside them). A low-rank leg is materialized to its full `[b, d]`, so this is not the
-    /// file's byte count.
-    pub lokr_factor_elements: u64,
+    /// The Kronecker dimensions of every LoKr module (stamped or LyCORIS): the two small factors
+    /// `[a, c]` / `[b, d]` the structured residual keeps on device ([`LokrFactors::resident_f32_bytes`]
+    /// holds them in f32, and a compute-dtype prepared copy rides beside them). A low-rank leg is
+    /// materialized to its full `[b, d]`, so this is not the file's byte count. Priced through the
+    /// shared [`candle_gen::gen_core::LokrKroneckerDims::resident_bytes`], the same rule the other candle
+    /// providers use (sc-24163).
+    pub lokr_modules: Vec<candle_gen::gen_core::LokrKroneckerDims>,
     /// One entry per `(LoHa file, projection)` fold.
     pub loha_fold_shapes: Vec<(usize, usize)>,
 }
@@ -243,9 +244,8 @@ pub fn plan(table: &ProjectionTable, specs: &[AdapterSpec], tier: Tier) -> Resul
             };
             for (key, shape, factors) in resolve_modules(spec, table, &entries, format)? {
                 check_lokr_factors(spec, &key, &factors)?;
-                plan.lokr_factor_elements = plan
-                    .lokr_factor_elements
-                    .saturating_add(lokr_factor_elements(spec, &key, shape, &factors)?);
+                plan.lokr_modules
+                    .push(lokr_kronecker_dims(spec, &key, shape, &factors)?);
             }
         } else {
             for (key, (out_f, in_f), factors) in
@@ -499,29 +499,23 @@ fn check_lokr_factors(
 /// ([`check_lokr_factors`]) from its header shapes — `w1_a [a, r]`·`w1_b [r, c]`, `w2_a [b, r]`·
 /// `w2_b [r, d]`, or the tucker `w2_a [r, b]` / `w2_b [r, d]` — refused unless `a·b × c·d` is the
 /// projection's `[out, in]` (so a mis-shaped LoKr fails at the weight-free preflight, not mid-render
-/// under `Sequential`). Returns `a·c + b·d`, the elements the structured residual keeps resident.
-fn lokr_factor_elements(
+/// under `Sequential`). The dimensions come from the shared
+/// [`candle_gen::gen_core::LokrKroneckerDims::from_factor_shapes`], which every candle provider prices with.
+fn lokr_kronecker_dims(
     spec: &AdapterSpec,
     key: &str,
     (out_f, in_f): (usize, usize),
     factors: &BTreeMap<&'static str, &[usize]>,
-) -> Result<u64> {
-    let dim = |factor: &str, axis: usize| factors.get(factor).map(|shape| shape[axis]);
-    let (a, c) = match factors.get("lokr_w1") {
-        Some(w1) => (Some(w1[0]), Some(w1[1])),
-        None => (dim("lokr_w1_a", 0), dim("lokr_w1_b", 1)),
-    };
-    let (b, d) = match (factors.get("lokr_w2"), factors.contains_key("lokr_t2")) {
-        (Some(w2), _) => (Some(w2[0]), Some(w2[1])),
-        (None, true) => (dim("lokr_w2_a", 1), dim("lokr_w2_b", 1)),
-        (None, false) => (dim("lokr_w2_a", 0), dim("lokr_w2_b", 1)),
-    };
-    let (Some(a), Some(b), Some(c), Some(d)) = (a, b, c, d) else {
+) -> Result<candle_gen::gen_core::LokrKroneckerDims> {
+    let Some(dims) = candle_gen::gen_core::LokrKroneckerDims::from_factor_shapes(|name| {
+        factors.get(name).copied()
+    }) else {
         return Err(Error::Msg(format!(
             "{MODEL_ID}: LoKr `{key}` in {} is missing a Kronecker factor",
             spec.path.display()
         )));
     };
+    let [a, b, c, d] = [dims.a, dims.b, dims.c, dims.d].map(|x| x as usize);
     if a * b != out_f || c * d != in_f {
         return Err(Error::Msg(format!(
             "{MODEL_ID}: LoKr `{key}` in {} does not reconstruct the projection's [out={out_f}, \
@@ -531,7 +525,7 @@ fn lokr_factor_elements(
             c * d
         )));
     }
-    Ok((a * c + b * d) as u64)
+    Ok(dims)
 }
 
 /// A LoHa module's factors must reconstruct exactly the projection's `[out, in]` **in orientation**:

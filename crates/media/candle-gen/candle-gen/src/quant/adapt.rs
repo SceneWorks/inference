@@ -209,6 +209,18 @@ impl PreparedLora {
         self.by_dtype.lock().map_or(0, |prepared| prepared.len())
     }
 
+    /// Bytes of the cached copies that own storage. A copy at the factors' own dtype is an `Arc`
+    /// clone of them (`Tensor::to_dtype` short-circuits), so it holds nothing new.
+    fn owned_bytes(&self, source: DType) -> usize {
+        self.by_dtype.lock().map_or(0, |prepared| {
+            prepared
+                .iter()
+                .filter(|(dtype, _, _)| *dtype != source)
+                .map(|(_, a, b)| tensor_bytes(a) + tensor_bytes(b))
+                .sum()
+        })
+    }
+
     fn clear(&self) -> candle_core::Result<()> {
         self.by_dtype
             .lock()
@@ -218,6 +230,11 @@ impl PreparedLora {
             .clear();
         Ok(())
     }
+}
+
+/// Storage bytes of `t` at its dtype.
+fn tensor_bytes(t: &Tensor) -> usize {
+    t.elem_count() * t.dtype().size_in_bytes()
 }
 
 /// Apply a **2-D** factor `w` `[in, out]` to an activation `x` whose last dim is `in`, folding every
@@ -591,6 +608,32 @@ impl LokrFactors {
 
     fn preparation_count(&self) -> usize {
         self.prepared.lock().map_or(0, |prepared| prepared.len())
+    }
+
+    /// Device bytes this structured residual holds right now: its factors ([`Self::nbytes`]) plus
+    /// the compute-dtype copies its forwards have cached so far. What an overlay pricing such as
+    /// `gen_core::LokrKroneckerDims::resident_bytes` must cover (sc-24163).
+    pub fn device_bytes(&self) -> usize {
+        self.nbytes() + self.prepared_owned_bytes()
+    }
+
+    /// Bytes of the cached compute-dtype copies that own storage: `w1` unless it is the factor's own
+    /// dtype (an `Arc` clone then), and the transposed `w2`, which `contiguous` always copies.
+    fn prepared_owned_bytes(&self) -> usize {
+        let source = self.w1.dtype();
+        self.prepared.lock().map_or(0, |prepared| {
+            prepared
+                .iter()
+                .map(|(dtype, w1, w2t)| {
+                    let w1 = if *dtype == source {
+                        0
+                    } else {
+                        tensor_bytes(w1)
+                    };
+                    w1 + tensor_bytes(w2t)
+                })
+                .sum()
+        })
     }
 
     fn migrate_to(&mut self, device: &Device) -> candle_core::Result<()> {
@@ -1003,6 +1046,25 @@ impl AdaptLinear {
     /// Whether any additive residual is attached.
     pub fn is_adapted(&self) -> bool {
         !self.adapters.is_empty()
+    }
+
+    /// Device bytes the **frozen** forward-time adapters on this projection hold right now: each
+    /// LoRA's factors and each structured LoKr's factors, plus the compute-dtype copies their
+    /// forwards have cached so far (a copy at the factors' own dtype shares their storage, so it adds
+    /// nothing). Trainable adapters are not counted; the optimizer owns their leaves. A narrowed
+    /// factor counts its own elements, not the storage it views. This is what an overlay pricing such
+    /// as `gen_core::adapter_stack_upcast_resident_bytes` must cover (sc-24163).
+    pub fn frozen_adapter_bytes(&self) -> usize {
+        self.adapters
+            .iter()
+            .map(|adapter| match adapter {
+                Adapter::Lora { a, b, prepared, .. } => {
+                    tensor_bytes(a) + tensor_bytes(b) + prepared.owned_bytes(a.dtype())
+                }
+                Adapter::LokrStructured { factors } => factors.device_bytes(),
+                Adapter::TrainableLora { .. } | Adapter::TrainableLokr { .. } => 0,
+            })
+            .sum()
     }
 
     /// Attach a forward-time **LoRA** residual `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b`
