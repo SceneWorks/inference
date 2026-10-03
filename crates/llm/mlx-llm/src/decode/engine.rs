@@ -841,6 +841,14 @@ pub struct EngineOptions<'a, 'c> {
     pub constraint: Option<&'a mut (dyn RewindableConstraintMask + 'c)>,
     /// A caller stop predicate checked after each emitted token (request stop strings).
     pub should_stop: Option<&'a dyn Fn() -> bool>,
+    /// Whether the caller has delivered output to its consumer yet. A streaming caller can hold
+    /// the first emitted tokens back — a thinking marker the segmenter strips, a partial stop
+    /// string, a detokenizer's incomplete character — so its time to first token is that of the
+    /// first token it *delivers*, not the engine's token 0. Until this reports `true` (for at
+    /// most [`FIRST_DELIVERY_HOLD_STEPS`] tokens) the pipelined loop reads every token back
+    /// before it enqueues the next step, so the delivered token never waits behind a look-ahead
+    /// step's host-side build and dispatch (sc-24446). `None`: every emitted token is delivered.
+    pub delivered: Option<&'a dyn Fn() -> bool>,
     /// When set, the run is timed: the prefill phase starts at this instant and closes, after a
     /// device synchronization, once the prompt is prefilled and the proposer warmed.
     pub prefill_clock: Option<Instant>,
@@ -855,6 +863,13 @@ pub struct EngineOptions<'a, 'c> {
     /// explicit proposer, `off`, the default — runs the proposer to the end.
     pub speculative_mode: Speculative,
 }
+
+/// The most tokens the pipelined loop reads back unpipelined while the caller has delivered
+/// nothing ([`EngineOptions::delivered`]). Holding trades about one step's dispatch overlap per
+/// token for the first delivered token's latency, which a look-ahead enqueued ahead of its read
+/// raises by up to one step's host-side dispatch; past a few tokens the lost overlap outweighs it,
+/// and a run whose output stays held for long (a tool call buffered whole) is pipelined again.
+pub const FIRST_DELIVERY_HOLD_STEPS: usize = 8;
 
 /// Whether [`generate_speculative`] pipelines its token-at-a-time loop (story sc-24439).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -914,8 +929,12 @@ impl SpeculativeRun {
 /// [`SpeculativeRun::committed_cache_len`] is where the committed sequence ends. The draws, and so the
 /// output, are the same with or without pipelining ([`Pipelining::Off`]).
 ///
-/// The first token is handed to the device before step 1 is enqueued behind it, so its read-back
-/// waits for the prefill and its own draw only — never for step 1's forward (sc-24446).
+/// The run's first token is read back and emitted before step 1 is built or enqueued, so its
+/// delivery waits for the prefill and its own draw only — never for step 1's graph build and
+/// dispatch, nor its forward (sc-24446). Pipelining starts at step 2 (enqueued before step 1 is
+/// read back) — or, when the caller holds its first tokens back
+/// ([`EngineOptions::delivered`]), after the first token it delivers, so that token's read-back
+/// never waits behind a look-ahead's dispatch either.
 ///
 /// A **speculative** step (any proposer) is not pipelined, even one whose proposer found nothing
 /// to draft: the proposer must read the committed token on the host — the n-gram context, the MTP
@@ -960,6 +979,7 @@ where
     let EngineOptions {
         mut constraint,
         should_stop,
+        delivered,
         prefill_clock,
         sampler,
         pipelining,
@@ -1118,6 +1138,7 @@ where
             config,
             &mut *sampler,
             should_stop,
+            delivered,
             cancel,
             on_event,
         )?;
@@ -1417,6 +1438,7 @@ where
                     config,
                     &mut *sampler,
                     should_stop,
+                    delivered,
                     cancel,
                     on_event,
                 )?;
@@ -1425,6 +1447,13 @@ where
         }
     }
     stats.monitor = monitor.as_ref().and_then(AcceptanceMonitor::last_decision);
+    // A window that demotes on the step that also ends the run (its budget, a stop token, the
+    // caller's stop, a cancel) leaves the loop before the demotion is recorded above: the run was
+    // still demoted there, so the report's `speculative_demoted_at` and its monitor decision
+    // agree (sc-24446).
+    if stats.demoted_at.is_none() && stats.monitor.is_some_and(|d| d.demoted) {
+        stats.demoted_at = Some(generated.len());
+    }
 
     Ok(finished(
         generated, finish, stats, sampler, timer, start_len, on_event,
@@ -1514,9 +1543,13 @@ fn token_dispatches() -> u64 {
 ///
 /// Step `t + 1`'s forward and draw are enqueued on step `t`'s unread token and handed to the
 /// device before step `t`'s id is read back, so the device computes the next step while the host
-/// commits this one. `pending` itself is handed to the device first (sc-24446): otherwise its
-/// read-back, queued behind step `t + 1`, waits for that whole forward — the first token of every
-/// run would arrive one decode step late. The look-ahead is never enqueued past the budget, and a
+/// commits this one. `pending` itself — and every token drawn without a look-ahead — is handed to
+/// the device first (sc-24446): otherwise its read-back, queued behind step `t + 1`, waits for
+/// that whole forward. The run's first token (an empty `generated`) — and every token until the
+/// caller has delivered one (`delivered`, at most [`FIRST_DELIVERY_HOLD_STEPS`] of them) — is read
+/// back before the step after it is built at all, so the first delivered token never waits for a
+/// look-ahead's host-side graph build and dispatch. The
+/// look-ahead is never enqueued past the budget, and a
 /// look-ahead enqueued behind the token that ends the run is discarded unread and counted
 /// ([`SpeculativeStats::discarded`]). The caller has checked the draws are device-resident and
 /// independent of the host (no constraint, a sampler that does not read the history).
@@ -1531,6 +1564,7 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
     config: &GenerationConfig,
     sampler: &mut dyn TokenSampler,
     should_stop: Option<&dyn Fn() -> bool>,
+    delivered: Option<&dyn Fn() -> bool>,
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Result<FinishReason> {
@@ -1543,10 +1577,26 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
     if let SampledToken::Device(id) = &pending {
         dispatch_token(id)?;
     }
+    // Until the caller has delivered its first token, every token is read back and emitted
+    // before anything is enqueued behind it: the look-ahead's graph build and dispatch are host
+    // time spent ahead of the read, and they would add to the time to the first *delivered*
+    // token (sc-24446) — the run's token 0, or a later one when the caller holds the first
+    // tokens back ([`EngineOptions::delivered`]; a thinking model's opening marker). The next
+    // step is then enqueued and dispatched as soon as the token is out, and once the caller has
+    // delivered (or after [`FIRST_DELIVERY_HOLD_STEPS`] held tokens) every step overlaps the
+    // read of the one before it.
+    let holding = |generated: &[i32]| {
+        generated.is_empty()
+            || (generated.len() < FIRST_DELIVERY_HOLD_STEPS
+                && delivered.is_some_and(|delivered| !delivered()))
+    };
     loop {
         // Enqueue step t + 1 on step t's unread token, then read step t back while the device
         // runs it. Never past the budget; a host draw is already read back, so it waits.
-        let ahead = if pending.is_device() && generated.len() + 1 < config.max_new_tokens {
+        let ahead = if !holding(generated)
+            && pending.is_device()
+            && generated.len() + 1 < config.max_new_tokens
+        {
             let position = target.cache_len(cache) + position_delta;
             let out =
                 target.forward(cache, &pending.input()?, position, LogitsScope::Last, false)?;
@@ -1609,7 +1659,13 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
                     false,
                 )?;
                 stats.forwards += 1;
-                sampler.sample(&out.logits, history, None)?
+                let next = sampler.sample(&out.logits, history, None)?;
+                // Handed to the device now, so its read-back never waits for the step enqueued
+                // behind it on the next iteration.
+                if let SampledToken::Device(id) = &next {
+                    dispatch_token(id)?;
+                }
+                next
             }
         };
     }
@@ -2126,8 +2182,9 @@ pub(crate) mod tests {
             assert_eq!((report.proposed_tokens, report.accepted_tokens), (0, 0));
             assert_eq!(report.mean_accepted_length(), None, "{name}");
             assert_eq!(report.sampler, sampler, "{name}");
-            // Device draws pipeline every step after the first; host draws never do.
-            let pipelined = if sampler == "device" { 19 } else { 0 };
+            // Device draws pipeline every step after step 1 (token 0 is read back before step 1
+            // is enqueued, sc-24446); host draws never do.
+            let pipelined = if sampler == "device" { 18 } else { 0 };
             assert_eq!(run.stats.pipelined, pipelined, "{name}");
             assert_eq!(
                 run.stats.discarded, 0,
@@ -3779,7 +3836,7 @@ pub(crate) mod tests {
             let on = off_run(target, &config, Pipelining::Auto, None);
             assert_eq!(on.output.tokens, off.output.tokens, "{name}");
             assert_eq!(on.output.tokens.len(), 20, "{name}");
-            assert_eq!((on.stats.pipelined, off.stats.pipelined), (19, 0), "{name}");
+            assert_eq!((on.stats.pipelined, off.stats.pipelined), (18, 0), "{name}");
             assert_eq!(on.stats.discarded, 0, "{name}");
             assert_eq!(
                 on.report.target_forwards, off.report.target_forwards,
@@ -3861,7 +3918,7 @@ pub(crate) mod tests {
         fn check<T: SpeculativeTarget>(label: &str, model: &T) {
             let run = || off_run(model, &greedy(12), Pipelining::Auto, None);
             let on = run();
-            assert_eq!(on.stats.pipelined, 11, "{label}: pipelined when allowed");
+            assert_eq!(on.stats.pipelined, 10, "{label}: pipelined when allowed");
             assert_eq!(on.report.sampler, "device", "{label}");
             let unpipelined = PIPELINING.scoped(false, run);
             assert_eq!(unpipelined.stats.pipelined, 0, "{label}: the switch is off");
@@ -4011,13 +4068,14 @@ pub(crate) mod tests {
     }
 
     /// The pipelining is real: step `t + 1`'s forward is enqueued before token `t` is read back.
-    /// With the prefill first, the `k`-th forward (`k >= 1`) runs after `k - 1` token reads under
-    /// `Auto` — one behind the unpipelined loop, whose `k`-th forward follows `k` reads.
+    /// With the prefill first, the `k`-th forward (`k >= 2`) runs after `k - 1` token reads under
+    /// `Auto` — one behind the unpipelined loop, whose `k`-th forward follows `k` reads. Step 1 is
+    /// the exception (sc-24446): token 0 is read back before it is enqueued, as unpipelined.
     #[test]
     fn a_pipelined_step_is_enqueued_before_the_previous_token_is_read() {
         let model = causal();
         for (pipelining, expected) in [
-            (Pipelining::Auto, vec![0, 0, 1, 2, 3, 4, 5, 6]),
+            (Pipelining::Auto, vec![0, 1, 1, 2, 3, 4, 5, 6]),
             (Pipelining::Off, vec![0, 1, 2, 3, 4, 5, 6, 7]),
         ] {
             let target = ReadsAtForward {
@@ -4272,9 +4330,9 @@ pub(crate) mod tests {
     /// Token 0 is handed to the device before step 1 is enqueued behind it, so its read-back
     /// waits for the prefill and its draw only: at the `k`-th forward (`k >= 1`) `k` tokens have
     /// been dispatched — token 0 included — where the pre-fix loop had dispatched `k - 1` (token
-    /// 0 then waited for step 1's whole forward). Step 1 is still enqueued before token 0 is read
-    /// back ([`a_pipelined_step_is_enqueued_before_the_previous_token_is_read`]), so the overlap
-    /// is kept; the unpipelined loop dispatches nothing ahead of its reads.
+    /// 0 then waited for step 1's whole forward). Every later step is still enqueued before the
+    /// previous token is read back ([`a_pipelined_step_is_enqueued_before_the_previous_token_is_read`]),
+    /// so the overlap is kept; the unpipelined loop dispatches nothing ahead of its reads.
     #[test]
     fn the_first_token_is_dispatched_before_step_one_is_enqueued() {
         let model = causal();
@@ -4288,6 +4346,191 @@ pub(crate) mod tests {
             assert_eq!(target.dispatched.into_inner(), expected, "{pipelining:?}");
             let again = off_run(&model, &top_p(8), pipelining, None);
             assert_eq!(again.output.tokens, run.output.tokens, "{pipelining:?}");
+        }
+    }
+
+    /// A target that records, at each forward, how many tokens the run had delivered to its event
+    /// sink (`emitted`, which the sink advances) — when each step was enqueued relative to the
+    /// stream.
+    struct EmittedAtForward<'a, T> {
+        inner: &'a T,
+        emitted: &'a std::cell::Cell<usize>,
+        at: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl<T: SpeculativeTarget> SpeculativeTarget for EmittedAtForward<'_, T> {
+        type Cache = T::Cache;
+        type Rollback = T::Rollback;
+
+        fn new_cache(&self) -> T::Cache {
+            self.inner.new_cache()
+        }
+
+        fn cache_len(&self, cache: &T::Cache) -> i32 {
+            self.inner.cache_len(cache)
+        }
+
+        fn rollback(&self, width: usize) -> T::Rollback {
+            self.inner.rollback(width)
+        }
+
+        fn forward(
+            &self,
+            cache: &mut T::Cache,
+            ids: &Array,
+            rope_offset: i32,
+            scope: LogitsScope,
+            want_hidden: bool,
+        ) -> Result<TargetOutput> {
+            self.at.borrow_mut().push(self.emitted.get());
+            self.inner
+                .forward(cache, ids, rope_offset, scope, want_hidden)
+        }
+
+        fn attention_label(&self) -> &'static str {
+            self.inner.attention_label()
+        }
+    }
+
+    /// sc-24446 (pipelined TTFT): the first token reaches the stream before step 1 is built or
+    /// enqueued — its delivery never waits for step 1's host-side graph build and dispatch — and
+    /// from step 2 on every step is still enqueued before the previous token is delivered (the
+    /// overlap). Greedy and seeded output is the unpipelined run's.
+    #[test]
+    fn the_first_token_is_delivered_before_step_one_is_enqueued() {
+        for (name, config) in [("greedy", greedy(8)), ("top_p", top_p(8))] {
+            for (pipelining, expected) in [
+                (Pipelining::Auto, vec![0, 1, 1, 2, 3, 4, 5, 6]),
+                (Pipelining::Off, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            ] {
+                let model = causal();
+                let emitted = std::cell::Cell::new(0usize);
+                let target = EmittedAtForward {
+                    inner: &model,
+                    emitted: &emitted,
+                    at: Default::default(),
+                };
+                let mut tokens = Vec::new();
+                let run = generate_speculative(
+                    &target,
+                    &mut NoProposer,
+                    SpeculativePrompt::Tokens(&PROMPT),
+                    &config,
+                    0,
+                    &CancelFlag::new(),
+                    &mut |e| {
+                        if let StreamEvent::Token { id, .. } = e {
+                            emitted.set(emitted.get() + 1);
+                            tokens.push(id);
+                        }
+                    },
+                    EngineOptions {
+                        pipelining,
+                        ..EngineOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(tokens, run.output.tokens, "{name} {pipelining:?}");
+                assert_eq!(
+                    target.at.into_inner(),
+                    expected,
+                    "{name} {pipelining:?}: tokens delivered at each forward"
+                );
+                let off = off_run(&model, &config, Pipelining::Off, None);
+                assert_eq!(
+                    run.output.tokens, off.output.tokens,
+                    "{name} {pipelining:?}"
+                );
+            }
+        }
+    }
+
+    /// sc-24446 (pipelined TTFT behind held tokens): when the caller holds its first tokens back
+    /// ([`EngineOptions::delivered`] — Qwen3's opening `<think>` emits nothing), its first
+    /// *delivered* token is read back before the step after it is enqueued, as token 0 is; the
+    /// look-ahead resumes once the caller has delivered, or after [`FIRST_DELIVERY_HOLD_STEPS`]
+    /// held tokens. Greedy and seeded output is the unpipelined run's.
+    #[test]
+    fn the_first_delivered_token_is_read_before_a_look_ahead_is_enqueued() {
+        assert_eq!(
+            FIRST_DELIVERY_HOLD_STEPS, 8,
+            "the never-delivered row below assumes 8"
+        );
+        // (tokens the caller holds back before its first delivery, tokens delivered at each
+        // forward of a 12-token run). The prefill is forward 0.
+        let never = usize::MAX;
+        let cases: [(Option<usize>, Pipelining, Vec<usize>); 6] = [
+            (
+                None,
+                Pipelining::Auto,
+                vec![0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                Some(0),
+                Pipelining::Auto,
+                vec![0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                Some(1),
+                Pipelining::Auto,
+                vec![0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                Some(3),
+                Pipelining::Auto,
+                vec![0, 1, 2, 3, 4, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                Some(never),
+                Pipelining::Auto,
+                vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 9, 10],
+            ),
+            (
+                Some(1),
+                Pipelining::Off,
+                vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            ),
+        ];
+        for (name, config) in [("greedy", greedy(12)), ("top_p", top_p(12))] {
+            let model = causal();
+            let off = off_run(&model, &config, Pipelining::Off, None);
+            for (held, pipelining, expected) in &cases {
+                let emitted = std::cell::Cell::new(0usize);
+                let target = EmittedAtForward {
+                    inner: &model,
+                    emitted: &emitted,
+                    at: Default::default(),
+                };
+                let delivered = || held.is_some_and(|held| emitted.get() > held);
+                let run = generate_speculative(
+                    &target,
+                    &mut NoProposer,
+                    SpeculativePrompt::Tokens(&PROMPT),
+                    &config,
+                    0,
+                    &CancelFlag::new(),
+                    &mut |e| {
+                        if let StreamEvent::Token { .. } = e {
+                            emitted.set(emitted.get() + 1);
+                        }
+                    },
+                    EngineOptions {
+                        pipelining: *pipelining,
+                        delivered: held.map(|_| &delivered as &dyn Fn() -> bool),
+                        ..EngineOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    target.at.into_inner(),
+                    *expected,
+                    "{name} held {held:?} {pipelining:?}: tokens emitted at each forward"
+                );
+                assert_eq!(
+                    run.output.tokens, off.output.tokens,
+                    "{name} held {held:?} {pipelining:?}"
+                );
+            }
         }
     }
 
@@ -4490,7 +4733,48 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(ids, run.output.tokens, "streamed ids == returned tokens");
+        assert_demotion_agrees(&run);
         run
+    }
+
+    /// The report's two demotion fields agree: `speculative_demoted_at` is set exactly when the
+    /// monitor's last decision demoted (sc-24446).
+    fn assert_demotion_agrees(run: &SpeculativeRun) {
+        let r = &run.report;
+        assert_eq!(
+            r.speculative_demoted_at.is_some(),
+            r.speculative_monitor.is_some_and(|d| d.demoted),
+            "demoted_at vs monitor: {r:?}"
+        );
+    }
+
+    /// sc-24446: a run whose budget, or a stop token, ends it on the very step that closes the
+    /// demoting window still reports where it was demoted — `speculative_demoted_at` agrees with
+    /// the monitor's demoting decision — pipelined (lookup) or not (MTP kind).
+    #[test]
+    fn a_demotion_on_the_runs_last_step_is_reported() {
+        let model = causal();
+        for (pipelining, kind) in [
+            (Pipelining::Auto, ProposerKind::PromptLookup),
+            (Pipelining::Off, ProposerKind::Mtp),
+        ] {
+            let label = format!("{pipelining:?} {kind:?}");
+            let config = greedy(DEMOTED_AT as usize);
+            let expected = plain(&model, &PROMPT, &config, None).tokens;
+            let mut wrong = Scripted::new(&expected, Script::Wrong, kind, 24);
+            let run = monitored(&model, &mut wrong, &config, 4, AUTO, pipelining);
+            assert_eq!(run.output.tokens, expected, "{label}");
+            assert_eq!(run.output.finish_reason, FinishReason::MaxTokens, "{label}");
+            assert!(
+                run.report.speculative_monitor.is_some_and(|d| d.demoted),
+                "{label}: the last window demoted"
+            );
+            assert_eq!(
+                run.report.speculative_demoted_at,
+                Some(DEMOTED_AT),
+                "{label}"
+            );
+        }
     }
 
     /// A deterministic decode clock (sc-24446): time moves only when [`Timed`] runs a forward.
@@ -4887,8 +5171,8 @@ pub(crate) mod tests {
     const PROBE: usize = core_llm::PLAIN_PROBE_MAX_STEPS as usize;
 
     /// sc-24446 (cost-aware) on MLX's unpipelined path: at the same scale of acceptance, a
-    /// request whose verify steps are dear (Bonsai-like: r = 2.4, mal 0.75) is demoted on its
-    /// measured gain at the end of its first window, one whose verify steps are cheap
+    /// request whose verify steps are dear (r = 2.0, mal 0.75: gain 0.875, a loser but not a
+    /// clear one) is demoted on its measured gain at the end of its first window, one whose verify steps are cheap
     /// (Qwen3.8-like: r = 1.5, mal 1.25) keeps its proposer — both after the plain probe, the
     /// proposer caught up on the probed tokens, the plain loop's tokens throughout. Prompt lookup
     /// (no static threshold here) is judged the same way.
@@ -4900,7 +5184,7 @@ pub(crate) mod tests {
         let bonsai = Script::Pattern(|n| if n % 4 == 1 { 3 } else { 0 });
         let mut dear = Scripted::new(&expected, bonsai, ProposerKind::Mtp, 50);
         dear.wants_hidden = true;
-        let run = timed_run(&model, &mut dear, &config, 3, 2.4, Pipelining::Off);
+        let run = timed_run(&model, &mut dear, &config, 3, 2.0, Pipelining::Off);
         assert_eq!(
             run.output.tokens, expected,
             "the probe and the demotion are output-neutral"
@@ -4913,7 +5197,7 @@ pub(crate) mod tests {
             (d.basis, d.demoted, d.window),
             (core_llm::DemotionBasis::Measured, true, 1)
         );
-        assert!((d.verify_cost_ratio().unwrap() - 2.4).abs() < 1e-9, "{d:?}");
+        assert!((d.verify_cost_ratio().unwrap() - 2.0).abs() < 1e-9, "{d:?}");
         assert_eq!(
             dear.caught_up,
             vec![(
@@ -4936,12 +5220,13 @@ pub(crate) mod tests {
             (core_llm::DemotionBasis::Measured, false)
         );
 
-        // Unpipelined lookup, never demoted by a static threshold, is demoted by its cost.
+        // Unpipelined lookup, never demoted by a static threshold, is demoted by its cost (gain
+        // 1 / 1.15 = 0.87: at its window's end).
         let causal = causal();
         let config = greedy(40);
         let expected = plain(&causal, &PROMPT, &config, None).tokens;
         let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, 24);
-        let run = timed_run(&causal, &mut wrong, &config, 4, 2.4, Pipelining::Off);
+        let run = timed_run(&causal, &mut wrong, &config, 4, 1.15, Pipelining::Off);
         assert_eq!(run.output.tokens, expected);
         assert_eq!(
             run.report.speculative_demoted_at,
@@ -4954,6 +5239,78 @@ pub(crate) mod tests {
         assert_eq!(
             wrong.caught_up,
             vec![(expected[..PROBE].to_vec(), None, PROMPT.len() as i32)]
+        );
+    }
+
+    /// sc-24446 (cuda-campaign-b4): on the deterministic decode clock a clear loser — measured
+    /// gain below [`core_llm::CLEAR_LOSS_GAIN`] (a lookup accepting nothing at r = 2.4, gain
+    /// 0.42; an MTP-kind proposer at mal 0.75, r = 2.6, gain 0.67) — is demoted by the end of the
+    /// probe and its first window: at the first step its measurement holds
+    /// [`core_llm::CLEAR_LOSS_MIN_TIMED_STEPS`] timed steps past its shape's warm-up, or — the
+    /// MTP-kind one, too lumpy (3 drafts every fourth step) for the optimistic gain to call
+    /// early — at its first window's end. A winner (every
+    /// draft accepted, r = 1.5) is never demoted. Pipelined and not, the plain loop's tokens.
+    #[test]
+    fn a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never() {
+        let first =
+            core_llm::SHAPE_WARMUP_STEPS as usize + core_llm::CLEAR_LOSS_MIN_TIMED_STEPS as usize;
+        let model = causal();
+        let config = greedy(64);
+        let expected = plain(&model, &PROMPT, &config, None).tokens;
+        for pipelining in [Pipelining::Auto, Pipelining::Off] {
+            let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, 24);
+            let run = timed_run(&model, &mut wrong, &config, 4, 2.4, pipelining);
+            assert_eq!(run.output.tokens, expected, "{pipelining:?}");
+            let at = run.report.speculative_demoted_at.expect("demoted") as usize;
+            assert_eq!(at, 1 + PROBE + first, "{pipelining:?}");
+            assert!(
+                at <= 1 + PROBE + WINDOW,
+                "{pipelining:?}: within the first window"
+            );
+            let d = run.report.speculative_monitor.unwrap();
+            assert_eq!(
+                (d.basis, d.demoted, d.window),
+                (core_llm::DemotionBasis::Measured, true, 1),
+                "{pipelining:?}"
+            );
+            assert!(d.gain().unwrap() < core_llm::CLEAR_LOSS_GAIN, "{d:?}");
+            assert_eq!(wrong.proposals, first, "{pipelining:?}");
+        }
+
+        let hybrid = qwen35(false);
+        let config = greedy(96);
+        let expected = plain(&hybrid, &PROMPT, &config, None).tokens;
+        let mut head = Scripted::new(
+            &expected,
+            Script::Pattern(|n| if n % 4 == 1 { 3 } else { 0 }),
+            ProposerKind::Mtp,
+            50,
+        );
+        head.wants_hidden = true;
+        let run = timed_run(&hybrid, &mut head, &config, 3, 2.6, Pipelining::Off);
+        assert_eq!(run.output.tokens, expected);
+        let at = run.report.speculative_demoted_at.expect("demoted") as usize;
+        assert!(
+            at <= 1 + PROBE + WINDOW + 12,
+            "within the first window: {at}"
+        );
+        assert_eq!(head.proposals, WINDOW);
+
+        // Qwen3.8-like: mal 1.0 at r = 1.71 (the dearest measured depth-3 MTP verify), gain 1.17.
+        let mut right = Scripted::new(
+            &expected,
+            Script::Pattern(|n| if n % 2 == 1 { 2 } else { 0 }),
+            ProposerKind::Mtp,
+            50,
+        );
+        right.wants_hidden = true;
+        let run = timed_run(&hybrid, &mut right, &config, 3, 1.71, Pipelining::Off);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.report.speculative_demoted_at, None);
+        let d = run.report.speculative_monitor.expect("a judged window");
+        assert_eq!(
+            (d.basis, d.demoted),
+            (core_llm::DemotionBasis::Measured, false)
         );
     }
 

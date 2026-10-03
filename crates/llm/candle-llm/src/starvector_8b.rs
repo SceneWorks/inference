@@ -179,7 +179,7 @@ impl CandleStarVector8bProvider {
         quantize_gate(spec)?;
         let dir = Path::new(&spec.source);
         validate_snapshot(dir).map_err(to_core)?;
-        let device = crate::device::select_device().map_err(to_core)?;
+        let device = crate::device::select_eager_device().map_err(to_core)?;
         let weights = Weights::from_dir(dir, &device).map_err(to_core)?;
         let memory = StarVectorCandleMemory {
             loaded_tensor_count: weights.len(),

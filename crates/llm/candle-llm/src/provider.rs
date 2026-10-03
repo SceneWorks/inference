@@ -1968,7 +1968,7 @@ impl LlamaProvider {
     /// source is [`CoreError::Load`].
     ///
     /// A CUDA load whose decoder the CUDA-graph runner wraps (its policy: `spec.cuda_graphs`,
-    /// else the process switch) also prices the parameter cache the runner's captures leave
+    /// else the process switch, else the CUDA row's default) also prices the parameter cache the runner's captures leave
     /// resident for the process ([`LoadMemoryEstimate::graph_param_cache_bytes`], sc-24441) —
     /// doubled for a load with an MTP head, whose hidden-row steps are captures of their own
     /// (sc-24446).
@@ -2047,7 +2047,10 @@ impl LlamaProvider {
             load_memory_requirements(payload, staging, projector, cuda, working)
                 .ok_or_else(overflow)?;
         let on_device = |bytes: u64| if cuda { bytes } else { 0 };
-        let graphs = target && spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
+        let graphs = target
+            && spec
+                .cuda_graphs
+                .unwrap_or_else(|| crate::decode::graph::cuda_graphs_default_for(cuda));
         let graph_param_cache = if graphs {
             on_device(crate::decode::graph_param_cache_load_bytes(hidden_steps))
         } else {
@@ -8775,6 +8778,36 @@ mod tests {
             (host.graph_param_cache_bytes, host.device_required_bytes),
             (0, None)
         );
+        // Unset (sc-24446), a CUDA estimate takes the CUDA row's graph default (on: priced) from
+        // the `cuda` it is asked about, not from the device this process would open — on a
+        // CPU-only host as on a CUDA one. (A host estimate carries none whatever the switch: the
+        // `host` case above.)
+        {
+            let _switch = crate::decode::graph::cuda_graphs_policy_guard(None);
+            // Neither switch set, and a build that can capture (no candle-flash-attn).
+            if std::env::var_os(crate::decode::graph::CUDA_GRAPHS_ENV).is_none()
+                && std::env::var_os(crate::device::CUDA_STREAM_ENV).is_none()
+                && !cfg!(feature = "flash-attn")
+            {
+                let unset = |cuda| {
+                    super::LlamaProvider::load_memory_estimate(
+                        &core_llm::LoadSpec {
+                            cuda_graphs: None,
+                            ..fixture.spec_with_draft()
+                        },
+                        cuda,
+                    )
+                    .unwrap()
+                    .graph_param_cache_bytes
+                };
+                let cuda_default = if core_llm::defaults::CANDLE_CUDA.cuda_graphs {
+                    on.graph_param_cache_bytes
+                } else {
+                    0
+                };
+                assert_eq!(unset(true), cuda_default);
+            }
+        }
         // The draft beside a graph-wrapped target: exactly room for its own unwrapped load.
         let draft = super::LlamaProvider::load_memory_estimate(
             &core_llm::LoadSpec {

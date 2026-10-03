@@ -841,7 +841,10 @@ mod engine_tests {
         let prompt = vec![3, 9, 4, 11, 3, 9, 4, 11, 5];
         let free = cold(&model, &mut NoProposer, &prompt, 12);
         let mut stopping = greedy(12);
-        stopping.stop_tokens = vec![free[6]];
+        // A stop past token 0: the run's first token is read back before any look-ahead is enqueued
+        // (sc-24446), so a stop there discards nothing.
+        let stop = *free[1..].iter().find(|&&t| t != free[0]).unwrap();
+        stopping.stop_tokens = vec![stop];
         let emitted = Cell::new(0usize);
         let after_four = || emitted.get() >= 4;
         type End<'a> = (&'a str, &'a GenerationConfig, Option<&'a dyn Fn() -> bool>);

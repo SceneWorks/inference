@@ -395,7 +395,7 @@ impl CandleStarVectorProvider {
     pub fn load(spec: &core_llm::LoadSpec) -> core_llm::Result<Self> {
         nvfp4_gate(spec)?;
         read_config(&spec.source).map_err(to_core)?;
-        let device = crate::device::select_device().map_err(to_core)?;
+        let device = crate::device::select_eager_device().map_err(to_core)?;
         let weights = Weights::from_dir(&spec.source, &device).map_err(to_core)?;
         for key in REQUIRED_WEIGHT_KEYS {
             if !weights.contains(key) {
@@ -1499,8 +1499,9 @@ mod tests {
         assert!(nvfp4_gate(&core_llm::LoadSpec::dense("/no/such/starvector-1b")).is_ok());
     }
 
-    /// sc-24134: the provider selects its device once, at load, and a request's pixels go to
-    /// that device. A `select_device()` per request would build a second device — on the own
+    /// sc-24134: the provider selects its device once, at load — on the legacy stream, since it
+    /// never captures (sc-24446, `select_eager_device`) — and a request's pixels go to that
+    /// device. A `select_device()` per request would build a second device — on the own
     /// stream a second CUDA stream (and cuBLAS / cuRAND handles) that candle's per-op check,
     /// which compares the GPU ordinal only, cannot tell from the model's (see the CUDA test).
     #[test]
@@ -1515,7 +1516,7 @@ mod tests {
             .find("pub fn descriptor()")
             .expect("descriptor()");
         let calls: Vec<usize> = production
-            .match_indices("select_device(")
+            .match_indices("select_eager_device(")
             .map(|(at, _)| at)
             .collect();
         assert_eq!(calls.len(), 1, "one device selection: {calls:?}");

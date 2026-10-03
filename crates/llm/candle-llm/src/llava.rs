@@ -34,7 +34,7 @@ use crate::decode::{
     generate_step_from_prefill, CancelFlag, DecodeRecord, FinishReason, GenerationConfig,
     RequestSpan, StreamEvent,
 };
-use crate::device::select_device;
+use crate::device::select_eager_device;
 use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
@@ -453,7 +453,7 @@ impl LlavaProvider {
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
         let requested = requested_quantization(spec)?;
         let dir = Path::new(&spec.source);
-        let device = select_device().map_err(to_core)?;
+        let device = select_eager_device().map_err(to_core)?;
         let model = LlavaModel::from_dir_with(dir, &device, requested).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         // `eos_token_ids` always returns a non-empty model-specific set or the Llama-3 fallback.

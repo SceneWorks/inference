@@ -81,10 +81,8 @@ pub fn device_positions_default(device: &Device) -> bool {
 /// put a second stream on the context). The speculative benchmark records it as the switch's
 /// effective state (sc-24446).
 pub fn device_positions_default_for_selected_device() -> bool {
-    let cpu_forced = std::env::var_os("CANDLE_LLM_DEVICE")
-        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("cpu"));
     SWITCH.explicit().unwrap_or_else(|| {
-        crate::device::decode_backend_for(cfg!(feature = "cuda") && !cpu_forced)
+        crate::device::decode_backend_for(crate::device::selected_device_is_cuda())
             .defaults()
             .device_positions
     })

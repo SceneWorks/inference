@@ -921,10 +921,71 @@ def jitter(k):
     return (-1.0, 0.0, 1.0)[(k - 1) % 3]
 
 
+LIVE_DEFAULTS = (REPOSITORY / "crates/contracts/core-llm/src/defaults.rs").read_text(
+    encoding="utf-8"
+)
+
+# The defaults table as the sc-24446 campaign found it (the entries it decided still
+# PROVISIONAL, CUDA graphs off): the compare logic is judged against this fixed table, not the
+# live one, whose values and justifications the campaign's own decisions change.
+CAMPAIGN_DEFAULTS = textwrap.dedent(
+    """\
+    pub const MLX: DecodeDefaults = DecodeDefaults {
+        // justification: PROVISIONAL — sc-24446 campaign. Off until measured.
+        speculative: Speculative::Off,
+        // justification: proposer-intrinsic depths.
+        recommended_depths: RECOMMENDED_DEPTHS,
+        // justification: PROVISIONAL — sc-24446 campaign. On (E5), admission-clamped (E7).
+        prefix_cache_bytes: PREFIX_CACHE_BYTES,
+        // justification: n/a — MLX has no CUDA graphs.
+        cuda_graphs: false,
+        // justification: on (sc-24439) — token-identical to the unpipelined loop by construction.
+        // Runtime switch `MLX_LLM_PIPELINING`.
+        pipelining: true,
+        // justification: on (sc-24439) — greedy is the device argmax. Runtime switch
+        // `MLX_LLM_DEVICE_SAMPLER`.
+        device_sampler: true,
+    };
+    pub const CANDLE_CUDA: DecodeDefaults = DecodeDefaults {
+        // justification: PROVISIONAL — sc-24446 campaign. Off until measured.
+        speculative: Speculative::Off,
+        // justification: proposer-intrinsic depths.
+        recommended_depths: RECOMMENDED_DEPTHS,
+        // justification: PROVISIONAL — sc-24446 campaign. On (E5), admission-clamped (E7).
+        prefix_cache_bytes: PREFIX_CACHE_BYTES,
+        // justification: PROVISIONAL — sc-24446 campaign. Off until measured. Runtime switch
+        // `CANDLE_LLM_CUDA_GRAPHS`.
+        cuda_graphs: false,
+        // justification: PROVISIONAL — sc-24446 campaign. On. Runtime switch
+        // `CANDLE_LLM_DEVICE_POSITIONS`.
+        device_positions: true,
+        // justification: n/a — Candle's engine has no pipelined loop.
+        pipelining: false,
+    };
+    pub const CANDLE_METAL: DecodeDefaults = DecodeDefaults {
+        // justification: PROVISIONAL — sc-24446 campaign (not a campaign host; follows CUDA).
+        speculative: Speculative::Off,
+        // justification: PROVISIONAL — sc-24446 campaign. On (E5), admission-clamped (E7).
+        prefix_cache_bytes: PREFIX_CACHE_BYTES,
+        // justification: n/a — CUDA only.
+        cuda_graphs: false,
+    };
+    pub const CANDLE_CPU: DecodeDefaults = DecodeDefaults {
+        // justification: PROVISIONAL — sc-24446 campaign (not a campaign host; follows CUDA).
+        speculative: Speculative::Off,
+        // justification: PROVISIONAL — sc-24446 campaign. On (E5), admission-clamped.
+        prefix_cache_bytes: PREFIX_CACHE_BYTES,
+        // justification: n/a — CUDA only.
+        cuda_graphs: false,
+        // justification: PROVISIONAL — sc-24446 campaign. Off: no graph runner on the CPU.
+        device_positions: false,
+    };
+    """
+)
+
+
 class CompareTests(unittest.TestCase):
-    DEFAULTS = (REPOSITORY / "crates/contracts/core-llm/src/defaults.rs").read_text(
-        encoding="utf-8"
-    )
+    DEFAULTS = CAMPAIGN_DEFAULTS
 
     def setUp(self) -> None:
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -1148,9 +1209,15 @@ class CompareTests(unittest.TestCase):
         self.assertFalse(out_json.exists())
 
     def test_the_provisional_defaults_are_read_from_the_table(self) -> None:
-        entries = campaign.provisional_defaults(self.DEFAULTS)
+        for table in (LIVE_DEFAULTS, self.DEFAULTS):
+            self.assert_provisional_entries_are_read(table)
+        # The live table parses: every row and its justified entries.
+        self.assertTrue(campaign.default_entries(LIVE_DEFAULTS))
+
+    def assert_provisional_entries_are_read(self, table: str) -> None:
+        entries = campaign.provisional_defaults(table)
         provisional = sum(
-            self.DEFAULTS.split(f"pub const {const}: DecodeDefaults", 1)[1]
+            table.split(f"pub const {const}: DecodeDefaults", 1)[1]
             .split("\n};", 1)[0]
             .count("justification: PROVISIONAL")
             for const in campaign.DEFAULTS_BACKENDS
