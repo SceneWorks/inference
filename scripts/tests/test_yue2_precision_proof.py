@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import copy
+import base64
+import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -12,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 import yue2_cuda_idle_context as IDLE
+import yue2_precision_reference_transfer as TRANSFER
 SPEC = importlib.util.spec_from_file_location("yue2_precision_proof", ROOT / "scripts/ci/yue2_precision_proof.py")
 CONTROL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CONTROL)
@@ -81,7 +85,7 @@ class PrecisionControlTests(unittest.TestCase):
                 mutate(changed)
                 with self.assertRaises(RuntimeError):
                     IDLE.validate_current(changed, baseline)
-        completed = datetime.fromisoformat(baseline["completedUtc"].replace("Z", "+00:00"))
+        completed = IDLE.parse_completed_utc(baseline["completedUtc"])
         IDLE.check_window(baseline["completedUtc"], completed + timedelta(hours=11))
         for bad in (completed - timedelta(seconds=1), completed + timedelta(hours=12, seconds=1)):
             with self.assertRaisesRegex(RuntimeError, "owner window"):
@@ -95,12 +99,12 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertEqual(IDLE.RUN_ID, "37073714206")
         self.assertEqual(IDLE.BASELINE_DIGEST,
                          "a05afe09223020d39f698f9ec5ed9bc4f2258a1fa8950e69ee4fa9e2769339a1")
-        IDLE.check_dispatch(IDLE.RUN_ID, IDLE.ENGINE_SHA, "a" * 40, "a" * 40)
+        IDLE.check_dispatch(IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40)
         for run_id, engine, control, github in (
-            ("36956986577", IDLE.ENGINE_SHA, "a" * 40, "a" * 40),
-            ("other", IDLE.ENGINE_SHA, "a" * 40, "a" * 40),
-            (IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40),
-            (IDLE.RUN_ID, IDLE.ENGINE_SHA, "a" * 40, "b" * 40),
+            ("36956986577", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
+            ("other", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
+            (IDLE.RUN_ID, "bad", "a" * 40, "a" * 40),
+            (IDLE.RUN_ID, IDLE.BASELINE_ENGINE_SHA, "a" * 40, "b" * 40),
         ):
             with self.assertRaises(RuntimeError):
                 IDLE.check_dispatch(run_id, engine, control, github)
@@ -115,12 +119,12 @@ class PrecisionControlTests(unittest.TestCase):
 
     def test_saved_runner_is_pinned_and_fresh_runner_matches_an_eligible_listener(self):
         self.assertEqual(IDLE.BASELINE_RUNNER, "cuda-windows-2")
-        source = {"completed": True, "targetPid": 38212, "engineSha": IDLE.ENGINE_SHA,
+        source = {"completed": True, "targetPid": 38212, "engineSha": IDLE.BASELINE_ENGINE_SHA,
                   "controlSha": IDLE.BASELINE_CONTROL_SHA}
         with patch.object(IDLE, "read_json", return_value={**source, "runner": "cuda-windows"}), \
              self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
             IDLE.summarize(Path("unused"), baseline=True, pid=38212,
-                           engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
+                           engine_sha=IDLE.BASELINE_ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
         # Reaching the catalog proves the fresh manifest passed runner provenance;
         # full fresh evidence still requires the separate 29-file device checks.
         for runner in ("cuda-windows", "cuda-windows-2"):
@@ -129,17 +133,17 @@ class PrecisionControlTests(unittest.TestCase):
                                                             RuntimeError("catalog reached")]), \
                  self.assertRaisesRegex(RuntimeError, "catalog reached"):
                 IDLE.summarize(Path("unused"), baseline=False, pid=38212,
-                               engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
+                               engine_sha=IDLE.BASELINE_ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
         with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows"}), \
              patch.object(IDLE, "read_json", return_value={**source, "runner": "cuda-windows-2"}), \
              self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
             IDLE.summarize(Path("unused"), baseline=False, pid=38212,
-                           engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
+                           engine_sha=IDLE.BASELINE_ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
         with patch.dict("os.environ", {"RUNNER_NAME": "unknown-listener"}), \
              patch.object(IDLE, "read_json", return_value={**source, "runner": "unknown-listener"}), \
              self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
             IDLE.summarize(Path("unused"), baseline=False, pid=38212,
-                           engine_sha=IDLE.ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
+                           engine_sha=IDLE.BASELINE_ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
 
     def test_shared_census_requires_live_receipt_only_for_mixed_context(self):
         def result(output):
@@ -170,6 +174,157 @@ class PrecisionControlTests(unittest.TestCase):
                  patch.object(IDLE, "census_mixed_context") as attestation:
                 self.assertEqual(len(CONTROL.cuda_census()[1]), 1)
                 attestation.assert_not_called()
+
+    def test_full_cuda_proof_refuses_bare_pmon_and_requires_all_fresh_files(self):
+        for raw, busy in (("# gpu pid type\n0 - -\n", []),
+                          ("typed busy", ["0 123 C 0 0"])):
+            with patch.object(CONTROL, "cuda_census", return_value=(raw, busy)):
+                _, refused = CONTROL.cuda_physical_census()
+                self.assertTrue(refused)
+        good = {"commandExit": 0,
+                "diagnosticFiles": {f"sample-{i}.json": "{}" for i in range(29)},
+                "diagnosticFileBytesB64": {f"sample-{i}.json": base64.b64encode(b"{}").decode()
+                                           for i in range(29)}}
+        with patch.object(CONTROL, "cuda_census", return_value=(json.dumps(good), [])):
+            self.assertEqual(CONTROL.cuda_physical_census()[1], [])
+        for mutate in (lambda item: item["diagnosticFiles"].pop("sample-0.json"),
+                       lambda item: item.__setitem__("refusal", "active")):
+            changed = copy.deepcopy(good)
+            mutate(changed)
+            with patch.object(CONTROL, "cuda_census", return_value=(json.dumps(changed), [])):
+                self.assertTrue(CONTROL.cuda_physical_census()[1])
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = CONTROL.retain_cuda_physical_evidence(Path(directory), "before", json.dumps(good))
+            self.assertEqual(len(inventory), 29)
+            self.assertEqual(len(list((Path(directory) / "physical-before").iterdir())), 29)
+        changed = copy.deepcopy(good)
+        changed["diagnosticFileBytesB64"]["sample-0.json"] = base64.b64encode(b"wrong").decode()
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, "raw bytes disagree"):
+            CONTROL.retain_cuda_physical_evidence(Path(directory), "before", json.dumps(changed))
+
+    def test_reviewed_baseline_copy_remains_byte_bound_to_original_28_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            for index in range(28):
+                (source / f"sample-{index:02d}.json").write_bytes(b"{\"reviewed\":true}\n")
+            pinned = IDLE.artifact_digest(source)
+            (root / "evidence").mkdir()
+            with patch.object(IDLE, "BASELINE_DIGEST", pinned):
+                copied = CONTROL.retain_reviewed_baseline(root / "evidence", source)
+                self.assertEqual(len(copied), 28)
+                self.assertEqual(IDLE.artifact_digest(root / "evidence" / "reviewed-idle-context"), pinned)
+            (source / "sample-00.json").write_bytes(b"{\"reviewed\":false}\n")
+            (root / "other").mkdir()
+            with patch.object(IDLE, "BASELINE_DIGEST", pinned), \
+                 self.assertRaisesRegex(RuntimeError, "differs from pinned"):
+                CONTROL.retain_reviewed_baseline(root / "other", source)
+
+    def test_runtime_engine_sha_is_not_relabelled_as_baseline_source(self):
+        completion = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="microseconds").replace("+00:00", "0Z")
+        baseline = {"identity": [38212, "owner", "C:/owner.exe", "birth"],
+                    "completedUtc": completion}
+        result = type("Result", (), {"returncode": 0, "stderr": ""})()
+        with patch.dict("os.environ", {"EXPECTED_ENGINE_SHA": "b" * 40,
+                                    "GITHUB_SHA": "c" * 40}), \
+             patch.object(IDLE, "reviewed_baseline", return_value=(baseline, Path("receipt"))), \
+             patch.object(IDLE, "_pmon_output"), \
+             patch.object(IDLE.subprocess, "run", return_value=result) as command, \
+             patch.object(IDLE, "summarize", return_value=baseline) as summarize, \
+             patch.object(IDLE, "validate_current"):
+            _, verified = IDLE.census_mixed_context(38212, "typed pmon")
+            self.assertTrue(verified)
+            self.assertIn("b" * 40, command.call_args.args[0])
+            self.assertEqual(summarize.call_args.kwargs["engine_sha"], "b" * 40)
+            self.assertEqual(IDLE.BASELINE_ENGINE_SHA,
+                             "4127a675fc8575555e029e01b7f6867488880a8f")
+        with patch.object(IDLE, "reviewed_baseline", return_value=(baseline, Path("receipt"))):
+            IDLE.require_remaining_window(60)
+            with self.assertRaisesRegex(RuntimeError, "cannot cover"):
+                IDLE.require_remaining_window(12 * 3600)
+
+    def test_only_owned_precision_child_is_killed_on_timeout(self):
+        class Owned:
+            pid = 8123
+            def __init__(self):
+                self.kills = 0
+                self.calls = []
+            def wait(self, timeout=None):
+                self.calls.append(timeout)
+                if len(self.calls) == 1:
+                    raise subprocess.TimeoutExpired("precision", timeout)
+                return -9
+            def kill(self):
+                self.kills += 1
+            def poll(self):
+                return -9 if self.kills else None
+        child = Owned()
+        self.assertEqual(CONTROL.wait_owned_child(child, "cuda"), (-9, True, None))
+        self.assertEqual(child.kills, 1)
+        self.assertEqual(child.calls, [CONTROL.CUDA_CHILD_TIMEOUT_SECONDS, 30])
+        self.assertEqual(CONTROL.CUDA_CHILD_TIMEOUT_SECONDS, 180 * 60)
+        self.assertEqual(CONTROL.CUDA_POSTFLIGHT_SECONDS, 600)
+        other = Owned()
+        def broken_wait(timeout=None):
+            other.calls.append(timeout)
+            if len(other.calls) == 1:
+                raise OSError("owned wait failed")
+            return -9
+        other.wait = broken_wait
+        code, timed_out, wait_error = CONTROL.wait_owned_child(other, "cuda")
+        self.assertEqual((code, timed_out), (-9, False))
+        self.assertIn("owned wait failed", wait_error)
+        self.assertEqual(other.kills, 1)
+
+    def test_timed_out_cuda_child_still_writes_release_and_postflight_proof(self):
+        class Owned:
+            pid = 8123
+            killed = False
+            def wait(self, timeout=None):
+                if not self.killed:
+                    raise subprocess.TimeoutExpired("precision", timeout)
+                return -9
+            def kill(self):
+                self.killed = True
+            def poll(self):
+                return -9 if self.killed else None
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence, reference, binary = root / "evidence", root / "reference", root / "binary"
+            reference.mkdir()
+            (reference / "vae_real_reference.safetensors").write_bytes(b"fixture")
+            binary.write_bytes(b"binary")
+            args = type("Args", (), {"evidence": evidence, "reference": reference,
+                                     "binary": binary, "work_dir": root / "listening",
+                                     "engine_sha": "a" * 40, "control_sha": "b" * 40,
+                                     "app_sha": "", "backend": "cuda"})()
+            baseline = {"completedUtc": "2026-10-03T00:00:00.0000000Z"}
+            census = '{"diagnosticFiles":{},"diagnosticFileBytesB64":{}}'
+            child = Owned()
+            with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows-2",
+                                        "CUDA_VISIBLE_DEVICES": "0",
+                                        "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
+                 patch.object(CONTROL, "sha256", return_value=CONTROL.REFERENCE_SHA256), \
+                 patch.object(CONTROL, "verify_revisions"), \
+                 patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
+                 patch.object(IDLE, "require_remaining_window", return_value=(baseline, root)), \
+                 patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
+                 patch.object(CONTROL, "cuda_physical_census", return_value=(census, [])) as physical, \
+                 patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
+                 patch.object(CONTROL.subprocess, "Popen", return_value=child), \
+                 patch("builtins.print"), \
+                 patch.object(CONTROL, "sample_cuda", return_value={"raw": "0,0,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}):
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    CONTROL.execute(args)
+            result = json.loads((evidence / "control.json").read_text(encoding="utf-8"))
+            self.assertTrue(child.killed)
+            self.assertTrue(result["owned_test_timed_out"])
+            self.assertTrue(result["owned_test_released"])
+            self.assertIsNone(result["post_census_error"])
+            self.assertEqual(physical.call_count, 2)
+            self.assertTrue((evidence / "external-samples.json").is_file())
+            self.assertTrue((evidence / "census-after.txt").is_file())
 
     def test_counter_status_and_missing_fields_refuse_instead_of_becoming_zero(self):
         luid = "luid_0x00000000_0x00020d46"
@@ -289,12 +444,34 @@ class PrecisionControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "vae_real_reference.safetensors").write_bytes(b"wrong reference")
-            (root / "reference-provenance.json").write_text(json.dumps({"engine_sha": "a" * 40, "sha256": CONTROL.REFERENCE_SHA256}), encoding="utf-8")
-            args = type("Args", (), {"directory": root, "engine_sha": "a" * 40})()
-            with self.assertRaisesRegex(RuntimeError, "digest differs"):
-                CONTROL.verify_reference(args)
+            (root / "NONCOMMERCIAL.txt").write_bytes(b"license")
+            metadata = {"engine_sha": "a" * 40, "control_sha": "c" * 40,
+                        "sha256": CONTROL.REFERENCE_SHA256, "runner": "hosted-cpu-transfer",
+                        "transfer_run_id": "123", "transfer_run_attempt": "1",
+                        "source_run_id": TRANSFER.SOURCE_RUN_ID, "source_run_attempt": 1,
+                        "source_engine_sha": TRANSFER.SOURCE_ENGINE_SHA,
+                        "source_artifact_id": TRANSFER.SOURCE_ARTIFACT_ID,
+                        "source_artifact_zip_sha256": TRANSFER.SOURCE_ZIP_SHA256,
+                        "source_provenance_sha256": TRANSFER.SOURCE_METADATA_SHA256,
+                        "noncommercial_sha256": TRANSFER.LICENSE_SHA256}
+            (root / "reference-provenance.json").write_text(json.dumps(metadata), encoding="utf-8")
+            args = type("Args", (), {"directory": root, "engine_sha": "a" * 40,
+                                     "control_sha": "c" * 40, "run_id": "123"})()
+            actual_sha = CONTROL.sha256
+            with patch.object(CONTROL, "sha256", side_effect=lambda path:
+                              TRANSFER.LICENSE_SHA256 if path.name == "NONCOMMERCIAL.txt" else actual_sha(path)):
+                with self.assertRaisesRegex(RuntimeError, "digest differs"):
+                    CONTROL.verify_reference(args)
             args.engine_sha = "b" * 40
             with self.assertRaisesRegex(RuntimeError, "engine SHA differs"):
+                CONTROL.verify_reference(args)
+            args.engine_sha = "a" * 40
+            args.run_id = "124"
+            with self.assertRaisesRegex(RuntimeError, "transfer provenance"):
+                CONTROL.verify_reference(args)
+            args.run_id = "123"
+            args.control_sha = "d" * 40
+            with self.assertRaisesRegex(RuntimeError, "transfer provenance"):
                 CONTROL.verify_reference(args)
 
     def test_actual_rust_receipt_shape_and_cross_policy_mutations(self):
@@ -369,7 +546,7 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertIn("idle_cuda_context_run_id:", workflow)
             self.assertIn("yue2-reviewed-idle-context", workflow)
             self.assertIn("if: inputs.idle_cuda_context_run_id != ''", workflow)
-            self.assertIn(f"{IDLE.ENGINE_SHA}-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1", workflow)
+            self.assertIn(f"{IDLE.BASELINE_ENGINE_SHA}-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1", workflow)
             self.assertNotIn("-36956986577-1", workflow)
             self.assertIn("run-id: ${{ inputs.idle_cuda_context_run_id }}", workflow)
             self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)

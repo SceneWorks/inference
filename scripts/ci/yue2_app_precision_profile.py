@@ -134,12 +134,23 @@ def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
 def preflight(backend: str, evidence: Path, label: str) -> dict:
     # The merged engine control owns the typed process census. Refuse if absent;
     # a generic process-name guess would weaken the shared physical-host lock.
-    from yue2_precision_proof import cuda_census, metal_census  # type: ignore[import-not-found]
+    from yue2_precision_proof import (  # type: ignore[import-not-found]
+        cuda_physical_census, metal_census, retain_cuda_physical_evidence,
+        retain_reviewed_baseline,
+    )
 
     require(backend in ("cuda", "metal"), "unsupported backend")
     if backend == "metal":
         require(os.environ.get("RUNNER_NAME") == "nax-macos-2", "Metal must run on nax-macos-2")
-    census, busy = (cuda_census if backend == "cuda" else metal_census)()
+    evidence.mkdir(parents=True, exist_ok=True)
+    baseline_files = None
+    if backend == "cuda" and label == "initial":
+        from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
+        _, baseline_dir = require_remaining_window(480 * 60 + 600)
+        baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
+    census, busy = (cuda_physical_census if backend == "cuda" else metal_census)()
+    physical_files = (retain_cuda_physical_evidence(evidence, label, census)
+                      if backend == "cuda" and not busy else None)
     disk = shutil.disk_usage(evidence.parent).free
     memory = None
     available = None
@@ -162,8 +173,9 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
               "hostname": os.environ.get("COMPUTERNAME") or subprocess.check_output(["hostname"], text=True, encoding="utf-8").strip(),
               "disk_free_bytes": disk, "physical_memory_bytes": memory, "available_memory_bytes": available,
               "minimum_disk_bytes": MIN_FREE_DISK, "observed_cpu_reference_peak_bytes": REFERENCE_PEAK,
-              "census": census, "competing_processes": busy, "admitted": not errors, "errors": errors}
-    evidence.mkdir(parents=True, exist_ok=True)
+              "census": census, "physical_files": physical_files,
+              "reviewed_baseline_files": baseline_files,
+              "competing_processes": busy, "admitted": not errors, "errors": errors}
     (evidence / f"preflight-{label}.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     require(not errors, "; ".join(errors))
     return record
@@ -310,6 +322,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                 json.dumps({"backend": backend, "status": "partial", "cases": completed_audio}, indent=2) + "\n",
                 encoding="utf-8",
             )
+        preflight(backend, evidence, "after-cases")
         return collect(output, evidence, backend)
     finally:
         copy_partial(output, evidence, backend)

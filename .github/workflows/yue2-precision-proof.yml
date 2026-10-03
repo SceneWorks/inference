@@ -1,6 +1,6 @@
 name: YuE2 targeted stage-precision proof
 
-# Dispatch only. The fixture stage copies the existing pinned CPU reference on nax-macos;
+# Dispatch only. The fixture stage transfers the immutable pinned CPU reference on a hosted runner;
 # the accelerator stages each run ONE ignored real-weight integration test. No old tier
 # quality, terminal acceptance, profile, or FP8 campaign is selected by this workflow.
 on:
@@ -112,7 +112,7 @@ jobs:
 
   reference:
     if: inputs.stage == 'fixture'
-    runs-on: [self-hosted, macOS, ARM64, rw-starvector]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
       run:
@@ -127,14 +127,14 @@ jobs:
           ref: ${{ inputs.expected_engine_sha }}
           path: engine
           persist-credentials: false
-      - name: Verify exact source and copy only the pinned CPU reference
+      - name: Verify exact source and transfer only the pinned CPU reference
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          test "$RUNNER_NAME" = nax-macos
           [[ "$EXPECTED_ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$EXPECTED_ENGINE_SHA"
@@ -143,22 +143,19 @@ jobs:
           test -z "$(git -C ../control status --porcelain --untracked-files=normal)"
           git diff --exit-code && git diff --cached --exit-code
           test -z "$(git status --porcelain --untracked-files=normal)"
-          source_file=/Users/michael/.cache/sceneworks-yue2-fixtures/vae/vae_real_reference.safetensors
-          expected=c4073edb3c7abfbf5d50a9c5bfa67c73b9b9a8ba20115570ddb616d00d5b72d4
-          test -f "$source_file"
-          test "$(shasum -a 256 "$source_file" | cut -d' ' -f1)" = "$expected"
+          source_dir="$RUNNER_TEMP/yue2-precision-reference-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$source_dir"
+          gh api repos/SceneWorks/inference/actions/runs/36748416547 > "$source_dir/run.json"
+          gh api repos/SceneWorks/inference/actions/artifacts/11116254689 > "$source_dir/artifact.json"
+          gh api repos/SceneWorks/inference/actions/artifacts/11116254689/zip > "$source_dir/original-artifact.zip"
           out="$RUNNER_TEMP/yue2-precision-reference-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir -m 700 "$out"
-          cp "$source_file" "$out/vae_real_reference.safetensors"
-          test "$(shasum -a 256 "$out/vae_real_reference.safetensors" | cut -d' ' -f1)" = "$expected"
-          printf '{"engine_sha":"%s","control_sha":"%s","sha256":"%s","runner":"%s","source":"pinned YuE2 VAE upstream CPU fixture"}\n' "$EXPECTED_ENGINE_SHA" "$EXPECTED_CONTROL_SHA" "$expected" "$RUNNER_NAME" > "$out/reference-provenance.json"
-          cat > "$out/NONCOMMERCIAL.txt" <<'EOF'
-          This reference contains tensors derived from m-a-p YuE2 VAE standard/legacy weights
-          (CC BY-NC 4.0). Internal validation artifact only; no model weights are included.
-          Source: https://github.com/multimodal-art-projection/YuE at 92a73cc7652fcc1f937855e4b765e0a0edd7ff2e
-          Models: m-a-p/YuE2-Vae@95535e72a97bc0f09b8ada125d26b4009428c0e8;
-                  m-a-p/YuE2-Vae-legacy@b54118f0fc462f08999d1ec07e88817f4ee3f770.
-          EOF
+          python3 ../control/scripts/ci/yue2_precision_reference_transfer.py \
+            --source-zip "$source_dir/original-artifact.zip" \
+            --run-json "$source_dir/run.json" --artifact-json "$source_dir/artifact.json" \
+            --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" \
+            --transfer-run-id "$GITHUB_RUN_ID" --transfer-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$out"
+          test "$(sha256sum "$out/vae_real_reference.safetensors" | cut -d' ' -f1)" = c4073edb3c7abfbf5d50a9c5bfa67c73b9b9a8ba20115570ddb616d00d5b72d4
           echo "YUE2_REF_OUT=$out" >> "$GITHUB_ENV"
       - name: Upload pinned reference and provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -186,6 +183,11 @@ jobs:
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
+      - name: Record CUDA job start for bounded owned-test deadline
+        shell: powershell
+        run: |
+          $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000000
+          Add-Content -Path $env:GITHUB_ENV -Value "YUE2_PRECISION_JOB_STARTED_UTC_NS=$stamp"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           path: control
@@ -247,7 +249,7 @@ jobs:
           uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
           for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
           if not defined REVIEWED_PYTHON exit /b 1
-          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py verify-reference --directory "%RUNNER_TEMP%\yue2-precision-reference" --engine-sha "${{ inputs.expected_engine_sha }}" || exit /b 1
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py verify-reference --directory "%RUNNER_TEMP%\yue2-precision-reference" --engine-sha "${{ inputs.expected_engine_sha }}" --control-sha "${{ inputs.expected_control_sha }}" --run-id "${{ inputs.reference_run_id }}" || exit /b 1
           echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select checked Git Bash before pinned Rust
         shell: cmd
@@ -355,7 +357,9 @@ jobs:
         shell: bash
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
-        run: python3.12 ../control/scripts/ci/yue2_precision_proof.py verify-reference --directory "$RUNNER_TEMP/yue2-precision-reference" --engine-sha "$EXPECTED_ENGINE_SHA"
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          REFERENCE_RUN_ID: ${{ inputs.reference_run_id }}
+        run: python3.12 ../control/scripts/ci/yue2_precision_proof.py verify-reference --directory "$RUNNER_TEMP/yue2-precision-reference" --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" --run-id "$REFERENCE_RUN_ID"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
