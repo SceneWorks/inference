@@ -4954,11 +4954,13 @@ jobs:
       - name: Record the macOS device inventory
         continue-on-error: true
         run: sysctl -n hw.model hw.memsize machdep.cpu.brand_string | tee "$QWEN_IMAGE_2_1_RENDER_OUT/device-inventory.txt"
-      - name: Materialize and verify immutable snapshots
-        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
-      # Its own step so the cold MLX build reads as build time in the step timings.
+      # BEFORE the ~66 GB materialization, and its own step: a compile error reds in minutes instead
+      # of after the fetch (these tests have never been compiled on a Mac), and the cold MLX build
+      # reads as build time in the step timings.
       - name: Build the Qwen-Image 2.1 MLX test binary
         run: cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration --no-run
+      - name: Materialize and verify immutable snapshots
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
       - name: Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh
       - name: Keep the Qwen-Image 2.1 MLX evidence
