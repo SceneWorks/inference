@@ -90,7 +90,7 @@ jobs:
         if: inputs.idle_cuda_context_run_id != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-3391f854565a5f5ea8eea48d4a8d9bad2e68c02d-36956986577-1
+          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-3391f854565a5f5ea8eea48d4a8d9bad2e68c02d-37073714206-1
           run-id: ${{ inputs.idle_cuda_context_run_id }}
           repository: ${{ github.repository }}
           github-token: ${{ github.token }}
