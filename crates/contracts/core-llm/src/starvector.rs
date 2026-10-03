@@ -307,6 +307,10 @@ pub struct StarVectorOutput {
     pub generated_bytes: usize,
     /// Typed terminal classification.
     pub finish_reason: StarVectorFinishReason,
+    /// The KV cache the decode ran on (sc-20682): a StarVector decoder has no qualification-table
+    /// family, so always dense with the request's reason
+    /// ([`KvCacheReport::without_table_family`](crate::KvCacheReport::without_table_family)).
+    pub kv_cache: Option<crate::KvCacheReport>,
 }
 
 /// Reusable host-side stop guard for provider decoding loops.
@@ -478,6 +482,9 @@ impl<'a> StarVectorBoundedStream<'a> {
             generated_tokens: self.generated_tokens,
             generated_bytes: self.source.len(),
             finish_reason,
+            kv_cache: Some(crate::KvCacheReport::without_table_family(
+                self.request.text_request.kv_compression,
+            )),
         })
     }
 
@@ -702,6 +709,24 @@ mod tests {
             Some("<svg data-name=\"café\"><path d=\"M0 0\"/></svg>")
         );
         assert_eq!(out.generated_bytes, out.svg.as_ref().unwrap().len());
+    }
+
+    /// sc-20682: the output names the dense KV cache the decode ran on, with the request's reason.
+    #[test]
+    fn bounded_stream_output_reports_the_dense_kv_cache() {
+        use crate::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let mut req = request(4, 128, TEST_LIMIT);
+            req.text_request.kv_compression = policy;
+            let mut stream = StarVectorBoundedStream::new(&req);
+            push(&mut stream, "<svg><path d=\"M0 0\"/></svg>", STEP).unwrap();
+            let report = stream.output().unwrap().kv_cache.unwrap();
+            assert_eq!(report.fallback, Some(reason));
+            assert!(!report.ran_compressed());
+        }
     }
 
     #[test]

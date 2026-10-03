@@ -139,6 +139,20 @@ const MIN_BLOCKS_PER_SPLIT: usize = 4;
 /// Upper bound on KV splits per query row (bounds the partial-result scratch and the reduction).
 const MAX_KV_SPLITS: usize = 128;
 
+/// Upper bound on the split-KV partial scratch one reader dispatch over `query_rows` query rows
+/// (`B · Sq · Hq`) holds before its reduction pass: an f32 accumulator of `head_dimension`
+/// channels plus an f32 running max and sum per (row, split), with at most [`MAX_KV_SPLITS`]
+/// splits whatever path ([`PackedKernelPath`]) the planner picks. `None` on overflow.
+pub(crate) fn packed_reader_partial_scratch_bound_bytes(
+    query_rows: u64,
+    head_dimension: u64,
+) -> Option<u64> {
+    query_rows
+        .checked_mul(MAX_KV_SPLITS as u64)?
+        .checked_mul(head_dimension.checked_add(2)?)?
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+}
+
 /// Split-KV heuristic. One threadgroup serves one (row, KV split), where a row is `B · Sq` times
 /// the query-head blocks sharing a KV head (8 rows for a Llama-3.2-3B or Qwen3-1.7B decode token).
 /// That is far too few threadgroups to occupy the GPU while each walks the whole history, so the

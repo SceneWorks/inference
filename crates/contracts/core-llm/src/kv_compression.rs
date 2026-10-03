@@ -68,6 +68,141 @@ impl KvCompressionFormat {
             Self::GroupAffineK8V8 => 32,
         }
     }
+
+    /// Bytes of one group's affine metadata: an f16 scale and an f16 zero.
+    pub const fn group_metadata_bytes(self) -> u64 {
+        match self {
+            Self::GroupAffineK8V8 => 2 * 2,
+        }
+    }
+
+    /// Bytes the packed representation stores for one layer and one KV head at
+    /// `capacity_tokens` positions: key and value codes plus their scale/zero metadata. K groups
+    /// span tokens (one scale/zero pair per channel per `group_size` tokens); V groups span
+    /// channels (one pair per `group_size` channels of every token). `capacity_tokens` is a
+    /// multiple of [`Self::group_size`] for a block-allocated cache; it is rounded up here so a
+    /// partial group is never under-priced.
+    pub fn packed_bytes_per_head(self, capacity_tokens: u64, head_dim: u64) -> Option<u64> {
+        let group = self.group_size() as u64;
+        let key_groups = capacity_tokens.div_ceil(group);
+        let key_codes =
+            key_groups.checked_mul(code_bytes(group.checked_mul(head_dim)?, self.key_bits())?)?;
+        let key_metadata = key_groups
+            .checked_mul(head_dim)?
+            .checked_mul(self.group_metadata_bytes())?;
+        let value_codes = capacity_tokens.checked_mul(code_bytes(head_dim, self.value_bits())?)?;
+        let value_metadata = capacity_tokens
+            .checked_mul(head_dim.div_ceil(group))?
+            .checked_mul(self.group_metadata_bytes())?;
+        key_codes
+            .checked_add(key_metadata)?
+            .checked_add(value_codes)?
+            .checked_add(value_metadata)
+    }
+}
+
+/// Bytes holding `codes` packed codes of `bits` width.
+fn code_bytes(codes: u64, bits: u8) -> Option<u64> {
+    Some(codes.checked_mul(u64::from(bits))?.div_ceil(8))
+}
+
+/// The KV geometry of a loaded decoder, as cache pricing reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvCacheShape {
+    /// Decoder layers holding a K/V cache.
+    pub layers: u64,
+    /// K/V heads per layer.
+    pub kv_heads: u64,
+    /// Channels per head.
+    pub head_dim: u64,
+    /// Scalar width of the dense K/V (the decoder's compute dtype). A compressed cache keeps its
+    /// incomplete group's residual rows at this width.
+    pub element_bytes: u64,
+}
+
+impl KvCacheShape {
+    /// Bytes of a dense K/V cache holding `tokens` positions (K and V for every layer and head).
+    pub fn dense_bytes(self, tokens: u64) -> Option<u64> {
+        tokens
+            .checked_mul(self.layers)?
+            .checked_mul(self.kv_heads)?
+            .checked_mul(self.head_dim)?
+            .checked_mul(self.element_bytes)?
+            .checked_mul(2)
+    }
+}
+
+/// How a backend's compressed cache allocates and reads, beyond what the format itself fixes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressedKvAllocation {
+    /// Positions the packed arrays grow by at a time; capacity is a whole number of these blocks
+    /// (rounded up to whole groups), never smaller than one block.
+    pub growth_block_tokens: u64,
+    /// Layers whose per-layer packed transient (a block growth's pre-growth arrays beside their
+    /// successors, or a group flush's freshly quantized codes before they are written in place)
+    /// the backend's evaluator can hold at once.
+    pub coexisting_layer_transients: u64,
+    /// Scratch one layer's fused-reader dispatch holds (split-KV partials), priced for every
+    /// layer.
+    pub reader_scratch_bytes_per_layer: u64,
+    /// Dense K/V the prompt step holds beside the packed store before it is quantized (the
+    /// layers' fresh prompt K/V the backend lets coexist).
+    pub prefill_transient_bytes: u64,
+}
+
+/// Bytes a compressed KV cache of `format` needs to serve `tokens` positions (prompt plus every
+/// generated token), derived from the format rather than a fixed ratio:
+///
+/// * resident: per layer and KV head, the packed codes and scale/zero metadata at the
+///   block-rounded capacity ([`KvCompressionFormat::packed_bytes_per_head`]) plus one group of
+///   dense K and V residual rows at the decoder's compute width;
+/// * transient: `coexisting_layer_transients` layers' packed arrays at full capacity plus one block
+///   (the pre-growth copy or the flush output beside the live arrays), every layer's residual
+///   rows once more (a step's rollback point holds the residuals a flush replaced), every
+///   layer's fused-reader scratch, and the prompt step's dense K/V
+///   (`prefill_transient_bytes`).
+///
+/// `None` on overflow or a zero growth block.
+pub fn compressed_kv_cache_bytes(
+    format: KvCompressionFormat,
+    shape: KvCacheShape,
+    tokens: u64,
+    allocation: CompressedKvAllocation,
+) -> Option<u64> {
+    let group = format.group_size() as u64;
+    if allocation.growth_block_tokens == 0 {
+        return None;
+    }
+    let block = allocation
+        .growth_block_tokens
+        .div_ceil(group)
+        .checked_mul(group)?;
+    let capacity = tokens.div_ceil(block).max(1).checked_mul(block)?;
+    let packed_layer = format
+        .packed_bytes_per_head(capacity, shape.head_dim)?
+        .checked_mul(shape.kv_heads)?;
+    let residual_layer = group
+        .checked_mul(shape.head_dim)?
+        .checked_mul(shape.element_bytes)?
+        .checked_mul(2)?
+        .checked_mul(shape.kv_heads)?;
+    let resident = packed_layer
+        .checked_add(residual_layer)?
+        .checked_mul(shape.layers)?;
+    let block_layer = format
+        .packed_bytes_per_head(block, shape.head_dim)?
+        .checked_mul(shape.kv_heads)?;
+    let transient = packed_layer
+        .checked_add(block_layer)?
+        .checked_mul(allocation.coexisting_layer_transients.min(shape.layers))?
+        .checked_add(residual_layer.checked_mul(shape.layers)?)?
+        .checked_add(
+            allocation
+                .reader_scratch_bytes_per_layer
+                .checked_mul(shape.layers)?,
+        )?
+        .checked_add(allocation.prefill_transient_bytes)?;
+    resident.checked_add(transient)
 }
 
 /// A decoder family the qualification table can name. A backend maps its loaded architecture onto
@@ -604,6 +739,142 @@ mod tests {
             (KvModelFamily::Llama.id(), KvModelFamily::Qwen3.id()),
             ("llama", "qwen3")
         );
+    }
+
+    /// Llama-3.2-3B / Qwen3-1.7B decoder KV geometry at bf16.
+    const EVIDENCE_SHAPE: KvCacheShape = KvCacheShape {
+        layers: 28,
+        kv_heads: 8,
+        head_dim: 128,
+        element_bytes: 2,
+    };
+    const NO_TRANSIENT: CompressedKvAllocation = CompressedKvAllocation {
+        growth_block_tokens: 256,
+        coexisting_layer_transients: 0,
+        reader_scratch_bytes_per_layer: 0,
+        prefill_transient_bytes: 0,
+    };
+
+    #[test]
+    fn k8v8_packs_one_byte_codes_and_a_scale_zero_pair_per_32_elements() {
+        let format = KvCompressionFormat::GroupAffineK8V8;
+        assert_eq!(format.group_metadata_bytes(), 4);
+        // Per head and position: K and V each store D one-byte codes plus D/32 f16 pairs.
+        for (capacity, head_dim) in [(256, 128), (32, 64), (130_560, 256)] {
+            let per_side = head_dim + head_dim / 32 * 4;
+            assert_eq!(
+                format.packed_bytes_per_head(capacity, head_dim),
+                Some(capacity * per_side * 2),
+                "{capacity} x {head_dim}"
+            );
+        }
+        // A partial K group is priced as a whole group.
+        assert_eq!(
+            format.packed_bytes_per_head(33, 128).unwrap(),
+            2 * (32 * 128 + 128 * 4) + 33 * (128 + 4 * 4)
+        );
+    }
+
+    #[test]
+    fn compressed_cache_bytes_price_block_capacity_residuals_and_transients() {
+        let format = KvCompressionFormat::GroupAffineK8V8;
+        let shape = EVIDENCE_SHAPE;
+        let packed_layer =
+            |tokens| format.packed_bytes_per_head(tokens, 128).unwrap() * shape.kv_heads;
+        let residual_layer = 32 * 128 * 2 * 2 * shape.kv_heads;
+        // Resident only: block-rounded packed arrays plus one group of dense residual rows.
+        let resident = |tokens| (packed_layer(tokens) + residual_layer) * shape.layers;
+        assert_eq!(
+            compressed_kv_cache_bytes(format, shape, 32_768 + 128, NO_TRANSIENT),
+            Some(resident(32_768 + 256) + residual_layer * shape.layers)
+        );
+        // An empty request still holds one block.
+        assert_eq!(
+            compressed_kv_cache_bytes(format, shape, 0, NO_TRANSIENT),
+            compressed_kv_cache_bytes(format, shape, 256, NO_TRANSIENT)
+        );
+        // Growth/flush transients scale with the coexisting layers (capped at the layer count)
+        // and the reader scratch with every layer.
+        let with = |coexisting, scratch| {
+            compressed_kv_cache_bytes(
+                format,
+                shape,
+                40_960,
+                CompressedKvAllocation {
+                    coexisting_layer_transients: coexisting,
+                    reader_scratch_bytes_per_layer: scratch,
+                    ..NO_TRANSIENT
+                },
+            )
+            .unwrap()
+        };
+        let base = with(0, 0);
+        assert_eq!(
+            with(3, 0) - base,
+            3 * (packed_layer(40_960) + packed_layer(256))
+        );
+        assert_eq!(with(1_000, 0), with(28, 0));
+        assert_eq!(with(0, 7) - base, 7 * shape.layers);
+        // The prompt step's dense K/V transient is charged as supplied.
+        assert_eq!(
+            compressed_kv_cache_bytes(
+                format,
+                shape,
+                40_960,
+                CompressedKvAllocation {
+                    prefill_transient_bytes: 12_345,
+                    ..NO_TRANSIENT
+                },
+            )
+            .unwrap()
+                - base,
+            12_345
+        );
+        assert_eq!(
+            compressed_kv_cache_bytes(
+                format,
+                shape,
+                1,
+                CompressedKvAllocation {
+                    growth_block_tokens: 0,
+                    ..NO_TRANSIENT
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            compressed_kv_cache_bytes(format, shape, u64::MAX, NO_TRANSIENT),
+            None
+        );
+    }
+
+    /// The point of the compressed cache: at every qualified context of the evidence geometry,
+    /// even with a full evaluator window of layer transients it prices below the dense cache.
+    #[test]
+    fn qualified_contexts_price_below_dense() {
+        let format = KvCompressionFormat::GroupAffineK8V8;
+        for row in KV_COMPRESSION_QUALIFICATIONS {
+            for tokens in [
+                row.min_context_tokens,
+                row.max_context_tokens.map_or(40_960, |max| max - 1),
+            ] {
+                let allocation = CompressedKvAllocation {
+                    growth_block_tokens: 256,
+                    coexisting_layer_transients: 11,
+                    reader_scratch_bytes_per_layer: 32 * 128 * 130 * 4,
+                    // One layer's dense K/V of the whole context as the prompt step's transient.
+                    prefill_transient_bytes: tokens * 8 * 128 * 2 * 2,
+                };
+                let compressed =
+                    compressed_kv_cache_bytes(format, EVIDENCE_SHAPE, tokens, allocation).unwrap();
+                let dense = EVIDENCE_SHAPE.dense_bytes(tokens).unwrap();
+                assert!(compressed < dense, "{tokens}: {compressed} vs {dense}");
+                assert!(
+                    compressed > dense / 2,
+                    "{tokens}: never cheaper than codes alone"
+                );
+            }
+        }
     }
 
     #[test]
