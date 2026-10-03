@@ -3,7 +3,10 @@
 
 Pins TSV rows: ``repo<TAB>revision<TAB>path<TAB>bytes<TAB>sha256`` (``#`` lines are comments).
 
-Default (W1, models.tsv): for each (repo, revision), if `<hub>/models--<org>--<name>/snapshots/
+Default (W1, models.tsv): FIRST a disk precheck (``disk_precheck``): the bytes of every pinned
+file still missing or of the wrong size, plus ``--reserve-gib`` (build.sh passes 20), against the
+hub volume's free space; free and needed bytes are logged either way and a shortfall fails before
+any download. Then, for each (repo, revision), if `<hub>/models--<org>--<name>/snapshots/
 <revision>` already holds every pinned file at its pinned byte size, nothing is fetched. Otherwise the
 revision is downloaded THROUGH the cache (`snapshot_download(cache_dir=<hub>)`, never `local_dir`)
 and verified again. Byte sizes are the cheap identity check here; the campaign parent re-inventories
@@ -107,6 +110,17 @@ def disk_table(hub: Path, pins, reserve_gib: float) -> tuple[bool, list[str]]:
     return fits, lines
 
 
+def disk_precheck(hub: Path, pins, reserve_gib: float) -> bool:
+    """Log the missing-bytes table against free space; False (with an error) when it does not fit."""
+    fits, lines = disk_table(hub, pins, reserve_gib)
+    for line in lines:
+        print(line, flush=True)
+    if not fits:
+        print("::error title=not enough disk for the pinned W1 snapshots::" + " | ".join(
+            line.strip() for line in lines if not line.startswith("    ")))
+    return fits
+
+
 def fetch_only_pinned(hub: Path, pins, reserve_gib: float) -> bool:
     fits, lines = disk_table(hub, pins, reserve_gib)
     for line in lines:
@@ -154,6 +168,8 @@ def main() -> int:
         print("\n".join(lines))
         return 0
     if args.only_pinned and not fetch_only_pinned(args.hub, pins, args.reserve_gib):
+        return 1
+    if not (args.check_only or args.only_pinned) and not disk_precheck(args.hub, pins, args.reserve_gib):
         return 1
 
     failed = False

@@ -68,13 +68,25 @@ class NoiseFloorPhaseTests(unittest.TestCase):
         self.assertEqual(values["phases"], ",nf,")
         code, values, log = run_config("")
         self.assertEqual(code, 0, log)
-        self.assertEqual(values["phases"], ",a1,a3,a2,b,", "nf is never a default phase")
+        self.assertEqual(values["phases"], ",a2,b,", "nf is never a default phase; a1/a3 neither (v3)")
         code, values, log = run_config("nf,a2")
         self.assertEqual(code, 0, log)
         self.assertEqual(values["phases"], ",a2,nf,", "run order is fixed: nf runs last")
         code, _, log = run_config("noise")
         self.assertNotEqual(code, 0)
         self.assertIn("unknown phase 'noise'", log)
+
+    def test_a3_is_refused_and_a1_is_opt_in_at_schedule_v3(self):
+        """sc-20688: an A1 campaign cannot complete at schedule v3 (llama8b-fit-boundary's bf16
+        reference exceeds the child cap), so A3, which binds a published A1 at the same source
+        closure, is refused before a self-hosted job queues; A1 alone still resolves."""
+        for phases in ("a3", "a1,a3,a2"):
+            code, _, log = run_config(phases)
+            self.assertNotEqual(code, 0, phases)
+            self.assertIn("phase a3 cannot run at SC-20671 schedule v3", log)
+        code, values, log = run_config("a1")
+        self.assertEqual(code, 0, log)
+        self.assertEqual(values["phases"], ",a1,")
 
     def test_nf_only_coordinate_selects_one_scheduled_row(self):
         row = "llama-fit-boundary-single-chunked-cold"
@@ -188,6 +200,70 @@ class NoiseFloorPhaseTests(unittest.TestCase):
             for flag in ("--prompt-file", "--safety-policy", "--stop-file", "--resume-dir", "--out"):
                 self.assertIn(flag, flags)
 
+    def test_w1_disk_precheck_needs_missing_bytes_plus_reserve_and_never_downloads_short(self):
+        """build.sh's W1 stage refuses before any download when the hub volume's free space is
+        under the missing pinned bytes (present right-size files skipped, wrong-size ones counted)
+        plus the reserve, and logs free and needed bytes either way."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("kv_poc_models", KV_POC / "models.py")
+        models = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(models)
+        gib = 1 << 30
+        with tempfile.TemporaryDirectory() as tmp:
+            hub = Path(tmp)
+            pins_file = hub / "pins.tsv"
+            pins_file.write_text(
+                "\n".join([
+                    "org/a\t" + "1" * 40 + "\tpresent.bin\t4\t" + "0" * 64,
+                    "org/a\t" + "1" * 40 + "\twrong.bin\t" + str(3 * gib) + "\t" + "0" * 64,
+                    "org/b\t" + "2" * 40 + "\tmissing.bin\t" + str(2 * gib) + "\t" + "0" * 64,
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            snapshot = models.snapshot_dir(hub, "org/a", "1" * 40)
+            snapshot.mkdir(parents=True)
+            (snapshot / "present.bin").write_bytes(b"1234")
+            (snapshot / "wrong.bin").write_bytes(b"x")
+            pins = models.load_pins(pins_file)
+            need = 5 * gib  # wrong.bin + missing.bin; present.bin is skipped
+
+            def precheck(free):
+                usage = mock.Mock(free=free)
+                out = io.StringIO()
+                with mock.patch.object(models.shutil, "disk_usage", return_value=usage), \
+                        contextlib.redirect_stdout(out):
+                    return models.disk_precheck(hub, pins, 20.0), out.getvalue()
+
+            fits, log = precheck(need + 20 * gib)
+            self.assertTrue(fits, log)
+            self.assertIn(f"missing or wrong-size: 2 files, {need} bytes", log)
+            self.assertIn(f"free on the hub volume ({hub}): {need + 20 * gib} bytes", log)
+            fits, log = precheck(need + 20 * gib - 1)
+            self.assertFalse(fits, log)
+            self.assertIn("::error title=not enough disk for the pinned W1 snapshots::", log)
+            self.assertIn("SHORTFALL", log)
+            # main() refuses before importing huggingface_hub or downloading anything.
+            argv = ["models.py", "--hub", str(hub), "--pins", str(pins_file), "--reserve-gib", "20"]
+            usage = mock.Mock(free=need)
+            with mock.patch.object(models.shutil, "disk_usage", return_value=usage), \
+                    mock.patch.object(models.sys, "argv", argv), \
+                    mock.patch.dict("sys.modules", {"huggingface_hub": None}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(models.main(), 1)
+        build = (KV_POC / "build.sh").read_text(encoding="utf-8")
+        self.assertIn('--reserve-gib "${KV_W1_DISK_RESERVE_GIB:-20}"', build)
+
+    def test_sixteen_row_a1_a2_budgets_doubled_within_the_row_deadline(self):
+        """Schedule v3 doubled the rows, so A1/A2 soft budgets doubled (330 -> 660 per
+        invocation); each hard timeout stays budget x invocations + 300-min row deadline + 20."""
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        for job, invocations in (("a1", 1), ("a2", 2)):
+            self.assertEqual(jobs[job]["env"]["KV_SOFT_BUDGET_MIN"], "660", job)
+            self.assertEqual(jobs[job]["timeout-minutes"], invocations * 660 + 300 + 20, job)
+
     def test_workflow_runs_collects_and_uploads_nf_after_every_other_w1_phase(self):
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         job = workflow["jobs"]["nf"]
@@ -223,17 +299,19 @@ class NoiseFloorPhaseTests(unittest.TestCase):
             r'repository: "([^"]+)",\s*revision: "([0-9a-f]{40})",(?:.|\n)*?required_files: ([A-Z0-9_]+_FILES),',
             source,
         )
-        expected = set()
-        for repo, revision, files_name in specs:
-            for path, size, sha256 in files[files_name]:
-                expected.add((repo, revision, path, size.replace("_", ""), sha256))
-        pins = {
+        expected = [
+            (repo, revision, path, size.replace("_", ""), sha256)
+            for repo, revision, files_name in specs
+            for path, size, sha256 in files[files_name]
+        ]
+        pins = [
             tuple(line.split("\t"))
             for line in (KV_POC / "models.tsv").read_text(encoding="utf-8").splitlines()
             if line and not line.startswith("#")
-        }
+        ]
         self.assertEqual(len({(repo, revision) for repo, revision, *_ in expected}), 8)
-        self.assertEqual(pins, expected)
+        # Ordered lists, not sets: a duplicated pin row (or a duplicated source entry) fails too.
+        self.assertEqual(sorted(pins), sorted(expected))
 
     def test_summary_renders_rows_and_the_worst_case(self):
         summarize = load_summarize()

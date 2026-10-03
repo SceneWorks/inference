@@ -70,13 +70,19 @@ case "$label" in
 esac
 
 # Each mode owns a fixed phase order; an empty list means the mode's default phases (every W2
-# phase; W1's a1,a3,a2,b). W1's `nf` (the SC-20669 dense noise floor, ~30 min) runs only when
+# phase; W1's a2,b). W1's `nf` (the SC-20669 dense noise floor, ~30 min) runs only when
 # listed, e.g. "phases": "nf" alone. W2 also takes `none`: run the asset prep and the build only
 # (e.g. to see a host's disk shortfall first).
 case "$mode" in
   w2) order="c d d-control"; default_order="$order" ;;
-  *) order="a1 a3 a2 b nf"; default_order="a1 a3 a2 b" ;;
+  *) order="a1 a3 a2 b nf"; default_order="a2 b" ;;
 esac
+# Schedule v3 (sc-20688): A1 loads each row's bf16 reference, which for llama8b-fit-boundary prices
+# 71.5 GiB against llm.json's 68 GiB child cap, so an A1 campaign refuses that row and never
+# publishes; it stays listable (the other fifteen rows still run) but is no default. A3 binds a
+# PUBLISHED A1 at the identical SC-20671 source closure (sc20676 SC20676_BASELINE_CLOSURE_PATHSPECS),
+# which a v3 A1 cannot produce and no earlier A1 matches, so it is refused here, before a self-hosted
+# job queues.
 phases="${phases// /}"
 [ -n "$phases" ] || phases="${default_order// /,}"
 canonical=""
@@ -88,6 +94,7 @@ fi
 for p in ${requested[@]+"${requested[@]}"}; do
   [ -n "$p" ] || continue
   case " $order " in *" $p "*) ;; *) fail "unknown phase '$p' for mode $mode (allowed: ${order// /,})" ;; esac
+  [ "$mode" != w1 ] || [ "$p" != a3 ] || fail "phase a3 cannot run at SC-20671 schedule v3: it binds a published A1 at the same source closure, and an A1 campaign cannot complete (llama8b-fit-boundary's bf16 reference exceeds the 68 GiB child cap)"
 done
 # Run order is fixed (A1 -> A3 -> A2 -> B -> NF; C -> D -> D-control) whatever order the list was typed in.
 for p in $order; do

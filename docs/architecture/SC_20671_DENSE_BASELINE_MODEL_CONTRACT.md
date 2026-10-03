@@ -21,11 +21,14 @@ LLAMA8B_CANDIDATE, LLAMA8B_REFERENCE, QWEN8B_CANDIDATE, QWEN8B_REFERENCE}`.
 
 Schedule v3 (sc-20688) runs every family on the same four rows (sixteen in all). Each band's
 target derives from the native window (short 32, medium 1,024, memory-material window/4, fit-boundary
-window−512), except `llama8b`'s fit-boundary row: at 130,560 tokens it prices at 59.2 GiB for the
-candidate and projects to ~71 GiB measured, above the 64 GiB Mac2 arm cap, so it is measured at the
-largest row with margin, 98,304 tokens (`LLAMA8B_FIT_WINDOW_TOKENS` 98,816). A compressed row's
-static floor prices only the candidate it loads; a dense (A1) row also prices its bf16 reference,
-which for `llama8b`'s fit row (68.2 GiB) exceeds the cap, so A1 refuses that one row before spawn.
+window−512), except `llama8b`'s fit-boundary row. A compressed row is priced on the candidate it
+loads, scaled by the measured A2 v5 peak ratio (`COMPRESSED_MEASURED_PEAK_SCALE_BPS`, 1.27). At
+130,560 tokens that is 75.2 GiB, over the 68 GiB child footprint cap of
+`.github/kv-poc/policies/llm.json`, so `llama8b` is measured at 106,496 tokens
+(`LLAMA8B_FIT_WINDOW_TOKENS` 107,008): 63.5 GiB, 4.5 GiB under the cap. A dense (A1) row also
+prices its bf16 reference, 71.5 GiB for that row, so A1 refuses `llama8b-fit-boundary` before
+spawn and an A1 campaign cannot complete at schedule v3; A1 is therefore opt-in and A3 (which binds
+a complete A1 at the same source closure) is refused by the workflow's config (sc-20688).
 
 The required inventory includes every published weights shard, `config.json`, and the published
 model/index and tokenizer configuration files. The contract records every required file's

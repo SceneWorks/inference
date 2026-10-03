@@ -460,7 +460,8 @@ pub struct BenchmarkModelSpec {
     pub model_type: &'static str,
     pub native_context_tokens: u64,
     /// The fit-boundary row's window when it is not the native window: the largest window whose
-    /// fit row the campaign's 64 GiB arm cap admits (see [`spec_band_target`]). `None` = native.
+    /// fit row the 68 GiB child footprint cap of `.github/kv-poc/policies/llm.json` admits with
+    /// margin (see [`spec_band_target`]). `None` = native.
     pub fit_window_tokens: Option<u64>,
     pub quantized: bool,
     pub required_files: &'static [PinnedSnapshotFile],
@@ -731,13 +732,15 @@ const QWEN8B_BF16_FILES: &[PinnedSnapshotFile] = &[
     },
 ];
 
-/// Llama-3.1-8B's fit-boundary window. At its native 131,072-token window the fit row prices at
-/// 59.2 GiB for the 4-bit candidate (80.7 GiB with the bf16 reference A1 loads), and the measured
-/// Llama-3.2-3B fit row peaked at 1.20x its candidate estimate (A2 run 37004025116: 52.3 GiB
-/// against 43.6 GiB), projecting ~71 GiB against the 64 GiB arm cap. A 98,816-token window puts
-/// the fit row at 98,304 tokens: 46.8 GiB priced, ~56 GiB projected, the largest fit row with a
-/// margin under the cap. The other bands keep the native window (memory-material 32,768).
-pub const LLAMA8B_FIT_WINDOW_TOKENS: u64 = 98_816;
+/// Llama-3.1-8B's fit-boundary window. The compressed fit row's admission estimate is the
+/// candidate estimate scaled by [`COMPRESSED_MEASURED_PEAK_SCALE_BPS`] (the measured A2 v5 peak
+/// ratio). At the native 130,560-token row that is 59.2 GiB x 1.27 = 75.2 GiB, over the 68 GiB
+/// child footprint cap of `.github/kv-poc/policies/llm.json`, so the row would be refused before
+/// spawn. A 107,008-token window puts the fit row at 106,496 tokens: 50.0 GiB x 1.27 = 63.5 GiB,
+/// 4.5 GiB under the cap; the next 2,048-token step (108,544) leaves 3.5 GiB. The other bands keep
+/// the native window (memory-material 32,768). A dense (A1) row also loads the bf16 reference
+/// (71.5 GiB here), which no fit row of at least 90% of this window keeps under the cap.
+pub const LLAMA8B_FIT_WINDOW_TOKENS: u64 = 107_008;
 
 pub const LLAMA8B_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
     family: "llama8b",
@@ -1303,10 +1306,20 @@ pub(crate) fn static_role_footprint_budget(
         .ok_or("static model-load plus KV/working budget overflows".into())
 }
 
+/// Measured whole-process peak over the static candidate estimate of a compressed row, in basis
+/// points: the largest ratio of the A2 v5 receipts (run 37004025116, group-affine-8, inference
+/// 0030a60b8; receipt `memory.phaseSamples[*].physFootprintPeakBytes` over the candidate-only
+/// estimate this source computes for the same row): qwen-fit-boundary 17,960,978,184 B over
+/// 14,149,222,820 B is 1.2694; llama-fit-boundary 56,136,371,440 B over 46,768,365,740 B is
+/// 1.2003; llama/qwen memory-material 1.0715 / 1.0400; the short and medium rows sit below 1 (the
+/// group-affine-4 run's peaks are lower still). Rounded up to 1.27.
+pub const COMPRESSED_MEASURED_PEAK_SCALE_BPS: u64 = 12_700;
+
 /// The row's static floor over the roles its worker loads: a dense row loads the candidate then
 /// the bf16 reference (the larger prices the row); a compressed row's quality reference is the
 /// dense-KV arm on the SAME candidate weights, so only the candidate is ever loaded and the bf16
-/// reference is never priced (for Llama-3.1-8B it alone would exceed the arm cap).
+/// reference is never priced. The candidate-only source estimate sat below the measured peak of
+/// the long compressed rows, so it is scaled by [`COMPRESSED_MEASURED_PEAK_SCALE_BPS`].
 fn static_row_footprint_budget(
     coordinate: &Coordinate,
     candidate_snapshot: &Path,
@@ -1324,6 +1337,9 @@ fn static_row_footprint_budget(
     )?;
     let required = if compressed {
         candidate
+            .checked_mul(COMPRESSED_MEASURED_PEAK_SCALE_BPS)
+            .map(|bytes| bytes.div_ceil(10_000))
+            .ok_or("scaled compressed footprint budget overflows")?
     } else {
         candidate.max(static_role_footprint_budget(
             benchmark_model(coordinate.family, true)?,
@@ -5900,8 +5916,15 @@ pub fn load_validated_complete_campaign(
             if value
                 .get("scheduleVersion")
                 .and_then(serde_json::Value::as_u64)
-                == Some(SC20671_SCHEDULE_VERSION) =>
+                .and_then(covering_schedule)
+                .is_some() =>
         {
+            let schedule_version = value
+                .get("scheduleVersion")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("SC-20671 v2 manifest lacks its schedule version")?;
+            let schedule =
+                covering_schedule(schedule_version).ok_or("unsupported covering schedule")?;
             for key in ["policySha256", "resumeIdentitySha256"] {
                 let digest = value
                     .get(key)
@@ -5930,7 +5953,7 @@ pub fn load_validated_complete_campaign(
                 || identity
                     .get("scheduleVersion")
                     .and_then(serde_json::Value::as_u64)
-                    != Some(SC20671_SCHEDULE_VERSION)
+                    != Some(schedule_version)
                 || identity
                     .get("schemaVersion")
                     .and_then(serde_json::Value::as_u64)
@@ -5938,9 +5961,9 @@ pub fn load_validated_complete_campaign(
                 || identity.get("kind").and_then(serde_json::Value::as_str)
                     != Some("sc-20671-resume-identity")
                 || identity.get("coordinates")
-                    != Some(&serde_json::json!(required_coordinates()
+                    != Some(&serde_json::json!(schedule
                         .iter()
-                        .map(coordinate_slug)
+                        .map(|row| coordinate_slug(&row.coordinate))
                         .collect::<Vec<_>>()))
                 || seal_json(&identity)?.0 != identity_bytes
             {
@@ -5961,7 +5984,7 @@ pub fn load_validated_complete_campaign(
             {
                 return Err("SC-20671 published safety policy bytes drifted".into());
             }
-            (required_schedule(), Some(identity), Some(policy))
+            (schedule, Some(identity), Some(policy))
         }
         _ => return Err("SC-20671 campaign manifest identity is invalid".into()),
     };
@@ -8483,6 +8506,22 @@ pub fn required_schedule() -> Vec<ScheduledCoordinate> {
         .collect()
 }
 
+/// The covering schedule a published campaign of `version` ran: v3 (the current sixteen rows) or
+/// v2 (the eight `llama`/`qwen` rows, published before the 8B families; still read so SC-20676 can
+/// bind an earlier dense baseline). `None` for any other version.
+fn covering_schedule(version: u64) -> Option<Vec<ScheduledCoordinate>> {
+    match version {
+        SC20671_SCHEDULE_VERSION => Some(required_schedule()),
+        2 => Some(
+            required_schedule()
+                .into_iter()
+                .filter(|row| ["llama", "qwen"].contains(&row.coordinate.family))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn legacy_required_schedule() -> Vec<ScheduledCoordinate> {
     legacy_required_coordinates()
         .into_iter()
@@ -8504,17 +8543,14 @@ pub fn validate_schedule_outcomes(
     scheduled: &[ScheduledCoordinate],
     outcomes: &[(Coordinate, ProcessDiscipline, u32)],
 ) -> Result<(), String> {
-    if ![
+    let lengths = [
+        covering_schedule(2).map_or(0, |rows| rows.len()),
         required_coordinates().len(),
         legacy_required_coordinates().len(),
-    ]
-    .contains(&scheduled.len())
-        || outcomes.len() != scheduled.len()
-    {
+    ];
+    if !lengths.contains(&scheduled.len()) || outcomes.len() != scheduled.len() {
         return Err(format!(
-            "campaign schedule must contain exactly {} or {} outcomes",
-            required_coordinates().len(),
-            legacy_required_coordinates().len()
+            "campaign schedule must contain exactly {lengths:?} outcomes"
         ));
     }
     let key = |coordinate: &Coordinate| {
@@ -14514,7 +14550,7 @@ pub(crate) mod tests {
 
     /// sc-20688: the 8B families pin their own candidate/reference pair, and every family runs the
     /// same four rows. Bands follow the native window (Llama-3.1-8B material 32,768, Qwen3-8B
-    /// 10,240) except Llama-3.1-8B's fit row, capped at the largest the 64 GiB arm admits.
+    /// 10,240) except Llama-3.1-8B's fit row, capped at the largest the 68 GiB child cap admits.
     #[test]
     fn eight_b_families_pin_their_pairs_and_mirror_the_row_structure() {
         for (family, candidate, reference, window, material, fit) in [
@@ -14524,7 +14560,7 @@ pub(crate) mod tests {
                 "mlx-community/Meta-Llama-3.1-8B-Instruct-bf16@f8311090f9ee47782b6f094984a20c856eb841d6",
                 131_072,
                 32_768,
-                98_304,
+                106_496,
             ),
             (
                 "qwen8b",
@@ -14553,7 +14589,7 @@ pub(crate) mod tests {
         // ran at the family's native window; a synthetic window keeps the plain band formula.
         assert_eq!(
             row_band_target("llama8b", 131_072, "fit-boundary").unwrap(),
-            98_304
+            106_496
         );
         assert_eq!(
             row_fit_window("llama8b", 131_072),
@@ -15042,6 +15078,99 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             load_validated_complete_campaign(&destination).unwrap_err(),
+            "SC-20671 campaign manifest identity is invalid"
+        );
+    }
+
+    /// sc-20688: the complete-campaign loader still reads a published schedule-v2 campaign (the
+    /// eight `llama`/`qwen` rows, SC-20676's dense baseline) as well as v3, routes each to its own
+    /// schedule and resume-identity coordinates, and refuses any other schedule version or a v2
+    /// manifest bound to the v3 coordinate list.
+    #[test]
+    fn complete_campaign_loader_reads_schedule_v2_and_v3_by_their_own_schedule() {
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1024,
+            child_footprint_cap_bytes: 2048,
+            max_context_tokens: 4096,
+            max_request_tokens: 4096,
+            stdout_cap_bytes: 4096,
+            stderr_cap_bytes: 4096,
+        };
+        let slugs = |version: u64| {
+            covering_schedule(version)
+                .unwrap()
+                .iter()
+                .map(|row| coordinate_slug(&row.coordinate))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            slugs(2),
+            required_coordinates()[..8]
+                .iter()
+                .map(coordinate_slug)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(slugs(3).len(), 16);
+        assert!(covering_schedule(1).is_none() && covering_schedule(4).is_none());
+        let publish_as =
+            |schedule_version: u64, identity_version: u64, coordinates: Vec<String>| {
+                let root = tempfile::tempdir().unwrap();
+                let dir = root.path();
+                let identity = serde_json::json!({
+                    "schemaVersion": 1, "kind": "sc-20671-resume-identity",
+                    "scheduleVersion": identity_version, "coordinates": coordinates,
+                    "policySha256": policy.seal().unwrap(),
+                });
+                let (identity_bytes, identity_sha) = seal_json(&identity).unwrap();
+                fs::write(dir.join("resume-identity.json"), &identity_bytes).unwrap();
+                fs::write(
+                    dir.join("resume-identity.json.sha256"),
+                    format!("{identity_sha}  resume-identity.json\n"),
+                )
+                .unwrap();
+                let (policy_bytes, _) = seal_json(&serde_json::to_value(&policy).unwrap()).unwrap();
+                fs::write(dir.join("safety-policy.json"), &policy_bytes).unwrap();
+                let manifest = canonical_json_bytes(&serde_json::json!({
+                    "schemaVersion": 2, "kind": SC20671_CAMPAIGN_KIND,
+                    "scheduleVersion": schedule_version,
+                    "policySha256": policy.seal().unwrap(),
+                    "resumeIdentitySha256": identity_sha,
+                    "coordinates": [],
+                }))
+                .unwrap();
+                fs::write(dir.join("campaign.json"), &manifest).unwrap();
+                fs::write(
+                    dir.join("campaign.json.sha256"),
+                    format!("{}  campaign.json\n", seal_bytes(&manifest)),
+                )
+                .unwrap();
+                load_validated_complete_campaign(dir).unwrap_err()
+            };
+        let publish =
+            |version: u64, coordinates: Vec<String>| publish_as(version, version, coordinates);
+        // Both versions pass the identity gate and reach their own (here empty) row set.
+        for version in [2, 3] {
+            assert_eq!(
+                publish(version, slugs(version)),
+                "SC-20671 campaign manifest is not a complete scheduled set",
+                "schedule v{version}"
+            );
+        }
+        assert_eq!(
+            publish(2, slugs(3)),
+            "SC-20671 published resume identity semantics drifted"
+        );
+        // A v2 manifest whose resume identity claims another schedule version is refused.
+        assert_eq!(
+            publish_as(2, 3, slugs(2)),
+            "SC-20671 published resume identity semantics drifted"
+        );
+        assert_eq!(
+            publish(4, slugs(3)),
             "SC-20671 campaign manifest identity is invalid"
         );
     }
@@ -15615,6 +15744,73 @@ pub(crate) mod tests {
         assert!(static_role_footprint_budget(&LLAMA_CANDIDATE, &snapshot, 425, 318).is_err());
     }
 
+    /// sc-20688: the scaled compressed estimate covers the measured A2 v5 peaks of the 3B and 1.7B
+    /// fit rows (run 37004025116: 56,136,371,440 B and 17,960,978,184 B) at their recorded live and
+    /// request tokens, so admission never prices a compressed row below what it was seen to hold.
+    #[test]
+    fn compressed_estimate_covers_the_measured_fit_row_peaks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1,
+            child_footprint_cap_bytes: u64::MAX - 1,
+            max_context_tokens: 1 << 20,
+            max_request_tokens: 1 << 20,
+            stdout_cap_bytes: 4_096,
+            stderr_cap_bytes: 4_096,
+        };
+        let qwen_config = br#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"head_dim":128,"num_attention_heads":16,"hidden_size":2048,"intermediate_size":6144,"vocab_size":151936}"#;
+        for (family, candidate_spec, reference_spec, scale, config, live, request, peak) in [
+            (
+                "llama",
+                &LLAMA_CANDIDATE,
+                &LLAMA_REFERENCE,
+                "F16",
+                None,
+                261_483,
+                130_846,
+                56_136_371_440_u64,
+            ),
+            (
+                "qwen",
+                &QWEN_CANDIDATE,
+                &QWEN_REFERENCE,
+                "BF16",
+                Some(&qwen_config[..]),
+                81_231,
+                40_700,
+                17_960_978_184,
+            ),
+        ] {
+            let candidate = temporary.path().join(format!("{family}-candidate"));
+            let reference = temporary.path().join(format!("{family}-reference"));
+            write_stub_dtype_snapshot(&candidate, candidate_spec, scale);
+            write_stub_dtype_snapshot(&reference, reference_spec, "BF16");
+            if let Some(config) = config {
+                fs::write(candidate.join("config.json"), config).unwrap();
+                fs::write(reference.join("config.json"), config).unwrap();
+            }
+            let row = required_coordinates()
+                .into_iter()
+                .find(|row| row.family == family && row.context_band == "fit-boundary")
+                .unwrap();
+            let unscaled =
+                static_role_footprint_budget(candidate_spec, &candidate, live, request).unwrap();
+            assert!(
+                unscaled < peak,
+                "{family}: the unscaled estimate is the under-price"
+            );
+            let priced = static_row_footprint_budget(
+                &row, &candidate, &reference, live, request, &policy, true,
+            )
+            .unwrap();
+            assert!(priced >= peak, "{family}: {priced} < measured {peak}");
+        }
+    }
+
     /// sc-20688: a compressed row loads only the candidate (its quality reference is the dense-KV
     /// arm on the same weights), so its floor is the candidate's alone; a dense row still prices
     /// the larger bf16 reference it loads.
@@ -15646,7 +15842,7 @@ pub(crate) mod tests {
         assert_eq!(
             static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy, true)
                 .unwrap(),
-            candidate_only
+            (candidate_only * COMPRESSED_MEASURED_PEAK_SCALE_BPS).div_ceil(10_000)
         );
         assert_eq!(
             static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy, false)
