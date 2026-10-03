@@ -1,4 +1,4 @@
-//! Native FP32 port of the YuE2 Oobleck VAE (sc-22993) — `yue2/modeling_vae.py` at the pinned
+//! Native YuE2 Oobleck VAE (sc-22993) — `yue2/modeling_vae.py` at the pinned
 //! commit, for **both** published decoders (`m-a-p/YuE2-Vae`, the standard listening decoder, and
 //! `m-a-p/YuE2-Vae-legacy`, the benchmark decoder). The two releases share this architecture and
 //! config and differ in `release_variant` and in their **decoder** weights only: all 218 encoder
@@ -25,8 +25,10 @@
 //!
 //! Precision (epic E8): released checkpoints and weight-norm/Snake preparation are FP32.
 //! Resident weights and stage activations use the selected FP32 or BF16 dtype. CUDA BF16 VAEs
-//! own a separate cuBLAS handle configured to disallow reduced-precision GEMM reductions; this
-//! does not change the resident dtype or eliminate documented FP32 numerical internals.
+//! route both convolution leaves through fixed-order reductions over native BF16 operands and
+//! cast each output once to BF16. FP32 is used only for the kernel accumulator, as for the prior
+//! GEMM path; the full decoder remains a genuine full-length run. A separate cuBLAS handle retains
+//! the existing fail-closed math-mode guard, but those convolution leaves do not call cuBLAS.
 //!
 //! Chunked decoding ([`Yue2Vae::decode_tiled`]) is upstream's exact-boundary halo/crop scheme:
 //! every tile carries at least [`Yue2Vae::required_halo`] latent frames of context on each side
@@ -510,8 +512,26 @@ struct Conv {
     dilation: usize,
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn stable_bf16_convolution(dtype: DType, location: DeviceLocation) -> bool {
+    dtype == DType::BF16 && matches!(location, DeviceLocation::Cuda { .. })
+}
+
 impl Conv {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        let y = if stable_bf16_convolution(x.dtype(), x.device().location()) {
+            candle_quant_kernels::yue2_stable_conv::conv1d(
+                x,
+                &self.weight,
+                self.stride,
+                self.padding,
+                self.dilation,
+            )?
+        } else {
+            x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?
+        };
+        #[cfg(not(feature = "cuda"))]
         let y = x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?;
         match &self.bias {
             Some(b) => y.broadcast_add(&b.reshape((1, (), 1))?),
@@ -542,9 +562,16 @@ struct ConvT {
 
 impl ConvT {
     /// Runs the unpadded transposed conv and crops `padding` samples from each end — exactly torch's
-    /// `padding` semantics for a transposed conv, and it keeps Candle on its col2im fast path
-    /// (which requires `padding == 0`).
+    /// `padding` semantics. The CUDA BF16 leaf uses the fixed reduction; other dtypes retain
+    /// Candle's col2im path (which requires `padding == 0`).
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        let y = if stable_bf16_convolution(x.dtype(), x.device().location()) {
+            candle_quant_kernels::yue2_stable_conv::conv_transpose1d(x, &self.weight, self.stride)?
+        } else {
+            x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1)?
+        };
+        #[cfg(not(feature = "cuda"))]
         let y = x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1)?;
         let len = y.dim(D::Minus1)? - 2 * self.padding;
         y.narrow(D::Minus1, self.padding, len)?
@@ -1325,6 +1352,78 @@ pub(crate) mod tests {
     use super::*;
     use std::cell::Cell;
     use std::path::PathBuf;
+
+    #[test]
+    fn fixed_order_leaves_are_selected_only_for_cuda_bf16() {
+        assert!(stable_bf16_convolution(
+            DType::BF16,
+            DeviceLocation::Cuda { gpu_id: 0 }
+        ));
+        for location in [DeviceLocation::Cpu, DeviceLocation::Metal { gpu_id: 0 }] {
+            assert!(!stable_bf16_convolution(DType::BF16, location));
+        }
+        assert!(!stable_bf16_convolution(
+            DType::F32,
+            DeviceLocation::Cuda { gpu_id: 0 }
+        ));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an owned CUDA device; uses only committed tiny fixture weights"]
+    fn bf16_cuda_both_vae_variants_decode_full_tiled_and_encode() {
+        let device = Device::new_cuda(0).unwrap();
+        let base = latent_bct();
+        let z = Tensor::cat(&[&base, &base, &base], 2).unwrap();
+        for variant in [VaeVariant::Standard, VaeVariant::Legacy] {
+            let dir = fixture_dir().join("vae_tiny").join(variant_name(variant));
+            let identity = DecoderIdentity {
+                component_key: format!("tiny_{}", variant_name(variant)),
+                repo: "fixture/vae_tiny".into(),
+                revision: "fixture".into(),
+                release_variant: variant,
+                config_sha256: sha256_file(&dir.join("config.json")).unwrap(),
+                weights_sha256: sha256_file(&dir.join("model.safetensors")).unwrap(),
+            };
+            let vae = Yue2Vae::load_files_with_dtype(
+                &dir.join("config.json"),
+                &dir.join("model.safetensors"),
+                identity,
+                VaeParts::Full,
+                &device,
+                DType::BF16,
+            )
+            .unwrap();
+            let full = vae.decode_full(&z).unwrap();
+            assert_eq!(full.dtype(), DType::BF16);
+            let tiled = vae
+                .decode_tiled(&z, 4, DEFAULT_HALO_FRAMES, &|| false, &mut |_, _| {})
+                .unwrap();
+            assert_eq!(tiled.dtype(), DType::BF16);
+            let full_cpu = full
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap();
+            let tiled_cpu = tiled.to_dtype(DType::F32).unwrap();
+            assert!(max_abs_diff(&full_cpu, &tiled_cpu) <= 1.0 / 64.0);
+            let posterior = vae.encode(&full_cpu).unwrap();
+            assert_eq!(posterior.mean.dtype(), DType::BF16);
+            let mean = posterior
+                .mean
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap();
+            assert!(mean
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .all(|x| x.is_finite()));
+        }
+    }
 
     struct MockMath {
         mode: Cell<u32>,
