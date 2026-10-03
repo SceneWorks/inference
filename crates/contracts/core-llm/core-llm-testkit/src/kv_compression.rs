@@ -143,7 +143,7 @@ fn context_points() -> Vec<u64> {
 }
 
 /// The fixture table: every combination of policy, table family (and no family), the prompt
-/// points around the qualification rows' bounds, a zero and a [`BUDGET`] token budget, batch 1 and
+/// points around the qualification rows' bounds, a zero and a 64-token budget, batch 1 and
 /// 2, and text-only and multimodal requests.
 pub fn kv_policy_cases() -> Vec<KvPolicyCase> {
     let mut cases = Vec::new();
