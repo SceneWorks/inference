@@ -23,6 +23,7 @@ pub mod packed_attention;
 pub mod packed_group_affine_kv;
 pub mod packed_metal;
 pub mod paged_kv_cache;
+pub mod paged_packed_kv;
 pub mod prism;
 pub mod projection;
 pub mod quant;
@@ -56,13 +57,17 @@ pub use packed_metal::{
     packed_nax_head_dimension_supported, packed_query_dtype_name, packed_tiled_min_query_tokens,
     packed_tiled_split_count, PackedAttentionArgs, PackedKernelDescriptor, PackedKernelPath,
     PackedKernelSelection, PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
-    PackedMetalTuningProfile, PackedNaxSelection, PACKED_METAL_B4_IDENTITY,
-    PACKED_METAL_B8_IDENTITY, PACKED_METAL_DEFAULT_IDENTITY, PACKED_NAX_KERNEL,
-    PACKED_PER_ROW_KERNEL, PACKED_SELECTION_BELOW_MULTI_ROW, PACKED_SELECTION_CONSERVATIVE,
-    PACKED_SELECTION_F32_QUERY, PACKED_SELECTION_HEAD_DIMENSION, PACKED_SELECTION_NAX,
-    PACKED_SELECTION_NAX_UNAVAILABLE, PACKED_TILED_KERNEL,
+    PackedMetalTuningProfile, PackedNaxSelection, PagedPackedAttentionArgs, PagedSequenceExtent,
+    PACKED_METAL_B4_IDENTITY, PACKED_METAL_B8_IDENTITY, PACKED_METAL_DEFAULT_IDENTITY,
+    PACKED_NAX_KERNEL, PACKED_PER_ROW_KERNEL, PACKED_SELECTION_BELOW_MULTI_ROW,
+    PACKED_SELECTION_CONSERVATIVE, PACKED_SELECTION_F32_QUERY, PACKED_SELECTION_HEAD_DIMENSION,
+    PACKED_SELECTION_NAX, PACKED_SELECTION_NAX_UNAVAILABLE, PACKED_TILED_KERNEL,
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
+pub use paged_packed_kv::{
+    paged_packed_identity, PackedPagePool, PagedCacheRequest, PagedCacheSelection,
+    PagedFallbackReason, PagedPackedKvCache, PagedPoolStorage, PAGED_PACKED_LAYOUT_VERSION,
+};
 pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};

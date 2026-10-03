@@ -84,6 +84,11 @@ pub struct PackedCacheEvidence {
     pub peak_packed_transient_logical_bytes: u64,
     pub dense_active: bool,
     pub fallback_reasons: Vec<(String, String)>,
+    /// Attention calls a paged compressed cache served through its dense gather fallback, per
+    /// stable reason id (SC-20680). History stays compressed across these calls, so they are not
+    /// dense transitions; empty (and omitted) for every other cache.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dense_gather_calls: Vec<(String, u64)>,
 }
 /// One kernel path of the packed reader and the accepted calls that ran it.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]

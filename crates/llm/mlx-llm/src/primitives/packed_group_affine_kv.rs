@@ -30,6 +30,7 @@ use crate::primitives::kv_cache::{
 };
 use crate::primitives::packed_metal::{
     quantize_group_affine_flush, PackedAttentionArgs, PackedKernelSelection,
+    PagedPackedAttentionArgs,
 };
 use half::f16;
 use mlx_rs::ops::indexing::{TryIndexMutOp, TryIndexOp};
@@ -180,7 +181,7 @@ fn mlx_shape(shape: [usize; 4]) -> Result<[i32; 4]> {
 
 /// Input tensors are owned by MLX and therefore arrive with signed extents. Reject malformed
 /// extents before comparing them with cache-owned `usize` geometry.
-fn packed_input_shape(shape: &[i32], tensor: &str) -> Result<[usize; 4]> {
+pub(super) fn packed_input_shape(shape: &[i32], tensor: &str) -> Result<[usize; 4]> {
     let [batch, heads, tokens, width] = shape else {
         return Err(Error::Unsupported(format!(
             "{tensor} tensor must have rank four"
@@ -313,6 +314,21 @@ pub trait RetainedPackedKernel: fmt::Debug {
     fn kernel_selection(&self, _args: &PackedAttentionArgs<'_>) -> Option<PackedKernelSelection> {
         None
     }
+    /// Fused attention over an SC-20680 page pool, reading the pages in place through the page
+    /// table. Readers without a paged layout refuse, and the paged cache then serves the call
+    /// through its explicit dense gather fallback.
+    fn dispatch_paged(&self, _args: &PagedPackedAttentionArgs<'_>) -> Result<Array> {
+        Err(Error::Unsupported(
+            "this packed reader has no paged-layout kernels".into(),
+        ))
+    }
+    /// The kernel [`Self::dispatch_paged`] runs for `args` and why (`None` when unreported).
+    fn paged_kernel_selection(
+        &self,
+        _args: &PagedPackedAttentionArgs<'_>,
+    ) -> Option<PackedKernelSelection> {
+        None
+    }
     /// Code width this reader was built to read. A cache of another width refuses to bind it.
     /// Readers that predate the 4-bit representation read the qualified 2-bit layout.
     fn code_bits(&self) -> PackedCodeBits {
@@ -326,6 +342,9 @@ pub trait RetainedPackedKernel: fmt::Debug {
 pub struct CompiledKernelHandle {
     inner: Arc<dyn RetainedPackedKernel>,
     warmed: Arc<AtomicBool>,
+    /// The paged-layout kernels are separate pipelines compiled on their own first dispatch, so
+    /// their warm state is tracked apart from the contiguous kernels'.
+    paged_warmed: Arc<AtomicBool>,
 }
 
 impl CompiledKernelHandle {
@@ -333,6 +352,7 @@ impl CompiledKernelHandle {
         Self {
             inner,
             warmed: Arc::new(AtomicBool::new(false)),
+            paged_warmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -353,12 +373,33 @@ impl CompiledKernelHandle {
         self.inner.code_bits()
     }
 
-    fn is_warmed(&self) -> bool {
+    pub(crate) fn is_warmed(&self) -> bool {
         self.warmed.load(Ordering::Acquire)
     }
 
-    fn mark_warmed(&self) {
+    pub(crate) fn mark_warmed(&self) {
         self.warmed.store(true, Ordering::Release);
+    }
+
+    /// Whether the reader's paged kernels have produced an output (see [`Self::dispatch_paged`]).
+    pub(crate) fn is_paged_warmed(&self) -> bool {
+        self.paged_warmed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_paged_warmed(&self) {
+        self.paged_warmed.store(true, Ordering::Release);
+    }
+
+    /// The retained reader's paged dispatch (see [`RetainedPackedKernel::dispatch_paged`]).
+    pub(crate) fn dispatch_paged(&self, args: &PagedPackedAttentionArgs<'_>) -> Result<Array> {
+        self.inner.dispatch_paged(args)
+    }
+
+    pub(crate) fn paged_kernel_selection(
+        &self,
+        args: &PagedPackedAttentionArgs<'_>,
+    ) -> Option<PackedKernelSelection> {
+        self.inner.paged_kernel_selection(args)
     }
 }
 
@@ -623,6 +664,7 @@ impl DenseFallbackPackedDecoderCache {
                 .iter()
                 .map(|event| (event.operation.clone(), event.reason.clone()))
                 .collect(),
+            dense_gather_calls: Vec::new(),
         }
     }
 
@@ -1913,12 +1955,12 @@ struct LayerStorage {
 
 /// Geometry of one layer's packed arrays.
 #[derive(Clone, Copy, Debug)]
-struct PackedGeometry {
-    batch: usize,
-    heads: usize,
-    dim: usize,
-    group: usize,
-    bits: PackedCodeBits,
+pub(super) struct PackedGeometry {
+    pub(super) batch: usize,
+    pub(super) heads: usize,
+    pub(super) dim: usize,
+    pub(super) group: usize,
+    pub(super) bits: PackedCodeBits,
 }
 
 impl PackedGeometry {
@@ -1946,12 +1988,12 @@ impl PackedGeometry {
     }
 }
 
-fn array_bytes(array: &Array) -> u64 {
+pub(super) fn array_bytes(array: &Array) -> u64 {
     // `usize` always fits in `u64` on supported targets.
     (array.size() as u64).saturating_mul(array.item_size() as u64)
 }
 
-fn dtype_bytes(dtype: Dtype) -> usize {
+pub(super) fn dtype_bytes(dtype: Dtype) -> usize {
     match dtype {
         Dtype::Float32 => 4,
         Dtype::Float16 | Dtype::Bfloat16 => 2,
@@ -1961,7 +2003,7 @@ fn dtype_bytes(dtype: Dtype) -> usize {
 
 /// Write `delta` into `array[.., .., start..start + delta_len, ..]` in place. MLX's slice update
 /// donates the buffer when the cache holds the only reference, so no history is copied.
-fn write_rows(array: &mut Array, start: usize, delta: &Array) -> Result<()> {
+pub(super) fn write_rows(array: &mut Array, start: usize, delta: &Array) -> Result<()> {
     let start = i32::try_from(start)
         .map_err(|_| Error::Config("packed KV row offset exceeds MLX i32 range".into()))?;
     let end = start
@@ -1971,7 +2013,7 @@ fn write_rows(array: &mut Array, start: usize, delta: &Array) -> Result<()> {
     Ok(())
 }
 
-fn rows_range(array: &Array, start: usize, end: usize) -> Result<Array> {
+pub(super) fn rows_range(array: &Array, start: usize, end: usize) -> Result<Array> {
     let bound = |value: usize| {
         i32::try_from(value)
             .map_err(|_| Error::Config("packed KV row range exceeds MLX i32 range".into()))
@@ -1979,7 +2021,7 @@ fn rows_range(array: &Array, start: usize, end: usize) -> Result<Array> {
     Ok(array.try_index((.., .., bound(start)?..bound(end)?, ..))?)
 }
 
-fn live_rows(array: &Array, rows: usize) -> Result<Array> {
+pub(super) fn live_rows(array: &Array, rows: usize) -> Result<Array> {
     rows_range(array, 0, rows)
 }
 
@@ -2014,7 +2056,7 @@ fn unpack_codes(codes: &Array, bits: PackedCodeBits) -> Result<Array> {
 
 /// `zero + scale · code` for the first `groups` K token groups: `[B,H,groups·G,D]` Float32. The
 /// separate multiply and add match the CPU reference's rounding.
-fn dequantize_key_groups(
+pub(super) fn dequantize_key_groups(
     geometry: PackedGeometry,
     codes: &Array,
     scales: &Array,
@@ -2037,7 +2079,7 @@ fn dequantize_key_groups(
 }
 
 /// `zero + scale · code` for the first `tokens` V rows: `[B,H,tokens,D]` Float32.
-fn dequantize_value_rows(
+pub(super) fn dequantize_value_rows(
     geometry: PackedGeometry,
     codes: &Array,
     scales: &Array,
@@ -2386,7 +2428,11 @@ impl DevicePackedLayer {
 }
 
 /// A `[B,H,G,D]` residual whose first `rows` rows are `rows_array` and the rest zero.
-fn padded_residual(geometry: PackedGeometry, rows_array: &Array, rows: usize) -> Result<Array> {
+pub(super) fn padded_residual(
+    geometry: PackedGeometry,
+    rows_array: &Array,
+    rows: usize,
+) -> Result<Array> {
     if rows >= geometry.group {
         return Ok(rows_array.clone());
     }

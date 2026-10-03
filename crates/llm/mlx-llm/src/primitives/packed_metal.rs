@@ -485,20 +485,50 @@ inline float4 sc20676_codes4(const device uint8_t* base, uint index) {
                   float((word >> (2u * uint(BITS))) & MASK), float((word >> (3u * uint(BITS))) & MASK));
 }
 
+// Where the quantized K group and V row of token `t` of KV row `kv_row` (batch · Hkv + KV head)
+// live. The contiguous layout indexes block-preallocated `[B, Hkv, capacity, ·]` arrays directly.
+struct sc20676_contiguous_kv {
+    uint key_groups;
+    uint value_rows;
+    uint key_group(uint kv_row, uint t) const { return kv_row * key_groups + t / 32u; }
+    uint value_row(uint kv_row, uint t) const { return kv_row * value_rows + t; }
+};
+
+// SC-20680 paged layout: a sequence's quantized K/V live in `PT`-token pages of a shared pool,
+// `[pages, Hkv, PT/32, ·]` for K groups and `[pages, Hkv, PT, ·]` for V rows, and
+// `pages[b · max_pages + t / PT]` is the physical page holding token `t` of sequence `b`. `PT` is a
+// multiple of the 32-token group, so a K group and every 32-token block lie inside one page. Only
+// quantized tokens are paged; the dense residual stays a per-sequence input. `P` is the page-table
+// pointer type: MLX binds an input of fewer than eight elements in the `constant` address space.
+template <int PT, typename P>
+struct sc20680_paged_kv {
+    P pages;
+    uint max_pages;
+    uint kv_heads;
+    uint slot(uint kv_row, uint t) const {
+        return uint(pages[(kv_row / kv_heads) * max_pages + t / uint(PT)]) * kv_heads
+            + kv_row % kv_heads;
+    }
+    uint key_group(uint kv_row, uint t) const {
+        return slot(kv_row, t) * uint(PT / 32) + (t % uint(PT)) / 32u;
+    }
+    uint value_row(uint kv_row, uint t) const { return slot(kv_row, t) * uint(PT) + t % uint(PT); }
+};
+
 // Fused packed attention for one threadgroup: one row of `QG` query heads sharing a KV head, one
 // block-aligned KV split. SIMD groups stride over 32-token blocks; each lane owns `EPL` contiguous
 // channels, so a score is one `simd_sum` and the online softmax lives in registers. Scores are in
 // the log2 domain (`q` pre-scaled by log2(e)/sqrt(D)), so `exp2` is the softmax exponential. SIMD
 // group 0 returns true holding the merged (unnormalized) accumulators, maxima, and sums for the
 // row's heads; `qrow0` is the output row of the first head (head `g` is `qrow0 + g * SQ`).
-template <int D, int QG, int BN, int MASK_MODE, int WINDOW, int BITS, typename QT, typename KT,
-          typename VT>
+template <int D, int QG, int BN, int MASK_MODE, int WINDOW, int BITS, typename L, typename QT,
+          typename KT, typename VT>
 inline bool sc20676_attend(
     const device QT* q, const device uint8_t* k_codes, const device half* k_scale,
     const device half* k_zero, const device KT* k_tail, const device uint8_t* v_codes,
     const device half* v_scale, const device half* v_zero, const device VT* v_tail,
-    uint k_packed, uint v_packed, uint kv_len, uint HQ, uint SQ, uint HKV, uint KG_CAP,
-    uint KT_CAP, uint V_CAP, uint VT_CAP, threadgroup float* tg_max, threadgroup float* tg_sum,
+    uint k_packed, uint v_packed, uint kv_len, uint HQ, uint SQ, uint HKV, thread const L& layout,
+    uint KT_CAP, uint VT_CAP, threadgroup float* tg_max, threadgroup float* tg_sum,
     threadgroup float* tg_acc, uint lane, uint sg, uint split, uint splits, uint row,
     thread float* merged, thread float* out_max, thread float* out_sum, thread uint& qrow0) {
     constexpr int EPL = D / 32;
@@ -542,11 +572,14 @@ inline bool sc20676_attend(
         const uint t_begin = max(blk * G, lo);
         const uint t_end = min(blk * G + G, hi);
         const bool k_quantized = (blk + 1) * G <= k_packed;
-        const device uint8_t* kc = k_codes + (kv_row * KG_CAP + blk) * KW;
+        const uint k_group = k_quantized ? layout.key_group(kv_row, blk * G) : 0u;
+        // A 32-token block lies inside one V page, so its rows are consecutive from the first.
+        const uint v_block = blk * G < v_packed ? layout.value_row(kv_row, blk * G) : 0u;
+        const device uint8_t* kc = k_codes + k_group * KW;
         float qs[QG][EPL];
         float qz[QG];
         if (k_quantized) {
-            const uint meta = (kv_row * KG_CAP + blk) * D + ch;
+            const uint meta = k_group * D + ch;
             float ks[EPL];
             float kz[EPL];
             for (uint j = 0; j < EPL; ++j) {
@@ -583,7 +616,7 @@ inline bool sc20676_attend(
                 }
             }
             if (t < v_packed) {
-                const uint vrow = kv_row * V_CAP + t;
+                const uint vrow = v_block + (t - blk * G);
                 const uint meta = vrow * VG + ch / G;
                 const float vs = float(v_scale[meta]);
                 const float vz = float(v_zero[meta]);
@@ -651,10 +684,11 @@ const ATTEND_BODY: &str = r#"
     uint qrow0;
     const uint splits = threadgroups_per_grid.x;
     const uint split = threadgroup_position_in_grid.x;
+    SC20676_EXTENTS
     const bool writer = sc20676_attend<D, QG, BN, MASK_MODE, WINDOW, BITS>(
-        q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, uint(params[0]),
-        uint(params[1]), uint(params[2]), uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]), uint(k_codes_shape[2]),
-        uint(k_tail_shape[2]), uint(v_codes_shape[2]), uint(v_tail_shape[2]), tg_max, tg_sum,
+        q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, k_packed,
+        v_packed, kv_len, uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]), layout,
+        uint(k_tail_shape[2]), uint(v_tail_shape[2]), tg_max, tg_sum,
         tg_acc, thread_index_in_simdgroup, simdgroup_index_in_threadgroup, split, splits,
         threadgroup_position_in_grid.y, merged, group_max, group_sum, qrow0);
     if (!writer) return;
@@ -664,6 +698,36 @@ const ATTEND_BODY: &str = r#"
         const uint qrow = qrow0 + g * SQ;
         SC20676_EPILOGUE
     }
+"#;
+
+/// Live extents and layout of a contiguous dispatch: `params = [key_packed, value_packed, kv]`.
+const CONTIGUOUS_EXTENTS: &str = r#"
+    const uint k_packed = uint(params[0]);
+    const uint v_packed = uint(params[1]);
+    const uint kv_len = uint(params[2]);
+    const sc20676_contiguous_kv layout{uint(k_codes_shape[2]), uint(v_codes_shape[2])};
+"#;
+
+/// Per-row paged extents: threadgroup row `y` belongs to sequence `y / (Sq · Hq/QG)`, whose
+/// `seq` row is `[key_packed, value_packed, kv]`.
+const PAGED_ROW_EXTENTS: &str = r#"
+    const uint seq_b = threadgroup_position_in_grid.y
+        / (uint(q_shape[2]) * (uint(q_shape[1]) / uint(QG)));
+    const uint k_packed = uint(seq[seq_b * 3]);
+    const uint v_packed = uint(seq[seq_b * 3 + 1]);
+    const uint kv_len = uint(seq[seq_b * 3 + 2]);
+    const sc20680_paged_kv<PT, decltype(pages)> layout{pages, uint(pages_shape[1]),
+                                                       uint(v_codes_shape[1])};
+"#;
+
+/// Tiled/NAX paged extents: grid `y` is `batch · Hkv + KV head`.
+const PAGED_TILE_EXTENTS: &str = r#"
+    const uint seq_b = threadgroup_position_in_grid.y / uint(v_codes_shape[1]);
+    const uint k_packed = uint(seq[seq_b * 3]);
+    const uint v_packed = uint(seq[seq_b * 3 + 1]);
+    const uint kv_len = uint(seq[seq_b * 3 + 2]);
+    const sc20680_paged_kv<PT, decltype(pages)> layout{pages, uint(pages_shape[1]),
+                                                       uint(v_codes_shape[1])};
 "#;
 
 const SINGLE_EPILOGUE: &str = r#"
@@ -744,14 +808,14 @@ inline float4 sc20676_load4(const device T* src) {
     return float4(float(src[0]), float(src[1]), float(src[2]), float(src[3]));
 }
 
-template <int D, int BK, int WM, int MASK_MODE, int WINDOW, int BITS, typename QT, typename KT,
-          typename VT>
+template <int D, int BK, int WM, int MASK_MODE, int WINDOW, int BITS, typename L, typename QT,
+          typename KT, typename VT>
 inline void sc20676_tiled(
     const device QT* q, const device uint8_t* k_codes, const device half* k_scale,
     const device half* k_zero, const device KT* k_tail, const device uint8_t* v_codes,
     const device half* v_scale, const device half* v_zero, const device VT* v_tail,
-    uint k_packed, uint v_packed, uint kv_len, uint HQ, uint SQ, uint HKV, uint KG_CAP,
-    uint KT_CAP, uint V_CAP, uint VT_CAP, threadgroup float* k_tile, threadgroup float* v_tile,
+    uint k_packed, uint v_packed, uint kv_len, uint HQ, uint SQ, uint HKV, thread const L& layout,
+    uint KT_CAP, uint VT_CAP, threadgroup float* k_tile, threadgroup float* v_tile,
     uint tid, uint lane, uint sg, uint tile, uint kv_row, uint split, uint splits,
     thread float* o, thread float& row_max, thread float& row_sum, thread uint& out_row,
     thread bool& valid) {
@@ -815,7 +879,7 @@ inline void sc20676_tiled(
             float4 vv = float4(0.0f);
             if (t < kv_len) {
                 if (t < k_packed) {
-                    const uint grp = kv_row * KG_CAP + t / G;
+                    const uint grp = layout.key_group(kv_row, t);
                     const float4 codes = sc20676_codes4<BITS>(k_codes + grp * KW, (t % G) * D + c0);
                     kv = sc20676_load4(k_zero + grp * D + c0)
                         + sc20676_load4(k_scale + grp * D + c0) * codes;
@@ -823,7 +887,7 @@ inline void sc20676_tiled(
                     kv = sc20676_load4(k_tail + (kv_row * KT_CAP + (t - k_packed)) * D + c0);
                 }
                 if (t < v_packed) {
-                    const uint vrow = kv_row * V_CAP + t;
+                    const uint vrow = layout.value_row(kv_row, t);
                     const uint meta = vrow * VG + c0 / G;
                     vv = float(v_zero[meta])
                         + float(v_scale[meta]) * sc20676_codes4<BITS>(v_codes + vrow * VW, c0);
@@ -916,11 +980,11 @@ const TILED_BODY: &str = r#"
     bool valid;
     const uint split = threadgroup_position_in_grid.z;
     const uint splits = threadgroups_per_grid.z;
+    SC20676_EXTENTS
     sc20676_tiled<D, BK, WM, MASK_MODE, WINDOW, BITS>(
-        q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, uint(params[0]),
-        uint(params[1]), uint(params[2]), uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]),
-        uint(k_codes_shape[2]), uint(k_tail_shape[2]), uint(v_codes_shape[2]), uint(v_tail_shape[2]),
-        k_tile, v_tile, thread_index_in_threadgroup, thread_index_in_simdgroup,
+        q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, k_packed, v_packed,
+        kv_len, uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]), layout,
+        uint(k_tail_shape[2]), uint(v_tail_shape[2]), k_tile, v_tile, thread_index_in_threadgroup, thread_index_in_simdgroup,
         simdgroup_index_in_threadgroup, threadgroup_position_in_grid.x,
         threadgroup_position_in_grid.y, split, splits, o, row_max, row_sum, out_row, valid);
     if (!valid) return;
@@ -1014,14 +1078,14 @@ inline __attribute__((always_inline)) vec<T, 8> sc20676_nax_tile_frag(const thre
     return vec<T, 8>(lo, hi);
 }
 
-template <int D, int BK, int WM, int MASK_MODE, int WINDOW, int BITS, typename T, typename KT,
-          typename VT>
+template <int D, int BK, int WM, int MASK_MODE, int WINDOW, int BITS, typename L, typename T,
+          typename KT, typename VT>
 inline __attribute__((always_inline)) void sc20676_nax(
     const device T* q, const device uint8_t* k_codes, const device half* k_scale,
     const device half* k_zero, const device KT* k_tail, const device uint8_t* v_codes,
     const device half* v_scale, const device half* v_zero, const device VT* v_tail,
-    uint k_packed, uint v_packed, uint kv_len, uint HQ, uint SQ, uint HKV, uint KG_CAP,
-    uint KT_CAP, uint V_CAP, uint VT_CAP, threadgroup T* k_tile, threadgroup T* v_tile,
+    uint k_packed, uint v_packed, uint kv_len, uint HQ, uint SQ, uint HKV, thread const L& layout,
+    uint KT_CAP, uint VT_CAP, threadgroup T* k_tile, threadgroup T* v_tile,
     uint tid, uint lane, uint sg, uint tile, uint kv_row, uint split, uint splits,
     thread vec<float, 8>* o, thread float* row_max, thread float* row_sum,
     thread uint* out_row, thread bool* valid) {
@@ -1086,7 +1150,8 @@ inline __attribute__((always_inline)) void sc20676_nax(
         if (t0 + BK <= k_packed && t0 + BK <= v_packed) {
             // Whole block packed (the prefill steady state): each thread owns one channel quad
             // for the block, so the block's K scale/zero (one token group) load once per thread.
-            const uint grp = kv_row * KG_CAP + blk;
+            const uint grp = layout.key_group(kv_row, t0);
+            const uint v_block = layout.value_row(kv_row, t0);
             const float4 ks = sc20676_load4(k_scale + grp * D + c_quad);
             const float4 kz = sc20676_load4(k_zero + grp * D + c_quad);
             const device uint8_t* kc = k_codes + grp * KW;
@@ -1095,7 +1160,7 @@ inline __attribute__((always_inline)) void sc20676_nax(
                 const uint tt = t_row + r * TSTEP;
                 const float4 kv = kz + ks * sc20676_codes4<BITS>(kc, tt * D + c_quad);
                 *(threadgroup vec<T, 4>*)(k_tile + tt * LD + c_quad) = vec<T, 4>(kv);
-                const uint vrow = kv_row * V_CAP + t0 + tt;
+                const uint vrow = v_block + tt;
                 const uint meta = vrow * VG + c_quad / G;
                 const float4 vv = float(v_zero[meta])
                     + float(v_scale[meta]) * sc20676_codes4<BITS>(v_codes + vrow * VW, c_quad);
@@ -1110,7 +1175,7 @@ inline __attribute__((always_inline)) void sc20676_nax(
                 float4 vv = float4(0.0f);
                 if (t < kv_len) {
                     if (t < k_packed) {
-                        const uint grp = kv_row * KG_CAP + t / G;
+                        const uint grp = layout.key_group(kv_row, t);
                         const float4 codes =
                             sc20676_codes4<BITS>(k_codes + grp * KW, (t % G) * D + c_quad);
                         kv = sc20676_load4(k_zero + grp * D + c_quad)
@@ -1119,7 +1184,7 @@ inline __attribute__((always_inline)) void sc20676_nax(
                         kv = sc20676_load4(k_tail + (kv_row * KT_CAP + (t - k_packed)) * D + c_quad);
                     }
                     if (t < v_packed) {
-                        const uint vrow = kv_row * V_CAP + t;
+                        const uint vrow = layout.value_row(kv_row, t);
                         const uint meta = vrow * VG + c_quad / G;
                         vv = float(v_zero[meta])
                             + float(v_scale[meta]) * sc20676_codes4<BITS>(v_codes + vrow * VW, c_quad);
@@ -1226,11 +1291,11 @@ const NAX_BODY: &str = r#"
     bool valid[2];
     const uint split = threadgroup_position_in_grid.z;
     const uint splits = threadgroups_per_grid.z;
+    SC20676_EXTENTS
     sc20676_nax<D, BK, WM, MASK_MODE, WINDOW, BITS>(
-        q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, uint(params[0]),
-        uint(params[1]), uint(params[2]), uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]),
-        uint(k_codes_shape[2]), uint(k_tail_shape[2]), uint(v_codes_shape[2]), uint(v_tail_shape[2]),
-        k_tile, v_tile, thread_index_in_threadgroup, thread_index_in_simdgroup,
+        q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, k_packed, v_packed,
+        kv_len, uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]), layout,
+        uint(k_tail_shape[2]), uint(v_tail_shape[2]), k_tile, v_tile, thread_index_in_threadgroup, thread_index_in_simdgroup,
         simdgroup_index_in_threadgroup, threadgroup_position_in_grid.x,
         threadgroup_position_in_grid.y, split, splits, o, row_max, row_sum, out_row, valid);
     const short col = sc20676_nax_coord(thread_index_in_simdgroup).x;
@@ -1270,6 +1335,177 @@ const ATTEND_INPUTS: [&str; 10] = [
     "params",
 ];
 
+/// Inputs of the paged kernels: the contiguous set with `params` replaced by the page table
+/// (`[B, max_pages]` Int32) and the per-sequence extents (`[B, 3]` Int32).
+const PAGED_ATTEND_INPUTS: [&str; 11] = [
+    "q", "k_codes", "k_scale", "k_zero", "k_tail", "v_codes", "v_scale", "v_zero", "v_tail",
+    "pages", "seq",
+];
+
+/// Where a kernel set finds the quantized K/V: contiguous per-sequence arrays or a page pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KernelLayout {
+    Contiguous,
+    Paged,
+}
+
+/// The six attention kernels of one [`KernelLayout`] (per-row, fp32 tiled, NAX tiled; each as a
+/// single pass and as a split-KV partial pass). Every pair shares the reduction pass.
+struct KernelSet {
+    single: MetalKernel,
+    partial: MetalKernel,
+    tiled_single: MetalKernel,
+    tiled_partial: MetalKernel,
+    nax_single: MetalKernel,
+    nax_partial: MetalKernel,
+}
+
+impl KernelSet {
+    fn new(layout: KernelLayout) -> Result<Self> {
+        let (prefix, inputs, extents, tile_extents): (_, &[&str], _, _) = match layout {
+            KernelLayout::Contiguous => (
+                "sc20676",
+                &ATTEND_INPUTS,
+                CONTIGUOUS_EXTENTS,
+                CONTIGUOUS_EXTENTS,
+            ),
+            KernelLayout::Paged => (
+                "sc20680_paged",
+                &PAGED_ATTEND_INPUTS,
+                PAGED_ROW_EXTENTS,
+                PAGED_TILE_EXTENTS,
+            ),
+        };
+        let body = |template: &str, marker: &str, epilogue: &str, extents: &str| {
+            template
+                .replace(marker, epilogue)
+                .replace("SC20676_EXTENTS", extents)
+        };
+        let tiled_header = format!("{HEADER}{TILED_HEADER}");
+        let nax_header = format!("{tiled_header}{NAX_HEADER}");
+        let kernel = |name: &str, outputs: &[&str], source: String, header: &str| {
+            MetalKernel::with_options(
+                &format!("{prefix}_{name}"),
+                inputs,
+                outputs,
+                &source,
+                header,
+                true,
+                false,
+            )
+        };
+        const PARTIALS: [&str; 3] = ["part_acc", "part_max", "part_sum"];
+        Ok(Self {
+            // Compiled on first run only, so a device without the Neural Accelerator (whose Metal
+            // compiler may lack MetalPerformancePrimitives) never builds the NAX pipelines.
+            nax_single: kernel(
+                "nax",
+                &["out"],
+                body(
+                    NAX_BODY,
+                    "SC20676_NAX_EPILOGUE",
+                    NAX_SINGLE_EPILOGUE,
+                    tile_extents,
+                ),
+                &nax_header,
+            )?,
+            nax_partial: kernel(
+                "nax_split",
+                &PARTIALS,
+                body(
+                    NAX_BODY,
+                    "SC20676_NAX_EPILOGUE",
+                    NAX_PARTIAL_EPILOGUE,
+                    tile_extents,
+                ),
+                &nax_header,
+            )?,
+            tiled_single: kernel(
+                "tiled",
+                &["out"],
+                body(
+                    TILED_BODY,
+                    "SC20676_TILED_EPILOGUE",
+                    TILED_SINGLE_EPILOGUE,
+                    tile_extents,
+                ),
+                &tiled_header,
+            )?,
+            tiled_partial: kernel(
+                "tiled_split",
+                &PARTIALS,
+                body(
+                    TILED_BODY,
+                    "SC20676_TILED_EPILOGUE",
+                    TILED_PARTIAL_EPILOGUE,
+                    tile_extents,
+                ),
+                &tiled_header,
+            )?,
+            single: kernel(
+                "attend",
+                &["out"],
+                body(ATTEND_BODY, "SC20676_EPILOGUE", SINGLE_EPILOGUE, extents),
+                HEADER,
+            )?,
+            partial: kernel(
+                "split",
+                &PARTIALS,
+                body(ATTEND_BODY, "SC20676_EPILOGUE", PARTIAL_EPILOGUE, extents),
+                HEADER,
+            )?,
+        })
+    }
+}
+
+/// Live extents of one sequence of a paged dispatch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PagedSequenceExtent {
+    /// Leading tokens held quantized in pages (a multiple of the quantization group); token `t`
+    /// of them lives in page `page_table[b][t / page_tokens]`.
+    pub packed_tokens: usize,
+    /// Live KV tokens; tokens `packed_tokens..kv_tokens` are rows `0..` of the sequence's dense
+    /// residual (`key_tail` / `value_tail` batch row `b`).
+    pub kv_tokens: usize,
+}
+
+/// Arguments of one fused paged packed-attention dispatch (SC-20680). The quantized K/V of every
+/// sequence live in `page_tokens`-token pages of one shared pool, reached through `page_table`;
+/// only the per-sequence dense residual (at most one quantization group) is a per-batch input.
+/// The kernels read codes and scale/zero metadata in place from the pages — no dense K/V is
+/// gathered, and no page is copied.
+#[derive(Clone, Copy, Debug)]
+pub struct PagedPackedAttentionArgs<'a> {
+    /// `[B, Hq, Sq, D]`, f16/bf16/f32. Queries are the last `Sq` positions of each sequence.
+    pub query: &'a Array,
+    /// `[pages, Hkv, page_tokens/G, G·D·b/8]` Uint8.
+    pub key_codes: &'a Array,
+    /// `[pages, Hkv, page_tokens/G, D]` Float16 scales.
+    pub key_scales: &'a Array,
+    /// `[pages, Hkv, page_tokens/G, D]` Float16 zeros.
+    pub key_zeros: &'a Array,
+    /// `[B, Hkv, key_residual_capacity, D]` dense residual keys, any float dtype.
+    pub key_tail: &'a Array,
+    /// `[pages, Hkv, page_tokens, D·b/8]` Uint8.
+    pub value_codes: &'a Array,
+    /// `[pages, Hkv, page_tokens, D/G]` Float16 scales.
+    pub value_scales: &'a Array,
+    /// `[pages, Hkv, page_tokens, D/G]` Float16 zeros.
+    pub value_zeros: &'a Array,
+    /// `[B, Hkv, value_residual_capacity, D]` dense residual values, any float dtype.
+    pub value_tail: &'a Array,
+    /// `[B, max_pages]` Int32 physical page ids; row `b` lists sequence `b`'s pages in position
+    /// order (any physical order). Columns past a sequence's pages are never read.
+    pub page_table: &'a Array,
+    /// Tokens per page, a positive multiple of the quantization group.
+    pub page_tokens: usize,
+    /// One extent per batch row.
+    pub sequences: &'a [PagedSequenceExtent],
+    /// Code width `b` of the page codes; the reader must have been built for it.
+    pub code_bits: PackedCodeBits,
+    pub mask: PackedMask,
+}
+
 /// Arguments of one fused packed-attention dispatch. Buffers may be larger than their live
 /// extents (block preallocation); `key_packed_tokens`, `value_packed_tokens`, and `kv_tokens` are
 /// the live extents. Tokens `key_packed_tokens..kv_tokens` of K are read from `key_tail` rows
@@ -1308,13 +1544,11 @@ pub struct PackedAttentionArgs<'a> {
 /// Retained kernel objects; MLX performs cold compilation on first `.run()` and reuses the same
 /// compiled pipelines for subsequent dispatches.
 pub struct PackedMetalKernel {
-    single: MetalKernel,
-    partial: MetalKernel,
+    /// Kernels over block-preallocated contiguous `[B, Hkv, capacity, ·]` arrays.
+    contiguous: KernelSet,
+    /// The same kernels walking an SC-20680 page table into a shared page pool.
+    paged: KernelSet,
     reduce: MetalKernel,
-    tiled_single: MetalKernel,
-    tiled_partial: MetalKernel,
-    nax_single: MetalKernel,
-    nax_partial: MetalKernel,
     identity: String,
     gpu_family: PackedMetalGpuFamily,
     /// Code width this reader reads; a dispatch of another width is refused before encoding.
@@ -1342,6 +1576,17 @@ impl crate::primitives::packed_group_affine_kv::RetainedPackedKernel for PackedM
 
     fn kernel_selection(&self, args: &PackedAttentionArgs<'_>) -> Option<PackedKernelSelection> {
         PackedMetalKernel::kernel_selection(self, args).ok()
+    }
+
+    fn dispatch_paged(&self, args: &PagedPackedAttentionArgs<'_>) -> Result<Array> {
+        PackedMetalKernel::dispatch_paged(self, args)
+    }
+
+    fn paged_kernel_selection(
+        &self,
+        args: &PagedPackedAttentionArgs<'_>,
+    ) -> Option<PackedKernelSelection> {
+        PackedMetalKernel::paged_kernel_selection(self, args).ok()
     }
 
     fn code_bits(&self) -> PackedCodeBits {
@@ -1438,7 +1683,32 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
             "SC-20676 packed buffers do not match query/cache geometry".into(),
         ));
     }
-    let (mask_mode, window) = match args.mask {
+    checked_msl_i32(kv, "KV length")?;
+    let visible_tokens = visible_tokens(args.mask, kv);
+    finish_validation(
+        [batch, query_heads, query_tokens, head_dimension, kv_heads],
+        args.mask,
+        visible_tokens,
+        args.code_bits,
+    )
+}
+
+/// Tokens a query row of a `kv`-token sequence can see under `mask` (the split-planning extent).
+fn visible_tokens(mask: PackedMask, kv: usize) -> usize {
+    match mask {
+        PackedMask::SlidingWindow(window) => window.min(kv),
+        _ => kv,
+    }
+}
+
+/// Mask, GQA row packing, and row counts shared by the contiguous and paged validations.
+fn finish_validation(
+    [batch, query_heads, query_tokens, head_dimension, kv_heads]: [usize; 5],
+    mask: PackedMask,
+    visible_tokens: usize,
+    code_bits: PackedCodeBits,
+) -> Result<ValidatedDispatch> {
+    let (mask_mode, window) = match mask {
         PackedMask::None => (0, 0),
         PackedMask::Causal => (1, 0),
         PackedMask::SlidingWindow(window) if window > 0 => (
@@ -1455,7 +1725,6 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
             ))
         }
     };
-    checked_msl_i32(kv, "KV length")?;
     // Serve as many GQA query heads per row as keep `heads · D/32` accumulators in registers.
     let gqa = query_heads / kv_heads;
     let lane_values = head_dimension / SIMD_WIDTH;
@@ -1463,10 +1732,6 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
         .rev()
         .find(|heads| gqa.is_multiple_of(*heads) && heads * lane_values <= MAX_LANE_ACCUMULATORS)
         .unwrap_or(1);
-    let visible_tokens = match args.mask {
-        PackedMask::SlidingWindow(window) => window.min(kv),
-        _ => kv,
-    };
     Ok(ValidatedDispatch {
         batch,
         kv_heads,
@@ -1479,8 +1744,106 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
         visible_tokens,
         mask_mode,
         window,
-        bits: i32::from(args.code_bits.bits()),
+        bits: i32::from(code_bits.bits()),
     })
+}
+
+/// Shape, dtype, and live-extent contract of one paged dispatch, checked before anything is
+/// encoded: every pool array shares one page geometry, the residuals and page table carry one row
+/// per sequence, and every sequence's quantized tokens are covered by its page-table row.
+fn validate_paged_dispatch(args: &PagedPackedAttentionArgs<'_>) -> Result<ValidatedDispatch> {
+    let group = PACKED_METAL_QUANT_GROUP_SIZE;
+    let [batch, query_heads, query_tokens, head_dimension] =
+        checked_shape(args.query.shape(), "query")?;
+    let kc = checked_shape(args.key_codes.shape(), "key codes")?;
+    let ks = checked_shape(args.key_scales.shape(), "key scales")?;
+    let kz = checked_shape(args.key_zeros.shape(), "key zeros")?;
+    let kt = checked_shape(args.key_tail.shape(), "key residual")?;
+    let vc = checked_shape(args.value_codes.shape(), "value codes")?;
+    let vs = checked_shape(args.value_scales.shape(), "value scales")?;
+    let vz = checked_shape(args.value_zeros.shape(), "value zeros")?;
+    let vt = checked_shape(args.value_tail.shape(), "value residual")?;
+    let table = args.page_table.shape();
+    let [table_rows, table_columns] = table else {
+        return Err(Error::Unsupported(
+            "SC-20680 page table must be [batch, max_pages]".into(),
+        ));
+    };
+    let (table_rows, table_columns) = (
+        usize::try_from(*table_rows).unwrap_or(0),
+        usize::try_from(*table_columns).unwrap_or(0),
+    );
+    let pages = kc[0];
+    let kv_heads = kc[1];
+    let page_tokens = args.page_tokens;
+    let float = |dtype: Dtype| matches!(dtype, Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32);
+    let key_words = args.code_bits.code_bytes(group * head_dimension);
+    let value_words = args.code_bits.code_bytes(head_dimension);
+    let value_groups = head_dimension / group;
+    let page_groups = page_tokens / group;
+    let extents_valid = args.sequences.len() == batch
+        && args.sequences.iter().all(|extent| {
+            extent.kv_tokens != 0
+                && query_tokens <= extent.kv_tokens
+                && extent.packed_tokens.is_multiple_of(group)
+                && extent.packed_tokens <= extent.kv_tokens
+                && extent.packed_tokens.div_ceil(page_tokens.max(1)) <= table_columns
+                && extent.kv_tokens - extent.packed_tokens <= kt[2]
+                && extent.kv_tokens - extent.packed_tokens <= vt[2]
+        });
+    let valid = batch != 0
+        && query_heads != 0
+        && query_tokens != 0
+        && packed_metal_head_dimension_supported(head_dimension)
+        && page_tokens != 0
+        && page_tokens.is_multiple_of(group)
+        && pages != 0
+        && kv_heads != 0
+        && query_heads % kv_heads == 0
+        && kc == [pages, kv_heads, page_groups, key_words]
+        && ks == [pages, kv_heads, page_groups, head_dimension]
+        && kz == ks
+        && vc == [pages, kv_heads, page_tokens, value_words]
+        && vs == [pages, kv_heads, page_tokens, value_groups]
+        && vz == vs
+        && kt == [batch, kv_heads, kt[2], head_dimension]
+        && vt == [batch, kv_heads, vt[2], head_dimension]
+        && kt[2] != 0
+        && vt[2] != 0
+        && table_rows == batch
+        && table_columns != 0
+        && args.page_table.dtype() == Dtype::Int32
+        && extents_valid
+        && args.key_codes.dtype() == Dtype::Uint8
+        && args.value_codes.dtype() == Dtype::Uint8
+        && args.key_scales.dtype() == Dtype::Float16
+        && args.key_zeros.dtype() == Dtype::Float16
+        && args.value_scales.dtype() == Dtype::Float16
+        && args.value_zeros.dtype() == Dtype::Float16
+        && float(args.key_tail.dtype())
+        && float(args.value_tail.dtype())
+        && float(args.query.dtype());
+    if !valid {
+        return Err(Error::Unsupported(
+            "SC-20680 paged buffers do not match query/page geometry".into(),
+        ));
+    }
+    let mut visible = 0;
+    for extent in args.sequences {
+        checked_msl_i32(extent.kv_tokens, "KV length")?;
+        visible = visible.max(visible_tokens(args.mask, extent.kv_tokens));
+    }
+    checked_msl_i32(page_tokens, "page tokens")?;
+    checked_msl_i32(
+        pages.saturating_mul(kv_heads).saturating_mul(page_tokens),
+        "page pool rows",
+    )?;
+    finish_validation(
+        [batch, query_heads, query_tokens, head_dimension, kv_heads],
+        args.mask,
+        visible,
+        args.code_bits,
+    )
 }
 
 /// Cache identity of the default SC-20676 packed group-affine reader (2-bit codes).
@@ -1529,71 +1892,9 @@ impl PackedMetalKernel {
         gpu_family: PackedMetalGpuFamily,
         code_bits: PackedCodeBits,
     ) -> Result<Self> {
-        let single = ATTEND_BODY.replace("SC20676_EPILOGUE", SINGLE_EPILOGUE);
-        let partial = ATTEND_BODY.replace("SC20676_EPILOGUE", PARTIAL_EPILOGUE);
-        let tiled_header = format!("{HEADER}{TILED_HEADER}");
-        let tiled_single = TILED_BODY.replace("SC20676_TILED_EPILOGUE", TILED_SINGLE_EPILOGUE);
-        let tiled_partial = TILED_BODY.replace("SC20676_TILED_EPILOGUE", TILED_PARTIAL_EPILOGUE);
-        let nax_header = format!("{tiled_header}{NAX_HEADER}");
-        let nax_single = NAX_BODY.replace("SC20676_NAX_EPILOGUE", NAX_SINGLE_EPILOGUE);
-        let nax_partial = NAX_BODY.replace("SC20676_NAX_EPILOGUE", NAX_PARTIAL_EPILOGUE);
         Ok(Self {
-            // Compiled on first run only, so a device without the Neural Accelerator (whose Metal
-            // compiler may lack MetalPerformancePrimitives) never builds these pipelines.
-            nax_single: MetalKernel::with_options(
-                "sc20676_nax",
-                &ATTEND_INPUTS,
-                &["out"],
-                &nax_single,
-                &nax_header,
-                true,
-                false,
-            )?,
-            nax_partial: MetalKernel::with_options(
-                "sc20676_nax_split",
-                &ATTEND_INPUTS,
-                &["part_acc", "part_max", "part_sum"],
-                &nax_partial,
-                &nax_header,
-                true,
-                false,
-            )?,
-            tiled_single: MetalKernel::with_options(
-                "sc20676_tiled",
-                &ATTEND_INPUTS,
-                &["out"],
-                &tiled_single,
-                &tiled_header,
-                true,
-                false,
-            )?,
-            tiled_partial: MetalKernel::with_options(
-                "sc20676_tiled_split",
-                &ATTEND_INPUTS,
-                &["part_acc", "part_max", "part_sum"],
-                &tiled_partial,
-                &tiled_header,
-                true,
-                false,
-            )?,
-            single: MetalKernel::with_options(
-                "sc20676_attend",
-                &ATTEND_INPUTS,
-                &["out"],
-                &single,
-                HEADER,
-                true,
-                false,
-            )?,
-            partial: MetalKernel::with_options(
-                "sc20676_split",
-                &ATTEND_INPUTS,
-                &["part_acc", "part_max", "part_sum"],
-                &partial,
-                HEADER,
-                true,
-                false,
-            )?,
+            contiguous: KernelSet::new(KernelLayout::Contiguous)?,
+            paged: KernelSet::new(KernelLayout::Paged)?,
             reduce: MetalKernel::with_options(
                 "sc20676_reduce",
                 &["part_acc", "part_max", "part_sum"],
@@ -1765,18 +2066,7 @@ impl PackedMetalKernel {
         args: &PackedAttentionArgs<'_>,
     ) -> Result<PackedKernelSelection> {
         let validated = self.validate_width(args)?;
-        let dtype = args.query.dtype();
-        let query_dtype = packed_query_dtype_name(dtype)
-            .ok_or_else(|| Error::Unsupported("SC-20676 query dtype".into()))?;
-        let descriptor = self
-            .kernel_descriptor(validated.query_tokens, validated.head_dimension, dtype)
-            .ok_or_else(|| Error::Unsupported("SC-20676 head dimension".into()))?;
-        Ok(PackedKernelSelection {
-            kernel: descriptor.kernel,
-            selection: descriptor.selection,
-            reason: descriptor.selection_reason,
-            query_dtype,
-        })
+        self.selection_for(&validated, args.query.dtype())
     }
 
     fn required_tuning(&self, head_dimension: usize) -> Result<PackedMetalTuning> {
@@ -1790,17 +2080,23 @@ impl PackedMetalKernel {
     /// Kernel and KV split count [`Self::dispatch`] selects (see [`Self::selects_tiled`]).
     pub fn planned_path(&self, args: &PackedAttentionArgs<'_>) -> Result<PackedKernelPath> {
         let validated = self.validate_width(args)?;
+        self.plan(&validated, args.query.dtype())
+    }
+
+    /// The path for a validated dispatch: tiled (NAX where selected) for multi-row steps on the
+    /// qualified family, otherwise the per-row kernel with the split heuristic.
+    fn plan(&self, validated: &ValidatedDispatch, query_dtype: Dtype) -> Result<PackedKernelPath> {
         if self.selects_tiled(validated.query_tokens, validated.head_dimension) {
             if self
-                .nax_selection(validated.head_dimension, args.query.dtype())
+                .nax_selection(validated.head_dimension, query_dtype)
                 .selected
             {
                 return Ok(PackedKernelPath::NaxTiled {
-                    splits: nax_splits(&validated),
+                    splits: nax_splits(validated),
                 });
             }
             return Ok(PackedKernelPath::Tiled {
-                splits: tiled_splits(&validated),
+                splits: tiled_splits(validated),
             });
         }
         let tuning = self.required_tuning(validated.head_dimension)?;
@@ -1814,11 +2110,183 @@ impl PackedMetalKernel {
     }
 
     pub fn dispatch(&self, args: &PackedAttentionArgs<'_>) -> Result<Array> {
-        match self.planned_path(args)? {
-            PackedKernelPath::NaxTiled { .. } => self.dispatch_nax(args, None),
-            PackedKernelPath::Tiled { .. } => self.dispatch_tiled(args, None),
-            PackedKernelPath::PerRow { .. } => self.dispatch_with_splits(args, None),
+        let validated = self.validate_width(args)?;
+        let path = self.plan(&validated, args.query.dtype())?;
+        let params = dispatch_params(args)?;
+        self.encode(&contiguous_inputs(args, &params), &validated, path)
+    }
+
+    /// Refuse a paged dispatch whose codes are not this reader's width, before anything is
+    /// encoded.
+    fn validate_paged_width(
+        &self,
+        args: &PagedPackedAttentionArgs<'_>,
+    ) -> Result<ValidatedDispatch> {
+        if args.code_bits != self.code_bits {
+            return Err(Error::Unsupported(format!(
+                "SC-20680 reader for {}-bit codes cannot read {}-bit pages",
+                self.code_bits.bits(),
+                args.code_bits.bits()
+            )));
         }
+        validate_paged_dispatch(args)
+    }
+
+    /// Kernel and KV split count [`Self::dispatch_paged`] selects: the same rule as the
+    /// contiguous reader, over the longest visible sequence.
+    pub fn planned_paged_path(
+        &self,
+        args: &PagedPackedAttentionArgs<'_>,
+    ) -> Result<PackedKernelPath> {
+        let validated = self.validate_paged_width(args)?;
+        self.plan(&validated, args.query.dtype())
+    }
+
+    /// The kernel [`Self::dispatch_paged`] runs for `args` and why.
+    pub fn paged_kernel_selection(
+        &self,
+        args: &PagedPackedAttentionArgs<'_>,
+    ) -> Result<PackedKernelSelection> {
+        let validated = self.validate_paged_width(args)?;
+        self.selection_for(&validated, args.query.dtype())
+    }
+
+    /// Fused attention over a paged pool (SC-20680): the per-row, tiled, or NAX kernel of
+    /// [`Self::planned_paged_path`], reading packed K/V and scale/zero in place from the pages
+    /// `page_table` names and each sequence's dense residual — no dense K/V gather.
+    pub fn dispatch_paged(&self, args: &PagedPackedAttentionArgs<'_>) -> Result<Array> {
+        let validated = self.validate_paged_width(args)?;
+        let path = self.plan(&validated, args.query.dtype())?;
+        self.dispatch_paged_validated(args, &validated, path)
+    }
+
+    /// Run the paged kernel of `path` with its explicit split count, regardless of `S_q`. Test,
+    /// benchmark, and evidence seam; refused where [`Self::dispatch_tiled`] or
+    /// [`Self::dispatch_nax`] refuse the same kernel.
+    pub fn dispatch_paged_path(
+        &self,
+        args: &PagedPackedAttentionArgs<'_>,
+        path: PackedKernelPath,
+    ) -> Result<Array> {
+        let validated = self.validate_paged_width(args)?;
+        self.dispatch_paged_validated(args, &validated, path)
+    }
+
+    fn dispatch_paged_validated(
+        &self,
+        args: &PagedPackedAttentionArgs<'_>,
+        validated: &ValidatedDispatch,
+        path: PackedKernelPath,
+    ) -> Result<Array> {
+        let page_tokens = checked_msl_i32(args.page_tokens, "page tokens")?;
+        let mut extents = Vec::with_capacity(args.sequences.len() * 3);
+        for extent in args.sequences {
+            let packed = checked_msl_i32(extent.packed_tokens, "packed tokens")?;
+            // Paged K and V are quantized together, one group at a time.
+            extents.extend([
+                packed,
+                packed,
+                checked_msl_i32(extent.kv_tokens, "KV tokens")?,
+            ]);
+        }
+        let batch = checked_msl_i32(args.sequences.len(), "batch")?;
+        let seq = Array::from_slice(&extents, &[batch, 3]);
+        let inputs = BoundInputs {
+            layout: KernelLayout::Paged,
+            query: args.query,
+            arrays: vec![
+                args.query,
+                args.key_codes,
+                args.key_scales,
+                args.key_zeros,
+                args.key_tail,
+                args.value_codes,
+                args.value_scales,
+                args.value_zeros,
+                args.value_tail,
+                args.page_table,
+                &seq,
+            ],
+            page_tokens,
+        };
+        self.encode(&inputs, validated, path)
+    }
+
+    /// Encode `path` over bound inputs, refusing a kernel this reader may not run.
+    fn encode(
+        &self,
+        inputs: &BoundInputs<'_>,
+        validated: &ValidatedDispatch,
+        path: PackedKernelPath,
+    ) -> Result<Array> {
+        match path {
+            PackedKernelPath::NaxTiled { splits } => {
+                let selection = self.nax_selection(validated.head_dimension, inputs.query.dtype());
+                if !selection.selected {
+                    return Err(Error::Unsupported(format!(
+                        "SC-20676 NAX tiled kernel refused: {}",
+                        selection.reason
+                    )));
+                }
+                let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
+                    .div_ceil(NAX_ROWS);
+                let set = self.kernels(inputs.layout);
+                self.dispatch_tiles(
+                    inputs,
+                    validated,
+                    [&set.nax_single, &set.nax_partial],
+                    tiles,
+                    NAX_SIMD_GROUPS,
+                    NAX_BLOCK_TOKENS,
+                    splits.clamp(1, MAX_KV_SPLITS),
+                )
+            }
+            PackedKernelPath::Tiled { splits } => {
+                if self.gpu_family != PackedMetalGpuFamily::Apple7OrNewer {
+                    return Err(Error::Unsupported(
+                        "SC-20676 tiled kernel requires the qualified Apple7OrNewer profile".into(),
+                    ));
+                }
+                let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
+                    .div_ceil(TILED_ROWS);
+                let set = self.kernels(inputs.layout);
+                self.dispatch_tiles(
+                    inputs,
+                    validated,
+                    [&set.tiled_single, &set.tiled_partial],
+                    tiles,
+                    TILED_SIMD_GROUPS,
+                    tiled_block_tokens(validated.head_dimension),
+                    splits.clamp(1, MAX_KV_SPLITS),
+                )
+            }
+            PackedKernelPath::PerRow { splits } => self.dispatch_rows(inputs, validated, splits),
+        }
+    }
+
+    fn kernels(&self, layout: KernelLayout) -> &KernelSet {
+        match layout {
+            KernelLayout::Contiguous => &self.contiguous,
+            KernelLayout::Paged => &self.paged,
+        }
+    }
+
+    fn selection_for(
+        &self,
+        validated: &ValidatedDispatch,
+        dtype: Dtype,
+    ) -> Result<PackedKernelSelection> {
+        let query_dtype = packed_query_dtype_name(dtype)
+            .ok_or_else(|| Error::Unsupported("SC-20676 query dtype".into()))?;
+        let descriptor = self
+            .kernel_descriptor(validated.query_tokens, validated.head_dimension, dtype)
+            .ok_or_else(|| Error::Unsupported("SC-20676 head dimension".into()))?;
+        Ok(PackedKernelSelection {
+            kernel: descriptor.kernel,
+            selection: descriptor.selection,
+            reason: descriptor.selection_reason,
+            query_dtype,
+        })
     }
 
     /// Run the NAX tiled kernel regardless of `S_q`, with an explicit KV split count (`None` =
@@ -1830,26 +2298,12 @@ impl PackedMetalKernel {
         splits: Option<usize>,
     ) -> Result<Array> {
         let validated = self.validate_width(args)?;
-        let selection = self.nax_selection(validated.head_dimension, args.query.dtype());
-        if !selection.selected {
-            return Err(Error::Unsupported(format!(
-                "SC-20676 NAX tiled kernel refused: {}",
-                selection.reason
-            )));
-        }
-        let splits = splits
-            .unwrap_or_else(|| nax_splits(&validated))
-            .clamp(1, MAX_KV_SPLITS);
-        let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
-            .div_ceil(NAX_ROWS);
-        self.dispatch_tiles(
-            args,
+        let splits = splits.unwrap_or_else(|| nax_splits(&validated));
+        let params = dispatch_params(args)?;
+        self.encode(
+            &contiguous_inputs(args, &params),
             &validated,
-            [&self.nax_single, &self.nax_partial],
-            tiles,
-            NAX_SIMD_GROUPS,
-            NAX_BLOCK_TOKENS,
-            splits,
+            PackedKernelPath::NaxTiled { splits },
         )
     }
 
@@ -1867,20 +2321,24 @@ impl PackedMetalKernel {
             ));
         }
         let validated = self.validate_width(args)?;
-        let splits = splits
-            .unwrap_or_else(|| tiled_splits(&validated))
-            .clamp(1, MAX_KV_SPLITS);
-        let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
-            .div_ceil(TILED_ROWS);
-        self.dispatch_tiles(
-            args,
+        let splits = splits.unwrap_or_else(|| tiled_splits(&validated));
+        let params = dispatch_params(args)?;
+        self.encode(
+            &contiguous_inputs(args, &params),
             &validated,
-            [&self.tiled_single, &self.tiled_partial],
-            tiles,
-            TILED_SIMD_GROUPS,
-            tiled_block_tokens(validated.head_dimension),
-            splits,
+            PackedKernelPath::Tiled { splits },
         )
+    }
+
+    /// The template arguments every attention kernel of `inputs.layout` takes besides its own.
+    fn layout_args<'k>(
+        inputs: &BoundInputs<'k>,
+        dispatch: mlx_rs::fast::MetalKernelDispatch<'k>,
+    ) -> mlx_rs::fast::MetalKernelDispatch<'k> {
+        match inputs.layout {
+            KernelLayout::Contiguous => dispatch,
+            KernelLayout::Paged => dispatch.template_arg("PT", inputs.page_tokens),
+        }
     }
 
     /// Encode one tiled-family dispatch (fp32 tiled or NAX): grid `x` = row tiles, `y` = batch ×
@@ -1888,7 +2346,7 @@ impl PackedMetalKernel {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_tiles(
         &self,
-        args: &PackedAttentionArgs<'_>,
+        inputs: &BoundInputs<'_>,
         validated: &ValidatedDispatch,
         [single, partial]: [&MetalKernel; 2],
         tiles: usize,
@@ -1897,7 +2355,6 @@ impl PackedMetalKernel {
         splits: usize,
     ) -> Result<Array> {
         let head_dimension = validated.head_dimension;
-        let params = dispatch_params(args)?;
         let threads = simd_groups * SIMD_WIDTH;
         let grid_x = tiles
             .checked_mul(threads)
@@ -1910,30 +2367,24 @@ impl PackedMetalKernel {
         let block = checked_msl_i32(block_tokens, "tiled block")?;
         let wm = checked_msl_i32(simd_groups, "tiled SIMD groups")?;
         let kernel = if splits == 1 { single } else { partial };
-        let attend = kernel
-            .apply()
-            .input(args.query)
-            .input(args.key_codes)
-            .input(args.key_scales)
-            .input(args.key_zeros)
-            .input(args.key_tail)
-            .input(args.value_codes)
-            .input(args.value_scales)
-            .input(args.value_zeros)
-            .input(args.value_tail)
-            .input(&params)
-            .template_arg("D", head_i32)
-            .template_arg("BK", block)
-            .template_arg("WM", wm)
-            .template_arg("MASK_MODE", validated.mask_mode)
-            .template_arg("WINDOW", validated.window)
-            .template_arg("BITS", validated.bits);
-        let query_shape = args.query.shape().to_vec();
+        let attend = Self::layout_args(
+            inputs,
+            kernel
+                .apply()
+                .inputs(inputs.arrays.iter().copied())
+                .template_arg("D", head_i32)
+                .template_arg("BK", block)
+                .template_arg("WM", wm)
+                .template_arg("MASK_MODE", validated.mask_mode)
+                .template_arg("WINDOW", validated.window)
+                .template_arg("BITS", validated.bits),
+        );
+        let query_shape = inputs.query.shape().to_vec();
         if splits == 1 {
             return attend
                 .output(OutputArg {
                     shape: query_shape,
-                    dtype: args.query.dtype(),
+                    dtype: inputs.query.dtype(),
                 })
                 .grid(grid_x, kv_rows, 1)
                 .thread_group(threads, 1, 1)
@@ -1969,7 +2420,7 @@ impl PackedMetalKernel {
         };
         self.reduce_partials(
             [&part_acc, &part_max, &part_sum],
-            args.query,
+            inputs.query,
             query_rows,
             head_i32,
         )
@@ -2012,13 +2463,23 @@ impl PackedMetalKernel {
     ) -> Result<Array> {
         let validated = self.validate_width(args)?;
         let tuning = self.required_tuning(validated.head_dimension)?;
-        let splits = splits
-            .unwrap_or_else(|| {
-                packed_kv_split_count(validated.rows, validated.visible_tokens, tuning.simd_groups)
-            })
-            .clamp(1, MAX_KV_SPLITS);
-        let head_dimension = validated.head_dimension;
+        let splits = splits.unwrap_or_else(|| {
+            packed_kv_split_count(validated.rows, validated.visible_tokens, tuning.simd_groups)
+        });
         let params = dispatch_params(args)?;
+        self.dispatch_rows(&contiguous_inputs(args, &params), &validated, splits)
+    }
+
+    /// Encode the per-row kernel (single pass, or partial pass plus reduction).
+    fn dispatch_rows(
+        &self,
+        inputs: &BoundInputs<'_>,
+        validated: &ValidatedDispatch,
+        splits: usize,
+    ) -> Result<Array> {
+        let tuning = self.required_tuning(validated.head_dimension)?;
+        let splits = splits.clamp(1, MAX_KV_SPLITS);
+        let head_dimension = validated.head_dimension;
         let threads = checked_msl_i32(tuning.threads, "thread-group width")?;
         let rows = checked_msl_i32(validated.rows, "threadgroup rows")?;
         let query_rows = checked_msl_i32(validated.query_rows, "query rows")?;
@@ -2030,35 +2491,30 @@ impl PackedMetalKernel {
         let head_i32 = checked_msl_i32(head_dimension, "head dimension")?;
         // Lane width (D/32), group size, and packed row widths are derived from `D` in the MSL.
         let bn = checked_msl_i32(tuning.simd_groups, "SIMD groups")?;
+        let set = self.kernels(inputs.layout);
         let kernel = if splits == 1 {
-            &self.single
+            &set.single
         } else {
-            &self.partial
+            &set.partial
         };
-        let attend = kernel
-            .apply()
-            .input(args.query)
-            .input(args.key_codes)
-            .input(args.key_scales)
-            .input(args.key_zeros)
-            .input(args.key_tail)
-            .input(args.value_codes)
-            .input(args.value_scales)
-            .input(args.value_zeros)
-            .input(args.value_tail)
-            .input(&params)
-            .template_arg("D", head_i32)
-            .template_arg("QG", heads_per_row)
-            .template_arg("BN", bn)
-            .template_arg("MASK_MODE", validated.mask_mode)
-            .template_arg("WINDOW", validated.window)
-            .template_arg("BITS", validated.bits);
-        let query_shape = args.query.shape().to_vec();
+        let attend = Self::layout_args(
+            inputs,
+            kernel
+                .apply()
+                .inputs(inputs.arrays.iter().copied())
+                .template_arg("D", head_i32)
+                .template_arg("QG", heads_per_row)
+                .template_arg("BN", bn)
+                .template_arg("MASK_MODE", validated.mask_mode)
+                .template_arg("WINDOW", validated.window)
+                .template_arg("BITS", validated.bits),
+        );
+        let query_shape = inputs.query.shape().to_vec();
         if splits == 1 {
             return attend
                 .output(OutputArg {
                     shape: query_shape,
-                    dtype: args.query.dtype(),
+                    dtype: inputs.query.dtype(),
                 })
                 .grid(threads, rows, 1)
                 .thread_group(threads, 1, 1)
@@ -2094,10 +2550,40 @@ impl PackedMetalKernel {
         };
         self.reduce_partials(
             [&part_acc, &part_max, &part_sum],
-            args.query,
+            inputs.query,
             query_rows,
             head_i32,
         )
+    }
+}
+
+/// One dispatch's arrays in kernel input order, with the layout that reads them.
+struct BoundInputs<'a> {
+    layout: KernelLayout,
+    query: &'a Array,
+    arrays: Vec<&'a Array>,
+    /// `PT` template argument of the paged kernels (unused for the contiguous layout).
+    page_tokens: i32,
+}
+
+/// The contiguous kernels' inputs for `args`, with `params` its live extents.
+fn contiguous_inputs<'a>(args: &PackedAttentionArgs<'a>, params: &'a Array) -> BoundInputs<'a> {
+    BoundInputs {
+        layout: KernelLayout::Contiguous,
+        query: args.query,
+        arrays: vec![
+            args.query,
+            args.key_codes,
+            args.key_scales,
+            args.key_zeros,
+            args.key_tail,
+            args.value_codes,
+            args.value_scales,
+            args.value_zeros,
+            args.value_tail,
+            params,
+        ],
+        page_tokens: 0,
     }
 }
 
