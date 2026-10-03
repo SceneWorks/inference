@@ -546,7 +546,7 @@ fn policy_name(policy: gen_core::Yue2ComputePolicy) -> &'static str {
 
 fn cuda_bf16_vae_math_policy(dtype: DType, location: DeviceLocation) -> Option<&'static str> {
     crate::vae::dedicated_cuda_vae_ordinal(dtype, location)
-        .map(|_| "disallow_reduced_precision_reduction_v1")
+        .map(|_| "fixed_order_bf16_convolution_v1")
 }
 
 fn check_stage_compute(
@@ -1114,7 +1114,7 @@ impl Yue2Engine {
         }
         if let Some(policy) = cuda_bf16_vae_math_policy(self.vae_dtype, self.device.location()) {
             // This changes CUDA BF16 VAE output arithmetic. Keep it in identity_config so a
-            // cached waveform from the earlier handle policy cannot satisfy a new decode.
+            // cached waveform from the earlier GEMM policy cannot satisfy a new decode.
             config["vae_cuda_bf16_math_policy"] = json!(policy);
         }
         config
@@ -1521,7 +1521,7 @@ mod identity_tests {
     fn cuda_bf16_vae_math_policy_is_bound_to_result_identity_only_when_selected() {
         assert_eq!(
             cuda_bf16_vae_math_policy(DType::BF16, DeviceLocation::Cuda { gpu_id: 2 }),
-            Some("disallow_reduced_precision_reduction_v1")
+            Some("fixed_order_bf16_convolution_v1")
         );
         for location in [DeviceLocation::Cpu, DeviceLocation::Metal { gpu_id: 0 }] {
             assert_eq!(cuda_bf16_vae_math_policy(DType::BF16, location), None);

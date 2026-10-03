@@ -29,6 +29,8 @@
 //!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
+//! - [`yue2_stable_conv`] — YuE2 VAE BF16 convolution leaves with fixed-order FP32 accumulation
+//!   and BF16 operands/output across full and tiled decoder shapes.
 //!
 //! Device code is behind `cfg(feature = "cuda")`; a CPU or Metal build compiles the codec, the
 //! capability floors, the kernel descriptors and the fused primitives' input checks only.
@@ -42,6 +44,7 @@ pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
 pub mod nvrtc;
 pub mod sm120_gate;
+pub mod yue2_stable_conv;
 
 pub use cublaslt::{
     compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
@@ -78,14 +81,18 @@ pub use nvrtc::{device_compute_cap, CompiledKernel};
 pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource};
 
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
-/// primitives, the NVFP4 decode GEMV and the fused NVFP4 activation quantizer.
+/// primitives, the NVFP4 decode GEMV/activation quantizer, and YuE2 VAE convolutions.
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
 /// (sc-24164). A `KernelSource` added anywhere in the workspace without being listed in one of
 /// the two fails `candle-llm`'s `every_workspace_kernel_source_is_registered`.
-pub const NVRTC_SOURCES: &[KernelSource] =
-    &[FUSED_DECODE_SRC, NVFP4_GEMV_SRC, cublaslt::NVFP4_QUANT_SRC];
+pub const NVRTC_SOURCES: &[KernelSource] = &[
+    FUSED_DECODE_SRC,
+    NVFP4_GEMV_SRC,
+    cublaslt::NVFP4_QUANT_SRC,
+    yue2_stable_conv::YUE2_STABLE_CONV_SRC,
+];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 
 /// Poison-tolerant `Mutex` lock for the handle's overwrite-on-miss caches — the same recovery
