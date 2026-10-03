@@ -841,6 +841,14 @@ pub struct EngineOptions<'a, 'c> {
     pub constraint: Option<&'a mut (dyn RewindableConstraintMask + 'c)>,
     /// A caller stop predicate checked after each emitted token (request stop strings).
     pub should_stop: Option<&'a dyn Fn() -> bool>,
+    /// Whether the caller has delivered output to its consumer yet. A streaming caller can hold
+    /// the first emitted tokens back — a thinking marker the segmenter strips, a partial stop
+    /// string, a detokenizer's incomplete character — so its time to first token is that of the
+    /// first token it *delivers*, not the engine's token 0. Until this reports `true` (for at
+    /// most [`FIRST_DELIVERY_HOLD_STEPS`] tokens) the pipelined loop reads every token back
+    /// before it enqueues the next step, so the delivered token never waits behind a look-ahead
+    /// step's host-side build and dispatch (sc-24446). `None`: every emitted token is delivered.
+    pub delivered: Option<&'a dyn Fn() -> bool>,
     /// When set, the run is timed: the prefill phase starts at this instant and closes, after a
     /// device synchronization, once the prompt is prefilled and the proposer warmed.
     pub prefill_clock: Option<Instant>,
@@ -855,6 +863,13 @@ pub struct EngineOptions<'a, 'c> {
     /// explicit proposer, `off`, the default — runs the proposer to the end.
     pub speculative_mode: Speculative,
 }
+
+/// The most tokens the pipelined loop reads back unpipelined while the caller has delivered
+/// nothing ([`EngineOptions::delivered`]). Holding trades about one step's dispatch overlap per
+/// token for the first delivered token's latency, which a look-ahead enqueued ahead of its read
+/// raises by up to one step's host-side dispatch; past a few tokens the lost overlap outweighs it,
+/// and a run whose output stays held for long (a tool call buffered whole) is pipelined again.
+pub const FIRST_DELIVERY_HOLD_STEPS: usize = 8;
 
 /// Whether [`generate_speculative`] pipelines its token-at-a-time loop (story sc-24439).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -917,7 +932,9 @@ impl SpeculativeRun {
 /// The run's first token is read back and emitted before step 1 is built or enqueued, so its
 /// delivery waits for the prefill and its own draw only — never for step 1's graph build and
 /// dispatch, nor its forward (sc-24446). Pipelining starts at step 2 (enqueued before step 1 is
-/// read back).
+/// read back) — or, when the caller holds its first tokens back
+/// ([`EngineOptions::delivered`]), after the first token it delivers, so that token's read-back
+/// never waits behind a look-ahead's dispatch either.
 ///
 /// A **speculative** step (any proposer) is not pipelined, even one whose proposer found nothing
 /// to draft: the proposer must read the committed token on the host — the n-gram context, the MTP
@@ -962,6 +979,7 @@ where
     let EngineOptions {
         mut constraint,
         should_stop,
+        delivered,
         prefill_clock,
         sampler,
         pipelining,
@@ -1120,6 +1138,7 @@ where
             config,
             &mut *sampler,
             should_stop,
+            delivered,
             cancel,
             on_event,
         )?;
@@ -1419,6 +1438,7 @@ where
                     config,
                     &mut *sampler,
                     should_stop,
+                    delivered,
                     cancel,
                     on_event,
                 )?;
@@ -1525,8 +1545,10 @@ fn token_dispatches() -> u64 {
 /// device before step `t`'s id is read back, so the device computes the next step while the host
 /// commits this one. `pending` itself — and every token drawn without a look-ahead — is handed to
 /// the device first (sc-24446): otherwise its read-back, queued behind step `t + 1`, waits for
-/// that whole forward. The run's first token (an empty `generated`) is read back before step 1 is
-/// built at all, so its delivery never waits for step 1's host-side graph build and dispatch. The
+/// that whole forward. The run's first token (an empty `generated`) — and every token until the
+/// caller has delivered one (`delivered`, at most [`FIRST_DELIVERY_HOLD_STEPS`] of them) — is read
+/// back before the step after it is built at all, so the first delivered token never waits for a
+/// look-ahead's host-side graph build and dispatch. The
 /// look-ahead is never enqueued past the budget, and a
 /// look-ahead enqueued behind the token that ends the run is discarded unread and counted
 /// ([`SpeculativeStats::discarded`]). The caller has checked the draws are device-resident and
@@ -1542,6 +1564,7 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
     config: &GenerationConfig,
     sampler: &mut dyn TokenSampler,
     should_stop: Option<&dyn Fn() -> bool>,
+    delivered: Option<&dyn Fn() -> bool>,
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Result<FinishReason> {
@@ -1554,16 +1577,23 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
     if let SampledToken::Device(id) = &pending {
         dispatch_token(id)?;
     }
-    // The run's first token is read back and emitted before anything is enqueued behind it: step
-    // 1's graph build and dispatch are host time spent ahead of the read, and a timed prefill is
-    // already synchronized, so there is no device work for them to overlap — they would only add
-    // to the time to first token (sc-24446). Step 1 is then enqueued and dispatched as soon as
-    // token 0 is out, and every later step overlaps the read of the one before it.
-    let mut first_read = generated.is_empty();
+    // Until the caller has delivered its first token, every token is read back and emitted
+    // before anything is enqueued behind it: the look-ahead's graph build and dispatch are host
+    // time spent ahead of the read, and they would add to the time to the first *delivered*
+    // token (sc-24446) — the run's token 0, or a later one when the caller holds the first
+    // tokens back ([`EngineOptions::delivered`]; a thinking model's opening marker). The next
+    // step is then enqueued and dispatched as soon as the token is out, and once the caller has
+    // delivered (or after [`FIRST_DELIVERY_HOLD_STEPS`] held tokens) every step overlaps the
+    // read of the one before it.
+    let holding = |generated: &[i32]| {
+        generated.is_empty()
+            || (generated.len() < FIRST_DELIVERY_HOLD_STEPS
+                && delivered.is_some_and(|delivered| !delivered()))
+    };
     loop {
         // Enqueue step t + 1 on step t's unread token, then read step t back while the device
         // runs it. Never past the budget; a host draw is already read back, so it waits.
-        let ahead = if !std::mem::take(&mut first_read)
+        let ahead = if !holding(generated)
             && pending.is_device()
             && generated.len() + 1 < config.max_new_tokens
         {
@@ -4410,6 +4440,95 @@ pub(crate) mod tests {
                 assert_eq!(
                     run.output.tokens, off.output.tokens,
                     "{name} {pipelining:?}"
+                );
+            }
+        }
+    }
+
+    /// sc-24446 (pipelined TTFT behind held tokens): when the caller holds its first tokens back
+    /// ([`EngineOptions::delivered`] — Qwen3's opening `<think>` emits nothing), its first
+    /// *delivered* token is read back before the step after it is enqueued, as token 0 is; the
+    /// look-ahead resumes once the caller has delivered, or after [`FIRST_DELIVERY_HOLD_STEPS`]
+    /// held tokens. Greedy and seeded output is the unpipelined run's.
+    #[test]
+    fn the_first_delivered_token_is_read_before_a_look_ahead_is_enqueued() {
+        assert_eq!(
+            FIRST_DELIVERY_HOLD_STEPS, 8,
+            "the never-delivered row below assumes 8"
+        );
+        // (tokens the caller holds back before its first delivery, tokens delivered at each
+        // forward of a 12-token run). The prefill is forward 0.
+        let never = usize::MAX;
+        let cases: [(Option<usize>, Pipelining, Vec<usize>); 6] = [
+            (
+                None,
+                Pipelining::Auto,
+                vec![0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                Some(0),
+                Pipelining::Auto,
+                vec![0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                Some(1),
+                Pipelining::Auto,
+                vec![0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                Some(3),
+                Pipelining::Auto,
+                vec![0, 1, 2, 3, 4, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                Some(never),
+                Pipelining::Auto,
+                vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 9, 10],
+            ),
+            (
+                Some(1),
+                Pipelining::Off,
+                vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            ),
+        ];
+        for (name, config) in [("greedy", greedy(12)), ("top_p", top_p(12))] {
+            let model = causal();
+            let off = off_run(&model, &config, Pipelining::Off, None);
+            for (held, pipelining, expected) in &cases {
+                let emitted = std::cell::Cell::new(0usize);
+                let target = EmittedAtForward {
+                    inner: &model,
+                    emitted: &emitted,
+                    at: Default::default(),
+                };
+                let delivered = || held.is_some_and(|held| emitted.get() > held);
+                let run = generate_speculative(
+                    &target,
+                    &mut NoProposer,
+                    SpeculativePrompt::Tokens(&PROMPT),
+                    &config,
+                    0,
+                    &CancelFlag::new(),
+                    &mut |e| {
+                        if let StreamEvent::Token { .. } = e {
+                            emitted.set(emitted.get() + 1);
+                        }
+                    },
+                    EngineOptions {
+                        pipelining: *pipelining,
+                        delivered: held.map(|_| &delivered as &dyn Fn() -> bool),
+                        ..EngineOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    target.at.into_inner(),
+                    *expected,
+                    "{name} held {held:?} {pipelining:?}: tokens emitted at each forward"
+                );
+                assert_eq!(
+                    run.output.tokens, off.output.tokens,
+                    "{name} held {held:?} {pipelining:?}"
                 );
             }
         }

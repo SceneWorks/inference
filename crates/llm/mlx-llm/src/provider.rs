@@ -1996,6 +1996,20 @@ impl TextLlm for LlamaProvider {
         let tools_active = self.descriptor.capabilities.supports_tools && !req.tools.is_empty();
         let mut tool_seg = tools_active.then(|| ToolCallSegmenter::new(&req.tools));
 
+        // Whether the stream has delivered a token yet. The segmenter, the tool segmenter and the
+        // stop matcher can hold the first engine tokens back (a thinking model's opening marker
+        // emits nothing), so the engine keeps its look-ahead out of the way until the first
+        // delivered token is out — the time to first token never waits behind one (sc-24446).
+        let delivered_any = std::cell::Cell::new(false);
+        let mut tracked = |event: CoreEvent| {
+            if matches!(event, CoreEvent::Token { .. }) {
+                delivered_any.set(true);
+            }
+            on_event(event);
+        };
+        let on_event: &mut dyn FnMut(CoreEvent) = &mut tracked;
+        let delivered = || delivered_any.get();
+
         // Drive the internal loop; translate token-id events to contract text-delta events via
         // incremental detokenization (re-decode the running sequence, emit the new suffix). The
         // `IncrementalDetok` guard holds back lossy U+FFFD placeholders so a multi-byte character
@@ -2136,6 +2150,7 @@ impl TextLlm for LlamaProvider {
                                         .as_mut()
                                         .map(|m| m as &mut dyn RewindableConstraintMask),
                                     should_stop: should_stop_opt,
+                                    delivered: Some(&delivered),
                                     prefill_clock: clock,
                                     speculative_mode,
                                     ..EngineOptions::default()
@@ -2172,6 +2187,7 @@ impl TextLlm for LlamaProvider {
                                         .as_mut()
                                         .map(|m| m as &mut dyn RewindableConstraintMask),
                                     should_stop: should_stop_opt,
+                                    delivered: Some(&delivered),
                                     prefill_clock: clock,
                                     speculative_mode,
                                     ..EngineOptions::default()
@@ -2215,6 +2231,7 @@ impl TextLlm for LlamaProvider {
                                 .as_mut()
                                 .map(|m| m as &mut dyn RewindableConstraintMask),
                             should_stop: should_stop_opt,
+                            delivered: Some(&delivered),
                             prefill_clock: None,
                             speculative_mode,
                             ..EngineOptions::default()
@@ -2231,6 +2248,7 @@ impl TextLlm for LlamaProvider {
                             .as_mut()
                             .map(|m| m as &mut dyn RewindableConstraintMask),
                         should_stop: should_stop_opt,
+                        delivered: Some(&delivered),
                         prefill_clock: Some(Instant::now()),
                         speculative_mode,
                         ..EngineOptions::default()

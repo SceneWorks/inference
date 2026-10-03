@@ -169,8 +169,10 @@ pub const MLX: DecodeDefaults = DecodeDefaults {
     // look-ahead step is enqueued on the unread device token; E1 parity suite) and it hides the
     // per-token read-back. MEASURED (mlx-final-compare.md, mlx-campaign-6, Qwen3-8B): no decode
     // regression on vs off (40 judged: 20 pass, 19 inconclusive); the one flagged cell, a TTFT
-    // (chat +37.7%, band ±35.2%), was token 0 waiting behind step 1's build, which the loop now
-    // delivers first (sc-24446). Runtime switch `MLX_LLM_PIPELINING`.
+    // (chat +37.7%, band ±35.2%), was the first *delivered* token (Qwen3's token 1, behind a
+    // `<think>` that streams nothing) read back behind the look-ahead step's dispatch; the loop now
+    // reads tokens back unpipelined until the caller has delivered one (sc-24446). Runtime switch
+    // `MLX_LLM_PIPELINING`.
     pipelining: true,
     // justification: on (sc-24439) — greedy is the device argmax (bit-identical); stochastic draws
     // keep the target distribution (same weights rule as the host reference). Runtime switch
