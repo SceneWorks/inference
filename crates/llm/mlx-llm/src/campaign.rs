@@ -976,35 +976,6 @@ fn dense_kv_width_refusal(observed: u64) -> String {
 /// pre-spawn refusal (a row whose floor already exceeds the child cap cannot fit) and the
 /// estimate recorded in the receipt. Admission itself is runtime-guarded: see
 /// [`runtime_guarded_admission`].
-/// One dense K/V history of `total_live_tokens` for the pinned `spec` (the KV term of
-/// [`static_role_footprint_budget`]).
-fn static_role_dense_kv_bytes(
-    spec: &BenchmarkModelSpec,
-    snapshot: &Path,
-    total_live_tokens: u64,
-) -> Result<u64, String> {
-    let config: serde_json::Value =
-        serde_json::from_slice(&fs::read(snapshot.join("config.json")).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    let positive = |key: &str| {
-        config
-            .get(key)
-            .and_then(serde_json::Value::as_u64)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| format!("pinned model lacks positive {key} for footprint preflight"))
-    };
-    let layers = positive("num_hidden_layers")?;
-    let element_bytes = pinned_dense_kv_element_bytes(spec, snapshot, layers)?;
-    dense_kv_bytes(
-        1,
-        layers,
-        positive("num_key_value_heads")?,
-        total_live_tokens,
-        positive("head_dim")?,
-        element_bytes,
-    )
-}
-
 pub(crate) fn static_role_footprint_budget(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
@@ -1160,29 +1131,35 @@ fn static_row_requirements(
     Ok((total, max_request, known_footprint_budget))
 }
 
-/// The static footprint of one noise-floor worker: the one-shot dense session budget plus a
-/// second dense K/V history, because the dense multi-turn control holds turn 1's prefix in the
-/// prompt store while turn 2 grows its own copy out of it (the product cache-hit path A2 measures).
+/// The live tokens one noise-floor worker holds at its peak: the live-token bound of a compressed
+/// row's same-weights dense reference arm, which runs exactly nf's passes (the kernel forced
+/// continuation to 1024 tokens or the window, and the multi-turn fixture whose stored turn 1 sits
+/// beside turn 2's request cache through a 1024-token forced turn-2 continuation). That bound
+/// already counts the stored prefix beside the request, so nothing is stacked on it.
+fn noise_floor_live_tokens(
+    snapshot: &Path,
+    spec: &BenchmarkModelSpec,
+    coordinate: &Coordinate,
+    prompt: &str,
+) -> Result<(u64, u64), String> {
+    preflight_total_live_tokens(snapshot, spec, coordinate, prompt, true)
+}
+
+/// The static footprint of one noise-floor worker: one dense candidate session over
+/// [`noise_floor_live_tokens`]: model load, that live K/V, the prefill tile and activations.
 fn noise_floor_footprint_budget(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
     total_live_tokens: u64,
     request_tokens: u64,
 ) -> Result<u64, String> {
-    static_role_footprint_budget(spec, snapshot, total_live_tokens, request_tokens)?
-        .checked_add(static_role_dense_kv_bytes(
-            spec,
-            snapshot,
-            total_live_tokens,
-        )?)
-        .ok_or_else(|| "noise-floor footprint budget overflows".into())
+    static_role_footprint_budget(spec, snapshot, total_live_tokens, request_tokens)
 }
 
 /// The requirements of one noise-floor row: what its worker actually holds, one dense session of
-/// the candidate at a time (never the bf16 reference, which it does not load) over the row's live
-/// tokens. The chunked-prefill control's cache is sized once ([`crate::provider`]); the one-shot
-/// dense budget of [`static_role_footprint_budget`] plus one more dense K/V history (the
-/// multi-turn control's stored turn 1 beside its turn-2 cache) prices every pass of the row.
+/// the candidate at a time (never the bf16 reference, which it does not load) over
+/// [`noise_floor_live_tokens`]. The chunked-prefill control's cache is sized once
+/// ([`crate::provider`]), so that one-session budget prices every pass of the row.
 fn noise_floor_row_requirements(
     coordinate: &Coordinate,
     snapshot: &Path,
@@ -1190,8 +1167,7 @@ fn noise_floor_row_requirements(
     policy: &CampaignSafetyPolicy,
 ) -> Result<(u64, u64, u64), String> {
     let spec = benchmark_model(coordinate.family, false)?;
-    let (total, max_request) =
-        preflight_total_live_tokens(snapshot, spec, coordinate, prompt, false)?;
+    let (total, max_request) = noise_floor_live_tokens(snapshot, spec, coordinate, prompt)?;
     if max_request > policy.max_request_tokens || total > policy.max_context_tokens {
         return Err(format!(
             "{} requires request ceiling {max_request} and total-live ceiling {total}; policy refuses before model load",
@@ -7950,7 +7926,22 @@ fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let logs = resume_dir.join("logs");
     fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
-    let coordinates = required_coordinates();
+    // `--only-coordinate`: one scheduled row (kv-poc `nf_only_coordinate`); else all eight.
+    let only_coordinate = optional_flag(args, "--only-coordinate")?;
+    let coordinates = required_coordinates()
+        .into_iter()
+        .filter(|coordinate| {
+            only_coordinate
+                .as_deref()
+                .is_none_or(|only| coordinate_slug(coordinate) == only)
+        })
+        .collect::<Vec<_>>();
+    if coordinates.is_empty() {
+        return Err(format!(
+            "--only-coordinate {:?} is not a scheduled coordinate",
+            only_coordinate.unwrap_or_default()
+        ));
+    }
     let mut rows = Vec::with_capacity(coordinates.len());
     for (index, coordinate) in coordinates.iter().enumerate() {
         let slug = coordinate_slug(coordinate);
@@ -8056,7 +8047,8 @@ fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
         let _ = fs::remove_file(&staged);
         rows.push(value);
     }
-    let summary = noise_floor_summary(&rows)?;
+    let mut summary = noise_floor_summary(&rows)?;
+    summary["onlyCoordinate"] = only_coordinate.into();
     let (bytes, sha256) = seal_json(&summary)?;
     fs::write(resume_dir.join("summary.json"), &bytes).map_err(|e| e.to_string())?;
     fs::write(
@@ -10304,6 +10296,18 @@ fn measure_product_dispatch<T>(
     let value = dispatch(observer)?;
     let wall_ms = dispatch_started.elapsed().as_secs_f64() * 1_000.0;
     let sampling_after_ms = observer.sampling_elapsed_ms();
+    let product_ms = sampling_adjusted_product(wall_ms, sampling_before_ms, sampling_after_ms)?;
+    Ok((value, product_ms))
+}
+
+/// The clock-free arithmetic of [`measure_product_dispatch`]: the dispatch's wall time less the
+/// observer sampling recorded across it, refused when any input or the result is not a positive,
+/// finite duration.
+fn sampling_adjusted_product(
+    wall_ms: f64,
+    sampling_before_ms: f64,
+    sampling_after_ms: f64,
+) -> core_llm::Result<f64> {
     let sampled_ms = sampling_after_ms - sampling_before_ms;
     let product_ms = wall_ms - sampled_ms;
     if !wall_ms.is_finite()
@@ -10317,7 +10321,7 @@ fn measure_product_dispatch<T>(
             "invalid sampling-adjusted product duration: wall={wall_ms:.6}ms sampled={sampled_ms:.6}ms product={product_ms:.6}ms"
         )));
     }
-    Ok((value, product_ms))
+    Ok(product_ms)
 }
 
 /// Execute the exact requested coordinate while a product observer is attached.  Quality fixtures
@@ -13910,10 +13914,36 @@ pub(crate) mod tests {
         let summary: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(summary["kind"], NOISE_FLOOR_SUMMARY_KIND);
         assert_eq!(summary["rows"], slugs.len());
+        assert!(summary["onlyCoordinate"].is_null());
         // A published destination is never overwritten.
         assert!(sc20671_cli(&args(&[]))
             .unwrap_err()
             .contains("must be absent"));
+        // `--only-coordinate` (kv-poc nf_only_coordinate) runs and publishes that one row.
+        fs::create_dir_all(&resume).unwrap();
+        seal_row(&slugs[3]);
+        let with_out = |extra: &[&str], out: &Path| {
+            let mut argv = args(extra);
+            let position = argv.iter().position(|arg| arg == "--out").unwrap();
+            argv[position + 1] = out.to_str().unwrap().into();
+            argv
+        };
+        let only_out = root.path().join("only");
+        assert_eq!(
+            sc20671_cli(&with_out(&["--only-coordinate", &slugs[3]], &only_out)).unwrap(),
+            CampaignOutcome::Completed
+        );
+        let only_summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(only_out.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(only_summary["rows"], 1);
+        assert_eq!(only_summary["onlyCoordinate"], slugs[3].as_str());
+        fs::create_dir_all(&resume).unwrap();
+        assert!(sc20671_cli(&with_out(
+            &["--only-coordinate", "llama-unknown"],
+            &root.path().join("unknown")
+        ))
+        .unwrap_err()
+        .contains("not a scheduled coordinate"));
     }
 
     /// Byte-exact inference copy of SceneWorks `config/kv-baseline-quality-contract.json`: its
@@ -14270,22 +14300,32 @@ pub(crate) mod tests {
 
     #[test]
     fn compile_dispatch_excludes_slow_observer_sampling_callbacks() {
+        // Clock-free: the arithmetic is exact on injected durations, so a loaded runner's sleep
+        // overshoot cannot move it.
+        assert_eq!(sampling_adjusted_product(100.0, 5.0, 35.0).unwrap(), 70.0);
+        assert_eq!(sampling_adjusted_product(4.0, 7.0, 7.0).unwrap(), 4.0);
+        // Sampling that consumed the whole dispatch leaves no product time to report.
+        assert!(sampling_adjusted_product(30.0, 0.0, 30.0).is_err());
+        assert!(sampling_adjusted_product(30.0, 10.0, 5.0).is_err());
+        assert!(sampling_adjusted_product(f64::NAN, 0.0, 1.0).is_err());
+
+        // The wrapper charges the observer's in-dispatch sampling against the dispatch: an
+        // injected interval no test run can reach makes the product duration non-positive, so
+        // only a wrapper that failed to subtract it could return a duration.
         let mut observer = ProductObserver::new();
-        let wall_started = std::time::Instant::now();
-        let (_, product_ms) = measure_product_dispatch(&mut observer, |observer| {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            let sampling_started = std::time::Instant::now();
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            observer.sampling_elapsed_ms += sampling_started.elapsed().as_secs_f64() * 1_000.0;
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        let excluded = measure_product_dispatch(&mut observer, |observer| {
+            observer.sampling_elapsed_ms += 1.0e12;
+            Ok(())
+        });
+        assert!(excluded.is_err(), "{excluded:?}");
+        // Sampling recorded before the dispatch is not charged to it: the 1e12 ms already on the
+        // observer would leave no product time, so a wrapper that charged it would refuse here.
+        // (The sleep only guarantees a non-zero wall reading; nothing races it.)
+        measure_product_dispatch(&mut observer, |_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
             Ok(())
         })
-        .unwrap();
-        let wall_ms = wall_started.elapsed().as_secs_f64() * 1_000.0;
-        assert!(observer.sampling_elapsed_ms >= 25.0);
-        assert!(product_ms > 0.0);
-        assert!(product_ms < observer.sampling_elapsed_ms);
-        assert!((product_ms + observer.sampling_elapsed_ms - wall_ms).abs() < 10.0);
+        .expect("prior sampling must not be charged to this dispatch");
     }
 
     #[test]
@@ -15126,21 +15166,62 @@ pub(crate) mod tests {
         assert!(activations > 11 << 30, "{activations}");
     }
 
-    /// The noise floor's worker estimate prices what it holds: the one-shot dense session plus the
-    /// multi-turn control's second dense K/V history (stored turn 1 beside turn 2's cache).
+    /// Run 37055710213: the noise floor's worker estimate prices what it holds, once. Its live
+    /// tokens are a compressed row's dense reference arm's (forced 1024-token kernel and turn-2
+    /// continuations), whose bound already counts stored turn 1 beside turn 2's cache, so the
+    /// budget is one dense session over them — never a second K/V history stacked on top (that
+    /// double count refused llama fit-boundary at 76.8 GB against the 68 GiB cap).
     #[test]
-    fn noise_floor_footprint_prices_the_multi_turn_second_history() {
+    fn noise_floor_estimate_prices_one_session_over_its_forced_passes() {
         let temporary = tempfile::tempdir().unwrap();
         let candidate = temporary.path().join("candidate");
         write_stub_dtype_snapshot(&candidate, &LLAMA_CANDIDATE, "BF16");
-        let (total, request) = (131_072_u64, 130_593_u64);
-        let one_shot =
-            static_role_footprint_budget(&LLAMA_CANDIDATE, &candidate, total, request).unwrap();
-        // 28 layers x K/V x 8 heads x 128 x BF16.
-        let kv = total * 28 * 2 * 8 * 128 * 2;
+        let (total, request) = (261_483_u64, 130_741_u64);
         assert_eq!(
             noise_floor_footprint_budget(&LLAMA_CANDIDATE, &candidate, total, request).unwrap(),
-            one_shot + kv
+            static_role_footprint_budget(&LLAMA_CANDIDATE, &candidate, total, request).unwrap()
+        );
+        // Live tokens: nf's forced turn-2 continuation (1024 tokens) is priced, not a dense
+        // row's 64-token natural answer.
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = serde_json::json!({
+            "version": "1.0", "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" }, "post_processor": null, "decoder": null,
+            "model": { "type": "WordLevel", "vocab": { "<unk>": 0, "context": 1 },
+                       "unk_token": "<unk>" },
+        });
+        fs::write(dir.path().join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let spec = BenchmarkModelSpec {
+            family: "llama",
+            role: "candidate",
+            repository: "test/tiny",
+            revision: "0",
+            architecture: "LlamaForCausalLM",
+            model_type: "llama",
+            native_context_tokens: 4096,
+            quantized: true,
+            required_files: &[],
+        };
+        let coordinate = Coordinate {
+            family: "llama",
+            context_band: "short",
+            request_mode: "single",
+            prefill_mode: "single-shot",
+            process_temperature: "cold",
+        };
+        let noise_floor =
+            noise_floor_live_tokens(dir.path(), &spec, &coordinate, "baseline prompt").unwrap();
+        let dense_row =
+            preflight_total_live_tokens(dir.path(), &spec, &coordinate, "baseline prompt", false)
+                .unwrap();
+        assert!(
+            noise_floor.0 > dense_row.0,
+            "{noise_floor:?} <= {dense_row:?}"
+        );
+        assert_eq!(
+            noise_floor,
+            preflight_total_live_tokens(dir.path(), &spec, &coordinate, "baseline prompt", true)
+                .unwrap()
         );
     }
 

@@ -72,7 +72,10 @@ select_value() { # <value>: RESUME, OUT and LABEL of that invocation
       RESUME="$R/sc20671-compressed-$V$ONLY-resume"; OUT="$R/evidence/sc20671-compressed-$V$ONLY"
       LABEL="a2 --kv-method $V${KV_A2_ONLY_COORDINATE:+ --only-coordinate $KV_A2_ONLY_COORDINATE (PARTIAL)}" ;;
     b) RESUME=""; OUT="" ;;
-    nf) RESUME="$R/sc20669-noise-floor-resume"; OUT="$R/evidence/sc20669-noise-floor" ;;
+    nf)
+      ONLY="${KV_NF_ONLY_COORDINATE:+-only-$KV_NF_ONLY_COORDINATE}"
+      RESUME="$R/sc20669-noise-floor$ONLY-resume"; OUT="$R/evidence/sc20669-noise-floor$ONLY"
+      LABEL="nf${KV_NF_ONLY_COORDINATE:+ --only-coordinate $KV_NF_ONLY_COORDINATE}" ;;
     c) RESUME="$R/sc20684-resume"; OUT="$R/evidence/sc20684-krea" ;;
     d) RESUME="$R/sc20686-mlx-resume"; OUT="$R/evidence/sc20686-mlx" ;;
     d-control) RESUME="$R/sc20686-mlx-control-resume"; OUT="$R/evidence/sc20686-mlx-control" ;;
@@ -327,7 +330,10 @@ for v in $values; do
     nf)
       # The A1/A2 snapshot, prompt and policy arguments: each row's worker loads one dense session
       # of the 4-bit candidate and is admitted on that session's estimate (bf16 flags unused).
+      NF_ONLY_ARGS=()
+      [ -z "${KV_NF_ONLY_COORDINATE:-}" ] || NF_ONLY_ARGS=(--only-coordinate "$KV_NF_ONLY_COORDINATE")
       run_cmd "$F/sc20671_kv_baseline" noise-floor-parent "${LLM_ARGS[@]}" \
+        ${NF_ONLY_ARGS[@]+"${NF_ONLY_ARGS[@]}"} \
         --stop-file "$CTL/stop-requested" --resume-dir "$RESUME" --out "$OUT" || rc=$?
       ;;
     b)
