@@ -18,6 +18,7 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 #     one-shot repeat and a chunked-prefill recomputation of itself with the compressed rows' own
 #     metrics (teacher-forced agreement, stream-scored perplexity delta), one guarded worker per
 #     row under llm.json; per-row JSON + sealed summary.json in evidence/sc20669-noise-floor.
+#     nf_only_coordinate (run json or dispatch input) runs one row into its own -only-<name> dirs.
 #   W2 (mode=w2), the media campaigns (docs/architecture/SC_20684_*.md, SC_20686_*.md):
 #     C  SC-20684 Krea Realtime six-cell (T2V/I2V/V2V x Q8/Q4 KV) -> D SC-20686 Metal matrix (18
 #     coordinates incl. the A14B Lightning default, normal + cancel arms) -> D-control (the same
@@ -121,6 +122,10 @@ on:
         description: "Empty = all eight A2 rows. One SC-20671 coordinate (e.g. llama-memory-material-single-single-shot-warm) = that row only, published as a PARTIAL non-publishable run in its own dirs"
         type: string
         default: ""
+      nf_only_coordinate:
+        description: "Empty = all eight nf rows. One SC-20671 coordinate = that row's dense noise floor only, in its own -only-<name> dirs"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -151,6 +156,7 @@ jobs:
       a3_bits: ${{ steps.resolve.outputs.a3_bits }}
       a2_methods: ${{ steps.resolve.outputs.a2_methods }}
       a2_only_coordinate: ${{ steps.resolve.outputs.a2_only_coordinate }}
+      nf_only_coordinate: ${{ steps.resolve.outputs.nf_only_coordinate }}
       runs_on: ${{ steps.resolve.outputs.runs_on }}
       runner_name: ${{ steps.resolve.outputs.runner_name }}
     steps:
@@ -172,6 +178,7 @@ jobs:
           DISPATCH_A3_BITS: ${{ inputs.a3_bits }}
           DISPATCH_A2_METHODS: ${{ inputs.a2_methods }}
           DISPATCH_A2_ONLY_COORDINATE: ${{ inputs.a2_only_coordinate }}
+          DISPATCH_NF_ONLY_COORDINATE: ${{ inputs.nf_only_coordinate }}
         run: bash .github/kv-poc/config.sh
 
   probe:
@@ -391,6 +398,7 @@ jobs:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_NF_ONLY_COORDINATE: ${{ needs.config.outputs.nf_only_coordinate }}
       KV_SOFT_BUDGET_MIN: "120"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

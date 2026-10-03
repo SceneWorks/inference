@@ -13,6 +13,8 @@
 # a2_only_coordinate (optional, default ""): run A2 as `--only-coordinate <name>`, one of the eight
 # scheduled SC-20671 coordinates. The run publishes a partial, non-publishable manifest (never a
 # campaign) into its own `-only-<name>` resume + evidence dirs, so it never touches a full A2.
+# nf_only_coordinate (optional, default ""): run the nf dense noise floor as `--only-coordinate
+# <name>` (one scheduled SC-20671 coordinate) into its own `-only-<name>` dirs.
 # Either way every value is validated here, so a typo fails in seconds on a hosted runner instead
 # of queueing a self-hosted job on a label no runner carries (which waits silently forever).
 set -euo pipefail
@@ -30,6 +32,7 @@ if [ "$EVENT_NAME" = "push" ]; then
   a3_bits="$(read_key a3_bits 2)"
   a2_methods="$(read_key a2_methods group-affine)"
   a2_only_coordinate="$(read_key a2_only_coordinate "")"
+  nf_only_coordinate="$(read_key nf_only_coordinate "")"
   source_desc="$file @ ${GITHUB_SHA}"
 else
   mode="$DISPATCH_MODE"
@@ -41,6 +44,7 @@ else
   a3_bits="${DISPATCH_A3_BITS:-2}"
   a2_methods="${DISPATCH_A2_METHODS:-group-affine}"
   a2_only_coordinate="${DISPATCH_A2_ONLY_COORDINATE:-}"
+  nf_only_coordinate="${DISPATCH_NF_ONLY_COORDINATE:-}"
   source_desc="workflow_dispatch inputs"
 fi
 
@@ -110,14 +114,19 @@ value_list() { # <key> <list> <allowed values...>; sets $listed to the canonical
 value_list a3_bits "$a3_bits" 2 4 8; a3_bits="$listed"
 value_list a2_methods "$a2_methods" group-affine group-affine-4 group-affine-8; a2_methods="$listed"
 # The frozen SC-20671 schedule (campaign.rs required_coordinates); sc20671 refuses any other name.
-a2_only_coordinate="${a2_only_coordinate// /}"
-case " $a2_only_coordinate " in
-  "  "|" llama-short-single-chunked-cold "|" llama-medium-supported-batch-single-shot-warm "\
-  |" llama-memory-material-single-single-shot-warm "|" llama-fit-boundary-single-chunked-cold "\
-  |" qwen-short-single-single-shot-cold "|" qwen-medium-supported-batch-chunked-warm "\
-  |" qwen-memory-material-single-single-shot-warm "|" qwen-fit-boundary-single-chunked-cold ") ;;
-  *) fail "a2_only_coordinate must be empty or one scheduled SC-20671 coordinate, got '$a2_only_coordinate'" ;;
-esac
+only_coordinate() { # <key> <value>: empty or one scheduled coordinate; sets $listed
+  local value="${2// /}"
+  case " $value " in
+    "  "|" llama-short-single-chunked-cold "|" llama-medium-supported-batch-single-shot-warm "\
+    |" llama-memory-material-single-single-shot-warm "|" llama-fit-boundary-single-chunked-cold "\
+    |" qwen-short-single-single-shot-cold "|" qwen-medium-supported-batch-chunked-warm "\
+    |" qwen-memory-material-single-single-shot-warm "|" qwen-fit-boundary-single-chunked-cold ") ;;
+    *) fail "$1 must be empty or one scheduled SC-20671 coordinate, got '$value'" ;;
+  esac
+  listed="$value"
+}
+only_coordinate a2_only_coordinate "$a2_only_coordinate"; a2_only_coordinate="$listed"
+only_coordinate nf_only_coordinate "$nf_only_coordinate"; nf_only_coordinate="$listed"
 
 runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l | split(" "))')"
 {
@@ -131,6 +140,7 @@ runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l 
   echo "a3_bits=$a3_bits"
   echo "a2_methods=$a2_methods"
   echo "a2_only_coordinate=$a2_only_coordinate"
+  echo "nf_only_coordinate=$nf_only_coordinate"
   echo "runs_on=$runs_on"
   echo "runner_name=$runner_name"
 } >> "$GITHUB_OUTPUT"
@@ -150,5 +160,6 @@ runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l 
   echo "| A3 --kv-bits | \`$a3_bits\` |"
   echo "| A2 --kv-method | \`$a2_methods\` |"
   echo "| A2 --only-coordinate | ${a2_only_coordinate:+\`$a2_only_coordinate\` (PARTIAL, non-publishable)}${a2_only_coordinate:-all eight rows} |"
+  echo "| NF --only-coordinate | ${nf_only_coordinate:+\`$nf_only_coordinate\`}${nf_only_coordinate:-all eight rows} |"
 } >> "$GITHUB_STEP_SUMMARY"
 cat "$GITHUB_STEP_SUMMARY"

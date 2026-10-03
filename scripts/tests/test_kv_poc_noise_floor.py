@@ -20,7 +20,7 @@ KV_POC = ROOT / ".github" / "kv-poc"
 WORKFLOW = ROOT / ".github" / "workflows" / "kv-poc-campaign.yml"
 
 
-def run_config(phases: str) -> tuple[int, dict[str, str], str]:
+def run_config(phases: str, **extra: str) -> tuple[int, dict[str, str], str]:
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp) / "output"
         summary = Path(tmp) / "summary"
@@ -35,6 +35,7 @@ def run_config(phases: str) -> tuple[int, dict[str, str], str]:
             "DISPATCH_BASELINE_EVIDENCE_REF": "",
             "GITHUB_OUTPUT": str(output),
             "GITHUB_STEP_SUMMARY": str(summary),
+            **extra,
         }
         done = subprocess.run(
             ["bash", str(KV_POC / "config.sh")],
@@ -75,12 +76,34 @@ class NoiseFloorPhaseTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("unknown phase 'noise'", log)
 
+    def test_nf_only_coordinate_selects_one_scheduled_row(self):
+        row = "llama-fit-boundary-single-chunked-cold"
+        code, values, log = run_config("nf", DISPATCH_NF_ONLY_COORDINATE=row)
+        self.assertEqual(code, 0, log)
+        self.assertEqual(values["nf_only_coordinate"], row)
+        code, values, log = run_config("nf")
+        self.assertEqual(code, 0, log)
+        self.assertEqual(values["nf_only_coordinate"], "")
+        code, _, log = run_config("nf", DISPATCH_NF_ONLY_COORDINATE="llama-unknown")
+        self.assertNotEqual(code, 0)
+        self.assertIn("nf_only_coordinate must be empty or one scheduled SC-20671 coordinate", log)
+        config = (KV_POC / "config.sh").read_text(encoding="utf-8")
+        self.assertIn('nf_only_coordinate="$(read_key nf_only_coordinate "")"', config, "the run json carries it")
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        self.assertIn("nf_only_coordinate", workflow[True]["workflow_dispatch"]["inputs"])
+        self.assertEqual(workflow["jobs"]["config"]["outputs"]["nf_only_coordinate"],
+                         "${{ steps.resolve.outputs.nf_only_coordinate }}")
+        resolve = next(step for step in workflow["jobs"]["config"]["steps"] if step.get("id") == "resolve")
+        self.assertEqual(resolve["env"]["DISPATCH_NF_ONLY_COORDINATE"], "${{ inputs.nf_only_coordinate }}")
+        self.assertEqual(workflow["jobs"]["nf"]["env"]["KV_NF_ONLY_COORDINATE"],
+                         "${{ needs.config.outputs.nf_only_coordinate }}")
+
     def test_phase_script_launches_the_guarded_noise_floor_parent(self):
         phase = (KV_POC / "phase.sh").read_text(encoding="utf-8")
         self.assertIn('a1|b|nf|c|d|d-control) values="-"', phase)
-        self.assertIn('nf) RESUME="$R/sc20669-noise-floor-resume"; OUT="$R/evidence/sc20669-noise-floor"', phase)
+        self.assertIn('RESUME="$R/sc20669-noise-floor$ONLY-resume"; OUT="$R/evidence/sc20669-noise-floor$ONLY"', phase)
         self.assertIn('a1|a2|a3|nf) phase_policy="$F/policies/llm.json"', phase)
-        launch = phase[phase.index("    nf)\n"):]
+        launch = phase[phase.rindex("    nf)\n", 0, phase.index("\"$F/sc20671_kv_baseline\" noise-floor-parent")):]
         launch = launch[: launch.index(";;")]
         for argument in (
             '"$F/sc20671_kv_baseline" noise-floor-parent "${LLM_ARGS[@]}"',
@@ -101,7 +124,7 @@ class NoiseFloorPhaseTests(unittest.TestCase):
         ]
         phase = (KV_POC / "phase.sh").read_text(encoding="utf-8")
         llm_args = next(line for line in phase.splitlines() if line.startswith("LLM_ARGS_TEXT="))
-        launch = phase[phase.index("    nf)\n"):]
+        launch = phase[phase.rindex("    nf)\n", 0, phase.index("\"$F/sc20671_kv_baseline\" noise-floor-parent")):]
         launch = launch[: launch.index(";;")]
         launch = "\n".join(line for line in launch.splitlines()[1:] if not line.strip().startswith("#"))
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,12 +150,21 @@ class NoiseFloorPhaseTests(unittest.TestCase):
                 "KV_POC_HF_HUB": str(hub),
                 "KV_EXPECTED_RUNNER": "",
             }
+            row = "llama-fit-boundary-single-chunked-cold"
+            only = subprocess.run(
+                ["bash", "-c", script], env={**env, "KV_NF_ONLY_COORDINATE": row},
+                capture_output=True, text=True, encoding="utf-8", check=False,
+            )
+            self.assertEqual(only.returncode, 0, only.stderr)
+            only_argv = only.stdout.splitlines()
+            self.assertEqual(only_argv[only_argv.index("--only-coordinate") + 1], row)
             done = subprocess.run(
                 ["bash", "-c", script], env=env, capture_output=True, text=True,
                 encoding="utf-8", check=False,
             )
             self.assertEqual(done.returncode, 0, done.stderr)
             argv = done.stdout.splitlines()
+            self.assertNotIn("--only-coordinate", argv, "all eight rows by default")
             self.assertEqual(argv[1], "noise-floor-parent")
             flags = dict(zip(argv[2::2], argv[3::2]))
             expected = {

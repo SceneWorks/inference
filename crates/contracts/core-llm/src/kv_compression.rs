@@ -365,6 +365,132 @@ impl KvCacheReport {
     pub fn ran_compressed(&self) -> bool {
         self.format.is_some() && self.fallback.is_none()
     }
+
+    /// The report of one single-sequence generation on a provider whose model has no table family
+    /// (a multimodal-wrapped or other non-table decoder, on any backend): the [`plan_kv_cache`]
+    /// decision for `family: None` — [`KvCacheFallbackReason::PolicyDisabled`] when the request
+    /// did not opt in, else [`KvCacheFallbackReason::UnqualifiedModel`].
+    pub fn without_table_family(policy: KvCompressionPolicy) -> Self {
+        plan_kv_cache_without_reader(
+            KvCacheRequest {
+                policy,
+                family: None,
+                batch: 1,
+                ..KvCacheRequest::default()
+            },
+            "this provider",
+        )
+    }
+}
+
+/// The table family of a loaded decoder (sc-20683), shared by every backend so the same checkpoint
+/// names the same family on MLX and Candle.
+///
+/// `decoder` is the backend's decoder-dispatch tag (`Architecture::family()` in both engines:
+/// `"llama"`, `"qwen3"`, `"qwen3_5"`, …); `architecture` and `model_type` are the loaded
+/// checkpoint config's `architectures[0]` and `model_type`. The Qwen3 dispatch is the family
+/// itself. The Llama dispatch also serves Mistral and dense Qwen2, so a Llama-dispatched
+/// checkpoint is the Llama family only when its config names llama. Every other dispatch (hybrid,
+/// multimodal-wrapped, other architectures) has no family, and neither has a decoder assembled
+/// without a config (a backend's `from_parts`), which cannot tell Llama from Mistral.
+pub fn kv_model_family(
+    decoder: &str,
+    architecture: &str,
+    model_type: &str,
+) -> Option<KvModelFamily> {
+    match decoder {
+        "qwen3" => Some(KvModelFamily::Qwen3),
+        "llama" => (architecture.to_ascii_lowercase().contains("llama")
+            || model_type.eq_ignore_ascii_case("llama"))
+        .then_some(KvModelFamily::Llama),
+        _ => None,
+    }
+}
+
+/// What a backend knows about one generation when it decides its KV cache (sc-20683).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KvCacheRequest {
+    /// The request's opt-in.
+    pub policy: KvCompressionPolicy,
+    /// The loaded model's table family ([`kv_model_family`]).
+    pub family: Option<KvModelFamily>,
+    /// Tokens prefilled before decoding starts.
+    pub context_tokens: u64,
+    /// The most tokens the request may generate after them (the final context is the sum).
+    pub max_new_tokens: u64,
+    /// Sequences decoding together.
+    pub batch: u64,
+    /// Why this request takes a path the compressed cache is not wired through (multimodal
+    /// prefill, a hybrid recurrent decoder), reported as
+    /// [`KvCacheFallbackReason::UnsupportedRequest`]; `None` for a plain causal text decode.
+    pub unsupported_request: Option<String>,
+}
+
+/// The KV cache a backend decided for one generation with [`plan_kv_cache`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KvCachePlan<R> {
+    /// Run compressed on the qualifying row's format, read by the backend's `reader`.
+    Compressed {
+        /// The qualifying row.
+        qualification: &'static KvQualification,
+        /// The backend's fused compressed-domain reader.
+        reader: R,
+    },
+    /// Run dense; the report (and its reason) the output carries.
+    Dense(KvCacheReport),
+}
+
+/// Decide one generation's KV cache in the fixed order every backend shares: the qualification
+/// table ([`qualify_kv_compression`]: policy, batch, family, prompt minimum, final-context
+/// maximum), then the request shape
+/// ([`KvCacheRequest::unsupported_request`]), then the backend's own `reader` stage — which refuses
+/// with its reason ([`KvCacheFallbackReason::UnsupportedGeometry`] or
+/// [`KvCacheFallbackReason::ReaderUnavailable`]) and detail, or hands back the reader that serves the
+/// qualifying row. The reader stage runs only for a request every earlier stage admits.
+pub fn plan_kv_cache<R>(
+    request: KvCacheRequest,
+    reader: impl FnOnce(&'static KvQualification) -> Result<R, (KvCacheFallbackReason, String)>,
+) -> KvCachePlan<R> {
+    let qualification = match qualify_kv_compression(
+        request.policy,
+        request.family,
+        request.context_tokens,
+        request.max_new_tokens,
+        request.batch,
+    ) {
+        Ok(row) => row,
+        Err(reason) => return KvCachePlan::Dense(KvCacheReport::dense(reason, None)),
+    };
+    if let Some(detail) = request.unsupported_request {
+        return KvCachePlan::Dense(KvCacheReport::dense(
+            KvCacheFallbackReason::UnsupportedRequest,
+            Some(detail),
+        ));
+    }
+    match reader(qualification) {
+        Ok(reader) => KvCachePlan::Compressed {
+            qualification,
+            reader,
+        },
+        Err((reason, detail)) => KvCachePlan::Dense(KvCacheReport::dense(reason, Some(detail))),
+    }
+}
+
+/// [`plan_kv_cache`] for a backend with no fused compressed-domain reader (Candle, on every
+/// device): the same decision, except that a request the table and request shape admit — one a
+/// reader-backed backend would run compressed — runs dense as
+/// [`KvCacheFallbackReason::ReaderUnavailable`], naming `backend`. The report never claims a
+/// compressed format or compressed counters.
+pub fn plan_kv_cache_without_reader(request: KvCacheRequest, backend: &str) -> KvCacheReport {
+    match plan_kv_cache(request, |_| {
+        Err::<std::convert::Infallible, _>((
+            KvCacheFallbackReason::ReaderUnavailable,
+            format!("{backend} has no fused compressed-domain KV reader; the cache runs dense"),
+        ))
+    }) {
+        KvCachePlan::Dense(report) => report,
+        KvCachePlan::Compressed { reader, .. } => match reader {},
+    }
 }
 
 #[cfg(test)]
@@ -558,5 +684,155 @@ mod tests {
             ..compressed
         };
         assert!(!interrupted.ran_compressed());
+    }
+
+    fn request(family: Option<KvModelFamily>, context_tokens: u64) -> KvCacheRequest {
+        KvCacheRequest {
+            policy: ON,
+            family,
+            context_tokens,
+            max_new_tokens: 64,
+            batch: 1,
+            unsupported_request: None,
+        }
+    }
+
+    #[test]
+    fn a_family_is_named_by_dispatch_and_for_llama_by_the_config_identity() {
+        use KvModelFamily::{Llama, Qwen3};
+        assert_eq!(
+            kv_model_family("qwen3", "Qwen3ForCausalLM", "qwen3"),
+            Some(Qwen3)
+        );
+        assert_eq!(
+            kv_model_family("llama", "LlamaForCausalLM", ""),
+            Some(Llama)
+        );
+        assert_eq!(kv_model_family("llama", "", "LLAMA"), Some(Llama));
+        // The Llama dispatch also serves Mistral and dense Qwen2, which have no row.
+        assert_eq!(
+            kv_model_family("llama", "MistralForCausalLM", "mistral"),
+            None
+        );
+        assert_eq!(kv_model_family("llama", "Qwen2ForCausalLM", "qwen2"), None);
+        assert_eq!(kv_model_family("llama", "", ""), None);
+        for decoder in ["qwen3_5", "qwen3_vl", "gemma2", "phi3", "deepseek_v2", ""] {
+            assert_eq!(
+                kv_model_family(decoder, "LlamaForCausalLM", "llama"),
+                None,
+                "{decoder}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_runs_the_table_then_the_request_shape_then_the_reader() {
+        let qwen = Some(KvModelFamily::Qwen3);
+        let reader_ran = std::cell::Cell::new(false);
+        let reader = |row: &'static KvQualification| {
+            reader_ran.set(true);
+            Ok::<_, (KvCacheFallbackReason, String)>(row.format)
+        };
+        // Table refusals win over the request shape and never reach the reader.
+        let short_multimodal = KvCacheRequest {
+            unsupported_request: Some("multimodal".into()),
+            ..request(qwen, 100)
+        };
+        assert_eq!(
+            plan_kv_cache(short_multimodal, reader),
+            KvCachePlan::Dense(KvCacheReport::dense(
+                KvCacheFallbackReason::BelowMinimumContext,
+                None
+            ))
+        );
+        let multimodal = KvCacheRequest {
+            unsupported_request: Some("multimodal".into()),
+            ..request(qwen, 20_000)
+        };
+        assert_eq!(
+            plan_kv_cache(multimodal, reader),
+            KvCachePlan::Dense(KvCacheReport::dense(
+                KvCacheFallbackReason::UnsupportedRequest,
+                Some("multimodal".into())
+            ))
+        );
+        assert!(!reader_ran.get());
+        let KvCachePlan::Compressed {
+            qualification,
+            reader: format,
+        } = plan_kv_cache(request(qwen, 20_000), reader)
+        else {
+            panic!("a qualified plain request runs compressed");
+        };
+        assert!(reader_ran.get());
+        assert_eq!(qualification.family, KvModelFamily::Qwen3);
+        assert_eq!(format, KvCompressionFormat::GroupAffineK8V8);
+        // The token budget is part of the table stage: it bounds the final context.
+        let past_the_window = KvCacheRequest {
+            max_new_tokens: 513,
+            ..request(qwen, 40_448)
+        };
+        assert_eq!(
+            plan_kv_cache(past_the_window, reader),
+            KvCachePlan::Dense(KvCacheReport::dense(
+                KvCacheFallbackReason::AboveQualifiedContext,
+                None
+            ))
+        );
+        let refused = plan_kv_cache(request(qwen, 20_000), |_| {
+            Err::<(), _>((
+                KvCacheFallbackReason::UnsupportedGeometry,
+                "head dim".into(),
+            ))
+        });
+        assert_eq!(
+            refused,
+            KvCachePlan::Dense(KvCacheReport::dense(
+                KvCacheFallbackReason::UnsupportedGeometry,
+                Some("head dim".into())
+            ))
+        );
+    }
+
+    #[test]
+    fn a_backend_without_a_reader_reports_dense_with_the_shared_reason() {
+        let backend = |request| plan_kv_cache_without_reader(request, "test-backend");
+        let qwen = Some(KvModelFamily::Qwen3);
+        let off = KvCacheRequest {
+            policy: KvCompressionPolicy::Off,
+            ..request(qwen, 20_000)
+        };
+        assert_eq!(
+            backend(off).fallback,
+            Some(KvCacheFallbackReason::PolicyDisabled)
+        );
+        assert_eq!(
+            backend(request(None, 20_000)).fallback,
+            Some(KvCacheFallbackReason::UnqualifiedModel)
+        );
+        let unavailable = backend(request(qwen, 20_000));
+        assert_eq!(
+            unavailable.fallback,
+            Some(KvCacheFallbackReason::ReaderUnavailable)
+        );
+        assert!(unavailable
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("test-backend")));
+        assert_eq!(unavailable.format, None);
+        assert_eq!(unavailable.counters, KvCacheCounters::default());
+        assert!(!unavailable.ran_compressed());
+    }
+
+    #[test]
+    fn a_provider_without_a_table_family_is_disabled_or_unqualified() {
+        assert_eq!(
+            KvCacheReport::without_table_family(KvCompressionPolicy::Off),
+            KvCacheReport::dense(KvCacheFallbackReason::PolicyDisabled, None)
+        );
+        assert_eq!(
+            KvCacheReport::without_table_family(ON),
+            KvCacheReport::dense(KvCacheFallbackReason::UnqualifiedModel, None)
+        );
     }
 }

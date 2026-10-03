@@ -2,7 +2,7 @@
 # A RATCHET, not a zero-gate: --check-baseline fails only when a count RISES or a new
 # flagged file appears. See that script's header for why zero is not the target and
 # why the total is a triage inbox size rather than a defect count.
-# 283 assertion(s) across 67 file(s); 2658 .rs file(s) scanned.
+# 279 assertion(s) across 67 file(s); 2912 .rs file(s) scanned.
 crates/audio/candle-audio-acestep/src/model.rs: 5
 crates/audio/candle-audio-acestep/src/text.rs: 2
 crates/audio/candle-audio-acestep/tests/conformance.rs: 1
@@ -35,8 +35,8 @@ crates/contracts/gen-core/src/duration_head.rs: 15
 crates/contracts/gen-core/src/generator.rs: 9
 crates/contracts/gen-core/src/ltx_checkpoint.rs: 9
 crates/contracts/gen-core/src/transcribe.rs: 1
-crates/llm/mlx-llm/src/campaign.rs: 8
 crates/llm/mlx-llm/server/src/main.rs: 8
+crates/llm/mlx-llm/src/campaign.rs: 4
 crates/media/candle-gen/candle-gen-joycaption/src/lib.rs: 2
 crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs: 1
 crates/media/candle-gen/candle-gen-ltx/src/duration_head.rs: 6
