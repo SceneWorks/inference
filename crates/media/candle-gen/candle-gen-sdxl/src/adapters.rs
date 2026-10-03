@@ -1848,6 +1848,88 @@ mod tests {
         );
     }
 
+    /// sc-24163 review: the packed tiers' overlay is priced at what `install_additive` holds. A LoRA
+    /// keeps f32 factors (4 B per element, even from a bf16 file) and casts them per forward without
+    /// keeping the cast, so no compute copy is priced (`UpcastLoraCopy::PerForward`). A low-rank
+    /// LoKr is materialized to its full `w2 [b, d]` and caches `w2ᵀ` at the compute width, so it is
+    /// priced from its Kronecker dims, not its stored elements.
+    ///
+    /// *Mutations that red this:* `memory_strategy::ADAPTER_LORA_COPY` set to
+    /// `UpcastLoraCopy::Cached`, or pricing LoKr tensors per stored element.
+    #[test]
+    fn the_packed_overlay_price_matches_the_installed_residuals() {
+        use candle_gen::gen_core::{
+            adapter_stack_upcast_resident_bytes, AdapterResidencyMode::Additive,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = Device::Cpu;
+        let target = "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q";
+        let bf16 = |shape: (usize, usize)| Tensor::ones(shape, DType::BF16, &dev).unwrap();
+        let lora = tmp.path().join("lora.safetensors");
+        ct_safetensors::save(
+            &HashMap::from([
+                (format!("{target}.lora_A.weight"), bf16((4, 64))),
+                (format!("{target}.lora_B.weight"), bf16((64, 4))),
+            ]),
+            &lora,
+        )
+        .unwrap();
+        // w1 [2, 4] ⊗ w2 [32, 16] = [64, 64], with a rank-2 w2.
+        let lokr = tmp.path().join("lokr.safetensors");
+        safetensors::serialize_to_file(
+            HashMap::from([
+                (format!("{target}.lokr_w1"), bf16((2, 4))),
+                (format!("{target}.lokr_w2_a"), bf16((32, 2))),
+                (format!("{target}.lokr_w2_b"), bf16((2, 16))),
+            ])
+            .into_iter()
+            .collect::<Vec<_>>(),
+            Some(HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "2".to_string()),
+                ("alpha".to_string(), "2".to_string()),
+            ])),
+            &lokr,
+        )
+        .unwrap();
+        for spec in [
+            AdapterSpec::new(lora, 1.0, AdapterKind::Lora),
+            AdapterSpec::new(lokr, 1.0, AdapterKind::Lokr),
+        ] {
+            let ([wq, scales, biases], _) = synth_q4(64, 64);
+            let mut host = OneLeaf(LoraLinear::from_qlinear(
+                QLinear::from_packed(&wq, &scales, &biases, None, &dev).unwrap(),
+                64,
+                64,
+                target.into(),
+            ));
+            let specs = [spec];
+            let report = install_additive(&mut host, &specs, &BTreeMap::new(), &dev).unwrap();
+            assert_eq!(report.applied, 1, "{:?}", specs[0].kind);
+            let x = Tensor::ones((1, 64), DType::F32, &dev).unwrap();
+            host.0.forward(&x).unwrap();
+            let installed = host.0.frozen_additive_bytes() as u64;
+            // A LoRA keeps no forward copy, so it is priced at the f16 activation width SDXL runs
+            // at. A LoKr caches at the forward's dtype, f32 here (the CPU packed forward).
+            let width = match specs[0].kind {
+                AdapterKind::Lora => 2,
+                AdapterKind::Lokr => 4,
+            };
+            let priced = adapter_stack_upcast_resident_bytes(
+                &specs,
+                Additive,
+                width,
+                crate::memory_strategy::ADAPTER_LORA_COPY,
+            )
+            .unwrap();
+            assert_eq!(
+                priced, installed,
+                "{:?}: priced == installed",
+                specs[0].kind
+            );
+        }
+    }
+
     #[test]
     fn packed_stack_rejects_later_zero_match_and_both_kind_mismatches() {
         let tmp = tempfile::tempdir().unwrap();
