@@ -1198,7 +1198,7 @@ impl Yue2Engine {
             &wav_f32_bytes(audio.samples(), SAMPLE_RATE, AUDIO_CHANNELS as u16),
         )?;
         let keys = self.identity_keys();
-        let decode_identity = identity_of(&json!([
+        let mut decode_keys = json!([
             IDENTITY_SCHEMA,
             "decode",
             latents.identity().sha256,
@@ -1207,7 +1207,14 @@ impl Yue2Engine {
             keys.runtime,
             // Not the tiling: it changes no sample (a memory control; the decoder metadata in
             // result.json records it).
-        ]));
+        ]);
+        if keys.vae_dtype != candle_audio::candle_core::DType::F32 {
+            decode_keys
+                .as_array_mut()
+                .expect("decode keys are an array")
+                .push(json!("bfloat16"));
+        }
+        let decode_identity = identity_of(&decode_keys);
         stage_ids.insert("decode".into(), stage_entry(&decode_identity, false));
 
         let request = plan.request();
@@ -1496,16 +1503,7 @@ impl Yue2Engine {
                 ..self.default_settings()
             },
         );
-        let mut config = source_config.as_object().cloned().unwrap_or_default();
-        for key in [
-            "vae_dtype",
-            "vae_decode",
-            "vae_core_frames",
-            "vae_halo_frames",
-            "decoder_release",
-        ] {
-            config.insert(key.into(), current.get(key).cloned().unwrap_or(Value::Null));
-        }
+        let mut config = cached_decode_current_config(&source_config, &current);
         let digest = |name: &str| durable::sha256_file(&source.join(name)).map(|(sha, _)| sha);
         config.insert(
             "cached_decode".into(),
@@ -1567,6 +1565,34 @@ impl Yue2Engine {
             stages,
         })
     }
+}
+
+/// A cached decode executes the currently loaded VAE. Keep the source's other configuration for
+/// provenance, but replace every effective target policy field (including a newly absent one).
+fn cached_decode_current_config(source: &Value, current: &Value) -> Map<String, Value> {
+    let mut config = source.as_object().cloned().unwrap_or_default();
+    for key in [
+        "compute_policy",
+        "effective_stage_dtypes",
+        "fp32_numerical_internals",
+        "vae_cuda_bf16_math_policy",
+    ] {
+        config.remove(key);
+        if let Some(value) = current.get(key) {
+            config.insert(key.into(), value.clone());
+        }
+    }
+    for key in [
+        "model_dtype",
+        "vae_dtype",
+        "vae_decode",
+        "vae_core_frames",
+        "vae_halo_frames",
+        "decoder_release",
+    ] {
+        config.insert(key.into(), current.get(key).cloned().unwrap_or(Value::Null));
+    }
+    config
 }
 
 #[cfg(test)]

@@ -65,9 +65,6 @@ impl TextEncoderBlockStream {
             self.dtype,
             self.quant,
         )?;
-        // Read this layer's bytes on the CPU stream now, before its forward is encoded; left lazy, the
-        // window's `eval` makes Metal command buffers wait on the disk read (sc-24245).
-        view.materialize_accessed()?;
         // LOAD-BEARING: constructors clone refcounted Array handles. Draining precisely the keys read
         // by this layer removes the view's second handle; without it a dropped window remains resident
         // while producing the same output, so correctness tests alone cannot detect the regression.

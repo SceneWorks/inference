@@ -1920,6 +1920,7 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -2129,10 +2130,12 @@ fn validate_request(req: &TrainingRequest, label: &str) -> Result<()> {
 /// [`LtxTrainer::validate`], so preflight and execution cannot drift.
 pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     let descriptor = trainer_descriptor_25();
-    gen_core::train::validate_control_request(&descriptor, req)
-        .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
-    gen_core::train::validate_full_finetune_request(&descriptor, req)
-        .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
+    // The shared floors keep their typed variant across the seam (`?` maps
+    // `gen_core::Error::Unsupported` 1:1): a capability gap must stay `Unsupported` for the worker,
+    // never be flattened to a message (sc-24161).
+    gen_core::train::validate_control_request(&descriptor, req)?;
+    gen_core::train::validate_full_finetune_request(&descriptor, req)?;
+    gen_core::train::validate_edit_request(&descriptor, req)?;
     validate_request(req, "ltx_2_5 trainer")?;
     validate_ltx25_adapter_scale(req.config.alpha)?;
     let plan = Ltx25TrainingPlan::from_request(req)?;
@@ -2164,6 +2167,7 @@ impl Trainer for LtxTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         // Single-use enforcement (F-055): `train` frees the Gemma text encoder + tokenizer (~24 GB)
         // after the embed cache, so a second `train` on the same instance can't re-encode. Fail here,
         // up front (validate runs before any progress is emitted), instead of with a late, confusing
@@ -4171,6 +4175,24 @@ mod preflight_tests {
 #[cfg(test)]
 mod validate_request_tests {
     use super::validate_request;
+
+    /// sc-24161: the LTX-2.5 weights-free preflight keeps the shared floors' typed variant — an
+    /// edit dataset is a capability gap (`Unsupported`), never flattened to `Msg`.
+    #[test]
+    fn ltx25_preflight_keeps_the_edit_refusal_typed() {
+        let mut req = request(1);
+        req.items = vec![TrainingItem::edit_pair(
+            PathBuf::from("target.png"),
+            "make it blue".into(),
+            vec![PathBuf::from("ref.png")],
+        )];
+        match super::validate_ltx25_training_request(&req) {
+            Err(mlx_gen::Error::Unsupported(message)) => {
+                assert!(message.contains("instruction-edit"), "{message}")
+            }
+            other => panic!("expected a typed Unsupported, got {other:?}"),
+        }
+    }
     use mlx_gen::{NetworkType, TrainingConfig, TrainingItem, TrainingRequest};
     use std::path::PathBuf;
 
@@ -4182,6 +4204,7 @@ mod validate_request_tests {
                     caption: "a cat".into(),
                     control_image_path: None,
                     model_options: serde_json::Map::new(),
+                    reference_image_paths: Vec::new(),
                 })
                 .collect(),
             config: TrainingConfig::default(),

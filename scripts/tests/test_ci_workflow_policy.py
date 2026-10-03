@@ -1648,6 +1648,47 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertIn('findstr /C:"YUE2_EVIDENCE_SUMMARY {"', text)
         self.assertIn('findstr /C:"zh_full semantic:"', run)
 
+    def test_yue2_fp8_route_dispatch_runs_only_the_registered_case(self) -> None:
+        workflow = yaml.safe_load(YUE_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertIn("fp8-route", workflow[True]["workflow_dispatch"]["inputs"]["mode"]["options"])
+        self.assertEqual(
+            workflow["concurrency"]["group"], "inference-real-weights-physical-host"
+        )
+        v1 = {step.get("name"): step for step in workflow["jobs"]["candle-audio-yue"]["steps"]}
+        invalid = v1["Refuse YuE2-only mode on YuE-v1"]
+        self.assertEqual(invalid["if"], "inputs.mode == 'fp8-route'")
+        self.assertIn("exit /b 1", invalid["run"])
+
+        steps = {step.get("name"): step for step in workflow["jobs"]["candle-audio-yue2"]["steps"]}
+        for name in (
+            "Build the YuE2 CUDA test binary",
+            "Run the YuE2 CUDA lib tests",
+            "Measure the YuE2 tiers against the F32 reference",
+        ):
+            self.assertEqual(steps[name]["if"], "inputs.mode != 'fp8-route'", name)
+        self.assertIn(
+            "steps.build-yue2.outcome == 'success'",
+            steps["Render YuE2 through the registered loader and replay the AR parity cases"]["if"],
+        )
+        build = steps["Build the YuE2 FP8 registered-route test binary"]
+        self.assertEqual(build["id"], "build-yue2-fp8")
+        self.assertEqual(build["if"], "inputs.mode == 'fp8-route'")
+        self.assertIn("--features cuda --lib --no-run", build["run"])
+        route = steps["Prove the registered YuE2 FP8 route on CUDA"]
+        self.assertIn("inputs.mode == 'fp8-route'", route["if"])
+        self.assertIn("steps.build-yue2-fp8.outcome == 'success'", route["if"])
+        self.assertIn('set "YUE2_HF_HUB=%CANDLE_GEN_MODELS_ROOT%"', route["run"])
+        self.assertIn(
+            "--lib provider::tests::registered_fp8_load_publishes_a_mode_bound_run "
+            "-- --ignored --exact --nocapture",
+            route["run"],
+        )
+        self.assertIn('findstr /C:"test result: ok. 1 passed; 0 failed; 0 ignored"', route["run"])
+        self.assertIn("git rev-parse HEAD", route["run"])
+        self.assertIn("nvidia-smi --query-gpu=", route["run"])
+        self.assertIn("exit /b 1", route["run"])
+        self.assertEqual(steps["Keep the YuE2 CUDA evidence"]["with"]["name"], "yue2-cuda-evidence")
+
     def test_ltx25_terminal_workflows_are_autonomous_and_artifact_bound(self) -> None:
         campaign = LTX25_QUANT_CAMPAIGN_WORKFLOW.read_text(encoding="utf-8")
         promotion = LTX25_QUANT_PROMOTION_WORKFLOW.read_text(encoding="utf-8")

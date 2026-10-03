@@ -37,6 +37,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_lokr: true,
         supports_control: false,
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -75,6 +76,7 @@ impl Trainer for AnimaTrainer {
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         if req.config.resume {
             return Err(gen_core::Error::Unsupported(
                 "anima candle trainer does not yet support resume".into(),

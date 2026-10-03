@@ -428,6 +428,7 @@ impl TrainVariant {
             supports_lokr: self == Self::T2v14b,
             supports_control: false,
             supports_full_finetune: false,
+            max_reference_images: 0,
         }
     }
 
@@ -632,6 +633,7 @@ impl Trainer for WanMoeTrainer {
         // adapter the caller did not ask for (F-006/F-055).
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         if !self.descriptor.supports_lokr && req.config.network_type == NetworkType::Lokr {
             return Err(gen_core::Error::Unsupported(format!(
                 "{} trainer is LoRA-only",
@@ -1590,6 +1592,7 @@ mod tests {
                 caption: "x".into(),
                 control_image_path: None,
                 model_options: Default::default(),
+                reference_image_paths: Vec::new(),
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),

@@ -177,9 +177,6 @@ impl AnimaBlockStream {
         }
         let prefix = format!("{}.{index}", self.base);
         let mut block = Block::from_weights(view, &prefix, &self.cfg)?;
-        // Read this block's bytes now, before its forward is encoded; left lazy, the window's `eval`
-        // makes Metal command buffers wait on the disk read (sc-24245; see `crate::loader`).
-        view.materialize_accessed()?;
         // LOAD-BEARING (SC-15750): the view keeps its own refcounted handle to every tensor the
         // constructor cloned. Draining exactly the accessed keys is what makes the window's drop a
         // real release rather than a no-op that still produces correct images.

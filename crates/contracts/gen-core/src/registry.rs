@@ -2699,13 +2699,26 @@ impl ProviderRegistry {
     }
 
     /// Reject a [`LoadSpec`] whose requested quant tier this platform's backend does not implement,
-    /// as declared by [`ProviderRegistryBuilder::reject_quant`].
+    /// as declared by [`ProviderRegistryBuilder::reject_quant`], or whose YuE2 AR mode a different
+    /// provider would silently ignore.
     ///
     /// The single boundary every registry-routed load of every provider kind passes through, so one
     /// check covers the whole catalog — the composition root states the platform's tier support once
     /// instead of each provider re-deriving it. Runs *after* id resolution so an unknown id still
     /// reports as an unknown id.
     fn ensure_quant_supported(&self, id: &str, spec: &LoadSpec) -> Result<()> {
+        if spec.yue2_ar_mode != crate::Yue2ArMode::Native && id != "yue2" {
+            return Err(Error::Unsupported(format!(
+                "the YuE2 AR mode {:?} cannot be used by provider '{id}'",
+                spec.yue2_ar_mode
+            )));
+        }
+        if spec.yue2_compute_policy != crate::Yue2ComputePolicy::Legacy && id != "yue2" {
+            return Err(Error::Unsupported(format!(
+                "the YuE2 compute policy {:?} cannot be used by provider '{id}'",
+                spec.yue2_compute_policy
+            )));
+        }
         let Some(quant) = spec.quantize else {
             return Ok(());
         };
@@ -3707,6 +3720,7 @@ mod tests {
             // Adapter-only: no full base fine-tune path (sc-14056). The shared
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
+            max_reference_images: 0,
         }
     }
 
@@ -3782,6 +3796,7 @@ mod tests {
             // Adapter-only: no full base fine-tune path (sc-14056). The shared
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
+            max_reference_images: 0,
         }
     }
 
@@ -3797,6 +3812,7 @@ mod tests {
             // Adapter-only: no full base fine-tune path (sc-14056). The shared
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
+            max_reference_images: 0,
         }
     }
 
@@ -4505,6 +4521,32 @@ mod tests {
             ),
             other => panic!("a rejected quant tier is a capability gap, got {other:?}"),
         }
+    }
+
+    /// A model-specific AR execution choice cannot be silently ignored by another provider.
+    #[test]
+    fn yue2_ar_mode_is_scoped_to_yue2() {
+        let registry = dummy_registry();
+        let base = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert_eq!(base.yue2_ar_mode, crate::Yue2ArMode::Native);
+        assert!(registry.load("dummy_test_model", &base).is_ok());
+        let fp8 = base
+            .clone()
+            .with_yue2_ar_mode(crate::Yue2ArMode::ExperimentalFp8);
+        let err = registry.load("dummy_test_model", &fp8).err().unwrap();
+        assert!(
+            matches!(&err, Error::Unsupported(message)
+            if message.contains("YuE2 AR mode") && message.contains("dummy_test_model")),
+            "{err}"
+        );
+        assert_eq!(base.yue2_compute_policy, crate::Yue2ComputePolicy::Legacy);
+        let strict = base.with_yue2_compute_policy(crate::Yue2ComputePolicy::Bf16);
+        let err = registry.load("dummy_test_model", &strict).err().unwrap();
+        assert!(
+            matches!(&err, Error::Unsupported(message)
+            if message.contains("YuE2 compute policy") && message.contains("dummy_test_model")),
+            "{err}"
+        );
     }
 
     /// The guard is scoped to the declared tiers: an unrejected tier (and a dense, `None` load) still
