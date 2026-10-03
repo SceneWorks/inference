@@ -552,6 +552,17 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
         self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
 
+    def test_cuda_deadline_stamp_uses_existing_directory_before_checkout(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        cuda = workflow.split("  cuda:\n", 1)[1].split("  metal:\n", 1)[0]
+        self.assertIn("working-directory: engine", cuda)
+        first_step = cuda.split("    steps:\n", 1)[1].split(
+            "      - uses: actions/checkout@", 1)[0]
+        self.assertIn("- name: Record CUDA job start for bounded owned-test deadline", first_step)
+        self.assertIn("working-directory: ${{ github.workspace }}", first_step)
+        self.assertIn("YUE2_PRECISION_JOB_STARTED_UTC_NS=$stamp", first_step)
+        self.assertNotIn("working-directory: engine", first_step)
+
     def test_cuda_diagnostic_is_provenance_guarded_and_cannot_launch_proof(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         job = workflow.split("  cuda_diagnostic:\n", 1)[1].split("  reference:\n", 1)[0]

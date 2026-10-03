@@ -185,6 +185,7 @@ jobs:
     steps:
       - name: Record CUDA job start for bounded owned-test deadline
         shell: powershell
+        working-directory: ${{ github.workspace }}
         run: |
           $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000000
           Add-Content -Path $env:GITHUB_ENV -Value "YUE2_PRECISION_JOB_STARTED_UTC_NS=$stamp"
