@@ -23,7 +23,7 @@ class PedanticDriverTests(unittest.TestCase):
             binary.write_bytes(b"built-test-binary")
             log = target / "build.jsonl"
             row = {"reason": "compiler-artifact", "target": {"name": "yue2-bf16-tile-diagnostic",
-                   "kind": ["bin"]}, "package_id": "path+file:///test#yue2-bf16-tile-diagnostic@0.1.0",
+                   "kind": ["bin"]}, "package_id": "path+file:///" + (target / "source/harness").resolve().as_posix(),
                    "executable": str(binary)}
             stage = target / "source"
             core = {"reason": "compiler-artifact", "target": {"name": "candle_core"},
@@ -32,21 +32,33 @@ class PedanticDriverTests(unittest.TestCase):
             kernel = {"reason": "compiler-artifact", "target": {"name": "candle_kernels"},
                       "package_id": "path+file:///" +
                                     (stage / "engine-overlay/crates/media/candle-gen/vendor/candle-kernels").resolve().as_posix()}
+            audio = {"reason": "compiler-artifact", "target": {"name": "candle_audio"},
+                     "features": ["cuda", "default"], "package_id": "path+file:///" +
+                     (stage / "engine-overlay/crates/audio/candle-audio").resolve().as_posix()}
+            yue2 = {"reason": "compiler-artifact", "target": {"name": "candle_audio_yue2"},
+                    "features": ["cuda", "default"], "package_id": "path+file:///" +
+                    (stage / "engine-overlay/crates/audio/candle-audio-yue2").resolve().as_posix()}
             def write(*rows: dict) -> None:
                 log.write_text("\n".join(json.dumps(item) for item in rows) + "\n", encoding="utf-8")
-            write(row, core, kernel)
+            write(row, core, kernel, audio, yue2)
             self.assertEqual(driver.verify_binary(log, binary, stage)["binary_sha256"], driver.sha256(binary))
             core["features"] = ["cuda", "cudarc", "default", "cudnn"]
-            write(row, core, kernel)
+            write(row, core, kernel, audio, yue2)
             with self.assertRaisesRegex(RuntimeError, "declared Candle"):
                 driver.verify_binary(log, binary, stage)
             core["features"] = ["cuda", "cudarc", "default"]
+            yue2["package_id"] = "path+file:///unreviewed/yue2"
+            write(row, core, kernel, audio, yue2)
+            with self.assertRaisesRegex(RuntimeError, "staged M4"):
+                driver.verify_binary(log, binary, stage)
+            yue2["package_id"] = "path+file:///" + \
+                                  (stage / "engine-overlay/crates/audio/candle-audio-yue2").resolve().as_posix()
             row["executable"] = str(target / "release" / "another.exe")
-            write(row, core, kernel)
+            write(row, core, kernel, audio, yue2)
             with self.assertRaisesRegex(RuntimeError, "differs from the one Cargo"):
                 driver.verify_binary(log, binary, stage)
             row["executable"] = str(binary)
-            write(row, row, core, kernel)
+            write(row, row, core, kernel, audio, yue2)
             with self.assertRaisesRegex(RuntimeError, "differs from the one Cargo"):
                 driver.verify_binary(log, binary, stage)
 

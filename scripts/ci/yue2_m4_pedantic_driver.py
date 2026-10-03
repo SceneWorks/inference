@@ -52,6 +52,8 @@ def verify_binary(build_json: Path, binary: Path, stage: Path) -> dict:
     matches = []
     core = []
     kernels = []
+    audio = []
+    yue2 = []
     for line in build_json.read_text(encoding="utf-8").splitlines():
         try:
             row = json.loads(line)
@@ -66,21 +68,37 @@ def verify_binary(build_json: Path, binary: Path, stage: Path) -> dict:
             core.append(row)
         if target.get("name") == "candle_kernels":
             kernels.append(row)
+        if target.get("name") == "candle_audio":
+            audio.append(row)
+        if target.get("name") == "candle_audio_yue2":
+            yue2.append(row)
     require(len(matches) == 1 and Path(matches[0]["executable"]).resolve() == binary.resolve(),
             "diagnostic executable differs from the one Cargo build artifact")
     def source(row: dict) -> str:
         return row.get("package_id", "").replace("\\", "/").lower()
     expected_core = (stage / "candle-overlay/candle-core").resolve().as_posix().lower()
     expected_kernel = (stage / "engine-overlay/crates/media/candle-gen/vendor/candle-kernels").resolve().as_posix().lower()
+    expected_harness = (stage / "harness").resolve().as_posix().lower()
+    expected_audio = (stage / "engine-overlay/crates/audio/candle-audio").resolve().as_posix().lower()
+    expected_yue2 = (stage / "engine-overlay/crates/audio/candle-audio-yue2").resolve().as_posix().lower()
     require(len(core) == len(kernels) == 1 and
             set(core[0].get("features", [])) == {"cuda", "cudarc", "default"} and
             source(core[0]).startswith("path+") and expected_core in source(core[0]) and
             source(kernels[0]).startswith("path+") and expected_kernel in source(kernels[0]),
             "diagnostic build changed the declared Candle CUDA core or vendored kernels")
+    require(source(matches[0]).startswith("path+") and expected_harness in source(matches[0]) and
+            len(audio) == len(yue2) == 1 and
+            source(audio[0]).startswith("path+") and expected_audio in source(audio[0]) and
+            source(yue2[0]).startswith("path+") and expected_yue2 in source(yue2[0]) and
+            {"cuda", "default"} <= set(audio[0].get("features", [])) and
+            {"cuda", "default"} <= set(yue2[0].get("features", [])),
+            "diagnostic build changed the staged M4 audio/VAE packages or harness")
     return {"binary_sha256": sha256(binary), "binary_bytes": binary.stat().st_size,
             "package_id": matches[0].get("package_id"), "target": matches[0]["target"],
             "candle_core_package_id": core[0]["package_id"],
-            "vendored_kernel_package_id": kernels[0]["package_id"]}
+            "vendored_kernel_package_id": kernels[0]["package_id"],
+            "candle_audio_package_id": audio[0]["package_id"],
+            "yue2_vae_package_id": yue2[0]["package_id"]}
 
 
 def verify_source(engine_sha: str, control_sha: str) -> None:
