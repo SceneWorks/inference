@@ -479,7 +479,7 @@ expected_files = [
 [[models]]
 # sc-24108 / sc-24109 — Qwen-Image 2.1, the pinned snapshot the `*-qwen-image-2-1` crates freeze (see their
 # UPSTREAM.md). Public, unmirrored, ~33 GB bf16 (text_encoder 17.5 GB + transformer 14.2 GB +
-# vae 1.35 GB). sc-24163 wires THIS row's MLX variable: the dispatch-only `qwen-image-2-1` profile's
+# vae 1.35 GB). sc-24163 wires THIS row's MLX variable: the dispatch-only `qwen-image-2-1-lora-mlx` profile's
 # `mlx-qwen-image-2-1` job materializes it under `MLX_GEN_MODELS_ROOT` (the persistent hub cache,
 # on the `rw-mage` Mac) and runs every test in `mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs`
 # (T2I LoRA + two-reference edit LoKr training, with/without renders at bf16/q8/q4, stacking). The
@@ -491,7 +491,7 @@ repository = "Qwen/Qwen-Image-2.1"
 revision = "790c92633540aa0cb11d9abf19eb46d861714758"
 license = "Qwen Research License Agreement"
 size_class = "very-large"
-profiles = ["qwen-image-2-1"]
+profiles = ["qwen-image-2-1-lora-mlx"]
 environment = ["MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"]
 expected_files = [
     "LICENSE",
@@ -576,7 +576,7 @@ expected_files = [
 
 [[models]]
 # sc-24163 — the SAME pinned `SceneWorks/qwen-image-2-1-mlx` bytes as `qwen-image-2-1-mlx` above,
-# for the MLX lane: the dispatch-only `qwen-image-2-1` profile's `mlx-qwen-image-2-1` job
+# for the MLX lane: the dispatch-only `qwen-image-2-1-lora-mlx` profile's `mlx-qwen-image-2-1` job
 # materializes it under `MLX_GEN_MODELS_ROOT` and renders the q8/ and q4/ tiers with and without
 # the trained adapters. A separate key for the same reason `qwen-image-2-1-cuda` is one: wiring is
 # per variable, and the candle row declares exactly `CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT`.
@@ -585,7 +585,7 @@ repository = "SceneWorks/qwen-image-2-1-mlx"
 revision = "1691de01c24a070131e0a28bf4c065fd027f4fe9"
 license = "Qwen Research License Agreement"
 size_class = "very-large"
-profiles = ["qwen-image-2-1"]
+profiles = ["qwen-image-2-1-lora-mlx"]
 environment = ["MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"]
 expected_files = [
     "q8/model_index.json",
