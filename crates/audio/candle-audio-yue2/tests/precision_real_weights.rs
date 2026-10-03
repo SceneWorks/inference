@@ -342,7 +342,7 @@ fn explicit_stage_precision_real_weights() {
         if backend == "cuda" && policy == Yue2ComputePolicy::Bf16 {
             assert_eq!(
                 generation["config"]["vae_cuda_bf16_math_policy"],
-                "disallow_reduced_precision_reduction_v1"
+                "fixed_order_bf16_convolution_v1"
             );
         } else {
             assert!(generation["config"]["vae_cuda_bf16_math_policy"].is_null());

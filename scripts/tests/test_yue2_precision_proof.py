@@ -96,9 +96,9 @@ class PrecisionControlTests(unittest.TestCase):
             with self.subTest(platform=platform, visible=visible, order=order), \
                  self.assertRaisesRegex(RuntimeError, "PCI-ordered CUDA GPU0"):
                 IDLE.check_device_selection(platform, visible, order)
-        self.assertEqual(IDLE.RUN_ID, "37073714206")
+        self.assertEqual(IDLE.RUN_ID, "37106146499")
         self.assertEqual(IDLE.BASELINE_DIGEST,
-                         "a05afe09223020d39f698f9ec5ed9bc4f2258a1fa8950e69ee4fa9e2769339a1")
+                         "1b6f2d9588b2e25da62f22eec80d406a8b8aeea578d913aefb74e4cc971ae112")
         IDLE.check_dispatch(IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40)
         for run_id, engine, control, github in (
             ("36956986577", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
@@ -551,6 +551,17 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertIn("run-id: ${{ inputs.idle_cuda_context_run_id }}", workflow)
             self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
         self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
+
+    def test_cuda_deadline_stamp_uses_existing_directory_before_checkout(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        cuda = workflow.split("  cuda:\n", 1)[1].split("  metal:\n", 1)[0]
+        self.assertIn("working-directory: engine", cuda)
+        first_step = cuda.split("    steps:\n", 1)[1].split(
+            "      - uses: actions/checkout@", 1)[0]
+        self.assertIn("- name: Record CUDA job start for bounded owned-test deadline", first_step)
+        self.assertIn("working-directory: ${{ github.workspace }}", first_step)
+        self.assertIn("YUE2_PRECISION_JOB_STARTED_UTC_NS=$stamp", first_step)
+        self.assertNotIn("working-directory: engine", first_step)
 
     def test_cuda_diagnostic_is_provenance_guarded_and_cannot_launch_proof(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
