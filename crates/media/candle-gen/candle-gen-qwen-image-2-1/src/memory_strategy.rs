@@ -328,6 +328,7 @@ pub fn adapter_overlay(
         &plan.additive,
         gen_core::AdapterResidencyMode::Additive,
         compute_width(),
+        gen_core::UpcastLoraCopy::Cached,
     )
     .ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
@@ -336,10 +337,13 @@ pub fn adapter_overlay(
     })?;
     // sc-24158: a LoKr (stamped or LyCORIS) keeps its two small Kronecker factors resident in f32
     // (a low-rank leg materialized to its full `[b, d]`, a tucker leg collapsed to it) plus the
-    // compute-dtype prepared copy the structured residual caches — not its file bytes.
+    // compute-dtype prepared copies the structured residual caches — not its file bytes. Priced by
+    // the shared rule (sc-24163).
     let lokr_bytes = plan
-        .lokr_factor_elements
-        .saturating_mul(F32_WIDTH + compute_width());
+        .lokr_modules
+        .iter()
+        .map(|dims| dims.resident_bytes(compute_width()))
+        .fold(0u64, u64::saturating_add);
     let residual_bytes = residual_bytes.saturating_add(lokr_bytes);
     let fold_bytes_per_element = 3 * F32_WIDTH + compute_width();
     let loha_fold_transient_bytes = plan

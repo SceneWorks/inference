@@ -825,16 +825,111 @@ pub fn adapter_stack_resident_bytes(
 /// installer.
 const UPCAST_FACTOR_WIDTH: u64 = 4;
 
-/// Load-exact resident bytes for an **additive** stack whose installer upcasts every float factor
-/// to f32 on device and then caches one compute-dtype copy of it for the forward (sc-24163).
+/// Whether an upcasting installer's LoRA residual keeps a compute-dtype copy of its f32 factors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpcastLoraCopy {
+    /// The first forward at a narrower compute dtype caches a copy for the life of the adapter
+    /// (`candle_gen::quant::AdaptLinear`'s `PreparedLora`).
+    Cached,
+    /// Each forward casts the factors and drops the cast (`candle_gen::train::lora::LoraLinear`'s
+    /// additive residual, the SDXL packed host). Only the f32 factors stay resident.
+    PerForward,
+}
+
+/// The Kronecker dimensions `w1 [a, c]` ⊗ `w2 [b, d]` of one LoKr module (sc-24163).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LokrKroneckerDims {
+    pub a: u64,
+    pub b: u64,
+    pub c: u64,
+    pub d: u64,
+}
+
+impl LokrKroneckerDims {
+    /// Read the dimensions off a module's factor shapes. `factor` maps a factor name (`lokr_w1`,
+    /// `lokr_w1_a`, `lokr_w1_b`, `lokr_w2`, `lokr_w2_a`, `lokr_w2_b`, `lokr_t2`) to its shape. The
+    /// forms are a full `w1 [a, c]` or a low-rank `w1_a [a, r]`·`w1_b [r, c]`, and a full
+    /// `w2 [b, d]`, a low-rank `w2_a [b, r]`·`w2_b [r, d]`, or a tucker `w2_a [r, b]` /
+    /// `w2_b [r, d]` beside `lokr_t2`. `None` when a factor the module needs is missing or not 2-D.
+    pub fn from_factor_shapes<'a>(factor: impl Fn(&str) -> Option<&'a [usize]>) -> Option<Self> {
+        let dim = |name: &str, axis: usize| -> Option<u64> {
+            let shape = factor(name)?;
+            (shape.len() == 2).then(|| shape[axis] as u64)
+        };
+        let (a, c) = match factor("lokr_w1") {
+            Some(_) => (dim("lokr_w1", 0)?, dim("lokr_w1", 1)?),
+            None => (dim("lokr_w1_a", 0)?, dim("lokr_w1_b", 1)?),
+        };
+        let (b, d) = match (factor("lokr_w2"), factor("lokr_t2")) {
+            (Some(_), _) => (dim("lokr_w2", 0)?, dim("lokr_w2", 1)?),
+            (None, Some(_)) => (dim("lokr_w2_a", 1)?, dim("lokr_w2_b", 1)?),
+            (None, None) => (dim("lokr_w2_a", 0)?, dim("lokr_w2_b", 1)?),
+        };
+        Some(Self { a, b, c, d })
+    }
+
+    /// `a·c + b·d`: the elements of the two Kronecker factors the structured residual keeps.
+    pub fn factor_elements(&self) -> u64 {
+        self.a
+            .saturating_mul(self.c)
+            .saturating_add(self.b.saturating_mul(self.d))
+    }
+
+    /// Device bytes `candle_gen::quant::LokrFactors` holds for this module once a forward has run at
+    /// `compute_width`. Both factors are materialized in f32 (a low-rank or tucker leg is multiplied
+    /// out to its full `[b, d]`, so a file's stored elements can be far fewer). The forward then
+    /// caches `w1` at the compute width, which is an `Arc` clone at f32, and `w2ᵀ`, which
+    /// `contiguous` copies at any width. So the cost is `(a·c + b·d)·4`, plus `a·c·w` when `w ≠ 4`,
+    /// plus `b·d·w`.
+    pub fn resident_bytes(&self, compute_width: u64) -> u64 {
+        let w1 = self.a.saturating_mul(self.c);
+        let w2 = self.b.saturating_mul(self.d);
+        let w1_copy = if compute_width == UPCAST_FACTOR_WIDTH {
+            0
+        } else {
+            w1.saturating_mul(compute_width)
+        };
+        self.factor_elements()
+            .saturating_mul(UPCAST_FACTOR_WIDTH)
+            .saturating_add(w1_copy)
+            .saturating_add(w2.saturating_mul(compute_width))
+    }
+}
+
+/// The LoKr factor suffixes a module groups by, longest first so `.lokr_w1_a` is not read as
+/// `.lokr_w1`.
+const LOKR_FACTOR_SUFFIXES: [&str; 7] = [
+    ".lokr_w1_a",
+    ".lokr_w1_b",
+    ".lokr_w2_a",
+    ".lokr_w2_b",
+    ".lokr_w1",
+    ".lokr_w2",
+    ".lokr_t2",
+];
+
+/// Split a LoKr factor tensor name into `(module, factor)`, e.g. `("m", "lokr_w2_a")`.
+fn lokr_factor(name: &str) -> Option<(&str, &'static str)> {
+    LOKR_FACTOR_SUFFIXES.iter().find_map(|suffix| {
+        name.strip_suffix(suffix)
+            .map(|module| (module, &suffix[1..]))
+    })
+}
+
+/// Load-exact resident bytes for an **additive** stack whose installer upcasts every factor to f32
+/// on device (sc-24163).
 ///
 /// That is the shared candle installer (`candle_gen::quant::install_dotted_adapters`) and the
-/// provider installers built the same way on `AdaptLinear::push_lora`. Each factor is read to the
-/// host, cast `to_dtype(F32)` and uploaded, so on device it holds 4 bytes per element whatever the
-/// file stores. The first forward at a narrower compute dtype then caches a `compute_width` copy
-/// beside it (`PreparedLora`: once per compute dtype, kept for the life of the adapter). At an f32
-/// compute dtype that cast is an `Arc` clone and adds nothing. So each float element costs
-/// `4 + compute_width` bytes (`4` at f32 compute), and a non-float tensor costs its stored bytes.
+/// provider installers built the same way. Each factor is read to the host, cast `to_dtype(F32)`
+/// and uploaded, so on device it holds 4 bytes per element whatever the file stores.
+///
+/// * **LoRA** (any file without LoKr keys): every float element costs 4 bytes, plus `compute_width`
+///   when the residual caches a narrower compute copy ([`UpcastLoraCopy::Cached`]; an f32 compute
+///   dtype shares the factors' storage). A non-float tensor costs its stored bytes.
+/// * **LoKr**: each module is priced structurally ([`LokrKroneckerDims::resident_bytes`]), because
+///   the installer materializes a low-rank `w2_a·w2_b` to its full `[b, d]`. Pricing the stored
+///   elements would under-price a low-rank module many times over. Non-factor tensors (`alpha`)
+///   cost their stored bytes.
 ///
 /// [`adapter_stack_resident_bytes`] prices the file length instead. That is right for an installer
 /// that keeps the file dtype and wrong for this one. Measured on CUDA (sc-24163, Qwen-Image 2.1 at
@@ -844,34 +939,50 @@ const UPCAST_FACTOR_WIDTH: u64 = 4;
 /// 167.9 MB and 83.9 MB.
 ///
 /// Fails closed like [`adapter_stack_resident_bytes`]: `None` when a file has no safetensors
-/// residency, its header cannot be read, or it holds no tensor bytes. A `Folded` stack is `Some(0)`.
+/// residency, its header cannot be read, it holds no tensor bytes, or a LoKr module's dimensions
+/// cannot be read. A `Folded` stack is `Some(0)`.
 pub fn adapter_stack_upcast_resident_bytes(
     adapters: &[AdapterSpec],
     mode: AdapterResidencyMode,
     compute_width: u64,
+    lora_copy: UpcastLoraCopy,
 ) -> Option<u64> {
     if adapters.is_empty() || mode == AdapterResidencyMode::Folded {
         return Some(0);
     }
-    let prepared_width = if compute_width == UPCAST_FACTOR_WIDTH {
-        0
-    } else {
-        compute_width
+    let lora_copy_width = match lora_copy {
+        UpcastLoraCopy::Cached if compute_width != UPCAST_FACTOR_WIDTH => compute_width,
+        _ => 0,
     };
-    let per_element = UPCAST_FACTOR_WIDTH.saturating_add(prepared_width);
+    let lora_per_element = UPCAST_FACTOR_WIDTH.saturating_add(lora_copy_width);
     adapters.iter().try_fold(0_u64, |total, adapter| {
         if safetensors_path_bytes(&adapter.path) == 0 {
             return None;
         }
         let headers = crate::weightsmeta::safetensors_path_tensor_headers(&adapter.path).ok()?;
+        let is_lokr = headers.iter().any(|h| lokr_factor(&h.name).is_some());
         let mut bytes = 0_u64;
+        let mut modules: std::collections::BTreeMap<&str, Vec<(&str, &[usize])>> =
+            std::collections::BTreeMap::new();
         for header in &headers {
-            let tensor = if header.is_float() {
-                header.element_count().ok()?.saturating_mul(per_element)
-            } else {
-                header.data_bytes
-            };
-            bytes = bytes.saturating_add(tensor);
+            match (is_lokr, lokr_factor(&header.name)) {
+                (true, Some((module, factor))) => modules
+                    .entry(module)
+                    .or_default()
+                    .push((factor, header.shape.as_slice())),
+                (true, None) => bytes = bytes.saturating_add(header.data_bytes),
+                (false, _) if header.is_float() => {
+                    let elements = header.element_count().ok()?;
+                    bytes = bytes.saturating_add(elements.saturating_mul(lora_per_element));
+                }
+                (false, _) => bytes = bytes.saturating_add(header.data_bytes),
+            }
+        }
+        for factors in modules.values() {
+            let dims = LokrKroneckerDims::from_factor_shapes(|name| {
+                factors.iter().find(|(f, _)| *f == name).map(|(_, s)| *s)
+            })?;
+            bytes = bytes.saturating_add(dims.resident_bytes(compute_width));
         }
         (bytes > 0).then(|| total.saturating_add(bytes))
     })
@@ -4400,50 +4511,114 @@ mod tests {
         let bf16_stack = vec![spec(&bf16)];
         let f32_stack = vec![spec(&f32)];
         let additive = AdapterResidencyMode::Additive;
+        let cached = UpcastLoraCopy::Cached;
+        let price = |stack: &[AdapterSpec], width| {
+            adapter_stack_upcast_resident_bytes(stack, additive, width, cached)
+        };
 
         assert_eq!(
-            adapter_stack_upcast_resident_bytes(&bf16_stack, additive, 2),
+            price(&bf16_stack, 2),
             Some(elements * (4 + 2) + 8),
             "f32 factors + a bf16 prepared copy, and the i64 alpha at its stored width"
         );
         assert_eq!(
-            adapter_stack_upcast_resident_bytes(&f32_stack, additive, 2),
+            price(&f32_stack, 2),
             Some(elements * (4 + 2)),
             "the same factors in an f32 file cost the same"
         );
         assert_eq!(
-            adapter_stack_upcast_resident_bytes(&f32_stack, additive, 4),
+            price(&f32_stack, 4),
             Some(elements * 4),
             "an f32 compute dtype shares the factors' storage"
         );
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(
+                &f32_stack,
+                additive,
+                2,
+                UpcastLoraCopy::PerForward
+            ),
+            Some(elements * 4),
+            "a residual that casts per forward keeps only the f32 factors"
+        );
         let both = vec![spec(&bf16), spec(&f32)];
         assert_eq!(
-            adapter_stack_upcast_resident_bytes(&both, additive, 2),
+            price(&both, 2),
             Some(2 * elements * 6 + 8),
             "a stack is the sum of its members"
         );
         let file_priced = adapter_stack_resident_bytes(&bf16_stack, additive).unwrap();
         assert!(file_priced < elements * 6, "{file_priced}");
 
+        // A LoKr is priced per module from its Kronecker dims, not its stored elements: the low-rank
+        // `w2_a [16, 2]·w2_b [2, 16]` (64 stored) is materialized to `w2 [16, 16]` (256), plus the
+        // f32 `w1 [2, 4]`, the bf16 `w1` copy and the `w2ᵀ` copy. The i64 alpha keeps its 8 bytes.
+        let lokr = root.join("lokr.safetensors");
+        write_safetensors(
+            &lokr,
+            &[
+                ("m.lokr_w1", "BF16", &[2, 4], 2),
+                ("m.lokr_w2_a", "BF16", &[16, 2], 2),
+                ("m.lokr_w2_b", "BF16", &[2, 16], 2),
+                ("m.alpha", "I64", &[], 8),
+            ],
+        );
+        let lokr_stack = vec![spec(&lokr)];
+        let dims = LokrKroneckerDims {
+            a: 2,
+            b: 16,
+            c: 4,
+            d: 16,
+        };
+        assert_eq!(dims.resident_bytes(2), (8 + 256) * 4 + 8 * 2 + 256 * 2);
         assert_eq!(
-            adapter_stack_upcast_resident_bytes(&bf16_stack, AdapterResidencyMode::Folded, 2),
+            dims.resident_bytes(4),
+            (8 + 256) * 4 + 256 * 4,
+            "at f32 the w1 copy is shared; the transposed w2 is still copied"
+        );
+        assert_eq!(price(&lokr_stack, 2), Some(dims.resident_bytes(2) + 8));
+        let stored = (8 + 32 + 32) * 6;
+        assert!(
+            price(&lokr_stack, 2).unwrap() > stored,
+            "not the stored elements"
+        );
+        // The low-rank `w1_a·w1_b` and tucker `w2_a [r, b]` / `w2_b [r, d]` forms.
+        let shapes = std::collections::HashMap::from([
+            ("lokr_w1_a", vec![2usize, 3]),
+            ("lokr_w1_b", vec![3usize, 4]),
+            ("lokr_t2", vec![3usize, 3, 1, 1]),
+            ("lokr_w2_a", vec![3usize, 16]),
+            ("lokr_w2_b", vec![3usize, 8]),
+        ]);
+        assert_eq!(
+            LokrKroneckerDims::from_factor_shapes(|n| shapes.get(n).map(Vec::as_slice)),
+            Some(LokrKroneckerDims {
+                a: 2,
+                b: 16,
+                c: 4,
+                d: 8
+            })
+        );
+        // A module with no w2 cannot be sized: fail closed.
+        let broken = root.join("broken.safetensors");
+        write_safetensors(&broken, &[("m.lokr_w1", "BF16", &[2, 4], 2)]);
+        assert_eq!(price(&[spec(&broken)], 2), None);
+
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(
+                &bf16_stack,
+                AdapterResidencyMode::Folded,
+                2,
+                cached
+            ),
             Some(0)
         );
-        assert_eq!(
-            adapter_stack_upcast_resident_bytes(&[], additive, 2),
-            Some(0)
-        );
+        assert_eq!(price(&[], 2), Some(0));
         let missing = vec![spec(&root.join("missing.safetensors"))];
-        assert_eq!(
-            adapter_stack_upcast_resident_bytes(&missing, additive, 2),
-            None
-        );
+        assert_eq!(price(&missing, 2), None);
         let garbage = root.join("garbage.safetensors");
         std::fs::write(&garbage, b"not a safetensors file").unwrap();
-        assert_eq!(
-            adapter_stack_upcast_resident_bytes(&[spec(&garbage)], additive, 2),
-            None
-        );
+        assert_eq!(price(&[spec(&garbage)], 2), None);
     }
 
     #[test]

@@ -891,14 +891,17 @@ fn asset_facts(
         &mut components,
         ADAPTER_STACK_COMPONENT_ID.to_owned(),
         MemoryComponentKind::AdapterStack,
-        // sc-24163: the packed tiers' additive install (`crate::adapters`) holds every factor in f32,
-        // and a projection's forward caches a copy at the activation width beside it, so the stack
-        // is priced per factor element, not at its file length. A conv residual casts per forward
-        // instead of caching, so this is an upper bound for its factors.
+        // sc-24163: the packed tiers' additive install (`crate::adapters`) holds every LoRA and conv
+        // factor in f32, and the residual (`candle_gen::train::lora::LoraLinear`, the conv host)
+        // casts it per forward without keeping the cast, so a LoRA costs 4 bytes per element. A LoKr
+        // goes through `LokrFactors::build` + `push_additive_lokr`, which materializes a low-rank
+        // `w2_a·w2_b` to its full `[b, d]` in f32 and caches `w1`/`w2ᵀ` at the activation width, so
+        // each LoKr module is priced from its Kronecker dims. Neither is the file length.
         gen_core::adapter_stack_upcast_resident_bytes(
             &spec.adapters,
             adapter_mode,
             ACTIVATION_DTYPE.size_in_bytes() as u64,
+            ADAPTER_LORA_COPY,
         )
         .ok_or_else(|| {
             gen_core::Error::Unsupported(
@@ -922,6 +925,11 @@ fn asset_facts(
         components,
     ))
 }
+
+/// How the packed tiers' LoRA residual holds its f32 factors: `candle_gen::train::lora::LoraLinear`
+/// casts them per forward and keeps no copy (sc-24163). The adapters test
+/// `the_packed_overlay_price_matches_the_installed_residuals` pins it against the installed host.
+pub(crate) const ADAPTER_LORA_COPY: gen_core::UpcastLoraCopy = gen_core::UpcastLoraCopy::PerForward;
 
 /// Activation dtype every SDXL-family Candle route computes in. `lib.rs` pins `DType::F16` on the
 /// loaded generator, so this is the provider's real activation width, not a memory-model literal.

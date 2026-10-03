@@ -786,7 +786,13 @@ mod tests {
                     elements * (4 + prepared),
                     "{file_dtype:?} file on a {compute:?} host: f32 factors + the prepared copy"
                 );
-                let priced = adapter_stack_upcast_resident_bytes(&specs, Additive, width).unwrap();
+                let priced = adapter_stack_upcast_resident_bytes(
+                    &specs,
+                    Additive,
+                    width,
+                    gen_core::UpcastLoraCopy::Cached,
+                )
+                .unwrap();
                 assert!(
                     priced >= resident,
                     "{file_dtype:?} on {compute:?}: priced {priced} < resident {resident}"
@@ -803,6 +809,88 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// sc-24163 review: a **low-rank** LoKr is priced at what `LokrFactors::build` +
+    /// `push_lokr_structured` actually hold, not at its stored elements. The build materializes
+    /// `w2 = w2_a·w2_b` to its full `[b, d]` in f32 (here 32×16 = 512 elements against 96 stored),
+    /// and the forward caches `w1` and `w2ᵀ` at the compute width. The candle-gen-qwen-image edit
+    /// stack, the SDXL packed tiers and Qwen-Image 2.1 all install LoKr this way and all price it
+    /// through `gen_core::LokrKroneckerDims`.
+    ///
+    /// *Mutations that red this:* pricing LoKr tensors per stored element like a LoRA, dropping
+    /// the `w2ᵀ` copy from `LokrKroneckerDims::resident_bytes`, or dropping the `w1` copy at a
+    /// narrower compute width.
+    #[test]
+    fn the_overlay_price_covers_an_installed_low_rank_lokr() {
+        use gen_core::{
+            adapter_stack_upcast_resident_bytes, AdapterResidencyMode::Additive, UpcastLoraCopy,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        // w1 [2, 4] ⊗ w2 [32, 16] = [64, 64]; w2 low-rank r = 2.
+        let (a, c, b, d, r) = (2usize, 4usize, 32usize, 16usize, 2usize);
+        let ones = |shape: (usize, usize)| Tensor::ones(shape, DType::BF16, &device).unwrap();
+        let (w1, w2_a, w2_b) = (ones((a, c)), ones((b, r)), ones((r, d)));
+        let path = temp.path().join("lokr.safetensors");
+        let tensors = HashMap::from([
+            ("layers.0.proj.lokr_w1".to_owned(), w1.clone()),
+            ("layers.0.proj.lokr_w2_a".to_owned(), w2_a.clone()),
+            ("layers.0.proj.lokr_w2_b".to_owned(), w2_b.clone()),
+        ]);
+        safetensors::serialize_to_file(
+            tensors.into_iter().collect::<Vec<_>>(),
+            Some(HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "2".to_string()),
+                ("alpha".to_string(), "2".to_string()),
+            ])),
+            &path,
+        )
+        .unwrap();
+        let specs = vec![AdapterSpec::new(path, 1.0, AdapterKind::Lokr)];
+        for (compute, width) in [(DType::F16, 2u64), (DType::F32, 4)] {
+            let (out_f, in_f) = (a * b, c * d);
+            let base = Tensor::zeros((out_f, in_f), compute, &device).unwrap();
+            let mut linear = AdaptLinear::from_dense(Linear::new(base, None), in_f, out_f);
+            let factors = LokrFactors::build(
+                1.0,
+                (out_f, in_f),
+                Some(&w1),
+                None,
+                None,
+                None,
+                None,
+                Some(&w2_a),
+                Some(&w2_b),
+            )
+            .unwrap()
+            .expect("the factors reconstruct the projection");
+            linear.push_lokr_structured(factors).unwrap();
+            let x = Tensor::ones((1, 3, in_f), compute, &device).unwrap();
+            linear.forward(&x).unwrap();
+            let resident = linear.frozen_adapter_bytes() as u64;
+            let priced = adapter_stack_upcast_resident_bytes(
+                &specs,
+                Additive,
+                width,
+                UpcastLoraCopy::Cached,
+            )
+            .unwrap();
+            assert!(
+                priced >= resident,
+                "{compute:?}: priced {priced} < installed {resident}"
+            );
+            assert_eq!(
+                priced, resident,
+                "{compute:?}: a LoKr module is priced exactly"
+            );
+            let stored = ((a * c + b * r + r * d) as u64) * (4 + width);
+            assert!(
+                stored < resident,
+                "per-stored-element pricing ({stored}) under-prices the installed LoKr ({resident})"
+            );
         }
     }
 

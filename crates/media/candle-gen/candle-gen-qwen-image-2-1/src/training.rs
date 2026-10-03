@@ -608,10 +608,12 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
     };
     let copies = (prefix_copy_rows + image_tokens + seq) * facts.inner * w;
     // The frozen base projections whose dead weight gradients are held at the attention peak: the
-    // SwiGLU's three and `to_out`.
-    let dead_weight_grads = DEAD_WEIGHT_GRAD_COPIES
-        * w
-        * (3 * facts.mlp_ratio * facts.inner * facts.inner + facts.inner * facts.inner);
+    // SwiGLU's three and `to_out`. A block whose backward has finished holds all seven (q/k/v too).
+    let swiglu_elements = 3 * facts.mlp_ratio * facts.inner * facts.inner;
+    let dead_weight_grads =
+        DEAD_WEIGHT_GRAD_COPIES * w * (swiglu_elements + facts.inner * facts.inner);
+    let finished_block_dead_weight_grads =
+        DEAD_WEIGHT_GRAD_COPIES * w * (swiglu_elements + 4 * facts.inner * facts.inner);
     let block_backward = (BACKWARD_RETAINED_HIDDEN + BACKWARD_QKV_COTANGENTS) * hidden
         + BACKWARD_HIDDEN_GRADS * hidden_f32;
     let lokr = |per_token: u64| seq * per_token * w;
@@ -631,11 +633,16 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
     } else {
         // One graph over every block, backpropagated in one `GradStore`: every block's forward set
         // is retained, and every processed block's dead weight gradients and retained chains
-        // accumulate until the backward ends.
+        // accumulate until the backward ends. At block 0's attention peak, blocks 1..L have
+        // finished (all seven projections' dead gradients each); block 0 holds the peak subset.
+        let layers = facts.num_layers.max(1);
         (
             facts.num_layers * (block_hidden + copies + scores)
                 + lokr(shape.adapter.lokr_blocks_per_token),
-            score_backward + facts.num_layers * (block_backward + dead_weight_grads),
+            score_backward
+                + facts.num_layers * block_backward
+                + (layers - 1) * finished_block_dead_weight_grads
+                + dead_weight_grads,
         )
     };
     let step = prelude + retained + backward;
@@ -2919,6 +2926,74 @@ mod tests {
         );
         let predicted = training_footprint(&facts, &two_refs).peak();
         assert!(predicted > 97_295 << 20, "two-reference edit: {predicted}");
+        eprintln!(
+            "[sc-24163] two-reference edit: predicted {:.2} GiB",
+            gib(predicted)
+        );
+    }
+
+    /// sc-24163 review: a **dense** (non-checkpointed) step backpropagates one graph in one
+    /// `GradStore`, so at block 0's attention peak every finished block still holds the dead
+    /// gradients of all seven frozen projections (q/k/v, `to_out`, the SwiGLU's three), three copies
+    /// each. Block 0 holds the peak subset (SwiGLU + `to_out`), the same set a checkpointed step
+    /// holds.
+    ///
+    /// *Mutations that red this:* pricing finished blocks with the peak subset (no q/k/v), or
+    /// pricing every block with the full seven.
+    #[test]
+    fn the_dense_step_counts_every_finished_blocks_dead_weight_gradients() {
+        let facts = release_snapshot_facts();
+        let shape = TrainingShape {
+            checkpointed: false,
+            ..measured_cell(NetworkType::Lora, 768, None)
+        };
+        let at = |layers: u64| {
+            training_footprint(
+                &FootprintFacts {
+                    num_layers: layers,
+                    ..facts
+                },
+                &shape,
+            )
+            .train_phase
+        };
+        let (inner, mlp, w) = (facts.inner, facts.mlp_ratio, shape.compute_width);
+        let all_seven = DEAD_WEIGHT_GRAD_COPIES * w * (3 * mlp * inner * inner + 4 * inner * inner);
+        let subset = DEAD_WEIGHT_GRAD_COPIES * w * (3 * mlp * inner * inner + inner * inner);
+        // The per-block terms other than the dead weight gradients, from the formula's own counts:
+        // the retained forward (hidden set, q/k/v copies, scores) and the backward chains.
+        let (side, text) = (768 / 16, shape.caption_tokens);
+        let (target, seq) = (side * side, side * side + text);
+        let hidden = seq * inner * w;
+        let hidden_f32 = seq * inner * F32_WIDTH;
+        let block_hidden = BLOCK_SAVED_HIDDEN * hidden
+            + BLOCK_SAVED_HIDDEN_F32 * hidden_f32
+            + BLOCK_SAVED_PER_MLP_RATIO * mlp * hidden;
+        let copies = (shape.prefix_copy_rows + target + seq) * inner * w;
+        let scores = facts.heads
+            * (target * seq + shape.prefix_scores)
+            * (SCORE_COMPUTE_TENSORS * w + SCORE_F32_TENSORS * F32_WIDTH);
+        let chains = (BACKWARD_RETAINED_HIDDEN + BACKWARD_QKV_COTANGENTS) * hidden
+            + BACKWARD_HIDDEN_GRADS * hidden_f32;
+        let per_block = block_hidden + copies + scores + chains;
+        // Each further block is one more finished block: all seven projections' dead gradients.
+        assert_eq!(at(33) - at(32), per_block + all_seven);
+        // A single block is block 0 alone, holding only the peak subset, exactly as a checkpointed
+        // step's one recomputed block does. The two then differ only by the checkpointed step's
+        // stashed block input and boundary copy.
+        let one_block = FootprintFacts {
+            num_layers: 1,
+            ..facts
+        };
+        let ckpt = TrainingShape {
+            checkpointed: true,
+            ..shape
+        };
+        assert_eq!(
+            training_footprint(&one_block, &ckpt).train_phase - at(1),
+            2 * hidden,
+            "one dense block holds the {subset}-byte subset, not every projection"
+        );
     }
 
     #[test]

@@ -291,13 +291,16 @@ fn adapter_overlay_bytes(spec: &LoadSpec, base: &std::path::Path) -> gen_core::R
     } else {
         AdapterResidencyMode::Folded
     };
-    // sc-24163: the additive install (`crate::adapters`) upcasts every factor to f32 and the bf16
-    // DiT's forward caches a bf16 copy beside it, so the stack is priced per factor element, not at
-    // its file length.
+    // sc-24163: the additive install (`crate::adapters`) upcasts every LoRA factor to f32 and the
+    // bf16 DiT's forward caches a bf16 copy beside it (`AdaptLinear::push_lora`). A LoKr goes through
+    // `LokrFactors::build` + `push_lokr_structured`, which materializes a low-rank `w2_a·w2_b` to its
+    // full `[b, d]` in f32 and caches `w1`/`w2ᵀ` at bf16, so each LoKr module is priced from its
+    // Kronecker dims. Neither is the file length.
     gen_core::adapter_stack_upcast_resident_bytes(
         &spec.adapters,
         mode,
         crate::edit::DIT_DTYPE.size_in_bytes() as u64,
+        gen_core::UpcastLoraCopy::Cached,
     )
     .ok_or_else(|| {
         gen_core::Error::Unsupported(
@@ -1722,6 +1725,66 @@ mod tests {
         let mut rejected = selection(MemoryStrategy::BoundedDecode);
         rejected.parameters.decode_overlap = Some(REJECTED_SUB_512_OVERLAP);
         assert!(contract.validate_selection(&rejected).is_err());
+    }
+
+    /// sc-24163 review: a PEFT-stamped **low-rank** LoKr on the edit stack is priced at what
+    /// `install_additive` holds, not its stored elements. `LokrFactors::build` materializes
+    /// `w2 = w2_a·w2_b` to its full `[b, d]` in f32 and the bf16 forward caches `w1` and `w2ᵀ` at
+    /// bf16. The installed f32 bytes are read off the real build; the bf16 copies are its two
+    /// factors at 2 bytes.
+    ///
+    /// *Mutations that red this:* the edit route pricing at a 4-byte compute width, or LoKr
+    /// tensors priced per stored element.
+    #[test]
+    fn a_low_rank_lokr_on_the_edit_stack_is_priced_at_its_installed_factors() {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = Device::Cpu;
+        let target = "transformer.transformer_blocks.0.attn.to_q";
+        let bf16 = |shape: (usize, usize)| Tensor::ones(shape, DType::BF16, &dev).unwrap();
+        // w1 [4, 8] ⊗ w2 [768, 384] = [3072, 3072], with a rank-4 w2 (4608 stored elements against
+        // 294,912 materialized).
+        let (w1, w2_a, w2_b) = (bf16((4, 8)), bf16((768, 4)), bf16((4, 384)));
+        let lokr = tmp.path().join("lokr.safetensors");
+        safetensors::serialize_to_file(
+            [
+                (format!("{target}.lokr_w1"), w1.clone()),
+                (format!("{target}.lokr_w2_a"), w2_a.clone()),
+                (format!("{target}.lokr_w2_b"), w2_b.clone()),
+            ],
+            Some(std::collections::HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "4".to_string()),
+                ("alpha".to_string(), "4".to_string()),
+            ])),
+            &lokr,
+        )
+        .unwrap();
+        let mut adapted = spec(&tmp);
+        adapted.adapters.push(gen_core::AdapterSpec::new(
+            lokr,
+            1.0,
+            gen_core::AdapterKind::Lokr,
+        ));
+        adapted.prepare_file_sources().unwrap();
+        let contract = provider_contract("qwen_image_edit", &adapted).unwrap();
+        let factors = candle_gen::quant::LokrFactors::build(
+            1.0,
+            (3072, 3072),
+            Some(&w1),
+            None,
+            None,
+            None,
+            None,
+            Some(&w2_a),
+            Some(&w2_b),
+        )
+        .unwrap()
+        .expect("the factors reconstruct to_q");
+        let installed = factors.resident_f32_bytes() as u64 + (4 * 8 + 768 * 384) * 2;
+        assert_eq!(contract.asset_facts.overlay_bytes, installed);
+        let stored = (4 * 8 + 768 * 4 + 4 * 384) * (4 + 2);
+        assert!(contract.asset_facts.overlay_bytes > 20 * stored);
     }
 
     #[test]

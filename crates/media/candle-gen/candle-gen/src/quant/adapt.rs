@@ -610,6 +610,13 @@ impl LokrFactors {
         self.prepared.lock().map_or(0, |prepared| prepared.len())
     }
 
+    /// Device bytes this structured residual holds right now: its factors ([`Self::nbytes`]) plus
+    /// the compute-dtype copies its forwards have cached so far. What an overlay pricing such as
+    /// `gen_core::LokrKroneckerDims::resident_bytes` must cover (sc-24163).
+    pub fn device_bytes(&self) -> usize {
+        self.nbytes() + self.prepared_owned_bytes()
+    }
+
     /// Bytes of the cached compute-dtype copies that own storage: `w1` unless it is the factor's own
     /// dtype (an `Arc` clone then), and the transposed `w2`, which `contiguous` always copies.
     fn prepared_owned_bytes(&self) -> usize {
@@ -1054,9 +1061,7 @@ impl AdaptLinear {
                 Adapter::Lora { a, b, prepared, .. } => {
                     tensor_bytes(a) + tensor_bytes(b) + prepared.owned_bytes(a.dtype())
                 }
-                Adapter::LokrStructured { factors } => {
-                    factors.nbytes() + factors.prepared_owned_bytes()
-                }
+                Adapter::LokrStructured { factors } => factors.device_bytes(),
                 Adapter::TrainableLora { .. } | Adapter::TrainableLokr { .. } => 0,
             })
             .sum()
