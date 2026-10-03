@@ -13,6 +13,9 @@
 
 mod common;
 
+#[path = "adapters.rs"]
+mod adapters;
+
 #[path = "descriptor_conformance.rs"]
 mod descriptor_conformance;
 
@@ -42,6 +45,9 @@ mod text_encoder_parity;
 
 #[path = "tiers.rs"]
 mod tiers;
+
+#[path = "trainer_conformance.rs"]
+mod trainer_conformance;
 
 #[path = "transformer_parity.rs"]
 mod transformer_parity;

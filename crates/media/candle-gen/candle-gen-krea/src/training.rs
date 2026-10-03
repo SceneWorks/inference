@@ -247,6 +247,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -294,6 +295,7 @@ impl Trainer for KreaTrainer {
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
@@ -779,6 +781,7 @@ mod tests {
             caption: "x".into(),
             control_image_path: None,
             model_options: Default::default(),
+            reference_image_paths: Vec::new(),
         };
         let base = TrainingRequest {
             items: vec![item],

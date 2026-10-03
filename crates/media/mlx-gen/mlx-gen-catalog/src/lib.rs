@@ -1827,6 +1827,7 @@ mod tests {
                 "ltx_2_3",
                 "ltx_2_5",
                 "mage_flow_base",
+                "qwen_image_2_1",
                 "sd3_5_large",
                 "sd3_5_medium",
                 "sdxl",
@@ -1844,7 +1845,7 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16666: the licence mapping in [`crate::licenses`] is keyed off exactly these lists, so
-        // this is where a surface change and a mapping change meet. All sixteen trainer ids are
+        // this is where a surface change and a mapping change meet. All seventeen trainer ids are
         // also generator ids, which is why 67 generators + 1 captioner + 2 embedders are 70
         // distinct ids.
         //

@@ -137,19 +137,45 @@ enum Adapter {
         down: Tensor,
         up: Tensor,
         scale: f64,
+        /// [`AdaptLinear::set_trainable_frozen`]: read detached (storage-sharing) views of the
+        /// leaves, so a preview render between optimizer steps builds no autograd graph.
+        frozen: bool,
     },
     /// Training LoKr retains live `Var` leaves and reconstructs only its bounded structured factors
     /// inside the current forward graph. This is the LoKr twin of `TrainableLora`.
     TrainableLokr {
         w1: Tensor,
-        w2: Tensor,
+        w2: TrainableLokrW2,
         base_shape: (usize, usize),
         scale: f64,
+        /// See `TrainableLora::frozen`.
+        frozen: bool,
     },
     /// Structured LoKr residual via the Kronecker vec-trick — the FULL `(alpha/rank)·strength` scale is
     /// baked into [`LokrFactors::w2`], so a LoKr applies WITHOUT ever forming the `[out,in]` delta (the
     /// packed-capable path the whole hoist adds over Wan's old dense-only delta).
     LokrStructured { factors: LokrFactors },
+}
+
+/// The second Kronecker factor of a trainable LoKr: a full `w2` leaf, or PEFT's low-rank
+/// `w2_a·w2_b` pair (`use_w2` off). The low-rank product is rebuilt inside every forward — never
+/// cached at install — so each loss graph ends at the live `w2_a`/`w2_b` leaves and observes every
+/// optimizer update.
+#[derive(Clone)]
+enum TrainableLokrW2 {
+    Full(Tensor),
+    LowRank { a: Tensor, b: Tensor },
+}
+
+/// A trainable leaf as the current forward should read it: the live tensor, or — while the owning
+/// projection is frozen for a graph-free preview — a detached view sharing its storage (so it
+/// still reflects every in-place `Var::set` the optimizer made).
+fn leaf(t: &Tensor, frozen: bool) -> Tensor {
+    if frozen {
+        t.detach()
+    } else {
+        t.clone()
+    }
 }
 
 /// Compute-dtype views of a frozen LoRA's already-oriented factors. This is deliberately absent from
@@ -252,10 +278,15 @@ impl Adapter {
                 let r = apply_factor(&apply_factor(x, &a)?, &b)?;
                 r * *scale
             }
-            Adapter::TrainableLora { down, up, scale } => {
+            Adapter::TrainableLora {
+                down,
+                up,
+                scale,
+                frozen,
+            } => {
                 let xd = x.dtype();
-                let down = down.to_dtype(xd)?;
-                let up = up.to_dtype(xd)?;
+                let down = leaf(down, *frozen).to_dtype(xd)?;
+                let up = leaf(up, *frozen).to_dtype(xd)?;
                 let r = apply_factor(&apply_factor(x, &down.t()?)?, &up.t()?)?;
                 r * *scale
             }
@@ -264,20 +295,32 @@ impl Adapter {
                 w2,
                 base_shape,
                 scale,
-            } => LokrFactors::build(
-                *scale,
-                *base_shape,
-                Some(w1),
-                None,
-                None,
-                Some(w2),
-                None,
-                None,
-                None,
-            )
-            .map_err(|error| candle_core::Error::Msg(error.to_string()))?
-            .ok_or_else(|| candle_core::Error::Msg("trainable LoKr factors lost 2-D shape".into()))?
-            .residual(x),
+                frozen,
+            } => {
+                let w1 = leaf(w1, *frozen);
+                let (full, low_a, low_b) = match w2 {
+                    TrainableLokrW2::Full(w) => (Some(leaf(w, *frozen)), None, None),
+                    TrainableLokrW2::LowRank { a, b } => {
+                        (None, Some(leaf(a, *frozen)), Some(leaf(b, *frozen)))
+                    }
+                };
+                LokrFactors::build(
+                    *scale,
+                    *base_shape,
+                    Some(&w1),
+                    None,
+                    None,
+                    full.as_ref(),
+                    None,
+                    low_a.as_ref(),
+                    low_b.as_ref(),
+                )
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))?
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("trainable LoKr factors lost 2-D shape".into())
+                })?
+                .residual(x)
+            }
             // The `scale` is already baked into `factors.w2`, so the vec-trick returns directly.
             Adapter::LokrStructured { factors } => factors.residual(x),
         }
@@ -297,7 +340,13 @@ impl Adapter {
             }
             Adapter::TrainableLokr { w1, w2, .. } => {
                 *w1 = w1.to_device(device)?;
-                *w2 = w2.to_device(device)?;
+                match w2 {
+                    TrainableLokrW2::Full(w) => *w = w.to_device(device)?,
+                    TrainableLokrW2::LowRank { a, b } => {
+                        *a = a.to_device(device)?;
+                        *b = b.to_device(device)?;
+                    }
+                }
             }
             Adapter::LokrStructured { factors } => {
                 factors.migrate_to(device)?;
@@ -911,6 +960,46 @@ impl AdaptLinear {
         self.out_features
     }
 
+    /// Fold an `[out, in]` delta into a **dense** base weight (`W ← W + δ`), for an adapter type that
+    /// has no deferred additive form (LyCORIS **LoHa** — a Hadamard product of two low-rank pairs).
+    ///
+    /// The sum is computed in f32 on the base weight's device and cast back to the base's storage
+    /// dtype; a fresh weight tensor replaces the old one, so a tensor shared with another holder
+    /// (an mmap'd snapshot, a cloned trunk) is never mutated in place. Attached residuals are kept.
+    ///
+    /// A **packed** (MLX q4/q8) or **NVFP4** base has no dense weight to fold into and is refused
+    /// with a typed `Unsupported` rather than silently dequantized; a delta whose shape is not the
+    /// base's `[out, in]` is refused too.
+    pub fn fold_dense_delta(&mut self, delta: &Tensor) -> Result<()> {
+        let (out_f, in_f) = self.base_shape();
+        if delta.dims() != [out_f, in_f] {
+            return Err(CandleError::Msg(format!(
+                "dense fold: delta {:?} does not match the base [out={out_f}, in={in_f}]",
+                delta.dims()
+            )));
+        }
+        match &mut self.base {
+            Base::Dense(l) => {
+                let w = l.weight();
+                let merged = (w.to_dtype(DType::F32)?
+                    + delta.to_device(w.device())?.to_dtype(DType::F32)?)?
+                .to_dtype(w.dtype())?;
+                let bias = l.bias().cloned();
+                *l = Linear::new(merged, bias);
+                Ok(())
+            }
+            Base::Packed(_) => Err(CandleError::Unsupported(
+                "dense fold: the base is MLX-packed (q4/q8); a delta cannot be folded into \
+                 quantized codes"
+                    .into(),
+            )),
+            Base::Nvfp4(_) => Err(CandleError::Unsupported(
+                "dense fold: the base is NVFP4; a delta cannot be folded into packed E2M1 codes"
+                    .into(),
+            )),
+        }
+    }
+
     /// Whether any additive residual is attached.
     pub fn is_adapted(&self) -> bool {
         !self.adapters.is_empty()
@@ -1057,8 +1146,12 @@ impl AdaptLinear {
     /// [`Self::push_lora`], this deliberately performs the factor transposes during each forward so
     /// every loss graph terminates at the live factor leaves and observes optimizer updates.
     pub fn push_trainable_lora(&mut self, down: Tensor, up: Tensor, scale: f64) {
-        self.adapters
-            .push(Adapter::TrainableLora { down, up, scale });
+        self.adapters.push(Adapter::TrainableLora {
+            down,
+            up,
+            scale,
+            frozen: false,
+        });
     }
 
     /// Attach live full-factor LoKr leaves for training. The base shape is captured here so the
@@ -1066,10 +1159,47 @@ impl AdaptLinear {
     pub fn push_trainable_lokr(&mut self, w1: Tensor, w2: Tensor, scale: f64) {
         self.adapters.push(Adapter::TrainableLokr {
             w1,
-            w2,
+            w2: TrainableLokrW2::Full(w2),
             base_shape: self.base_shape(),
             scale,
+            frozen: false,
         });
+    }
+
+    /// [`Self::push_trainable_lokr`] with PEFT's **low-rank** second factor (`use_w2` off): `w2` is
+    /// `w2_a [out_b, rank] · w2_b [rank, in_b]`, rebuilt from the live leaves inside every forward
+    /// (never cached at install, so no optimizer update is hidden behind a stale product).
+    pub fn push_trainable_lokr_low_rank(
+        &mut self,
+        w1: Tensor,
+        w2_a: Tensor,
+        w2_b: Tensor,
+        scale: f64,
+    ) {
+        self.adapters.push(Adapter::TrainableLokr {
+            w1,
+            w2: TrainableLokrW2::LowRank { a: w2_a, b: w2_b },
+            base_shape: self.base_shape(),
+            scale,
+            frozen: false,
+        });
+    }
+
+    /// Freeze (`true`) or thaw (`false`) every **trainable** residual on this projection. A frozen
+    /// trainable residual reads detached, storage-sharing views of its `Var` leaves, so a forward run
+    /// while frozen (a preview render between optimizer steps) builds no autograd graph yet still sees
+    /// the current factor values; thawing restores the live leaves for the next loss. Frozen
+    /// (inference) residuals are unaffected. The [`AdaptLinear`] twin of
+    /// `train::lora::LoraLinear::freeze_adapter`/`thaw_adapter`.
+    pub fn set_trainable_frozen(&mut self, freeze: bool) {
+        for adapter in &mut self.adapters {
+            match adapter {
+                Adapter::TrainableLora { frozen, .. } | Adapter::TrainableLokr { frozen, .. } => {
+                    *frozen = freeze
+                }
+                Adapter::Lora { .. } | Adapter::LokrStructured { .. } => {}
+            }
+        }
     }
 
     /// Attach a forward-time **structured LoKr** residual via the Kronecker vec-trick: the full
@@ -2684,5 +2814,41 @@ mod tests {
         let (a, b) = lora_pair(in_dim + 1, rank, out_dim);
         let error = host.push_lora_checked(a, b, 1.0).unwrap_err().to_string();
         assert!(error.contains("dense base"), "{error}");
+    }
+
+    /// `fold_dense_delta` adds the delta to a dense base (output moves by exactly `x·δᵀ`, kept at
+    /// the base dtype) and refuses a packed base and a mis-shaped delta with an error, never a
+    /// silent dequantize or skip.
+    #[test]
+    fn fold_dense_delta_adds_on_dense_and_refuses_packed() {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (2usize, 64usize);
+        let w = deterministic_weight(out_dim, in_dim, DType::F32);
+        let mut dense = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
+        let x = Tensor::ones((1, in_dim), DType::F32, &dev).unwrap();
+        let before = dense.forward(&x).unwrap();
+        let delta = Tensor::full(0.5f32, (out_dim, in_dim), &dev).unwrap();
+        dense.fold_dense_delta(&delta).unwrap();
+        let after = dense.forward(&x).unwrap();
+        let moved: Vec<f32> = (after - before)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for value in moved {
+            assert!((value - 32.0).abs() < 1e-4, "x·δᵀ = 64·0.5, got {value}");
+        }
+        assert!(!dense.is_adapted(), "a fold attaches no residual");
+        let wrong = Tensor::zeros((out_dim, in_dim + 1), DType::F32, &dev).unwrap();
+        assert!(dense.fold_dense_delta(&wrong).is_err());
+
+        let (wq, s, b, _grid) = q4_packed(out_dim, in_dim);
+        let packed = QLinear::from_packed(&wq, &s, &b, None, &dev).unwrap();
+        let mut packed = AdaptLinear::from_packed(packed, in_dim, out_dim);
+        match packed.fold_dense_delta(&delta) {
+            Err(CandleError::Unsupported(message)) => assert!(message.contains("packed")),
+            other => panic!("a packed base must refuse the fold, got {other:?}"),
+        }
     }
 }

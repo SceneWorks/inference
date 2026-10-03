@@ -17,8 +17,8 @@ use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::config::VAE_SCALE_FACTOR;
-use crate::reference::PreparedReference;
-use crate::text_encoder::QwenImage21TextEncoder;
+use crate::reference::{prepare_references, PreparedReference};
+use crate::text_encoder::{QwenImage21TextEncoder, TextConditioning};
 use crate::transformer::{JointLayout, QwenImage21Transformer, Segment};
 use crate::vae::QwenImage21Vae;
 
@@ -199,6 +199,75 @@ pub fn text_rows(hidden: &Array, image_pad_mask: &[bool]) -> Result<Array> {
     Ok(hidden.take_axis(&index, 1)?)
 }
 
+/// One prompt branch of the joint sequence, assembled for the DiT: the text rows `txt_in`
+/// consumes ([`text_rows`]) and the interleaved layout ([`joint_layout`]) that the text and every
+/// image block follow.
+///
+/// Built by [`joint_branch`] — the **single** assembly both the render path ([`crate::model`]) and
+/// the edit trainer ([`crate::training`], sc-24161) run, so a trained edit adapter is fitted on
+/// exactly the sequence it is later rendered with: the same image-conditioned template (vision
+/// tokens included), the same reference order, block boundaries, positional ids and RoPE offsets
+/// ([`JointLayout::position_ids`]). With no references it is the text-to-image layout
+/// `[Text, Image(target)]` over the unmodified hidden states.
+#[derive(Clone, Debug)]
+pub struct JointBranch {
+    /// `[1, text_len, hidden]` — the conditioning with the vision-slot rows removed.
+    pub text: Array,
+    /// The joint text/image layout, target block last.
+    pub layout: JointLayout,
+}
+
+/// Assemble one prompt branch ([`JointBranch`]) from its encoded conditioning, the ordered
+/// prepared references it was encoded with, and the target's `width × height`.
+pub fn joint_branch(
+    conditioning: &TextConditioning,
+    references: &[PreparedReference],
+    width: u32,
+    height: u32,
+) -> Result<JointBranch> {
+    let layout = joint_layout(&conditioning.image_pad_mask, references, width, height)?;
+    let text = text_rows(&conditioning.hidden, &conditioning.image_pad_mask)?;
+    Ok(JointBranch { text, layout })
+}
+
+/// The ordered image stream [`QwenImage21Transformer::forward_joint`] consumes for a layout built
+/// by [`joint_branch`]: every condition latent in reference order, then the target —
+/// upstream's `latent_model_input = cat([*reference_latents, latents], dim=1)`. Shared by the
+/// denoise loop and the edit trainer's forward.
+pub fn joint_images<'a>(reference_latents: &'a [Array], target: &'a Array) -> Vec<&'a Array> {
+    let mut images: Vec<&'a Array> = Vec::with_capacity(reference_latents.len() + 1);
+    images.extend(reference_latents.iter());
+    images.push(target);
+    images
+}
+
+/// Host-preprocess an ordered reference list against the loaded tower's own Qwen3-VL processor
+/// geometry ([`prepare_references`]). Empty ⇒ the text-to-image route (no vision tower needed); a
+/// non-empty list on a snapshot that ships no vision tower is a typed refusal. Shared by the render
+/// path and the edit trainer.
+pub fn prepare_conditioning_references(
+    text_encoder: &QwenImage21TextEncoder,
+    images: &[RgbaImage],
+) -> Result<Vec<PreparedReference>> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vision = text_encoder
+        .vision_config()
+        .ok_or_else(missing_vision_tower)?;
+    prepare_references(images, vision)
+}
+
+/// The typed refusal for reference conditioning on a snapshot without a Qwen3-VL vision tower.
+pub fn missing_vision_tower() -> Error {
+    Error::Unsupported(
+        "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL vision tower \
+         (`text_encoder/config.json` `vision_config` + `model.visual.*`), which this snapshot \
+         does not carry"
+            .into(),
+    )
+}
+
 /// The reference conditioning one denoise run carries: the packed condition latents (in order)
 /// and the joint layout of each branch.
 pub struct ReferenceConditioning<'a> {
@@ -250,11 +319,12 @@ pub fn denoise(inputs: DenoiseInputs<'_>, on_progress: &mut dyn FnMut(Progress))
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
         let branch = |text: &Array, layout: Option<&JointLayout>| -> Result<Array> {
             match (references, layout) {
-                (Some(conditioning), Some(layout)) => {
-                    let mut images: Vec<&Array> = conditioning.latents.iter().collect();
-                    images.push(latents);
-                    transformer.forward_joint(text, &images, sigma, layout)
-                }
+                (Some(conditioning), Some(layout)) => transformer.forward_joint(
+                    text,
+                    &joint_images(conditioning.latents, latents),
+                    sigma,
+                    layout,
+                ),
                 _ => transformer.forward(latents, text, sigma, h, w),
             }
         };

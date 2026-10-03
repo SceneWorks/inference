@@ -291,7 +291,11 @@ fn wan_candidates(family: &str, path: &str) -> Vec<LoraCandidate> {
         .collect()
 }
 
+/// Strip a raw PEFT `PeftModel.save_pretrained` wrapper (`base_model.model.`, sc-24158), then a
+/// leading [`wmeta::COMMON_LORA_PREFIXES`] namespace. No visitor path begins with `base_model`, so
+/// the wrapper strip only ever turns an unmatched key into its matching dotted path.
 fn strip_prefix(key: &str) -> &str {
+    let key = key.strip_prefix("base_model.model.").unwrap_or(key);
     for prefix in wmeta::COMMON_LORA_PREFIXES {
         if let Some(rest) = key.strip_prefix(prefix) {
             return rest;
@@ -719,6 +723,15 @@ mod tests {
         assert_eq!(
             classify_lokr_key("transformer.layers.0.attn.q.lokr_w2_b"),
             Some(("layers.0.attn.q".into(), "lokr_w2_b"))
+        );
+        // sc-24158: a raw PEFT `save_pretrained` wrapper, alone or over a namespace.
+        assert_eq!(
+            classify_lora_key("base_model.model.layers.0.attn.q.lora_A.weight"),
+            Some(("layers.0.attn.q".into(), Role::Down))
+        );
+        assert_eq!(
+            classify_lora_key("base_model.model.transformer.layers.0.attn.q.lora_B.weight"),
+            Some(("layers.0.attn.q".into(), Role::Up))
         );
     }
 

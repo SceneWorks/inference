@@ -15,8 +15,8 @@ use candle_gen::run_flow_sampler;
 use candle_gen::{CandleError as Error, Result};
 
 use crate::config::VAE_SCALE_FACTOR;
-use crate::reference::PreparedReference;
-use crate::text_encoder::QwenImage21TextEncoder;
+use crate::reference::{prepare_references, PreparedReference};
+use crate::text_encoder::{QwenImage21TextEncoder, TextConditioning};
 use crate::transformer::{JointLayout, QwenImage21Transformer, Segment};
 use crate::vae::QwenImage21Vae;
 
@@ -208,6 +208,69 @@ pub fn text_rows(hidden: &Tensor, image_pad_mask: &[bool]) -> Result<Tensor> {
     Ok(hidden.index_select(&index, 1)?.contiguous()?)
 }
 
+/// One prompt branch as the DiT consumes it: the conditioning's text rows and the joint layout
+/// (condition blocks interleaved with the text, target block last). The render path builds one per
+/// CFG branch; the edit trainer (sc-24162) builds one per dataset item through the same
+/// [`joint_branch`], so the two cannot drift.
+pub struct JointBranch {
+    /// `[1, text_len, hidden]` — the conditioning with the vision-slot rows removed.
+    pub text: Tensor,
+    /// The joint text/image layout, target block last.
+    pub layout: JointLayout,
+}
+
+/// Assemble one prompt branch ([`JointBranch`]) from its encoded conditioning, the ordered
+/// prepared references it was encoded with, and the target's `width × height`:
+/// [`joint_layout`] over the image-pad mask and [`text_rows`] of the hidden states.
+pub fn joint_branch(
+    conditioning: &TextConditioning,
+    references: &[PreparedReference],
+    width: u32,
+    height: u32,
+) -> Result<JointBranch> {
+    let layout = joint_layout(&conditioning.image_pad_mask, references, width, height)?;
+    let text = text_rows(&conditioning.hidden, &conditioning.image_pad_mask)?;
+    Ok(JointBranch { text, layout })
+}
+
+/// The ordered image stream [`QwenImage21Transformer::forward_joint`] consumes for a layout built
+/// by [`joint_branch`]: every condition latent in reference order, then the target — upstream's
+/// `latent_model_input = cat([*reference_latents, latents], dim=1)`. Shared by the denoise loop and
+/// the edit trainer's forward (sc-24162).
+pub fn joint_images<'a>(reference_latents: &'a [Tensor], target: &'a Tensor) -> Vec<&'a Tensor> {
+    let mut images: Vec<&'a Tensor> = Vec::with_capacity(reference_latents.len() + 1);
+    images.extend(reference_latents.iter());
+    images.push(target);
+    images
+}
+
+/// Host-preprocess an ordered reference list against the loaded tower's own Qwen3-VL processor
+/// geometry ([`prepare_references`]). Empty ⇒ the text-to-image route (no vision tower needed); a
+/// non-empty list on a snapshot that ships no vision tower is a typed refusal
+/// ([`missing_vision_tower`]). Shared by the render path and the edit trainer (sc-24162).
+pub fn prepare_conditioning_references(
+    text_encoder: &QwenImage21TextEncoder,
+    images: &[RgbaImage],
+) -> Result<Vec<PreparedReference>> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vision = text_encoder
+        .vision_config()
+        .ok_or_else(missing_vision_tower)?;
+    prepare_references(images, vision, text_encoder.device())
+}
+
+/// The typed refusal for reference conditioning on a snapshot without a Qwen3-VL vision tower.
+pub fn missing_vision_tower() -> Error {
+    Error::Unsupported(
+        "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL vision tower \
+         (`text_encoder/config.json` `vision_config` + `model.visual.*`), which this snapshot \
+         does not carry"
+            .to_string(),
+    )
+}
+
 /// The reference conditioning one denoise run carries: the packed condition latents (in order)
 /// and the joint layout of each branch.
 pub struct ReferenceConditioning<'a> {
@@ -259,8 +322,7 @@ pub fn denoise(inputs: DenoiseInputs<'_>, on_progress: &mut dyn FnMut(Progress))
         let branch = |text: &Tensor, layout: Option<&JointLayout>| -> Result<Tensor> {
             match (references, layout) {
                 (Some(conditioning), Some(layout)) => {
-                    let mut images: Vec<&Tensor> = conditioning.latents.iter().collect();
-                    images.push(latents);
+                    let images = joint_images(conditioning.latents, latents);
                     transformer.forward_joint(text, &images, sigma, layout)
                 }
                 _ => transformer.forward(latents, text, sigma, h, w),

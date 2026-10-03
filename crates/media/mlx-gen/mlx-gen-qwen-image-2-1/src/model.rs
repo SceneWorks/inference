@@ -19,10 +19,10 @@ use mlx_gen::{
 use crate::config::{SchedulerConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, PRESETS, SIZE_MULTIPLE};
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_layout, text_rows,
-    DenoiseInputs, ReferenceConditioning,
+    create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_branch,
+    prepare_conditioning_references, DenoiseInputs, JointBranch, ReferenceConditioning,
 };
-use crate::reference::{collect_references, prepare_references};
+use crate::reference::{collect_references, PreparedReference};
 use crate::scheduler;
 use crate::text_encoder::{system_prompt_drop_count, QwenImage21TextEncoder};
 use crate::transformer::QwenImage21Transformer;
@@ -80,8 +80,12 @@ pub fn descriptor() -> ModelDescriptor {
             // that would have to fabricate an alpha to honour the flag. Whether a given render is
             // actually transparent is decided by the prompt, not by this bit; see UPSTREAM.md.
             supports_alpha_output: true,
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA + LoKr (sc-24156): installed onto every DiT Linear through the
+            // transformer's `AdaptableHost`, stacked and mixed via the shared strict seam, as
+            // residuals after any Q4/Q8 — so on every tier and on every route (T2I and the
+            // reference/edit path share the one DiT `load_heavy` builds).
+            supports_lora: true,
+            supports_lokr: true,
             samplers: curated_sampler_names(),
             schedulers: curated_scheduler_names(),
             min_size: MIN_SIZE,
@@ -157,11 +161,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(PRECISION_OVERRIDE_REFUSAL.into()));
     }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Unsupported(
-            "qwen_image_2_1: LoRA/LoKr adapters are not wired for Qwen-Image 2.1 yet".into(),
-        ));
-    }
     if spec.text_encoder.is_some() {
         return Err(Error::Unsupported(
             "qwen_image_2_1: the Qwen3-VL text encoder is loaded from the snapshot's own \
@@ -184,6 +183,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
     // through the memory registration.
     let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
+    // `Resident` builds the DiT (and installs the adapters) right here; `Sequential` defers that to
+    // every generate, where an unmatched adapter key would fail each request instead of the load.
+    // Resolve the stack now so both policies refuse a bad key at load, by name.
+    if spec.offload_policy == gen_core::OffloadPolicy::Sequential && !spec.adapters.is_empty() {
+        validate_adapters_on_lazy_dit(spec)?;
+    }
     let tokenizer = loader::load_tokenizer(root)?;
     let drop_count = system_prompt_drop_count(&tokenizer)?;
     let scheduler = loader::load_scheduler_config(root)?;
@@ -249,6 +254,29 @@ fn load_text_encoder(spec: &LoadSpec) -> Result<QwenImage21TextEncoder> {
     Ok(encoder)
 }
 
+/// Run the exact `load_heavy` adapter install — same quantize decision, same strict seam, same
+/// key→module map — against a DiT that is only a lazy graph, and drop it unevaluated.
+///
+/// MLX safetensors loads, the load-time quantize and the adapter install are all lazy graph
+/// construction; nothing here calls `eval` or `materialize_accessed` (which
+/// [`loader::load_transformer`] does), so no DiT weight is read and a `Sequential` load keeps its
+/// `max(text encoder, DiT + VAE)` bound. What it does do is resolve every adapter key against the
+/// real module tree, so an unmatched key fails here with the same named error the `Resident`
+/// install raises.
+fn validate_adapters_on_lazy_dit(spec: &LoadSpec) -> Result<()> {
+    let root: &Path = loader::snapshot_root(&spec.weights)?;
+    let mut probe = loader::load_transformer_lazy(root)?;
+    if crate::quant::needs_load_time_quant(root, spec.quantize)? {
+        let bits = spec
+            .quantize
+            .expect("needs_load_time_quant is false without a requested tier")
+            .bits();
+        probe.quantize(bits)?;
+    }
+    crate::adapters::apply_qwen_image_2_1_adapters(&mut probe, &spec.adapters)?;
+    Ok(())
+}
+
 fn load_heavy(spec: &LoadSpec) -> Result<Heavy> {
     let root: &Path = loader::snapshot_root(&spec.weights)?;
     let mut transformer = loader::load_transformer(root)?;
@@ -260,6 +288,13 @@ fn load_heavy(spec: &LoadSpec) -> Result<Heavy> {
             .expect("needs_load_time_quant is false without a requested tier")
             .bits();
         transformer.quantize(bits)?;
+    }
+    // LoRA/LoKr (sc-24156): installed AFTER quantization, as forward-time residuals over the dense
+    // or packed base, so a tier never has to re-pack an adapted Linear and every tier takes the
+    // same adapters. Strict: an adapter key that resolves to no DiT Linear fails the load by name.
+    // Every route (T2I and the reference/edit path) renders through this one DiT.
+    if !spec.adapters.is_empty() {
+        crate::adapters::apply_qwen_image_2_1_adapters(&mut transformer, &spec.adapters)?;
     }
     let vae = loader::load_vae(root)?;
     Ok(Heavy { transformer, vae })
@@ -353,12 +388,16 @@ impl QwenImage21 {
         // (freed buffers above it go back to the OS instead of pooling to the device's working-set
         // line, which is what let the footprint reach 110 GB), memory limit = resident + budget
         // (uncredited defence in depth against the eval pipeline's run-ahead). Restored on drop.
+        // The resident term credits the installed adapter stack (sc-24156) — its residual factors
+        // and any materialized LyCORIS deltas, exactly as the loaded contract prices them in
+        // `overlay_bytes` — so an adapter load does not run under a limit sized for the bare base.
         let _bounds = crate::memory_strategy::AllocatorBounds::enter(
             crate::memory_strategy::derived::resident_weights(
                 crate::quant::Tier::from_selected(self.spec.quantize)
                     .unwrap_or(crate::quant::Tier::Bf16),
             )
-            .resident_total(),
+            .resident_total()
+            .saturating_add(self.memory_strategy.asset_facts.overlay_bytes),
             crate::memory_strategy::derived::request_transient_budget_bytes(
                 req.width,
                 req.height,
@@ -385,65 +424,22 @@ impl QwenImage21 {
             false,
             on_progress,
             |te: &QwenImage21TextEncoder| {
-                // The ordered reference list, host-preprocessed against the snapshot's own
-                // Qwen3-VL processor geometry. Empty ⇒ the text-to-image route, unchanged.
-                let images = collect_references(req)?;
-                let references = if images.is_empty() {
-                    Vec::new()
-                } else {
-                    let vision = te.vision_config().ok_or_else(|| {
-                        Error::Unsupported(
-                            "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL \
-                             vision tower (`text_encoder/config.json` `vision_config` + \
-                             `model.visual.*`), which this snapshot does not carry"
-                                .into(),
-                        )
-                    })?;
-                    prepare_references(&images, vision)?
-                };
-                let pos =
-                    te.encode_conditioning(&self.tokenizer, &req.prompt, drop, &references)?;
-                let neg = if params.use_negative {
-                    Some(te.encode_conditioning(
-                        &self.tokenizer,
-                        req.negative_prompt.as_deref().unwrap_or(""),
-                        drop,
-                        &references,
-                    )?)
-                } else {
-                    None
-                };
-                // MLX is lazy: force the conditioning while the encoder is alive, so a Sequential
-                // drop cannot leave an unevaluated graph pointing at freed weights.
-                match &neg {
-                    Some(neg) => mlx_rs::transforms::eval([&pos.hidden, &neg.hidden])?,
-                    None => mlx_rs::transforms::eval([&pos.hidden])?,
-                }
-                Ok((pos, neg, references))
+                assemble_reference_branches(te, &self.tokenizer, req, drop, params.use_negative)
             },
             |_| Ok(()),
-            |heavy, (pos, neg, references), on_progress| {
+            |heavy, branches, on_progress| {
+                let ReferenceBranches {
+                    pos,
+                    neg,
+                    references,
+                } = branches;
                 let channels = heavy.transformer.config().in_channels;
-                // The joint layout + the condition latents: both branches share one reference
-                // encode, but a different prompt is a different text length, hence two layouts.
+                // The condition latents: both branches share one reference encode.
                 let reference_latents = encode_references(&heavy.vae, &references)?;
-                let pos_layout =
-                    joint_layout(&pos.image_pad_mask, &references, req.width, req.height)?;
-                let neg_layout = neg
-                    .as_ref()
-                    .map(|neg| {
-                        joint_layout(&neg.image_pad_mask, &references, req.width, req.height)
-                    })
-                    .transpose()?;
-                let pos_text = text_rows(&pos.hidden, &pos.image_pad_mask)?;
-                let neg_text = neg
-                    .as_ref()
-                    .map(|neg| text_rows(&neg.hidden, &neg.image_pad_mask))
-                    .transpose()?;
                 let conditioning = (!references.is_empty()).then(|| ReferenceConditioning {
                     latents: &reference_latents,
-                    layout: &pos_layout,
-                    negative_layout: neg_layout.as_ref(),
+                    layout: &pos.layout,
+                    negative_layout: neg.as_ref().map(|neg| &neg.layout),
                 });
                 // ONE decode per image either way — upstream always decodes four channels and
                 // has no transparency flag — so this branch chooses only whether the alpha is
@@ -461,8 +457,8 @@ impl QwenImage21 {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
                             latents,
-                            prompt_embeds: &pos_text,
-                            negative_embeds: neg_text.as_ref(),
+                            prompt_embeds: &pos.text,
+                            negative_embeds: neg.as_ref().map(|neg| &neg.text),
                             true_cfg_scale: params.true_cfg,
                             width: req.width,
                             height: req.height,
@@ -516,6 +512,54 @@ impl QwenImage21 {
             },
         )
     }
+}
+
+/// The conditioning one render carries, assembled while the text encoder is resident: the
+/// positive (and, with true CFG, negative) [`JointBranch`] and the ordered prepared references.
+pub(crate) struct ReferenceBranches {
+    pub(crate) pos: JointBranch,
+    pub(crate) neg: Option<JointBranch>,
+    pub(crate) references: Vec<PreparedReference>,
+}
+
+/// The render path's whole text-side assembly for `req`: the ordered reference list
+/// ([`collect_references`]), host-preprocessed against the snapshot's own Qwen3-VL geometry
+/// ([`prepare_conditioning_references`]; empty ⇒ the text-to-image route, unchanged), each
+/// prompt encoded with those references and assembled by [`joint_branch`] at the request's size —
+/// a different prompt is a different text length, hence one layout per branch. The text rows are
+/// forced while the encoder is alive, so a Sequential drop cannot leave an unevaluated graph
+/// pointing at freed weights.
+///
+/// Factored out of `generate` so the edit trainer's equivalence test (sc-24161) compares against
+/// the code the render path actually runs, not a re-implementation of it.
+pub(crate) fn assemble_reference_branches(
+    te: &QwenImage21TextEncoder,
+    tokenizer: &TextTokenizer,
+    req: &GenerationRequest,
+    drop: usize,
+    use_negative: bool,
+) -> Result<ReferenceBranches> {
+    let images = collect_references(req)?;
+    let references = prepare_conditioning_references(te, &images)?;
+    let branch = |prompt: &str| -> Result<JointBranch> {
+        let conditioning = te.encode_conditioning(tokenizer, prompt, drop, &references)?;
+        joint_branch(&conditioning, &references, req.width, req.height)
+    };
+    let pos = branch(&req.prompt)?;
+    let neg = if use_negative {
+        Some(branch(req.negative_prompt.as_deref().unwrap_or(""))?)
+    } else {
+        None
+    };
+    match &neg {
+        Some(neg) => mlx_rs::transforms::eval([&pos.text, &neg.text])?,
+        None => mlx_rs::transforms::eval([&pos.text])?,
+    }
+    Ok(ReferenceBranches {
+        pos,
+        neg,
+        references,
+    })
 }
 
 /// Capability-driven request validation: the shared floor (count, size range + 32-px grid,
