@@ -84,9 +84,10 @@ pub use constraint::{
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
 pub use kv_compression::{
-    kv_model_family, plan_kv_cache, plan_kv_cache_without_reader, qualify_kv_compression,
-    qualify_kv_sequence, KvCacheCounters, KvCacheFallbackReason, KvCachePlan, KvCacheReport,
-    KvCacheRequest, KvCompressionFormat, KvCompressionPolicy, KvModelFamily, KvQualification,
+    compressed_kv_cache_bytes, kv_model_family, plan_kv_cache, plan_kv_cache_without_reader,
+    qualify_kv_compression, qualify_kv_sequence, CompressedKvAllocation, KvCacheCounters,
+    KvCacheFallbackReason, KvCachePlan, KvCacheReport, KvCacheRequest, KvCacheShape,
+    KvCompressionFormat, KvCompressionPolicy, KvModelFamily, KvQualification,
     KV_CACHE_FORMAT_VERSION, KV_COMPRESSION_QUALIFICATIONS,
 };
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
@@ -122,9 +123,9 @@ pub use resource::{
     admit_request_memory, admit_request_memory_with_geometry, available_host_memory_bytes,
     checkpoint_payload_bytes, checkpoint_staging_bytes, effective_memory_budget,
     estimate_chunked_request_bytes, estimate_chunked_request_bytes_with_recurrent_copies,
-    estimate_request_bytes, estimate_tiled_request_bytes_with_recurrent_copies,
-    operational_memory_override, tiled_prefill_activation_bytes, LlmMemoryGeometry,
-    AVAILABLE_MEMORY_OVERRIDE,
+    estimate_request_bytes, estimate_tiled_request_bytes_with_kv_bytes,
+    estimate_tiled_request_bytes_with_recurrent_copies, operational_memory_override,
+    tiled_prefill_activation_bytes, LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{

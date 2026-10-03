@@ -662,8 +662,12 @@ mod compressed_tests {
         let model = crate::provider::tests::tiny_causal_model(4, 2, 64);
         let reader = crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap();
         let compressed = || {
-            let (cache, refused) =
-                crate::kv_policy::select_compressed_cache(&model, reader.clone(), prompt().len());
+            let (cache, refused) = crate::kv_policy::select_compressed_cache(
+                &model,
+                reader.clone(),
+                prompt().len(),
+                crate::provider::tests::admit_any_transition(),
+            );
             assert_eq!(refused, None, "the request starts on the compressed cache");
             cache
         };
