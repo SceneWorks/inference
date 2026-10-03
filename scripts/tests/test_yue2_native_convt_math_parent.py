@@ -1,13 +1,18 @@
 """CPU-only parent artifact and stage-2 selector guard regressions."""
+import ast
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.request
 import zipfile
+
+from scripts.tests.test_script_encoding import violations
 
 CI = Path(__file__).resolve().parents[1] / "ci"
 sys.path.insert(0, str(CI))
@@ -20,6 +25,47 @@ def sha(value: bytes) -> str:
 
 
 class NativeMathParent(unittest.TestCase):
+    def test_parent_binary_transport_passes_repository_encoding_guard(self):
+        source = Path(parent.__file__).read_text(encoding="utf-8")
+        self.assertEqual(violations(ast.parse(source)), [])
+
+    def test_fetch_installs_redirect_policy_before_authenticated_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "parent.zip"
+            anchor_path = root / "anchor.json"
+            archive_bytes = b"SYNTHETIC_ZIP_ONLY"
+            anchor = {"metricsArtifactId": 42, "metricsArtifactName": "synthetic-parent",
+                      "metricsZipSha256": sha(archive_bytes), "runId": 7,
+                      "controlSha": "a" * 40}
+            anchor_path.write_text(json.dumps(anchor), encoding="utf-8")
+            metadata = {"id": 42, "name": "synthetic-parent", "expired": False,
+                        "workflow_run": {"id": 7, "head_sha": "a" * 40}}
+            calls = []
+            events = []
+
+            def fake_urlopen(request, *, timeout):
+                self.assertEqual(events, ["installed"])
+                calls.append((request.full_url, request.get_header("Authorization"), timeout))
+                if request.full_url.endswith("/zip"):
+                    return io.BytesIO(archive_bytes)
+                return io.BytesIO(json.dumps(metadata).encode("utf-8"))
+
+            opener = Mock()
+            with (patch.object(parent, "ANCHOR", anchor_path),
+                  patch.dict(os.environ, {"GITHUB_TOKEN": "SYNTHETIC_ONLY"}),
+                  patch.object(parent.urllib.request, "build_opener", return_value=opener) as build,
+                  patch.object(parent.urllib.request, "install_opener",
+                               side_effect=lambda selected: events.append("installed")) as install,
+                  patch.object(parent.urllib.request, "urlopen", side_effect=fake_urlopen)):
+                parent.fetch_parent(archive)
+            self.assertIsInstance(build.call_args.args[0], parent.ArtifactRedirects)
+            install.assert_called_once_with(opener)
+            self.assertEqual(archive.read_bytes(), archive_bytes)
+            self.assertEqual([call[1] for call in calls], ["Bearer SYNTHETIC_ONLY"] * 2)
+            self.assertTrue(calls[0][0].startswith("https://api.github.com/"))
+            self.assertEqual(calls[1][0], calls[0][0] + "/zip")
+
     def test_https_redirect_credentials_stay_on_original_origin_only(self):
         handler = parent.ArtifactRedirects()
         request = urllib.request.Request(

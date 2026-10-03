@@ -84,7 +84,7 @@ def verify_parent_zip(archive: Path, destination: Path) -> dict:
                         not source.getinfo(name).is_dir(), "unsafe parent ZIP entry")
                 target = destination / name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with source.open(name) as stream, target.open("xb") as sink:
+                with zipfile.Path(source, name).open("rb") as stream, target.open("xb") as sink:
                     shutil.copyfileobj(stream, sink, length=8 * 1024 * 1024)
         report_path = destination / "data/report.json"
         require(digest(report_path) == anchor["reportSha256"], "parent report changed")
@@ -136,8 +136,10 @@ def fetch_parent(archive: Path) -> None:
            + str(anchor["metricsArtifactId"]))
     headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
-    opener = urllib.request.build_opener(ArtifactRedirects())
-    with opener.open(urllib.request.Request(api, headers=headers), timeout=30) as response:
+    # This helper is a standalone process; install the scoped redirect policy for
+    # both URL requests without changing their authenticated GitHub API origin.
+    urllib.request.install_opener(urllib.request.build_opener(ArtifactRedirects()))
+    with urllib.request.urlopen(urllib.request.Request(api, headers=headers), timeout=30) as response:
         metadata = json.load(response)
     require(metadata["id"] == anchor["metricsArtifactId"] and
             metadata["name"] == anchor["metricsArtifactName"] and
@@ -147,7 +149,7 @@ def fetch_parent(archive: Path) -> None:
             "parent artifact provenance changed")
     require(not archive.exists(), "parent archive destination already exists")
     try:
-        with opener.open(urllib.request.Request(api + "/zip", headers=headers), timeout=60) as source, archive.open("xb") as sink:
+        with urllib.request.urlopen(urllib.request.Request(api + "/zip", headers=headers), timeout=60) as source, archive.open("xb") as sink:
             shutil.copyfileobj(source, sink, length=8 * 1024 * 1024)
         require(digest(archive) == anchor["metricsZipSha256"], "parent artifact ZIP digest changed")
     except BaseException:
