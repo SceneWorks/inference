@@ -1503,30 +1503,7 @@ impl Yue2Engine {
                 ..self.default_settings()
             },
         );
-        let mut config = source_config.as_object().cloned().unwrap_or_default();
-        // This is a NEW decode under the currently selected VAE policy. The historical source
-        // configuration remains byte-for-byte in source_generation.json below; config.json names
-        // the loaded target policy and model dtype, even when the input latents came from Legacy.
-        for key in [
-            "compute_policy",
-            "effective_stage_dtypes",
-            "fp32_numerical_internals",
-        ] {
-            config.remove(key);
-            if let Some(value) = current.get(key) {
-                config.insert(key.into(), value.clone());
-            }
-        }
-        for key in [
-            "model_dtype",
-            "vae_dtype",
-            "vae_decode",
-            "vae_core_frames",
-            "vae_halo_frames",
-            "decoder_release",
-        ] {
-            config.insert(key.into(), current.get(key).cloned().unwrap_or(Value::Null));
-        }
+        let mut config = cached_decode_current_config(&source_config, &current);
         let digest = |name: &str| durable::sha256_file(&source.join(name)).map(|(sha, _)| sha);
         config.insert(
             "cached_decode".into(),
@@ -1588,6 +1565,34 @@ impl Yue2Engine {
             stages,
         })
     }
+}
+
+/// A cached decode executes the currently loaded VAE. Keep the source's other configuration for
+/// provenance, but replace every effective target policy field (including a newly absent one).
+fn cached_decode_current_config(source: &Value, current: &Value) -> Map<String, Value> {
+    let mut config = source.as_object().cloned().unwrap_or_default();
+    for key in [
+        "compute_policy",
+        "effective_stage_dtypes",
+        "fp32_numerical_internals",
+        "vae_cuda_bf16_math_policy",
+    ] {
+        config.remove(key);
+        if let Some(value) = current.get(key) {
+            config.insert(key.into(), value.clone());
+        }
+    }
+    for key in [
+        "model_dtype",
+        "vae_dtype",
+        "vae_decode",
+        "vae_core_frames",
+        "vae_halo_frames",
+        "decoder_release",
+    ] {
+        config.insert(key.into(), current.get(key).cloned().unwrap_or(Value::Null));
+    }
+    config
 }
 
 #[cfg(test)]

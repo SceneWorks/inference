@@ -6,6 +6,7 @@ engine activity, and no rise in its device residency. Missing data refuses.
 """
 from __future__ import annotations
 
+import base64
 import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -18,7 +19,7 @@ import subprocess
 import tempfile
 
 RUN_ID = "37073714206"
-ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
+BASELINE_ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
 BASELINE_CONTROL_SHA = "3391f854565a5f5ea8eea48d4a8d9bad2e68c02d"
 BASELINE_DIGEST = "a05afe09223020d39f698f9ec5ed9bc4f2258a1fa8950e69ee4fa9e2769339a1"
 BASELINE_RUNNER = "cuda-windows-2"
@@ -247,15 +248,24 @@ def validate_current(current: dict, baseline: dict) -> None:
 
 
 def check_window(completed_utc: str, now: datetime) -> None:
-    completed = datetime.fromisoformat(completed_utc.replace("Z", "+00:00"))
+    completed = parse_completed_utc(completed_utc)
     require(completed <= now <= completed + WINDOW, "reviewed owner window expired or not yet open")
+
+
+def parse_completed_utc(completed_utc: str) -> datetime:
+    # PowerShell writes 100-ns ticks; datetime retains microseconds. Truncate
+    # the seventh digit so the expiration is conservative by at most 0.9 us.
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})\dZ", completed_utc)
+    require(match is not None, "reviewed owner completion timestamp invalid")
+    return datetime.fromisoformat(match.group(1) + "+00:00")
 
 
 def check_dispatch(run_id: str | None, engine_sha: str | None,
                    control_sha: str | None, github_sha: str | None) -> None:
     require(run_id == RUN_ID, "no reviewed owner-window run selected")
-    require(engine_sha == ENGINE_SHA and control_sha == github_sha and
-            bool(control_sha) and re.fullmatch(r"[0-9a-f]{40}", control_sha) is not None,
+    require(bool(engine_sha) and re.fullmatch(r"[0-9a-f]{40}", engine_sha) is not None and
+            control_sha == github_sha and bool(control_sha) and
+            re.fullmatch(r"[0-9a-f]{40}", control_sha) is not None,
             "reviewed source/control SHA mismatch")
 
 
@@ -282,8 +292,17 @@ def reviewed_baseline() -> tuple[dict, Path]:
     directory = Path(path)
     verify_artifact(directory)
     baseline = summarize(directory, baseline=True, pid=38212,
-                         engine_sha=ENGINE_SHA, control_sha=BASELINE_CONTROL_SHA)
+                         engine_sha=BASELINE_ENGINE_SHA, control_sha=BASELINE_CONTROL_SHA)
     check_window(baseline["completedUtc"], datetime.now(timezone.utc))
+    return baseline, directory
+
+
+def require_remaining_window(seconds: int) -> tuple[dict, Path]:
+    """Refuse before weight load unless the owned deadline and postflight fit."""
+    baseline, directory = reviewed_baseline()
+    completed = parse_completed_utc(baseline["completedUtc"])
+    require(datetime.now(timezone.utc) + timedelta(seconds=seconds) <= completed + WINDOW,
+            "reviewed owner window cannot cover bounded run and postflight")
     return baseline, directory
 
 
@@ -291,20 +310,23 @@ def census_mixed_context(pid: int, initial_pmon: str) -> tuple[str, bool]:
     baseline, _ = reviewed_baseline()
     require(pid == baseline["identity"][0], "unreviewed mixed-context PID")
     _pmon_output(initial_pmon.splitlines(), "initial pmon", pid)
+    runtime_engine_sha = os.environ["EXPECTED_ENGINE_SHA"]
     with tempfile.TemporaryDirectory(prefix="yue2-cuda-guard-") as root:
         output = Path(root)
         script = Path(__file__).with_name("yue2_cuda_context_diagnostic.ps1")
         command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                    "-File", str(script), "-TargetPid", str(pid), "-OutputDirectory", str(output),
-                   "-EngineSha", ENGINE_SHA, "-ControlSha", os.environ["GITHUB_SHA"]]
+                   "-EngineSha", runtime_engine_sha, "-ControlSha", os.environ["GITHUB_SHA"]]
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=180)
         raw = {"initialPmon": initial_pmon, "reviewedBaseline": baseline,
                "commandExit": result.returncode,
                "diagnosticFiles": {item.name: item.read_text(encoding="utf-8-sig")
-                                   for item in sorted(output.iterdir()) if item.is_file()}}
+                                   for item in sorted(output.iterdir()) if item.is_file()},
+               "diagnosticFileBytesB64": {item.name: base64.b64encode(item.read_bytes()).decode("ascii")
+                                          for item in sorted(output.iterdir()) if item.is_file()}}
         try:
             require(result.returncode == 0, f"fresh WDDM counter probe failed: {result.stderr.strip()}")
-            current = summarize(output, baseline=False, pid=pid, engine_sha=ENGINE_SHA,
+            current = summarize(output, baseline=False, pid=pid, engine_sha=runtime_engine_sha,
                                 control_sha=os.environ["GITHUB_SHA"])
             validate_current(current, baseline)
             # The baseline may expire during a long app job; enforce at every call.
