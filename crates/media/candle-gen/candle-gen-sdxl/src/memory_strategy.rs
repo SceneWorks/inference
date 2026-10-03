@@ -891,7 +891,16 @@ fn asset_facts(
         &mut components,
         ADAPTER_STACK_COMPONENT_ID.to_owned(),
         MemoryComponentKind::AdapterStack,
-        gen_core::adapter_stack_resident_bytes(&spec.adapters, adapter_mode).ok_or_else(|| {
+        // sc-24163: the packed tiers' additive install (`crate::adapters`) holds every factor in f32,
+        // and a projection's forward caches a copy at the activation width beside it, so the stack
+        // is priced per factor element, not at its file length. A conv residual casts per forward
+        // instead of caching, so this is an upper bound for its factors.
+        gen_core::adapter_stack_upcast_resident_bytes(
+            &spec.adapters,
+            adapter_mode,
+            ACTIVATION_DTYPE.size_in_bytes() as u64,
+        )
+        .ok_or_else(|| {
             gen_core::Error::Unsupported(
                 "sdxl: every additive packed adapter must have an exact non-zero size".into(),
             )

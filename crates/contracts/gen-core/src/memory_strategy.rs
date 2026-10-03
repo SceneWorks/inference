@@ -799,7 +799,9 @@ pub enum AdapterResidencyMode {
     Additive,
 }
 
-/// Load-exact resident bytes for a single-stack adapter installation.
+/// Load-exact resident bytes for a single-stack adapter installation that keeps each factor at its
+/// **file** dtype: the stack is priced at its safetensors file lengths. An installer that upcasts
+/// the factors (candle's) is priced by [`adapter_stack_upcast_resident_bytes`] instead.
 ///
 /// `Some(0)` is positive evidence that factors are folded and therefore add no independent
 /// residency. `None` means an additive stack was requested but at least one source could not be
@@ -815,6 +817,62 @@ pub fn adapter_stack_resident_bytes(
     }
     adapters.iter().try_fold(0_u64, |total, adapter| {
         let bytes = safetensors_path_bytes(&adapter.path);
+        (bytes > 0).then(|| total.saturating_add(bytes))
+    })
+}
+
+/// Width of the f32 every float factor is upcast to by an [`adapter_stack_upcast_resident_bytes`]
+/// installer.
+const UPCAST_FACTOR_WIDTH: u64 = 4;
+
+/// Load-exact resident bytes for an **additive** stack whose installer upcasts every float factor
+/// to f32 on device and then caches one compute-dtype copy of it for the forward (sc-24163).
+///
+/// That is the shared candle installer (`candle_gen::quant::install_dotted_adapters`) and the
+/// provider installers built the same way on `AdaptLinear::push_lora`. Each factor is read to the
+/// host, cast `to_dtype(F32)` and uploaded, so on device it holds 4 bytes per element whatever the
+/// file stores. The first forward at a narrower compute dtype then caches a `compute_width` copy
+/// beside it (`PreparedLora`: once per compute dtype, kept for the life of the adapter). At an f32
+/// compute dtype that cast is an `Arc` clone and adds nothing. So each float element costs
+/// `4 + compute_width` bytes (`4` at f32 compute), and a non-float tensor costs its stored bytes.
+///
+/// [`adapter_stack_resident_bytes`] prices the file length instead. That is right for an installer
+/// that keeps the file dtype and wrong for this one. Measured on CUDA (sc-24163, Qwen-Image 2.1 at
+/// 768², `CU_MEMPOOL_ATTR_USED_MEM_HIGH`, one process per cell): a 167.9 MB f32 LoRA and an
+/// 83.9 MB bf16 LoRA with the same factor count both added 167.8 MB right after load and 251.7 MB
+/// at the render peak. That is 6 bytes per element at bf16 compute; the file length priced them at
+/// 167.9 MB and 83.9 MB.
+///
+/// Fails closed like [`adapter_stack_resident_bytes`]: `None` when a file has no safetensors
+/// residency, its header cannot be read, or it holds no tensor bytes. A `Folded` stack is `Some(0)`.
+pub fn adapter_stack_upcast_resident_bytes(
+    adapters: &[AdapterSpec],
+    mode: AdapterResidencyMode,
+    compute_width: u64,
+) -> Option<u64> {
+    if adapters.is_empty() || mode == AdapterResidencyMode::Folded {
+        return Some(0);
+    }
+    let prepared_width = if compute_width == UPCAST_FACTOR_WIDTH {
+        0
+    } else {
+        compute_width
+    };
+    let per_element = UPCAST_FACTOR_WIDTH.saturating_add(prepared_width);
+    adapters.iter().try_fold(0_u64, |total, adapter| {
+        if safetensors_path_bytes(&adapter.path) == 0 {
+            return None;
+        }
+        let headers = crate::weightsmeta::safetensors_path_tensor_headers(&adapter.path).ok()?;
+        let mut bytes = 0_u64;
+        for header in &headers {
+            let tensor = if header.is_float() {
+                header.element_count().ok()?.saturating_mul(per_element)
+            } else {
+                header.data_bytes
+            };
+            bytes = bytes.saturating_add(tensor);
+        }
         (bytes > 0).then(|| total.saturating_add(bytes))
     })
 }
@@ -4284,6 +4342,106 @@ mod tests {
         )];
         assert_eq!(
             adapter_stack_resident_bytes(&missing, AdapterResidencyMode::Additive),
+            None
+        );
+    }
+
+    /// Write a safetensors file with one tensor per `(name, dtype, shape)`, zero-filled.
+    fn write_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        let mut header = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, dtype, shape, width) in tensors {
+            let bytes = shape.iter().product::<usize>() * width;
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({ "dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes] }),
+            );
+            offset += bytes;
+        }
+        let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&header);
+        file.resize(file.len() + offset, 0);
+        std::fs::write(path, file).unwrap();
+    }
+
+    /// sc-24163: an upcasting installer's stack is priced at f32 per float element plus the
+    /// compute-width copy, whatever the file stores; an f32 compute dtype adds no copy; a non-float
+    /// tensor keeps its stored bytes; a missing or unreadable file fails closed; a folded stack is
+    /// zero. The file-length pricing stays what it was, and is below the upcast one for a bf16 file.
+    #[test]
+    fn upcast_adapter_residency_prices_f32_factors_and_the_prepared_copy() {
+        let tmp = tempfile::Builder::new()
+            .prefix("gen-core-upcast-residency-")
+            .tempdir()
+            .expect("fixture temp dir");
+        let root = tmp.path();
+        let bf16 = root.join("bf16.safetensors");
+        let f32 = root.join("f32.safetensors");
+        write_safetensors(
+            &bf16,
+            &[
+                ("a.lora_A.weight", "BF16", &[16, 64], 2),
+                ("a.lora_B.weight", "BF16", &[32, 16], 2),
+                ("a.alpha", "I64", &[], 8),
+            ],
+        );
+        write_safetensors(
+            &f32,
+            &[
+                ("a.lora_A.weight", "F32", &[16, 64], 4),
+                ("a.lora_B.weight", "F32", &[32, 16], 4),
+            ],
+        );
+        let elements = 16 * 64 + 32 * 16;
+        let spec = |path: &std::path::Path| {
+            AdapterSpec::new(path.to_owned(), 1.0, crate::AdapterKind::Lora)
+        };
+        let bf16_stack = vec![spec(&bf16)];
+        let f32_stack = vec![spec(&f32)];
+        let additive = AdapterResidencyMode::Additive;
+
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(&bf16_stack, additive, 2),
+            Some(elements * (4 + 2) + 8),
+            "f32 factors + a bf16 prepared copy, and the i64 alpha at its stored width"
+        );
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(&f32_stack, additive, 2),
+            Some(elements * (4 + 2)),
+            "the same factors in an f32 file cost the same"
+        );
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(&f32_stack, additive, 4),
+            Some(elements * 4),
+            "an f32 compute dtype shares the factors' storage"
+        );
+        let both = vec![spec(&bf16), spec(&f32)];
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(&both, additive, 2),
+            Some(2 * elements * 6 + 8),
+            "a stack is the sum of its members"
+        );
+        let file_priced = adapter_stack_resident_bytes(&bf16_stack, additive).unwrap();
+        assert!(file_priced < elements * 6, "{file_priced}");
+
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(&bf16_stack, AdapterResidencyMode::Folded, 2),
+            Some(0)
+        );
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(&[], additive, 2),
+            Some(0)
+        );
+        let missing = vec![spec(&root.join("missing.safetensors"))];
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(&missing, additive, 2),
+            None
+        );
+        let garbage = root.join("garbage.safetensors");
+        std::fs::write(&garbage, b"not a safetensors file").unwrap();
+        assert_eq!(
+            adapter_stack_upcast_resident_bytes(&[spec(&garbage)], additive, 2),
             None
         );
     }

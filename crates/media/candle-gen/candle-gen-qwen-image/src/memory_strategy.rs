@@ -291,7 +291,15 @@ fn adapter_overlay_bytes(spec: &LoadSpec, base: &std::path::Path) -> gen_core::R
     } else {
         AdapterResidencyMode::Folded
     };
-    gen_core::adapter_stack_resident_bytes(&spec.adapters, mode).ok_or_else(|| {
+    // sc-24163: the additive install (`crate::adapters`) upcasts every factor to f32 and the bf16
+    // DiT's forward caches a bf16 copy beside it, so the stack is priced per factor element, not at
+    // its file length.
+    gen_core::adapter_stack_upcast_resident_bytes(
+        &spec.adapters,
+        mode,
+        crate::edit::DIT_DTYPE.size_in_bytes() as u64,
+    )
+    .ok_or_else(|| {
         gen_core::Error::Unsupported(
             "qwen_image_edit: every additive adapter must have a non-zero safetensors residency"
                 .to_owned(),
@@ -1736,7 +1744,9 @@ mod tests {
             gen_core::AdapterKind::Lora,
         ));
         adapted.prepare_file_sources().unwrap();
-        let adapted_bytes = std::fs::metadata(&adapted.adapters[0].path).unwrap().len();
+        // sc-24163: one bf16 factor element, installed as f32 (4) plus its bf16 forward copy (2).
+        // The file length, header included, is no longer what is priced.
+        let adapted_bytes = 4 + 2;
         let adapted_contract = provider_contract("qwen_image_edit", &adapted).unwrap();
         assert_eq!(adapted_contract.asset_facts.overlay_bytes, adapted_bytes);
 
@@ -1764,9 +1774,7 @@ mod tests {
             gen_core::AdapterKind::Lora,
         ));
         lightning.prepare_file_sources().unwrap();
-        let lightning_bytes = std::fs::metadata(&lightning.adapters[0].path)
-            .unwrap()
-            .len();
+        let lightning_bytes = 4 + 2;
         let lightning_contract = provider_contract("qwen_image_edit", &lightning).unwrap();
         assert_eq!(
             lightning_contract.asset_facts.overlay_bytes,

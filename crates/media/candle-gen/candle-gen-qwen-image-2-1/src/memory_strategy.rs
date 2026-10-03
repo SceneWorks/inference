@@ -280,9 +280,10 @@ pub fn memory_strategy_contract(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdapterOverlay {
     /// LoRA / LoKr ride as forward-time residuals for the whole render
-    /// (`AdapterResidencyMode::Additive`): every LoRA file's safetensors bytes (each non-zero),
-    /// plus every LoKr module's resident Kronecker factors — `(a·c + b·d)` elements in f32 and
-    /// again at the compute width for the prepared copy (sc-24158).
+    /// (`AdapterResidencyMode::Additive`): every LoRA file's factor elements in f32 plus the
+    /// compute-width copy the forward caches (`gen_core::adapter_stack_upcast_resident_bytes`,
+    /// sc-24163), plus every LoKr module's resident Kronecker factors — `(a·c + b·d)` elements in
+    /// f32 and again at the compute width for the prepared copy (sc-24158).
     pub residual_bytes: u64,
     /// A LyCORIS LoHa is **folded** into the dense weights (`AdapterResidencyMode::Folded` — zero
     /// bytes resident once loaded), but each fold is a load-time transient on the DiT's device:
@@ -319,9 +320,14 @@ pub fn adapter_overlay(
         &spec.adapters,
         tier,
     )?;
-    let residual_bytes = gen_core::adapter_stack_resident_bytes(
+    // sc-24163: the shared installer upcasts every LoRA factor to f32 and the forward caches a
+    // compute-width copy beside it, so a LoRA is priced per factor element, not at its file length
+    // (a bf16 file is half its f32 factors). Measured on CUDA at 768²: +251.7 MB at the render peak
+    // for a 167.9 MB f32 LoRA and for an 83.9 MB bf16 one with the same factors.
+    let residual_bytes = gen_core::adapter_stack_upcast_resident_bytes(
         &plan.additive,
         gen_core::AdapterResidencyMode::Additive,
+        compute_width(),
     )
     .ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
@@ -1103,7 +1109,14 @@ mod tests {
             ),
         ]);
         candle_core::safetensors::save(&tensors, &lora).unwrap();
-        let lora_bytes = std::fs::metadata(&lora).unwrap().len();
+        // sc-24163: the installer holds the 2·32 + 32·2 factor elements in f32, plus a copy at the
+        // compute width when that is narrower (none on the f32 CPU lane). Not the file length.
+        let prepared = if compute_width() == 4 {
+            0
+        } else {
+            compute_width()
+        };
+        let lora_bytes = 128 * (4 + prepared);
 
         let adapted = plain.clone().with_adapters(vec![AdapterSpec::new(
             lora.clone(),

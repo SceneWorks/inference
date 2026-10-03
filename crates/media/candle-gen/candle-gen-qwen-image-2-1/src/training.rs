@@ -233,12 +233,55 @@ pub const BLOCK_SAVED_PER_MLP_RATIO: u64 = 10;
 pub const SCORE_COMPUTE_TENSORS: u64 = 3;
 /// `[heads, Sq, Sk]` score tensors it retains at **f32** — the softmax island: the upcast, the
 /// max-shifted, the exponential and the normalised probabilities.
+///
+/// These two counts are the **forward** retention, and they hold for every SDPA call of a block at
+/// once: 22 B per score element at bf16, measured at 22.1–22.5 on CUDA (sc-24163).
 pub const SCORE_F32_TENSORS: u64 = 4;
-/// f32 `[heads, Sq, Sk]` gradients the attention backward holds at once (the probabilities' and the
-/// scores' cotangents).
-const BACKWARD_SCORE_GRADS: u64 = 2;
+/// f32 `[heads, Sq, Sk]` tensors the attention **backward** holds at its peak, on top of the forward
+/// retention, for the **one** SDPA call (or chunk) being backpropagated (sc-24163).
+///
+/// The peak is candle's `Div` rule for `probs = exp / sum`. It holds the incoming cotangent, the
+/// quotient `g / sum`, the numerator's accumulator and the `zeros_like` it was added to, the product
+/// `g · exp`, the materialized `sum²` (a full-size square of the broadcast denominator), their
+/// quotient, and the denominator's accumulator and its `zeros_like`. That is nine tensors. They are
+/// all alive at once because a rule that multiplies the cotangent by a forward tensor carrying an op
+/// returns a tensor that carries an op too, and the gradient-store entry built from it keeps that
+/// chain until its node is processed. The structural count matches the measurement: 36 B per
+/// element. An isolated composable attention measured 58–63 B per score element in total on CUDA
+/// (forward 22 + backward 36), and the probe over the real block at the production geometry fit
+/// exactly 58.0 per element of its largest call.
+///
+/// The old count was 2 tensors over **every** call's elements. That was too few for the call in
+/// flight and too many for the others, which are backpropagated one at a time.
+pub const BACKWARD_SCORE_F32_TENSORS: u64 = 9;
 /// f32 `[S, inner]` gradients in flight at once during a block's backward.
 const BACKWARD_HIDDEN_GRADS: u64 = 4;
+/// `[S, inner]` compute-width tensors the block backward's **retained gradient chains** hold at the
+/// attention peak, beyond [`BLOCK_SAVED_HIDDEN`]'s forward set (sc-24163).
+///
+/// candle computes a gradient for **every** input of a rule, including inputs that never reach a
+/// trainable leaf: the frozen base weights, the modulation's token mask and the RoPE tables. Those
+/// entries are never consumed, so they live until the segment's backward ends, and each one keeps
+/// the chain it was built from. For example, the weight gradient `xᵀ·g` of a base projection holds
+/// that projection's output cotangent. By the attention peak the SwiGLU, `to_out` and the gated
+/// residuals have already been processed, so their cotangents and the three processed modulation
+/// slots' mask chains are among what is live. This count is **measured**, not enumerated
+/// tensor-by-tensor: a CUDA probe of the real checkpointed step over the production block geometry
+/// (768²…1024², four sizes) fit a per-token term of 352.75 B per channel exactly. That leaves
+/// 70.75 B per channel above the forward and in-flight counts, which is 35.4 bf16 tensors, rounded
+/// up.
+pub const BACKWARD_RETAINED_HIDDEN: u64 = 36;
+/// `[S, inner]` compute-width cotangent accumulators for q, k and v. They are already live when a
+/// **later** SDPA call's scores backpropagate: an edit layout processes the target call first, then
+/// each condition block, and the target call has already accumulated into q, k and v (sc-24163).
+pub const BACKWARD_QKV_COTANGENTS: u64 = 3;
+/// Copies each frozen base projection's dead weight gradient keeps (sc-24163): the `zeros_like`
+/// accumulator `GradStore::or_insert` made, the `xᵀ·g` product, and their sum. The product carries
+/// an op, so the sum keeps both alive. That is three `[out, in]` copies at the compute width per
+/// projection, held until the segment's backward ends. By the attention peak the SwiGLU's three
+/// projections and `to_out` have been processed. For the production block that is 1.007 GB at
+/// bf16; the probe's constant term measured 1.021 GB.
+pub const DEAD_WEIGHT_GRAD_COPIES: u64 = 3;
 /// `[S, inner]` compute-width tensors the retained pre-block forward holds (the text/image
 /// projections and their joint concatenation, adapter residuals included).
 const PRELUDE_SAVED_HIDDEN: u64 = 8;
@@ -411,6 +454,16 @@ pub struct TrainingShape {
     /// the whole prefix squared (`(caption_tokens + reference_tokens)²`), which is exact for a
     /// text-only prefix and an upper bound otherwise.
     pub prefix_scores: u64,
+    /// Score elements (per head) of the costliest **single** prefix attention call:
+    /// `max (end − start)·end` over the prefix segments ([`largest_prefix_call_elements`]). The
+    /// attention backward runs one call at a time, so its transient is sized by the largest call,
+    /// whether that is this one or the target's. `0` falls back to the whole prefix squared.
+    pub largest_prefix_call: u64,
+    /// Rows the block-causal attention copies for the prefix calls: `Σ (end − start) + 3·end` over
+    /// the prefix segments ([`prefix_copy_rows`]). Each call takes contiguous copies of its query rows,
+    /// of the keys and values up to its end and of those keys transposed, and the graph retains those
+    /// copies. `0` falls back to `4 ·` the prefix.
+    pub prefix_copy_rows: u64,
     /// Dataset items (each caches one caption feature and one latent).
     pub items: u64,
     /// Bytes per element of the DiT compute dtype (2 for bf16, 4 for f32). The text encoder's
@@ -455,12 +508,17 @@ impl TrainingFootprint {
 /// for an edit run, every condition block: the target rows attend to every key, each block-causal
 /// prefix segment's rows to the keys up to its end — `L²` for a text-only prefix), each held
 /// [`SCORE_COMPUTE_TENSORS`] times at the
-/// compute width and [`SCORE_F32_TENSORS`] times at f32 — plus, for LoKr, the vec-trick
-/// intermediates. A
-/// **dense** step retains that for every block (candle is eager: the graph holds it until the
-/// backward); a **checkpointed** step retains each block's `[S, inner]` input plus ONE block's set
-/// (the recompute) and the boundary copy the segmented VJP makes. Both add the backward's in-flight
-/// gradients and the retained pre-block forward.
+/// compute width and [`SCORE_F32_TENSORS`] times at f32 — plus the attention's contiguous q/k/v
+/// copies and, for LoKr, the vec-trick intermediates. A **dense** step retains that for every block
+/// (candle is eager: the graph holds it until the backward); a **checkpointed** step retains each
+/// block's `[S, inner]` input plus ONE block's set (the recompute) and the boundary copy the
+/// segmented VJP makes. Both add the retained pre-block forward and the backward's peak: the
+/// largest single attention call's [`BACKWARD_SCORE_F32_TENSORS`] f32 score tensors, the in-flight
+/// and retained `[S, inner]` gradient chains, and the frozen projections' dead weight gradients
+/// ([`DEAD_WEIGHT_GRAD_COPIES`]). On a dense step the last two accumulate over every block.
+///
+/// sc-24163 measured this against the CUDA driver's live high-water. With the backward priced as two
+/// f32 tensors over every call's scores and no retained chains, the step came out 26–45 % low.
 pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> TrainingFootprint {
     let w = shape.compute_width;
     let side = shape.edge as u64 / facts.pixels_per_token.max(1);
@@ -521,23 +579,65 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
         prefix * prefix
     };
     let score_elements = facts.heads * (image_tokens * seq + prefix_scores);
+    // Forward retention: every call's scores, held by the block's graph until its backward ends.
     let scores = score_elements * (SCORE_COMPUTE_TENSORS * w + SCORE_F32_TENSORS * F32_WIDTH);
+    // Backward transient: the calls backpropagate one at a time, so the largest one sizes it. A call
+    // over the i32 guard's budget runs in query chunks, and the in-flight chunk holds the full set.
+    // The other chunks' score cotangents (compute width) stay alive meanwhile: each chunk's `kᵀ`
+    // gradient keeps its own, and every chunk shares the one `kᵀ`, which is processed last.
+    let largest_prefix_call = if shape.largest_prefix_call > 0 {
+        shape.largest_prefix_call
+    } else {
+        prefix * prefix
+    };
+    let largest_call = facts.heads * (image_tokens * seq).max(largest_prefix_call);
+    let chunk = largest_call.min(candle_gen::ATTN_SCORES_BUDGET as u64);
+    let score_backward =
+        BACKWARD_SCORE_F32_TENSORS * chunk * F32_WIDTH + (largest_call - chunk) * w;
     let block_hidden = BLOCK_SAVED_HIDDEN * hidden
         + BLOCK_SAVED_HIDDEN_F32 * hidden_f32
         + BLOCK_SAVED_PER_MLP_RATIO * facts.mlp_ratio * hidden;
+    // The block-causal attention's contiguous copies: each prefix call's query rows, its keys and
+    // values up to its end and its transposed keys, plus the target call's query rows and its
+    // transposed keys (the whole sequence). The target call's keys and values are the whole, already
+    // contiguous, sequence, so they are not copied again.
+    let prefix_copy_rows = if shape.prefix_copy_rows > 0 {
+        shape.prefix_copy_rows
+    } else {
+        4 * prefix
+    };
+    let copies = (prefix_copy_rows + image_tokens + seq) * facts.inner * w;
+    // The frozen base projections whose dead weight gradients are held at the attention peak: the
+    // SwiGLU's three and `to_out`.
+    let dead_weight_grads = DEAD_WEIGHT_GRAD_COPIES
+        * w
+        * (3 * facts.mlp_ratio * facts.inner * facts.inner + facts.inner * facts.inner);
+    let block_backward = (BACKWARD_RETAINED_HIDDEN + BACKWARD_QKV_COTANGENTS) * hidden
+        + BACKWARD_HIDDEN_GRADS * hidden_f32;
     let lokr = |per_token: u64| seq * per_token * w;
     let prelude = PRELUDE_SAVED_HIDDEN * hidden + lokr(shape.adapter.lokr_global_per_token);
-    let retained = if shape.checkpointed {
-        facts.num_layers * hidden
-            + hidden
-            + block_hidden
-            + scores
-            + lokr(shape.adapter.lokr_block_per_token)
+    let (retained, backward) = if shape.checkpointed {
+        // Every block's input stashed, the boundary copy the segmented VJP makes, and ONE block's
+        // recomputed graph with its backward.
+        (
+            facts.num_layers * hidden
+                + hidden
+                + block_hidden
+                + copies
+                + scores
+                + lokr(shape.adapter.lokr_block_per_token),
+            score_backward + block_backward + dead_weight_grads,
+        )
     } else {
-        facts.num_layers * (block_hidden + scores) + lokr(shape.adapter.lokr_blocks_per_token)
+        // One graph over every block, backpropagated in one `GradStore`: every block's forward set
+        // is retained, and every processed block's dead weight gradients and retained chains
+        // accumulate until the backward ends.
+        (
+            facts.num_layers * (block_hidden + copies + scores)
+                + lokr(shape.adapter.lokr_blocks_per_token),
+            score_backward + facts.num_layers * (block_backward + dead_weight_grads),
+        )
     };
-    let backward =
-        BACKWARD_SCORE_GRADS * score_elements * F32_WIDTH + BACKWARD_HIDDEN_GRADS * hidden_f32;
     let step = prelude + retained + backward;
     // A preview render runs between steps (the step's activations are released by then), so its
     // denoise + decode transient competes with the step rather than adding to it.
@@ -1128,6 +1228,10 @@ struct PromptBudget {
     largest_reference_tokens: u64,
     /// [`prefix_score_elements`] of the layout.
     prefix_scores: u64,
+    /// [`largest_prefix_call_elements`] of the layout.
+    largest_prefix_call: u64,
+    /// [`prefix_copy_rows`] of the layout.
+    prefix_copy_rows: u64,
 }
 
 impl PromptBudget {
@@ -1139,6 +1243,8 @@ impl PromptBudget {
             reference_tokens: 0,
             largest_reference_tokens: 0,
             prefix_scores: prefix_score_elements(layout),
+            largest_prefix_call: largest_prefix_call_elements(layout),
+            prefix_copy_rows: prefix_copy_rows(layout),
         };
         for segment in &layout.segments[..blocks] {
             match *segment {
@@ -1265,6 +1371,31 @@ pub fn prefix_score_elements(layout: &JointLayout) -> u64 {
         .prefix_segments()
         .iter()
         .map(|&(start, end, _)| ((end - start) * end) as u64)
+        .sum()
+}
+
+/// Per-head score elements of a layout's costliest **single** prefix attention call:
+/// `max (end − start)·end` over [`JointLayout::prefix_segments`]. `L²` for the text-to-image
+/// layout. The attention backward runs one call at a time, so the larger of this and the target
+/// call sizes its transient (sc-24163).
+pub fn largest_prefix_call_elements(layout: &JointLayout) -> u64 {
+    layout
+        .prefix_segments()
+        .iter()
+        .map(|&(start, end, _)| ((end - start) * end) as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Rows a layout's prefix attention calls copy: `Σ (end − start) + 3·end` over
+/// [`JointLayout::prefix_segments`]. Each call takes contiguous copies of its query rows and of the
+/// keys and values before its end, and the SDPA makes one more of those keys, transposed. The
+/// training graph retains all of them (sc-24163). `4·L` for the text-to-image layout.
+pub fn prefix_copy_rows(layout: &JointLayout) -> u64 {
+    layout
+        .prefix_segments()
+        .iter()
+        .map(|&(start, end, _)| ((end - start) + 3 * end) as u64)
         .sum()
 }
 
@@ -1659,7 +1790,7 @@ impl QwenImage21Trainer {
             largest_target_tokens =
                 largest_target_tokens.max(target_tokens(edit_target_size(item, edge)?));
         }
-        let mut prefix_scores = 0u64;
+        let (mut prefix_scores, mut largest_prefix_call, mut prefix_copy_rows) = (0u64, 0u64, 0u64);
         let mut prompts: Vec<PreflightPrompt<'_>> = Vec::new();
         for item in &req.items {
             prompts.push((
@@ -1697,11 +1828,15 @@ impl QwenImage21Trainer {
                         reference_cache_tokens += budget.reference_tokens;
                     }
                     prefix_scores = prefix_scores.max(budget.prefix_scores);
+                    largest_prefix_call = largest_prefix_call.max(budget.largest_prefix_call);
+                    prefix_copy_rows = prefix_copy_rows.max(budget.prefix_copy_rows);
                     budget.text_tokens
                 }
                 None => {
                     let tokens = caption_tokens(&self.tokenizer, self.drop_count, text)?;
                     prefix_scores = prefix_scores.max(tokens * tokens);
+                    largest_prefix_call = largest_prefix_call.max(tokens * tokens);
+                    prefix_copy_rows = prefix_copy_rows.max(4 * tokens);
                     tokens
                 }
             };
@@ -1715,6 +1850,8 @@ impl QwenImage21Trainer {
             largest_reference_tokens,
             reference_cache_tokens,
             prefix_scores,
+            largest_prefix_call,
+            prefix_copy_rows,
             items: req.items.len() as u64,
             compute_width: compute_dtype.size_in_bytes() as u64,
             adapter: adapter_footprint(&targets, cfg),
@@ -2566,6 +2703,8 @@ mod tests {
             largest_reference_tokens: 0,
             reference_cache_tokens: 0,
             prefix_scores: 0,
+            largest_prefix_call: 0,
+            prefix_copy_rows: 0,
             items: 20,
             compute_width: 2,
             adapter: production_adapter(NetworkType::Lora),
@@ -2623,6 +2762,163 @@ mod tests {
             ckpt <= budget && dense > budget,
             "{ckpt} / {dense} vs {budget}"
         );
+    }
+
+    /// `Qwen/Qwen-Image-2.1@790c92633540aa0cb11d9abf19eb46d861714758` as
+    /// [`FootprintFacts::from_snapshot`] reads it at bf16 (component width 2), captured from the
+    /// release snapshot for sc-24163.
+    fn release_snapshot_facts() -> FootprintFacts {
+        FootprintFacts {
+            dit_elements: 7_115_124_736,
+            text_encoder_bytes: 15_136_811_008,
+            vae_encoder_bytes: 157_384_384,
+            vae_decoder_bytes: 518_096_424,
+            num_layers: 32,
+            inner: 4096,
+            heads: 32,
+            mlp_ratio: 3,
+            latent_channels: 64,
+            text_hidden: 4096,
+            text_heads: 32,
+            vae_encode_channels: 96,
+            vae_decode_channels: 144,
+            pixels_per_token: 16,
+            vision_tower_bytes: 1_152_776_672,
+            vision_hidden: 1152,
+            vision_heads: 16,
+        }
+    }
+
+    /// The trainer's preflight shape for one sc-24163 measurement cell (rank 16, adamw8bit, previews
+    /// on, gradient checkpointing on, bf16), as the trainer derived it from that cell's dataset.
+    fn measured_cell(
+        network: NetworkType,
+        edge: u32,
+        edit: Option<(u64, (u64, u64), u64)>,
+    ) -> TrainingShape {
+        let side = (edge / 16) as u64;
+        let adapter = production_adapter(network);
+        let base = TrainingShape {
+            edge,
+            target_tokens: side * side,
+            caption_tokens: 25,
+            reference_tokens: 0,
+            largest_reference_tokens: 0,
+            reference_cache_tokens: 0,
+            prefix_scores: 625,
+            largest_prefix_call: 625,
+            prefix_copy_rows: 100,
+            items: 8,
+            compute_width: 2,
+            adapter,
+            optimizer_state_per_param: 2,
+            checkpointed: true,
+            sampling: true,
+        };
+        match edit {
+            None => base,
+            // 6 instruction pairs; `refs` reference latents per prompt (4096 each), its prefix calls.
+            Some((refs, (prefix_scores, largest_prefix_call), prefix_copy_rows)) => TrainingShape {
+                caption_tokens: if refs == 1 { 37 } else { 43 },
+                reference_tokens: refs * 4096,
+                largest_reference_tokens: 4096,
+                reference_cache_tokens: 6 * refs * 4096,
+                prefix_scores,
+                largest_prefix_call,
+                prefix_copy_rows,
+                items: 6,
+                ..base
+            },
+        }
+    }
+
+    /// sc-24163 (E13/E11): the checkpointed training step is priced at its **measured** peak, never
+    /// below it.
+    ///
+    /// Each cell is the A1 request run through this trainer for 10 steps on CUDA (RTX PRO 6000,
+    /// driver 596.36, one process per cell, budget disabled). The measured value is the driver's
+    /// live high-water `CU_MEMPOOL_ATTR_USED_MEM_HIGH` over the whole run, in bytes. Source:
+    /// SceneWorks `docs/calibration/sc-24163/cuda-measurements.json` (`a5.trainingFootprint`) on
+    /// `feature/sc-24107-qwen-image-2-1-lora`. Before this fix the preflight derived 22.4 / 21.8 /
+    /// 35.1 / 51.1 / 51.4 GiB, 26–45 % under, and admitted a 1024² run it could not hold.
+    ///
+    /// *Mutations that red this:* `BACKWARD_SCORE_F32_TENSORS` back to 2, or the score backward
+    /// sized over every call; `BACKWARD_RETAINED_HIDDEN` or `DEAD_WEIGHT_GRAD_COPIES` at 0; the q/k/v
+    /// copies or the pending q/k/v cotangents dropped (the edit cells go under); the backward over
+    /// every call's elements (the edit cells go over 1.15).
+    #[test]
+    fn the_checkpointed_step_covers_the_measured_cuda_peaks() {
+        let facts = release_snapshot_facts();
+        // The runs' own adapter sizes (rank 16 over every block projection).
+        assert_eq!(
+            production_adapter(NetworkType::Lora).trainable_params,
+            41_943_040
+        );
+        let lokr = production_adapter(NetworkType::Lokr);
+        assert_eq!(
+            (lokr.trainable_params, lokr.lokr_block_per_token),
+            (1_671_168, 38_912)
+        );
+        // Text 8 / reference 64×64 / text 29 / target: Σ (end−start)·end, the reference call, copies.
+        let one_ref = Some((1, (16_929_905, 16_809_984), 28_868));
+        let cells = [
+            (
+                "t2i lora 768²",
+                measured_cell(NetworkType::Lora, 768, None),
+                30_361_842_468u64,
+            ),
+            (
+                "t2i lokr 768²",
+                measured_cell(NetworkType::Lokr, 768, None),
+                29_850_168_644,
+            ),
+            (
+                "t2i lora 1024²",
+                measured_cell(NetworkType::Lora, 1024, None),
+                54_794_203_428,
+            ),
+            (
+                "edit lokr 768² 1 ref",
+                measured_cell(NetworkType::Lokr, 768, one_ref),
+                69_364_708_316,
+            ),
+            (
+                "edit lora 768² 1 ref",
+                measured_cell(NetworkType::Lora, 768, one_ref),
+                69_641_733_180,
+            ),
+        ];
+        for (label, shape, measured) in cells {
+            let fp = training_footprint(&facts, &shape);
+            let predicted = fp.peak();
+            eprintln!(
+                "[sc-24163] {label}: predicted {:.2} GiB (step stage), measured {:.2} GiB, ×{:.3}",
+                gib(predicted),
+                gib(measured),
+                predicted as f64 / measured as f64
+            );
+            assert_eq!(
+                predicted, fp.train_phase,
+                "{label}: the step is the peak stage"
+            );
+            assert!(
+                predicted >= measured,
+                "{label}: {predicted} under the measured {measured}"
+            );
+            assert!(
+                predicted as f64 <= measured as f64 * 1.15,
+                "{label}: {predicted} more than 15 % over the measured {measured}"
+            );
+        }
+        // Two references per edit at 768² filled the 97,295 MiB card and spilled (A1), so its need
+        // is above that, and the refusal it got on a 96 GB card must stand.
+        let two_refs = measured_cell(
+            NetworkType::Lokr,
+            768,
+            Some((2, (50_685_299, 33_611_776), 82_224)),
+        );
+        let predicted = training_footprint(&facts, &two_refs).peak();
+        assert!(predicted > 97_295 << 20, "two-reference edit: {predicted}");
     }
 
     #[test]
@@ -4342,8 +4638,14 @@ mod tests {
                 reference_tokens: 12,
                 largest_reference_tokens: 8,
                 prefix_scores: 253,
+                // The costliest prefix call is the 2×4 block's `8·16`; the copies are
+                // `(3+3·3) + (4+3·7) + (1+3·8) + (8+3·16) + (4+3·20)`.
+                largest_prefix_call: 128,
+                prefix_copy_rows: 182,
             }
         );
+        assert_eq!(largest_prefix_call_elements(&t2i_layout()), 25);
+        assert_eq!(prefix_copy_rows(&t2i_layout()), 20);
 
         let facts = production_facts();
         let base = TrainingShape {
@@ -4361,12 +4663,11 @@ mod tests {
             )
             .train_phase
         };
-        // Checkpointed, no previews: the scores are retained once at the compute width
-        // (SCORE_COMPUTE_TENSORS) and at f32 (SCORE_F32_TENSORS), plus the backward's f32 grads.
+        // Checkpointed, no previews: the prefix scores are retained once at the compute width
+        // (SCORE_COMPUTE_TENSORS) and at f32 (SCORE_F32_TENSORS). The backward transient is sized by
+        // the largest single call, here the target's, so the prefix sum does not reach it.
         let per_element = facts.heads
-            * (SCORE_COMPUTE_TENSORS * base.compute_width
-                + SCORE_F32_TENSORS * F32_WIDTH
-                + BACKWARD_SCORE_GRADS * F32_WIDTH);
+            * (SCORE_COMPUTE_TENSORS * base.compute_width + SCORE_F32_TENSORS * F32_WIDTH);
         assert_eq!(at(400) - at(253), (400 - 253) * per_element);
         assert_eq!(at(0), at(400), "the fallback is the whole prefix squared");
     }

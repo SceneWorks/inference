@@ -735,6 +735,77 @@ mod tests {
         );
     }
 
+    /// sc-24163 (E13): the installed LoRA is priced at what it actually holds on device. The
+    /// installer upcasts every factor to f32, and the first forward at the compute dtype caches one
+    /// more copy at that width. The file length is half of that f32 copy for a bf16 file, and that
+    /// is the size the overlay used to be priced at. Measured on CUDA (Qwen-Image 2.1, 768²): a
+    /// bf16 and an f32 LoRA with the same factors both added 6 B per factor element at the render
+    /// peak.
+    ///
+    /// *Mutations that red this:* pricing at the file length (`adapter_stack_resident_bytes`), or
+    /// dropping the prepared copy's width from `adapter_stack_upcast_resident_bytes`.
+    #[test]
+    fn the_overlay_price_covers_the_installed_factors_for_bf16_and_f32_files() {
+        use gen_core::{
+            adapter_stack_resident_bytes, adapter_stack_upcast_resident_bytes,
+            AdapterResidencyMode::Additive,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let (rank, in_dim, out_dim) = (8, 64, 32);
+        let elements = (rank * in_dim + out_dim * rank) as u64;
+        for file_dtype in [DType::BF16, DType::F32] {
+            let path = temp.path().join(format!("{file_dtype:?}.safetensors"));
+            let tensors = HashMap::from([
+                (
+                    "layers.0.proj.lora_A.weight".to_owned(),
+                    Tensor::ones((rank, in_dim), file_dtype, &device).unwrap(),
+                ),
+                (
+                    "layers.0.proj.lora_B.weight".to_owned(),
+                    Tensor::ones((out_dim, rank), file_dtype, &device).unwrap(),
+                ),
+            ]);
+            candle_core::safetensors::save(&tensors, &path).unwrap();
+            let specs = vec![AdapterSpec::new(path, 1.0, AdapterKind::Lora)];
+            // A half-precision host (the GPU tiers compute at bf16; CPU has an f16 matmul) and an
+            // f32 one, where the prepared copy is the f32 factors themselves.
+            for (compute, width) in [(DType::F16, 2u64), (DType::F32, 4)] {
+                let base = Tensor::zeros((out_dim, in_dim), compute, &device).unwrap();
+                let mut linear = AdaptLinear::from_dense(Linear::new(base, None), in_dim, out_dim);
+                install_dotted_adapters("fixture", &specs, &device, |visitor| {
+                    visitor("layers.0.proj", &mut linear)
+                })
+                .unwrap();
+                let x = Tensor::ones((1, 4, in_dim), compute, &device).unwrap();
+                linear.forward(&x).unwrap();
+                let resident = linear.frozen_adapter_bytes() as u64;
+                let prepared = if width == 4 { 0 } else { width };
+                assert_eq!(
+                    resident,
+                    elements * (4 + prepared),
+                    "{file_dtype:?} file on a {compute:?} host: f32 factors + the prepared copy"
+                );
+                let priced = adapter_stack_upcast_resident_bytes(&specs, Additive, width).unwrap();
+                assert!(
+                    priced >= resident,
+                    "{file_dtype:?} on {compute:?}: priced {priced} < resident {resident}"
+                );
+                assert_eq!(
+                    priced, resident,
+                    "{file_dtype:?} on {compute:?}: a plain LoRA is priced exactly"
+                );
+                if width == 2 {
+                    let file = adapter_stack_resident_bytes(&specs, Additive).unwrap();
+                    assert!(
+                        file < resident,
+                        "the file length ({file}) under-prices the installed factors ({resident})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn installs_a_stacked_lora_on_dense_and_fails_closed_on_zero_match() {
         let temp = tempfile::tempdir().unwrap();
