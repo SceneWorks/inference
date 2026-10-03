@@ -1608,3 +1608,318 @@ fn a_lokr_overlay_prices_the_resident_kronecker_factors() {
         );
     }
 }
+
+// ── sc-24163: feature-end review — mixed stacks, per-adapter strength, the render seam ─────────
+
+/// The output of the projection at `path` on a fixed probe — linear in the projection's weight and
+/// in every residual it carries, so a strength's effect is exactly measurable here (the DiT
+/// velocity is not linear in its weights).
+fn projection_output(dit: &mut QwenImage21Transformer, path: &str) -> Tensor {
+    let mut out = None;
+    dit.visit_adaptable_mut(&mut |name, linear| {
+        if name == path {
+            let (_, in_f) = linear.base_shape();
+            out = Some(linear.forward(&ramp((1, 2, in_f), 5))?);
+        }
+        Ok(())
+    })
+    .unwrap();
+    out.unwrap_or_else(|| panic!("{path} is not an adaptable projection"))
+}
+
+/// A third-party (unstamped) LyCORIS LoKr over `target`: full `w1 [2, 2]`, low-rank `w2` with a
+/// per-module alpha 1 (LyCORIS scale 0.5).
+fn write_lycoris_lokr(path: &Path, target: &str) {
+    let (out_f, in_f) = projection_shapes()[target];
+    write_lokr_modules(
+        path,
+        &[(lycoris(target), low_rank_lokr(out_f, in_f, (2, 2), 1.0))],
+        None,
+    );
+}
+
+/// The four adapter routes, one file each, stacked on overlapping projections: a LoRA and a
+/// stamped (PEFT) LoKr on `to_v`, a LoHa fold on `img_mlp.out`, and a LyCORIS LoKr beside the LoRA
+/// on `to_q`.
+struct MixedStack {
+    _dir: tempfile::TempDir,
+    files: [(PathBuf, AdapterKind); 4],
+}
+
+const MIXED_NAMES: [&str; 4] = ["LoRA", "stamped LoKr", "LoHa", "LyCORIS LoKr"];
+
+fn mixed_stack() -> MixedStack {
+    let dir = tempfile::tempdir().unwrap();
+    let lora_file = dir.path().join("lora.safetensors");
+    write_lora(
+        &lora_file,
+        &[
+            (ATTN_TARGET, DIM, DIM),
+            ("transformer_blocks.0.attn.to_v", DIM, DIM),
+        ],
+        0,
+    );
+    let lokr_file = dir.path().join("lokr.safetensors");
+    write_lokr(
+        &lokr_file,
+        "transformer_blocks.0.attn.to_v",
+        (2, 2),
+        (DIM / 2, DIM / 2),
+    );
+    let loha_file = dir.path().join("loha.safetensors");
+    write_loha(
+        &loha_file,
+        &[("transformer_blocks.1.img_mlp.out", HIDDEN, DIM)],
+    );
+    let lycoris_file = dir.path().join("lycoris.safetensors");
+    write_lycoris_lokr(&lycoris_file, ATTN_TARGET);
+    MixedStack {
+        _dir: dir,
+        files: [
+            (lora_file, AdapterKind::Lora),
+            (lokr_file, AdapterKind::Lokr),
+            (loha_file, AdapterKind::Lora),
+            (lycoris_file, AdapterKind::Lokr),
+        ],
+    }
+}
+
+impl MixedStack {
+    /// The stack at `strengths` (one per file, in order); `None` leaves that file out.
+    fn specs(&self, strengths: [Option<f32>; 4]) -> Vec<AdapterSpec> {
+        self.files
+            .iter()
+            .zip(strengths)
+            .filter_map(|((path, kind), strength)| {
+                strength.map(|s| AdapterSpec::new(path.clone(), s, *kind))
+            })
+            .collect()
+    }
+
+    fn velocity(&self, strengths: [Option<f32>; 4]) -> Tensor {
+        let mut dit = dense_dit();
+        install(&mut dit, &self.specs(strengths), Tier::Bf16, &Device::Cpu).unwrap();
+        velocity(&dit)
+    }
+}
+
+/// A MIXED stack — LoRA + stamped LoKr on one projection, LoRA + LyCORIS LoKr on another, and a
+/// LoHa fold — installs through one `adapters::install` (the candle twin of the MLX
+/// `stacked_mixed_adapters_install_with_per_file_strengths`), and each file's strength is its own:
+/// every file at strength 0 renders exactly the stack without that file, and moving any one file's
+/// strength alone moves the velocity.
+///
+/// *Mutation that reds this:* any route ignoring its own `AdapterSpec::scale` (e.g. `spec.scale` →
+/// `1.0` in `fold_loha` / `install_lycoris_lokr`, or the shared additive install taking the first
+/// spec's scale for every file) — that file at 0 then still applies, so it no longer equals the
+/// stack without it.
+#[test]
+fn a_mixed_adapter_stack_installs_with_independent_per_file_strengths() {
+    let stack = mixed_stack();
+    let full = [Some(0.75), Some(0.5), Some(1.0), Some(1.25)];
+    preflight(&tiny_snapshot(), &stack.specs(full), Tier::Bf16).unwrap();
+    let mut dit = dense_dit();
+    let report = install(&mut dit, &stack.specs(full), Tier::Bf16, &Device::Cpu).unwrap();
+    assert_eq!(
+        report.residuals,
+        2 + 1 + 1,
+        "LoRA ×2, stamped LoKr, LyCORIS LoKr"
+    );
+    assert_eq!(report.loha_folds, 1);
+    let stacked = velocity(&dit);
+    let base = velocity(&dense_dit());
+    assert!(max_abs_diff(&base, &stacked) > 1e-4, "the stack applies");
+
+    for (i, name) in MIXED_NAMES.iter().enumerate() {
+        let mut zeroed = full;
+        zeroed[i] = Some(0.0);
+        let mut without = full;
+        without[i] = None;
+        let mut moved = full;
+        moved[i] = full[i].map(|s| s * 2.0);
+        let at_zero = stack.velocity(zeroed);
+        assert!(
+            max_abs_diff(&at_zero, &stack.velocity(without)) < 1e-6,
+            "{name} at strength 0 must equal the stack without it"
+        );
+        assert!(
+            max_abs_diff(&stacked, &at_zero) > 1e-5,
+            "{name}'s own strength must matter inside the stack"
+        );
+        assert!(
+            max_abs_diff(&stacked, &stack.velocity(moved)) > 1e-5,
+            "{name} at twice its strength must move the stack"
+        );
+    }
+}
+
+/// Per-adapter strength on the two routes this crate installs itself (the LoHa fold and the
+/// third-party LyCORIS LoKr residual), measured where it is linear — the adapted projection's own
+/// output: strength 0 is bit-identical to the bare base, and strength `s` moves the output by
+/// exactly `s ×` the strength-1 delta.
+///
+/// *Mutation that reds this:* `spec.scale` → `1.0` at the `group.delta(…)` call in `fold_loha`, or
+/// at the `group.factors(…)` call in `install_lycoris_lokr`.
+#[test]
+fn loha_and_lycoris_lokr_strength_scales_the_projection_delta() {
+    let temp = tempfile::tempdir().unwrap();
+    let loha = temp.path().join("loha.safetensors");
+    let loha_target = "transformer_blocks.1.img_mlp.out";
+    write_loha(&loha, &[(loha_target, HIDDEN, DIM)]);
+    let lycoris_file = temp.path().join("lycoris.safetensors");
+    write_lycoris_lokr(&lycoris_file, ATTN_TARGET);
+    for (name, file, kind, target) in [
+        ("LoHa", &loha, AdapterKind::Lora, loha_target),
+        (
+            "LyCORIS LoKr",
+            &lycoris_file,
+            AdapterKind::Lokr,
+            ATTN_TARGET,
+        ),
+    ] {
+        let at = |strength: f32| {
+            let mut dit = dense_dit();
+            install(
+                &mut dit,
+                &[AdapterSpec::new(file.clone(), strength, kind)],
+                Tier::Bf16,
+                &Device::Cpu,
+            )
+            .unwrap();
+            projection_output(&mut dit, target)
+        };
+        let base = projection_output(&mut dense_dit(), target);
+        assert_eq!(
+            max_abs_diff(&base, &at(0.0)),
+            0.0,
+            "{name}: strength 0 is bit-identical to the base"
+        );
+        let unit = (at(1.0) - &base).unwrap();
+        let unit_peak = max_abs_diff(&unit, &unit.zeros_like().unwrap());
+        assert!(unit_peak > 1e-3, "{name}: the adapter moves its projection");
+        for strength in [0.5f32, 2.0, -0.75] {
+            let delta = (at(strength) - &base).unwrap();
+            let want = (&unit * f64::from(strength)).unwrap();
+            assert!(
+                max_abs_diff(&delta, &want) <= 1e-4 * unit_peak,
+                "{name}: strength {strength} must move the output by {strength}× the unit delta"
+            );
+        }
+    }
+}
+
+/// A large-amplitude LoRA (the MLX twin's `render_lora`) over a block attention, a packable FFN
+/// projection and the output projection, so its effect survives the VAE decode and u8 quantization
+/// of a 2-step miniature render.
+fn write_render_lora(path: &Path) {
+    let shapes = projection_shapes();
+    let mut tensors = Vec::new();
+    for (i, target) in ["transformer_blocks.0.attn.to_v", PACKED_TARGET, "proj_out"]
+        .iter()
+        .enumerate()
+    {
+        let (out_f, in_f) = shapes[*target];
+        tensors.push((
+            format!("transformer.{target}.lora_A.weight"),
+            (filled((2, in_f), i) * 2.0).unwrap(),
+        ));
+        tensors.push((
+            format!("transformer.{target}.lora_B.weight"),
+            (filled((out_f, 2), i + 1) * 2.0).unwrap(),
+        ));
+    }
+    save(path, tensors, None);
+}
+
+fn render_pixels(spec: &LoadSpec, request: &GenerationRequest) -> Vec<u8> {
+    let generator = candle_gen_qwen_image_2_1::load(spec).expect("the tiny snapshot loads");
+    match generator
+        .generate(request, &mut |_| {})
+        .expect("the render runs")
+    {
+        candle_gen::gen_core::GenerationOutput::Images(mut images) => {
+            assert_eq!(images.len(), 1);
+            images.remove(0).pixels
+        }
+        other => panic!("images expected, got {other:?}"),
+    }
+}
+
+fn t2i_request(edge: u32) -> GenerationRequest {
+    GenerationRequest {
+        prompt: "a red fox in the forest".into(),
+        width: edge,
+        height: edge,
+        steps: Some(2),
+        seed: Some(42),
+        ..Default::default()
+    }
+}
+
+/// At the generator seam: the adapter changes the T2I render against the bare base; a
+/// `Sequential` load — which defers the DiT, and so the install, to the render — renders exactly
+/// the `Resident` adapted pixels; and strength 0 is pixel-identical to no adapter.
+///
+/// *Mutation that reds this:* `load_heavy` skipping `adapters::install` (both adapted renders equal
+/// the plain one), or installing only on the `Resident` path (Sequential ≠ Resident).
+#[test]
+fn adapters_reach_the_render_under_both_residencies() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("render.safetensors");
+    write_render_lora(&file);
+    let request = t2i_request(32);
+    let bare = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()));
+    let plain = render_pixels(&bare, &request);
+    let adapted_spec = bare.clone().with_adapters(vec![lora(&file, 1.0)]);
+    let adapted = render_pixels(&adapted_spec, &request);
+    assert_ne!(adapted, plain, "the LoRA must change the T2I render");
+    let sequential = render_pixels(
+        &adapted_spec
+            .clone()
+            .with_offload_policy(OffloadPolicy::Sequential),
+        &request,
+    );
+    assert_eq!(
+        sequential, adapted,
+        "Sequential must render the same adapted pixels as Resident"
+    );
+    let off = render_pixels(&bare.with_adapters(vec![lora(&file, 0.0)]), &request);
+    assert_eq!(off, plain, "strength 0 is pixel-identical to no adapter");
+}
+
+/// The documented boundary — ten ordered references — renders with an adapter installed, and the
+/// adapter changes the 10-reference edit render (the reference route denoises through the same
+/// adapted DiT).
+///
+/// *Mutation that reds this:* the reference/edit route denoising through an un-adapted DiT.
+#[test]
+fn an_adapter_reaches_a_ten_reference_edit_render() {
+    use candle_gen::gen_core::{Conditioning, Image};
+
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("render.safetensors");
+    write_render_lora(&file);
+    let edge = 64u32;
+    let images: Vec<Image> = (0..10u32)
+        .map(|r| Image {
+            width: edge,
+            height: edge,
+            pixels: (0..edge * edge * 3)
+                .map(|i| ((i * 37 + r * 53 + 11) % 251) as u8)
+                .collect(),
+        })
+        .collect();
+    let request = GenerationRequest {
+        prompt: "combine every image".into(),
+        conditioning: vec![Conditioning::MultiReference { images }],
+        ..t2i_request(edge)
+    };
+    let bare = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()));
+    let plain = render_pixels(&bare, &request);
+    let adapted = render_pixels(&bare.with_adapters(vec![lora(&file, 1.0)]), &request);
+    assert_eq!(adapted.len(), (edge * edge * 3) as usize);
+    assert_ne!(
+        adapted, plain,
+        "the LoRA must change the 10-reference render"
+    );
+}

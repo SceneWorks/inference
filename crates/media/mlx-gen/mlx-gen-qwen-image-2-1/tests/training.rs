@@ -633,3 +633,123 @@ fn an_edit_item_over_the_reference_cap_is_refused_before_training() {
         "the refusal precedes every load: {events:?}"
     );
 }
+
+// ── sc-24163: parity with the candle twin's refusals ─────────────────────────────────────────
+
+/// `train` runs the full `validate` itself, so a caller that skips `validate` cannot slip a
+/// full-fine-tune or a control-branch request through as a plain adapter run: each is the shared
+/// floor's typed `Unsupported`, before any model loads.
+///
+/// *Mutation that reds this:* dropping `self.validate(req)?` from `Trainer::train` — `train_impl`
+/// re-checks only the request floor, so both requests would train a plain LoRA.
+#[test]
+fn train_refuses_full_finetune_and_control_requests_without_a_prior_validate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let items = dataset(tmp.path());
+    for (name, cfg) in [
+        (
+            "full_finetune",
+            TrainingConfig {
+                full_finetune: true,
+                ..config(2)
+            },
+        ),
+        (
+            "control_type",
+            TrainingConfig {
+                control_type: Some("canny".into()),
+                ..config(2)
+            },
+        ),
+    ] {
+        let req = request(items.clone(), cfg, &tmp.path().join(name));
+        let mut t = trainer();
+        let mut events = Vec::new();
+        let err = t
+            .train(&req, &mut |p| events.push(format!("{p:?}")))
+            .unwrap_err();
+        assert!(
+            matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+            "{name}: {err:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.starts_with("LoadingModel")),
+            "{name}: the refusal precedes every load: {events:?}"
+        );
+    }
+}
+
+/// A resume continues only the same dataset: an edit run cancelled after its step-1 snapshot does
+/// NOT resume once its ordered reference set changes (the references swapped) — the bundle's
+/// recorded dataset fingerprint (ordered reference paths + contents) differs — while the original
+/// dataset still resumes. The candle twin's rule, through the same gen-core check.
+///
+/// *Mutation that reds this:* dropping both identity checks (the early metadata admission and
+/// `load_resume_with_identity`) — the swapped-reference run then continues the old adapter.
+#[test]
+fn a_changed_reference_set_refuses_resume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (ref_a, _) = reference(dir, "ref_a.png", 64, 64, 11);
+    let (ref_b, _) = reference(dir, "ref_b.png", 64, 64, 97);
+    let target = write_image(dir, "target.png", 0);
+    let items = |refs: Vec<PathBuf>| {
+        vec![TrainingItem::edit_pair(
+            target.clone(),
+            "paint the first image in the colours of the second".into(),
+            refs,
+        )]
+    };
+    let cfg = TrainingConfig {
+        save_every: 1,
+        ..config(2)
+    };
+    let out = dir.join("out");
+
+    // Cancelled after step 1: the step-1 resume bundle is on disk.
+    let req = request(items(vec![ref_a.clone(), ref_b.clone()]), cfg.clone(), &out);
+    let cancel = req.cancel.clone();
+    let mut t = trainer();
+    let (steps, result) = run(t.as_mut(), &req, |step| {
+        if step == 1 {
+            cancel.cancel();
+        }
+    });
+    assert_eq!(steps, [1]);
+    assert_eq!(result.unwrap().steps, 1);
+    assert!(out
+        .join("qwen21_lora-step000001.resume.safetensors")
+        .is_file());
+
+    let resume = TrainingConfig {
+        resume: true,
+        ..cfg
+    };
+    let swapped = request(
+        items(vec![ref_b.clone(), ref_a.clone()]),
+        resume.clone(),
+        &out,
+    );
+    let mut t = trainer();
+    let mut events = Vec::new();
+    let result = t.train(&swapped, &mut |p| events.push(format!("{p:?}")));
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("dataset/request fingerprint differs"), "{err}");
+    // The refusal is admitted from the snapshot's metadata right after the preflight, so it pays
+    // no model load. *Mutation that reds this:* checking the identity only at the post-cache
+    // `load_resume_with_identity`.
+    assert!(
+        !events.iter().any(|e| e.starts_with("LoadingModel")),
+        "a refused resume loads no model: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.starts_with("Training")),
+        "no step runs on a refused resume: {events:?}"
+    );
+
+    let original = request(items(vec![ref_a, ref_b]), resume, &out);
+    let mut t = trainer();
+    let (steps, result) = run(t.as_mut(), &original, |_| {});
+    assert_eq!(steps, [2], "the unchanged dataset resumes from step 1");
+    assert_eq!(result.unwrap().steps, 2);
+}

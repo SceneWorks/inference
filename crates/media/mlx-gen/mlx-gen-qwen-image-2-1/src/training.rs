@@ -717,6 +717,8 @@ impl QwenImage21Trainer {
                  silently dropped"
             )));
         }
+        // Shared with the candle twin (sc-24163): one refusal, one message.
+        gen_core::train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
         let root = loader::snapshot_root(&spec.weights)?.to_path_buf();
         let tier = installed_tier(&root)?;
         if tier != Tier::Bf16 {
@@ -771,7 +773,9 @@ fn normalize_cfg(s: &str) -> String {
 
 /// Capability-free training-request validation, unit-testable without loaded weights. Rejects an
 /// empty dataset, zero rank, zero steps (a 0-step run would write a no-op identity adapter), an
-/// unsupported optimizer, and an unrecognized `timestep_type`/`timestep_bias`/`loss_type`.
+/// unsupported optimizer, an unrecognized `timestep_type`/`timestep_bias`/`loss_type`, a control
+/// image on any item, and `model_options` that select reference / control conditioning — the same
+/// inputs, with the same messages, the candle twin refuses (sc-24163).
 fn validate_request(req: &TrainingRequest) -> Result<()> {
     let cfg = &req.config;
     if req.items.is_empty() {
@@ -815,6 +819,23 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
         )
         .into());
     }
+    if req
+        .items
+        .iter()
+        .any(|item| item.control_image_path.is_some())
+    {
+        return Err(format!(
+            "{TRAINER_ID} trainer: control images are not part of Qwen-Image 2.1 LoRA/LoKr training"
+        )
+        .into());
+    }
+    // The worker forwards its whole `advanced` map as `model_options` and native trainers parse
+    // only the keys they own, so an unknown key is ignored — but a key that would switch this run
+    // into a workflow it does not read from there (reference / control conditioning) is refused
+    // rather than silently trained without it; its *off* state (null, `[]`, `""`, `{}`, `false`,
+    // `"none"`) selects nothing. The list, the off-value rule and the message are gen-core's, shared
+    // with the candle twin, so the two backends cannot drift.
+    gen_core::train::refuse_reference_control_model_options(&format!("{TRAINER_ID} trainer"), req)?;
     Ok(())
 }
 
@@ -1488,6 +1509,10 @@ impl Trainer for QwenImage21Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // The full `validate` — the shared control / full-fine-tune / edit floors included — so a
+        // caller that skips it cannot slip a control or full-tune request through as a plain
+        // text-to-image run (the candle twin does the same).
+        self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -1633,6 +1658,41 @@ impl QwenImage21Trainer {
             .unwrap_or_else(device_budget_bytes);
         check_training_footprint(&self.facts, &shape, budget)?;
 
+        // --- resume admission, before any model loads ---
+        // The run's identity (sc-24163): its training config and its dataset fingerprint (item
+        // order, captions, image / ordered reference paths and contents). Every resume bundle
+        // records it, and a resume whose config, dataset or training mode changed is refused HERE —
+        // from the snapshot's metadata alone, right after the preflight, as the candle twin does —
+        // so a refused resume never pays the text-encoder / VAE caching pass.
+        let stem = Path::new(&req.file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lora")
+            .to_string();
+        let fingerprint = checkpoint::request_fingerprint(req)?;
+        let identity = checkpoint::ResumeIdentity {
+            config: cfg,
+            request_fingerprint: &fingerprint,
+        };
+        let resume_from = if cfg.resume {
+            checkpoint::find_latest_resume(&req.output_dir, &stem)
+        } else {
+            None
+        };
+        if let Some((snapshot, step)) = &resume_from {
+            let meta = gen_core::weightsmeta::safetensors_file_metadata(
+                req.output_dir.join(checkpoint_filename(&stem, *step)),
+            )?;
+            check_resumed_mode(meta.get(EDIT_ADAPTER_MARKER.0).map(String::as_str), edit)?;
+            checkpoint::check_resume_fingerprints(
+                &gen_core::weightsmeta::safetensors_file_metadata(snapshot)?
+                    .into_iter()
+                    .collect::<std::collections::HashMap<_, _>>(),
+                cfg,
+                &fingerprint,
+            )?;
+        }
+
         // --- 1. captions: the Qwen3-VL tower, encoded ONCE, then dropped ---
         // Every prompt goes through the render path's own assembly: references preprocessed by
         // `prepare_conditioning_references`, the (image-conditioned, for edit) template encoded by
@@ -1771,27 +1831,18 @@ impl QwenImage21Trainer {
         let accum = cfg.gradient_accumulation.max(1);
         let (total_updates, warmup_updates) =
             schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("lora")
-            .to_string();
 
-        // --- resume: continue from the latest snapshot of THIS adapter in output_dir, if any ---
+        // --- resume: continue from the snapshot admitted above (identity + mode already checked;
+        // `load_resume_with_identity` re-checks the identity against the bundle it restores) ---
         let mut update_idx: u32 = 0;
         let mut start_step: u32 = 0;
-        if cfg.resume {
-            if let Some((snapshot, step)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
-                let meta = gen_core::weightsmeta::safetensors_file_metadata(
-                    req.output_dir.join(checkpoint_filename(&stem, step)),
-                )?;
-                check_resumed_mode(meta.get(EDIT_ADAPTER_MARKER.0).map(String::as_str), edit)?;
-                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
-                check_resumed_params(&params, &loaded)?;
-                params = loaded;
-                start_step = meta.step;
-                update_idx = meta.update_idx;
-            }
+        if let Some((snapshot, _)) = &resume_from {
+            let (loaded, meta) =
+                checkpoint::load_resume_with_identity(snapshot, &mut opt, identity)?;
+            check_resumed_params(&params, &loaded)?;
+            params = loaded;
+            start_step = meta.step;
+            update_idx = meta.update_idx;
         }
 
         // Provenance + licence on every saved adapter; an edit adapter is also marked as one.
@@ -1902,13 +1953,14 @@ impl QwenImage21Trainer {
                 // resumes from the latest boundary snapshot instead of silently dropping the
                 // partial window's gradients.
                 if step % accum == 0 {
-                    checkpoint::save_resume(
+                    checkpoint::save_resume_with_identity(
                         &req.output_dir,
                         &stem,
                         step,
                         update_idx,
                         &opt,
                         &params,
+                        identity,
                     )?;
                 }
                 on_progress(TrainingProgress::Checkpoint { step });
@@ -3372,5 +3424,99 @@ mod tests {
             training_footprint(&facts, &squared).train_phase - at(400),
             (seq * seq - target * seq - 400) * per_element
         );
+    }
+
+    // ── sc-24163: the candle twin's refusals, with the candle twin's messages ────────────────
+
+    /// A control image on any item is refused (the candle twin's message), and `model_options`
+    /// that select reference / control conditioning are refused through gen-core's one rule —
+    /// the defaults-shaped *off* values the worker sends pass, the same keys turned on do not.
+    ///
+    /// *Mutation that reds this:* dropping the control-image check or the
+    /// `refuse_reference_control_model_options` call from `validate_request`.
+    #[test]
+    fn validate_refuses_control_items_and_reference_control_model_options_like_candle() {
+        let base = req_with(base_config());
+        validate_request(&base).unwrap();
+
+        let mut control = base.clone();
+        control.items[0].control_image_path = Some(PathBuf::from("/nonexistent/c.png"));
+        let err = validate_request(&control).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "qwen_image_2_1 trainer: control images are not part of Qwen-Image 2.1 LoRA/LoKr \
+             training"
+        );
+
+        let advanced = serde_json::json!({
+            "mixedPrecision": "bf16",
+            "cacheLatents": true,
+            "networkType": "lora",
+            "controlType": null,
+            "control_type": "none",
+            "references": [],
+            "referenceImages": "",
+            "reference_images": "  ",
+            "referenceImagePaths": {},
+            "controlImage": false,
+            "control_image": "None",
+        });
+        let mut off = base.clone();
+        off.config.model_options = advanced.as_object().unwrap().clone();
+        off.items[0].model_options = advanced.as_object().unwrap().clone();
+        validate_request(&off).expect("off-state reference/control keys select nothing");
+
+        for (key, on) in [
+            ("references", serde_json::json!(["/r.png"])),
+            ("referenceImages", serde_json::json!("/r.png")),
+            ("controlImage", serde_json::json!(true)),
+            ("controlType", serde_json::json!("canny")),
+            ("referenceImagePaths", serde_json::json!({ "0": "/r.png" })),
+        ] {
+            let mut on_req = off.clone();
+            on_req.items[0].model_options.insert(key.into(), on.clone());
+            let err = validate_request(&on_req).unwrap_err().to_string();
+            assert!(err.contains(&format!("model_options `{key}`")), "{err}");
+            // The candle twin calls the same gen-core refusal with the same label, so the text
+            // is identical on both backends.
+            let shared = gen_core::train::refuse_reference_control_model_options(
+                "qwen_image_2_1 trainer",
+                &on_req,
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(err, shared);
+            let mut on_config = off.clone();
+            on_config.config.model_options.insert(key.into(), on);
+            assert!(validate_request(&on_config).is_err(), "{key} on the config");
+        }
+    }
+
+    /// `load` refuses a control / extra-control / IP-adapter / identity overlay with the candle
+    /// twin's typed `Unsupported`, before any weight is read.
+    ///
+    /// *Mutation that reds this:* dropping the `refuse_trainer_load_overlays` call from `load`.
+    #[test]
+    fn load_refuses_control_ip_adapter_and_identity_overlays_like_candle() {
+        let dense = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()));
+        QwenImage21Trainer::load(&dense).expect("the bare snapshot loads");
+        let other = || WeightsSource::Dir(PathBuf::from("/nonexistent/overlay"));
+        let mut identity = dense.clone();
+        identity.identity = Some(Default::default());
+        for spec in [
+            dense.clone().with_control(other()),
+            dense.clone().with_extra_control(other()),
+            dense.clone().with_ip_adapter(other()),
+            identity,
+        ] {
+            match QwenImage21Trainer::load(&spec).err() {
+                Some(Error::Unsupported(message)) => assert_eq!(
+                    message,
+                    "qwen_image_2_1 trainer: control / IP-adapter / identity overlays are not \
+                     part of text-to-image LoRA/LoKr training"
+                ),
+                other => panic!("an overlay must be a typed Unsupported, got {other:?}"),
+            }
+        }
     }
 }

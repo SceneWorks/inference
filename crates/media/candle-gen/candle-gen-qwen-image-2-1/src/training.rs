@@ -800,16 +800,8 @@ impl QwenImage21Trainer {
                  silently dropped"
             )));
         }
-        if spec.control.is_some()
-            || !spec.extra_controls.is_empty()
-            || spec.ip_adapter.is_some()
-            || spec.identity.is_some()
-        {
-            return Err(Error::Unsupported(format!(
-                "{TRAINER_ID} trainer: control / IP-adapter / identity overlays are not part of \
-                 text-to-image LoRA/LoKr training"
-            )));
-        }
+        // Shared with the MLX twin (sc-24163): one refusal, one message.
+        gen_core::train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
         let root = loader::snapshot_root(&spec.weights)?.to_path_buf();
         let tier = installed_tier(&root)?;
         if tier != Tier::Bf16 {
@@ -887,61 +879,12 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     // only the keys they own, so an unknown key is ignored — but a key that would switch this run
     // into a workflow it does not read from there (reference / control conditioning) is refused
     // rather than silently trained without it. A key the worker sends in its *off* state (null, an
-    // empty list or string, `false`, `"none"`) selects nothing and is ignored like any other.
-    let refused = |options: &serde_json::Map<String, serde_json::Value>| {
-        UNHONOURED_MODEL_OPTIONS
-            .iter()
-            .find(|key| options.get(**key).is_some_and(selects_something))
-            .copied()
-    };
-    let hit = refused(&req.config.model_options).or_else(|| {
-        req.items
-            .iter()
-            .find_map(|item| refused(&item.model_options))
-    });
-    if let Some(key) = hit {
-        return Err(Error::Msg(format!(
-            "{LABEL}: model_options `{key}` selects reference/control conditioning, which this \
-             trainer does not read from model_options (instruction-edit references travel as \
-             TrainingItem::reference_image_paths); refusing rather than silently training \
-             without it"
-        )));
-    }
+    // empty list or string, `{}`, `false`, `"none"`) selects nothing and is ignored like any other.
+    // The list, the off-value rule and the message are gen-core's, shared with the MLX twin
+    // (sc-24163), so the two backends cannot drift.
+    gen_core::train::refuse_reference_control_model_options(LABEL, req)?;
     Ok(())
 }
-
-/// Whether a [`UNHONOURED_MODEL_OPTIONS`] value actually selects a workflow. The worker's `advanced`
-/// map carries these keys in their *off* state too — `null`, `[]`, `""`, `false`, `"none"` — and
-/// those select nothing.
-fn selects_something(value: &serde_json::Value) -> bool {
-    use serde_json::Value;
-    match value {
-        Value::Null | Value::Bool(false) => false,
-        Value::String(s) => {
-            let s = s.trim();
-            !s.is_empty() && !s.eq_ignore_ascii_case("none")
-        }
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(map) => !map.is_empty(),
-        Value::Bool(true) | Value::Number(_) => true,
-    }
-}
-
-/// `model_options` keys naming a workflow this trainer does not read from `model_options`: ordered
-/// reference images (instruction-edit training travels as `TrainingItem::reference_image_paths`,
-/// under the shared edit floor) and control conditioning. Every other key — the worker's
-/// `mixedPrecision`, `cacheLatents`, `networkType`, `sampleEvery`, … — is not this trainer's to
-/// read and is ignored.
-const UNHONOURED_MODEL_OPTIONS: [&str; 8] = [
-    "references",
-    "referenceImages",
-    "reference_images",
-    "referenceImagePaths",
-    "controlType",
-    "control_type",
-    "controlImage",
-    "control_image",
-];
 
 /// Resolve the config's target-module *suffixes* to `(dotted path, [out, in])` on the DiT's
 /// weight-free projection table. The DEFAULT (empty `lora_target_modules`) is every
@@ -2305,6 +2248,33 @@ mod tests {
         assert!(err.to_string().contains("vision tower"), "{err}");
     }
 
+    /// `load` refuses a control / extra-control / IP-adapter / identity overlay as a typed
+    /// `Unsupported` — gen-core's one refusal and message, shared with the MLX twin (sc-24163).
+    ///
+    /// *Mutation that reds this:* dropping the `refuse_trainer_load_overlays` call from `load_on`.
+    #[test]
+    fn load_refuses_control_ip_adapter_and_identity_overlays() {
+        let dense = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()));
+        let other = || WeightsSource::Dir(PathBuf::from("/nonexistent/overlay"));
+        let mut identity = dense.clone();
+        identity.identity = Some(Default::default());
+        for spec in [
+            dense.clone().with_control(other()),
+            dense.clone().with_extra_control(other()),
+            dense.clone().with_ip_adapter(other()),
+            identity,
+        ] {
+            match QwenImage21Trainer::load_on(&spec, Device::Cpu).err() {
+                Some(Error::Unsupported(message)) => assert_eq!(
+                    message,
+                    "qwen_image_2_1 trainer: control / IP-adapter / identity overlays are not \
+                     part of text-to-image LoRA/LoKr training"
+                ),
+                other => panic!("an overlay must be a typed Unsupported, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn validate_rejects_bad_requests_and_accepts_normalised_spellings() {
         let t = trainer();
@@ -2370,7 +2340,8 @@ mod tests {
     /// or string, `false`, `"none"`), which selects nothing — so a defaults-shaped map, on the
     /// config and on the items, passes `validate`. The same keys turned *on* are still refused.
     ///
-    /// *Mutation that reds this:* `selects_something` treating any non-null value as present (the
+    /// *Mutation that reds this:* `gen_core::train::model_option_selects_something` treating
+    /// any non-null value as present (the
     /// original rule — `[]`, `""`, `false` and `"none"` then refuse a defaults-shaped run).
     #[test]
     fn a_sceneworks_shaped_advanced_map_passes_validate() {

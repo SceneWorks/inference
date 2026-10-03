@@ -15,6 +15,7 @@
 
 // The pure LR-schedule policy lives here (gen-core); the MLX training kernels
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.
+pub mod resume;
 pub mod schedule;
 
 use std::path::PathBuf;
@@ -549,6 +550,97 @@ pub fn validate_edit_request(desc: &TrainerDescriptor, req: &TrainingRequest) ->
     Ok(())
 }
 
+/// `model_options` keys naming a workflow an image LoRA/LoKr trainer does not read from
+/// `model_options`: ordered reference images (instruction-edit training travels as
+/// `TrainingItem::reference_image_paths`, under the shared edit floor) and control conditioning.
+/// Every other key — the worker's `mixedPrecision`, `cacheLatents`, `networkType`, `sampleEvery`, … —
+/// is not the trainer's to read and is ignored.
+pub const REFERENCE_CONTROL_MODEL_OPTIONS: [&str; 8] = [
+    "references",
+    "referenceImages",
+    "reference_images",
+    "referenceImagePaths",
+    "controlType",
+    "control_type",
+    "controlImage",
+    "control_image",
+];
+
+/// Whether a [`REFERENCE_CONTROL_MODEL_OPTIONS`] value actually selects a workflow. The worker's
+/// `advanced` map carries these keys in their *off* state too — `null`, `[]`, `""` (or whitespace),
+/// `{}`, `false`, `"none"` — and those select nothing.
+pub fn model_option_selects_something(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Null | JsonValue::Bool(false) => false,
+        JsonValue::String(s) => {
+            let s = s.trim();
+            !s.is_empty() && !s.eq_ignore_ascii_case("none")
+        }
+        JsonValue::Array(items) => !items.is_empty(),
+        JsonValue::Object(map) => !map.is_empty(),
+        JsonValue::Bool(true) | JsonValue::Number(_) => true,
+    }
+}
+
+/// The first [`REFERENCE_CONTROL_MODEL_OPTIONS`] key that selects something, on the config's
+/// `model_options` first and then on each item's.
+pub fn selected_reference_control_model_option(req: &TrainingRequest) -> Option<&'static str> {
+    let refused = |options: &JsonMap<String, JsonValue>| {
+        REFERENCE_CONTROL_MODEL_OPTIONS
+            .iter()
+            .find(|key| {
+                options
+                    .get(**key)
+                    .is_some_and(model_option_selects_something)
+            })
+            .copied()
+    };
+    refused(&req.config.model_options).or_else(|| {
+        req.items
+            .iter()
+            .find_map(|item| refused(&item.model_options))
+    })
+}
+
+/// Refuse (as [`crate::Error::Msg`], `label`-prefixed) a request whose `model_options` select
+/// reference / control conditioning ([`selected_reference_control_model_option`]) rather than
+/// silently training without it.
+pub fn refuse_reference_control_model_options(
+    label: &str,
+    req: &TrainingRequest,
+) -> crate::Result<()> {
+    match selected_reference_control_model_option(req) {
+        None => Ok(()),
+        Some(key) => Err(crate::Error::Msg(format!(
+            "{label}: model_options `{key}` selects reference/control conditioning, which this \
+             trainer does not read from model_options (instruction-edit references travel as \
+             TrainingItem::reference_image_paths); refusing rather than silently training \
+             without it"
+        ))),
+    }
+}
+
+/// The shared **load-overlay floor** for image LoRA/LoKr trainers (sc-24163): a control,
+/// extra-control, IP-adapter or identity overlay on the trainer's
+/// [`LoadSpec`](crate::runtime::LoadSpec) is not part of the trained adapter, so it is a typed
+/// [`crate::Error::Unsupported`] rather than silently dropped. `label` names the trainer.
+pub fn refuse_trainer_load_overlays(
+    label: &str,
+    spec: &crate::runtime::LoadSpec,
+) -> crate::Result<()> {
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.identity.is_some()
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{label}: control / IP-adapter / identity overlays are not part of text-to-image \
+             LoRA/LoKr training"
+        )));
+    }
+    Ok(())
+}
+
 /// A LoRA/LoKr trainer for one model family — the training analog of
 /// [`Generator`](crate::generator::Generator). `train` is **synchronous** (long/blocking; the
 /// worker runs each job on its own thread) and takes `&mut self` because training mutates the
@@ -928,5 +1020,78 @@ mod tests {
             validate_edit_request(&edit_desc(0), &train_req(None, vec![trigger_only])).is_ok(),
             "an empty caption on a captioned item stays legal"
         );
+    }
+
+    fn plain_request() -> TrainingRequest {
+        TrainingRequest {
+            items: vec![TrainingItem::captioned(
+                PathBuf::from("a.png"),
+                "a cat".into(),
+            )],
+            config: TrainingConfig::default(),
+            output_dir: PathBuf::from("out"),
+            file_name: "out.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        }
+    }
+
+    /// *Mutation that reds this:* `model_option_selects_something` treating every non-null value as
+    /// present, or dropping a key from [`REFERENCE_CONTROL_MODEL_OPTIONS`].
+    #[test]
+    fn reference_control_model_options_refuse_on_values_and_ignore_off_values() {
+        let mut req = plain_request();
+        let off = serde_json::json!({
+            "mixedPrecision": "bf16",
+            "references": [],
+            "referenceImages": "",
+            "reference_images": "  ",
+            "referenceImagePaths": {},
+            "controlType": null,
+            "control_type": "none",
+            "controlImage": false,
+            "control_image": "None",
+        });
+        req.config.model_options = off.as_object().unwrap().clone();
+        req.items[0].model_options = off.as_object().unwrap().clone();
+        refuse_reference_control_model_options("t", &req).unwrap();
+        for key in REFERENCE_CONTROL_MODEL_OPTIONS {
+            let mut on = req.clone();
+            on.items[0]
+                .model_options
+                .insert(key.into(), serde_json::json!("x"));
+            let err = refuse_reference_control_model_options("t", &on)
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("t: model_options `"), "{err}");
+            assert!(err.contains(&format!("`{key}`")), "{err}");
+        }
+    }
+
+    /// *Mutation that reds this:* dropping any arm of the `||` in `refuse_trainer_load_overlays`.
+    #[test]
+    fn trainer_load_overlays_are_typed_refusals() {
+        use crate::runtime::{IdentityWeights, LoadSpec, WeightsSource};
+
+        let dir = || WeightsSource::Dir(PathBuf::from("/x"));
+        let base = LoadSpec::new(dir());
+        refuse_trainer_load_overlays("t", &base).unwrap();
+        let mut identity = base.clone();
+        identity.identity = Some(IdentityWeights::default());
+        for spec in [
+            base.clone().with_control(dir()),
+            base.clone().with_extra_control(dir()),
+            base.clone().with_ip_adapter(dir()),
+            identity,
+        ] {
+            match refuse_trainer_load_overlays("t", &spec) {
+                Err(crate::Error::Unsupported(message)) => assert_eq!(
+                    message,
+                    "t: control / IP-adapter / identity overlays are not part of text-to-image \
+                     LoRA/LoKr training"
+                ),
+                other => panic!("an overlay must be a typed Unsupported, got {other:?}"),
+            }
+        }
     }
 }

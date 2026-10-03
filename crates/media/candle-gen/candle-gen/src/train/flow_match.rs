@@ -37,7 +37,6 @@
 //! the driver only orchestrates around it.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use candle_core::backprop::GradStore;
@@ -46,7 +45,6 @@ use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
-use sha2::{Digest, Sha256};
 
 use crate::gen_core::train::{
     NetworkType, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -158,104 +156,13 @@ pub fn sample_uniform_range(seed: u64, lower: f32, upper: f32) -> f32 {
     rng.random::<f32>().mul_add(upper - lower, lower)
 }
 
-fn fingerprint_field(hasher: &mut Sha256, tag: &[u8], bytes: &[u8]) {
-    hasher.update((tag.len() as u64).to_le_bytes());
-    hasher.update(tag);
-    hasher.update((bytes.len() as u64).to_le_bytes());
-    hasher.update(bytes);
-}
-
-fn fingerprint_cancelled(req: &TrainingRequest) -> Result<()> {
-    if req.cancel.is_cancelled() {
-        Err(CandleError::Canceled)
-    } else {
-        Ok(())
-    }
-}
-
-fn fingerprint_file(
-    hasher: &mut Sha256,
-    tag: &[u8],
-    path: &Path,
-    req: &TrainingRequest,
-) -> Result<()> {
-    fingerprint_cancelled(req)?;
-    fingerprint_field(hasher, tag, path.to_string_lossy().as_bytes());
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        CandleError::Msg(format!(
-            "training resume fingerprint: open {}: {e}",
-            path.display()
-        ))
-    })?;
-    let size = file
-        .metadata()
-        .map_err(|e| {
-            CandleError::Msg(format!(
-                "training resume fingerprint: stat {}: {e}",
-                path.display()
-            ))
-        })?
-        .len();
-    hasher.update(size.to_le_bytes());
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        fingerprint_cancelled(req)?;
-        let n = file.read(&mut buffer).map_err(|e| {
-            CandleError::Msg(format!(
-                "training resume fingerprint: read {}: {e}",
-                path.display()
-            ))
-        })?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(())
-}
-
 /// Stable digest of every input that selects cached training data. Item order, captions, paths, file
-/// contents, optional control inputs, and resolution are length-delimited to prevent ambiguity.
+/// contents, optional control inputs, ordered edit references, and resolution are length-delimited to
+/// prevent ambiguity. The one backend-neutral implementation lives in
+/// [`crate::gen_core::train::resume::request_fingerprint`]
+/// (sc-24163), shared with the MLX trainers; the digest is unchanged, so existing bundles resume.
 pub fn request_fingerprint(req: &TrainingRequest) -> Result<String> {
-    fingerprint_cancelled(req)?;
-    let mut hasher = Sha256::new();
-    fingerprint_field(&mut hasher, b"format", b"candle-training-request-v1");
-    fingerprint_field(
-        &mut hasher,
-        b"resolution",
-        &req.config.resolution.to_le_bytes(),
-    );
-    fingerprint_field(
-        &mut hasher,
-        b"item_count",
-        &(req.items.len() as u64).to_le_bytes(),
-    );
-    for (index, item) in req.items.iter().enumerate() {
-        fingerprint_cancelled(req)?;
-        fingerprint_field(&mut hasher, b"item_index", &(index as u64).to_le_bytes());
-        fingerprint_field(&mut hasher, b"caption", item.caption.as_bytes());
-        fingerprint_file(&mut hasher, b"image", &item.image_path, req)?;
-        match &item.control_image_path {
-            Some(path) => {
-                fingerprint_field(&mut hasher, b"has_control", &[1]);
-                fingerprint_file(&mut hasher, b"control", path, req)?;
-            }
-            None => fingerprint_field(&mut hasher, b"has_control", &[0]),
-        }
-        // Instruction-edit references (sc-24161), in order. Hashed only when present, so every
-        // captioned / control request keeps the fingerprint (and the resume bundles) it had.
-        if !item.reference_image_paths.is_empty() {
-            fingerprint_field(
-                &mut hasher,
-                b"reference_count",
-                &(item.reference_image_paths.len() as u64).to_le_bytes(),
-            );
-            for reference in &item.reference_image_paths {
-                fingerprint_file(&mut hasher, b"reference", reference, req)?;
-            }
-        }
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::gen_core::train::resume::request_fingerprint(req)?)
 }
 
 /// The per-step timestep RNG seed: mixes the config `seed` with `step` via the golden-ratio constant —
@@ -627,7 +534,9 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     let device = model.device();
     on_progress(TrainingProgress::Preparing);
     model.preflight(req)?;
-    fingerprint_cancelled(req)?;
+    if req.cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
     let fingerprint = request_fingerprint(req)?;
 
     // --- cache (latents + conditioning); the encoders load and drop inside the hook ---
