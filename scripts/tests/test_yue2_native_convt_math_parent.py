@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.request
 import zipfile
 
 CI = Path(__file__).resolve().parents[1] / "ci"
@@ -19,6 +20,41 @@ def sha(value: bytes) -> str:
 
 
 class NativeMathParent(unittest.TestCase):
+    def test_https_redirect_credentials_stay_on_original_origin_only(self):
+        handler = parent.ArtifactRedirects()
+        request = urllib.request.Request(
+            "https://api.github.com/repos/SceneWorks/inference/actions/artifacts/11259450025/zip",
+            headers={"Authorization": "Bearer SYNTHETIC_ONLY", "Accept": "application/zip"})
+        same = handler.redirect_request(request, None, 302, "Found", {},
+                                        "https://API.GITHUB.COM:443/next")
+        self.assertEqual(same.get_header("Authorization"), "Bearer SYNTHETIC_ONLY")
+        cross = handler.redirect_request(request, None, 302, "Found", {},
+                                         "https://artifact-host.example/signed.zip")
+        self.assertIsNone(cross.get_header("Authorization"))
+        self.assertEqual(cross.get_header("Accept"), "application/zip")
+        chained = handler.redirect_request(cross, None, 302, "Found", {},
+                                           "https://artifact-host.example/another-signed.zip")
+        self.assertIsNone(chained.get_header("Authorization"))
+        back = handler.redirect_request(chained, None, 302, "Found", {},
+                                        "https://api.github.com/back")
+        self.assertIsNone(back.get_header("Authorization"))
+
+    def test_redirect_refuses_http_downgrade_and_userinfo(self):
+        handler = parent.ArtifactRedirects()
+        request = urllib.request.Request("https://api.github.com/fixture",
+                                         headers={"Authorization": "Bearer SYNTHETIC_ONLY"})
+        for destination in ("http://artifact-host.example/zip",
+                            "https://user:pass@artifact-host.example/zip",
+                            "//artifact-host.example/zip"):
+            with self.subTest(destination=destination), self.assertRaisesRegex(
+                    ValueError, "HTTPS URL without userinfo"):
+                handler.redirect_request(request, None, 302, "Found", {}, destination)
+        insecure_source = urllib.request.Request("http://api.github.com/fixture",
+                                                 headers={"Authorization": "Bearer SYNTHETIC_ONLY"})
+        with self.assertRaisesRegex(ValueError, "HTTPS URL without userinfo"):
+            handler.redirect_request(insecure_source, None, 302, "Found", {},
+                                     "https://artifact-host.example/zip")
+
     def test_native_math_raw_shape_hash_and_parent_geometry_mutations(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)

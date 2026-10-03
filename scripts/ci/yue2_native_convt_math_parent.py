@@ -9,12 +9,41 @@ import os
 from pathlib import Path
 import shutil
 import urllib.request
+from urllib.parse import urlsplit
 import zipfile
 
 
 HERE = Path(__file__).parent / "yue2_bf16_tile_diagnostic"
 ANCHOR = HERE / "native-convt-math-parent.json"
 AUDIT = HERE / "native-convt-parent-audit.json"
+
+
+class ArtifactRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep GitHub credentials on its HTTPS API origin only."""
+
+    @staticmethod
+    def origin(url: str) -> tuple[str, str, int]:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("artifact redirect requires an HTTPS URL without userinfo")
+        return parsed.scheme.lower(), parsed.hostname.lower(), parsed.port or 443
+
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        original = self.origin(request.full_url)
+        destination = self.origin(new_url)
+        redirected = super().redirect_request(request, file_pointer, code, message, headers, new_url)
+        if redirected is None:
+            return None
+        if destination != original:
+            for collection in (redirected.headers, redirected.unredirected_hdrs):
+                for key in tuple(collection):
+                    if key.lower() in {"authorization", "proxy-authorization"}:
+                        redirected.remove_header(key)
+            if any(key.lower() in {"authorization", "proxy-authorization"}
+                   for collection in (redirected.headers, redirected.unredirected_hdrs)
+                   for key in collection):
+                raise ValueError("artifact redirect retained a credential across origins")
+        return redirected
 
 
 def require(condition: bool, message: str) -> None:
@@ -107,7 +136,8 @@ def fetch_parent(archive: Path) -> None:
            + str(anchor["metricsArtifactId"]))
     headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
-    with urllib.request.urlopen(urllib.request.Request(api, headers=headers), timeout=30) as response:
+    opener = urllib.request.build_opener(ArtifactRedirects())
+    with opener.open(urllib.request.Request(api, headers=headers), timeout=30) as response:
         metadata = json.load(response)
     require(metadata["id"] == anchor["metricsArtifactId"] and
             metadata["name"] == anchor["metricsArtifactName"] and
@@ -117,7 +147,7 @@ def fetch_parent(archive: Path) -> None:
             "parent artifact provenance changed")
     require(not archive.exists(), "parent archive destination already exists")
     try:
-        with urllib.request.urlopen(urllib.request.Request(api + "/zip", headers=headers), timeout=60) as source, archive.open("xb") as sink:
+        with opener.open(urllib.request.Request(api + "/zip", headers=headers), timeout=60) as source, archive.open("xb") as sink:
             shutil.copyfileobj(source, sink, length=8 * 1024 * 1024)
         require(digest(archive) == anchor["metricsZipSha256"], "parent artifact ZIP digest changed")
     except BaseException:
