@@ -1,6 +1,7 @@
 """CPU-only controls for the dispatch-only precision proof."""
 import importlib.util
 import json
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import copy
@@ -24,6 +25,67 @@ WORKFLOW = ROOT / ".github/workflows/yue2-precision-proof.yml"
 
 
 class PrecisionControlTests(unittest.TestCase):
+    @staticmethod
+    def concurrency_settings(source):
+        block = re.search(r"(?m)^concurrency:\n((?: +[^\n]*\n)+)", source)
+        if block is None:
+            raise AssertionError("workflow concurrency block missing")
+        return dict(line.strip().split(": ", 1) for line in block[1].splitlines())
+
+    @staticmethod
+    def concurrency_group(group, stage, run_id):
+        # Read the actual workflow expression; accept only the narrow selector and
+        # run-id formatter this contract permits, rather than evaluating Python.
+        match = re.fullmatch(
+            r"\$\{\{ inputs\.stage == '([^']+)' && format\('([^']+)', github\.run_id\) \|\| '([^']+)' \}\}",
+            group,
+        )
+        if match is None:
+            raise AssertionError("unexpected precision concurrency expression")
+        selected_stage, cpu_group, accelerator_group = match.groups()
+        return cpu_group.format(run_id) if stage == selected_stage else accelerator_group
+
+    def test_fixture_transfers_use_distinct_run_owned_cpu_groups(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        settings = self.concurrency_settings(source)
+        group = settings["group"]
+        first = self.concurrency_group(group, "fixture", "101")
+        second = self.concurrency_group(group, "fixture", "102")
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(first, "inference-real-weights-physical-host")
+        fixture = source.split("  reference:\n", 1)[1].split("\n  cuda:", 1)[0]
+        self.assertIn("    if: inputs.stage == 'fixture'\n", fixture)
+        self.assertIn("    runs-on: ubuntu-latest\n", fixture)
+
+    def test_every_accelerator_stage_retains_the_existing_shared_physical_group(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        settings = self.concurrency_settings(source)
+        group = settings["group"]
+        for stage in ("cuda", "metal", "cuda-diagnostic", "", "unknown"):
+            for run_id in ("101", "102"):
+                with self.subTest(stage=stage, run_id=run_id):
+                    self.assertEqual(self.concurrency_group(group, stage, run_id),
+                                     "inference-real-weights-physical-host")
+        # Keep all other workflow users of the accelerator lock byte-consistent.
+        for name in ("real-weights.yml", "real-weights-yue.yml", "yue2-bf16-tile-diagnostic.yml",
+                     "ltx25-quant-campaign.yml", "ltx25-quant-promotion.yml"):
+            other = self.concurrency_settings(WORKFLOW.with_name(name).read_text(encoding="utf-8"))
+            with self.subTest(workflow=name):
+                self.assertEqual(other["group"],
+                                 self.concurrency_group(group, "cuda", "101"))
+                self.assertEqual(other["cancel-in-progress"], "false")
+        app = self.concurrency_settings(
+            WORKFLOW.with_name("yue2-app-precision-profile.yml").read_text(encoding="utf-8"))
+        self.assertEqual(app["group"],
+                         "${{ inputs.backend == 'cuda' && 'inference-real-weights-physical-host' "
+                         "|| 'yue2-app-precision-nax-macos-2' }}")
+        self.assertEqual(app["cancel-in-progress"], "false")
+
+    def test_precision_queue_preserves_existing_pending_and_running_work(self):
+        settings = self.concurrency_settings(WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(settings["queue"], "max")
+        self.assertEqual(settings["cancel-in-progress"], "false")
+
     def test_optional_app_sha_is_absent_when_empty_and_one_argument_when_set(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         cuda = workflow.split("      - name: Run exactly one CUDA precision test with external sampling\n", 1)[1].split("      - name: Upload raw CUDA proof", 1)[0]
@@ -603,7 +665,8 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("if: inputs.stage == 'fixture'", source)
         self.assertIn("if: inputs.stage == 'cuda'", source)
         self.assertIn("if: inputs.stage == 'metal'", source)
-        self.assertIn("group: inference-real-weights-physical-host", source)
+        self.assertEqual(self.concurrency_group(self.concurrency_settings(source)["group"],
+                                               "cuda", "101"), "inference-real-weights-physical-host")
         self.assertIn('CUDA_VISIBLE_DEVICES: "0"', source)
         self.assertEqual(source.count("path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav"), 2)
         self.assertEqual(source.count("if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}"), 2)
@@ -649,7 +712,8 @@ class PrecisionControlTests(unittest.TestCase):
         job = workflow.split("  cuda_diagnostic:\n", 1)[1].split("  reference:\n", 1)[0]
         probe = (ROOT / "scripts/ci/yue2_cuda_context_diagnostic.ps1").read_text(encoding="utf-8")
         self.assertIn("if: inputs.stage == 'cuda-diagnostic'", job)
-        self.assertIn("group: inference-real-weights-physical-host", workflow)
+        self.assertEqual(self.concurrency_group(self.concurrency_settings(workflow)["group"],
+                                               "cuda-diagnostic", "101"), "inference-real-weights-physical-host")
         self.assertIn("$env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA", job)
         self.assertIn("(git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA", job)
         self.assertIn("diagnostic_pid must be a positive decimal PID", job)
