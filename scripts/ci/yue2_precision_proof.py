@@ -442,6 +442,9 @@ def execute(args: argparse.Namespace) -> None:
     require(not dirty.strip(), "engine source became dirty before hardware execution")
     runner = os.environ.get("RUNNER_NAME", "")
     baseline_files = None
+    owner_guard = None
+    scheduling = getattr(args, "cuda_scheduling_mode", "shared-host")
+    require(scheduling == "shared-host" or args.backend == "cuda", "GPU0 owner mode is CUDA only")
     if args.backend == "metal":
         require(runner == "nax-macos-2", f"Metal proof assigned to wrong runner: {runner}")
     else:
@@ -460,7 +463,17 @@ def execute(args: argparse.Namespace) -> None:
     (evidence / "census-before.txt").write_text(before_raw, encoding="utf-8")
     require(not before_busy, f"foreign/lingering accelerator executables before test: {before_busy}")
     before_files = retain_cuda_physical_evidence(evidence, "before", before_raw) if args.backend == "cuda" else None
-    env = os.environ.copy()
+    if scheduling == "owner-gpu0":
+        from yue2_gpu0_owner_guard import OwnerGuard
+        owner_guard = OwnerGuard(evidence, args.engine_sha, args.control_sha)
+        owner_guard.preflight()
+        # API/source authentication consumes time; retain the original deadline
+        # reservation at the actual model boundary rather than extending its clock.
+        require_remaining_window(CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS)
+        require(time.time_ns() + (CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS) * 1_000_000_000 <=
+                int(job_start) + CUDA_JOB_TIMEOUT_SECONDS * 1_000_000_000,
+                "owner preflight consumed bounded CUDA job upload tail")
+    env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     env["YUE2_VAE_REFERENCE_DIR"] = str(args.reference)
     env["YUE2_PRECISION_RECEIPT"] = str(evidence / "precision-receipt.json")
     env["YUE2_PRECISION_WORK_DIR"] = str(args.work_dir)
@@ -482,15 +495,31 @@ def execute(args: argparse.Namespace) -> None:
         thread = threading.Thread(target=loop, daemon=True)
         try:
             thread.start()
-            code, timed_out, wait_error = wait_owned_child(child, args.backend)
-        except Exception as error:
-            code, cleanup_error = reap_owned_child(child)
+            if owner_guard is not None:
+                from yue2_gpu0_owner_guard import wait
+                owner_guard.start(child)
+                code, timed_out, wait_error = wait(child, owner_guard, CUDA_CHILD_TIMEOUT_SECONDS)
+            else:
+                code, timed_out, wait_error = wait_owned_child(child, args.backend)
+        except BaseException as error:
+            if owner_guard is None and not isinstance(error, Exception):
+                raise
+            if owner_guard is not None:
+                from yue2_gpu0_owner_guard import reap_tree
+                code, cleanup_error = reap_tree(child)
+            else:
+                code, cleanup_error = reap_owned_child(child)
             timed_out = False
             wait_error = f"sampler startup: {error}; cleanup: {cleanup_error}"
         finally:
             stop.set()
             if thread.is_alive():
                 thread.join(timeout=25)
+    if owner_guard is not None:
+        try:
+            owner_guard.finish()
+        except BaseException as error:
+            wait_error = f"{wait_error}; final holder: {error}"
     ended = time.time_ns()
     post_census_error = None
     try:
@@ -552,7 +581,8 @@ def execute(args: argparse.Namespace) -> None:
               "fresh_physical_before_files": before_files, "fresh_physical_after_files": after_files,
               "post_census_busy": after_busy, "post_census_error": post_census_error,
               "receipt_sha256": sha256(receipt) if receipt.is_file() else None,
-              "receipt_schema_error": receipt_schema_error}
+              "receipt_schema_error": receipt_schema_error,
+              "scheduling": owner_guard.summary() if owner_guard is not None else {"mode": "shared-host"}}
     write_json(evidence / "control.json", report)
     print(json.dumps(report, indent=2), flush=True)
     require(not timed_out and wait_error is None and code == 0,
@@ -588,6 +618,7 @@ def main() -> None:
     p.add_argument("--engine-sha", required=True)
     p.add_argument("--control-sha", required=True)
     p.add_argument("--app-sha", default="")
+    p.add_argument("--cuda-scheduling-mode", choices=("shared-host", "owner-gpu0"), default="shared-host")
     args = parser.parse_args()
     {"resolve-binary": resolve_binary, "verify-reference": verify_reference, "run": execute}[args.mode](args)
 

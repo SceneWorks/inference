@@ -1,0 +1,350 @@
+"""CPU mocks for the opt-in physical-owner guard; no GPU or GitHub calls."""
+import base64
+import copy
+from datetime import datetime, timezone
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts/ci"))
+import yue2_gpu0_owner_guard as guard
+from scripts.tests import test_yue2_precision_proof as routes
+
+
+def run(run_id=guard.HOLDER_RUN, sha=guard.HOLDER_SHA, path=".github/workflows/real-weights.yml"):
+    return {"id": run_id, "head_sha": sha, "run_attempt": 1, "event": "workflow_dispatch",
+            "path": path, "repository": {"full_name": guard.REPO}, "status": "in_progress", "conclusion": None}
+
+
+def jobs(job_id=guard.HOLDER_JOB, name=guard.HOLDER_NAME, runner=guard.HOLDER_RUNNER):
+    selected = {"id": job_id, "name": name, "runner_name": runner, "status": "in_progress",
+                "conclusion": None, "completed_at": None, "started_at": "2026-10-03T10:00:00Z"}
+    return {"total_count": 55, "jobs": [selected] +
+            [{"id": i, "status": "completed", "conclusion": "skipped"} for i in range(54)]}
+
+
+def group(name=guard.OLD_GROUP, run_id=guard.HOLDER_RUN):
+    return {"group_name": name, "total_count": 2,
+            "group_members": [{"run_id": run_id, "status": "in_progress"},
+                              {"run_id": 123, "status": "pending"}]}
+
+
+class Owned:
+    pid = 777
+    code = None
+    def poll(self): return self.code
+    def wait(self, timeout):
+        if self.code is not None: return self.code
+        raise subprocess.TimeoutExpired("owned", timeout)
+
+
+class OwnerGuardTests(unittest.TestCase):
+    def test_routing_is_one_fixed_group_only_exact_cuda_owner_mode(self):
+        for filename, selector in (("yue2-precision-proof.yml", "stage"),
+                                   ("yue2-app-precision-profile.yml", "backend")):
+            source = (ROOT / ".github/workflows" / filename).read_text(encoding="utf-8")
+            settings = routes.PrecisionControlTests.concurrency_settings(source)
+            self.assertEqual(settings["queue"], "max")
+            self.assertEqual(settings["cancel-in-progress"], "false")
+            for stage in ("fixture", "cuda", "metal", "cuda-diagnostic", "", "unknown"):
+                for mode in ("shared-host", "owner-gpu0", "", "unknown"):
+                    for receipt in (guard.RECEIPT, "37106146499", "", "arbitrary"):
+                        for engine in (guard.ENGINE, "a" * 40):
+                            opted = stage == "cuda" and mode == "owner-gpu0" and receipt == guard.RECEIPT and engine == guard.ENGINE
+                            actual = routes.PrecisionControlTests.concurrency_group(settings["group"], stage, "101", mode, receipt, engine)
+                            if opted:
+                                expected = guard.GPU0_GROUP
+                            elif selector == "stage" and stage == "fixture":
+                                expected = "inference-yue2-precision-fixture-101"
+                            elif selector == "backend" and stage != "cuda":
+                                expected = "yue2-app-precision-nax-macos-2"
+                            else:
+                                expected = guard.OLD_GROUP
+                            self.assertEqual(actual, expected, (filename, stage, mode, receipt, engine))
+                            if opted:
+                                self.assertEqual(actual, routes.PrecisionControlTests.concurrency_group(settings["group"], stage, "102", mode, receipt, engine))
+            cuda = source.split("  cuda:\n", 1)[1].split("\n  metal:", 1)[0]
+            self.assertIn("      YUE2_CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}", cuda)
+            self.assertIn("GH_TOKEN: ${{ github.token }}", cuda)
+            self.assertIn("default: shared-host", source)
+
+    def test_exact_run_identity_mutants_refuse(self):
+        guard.run_identity(run(), guard.HOLDER_RUN, guard.HOLDER_SHA, ".github/workflows/real-weights.yml")
+        changes = {"id": 1, "head_sha": "b" * 40, "run_attempt": 2, "event": "push",
+                   "path": "other.yml", "repository": {"full_name": "other/repo"},
+                   "status": "completed", "conclusion": "success"}
+        for key, value in changes.items():
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                guard.run_identity({**run(), key: value}, guard.HOLDER_RUN, guard.HOLDER_SHA, ".github/workflows/real-weights.yml")
+
+    def test_exact_sole_job_runner_attempt_inventory_mutants_refuse(self):
+        guard.selected_job(jobs(), guard.HOLDER_JOB, guard.HOLDER_NAME, guard.HOLDER_RUNNER)
+        for key, value in {"id": 1, "name": "other", "runner_name": "cuda-windows", "status": "queued",
+                           "conclusion": "success", "completed_at": "2026-10-03T12:00:00Z", "started_at": None}.items():
+            data = jobs(); data["jobs"][0][key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                guard.selected_job(data, guard.HOLDER_JOB, guard.HOLDER_NAME, guard.HOLDER_RUNNER)
+        for mutate in (lambda x: x.update(total_count=56),
+                       lambda x: x["jobs"][1].update(conclusion=None),
+                       lambda x: x["jobs"][1].update(status="queued")):
+            data = jobs(); mutate(data)
+            with self.assertRaises(RuntimeError):
+                guard.selected_job(data, guard.HOLDER_JOB, guard.HOLDER_NAME, guard.HOLDER_RUNNER)
+
+    def test_old_group_membership_mutants_refuse(self):
+        guard.active_group(group(), guard.OLD_GROUP, guard.HOLDER_RUN)
+        for mutate in (lambda x: x.update(group_name="new"), lambda x: x.update(total_count=1),
+                       lambda x: x["group_members"][0].update(run_id=1),
+                       lambda x: x["group_members"][0].update(status="pending"),
+                       lambda x: x["group_members"][0].update(job_id=1),
+                       lambda x: x["group_members"][1].update(status="in_progress")):
+            data = group(); mutate(data)
+            with self.assertRaises(RuntimeError): guard.active_group(data, guard.OLD_GROUP, guard.HOLDER_RUN)
+
+    def test_typed_gpu0_only_owned_root_desktop_or_owned_descendants(self):
+        header = "# gpu pid type sm mem enc dec command\n"
+        good = header + "0 38212 C+G 0 0 0 0 desktop\n0 777 C 1 0 0 0 owned\n"
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=good)):
+            self.assertEqual(guard.gpu0_actors(777), good)
+            with self.assertRaises(RuntimeError): guard.gpu0_actors(None)
+        for raw in (good.replace("777", "888"), good.replace(" C 1", " G 1"), good.replace("C+G", "G"),
+                    good.replace("0 777", "1 777"), "", "0 777 C 1 0 0 0 owned\n", good + "0 777 C 1 0 0 0 owned\n"):
+            with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=raw)), self.assertRaises(RuntimeError):
+                guard.gpu0_actors(777)
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=good.replace("777", "999"))), \
+             patch.object(guard, "owned_descendants", return_value={777, 888, 999}):
+            guard.gpu0_actors(777, True)
+
+    def test_descendants_are_parent_chain_only_not_names(self):
+        rows = [{"ProcessId": 777, "ParentProcessId": 10}, {"ProcessId": 888, "ParentProcessId": 777},
+                {"ProcessId": 999, "ParentProcessId": 888}, {"ProcessId": 123, "ParentProcessId": 10}]
+        for index, row in enumerate(rows):
+            row["CreatedUtc"] = f"2026-10-03T10:00:0{index}Z"
+        rows.append({"ProcessId": 0, "ParentProcessId": 0, "CreatedUtc": None})
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=json.dumps(rows))):
+            self.assertEqual(guard.owned_descendants(777), {777, 888, 999})
+            with self.assertRaises(RuntimeError): guard.owned_descendants(1000)
+        old = copy.deepcopy(rows); old[1]["CreatedUtc"] = "2026-10-03T09:00:00Z"
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=json.dumps(old))):
+            self.assertEqual(guard.owned_descendants(777), {777})
+        missing = copy.deepcopy(rows); missing[1]["CreatedUtc"] = None
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=json.dumps(missing))), self.assertRaises(RuntimeError):
+            guard.owned_descendants(777)
+        for raw in ("null", "{}", json.dumps(rows + [rows[0]])):
+            with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=raw)), self.assertRaises(RuntimeError):
+                guard.owned_descendants(777)
+
+    def test_holder_fault_and_network_failure_prevent_model_spawn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40)
+            job = jobs()["jobs"][0]
+            job.update(run_id=guard.HOLDER_RUN, run_attempt=1, head_sha=guard.HOLDER_SHA,
+                       workflow_name="Real-weight validation")
+            valid = [{"body": run()}, {"body": jobs()}, {"body": group()}, {"body": job}]
+            with patch.object(guard, "api", side_effect=valid), patch.object(guard, "gpu0_actors", return_value="raw"):
+                owner.holder()
+            self.assertIn("holder_readback", owner.path.read_text(encoding="utf-8"))
+            for failure in (RuntimeError("network unavailable"), TimeoutError("network deadline")):
+                with patch.object(guard, "api", side_effect=failure), self.assertRaises(type(failure)):
+                    owner.holder()
+            owner.metadata_checked = None
+            invalid = copy.deepcopy(valid); invalid[0]["body"]["status"] = "completed"
+            with patch.object(guard, "api", side_effect=invalid), patch.object(guard, "gpu0_actors") as actors, self.assertRaises(RuntimeError):
+                owner.holder()
+            actors.assert_not_called()
+
+    def test_watchdog_refusal_reaps_only_popen_tree(self):
+        child = Owned(); owner = Mock(failed=threading.Event(), fault="holder ended", cycle_started=None)
+        owner.failed.set()
+        def taskkill(argv, **kwargs):
+            self.assertEqual(argv, ["taskkill", "/PID", "777", "/T", "/F"])
+            self.assertEqual(kwargs["timeout"], 15)
+            child.code = -9
+            return Mock(returncode=0)
+        with patch.object(guard.subprocess, "run", side_effect=taskkill) as killer:
+            code, timed_out, error = guard.wait(child, owner, 100)
+        self.assertEqual(code, -9); self.assertFalse(timed_out)
+        self.assertIn("holder ended", error); self.assertEqual(killer.call_count, 1)
+
+    def test_wait_timeout_keyboardinterrupt_and_stale_cycle_reap(self):
+        for situation in ("timeout", "interrupt", "stale"):
+            child = Owned(); owner = Mock(failed=threading.Event(), fault=None, cycle_started=None)
+            if situation == "stale": owner.cycle_started = time.monotonic() - 100
+            if situation == "interrupt": child.wait = Mock(side_effect=KeyboardInterrupt("cancel"))
+            def kill(argv, **kwargs): child.code = -9; return Mock(returncode=0)
+            with patch.object(guard.subprocess, "run", side_effect=kill) as killer:
+                code, timeout, error = guard.wait(child, owner, 0 if situation == "timeout" else 100)
+            self.assertEqual(killer.call_count, 1); self.assertEqual(code, -9)
+            self.assertEqual(timeout, situation == "timeout")
+            if situation != "timeout": self.assertIsNotNone(error)
+
+    def test_heartbeat_is_exact_and_full_metadata_is_bounded_not_omitted(self):
+        heartbeat = jobs()["jobs"][0]
+        heartbeat.update(run_id=guard.HOLDER_RUN, run_attempt=1, head_sha=guard.HOLDER_SHA,
+                         workflow_name="Real-weight validation")
+        def read(path):
+            if path == f"actions/jobs/{guard.HOLDER_JOB}": body = heartbeat
+            elif "attempts" in path: body = jobs()
+            elif "concurrency_groups" in path: body = group()
+            else: body = run()
+            return {"body": body}
+        with tempfile.TemporaryDirectory() as directory, patch.object(guard, "api", side_effect=read) as api, \
+             patch.object(guard, "gpu0_actors", return_value="raw"):
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40)
+            owner.holder(); self.assertEqual(api.call_count, 4)
+            owner.holder(); self.assertEqual(api.call_count, 5)
+            owner.metadata_checked -= 60
+            owner.holder(); self.assertEqual(api.call_count, 9)
+            for key, value in {"run_id": 1, "run_attempt": 2, "head_sha": "b" * 40,
+                               "workflow_name": "other", "started_at": "other"}.items():
+                wrong = {**heartbeat, key: value}
+                with patch.object(guard, "api", return_value={"body": wrong}), self.subTest(key=key), self.assertRaises(RuntimeError):
+                    owner.holder()
+
+    def test_api_is_bounded_read_only_github_origin_no_redirect_token_log(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response); response.__exit__ = Mock(return_value=False)
+        response.headers = {"Date": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")}
+        response.read.return_value = b'{"id":1}'
+        opener = Mock(open=Mock(return_value=response))
+        with patch.dict(os.environ, {"GH_TOKEN": "fake-secret"}), patch.object(guard.urllib.request, "build_opener", return_value=opener):
+            row = guard.api("actions/runs/1")
+        request = opener.open.call_args.args[0]
+        self.assertTrue(request.full_url.startswith("https://api.github.com/repos/SceneWorks/inference/"))
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 3)
+        self.assertNotIn("fake-secret", json.dumps(row))
+        with self.assertRaises(RuntimeError): guard.NoRedirect().redirect_request(None, None, 302, "redirect", {}, "https://other.example")
+        response.headers["Date"] = "Mon, 01 Jan 2001 00:00:00 GMT"
+        with patch.dict(os.environ, {"GH_TOKEN": "fake"}), patch.object(guard.urllib.request, "build_opener", return_value=opener), self.assertRaises(RuntimeError):
+            guard.api("actions/runs/1")
+
+    def test_preflight_authenticates_frozen_source_and_rejects_receipt_or_source_drift(self):
+        environ = {"GITHUB_RUN_ID": "8888", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "cuda",
+                   "GITHUB_REPOSITORY": guard.REPO, "GITHUB_SHA": "a" * 40,
+                   "GITHUB_WORKSPACE": "/workspace", "RUNNER_NAME": "cuda-windows",
+                   "YUE2_IDLE_CONTEXT_RUN_ID": guard.RECEIPT, "CUDA_VISIBLE_DEVICES": "0",
+                   "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+        # Portable synthetic bytes exercise the same immutable hash contract.
+        synthetic = {path: path.encode() for path in guard.SOURCE_HASHES}
+        hashes = {path: hashlib.sha256(data).hexdigest() for path, data in synthetic.items()}
+        def read(path):
+            if path == "actions/runs/8888": body = run(8888, "a" * 40, ".github/workflows/yue2-precision-proof.yml")
+            elif path == "actions/runs/8888/attempts/1/jobs?per_page=100": body = jobs(999, "cuda", "cuda-windows")
+            elif path == f"actions/concurrency_groups/{guard.GPU0_GROUP}": body = group(guard.GPU0_GROUP, 8888)
+            elif path.startswith("contents/"):
+                source_path = path[len("contents/"):].split("?ref=")[0]
+                self.assertTrue(path.endswith("?ref=" + guard.HOLDER_SHA))
+                body = {"path": source_path, "encoding": "base64",
+                        "content": base64.b64encode(synthetic[source_path]).decode()}
+            elif path == f"actions/jobs/{guard.HOLDER_JOB}":
+                body = jobs()["jobs"][0]
+                body.update(run_id=guard.HOLDER_RUN, run_attempt=1, head_sha=guard.HOLDER_SHA,
+                            workflow_name="Real-weight validation")
+            elif path == f"actions/runs/{guard.HOLDER_RUN}": body = run()
+            elif "attempts/1/jobs" in path: body = jobs()
+            else: body = group()
+            return {"body": body}
+        def git(argv, **kwargs):
+            return Mock(stdout=(guard.ENGINE if argv[2].endswith("/engine") else "a" * 40)
+                        if argv[-1] == "HEAD" else "")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, environ), \
+             patch.object(guard, "IS_WINDOWS", True), patch.object(guard, "SOURCE_HASHES", hashes), \
+             patch.object(guard, "api", side_effect=read), patch.object(guard.subprocess, "run", side_effect=git), \
+             patch.object(guard, "gpu0_actors", return_value="raw"):
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40)
+            owner.preflight()
+            self.assertEqual(owner.proof_job["id"], 999)
+            for key, value in {"YUE2_IDLE_CONTEXT_RUN_ID": "37106146499", "CUDA_VISIBLE_DEVICES": "1",
+                               "CUDA_DEVICE_ORDER": "FASTEST_FIRST", "GITHUB_RUN_ATTEMPT": "2",
+                               "GITHUB_JOB": "metal", "GITHUB_REPOSITORY": "other/repo", "GITHUB_SHA": "b" * 40}.items():
+                with patch.dict(os.environ, {key: value}), self.subTest(key=key), self.assertRaises(RuntimeError):
+                    owner.preflight()
+            with patch.object(guard, "SOURCE_HASHES", {**hashes, next(iter(hashes)): "0" * 64}), self.assertRaises(RuntimeError):
+                owner.preflight()
+            with patch.object(guard.subprocess, "run", return_value=Mock(stdout="dirty")), self.assertRaises(RuntimeError):
+                owner.preflight()
+
+    def test_failed_preflight_never_spawns_app_and_token_is_not_in_owned_child(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "EXPECTED_ENGINE_SHA": guard.ENGINE, "EXPECTED_CONTROL_SHA": "a" * 40,
+            "YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}):
+            evidence = Path(directory)
+            with patch.object(guard.OwnerGuard, "preflight", side_effect=RuntimeError("holder ended")), \
+                 patch.object(guard.subprocess, "Popen") as launch, self.assertRaises(RuntimeError):
+                guard.guarded_command(["node", "unchanged-case"], evidence, {}, None, evidence, "case")
+            launch.assert_not_called()
+            child = Owned(); child.code = 0
+            with patch.object(guard.OwnerGuard, "preflight"), patch.object(guard.OwnerGuard, "start"), \
+                 patch.object(guard.OwnerGuard, "finish"), patch.object(guard.subprocess, "Popen", return_value=child) as launch:
+                status = guard.guarded_command(["node", "unchanged-case"], evidence,
+                                               {"GH_TOKEN": "secret", "GITHUB_TOKEN": "secret", "CUDA_VISIBLE_DEVICES": "0"},
+                                               None, evidence, "case")
+            self.assertEqual(status, 0)
+            self.assertEqual(launch.call_args.args[0], ["node", "unchanged-case"])
+            self.assertEqual(launch.call_args.kwargs["env"], {"CUDA_VISIBLE_DEVICES": "0"})
+            self.assertIn("provisional-holder-chronology", (evidence / "gpu0-holder-chronology.jsonl").read_text(encoding="utf-8"))
+
+    def test_expired_app_job_tail_refuses_before_popen(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "EXPECTED_ENGINE_SHA": guard.ENGINE, "EXPECTED_CONTROL_SHA": "a" * 40,
+            "YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns() - 480 * 60 * 1_000_000_000)}), \
+             patch.object(guard.OwnerGuard, "preflight"), patch.object(guard.subprocess, "Popen") as launch, \
+             self.assertRaisesRegex(RuntimeError, "cleanup/upload tail"):
+            guard.guarded_command(["node"], Path(directory), {}, None, Path(directory), "case")
+        launch.assert_not_called()
+
+    def test_engine_owner_refusal_happens_before_any_popen(self):
+        from scripts.tests import test_yue2_precision_proof as existing
+        control = existing.CONTROL
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); reference = root / "reference"; reference.mkdir()
+            (reference / "vae_real_reference.safetensors").write_bytes(b"fixture")
+            binary = root / "binary"; binary.write_bytes(b"binary")
+            args = Mock(evidence=root / "evidence", reference=reference, binary=binary,
+                        work_dir=root / "listening", engine_sha=guard.ENGINE, control_sha="a" * 40,
+                        app_sha="", backend="cuda", cuda_scheduling_mode="owner-gpu0")
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0", "RUNNER_NAME": "cuda-windows",
+                                         "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
+                 patch.object(control, "sha256", return_value=control.REFERENCE_SHA256), \
+                 patch.object(control, "verify_revisions"), patch.object(control.subprocess, "run", return_value=Mock(stdout="")), \
+                 patch.object(existing.IDLE, "require_remaining_window", return_value=({}, root)), \
+                 patch.object(control, "retain_reviewed_baseline", return_value=[]), \
+                 patch.object(control, "retain_cuda_physical_evidence", return_value=[]), \
+                 patch.object(control, "cuda_physical_census", return_value=("raw", [])), \
+                 patch.object(guard.OwnerGuard, "preflight", side_effect=RuntimeError("exact holder lost")), \
+                 patch.object(control.subprocess, "Popen") as launch, self.assertRaisesRegex(RuntimeError, "exact holder lost"):
+                control.execute(args)
+            launch.assert_not_called()
+
+    def test_watchdog_network_fault_sets_failure_and_preserves_refusal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40)
+            with patch.object(owner, "holder", side_effect=TimeoutError("network timeout")):
+                owner.start(Owned())
+                self.assertTrue(owner.failed.wait(1))
+                with self.assertRaises(RuntimeError): owner.finish()
+            self.assertIn("network timeout", owner.path.read_text(encoding="utf-8"))
+            self.assertEqual(owner.signals, {})
+
+    def test_provisional_summary_cannot_claim_final_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40)
+            summary = owner.summary()
+            self.assertEqual(summary["acceptance"], "provisional-holder-chronology")
+            self.assertIn("completed_at strictly after proof job completed_at", summary["final_acceptance_requires"])
+            self.assertEqual(summary["maximum_detection_seconds"], 25)
+            self.assertEqual(summary["maximum_group_detection_seconds"], 85)
+            self.assertEqual(summary["steady_requests_per_hour_upper_bound"], 540)
+
+
+if __name__ == "__main__": unittest.main()

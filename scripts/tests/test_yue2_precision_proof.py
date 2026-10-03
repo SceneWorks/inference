@@ -33,17 +33,31 @@ class PrecisionControlTests(unittest.TestCase):
         return dict(line.strip().split(": ", 1) for line in block[1].splitlines())
 
     @staticmethod
-    def concurrency_group(group, stage, run_id):
-        # Read the actual workflow expression; accept only the narrow selector and
-        # run-id formatter this contract permits, rather than evaluating Python.
-        match = re.fullmatch(
-            r"\$\{\{ inputs\.stage == '([^']+)' && format\('([^']+)', github\.run_id\) \|\| '([^']+)' \}\}",
-            group,
-        )
-        if match is None:
+    def concurrency_group(group, stage, run_id, scheduling="shared-host", receipt="", engine=""):
+        # A restricted GitHub &&/|| interpreter reads both workflow expressions.
+        # It has no scheduling policy of its own; the tests below specify routing.
+        if not (group.startswith("${{ ") and group.endswith(" }}")):
             raise AssertionError("unexpected precision concurrency expression")
-        selected_stage, cpu_group, accelerator_group = match.groups()
-        return cpu_group.format(run_id) if stage == selected_stage else accelerator_group
+        values = {"stage": stage, "backend": stage, "cuda_scheduling_mode": scheduling,
+                  "idle_cuda_context_run_id": receipt, "expected_engine_sha": engine}
+        for branch in group[4:-3].split(" || "):
+            clauses = branch.split(" && ")
+            selected = True
+            for clause in clauses[:-1]:
+                match = re.fullmatch(r"inputs\.([a-z_]+) == '([^']*)'", clause)
+                if match is None or match[1] not in values:
+                    raise AssertionError("unsupported selector")
+                selected &= values[match[1]] == match[2]
+            if selected:
+                result = clauses[-1]
+                match = re.fullmatch(r"format\('([^']+)', github\.run_id\)", result)
+                if match:
+                    return match[1].format(run_id)
+                match = re.fullmatch(r"'([^']+)'", result)
+                if match:
+                    return match[1]
+                raise AssertionError("unsupported group")
+        raise AssertionError("group expression has no default")
 
     def test_fixture_transfers_use_distinct_run_owned_cpu_groups(self):
         source = WORKFLOW.read_text(encoding="utf-8")
@@ -76,9 +90,9 @@ class PrecisionControlTests(unittest.TestCase):
                 self.assertEqual(other["cancel-in-progress"], "false")
         app = self.concurrency_settings(
             WORKFLOW.with_name("yue2-app-precision-profile.yml").read_text(encoding="utf-8"))
-        self.assertEqual(app["group"],
-                         "${{ inputs.backend == 'cuda' && 'inference-real-weights-physical-host' "
-                         "|| 'yue2-app-precision-nax-macos-2' }}")
+        for backend, expected in (("cuda", "inference-real-weights-physical-host"),
+                                  ("metal", "yue2-app-precision-nax-macos-2")):
+            self.assertEqual(self.concurrency_group(app["group"], backend, "101"), expected)
         self.assertEqual(app["cancel-in-progress"], "false")
 
     def test_precision_queue_preserves_existing_pending_and_running_work(self):

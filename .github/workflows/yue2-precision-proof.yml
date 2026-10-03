@@ -11,6 +11,12 @@ on:
         required: true
         options: [fixture, cuda, metal, cuda-diagnostic]
         description: "fixture = CPU reference; cuda/metal = precision test; cuda-diagnostic = read-only context evidence"
+      cuda_scheduling_mode:
+        type: choice
+        required: false
+        default: shared-host
+        options: [shared-host, owner-gpu0]
+        description: Owner-approved provisional GPU0 lane; exact GPU1 holder must remain active
       expected_engine_sha:
         type: string
         required: true
@@ -45,9 +51,10 @@ permissions:
   actions: read
 
 # Hosted CPU fixture transfers do not hold the shared accelerator lock. Every accelerator
-# stage retains the existing physical group, including Metal; queue without replacing pending work.
+# stage defaults to the existing physical group. Only the explicitly approved receipt-bound
+# CUDA route uses the fixed provisional GPU0 group; the controller authenticates the GPU1 holder.
 concurrency:
-  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || 'inference-real-weights-physical-host' }}
+  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37122359802' && inputs.expected_engine_sha == '825341ff8d0110ea448213485891b39d57806fa4' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
   queue: max
   cancel-in-progress: false
 
@@ -177,6 +184,7 @@ jobs:
       EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
       EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
       YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
+      YUE2_CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}
       YUE2_HF_HUB: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       CUDA_VISIBLE_DEVICES: "0"
       CUDA_DEVICE_ORDER: PCI_BUS_ID
@@ -276,9 +284,10 @@ jobs:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           $binary = (Get-Content "$env:RUNNER_TEMP\yue2-precision-proof\binary.txt" -Raw).Trim()
-          $proofArgs = @('run', '--backend', 'cuda', '--binary', $binary, '--reference', "$env:RUNNER_TEMP\yue2-precision-reference", '--evidence', "$env:RUNNER_TEMP\yue2-precision-proof", '--work-dir', $env:YUE2_PRECISION_WORK_DIR, '--engine-sha', $env:EXPECTED_ENGINE_SHA, '--control-sha', $env:EXPECTED_CONTROL_SHA)
+          $proofArgs = @('run', '--backend', 'cuda', '--binary', $binary, '--reference', "$env:RUNNER_TEMP\yue2-precision-reference", '--evidence', "$env:RUNNER_TEMP\yue2-precision-proof", '--work-dir', $env:YUE2_PRECISION_WORK_DIR, '--engine-sha', $env:EXPECTED_ENGINE_SHA, '--control-sha', $env:EXPECTED_CONTROL_SHA, '--cuda-scheduling-mode', $env:YUE2_CUDA_SCHEDULING_MODE)
           if ($env:EXPECTED_APP_SHA) { $proofArgs += @('--app-sha', $env:EXPECTED_APP_SHA) }
           & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_precision_proof.py @proofArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

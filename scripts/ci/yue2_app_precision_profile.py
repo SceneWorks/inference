@@ -279,6 +279,10 @@ def collect(profile_dir: Path, evidence: Path, backend: str) -> dict:
                 shutil.copy2(file, target / "boundary" / file.name)
     verdict = {"backend": backend, "cases": rows, "status": "completed",
                "listening_audio": [row["listening_audio"] for row in rows]}
+    if os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "owner-gpu0":
+        require(backend == "cuda", "GPU0 owner scheduling cannot grade Metal")
+        verdict["scheduling_acceptance"] = "provisional-holder-chronology"
+        verdict["holder_chronology_file"] = "gpu0-holder-chronology.jsonl"
     (evidence / "audio-inventory.json").write_text(
         json.dumps({"backend": backend, "status": "completed", "cases": verdict["listening_audio"]}, indent=2) + "\n",
         encoding="utf-8",
@@ -312,8 +316,13 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
     output.mkdir(parents=True)
     evidence.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
+    scheduling = environment.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host")
+    require(scheduling in {"shared-host", "owner-gpu0"} and
+            (scheduling == "shared-host" or backend == "cuda"), "invalid CUDA owner route")
     environment.pop("HF_HUB_CACHE", None)
     environment.pop("HUGGINGFACE_HUB_CACHE", None)
+    environment.pop("GH_TOKEN", None)
+    environment.pop("GITHUB_TOKEN", None)
     manifest = json.loads((cases / "manifest.json").read_text(encoding="utf-8"))
     require(manifest.get("backend") == backend and
             [row.get("name") for row in manifest.get("cases", [])] == list(names_for_backend(backend)),
@@ -336,8 +345,12 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                 command.extend(("--budget-minutes", "120"))
             for label, argv in (("dry-run", [*command, "--dry-run"]), ("capture", command)):
                 with (evidence / f"{name}-{label}.log").open("w", encoding="utf-8") as log:
-                    status = subprocess.run(argv, cwd=app, env=environment,
-                                            stdout=log, stderr=subprocess.STDOUT, check=False).returncode
+                    if scheduling == "owner-gpu0":
+                        from yue2_gpu0_owner_guard import guarded_command
+                        status = guarded_command(argv, app, environment, log, evidence, f"{name}-{label}")
+                    else:
+                        status = subprocess.run(argv, cwd=app, env=environment,
+                                                stdout=log, stderr=subprocess.STDOUT, check=False).returncode
                 require(status == 0, f"{name} {label} exited {status}; see retained log")
             record = output / case_id(backend, name).replace(":", "__") / "record.json"
             verify_record(record, backend, name)
