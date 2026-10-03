@@ -37,7 +37,7 @@
 //! ## Cache semantics
 //!
 //! [`PagedPackedKvCache`] is a single-sequence [`KvCache`] like the dense
-//! [`PagedKvCache`](super::PagedKvCache). A model step is a whole-step transaction across layers:
+//! [`PagedKvCache`]. A model step is a whole-step transaction across layers:
 //! a fault or cancellation at any layer restores every layer's extents and residuals and returns
 //! the pages the step allocated, so the pool's live pages return to their pre-step count. Trim
 //! re-stages the retained prefix of a cut group from its quantized values (as the contiguous cache
