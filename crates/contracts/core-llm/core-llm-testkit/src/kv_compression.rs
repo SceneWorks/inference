@@ -1,7 +1,7 @@
 //! Cross-backend conformance fixture for the compressed-KV policy (epic sc-20669, story sc-20683).
 //!
-//! One table of requests — policy × table family × prompt × token budget × batch × request
-//! shape — and the
+//! One table of requests — policy × table family × loaded decoder (plain, outside the fused
+//! reader's geometry, hybrid recurrent) × prompt × token budget × batch × request shape — and the
 //! decision every backend must reach for each. A backend runs the table through its own production
 //! planner (MLX's provider plan, Candle's provider plan) with [`kv_policy_conformance`]; because
 //! every backend checks against the same table, MLX and Candle reach the same decision and reason
@@ -14,7 +14,7 @@
 //! [`KV_COMPRESSION_QUALIFICATIONS`] (each row's bounds and their neighbours), so a requalified row
 //! moves the fixture with it; the expected decision is this module's own restatement of the
 //! policy's fixed order (policy, batch, family, prompt minimum, final-context maximum, request
-//! shape), independent of
+//! shape, geometry), independent of
 //! [`core_llm::qualify_kv_compression`]'s implementation.
 
 use core_llm::{
@@ -49,6 +49,25 @@ pub enum KvBackendDecision {
     Dense(KvCacheReport),
 }
 
+/// The loaded decoder a case plans on. A backend runs the geometry and hybrid cases on decoders it
+/// actually loads, so its own geometry and decoder-shape extraction is under test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvCaseDecoder {
+    /// A plain causal decoder the fused reader can read (head dimension 64, 128 or 256).
+    Plain,
+    /// A plain causal decoder outside the fused reader's geometry (an unsupported head
+    /// dimension): [`KvCacheFallbackReason::UnsupportedGeometry`] on every backend.
+    UnsupportedGeometry,
+    /// A hybrid recurrent decoder (Qwen3.5/3.6): no compressed cache, so
+    /// [`KvCacheFallbackReason::UnsupportedRequest`].
+    Hybrid,
+}
+
+impl KvCaseDecoder {
+    /// Every decoder of the table.
+    pub const ALL: [Self; 3] = [Self::Plain, Self::UnsupportedGeometry, Self::Hybrid];
+}
+
 /// One request of the fixture table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KvPolicyCase {
@@ -57,6 +76,8 @@ pub struct KvPolicyCase {
     /// The loaded model's table family; `None` is a model the table cannot name (a backend loads a
     /// Llama-dispatched non-llama checkpoint such as Mistral for it).
     pub family: Option<KvModelFamily>,
+    /// The loaded decoder (armed as `family` by the backend's test seam).
+    pub decoder: KvCaseDecoder,
     /// Tokens prefilled before decoding starts.
     pub context_tokens: u64,
     /// The request's token budget (`max_new_tokens`): the final context is the prompt plus this.
@@ -85,7 +106,7 @@ impl KvPolicyCase {
 }
 
 /// The policy's fixed order, restated: policy, batch, family, prompt minimum, final-context
-/// maximum, then request shape.
+/// maximum, then request shape (multimodal content, a hybrid decoder), then geometry.
 fn expected_decision(case: &KvPolicyCase) -> KvPolicyDecision {
     use KvCacheFallbackReason as Reason;
     if case.policy == KvCompressionPolicy::Off {
@@ -107,7 +128,12 @@ fn expected_decision(case: &KvPolicyCase) -> KvPolicyDecision {
             && row.max_context_tokens.is_none_or(|max| final_context < max)
     });
     match admitting {
-        Some(_) if case.multimodal => KvPolicyDecision::Dense(Reason::UnsupportedRequest),
+        Some(_) if case.multimodal || case.decoder == KvCaseDecoder::Hybrid => {
+            KvPolicyDecision::Dense(Reason::UnsupportedRequest)
+        }
+        Some(_) if case.decoder == KvCaseDecoder::UnsupportedGeometry => {
+            KvPolicyDecision::Dense(Reason::UnsupportedGeometry)
+        }
         Some(row) => KvPolicyDecision::Compressed(row.format),
         None if rows
             .iter()
@@ -142,30 +168,33 @@ fn context_points() -> Vec<u64> {
     points
 }
 
-/// The fixture table: every combination of policy, table family (and no family), the prompt
-/// points around the qualification rows' bounds, a zero and a 64-token budget, batch 1 and
-/// 2, and text-only and multimodal requests.
+/// The fixture table: every combination of policy, table family (and no family), loaded decoder,
+/// the prompt points around the qualification rows' bounds, a zero and a 64-token budget, batch 1
+/// and 2, and text-only and multimodal requests.
 pub fn kv_policy_cases() -> Vec<KvPolicyCase> {
     let mut cases = Vec::new();
     for policy in [KvCompressionPolicy::Off, KvCompressionPolicy::Qualified] {
         for family in [None, Some(KvModelFamily::Llama), Some(KvModelFamily::Qwen3)] {
-            for &context_tokens in &context_points() {
-                for max_new_tokens in [0, BUDGET] {
-                    for batch in [1, 2] {
-                        for multimodal in [false, true] {
-                            let mut case = KvPolicyCase {
-                                policy,
-                                family,
-                                context_tokens,
-                                max_new_tokens,
-                                batch,
-                                multimodal,
-                                expected: KvPolicyDecision::Dense(
-                                    KvCacheFallbackReason::PolicyDisabled,
-                                ),
-                            };
-                            case.expected = expected_decision(&case);
-                            cases.push(case);
+            for decoder in KvCaseDecoder::ALL {
+                for &context_tokens in &context_points() {
+                    for max_new_tokens in [0, BUDGET] {
+                        for batch in [1, 2] {
+                            for multimodal in [false, true] {
+                                let mut case = KvPolicyCase {
+                                    policy,
+                                    family,
+                                    decoder,
+                                    context_tokens,
+                                    max_new_tokens,
+                                    batch,
+                                    multimodal,
+                                    expected: KvPolicyDecision::Dense(
+                                        KvCacheFallbackReason::PolicyDisabled,
+                                    ),
+                                };
+                                case.expected = expected_decision(&case);
+                                cases.push(case);
+                            }
                         }
                     }
                 }
@@ -236,8 +265,8 @@ pub fn kv_policy_conformance(
 mod tests {
     use super::*;
     use core_llm::{
-        plan_kv_cache, plan_kv_cache_without_reader, KvCacheFallbackReason as Reason, KvCachePlan,
-        KvCacheRequest,
+        plan_kv_cache, plan_kv_cache_without_reader, KvAttentionGeometry,
+        KvCacheFallbackReason as Reason, KvCachePlan, KvCacheRequest,
     };
 
     fn request(case: &KvPolicyCase) -> KvCacheRequest {
@@ -247,7 +276,21 @@ mod tests {
             context_tokens: case.context_tokens,
             max_new_tokens: u64::from(case.max_new_tokens),
             batch: case.batch,
-            unsupported_request: case.multimodal.then(|| "multimodal".into()),
+            unsupported_request: if case.multimodal {
+                Some("multimodal".into())
+            } else if case.decoder == KvCaseDecoder::Hybrid {
+                Some("hybrid".into())
+            } else {
+                None
+            },
+            geometry: KvAttentionGeometry {
+                head_dim: if case.decoder == KvCaseDecoder::UnsupportedGeometry {
+                    96
+                } else {
+                    128
+                },
+                ..KvAttentionGeometry::default()
+            },
         }
     }
 
@@ -287,6 +330,7 @@ mod tests {
                 KvPolicyDecision::Dense(Reason::BelowMinimumContext),
                 KvPolicyDecision::Dense(Reason::AboveQualifiedContext),
                 KvPolicyDecision::Dense(Reason::UnsupportedRequest),
+                KvPolicyDecision::Dense(Reason::UnsupportedGeometry),
             ];
             wanted.push(match reader {
                 KvReader::Fused => {

@@ -32,7 +32,7 @@ pub mod comparison;
 pub mod kv_compression;
 pub use kv_compression::{
     check_kv_policy_conformance, kv_policy_cases, kv_policy_conformance, KvBackendDecision,
-    KvPolicyCase, KvPolicyDecision, KvReader,
+    KvCaseDecoder, KvPolicyCase, KvPolicyDecision, KvReader,
 };
 pub mod starvector;
 pub use starvector::{

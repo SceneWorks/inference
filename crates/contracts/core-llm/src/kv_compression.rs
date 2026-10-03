@@ -226,11 +226,109 @@ impl KvModelFamily {
     }
 }
 
-/// One qualified (family × format × context range) combination and the evidence behind it.
+/// The exact decoder architecture a qualification row was measured on (sc-20688 review): the
+/// checkpoint config's geometry. The evidence is per model, not per family — a larger or smaller
+/// sibling (Llama-3.1-8B, TinyLlama, Qwen3-0.6B/8B) shares the family's decoder code but not its
+/// measured quality and speed — so only a checkpoint whose config matches a row's architecture
+/// field for field is that row's model ([`qualified_kv_model_family`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KvModelArchitecture {
+    /// `num_hidden_layers`.
+    pub layers: u64,
+    /// `hidden_size`.
+    pub hidden_size: u64,
+    /// `num_attention_heads`.
+    pub attention_heads: u64,
+    /// `num_key_value_heads` (defaults to `num_attention_heads`).
+    pub kv_heads: u64,
+    /// `head_dim` (defaults to `hidden_size / num_attention_heads`).
+    pub head_dim: u64,
+    /// `intermediate_size`.
+    pub intermediate_size: u64,
+    /// `vocab_size`.
+    pub vocab_size: u64,
+    /// `max_position_embeddings`.
+    pub max_position_embeddings: u64,
+    /// `rope_theta`, which must be a whole number to match.
+    pub rope_theta: u64,
+    /// `tie_word_embeddings` (defaults to `false`).
+    pub tie_word_embeddings: bool,
+}
+
+impl KvModelArchitecture {
+    /// The architecture of a checkpoint `config.json` (its `text_config` when it has one), or
+    /// `None` when a required field is missing or not a whole number — such a config matches no
+    /// row.
+    pub fn from_config(config: &serde_json::Value) -> Option<Self> {
+        let text = config.get("text_config").unwrap_or(config);
+        let int = |key: &str| text.get(key).and_then(serde_json::Value::as_u64);
+        let hidden_size = int("hidden_size")?;
+        let attention_heads = int("num_attention_heads")?;
+        let rope_theta = text.get("rope_theta").and_then(serde_json::Value::as_f64)?;
+        if rope_theta.fract() != 0.0 || !(0.0..=u64::MAX as f64).contains(&rope_theta) {
+            return None;
+        }
+        Some(Self {
+            layers: int("num_hidden_layers")?,
+            hidden_size,
+            attention_heads,
+            kv_heads: int("num_key_value_heads").unwrap_or(attention_heads),
+            head_dim: match int("head_dim") {
+                Some(head_dim) => head_dim,
+                None => hidden_size.checked_div(attention_heads)?,
+            },
+            intermediate_size: int("intermediate_size")?,
+            vocab_size: int("vocab_size")?,
+            max_position_embeddings: int("max_position_embeddings")?,
+            rope_theta: rope_theta as u64,
+            tie_word_embeddings: text
+                .get("tie_word_embeddings")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
+/// `meta-llama/Llama-3.2-3B-Instruct` (the measured `mlx-community/Llama-3.2-3B-Instruct-4bit`
+/// and its bf16 reference share it).
+pub const LLAMA_3_2_3B_ARCHITECTURE: KvModelArchitecture = KvModelArchitecture {
+    layers: 28,
+    hidden_size: 3072,
+    attention_heads: 24,
+    kv_heads: 8,
+    head_dim: 128,
+    intermediate_size: 8192,
+    vocab_size: 128_256,
+    max_position_embeddings: 131_072,
+    rope_theta: 500_000,
+    tie_word_embeddings: true,
+};
+
+/// `Qwen/Qwen3-1.7B` (the measured `mlx-community/Qwen3-1.7B-4bit` and its bf16 reference share
+/// it).
+pub const QWEN3_1_7B_ARCHITECTURE: KvModelArchitecture = KvModelArchitecture {
+    layers: 28,
+    hidden_size: 2048,
+    attention_heads: 16,
+    kv_heads: 8,
+    head_dim: 128,
+    intermediate_size: 6144,
+    vocab_size: 151_936,
+    max_position_embeddings: 40_960,
+    rope_theta: 1_000_000,
+    tie_word_embeddings: true,
+};
+
+/// One qualified (model × format × context range) combination and the evidence behind it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvQualification {
-    /// The decoder family.
+    /// The decoder family of the measured model.
     pub family: KvModelFamily,
+    /// The measured model.
+    pub model: &'static str,
+    /// The measured model's exact architecture: a checkpoint of the family qualifies for this row
+    /// only when its config matches it.
+    pub architecture: KvModelArchitecture,
     /// The compressed representation it qualified with.
     pub format: KvCompressionFormat,
     /// Smallest prompt (tokens prefilled before decode starts) that runs compressed. Shorter
@@ -260,6 +358,9 @@ impl KvQualification {
 
 /// The one checked-in qualification table (format version [`KV_CACHE_FORMAT_VERSION`]).
 ///
+/// Each row is one measured model ([`KvQualification::architecture`]), decoding one sequence: a
+/// batch of more than one is [`KvCacheFallbackReason::BatchedDecode`] on every path.
+///
 /// Thresholds are the SC-20671 campaign coordinates the evidence was measured at
 /// (`context_band_target` in `mlx-llm`'s campaign): memory-material is a quarter of the evidence
 /// model's native window and fit-boundary is `max(window − 512, ⌈0.9 · window⌉)`. The minimum
@@ -273,6 +374,8 @@ impl KvQualification {
 pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
     KvQualification {
         family: KvModelFamily::Llama,
+        model: "Llama-3.2-3B-Instruct",
+        architecture: LLAMA_3_2_3B_ARCHITECTURE,
         format: KvCompressionFormat::GroupAffineK8V8,
         min_context_tokens: 32_768,
         max_context_tokens: Some(130_560),
@@ -282,6 +385,8 @@ pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
     },
     KvQualification {
         family: KvModelFamily::Qwen3,
+        model: "Qwen3-1.7B",
+        architecture: QWEN3_1_7B_ARCHITECTURE,
         format: KvCompressionFormat::GroupAffineK8V8,
         min_context_tokens: 10_240,
         max_context_tokens: Some(40_961),
@@ -296,16 +401,15 @@ pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
 pub enum KvCacheFallbackReason {
     /// The request did not opt in ([`KvCompressionPolicy::Off`]).
     PolicyDisabled,
-    /// The loaded model's family has no row in the qualification table.
+    /// The loaded model is not one the qualification table measured: no row of its family, or a
+    /// checkpoint of the family whose architecture is not a row's ([`qualified_kv_model_family`]).
     UnqualifiedModel,
     /// The request takes a path the compressed cache is not wired through (multimodal prefill,
     /// multi-token prediction, a hybrid recurrent decoder).
     UnsupportedRequest,
-    /// More than one sequence decodes together on a path without per-sequence paged compressed
-    /// caches (the contiguous single-sequence planner, the padded lockstep batch decoder): its
-    /// batched prefill attends through additive padding masks, which the fused compressed reader
-    /// cannot apply. A batch served by per-sequence paged caches (continuous batching) qualifies
-    /// each sequence on its own with [`qualify_kv_sequence`] and never reports this.
+    /// More than one sequence decodes together. The table's evidence is single-sequence only, so
+    /// every batched path — the padded lockstep batch decoder and continuous batching over paged
+    /// caches alike — runs every sequence of a batch of more than one dense with this reason.
     BatchedDecode,
     /// The prompt is below the family's qualified minimum (short contexts decode slower
     /// compressed than dense).
@@ -359,28 +463,6 @@ impl KvCacheFallbackReason {
             Self::DenseGather => "dense_gather",
         }
     }
-}
-
-/// Decide one sequence against [`KV_COMPRESSION_QUALIFICATIONS`] on its own: the qualifying row,
-/// or why the sequence stays dense. The table's evidence is per sequence, so a batch whose
-/// sequences each own a paged compressed cache (and attend through per-sequence page tables and
-/// lengths, not padding masks) qualifies every sequence with this; a sequence it refuses runs dense
-/// beside the others with its reason. The checks run in a fixed order — policy, family, prompt
-/// minimum, final-context maximum.
-pub fn qualify_kv_sequence(
-    policy: KvCompressionPolicy,
-    family: Option<KvModelFamily>,
-    context_tokens: u64,
-    max_new_tokens: u64,
-) -> Result<&'static KvQualification, KvCacheFallbackReason> {
-    qualify_against(
-        KV_COMPRESSION_QUALIFICATIONS,
-        policy,
-        family,
-        context_tokens,
-        max_new_tokens,
-        1,
-    )
 }
 
 /// Decide one request against [`KV_COMPRESSION_QUALIFICATIONS`]: the qualifying row, or why the
@@ -542,6 +624,90 @@ pub fn kv_model_family(
     }
 }
 
+/// The table family a loaded checkpoint plans its KV cache as (sc-20688 review): its
+/// [`kv_model_family`] — read from the config's (`text_config`'s) `architectures[0]` and
+/// `model_type` — but only when the config's [`KvModelArchitecture`] is that of a measured row of
+/// the family. Every other checkpoint — another size of the family, a different context window or
+/// RoPE base, an unreadable config — has no table family, so an opted-in request reports
+/// [`KvCacheFallbackReason::UnqualifiedModel`]. `decoder` is the backend's decoder-dispatch tag.
+pub fn qualified_kv_model_family(
+    decoder: &str,
+    config: &serde_json::Value,
+) -> Option<KvModelFamily> {
+    let text = config.get("text_config").unwrap_or(config);
+    let field = |key: &str| {
+        text.get(key)
+            .and_then(|value| match value {
+                serde_json::Value::Array(values) => {
+                    values.first().and_then(serde_json::Value::as_str)
+                }
+                value => value.as_str(),
+            })
+            .unwrap_or("")
+    };
+    let family = kv_model_family(decoder, field("architectures"), field("model_type"))?;
+    let architecture = KvModelArchitecture::from_config(config)?;
+    KV_COMPRESSION_QUALIFICATIONS
+        .iter()
+        .any(|row| row.family == family && row.architecture == architecture)
+        .then_some(family)
+}
+
+/// Head dimensions the fused compressed-domain reader implements.
+pub const KV_FUSED_READER_HEAD_DIMS: [u64; 3] = [64, 128, 256];
+
+/// The attention geometry of a loaded decoder, as the compressed-KV plan's geometry stage reads it
+/// (sc-20688 review: one stage both backends run, so a decoder the fused reader cannot serve
+/// reports [`KvCacheFallbackReason::UnsupportedGeometry`] on every backend).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvAttentionGeometry {
+    /// Channels per attention head.
+    pub head_dim: u64,
+    /// The decoder soft-caps attention scores (Gemma-2 `attn_logit_softcapping`).
+    pub attention_softcap: bool,
+    /// The decoder's attention scale denominator (`query_pre_attn_scalar`); `None` is `head_dim`.
+    pub query_pre_attn_scalar: Option<u64>,
+    /// The decoder attends through latent (MLA) or cross-layer shared K/V.
+    pub latent_or_shared_kv: bool,
+    /// The decoder routes its MLP through experts (a mixture-of-experts checkpoint such as
+    /// `qwen3_moe`, which dispatches as its dense family).
+    pub mixture_of_experts: bool,
+}
+
+impl KvAttentionGeometry {
+    /// Why the fused compressed reader cannot serve this decoder, or `None` when it can. The
+    /// default (zero) geometry is refused, so a backend that does not fill it in fails closed.
+    pub fn refusal(&self) -> Option<String> {
+        if !KV_FUSED_READER_HEAD_DIMS.contains(&self.head_dim) {
+            return Some(format!(
+                "the fused compressed reader supports head dimension 64, 128 or 256, not {}",
+                self.head_dim
+            ));
+        }
+        if self.attention_softcap {
+            return Some("attention-score soft-cap needs tanh before softmax".into());
+        }
+        if self
+            .query_pre_attn_scalar
+            .is_some_and(|scalar| scalar != self.head_dim)
+        {
+            return Some(
+                "the fused reader scales scores by the inverse square-root head dimension".into(),
+            );
+        }
+        if self.latent_or_shared_kv {
+            return Some("latent or shared K/V attention has no compressed-domain reader".into());
+        }
+        if self.mixture_of_experts {
+            return Some(
+                "a mixture-of-experts decoder is outside the dense decoders the evidence measured"
+                    .into(),
+            );
+        }
+        None
+    }
+}
+
 /// What a backend knows about one generation when it decides its KV cache (sc-20683).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KvCacheRequest {
@@ -559,6 +725,9 @@ pub struct KvCacheRequest {
     /// prefill, a hybrid recurrent decoder), reported as
     /// [`KvCacheFallbackReason::UnsupportedRequest`]; `None` for a plain causal text decode.
     pub unsupported_request: Option<String>,
+    /// The loaded decoder's attention geometry, refused by the geometry stage
+    /// ([`KvAttentionGeometry::refusal`]) as [`KvCacheFallbackReason::UnsupportedGeometry`].
+    pub geometry: KvAttentionGeometry,
 }
 
 /// The KV cache a backend decided for one generation with [`plan_kv_cache`].
@@ -578,10 +747,11 @@ pub enum KvCachePlan<R> {
 /// Decide one generation's KV cache in the fixed order every backend shares: the qualification
 /// table ([`qualify_kv_compression`]: policy, batch, family, prompt minimum, final-context
 /// maximum), then the request shape
-/// ([`KvCacheRequest::unsupported_request`]), then the backend's own `reader` stage — which refuses
-/// with its reason ([`KvCacheFallbackReason::UnsupportedGeometry`] or
-/// [`KvCacheFallbackReason::ReaderUnavailable`]) and detail, or hands back the reader that serves the
-/// qualifying row. The reader stage runs only for a request every earlier stage admits.
+/// ([`KvCacheRequest::unsupported_request`]), then the decoder's attention geometry
+/// ([`KvCacheRequest::geometry`], refused as [`KvCacheFallbackReason::UnsupportedGeometry`]), then
+/// the backend's own `reader` stage — which refuses with its reason (normally
+/// [`KvCacheFallbackReason::ReaderUnavailable`]) and detail, or hands back the reader that serves
+/// the qualifying row. The reader stage runs only for a request every earlier stage admits.
 pub fn plan_kv_cache<R>(
     request: KvCacheRequest,
     reader: impl FnOnce(&'static KvQualification) -> Result<R, (KvCacheFallbackReason, String)>,
@@ -599,6 +769,12 @@ pub fn plan_kv_cache<R>(
     if let Some(detail) = request.unsupported_request {
         return KvCachePlan::Dense(KvCacheReport::dense(
             KvCacheFallbackReason::UnsupportedRequest,
+            Some(detail),
+        ));
+    }
+    if let Some(detail) = request.geometry.refusal() {
+        return KvCachePlan::Dense(KvCacheReport::dense(
+            KvCacheFallbackReason::UnsupportedGeometry,
             Some(detail),
         ));
     }
@@ -738,38 +914,11 @@ mod tests {
     }
 
     #[test]
-    fn a_sequence_qualifies_on_its_own_row_whatever_batch_it_decodes_in() {
-        let qwen = Some(KvModelFamily::Qwen3);
-        // Exactly the batch-1 decision of the request-level qualification, for every outcome.
-        for (family, prompt, new) in [
-            (qwen, 20_000, 64),
-            (qwen, 10_239, 64),
-            (qwen, 40_448, 513),
-            (None, 20_000, 0),
-            (Some(KvModelFamily::Llama), 40_000, 0),
-        ] {
-            assert_eq!(
-                qualify_kv_sequence(ON, family, prompt, new),
-                qualify_kv_compression(ON, family, prompt, new, 1),
-                "{family:?} {prompt} + {new}"
-            );
-        }
-        assert_eq!(
-            qualify_kv_sequence(KvCompressionPolicy::Off, qwen, 20_000, 0),
-            Err(KvCacheFallbackReason::PolicyDisabled)
-        );
-        // A sequence of a batch the request-level planner refuses as batched still qualifies.
-        assert_eq!(
-            qualify_kv_compression(ON, qwen, 20_000, 64, 3),
-            Err(KvCacheFallbackReason::BatchedDecode)
-        );
-        assert!(qualify_kv_sequence(ON, qwen, 20_000, 64).is_ok());
-    }
-
-    #[test]
     fn a_table_without_a_family_row_is_unqualified_for_it() {
         static ONLY_QWEN: &[KvQualification] = &[KvQualification {
             family: KvModelFamily::Qwen3,
+            model: "test",
+            architecture: QWEN3_1_7B_ARCHITECTURE,
             format: KvCompressionFormat::GroupAffineK8V8,
             min_context_tokens: 1,
             max_context_tokens: None,
@@ -965,8 +1114,17 @@ mod tests {
             max_new_tokens: 64,
             batch: 1,
             unsupported_request: None,
+            geometry: SUPPORTED,
         }
     }
+
+    const SUPPORTED: KvAttentionGeometry = KvAttentionGeometry {
+        head_dim: 128,
+        attention_softcap: false,
+        query_pre_attn_scalar: None,
+        latent_or_shared_kv: false,
+        mixture_of_experts: false,
+    };
 
     #[test]
     fn a_family_is_named_by_dispatch_and_for_llama_by_the_config_identity() {
@@ -1105,5 +1263,238 @@ mod tests {
             KvCacheReport::without_table_family(ON),
             KvCacheReport::dense(KvCacheFallbackReason::UnqualifiedModel, None)
         );
+    }
+
+    /// The measured checkpoints' own `config.json` fields (the mlx-community 4-bit snapshots the
+    /// SC-20671 campaign measured; `quantization` is the MLX conversion's and not architecture).
+    fn llama_3_2_3b_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "num_hidden_layers": 28, "hidden_size": 3072, "num_attention_heads": 24,
+            "num_key_value_heads": 8, "head_dim": 128, "vocab_size": 128256,
+            "intermediate_size": 8192, "rope_theta": 500000.0,
+            "max_position_embeddings": 131072, "tie_word_embeddings": true,
+            "rope_scaling": {"factor": 32.0, "high_freq_factor": 4.0, "low_freq_factor": 1.0,
+                             "original_max_position_embeddings": 8192, "rope_type": "llama3"},
+            "quantization": {"group_size": 64, "bits": 4},
+        })
+    }
+
+    fn qwen3_1_7b_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+            "num_hidden_layers": 28, "hidden_size": 2048, "num_attention_heads": 16,
+            "num_key_value_heads": 8, "head_dim": 128, "vocab_size": 151936,
+            "intermediate_size": 6144, "rope_theta": 1000000, "max_position_embeddings": 40960,
+            "tie_word_embeddings": true, "quantization": {"group_size": 64, "bits": 4},
+        })
+    }
+
+    fn with(mut config: serde_json::Value, fields: serde_json::Value) -> serde_json::Value {
+        for (key, value) in fields.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        config
+    }
+
+    /// sc-20688 review: qualification is per measured model, not per family. The two measured
+    /// configs plan as their family; a sibling of the same family (same decoder dispatch and
+    /// config identity) does not, so an opted-in request on it reports `UnqualifiedModel`.
+    #[test]
+    fn only_the_measured_architectures_plan_as_a_table_family() {
+        use KvModelFamily::{Llama, Qwen3};
+        assert_eq!(
+            KvModelArchitecture::from_config(&llama_3_2_3b_config()),
+            Some(LLAMA_3_2_3B_ARCHITECTURE)
+        );
+        assert_eq!(
+            KvModelArchitecture::from_config(&qwen3_1_7b_config()),
+            Some(QWEN3_1_7B_ARCHITECTURE)
+        );
+        assert_eq!(
+            qualified_kv_model_family("llama", &llama_3_2_3b_config()),
+            Some(Llama)
+        );
+        assert_eq!(
+            qualified_kv_model_family("qwen3", &qwen3_1_7b_config()),
+            Some(Qwen3)
+        );
+        // A multimodal-style wrapper reads its text decoder's config.
+        assert_eq!(
+            qualified_kv_model_family(
+                "qwen3",
+                &serde_json::json!({"model_type": "wrapper", "text_config": qwen3_1_7b_config()})
+            ),
+            Some(Qwen3)
+        );
+        let llama_3_1_8b = with(
+            llama_3_2_3b_config(),
+            serde_json::json!({"num_hidden_layers": 32, "hidden_size": 4096,
+                "num_attention_heads": 32, "intermediate_size": 14336,
+                "tie_word_embeddings": false}),
+        );
+        let tinyllama = with(
+            llama_3_2_3b_config(),
+            serde_json::json!({"num_hidden_layers": 22, "hidden_size": 2048,
+                "num_attention_heads": 32, "num_key_value_heads": 4, "head_dim": 64,
+                "intermediate_size": 5632, "vocab_size": 32000, "rope_theta": 10000.0,
+                "max_position_embeddings": 2048, "tie_word_embeddings": false}),
+        );
+        let qwen3_8b = with(
+            qwen3_1_7b_config(),
+            serde_json::json!({"num_hidden_layers": 36, "hidden_size": 4096,
+                "num_attention_heads": 32, "intermediate_size": 12288,
+                "tie_word_embeddings": false}),
+        );
+        let qwen3_0_6b = with(
+            qwen3_1_7b_config(),
+            serde_json::json!({"hidden_size": 1024, "intermediate_size": 3072}),
+        );
+        // A long-window Qwen3-1.7B variant (YaRN / 2507-style) is not the measured window.
+        let qwen3_long = with(
+            qwen3_1_7b_config(),
+            serde_json::json!({"max_position_embeddings": 262144}),
+        );
+        let llama_other_rope = with(
+            llama_3_2_3b_config(),
+            serde_json::json!({"rope_theta": 500000.5}),
+        );
+        for (decoder, config, family) in [
+            ("llama", &llama_3_1_8b, Llama),
+            ("llama", &tinyllama, Llama),
+            ("llama", &llama_other_rope, Llama),
+            ("qwen3", &qwen3_8b, Qwen3),
+            ("qwen3", &qwen3_0_6b, Qwen3),
+            ("qwen3", &qwen3_long, Qwen3),
+        ] {
+            // The family rule alone names it — the architecture is what refuses it.
+            assert_eq!(
+                kv_model_family(
+                    decoder,
+                    config["architectures"][0].as_str().unwrap(),
+                    config["model_type"].as_str().unwrap()
+                ),
+                Some(family),
+                "{config}"
+            );
+            assert_eq!(qualified_kv_model_family(decoder, config), None, "{config}");
+        }
+        // Missing or fractional fields match no row.
+        let mut partial = llama_3_2_3b_config();
+        partial.as_object_mut().unwrap().remove("intermediate_size");
+        assert_eq!(qualified_kv_model_family("llama", &partial), None);
+        // The measured architecture under another dispatch (Mistral identity) has no family.
+        let mistral = with(
+            llama_3_2_3b_config(),
+            serde_json::json!({"architectures": ["MistralForCausalLM"], "model_type": "mistral"}),
+        );
+        assert_eq!(qualified_kv_model_family("llama", &mistral), None);
+        // Every row names a distinct measured architecture.
+        let rows = KV_COMPRESSION_QUALIFICATIONS
+            .iter()
+            .map(|row| (row.family, row.architecture))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(rows.len(), KV_COMPRESSION_QUALIFICATIONS.len());
+    }
+
+    /// sc-20688 review: the geometry stage is shared, so every backend refuses the same decoders
+    /// with `UnsupportedGeometry` — after the table and the request shape, before the reader.
+    #[test]
+    fn the_shared_geometry_stage_refuses_what_the_fused_reader_cannot_read() {
+        assert_eq!(SUPPORTED.refusal(), None);
+        for head_dim in KV_FUSED_READER_HEAD_DIMS {
+            assert_eq!(
+                KvAttentionGeometry {
+                    head_dim,
+                    query_pre_attn_scalar: Some(head_dim),
+                    ..SUPPORTED
+                }
+                .refusal(),
+                None
+            );
+        }
+        let refusals = [
+            (KvAttentionGeometry::default(), "head dimension"),
+            (
+                KvAttentionGeometry {
+                    head_dim: 96,
+                    ..SUPPORTED
+                },
+                "head dimension",
+            ),
+            (
+                KvAttentionGeometry {
+                    attention_softcap: true,
+                    ..SUPPORTED
+                },
+                "soft-cap",
+            ),
+            (
+                KvAttentionGeometry {
+                    query_pre_attn_scalar: Some(256),
+                    ..SUPPORTED
+                },
+                "square-root",
+            ),
+            (
+                KvAttentionGeometry {
+                    latent_or_shared_kv: true,
+                    ..SUPPORTED
+                },
+                "latent or shared",
+            ),
+            (
+                KvAttentionGeometry {
+                    mixture_of_experts: true,
+                    ..SUPPORTED
+                },
+                "mixture-of-experts",
+            ),
+        ];
+        let qwen = Some(KvModelFamily::Qwen3);
+        for (geometry, words) in refusals {
+            let refusal = geometry.refusal().unwrap();
+            assert!(refusal.contains(words), "{refusal}");
+            let refused = KvCacheRequest {
+                geometry,
+                ..request(qwen, 20_000)
+            };
+            let dense = KvCacheReport::dense(
+                KvCacheFallbackReason::UnsupportedGeometry,
+                Some(refusal.clone()),
+            );
+            // With a reader and without one: the same reason and detail.
+            assert_eq!(
+                plan_kv_cache(refused.clone(), |row| Ok::<
+                    _,
+                    (KvCacheFallbackReason, String),
+                >(row.format)),
+                KvCachePlan::Dense(dense.clone())
+            );
+            assert_eq!(plan_kv_cache_without_reader(refused.clone(), "test"), dense);
+            // The table and the request shape decide first.
+            assert_eq!(
+                plan_kv_cache_without_reader(
+                    KvCacheRequest {
+                        geometry,
+                        ..request(qwen, 100)
+                    },
+                    "test"
+                )
+                .fallback,
+                Some(KvCacheFallbackReason::BelowMinimumContext)
+            );
+            assert_eq!(
+                plan_kv_cache_without_reader(
+                    KvCacheRequest {
+                        unsupported_request: Some("hybrid".into()),
+                        ..refused
+                    },
+                    "test"
+                )
+                .fallback,
+                Some(KvCacheFallbackReason::UnsupportedRequest)
+            );
+        }
     }
 }

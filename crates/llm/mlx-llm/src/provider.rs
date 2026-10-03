@@ -386,6 +386,38 @@ enum Decoder {
     Qwen35(Box<Qwen35Model>),
 }
 
+/// The identity of a snapshot's weight files for [`CausalLm::cache_fingerprint`] (sc-20688
+/// review): each `*.safetensors` file's name, size and modification time, in name order, so
+/// weights replaced at the same path never share a stored compressed prefix with the old ones.
+fn snapshot_weights_identity(dir: &Path) -> String {
+    let mut files = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "safetensors")
+        })
+        .map(|entry| {
+            let metadata = entry.metadata().ok();
+            let modified = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos());
+            format!(
+                "{}:{}:{modified}",
+                entry.file_name().to_string_lossy(),
+                metadata.map_or(0, |metadata| metadata.len())
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files.join(";")
+}
+
 /// The KV cache one production generation runs on (sc-20679), decided before any K/V mutation.
 enum KvPlan {
     /// The SC-20671 campaign observer path: it selects its own explicit arm and is not a product
@@ -929,9 +961,11 @@ pub struct LlamaProvider {
     /// identity instead of trusting the matrix row's caller-authored family label.
     architecture: Architecture,
     campaign_family: Option<&'static str>,
-    /// The compressed-KV qualification family (sc-20679). Only a snapshot load names it, from the
-    /// same architecture-name check as `campaign_family`; [`Self::from_parts`] cannot tell a
-    /// Llama checkpoint from a Mistral or dense Qwen2 one sharing its decoder, so it has none.
+    /// The compressed-KV qualification family (sc-20679). Only a snapshot load names it, and only
+    /// for a checkpoint whose config is a measured row's exact architecture
+    /// ([`core_llm::qualified_kv_model_family`], sc-20688 review); [`Self::from_parts`] cannot
+    /// tell a Llama checkpoint from a Mistral or dense Qwen2 one sharing its decoder, so it has
+    /// none.
     kv_family: Option<core_llm::KvModelFamily>,
     model: Decoder,
     tokenizer: Tokenizer,
@@ -1636,7 +1670,9 @@ impl LlamaProvider {
         } else {
             let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
-            let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+            let m = CausalLm::from_weights_with(&weights, "", cfg, quant)
+                .map_err(to_core)?
+                .with_weights_identity(snapshot_weights_identity(dir));
             (Decoder::Causal(Box::new(m)), descriptor)
         };
 
@@ -1743,7 +1779,8 @@ impl LlamaProvider {
             descriptor,
             architecture: arch,
             campaign_family,
-            kv_family: crate::kv_policy::family_for(campaign_family),
+            // sc-20688 review: only the measured architectures plan as a table family.
+            kv_family: core_llm::qualified_kv_model_family(arch.family(), &cfg_value),
             model,
             tokenizer,
             template,
@@ -2671,9 +2708,12 @@ impl TextLlm for LlamaProvider {
     /// Continuous batching of the requests the batched decode serves (sc-20681): plain text
     /// generations on the causal decoder (no media, JSON constraint, tools or stop strings),
     /// decoded together by [`crate::decode::generate_continuous_kv`] — each with its own
-    /// compressed-KV opt-in, qualification and report, its own cancellation, and the provider's
-    /// shared-prefix store over compressed pages. Every other request, and any request the batch's
-    /// memory admission does not fit, runs on its own through [`TextLlm::generate`] afterwards.
+    /// compressed-KV opt-in and report and its own cancellation. The compressed KV cache is
+    /// qualified for single-sequence decodes only, so every request decoding beside another runs
+    /// dense and reports [`core_llm::KvCacheFallbackReason::BatchedDecode`], exactly as the
+    /// single-request plan reports a batch (sc-20688 review). Every other request, and any request
+    /// the batch's memory admission does not fit, runs on its own through [`TextLlm::generate`]
+    /// afterwards.
     fn generate_batch(
         &self,
         reqs: &[TextLlmRequest],
@@ -2894,6 +2934,8 @@ impl LlamaProvider {
             model_identity: &self.kv_model_name,
             cancels: &cancels,
             policies: &policies,
+            // The product path: a batch of more than one decodes dense (`BatchedDecode`).
+            experimental_per_sequence_compression: false,
         };
         let config = crate::decode::ContinuousConfig {
             max_batch: batch.len(),
@@ -3256,9 +3298,9 @@ impl LlamaProvider {
     /// Decide the KV cache of one product generation with the shared [`core_llm::plan_kv_cache`]
     /// (sc-20683): the qualification table (the request's opt-in, the `batch`, this model's table
     /// family, the `context_tokens` prefilled before decode and the final context after up to
-    /// `max_new_tokens` more), then the request shape, then this backend's reader stage — the
-    /// decoder's attention geometry and the retained fused reader. Every refusal is a dense plan
-    /// with its reason.
+    /// `max_new_tokens` more), then the request shape, then the shared geometry stage over the
+    /// decoder's attention geometry, then this backend's reader stage — the retained fused reader.
+    /// Every refusal is a dense plan with its reason.
     fn plan_kv_cache(
         &self,
         policy: core_llm::KvCompressionPolicy,
@@ -3282,18 +3324,13 @@ impl LlamaProvider {
             max_new_tokens: u64::from(max_new_tokens),
             batch,
             unsupported_request,
+            // The hybrid decoder is refused by the request-shape stage before geometry is read.
+            geometry: match &self.model {
+                Decoder::Causal(model) => crate::kv_policy::attention_geometry(model.config()),
+                _ => core_llm::KvAttentionGeometry::default(),
+            },
         };
         let plan = core_llm::plan_kv_cache(request, |row| {
-            let Decoder::Causal(model) = &self.model else {
-                // The request-shape stage refuses the hybrid decoder before this stage runs.
-                return Err((
-                    Reason::UnsupportedRequest,
-                    "the hybrid recurrent decoder has no compressed cache".into(),
-                ));
-            };
-            if let Some(refusal) = crate::kv_policy::geometry_refusal(model.config()) {
-                return Err((Reason::UnsupportedGeometry, refusal));
-            }
             let bits = crate::kv_policy::packed_code_bits(row.format);
             match self
                 .kv_reader
@@ -6751,11 +6788,22 @@ pub(crate) mod tests {
         (output, prompt_ids, stream)
     }
 
-    fn load_tiny(snapshot: &tempfile::TempDir) -> LlamaProvider {
+    /// A tiny snapshot's provider exactly as production loads it: its synthetic architecture is
+    /// no measured row's, so it has no compressed-KV table family.
+    fn load_tiny_unarmed(snapshot: &tempfile::TempDir) -> LlamaProvider {
         LlamaProvider::load(&core_llm::LoadSpec::dense(
             snapshot.path().to_string_lossy().to_string(),
         ))
         .unwrap()
+    }
+
+    /// [`load_tiny_unarmed`], test-armed: the provider plans its KV cache as its decoder's
+    /// dispatch family ([`core_llm::kv_model_family`]), as if the tiny fixture were that family's
+    /// measured architecture, so the compressed path can run on synthetic weights.
+    fn load_tiny(snapshot: &tempfile::TempDir) -> LlamaProvider {
+        let mut provider = load_tiny_unarmed(snapshot);
+        provider.kv_family = crate::kv_policy::family_for(provider.campaign_family);
+        provider
     }
 
     /// Gains that make the tiny fixture's generation depend on its context: sharp attention whose
@@ -6993,14 +7041,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// sc-20681 AC1 at the provider: `generate_batch` decodes the plain text requests together
-    /// (continuous batching on compressed pages where each qualifies), runs a short one dense
-    /// beside them with its reason, serves a request the batch cannot (a stop string) on its own,
-    /// streams every request's events under its own index with exactly one `Done` each, and keeps
-    /// the batched prompts in the provider's shared-prefix store.
+    /// sc-20688 review (finding 1) at the provider: `generate_batch` decodes the plain text
+    /// requests together, and two concurrent qualified requests — each one a single request would
+    /// run compressed — both decode dense with `BatchedDecode`, the reason the single-request plan
+    /// gives a batch, as does a short one beside them; their tokens are exactly the un-opted
+    /// batch's. A request the batch cannot serve (a stop string) runs alone, a single sequence,
+    /// and qualifies. Every request streams under its own index with exactly one `Done`, and no
+    /// batched prompt reaches the compressed prefix store.
     #[cfg(target_os = "macos")]
     #[test]
-    fn generate_batch_runs_qualified_requests_compressed_and_the_rest_with_their_reasons() {
+    fn generate_batch_decodes_concurrent_qualified_requests_dense_as_batched() {
         use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
         let provider = load_tiny(&tiny_snapshot(
             json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
@@ -7013,55 +7063,70 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let request = |text: String, stop: Vec<String>| TextLlmRequest {
+        let request = |text: String, stop: Vec<String>, policy| TextLlmRequest {
             messages: vec![Message::text(Role::User, text)],
             sampling: core_llm::Sampling::greedy(),
             max_new_tokens: 4,
             seed: Some(0),
-            kv_compression: Policy::Qualified,
+            kv_compression: policy,
             stop,
             ..Default::default()
         };
-        let requests = vec![
-            request(words(10_300, 0), Vec::new()),
-            request(words(10_450, 3), Vec::new()),
-            request(words(64, 5), Vec::new()),
-            request(words(10_300, 1), vec!["never-emitted".into()]),
-        ];
-        let (mut tokens, mut dones) = (vec![0usize; 4], vec![0usize; 4]);
-        let outputs = provider
-            .generate_batch(&requests, &mut |i, event| match event {
-                CoreEvent::Token { .. } => tokens[i] += 1,
-                CoreEvent::Done { .. } => dones[i] += 1,
-            })
-            .into_iter()
-            .map(Result::unwrap)
-            .collect::<Vec<_>>();
-        assert_eq!(dones, vec![1; 4]);
-        for (i, out) in outputs.iter().enumerate() {
-            assert_eq!(out.usage.generated_tokens, 4, "request {i}");
-            assert!(tokens[i] > 0, "request {i} streamed");
-        }
-        for out in &outputs[..2] {
-            let report = out.kv_cache.as_ref().unwrap();
-            assert!(report.ran_compressed(), "{report:?}");
+        let requests = |policy| {
+            vec![
+                request(words(10_300, 0), Vec::new(), policy),
+                request(words(10_450, 3), Vec::new(), policy),
+                request(words(64, 5), Vec::new(), policy),
+                request(words(10_300, 1), vec!["never-emitted".into()], policy),
+            ]
+        };
+        // Each batched request on its own qualifies: the batch, not the request, refuses it.
+        for (i, req) in requests(Policy::Qualified).iter().enumerate().take(2) {
+            let prompt = provider.render_prompt(req, &req.messages).unwrap().1.len();
             assert!(
-                report.counters.pool_held_bytes > 0,
-                "batched on the shared pool"
+                matches!(
+                    provider.plan_kv_cache(Policy::Qualified, prompt, req.max_new_tokens, 1, false),
+                    KvPlan::Compressed { .. }
+                ),
+                "request {i} alone runs compressed"
             );
         }
-        assert_eq!(
-            outputs[2].kv_cache.as_ref().unwrap().fallback,
-            Some(Reason::BelowMinimumContext)
-        );
+        let generate = |policy| {
+            let (mut tokens, mut dones) = (vec![0usize; 4], vec![0usize; 4]);
+            let outputs = provider
+                .generate_batch(&requests(policy), &mut |i, event| match event {
+                    CoreEvent::Token { .. } => tokens[i] += 1,
+                    CoreEvent::Done { .. } => dones[i] += 1,
+                })
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            assert_eq!(dones, vec![1; 4]);
+            for (i, out) in outputs.iter().enumerate() {
+                assert_eq!(out.usage.generated_tokens, 4, "request {i}");
+                assert!(tokens[i] > 0, "request {i} streamed");
+            }
+            outputs
+        };
+        let outputs = generate(Policy::Qualified);
+        let off = generate(Policy::Off);
+        for (i, (out, off)) in outputs.iter().zip(&off).enumerate().take(3) {
+            assert_eq!(
+                out.kv_cache,
+                Some(core_llm::KvCacheReport::dense(Reason::BatchedDecode, None)),
+                "request {i}"
+            );
+            assert_eq!(out.text, off.text, "request {i}");
+        }
         // Served alone, on the single-request (contiguous) compressed path.
         let alone = outputs[3].kv_cache.as_ref().unwrap();
         assert!(alone.ran_compressed(), "{alone:?}");
         assert_eq!(alone.counters.pool_held_bytes, 0);
         let store = provider.kv_batch_store.borrow();
-        let store = store.as_ref().expect("the batch created the store");
-        assert!(!store.is_empty(), "the batched prompts were stored");
-        assert_eq!(store.stats().refused, 0, "a loaded provider keys its store");
+        assert!(
+            store.as_ref().is_none_or(|store| store.is_empty()),
+            "no batched prompt was stored"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -7386,41 +7451,54 @@ pub(crate) mod tests {
         );
     }
 
+    /// A tiny hybrid (Qwen3.5-style GatedDeltaNet + full attention) snapshot the provider loads
+    /// as its hybrid decoder.
+    fn tiny_hybrid_snapshot() -> tempfile::TempDir {
+        let dir = tiny_snapshot(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            2048,
+            true,
+        );
+        let (tensors, config) = crate::snapshot::tests::tiny_qwen35(false);
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
+        dir
+    }
+
     /// sc-20683 AC2: the cross-backend compressed-KV conformance table
     /// (`core_llm_testkit::kv_policy_cases`) through MLX's production plan, with the fused reader:
-    /// the same table Candle's plan passes without one. The family each provider plans with is the
-    /// shared `core_llm::kv_model_family` of its loaded config.
+    /// the same table Candle's plan passes without one. Each case plans on a decoder the provider
+    /// actually loaded — a plain one the fused reader reads, one outside its geometry (head
+    /// dimension 96) and a hybrid recurrent one — test-armed as the case's table family (no tiny
+    /// fixture is a measured architecture: unarmed, every one has no family).
     #[test]
     fn mlx_kv_plan_conforms_to_the_cross_backend_policy_table() {
-        use core_llm::KvModelFamily;
-        use core_llm_testkit::{kv_policy_conformance, KvBackendDecision, KvReader};
-        let load = |identity, qk_norm| load_tiny(&tiny_snapshot(identity, 2048, qk_norm));
-        let llama = load(
-            json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"}),
-            false,
-        );
-        let qwen = load(
+        use core_llm_testkit::{kv_policy_conformance, KvBackendDecision, KvCaseDecoder, KvReader};
+        let load = |identity, qk_norm| load_tiny_unarmed(&tiny_snapshot(identity, 2048, qk_norm));
+        let mut plain = load(
             json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
             true,
         );
-        // Mistral loads through the Llama decoder but is not a table family.
-        let mistral = load(
-            json!({"architectures": ["MistralForCausalLM"], "model_type": "mistral"}),
+        let mut outside_geometry = load(
+            json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama", "head_dim": 96}),
             false,
         );
-        for (provider, family) in [
-            (&llama, Some(KvModelFamily::Llama)),
-            (&qwen, Some(KvModelFamily::Qwen3)),
-            (&mistral, None),
-        ] {
-            assert_eq!(provider.kv_family, family);
+        let mut hybrid = load_tiny_unarmed(&tiny_hybrid_snapshot());
+        assert!(matches!(hybrid.model, Decoder::Qwen35(_)));
+        for provider in [&plain, &outside_geometry, &hybrid] {
+            assert_eq!(
+                provider.kv_family, None,
+                "no tiny fixture is a measured model"
+            );
         }
         kv_policy_conformance(KvReader::Fused, |case| {
-            let provider = match case.family {
-                Some(KvModelFamily::Llama) => &llama,
-                Some(KvModelFamily::Qwen3) => &qwen,
-                None => &mistral,
+            let provider = match case.decoder {
+                KvCaseDecoder::Plain => &mut plain,
+                KvCaseDecoder::UnsupportedGeometry => &mut outside_geometry,
+                KvCaseDecoder::Hybrid => &mut hybrid,
             };
+            provider.kv_family = case.family;
             match provider.plan_kv_cache(
                 case.policy,
                 usize::try_from(case.context_tokens).unwrap(),
@@ -7433,6 +7511,101 @@ pub(crate) mod tests {
                 KvPlan::Unreported => panic!("a product plan always reports"),
             }
         });
+    }
+
+    /// sc-20688 review (finding 9): the compressed-cache fingerprint a prefix store keys on tells
+    /// apart loads that the config alone does not — a Q4 and a Q8 load of the same weights, and
+    /// weights replaced at the same path — while a reload of unchanged weights keeps it.
+    #[test]
+    fn the_cache_fingerprint_names_the_load_quantization_and_the_weights() {
+        let snapshot = tiny_snapshot(
+            json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"}),
+            2048,
+            false,
+        );
+        let fingerprint = |quantize| {
+            let provider = LlamaProvider::load(&core_llm::LoadSpec {
+                quantize,
+                ..core_llm::LoadSpec::dense(snapshot.path().to_string_lossy().to_string())
+            })
+            .unwrap();
+            let Decoder::Causal(model) = &provider.model else {
+                panic!("a causal decoder");
+            };
+            model.cache_fingerprint()
+        };
+        let dense = fingerprint(None);
+        let q4 = fingerprint(Some(core_llm::Quantize::Q4));
+        let q8 = fingerprint(Some(core_llm::Quantize::Q8));
+        assert_ne!(q4, q8, "Q4 and Q8 loads of the same weights");
+        assert_ne!(dense, q4);
+        assert_eq!(
+            fingerprint(None),
+            dense,
+            "an unchanged reload keeps its fingerprint"
+        );
+        // Replace the weights at the same path (another draw, so another size and mtime).
+        let replacement = tiny_snapshot_with(
+            json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"}),
+            2048,
+            false,
+            CONTEXT_SENSITIVE_GAINS,
+        );
+        let weights = snapshot.path().join("model.safetensors");
+        let before = std::fs::metadata(&weights).unwrap().modified().unwrap();
+        std::fs::copy(replacement.path().join("model.safetensors"), &weights).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&weights)
+            .unwrap();
+        file.set_modified(before + std::time::Duration::from_secs(1))
+            .unwrap();
+        drop(file);
+        assert_ne!(
+            fingerprint(None),
+            dense,
+            "replaced weights at the same path"
+        );
+        // The identity alone moves the fingerprint of an otherwise identical decoder.
+        let model = tiny_causal_model(4, 2, 64);
+        let base = model.cache_fingerprint();
+        let named = tiny_causal_model(4, 2, 64).with_weights_identity("model.safetensors:1:2");
+        assert_ne!(named.cache_fingerprint(), base);
+    }
+
+    /// sc-20688 review (finding 2): a production load plans as a table family only for a measured
+    /// architecture. The tiny Llama and Qwen3 fixtures dispatch as those families (their campaign
+    /// identity) but are not Llama-3.2-3B or Qwen3-1.7B, so an opted-in request at a qualified
+    /// context reports `UnqualifiedModel` — as a Llama-3.1-8B or Qwen3-8B load does
+    /// (`core_llm::qualified_kv_model_family`, tested on their configs in core-llm).
+    #[test]
+    fn a_load_of_an_unmeasured_architecture_has_no_table_family() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        for (identity, qk_norm, family) in [
+            (
+                json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"}),
+                false,
+                "llama",
+            ),
+            (
+                json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+                true,
+                "qwen",
+            ),
+        ] {
+            let provider = load_tiny_unarmed(&tiny_snapshot(identity, 40_960, qk_norm));
+            assert_eq!(provider.campaign_family, Some(family));
+            assert_eq!(provider.kv_family, None);
+            let KvPlan::Dense(report) =
+                provider.plan_kv_cache(Policy::Qualified, 20_000, 64, 1, false)
+            else {
+                panic!("an unmeasured architecture never plans compressed");
+            };
+            assert_eq!(
+                report,
+                core_llm::KvCacheReport::dense(Reason::UnqualifiedModel, None)
+            );
+        }
     }
 
     /// sc-20682 review: the admission estimate covers the MLX allocator's measured peak of the
@@ -7587,7 +7760,32 @@ pub(crate) mod tests {
         let healthy =
             crate::kv_policy::group_affine_reader(crate::primitives::PackedCodeBits::Eight)
                 .unwrap();
-        assert!(run(healthy).ran_compressed());
+        assert!(run(healthy.clone()).ran_compressed());
+
+        // sc-20688 review (finding 7): a decoder outside the fused reader's geometry (head
+        // dimension 32) is refused with its true reason, `UnsupportedGeometry` and the shared
+        // stage's detail — not `ReaderUnavailable` — even with a healthy reader.
+        let narrow = tiny_causal_model(4, 2, 32);
+        let (cache, refused) = crate::kv_policy::select_compressed_cache(
+            &narrow,
+            healthy,
+            prompt.len(),
+            admit_any_transition(),
+        );
+        let report =
+            crate::kv_policy::compressed_report(Format::GroupAffineK8V8, refused, cache.as_ref())
+                .unwrap();
+        assert_eq!(
+            report,
+            core_llm::KvCacheReport::dense(
+                Reason::UnsupportedGeometry,
+                crate::kv_policy::geometry_refusal(narrow.config())
+            )
+        );
+        assert!(report
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("head dimension")));
     }
 
     /// AC2: no dense K/V mirror survives an attention call on the compressed path. After the
@@ -7712,6 +7910,7 @@ pub(crate) mod tests {
             family: Some(core_llm::KvModelFamily::Qwen3),
             prompt_tokens: 20_000,
             max_new_tokens: 1_024,
+            batch: 1,
             dense_pool,
             packed_pool,
             reader,
@@ -7850,6 +8049,14 @@ pub(crate) mod tests {
                 ..qualified()
             }),
             Some(Reason::UnqualifiedModel)
+        );
+        assert_eq!(
+            reason(crate::primitives::PagedCacheRequest {
+                batch: 2,
+                ..qualified()
+            }),
+            Some(Reason::BatchedDecode),
+            "a sequence decoding beside another is refused as the static plan refuses a batch"
         );
         assert_eq!(
             reason(crate::primitives::PagedCacheRequest {

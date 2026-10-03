@@ -133,6 +133,12 @@ pub struct CausalLm {
     full_rope: Option<Rope>,
     cfg: ModelConfig,
     quantized: bool,
+    /// The load-time quantization the projections were built with (`None` for none): its bits
+    /// and group size shape the K/V as much as the config does.
+    load_quant: Option<QuantSpec>,
+    /// The identity of the weight files this decoder was loaded from ([`Self::with_weights_identity`];
+    /// empty when the caller named none).
+    weights_identity: String,
     /// Gemma scales token embeddings by √hidden; `None` ⇒ no scaling.
     embed_scale: Option<f32>,
     /// Gemma-2 final-logit soft-cap; `None` ⇒ no cap.
@@ -406,6 +412,8 @@ impl CausalLm {
             rope,
             full_rope,
             quantized,
+            load_quant: quant,
+            weights_identity: String::new(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f32).sqrt()),
             final_softcap: cfg.final_logit_softcap,
             cfg,
@@ -508,18 +516,30 @@ impl CausalLm {
         Self::COMPUTE_DTYPE
     }
 
-    /// SHA-256 (hex) of everything in the loaded decoder that shapes its K/V besides the weights
-    /// (sc-20681): the whole parsed config (geometry, vocabulary, RoPE theta and scaling,
-    /// attention variants, projection quantization spec), the cached K/V dtype and whether the
-    /// projections were quantized on load. Paged prefix stores and snapshots key on it next to the
-    /// caller's model name, so decoders named alike but configured differently never share pages.
+    /// Name the weight files this decoder was loaded from (for example each file's name, size
+    /// and modification time), so its [`Self::cache_fingerprint`] changes when they are replaced.
+    pub fn with_weights_identity(mut self, identity: impl Into<String>) -> Self {
+        self.weights_identity = identity.into();
+        self
+    }
+
+    /// SHA-256 (hex) of everything in the loaded decoder that shapes its K/V (sc-20681): the whole
+    /// parsed config (geometry, vocabulary, RoPE theta and scaling, attention variants, a
+    /// pre-quantized checkpoint's quantization spec), the cached K/V dtype, the load-time
+    /// quantization (its bits and group size, so Q4 and Q8 loads of the same weights differ) and
+    /// the weights' identity ([`Self::with_weights_identity`], so replaced weights at the same
+    /// path differ; sc-20688 review). Paged prefix stores and snapshots key on it next to the
+    /// caller's model name, so decoders named alike but configured or weighted differently never
+    /// share pages.
     pub fn cache_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
         let described = format!(
-            "{:?}|kv={:?}|quantized={}",
+            "{:?}|kv={:?}|quantized={}|load_quant={:?}|weights={}",
             self.cfg,
             Self::COMPUTE_DTYPE,
-            self.quantized
+            self.quantized,
+            self.load_quant,
+            self.weights_identity
         );
         format!("{:x}", Sha256::digest(described.as_bytes()))
     }
