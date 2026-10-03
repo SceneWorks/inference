@@ -77,10 +77,13 @@ const ADAPTER_MOVES_FLOOR: f64 = 2.0;
 /// Mean |Δ| one stacked file at strength 1 must add over the other alone — the weaker of the two
 /// files (the edit LoKr, on a text-to-image render) must still be visible in the stack.
 const STACK_MOVES_FLOOR: f64 = 0.5;
-/// Absolute gain in the fraction of pixels near the training palette the T2I LoRA must produce
-/// over the bare base on the same prompt and seed — the "it learned the style" direction, not just
-/// "something changed".
-const PALETTE_GAIN_FLOOR: f64 = 0.05;
+/// Mean RGB distance to the nearest training-palette colour ([`palette_distance`]) by which the T2I
+/// LoRA's render must be CLOSER to the palette than the bare base's, same prompt and seed — the "it
+/// learned the style" direction, not just "something changed". A no-op adapter measures exactly 0.
+/// The first-run floor was a palette-FRACTION gain of 0.05, which is binary per pixel: a 1e-4 x 300
+/// step run (inference run 37124582021) moved every tier toward the palette (distance 164.7 ->
+/// 161.8 bf16, 164.5 -> 161.7 q8, 159.8 -> 158.7 q4) while the fraction stayed 0.000 -> 0.000.
+const PALETTE_DISTANCE_GAIN_FLOOR: f64 = 1.0;
 /// Mean |Δ| per byte by which the edit adapter's output must be CLOSER to the trained transform of
 /// the held-out source than the bare base's output is.
 const EDIT_GAIN_FLOOR: f64 = 1.0;
@@ -635,6 +638,14 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     mlx_rs::memory::clear_cache();
     let (caching_peak, caching_footprint) = caching_peaks.unwrap_or((0, 0));
     let resident = resident_after_first_step.unwrap_or(0);
+    eprintln!(
+        "trained in {seconds:.0}s: step-phase peak {:.2} GiB (resident after step 1 {:.2} + \
+         transient {:.2}) vs preflight train ~{} GiB",
+        gib(train_peak),
+        gib(resident),
+        gib(train_peak.saturating_sub(resident)),
+        predicted_train_gib.map_or("?".into(), |g| format!("{g:.1}"))
+    );
 
     if output.adapter_path != canonical {
         std::fs::copy(&output.adapter_path, canonical).unwrap_or_else(|e| {
@@ -710,8 +721,12 @@ fn assert_trained(label: &str, trained: &Trained, steps: u32, edit: bool) {
     } else {
         assert!(meta.get("trainingMode").is_none(), "{label}: {meta}");
     }
-    // The preflight is what stops the OS killing a worker mid-run, so its train-phase figure must
-    // not under-predict the step phase it guards.
+}
+
+/// The preflight is what stops the OS killing a worker mid-run, so its train-phase figure must not
+/// under-predict the step phase it guards. Checked LAST in each training test, after every
+/// render-side assertion, so a red run still exercises (and reports) the adapter's own checks.
+fn assert_preflight_covers_step(label: &str, trained: &Trained) {
     let predicted = trained
         .predicted_train_gib
         .unwrap_or_else(|| panic!("{label}: could not read the preflight's train figure"));
@@ -757,13 +772,14 @@ fn t2i_request() -> GenerationRequest {
 /// A short text-to-image LoRA run on real weights, then the same-seed with/without comparison at
 /// bf16, q8 and q4. Asserts, per tier: both renders are pictures; the adapter moves the render by
 /// at least [`ADAPTER_MOVES_FLOOR`]; it moves it TOWARD the training palette by at least
-/// [`PALETTE_GAIN_FLOOR`]; the observed overlay does not exceed the priced one. At bf16 a
+/// [`PALETTE_DISTANCE_GAIN_FLOOR`]; the observed overlay does not exceed the priced one. At bf16 a
 /// strength-0 load must be byte-identical to the bare render (the change is the adapter's, not
 /// nondeterminism). The run itself must complete every step with finite losses, carry the 2.1
 /// provenance, and peak inside its own preflight's derived train phase.
 ///
-/// `QWEN_IMAGE_2_1_LORA_T2I_STEPS` (default 300 — at the product rate [`TRAIN_LR`]; ~1.5 s a step
-/// on an M5 Max at 512 px) scales the run without a code edit.
+/// `QWEN_IMAGE_2_1_LORA_T2I_STEPS` (default 1000 — at the product rate [`TRAIN_LR`], ~1.45 s a
+/// step on an M5 Max at 512 px, ~24 min; 300 steps moved the palette distance only 1-3) scales the
+/// run without a code edit.
 #[test]
 #[ignore]
 fn t2i_lora_trains_reloads_and_moves_every_tier() {
@@ -797,7 +813,7 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
             )
         })
         .collect();
-    let steps = env_u32("QWEN_IMAGE_2_1_LORA_T2I_STEPS", 300);
+    let steps = env_u32("QWEN_IMAGE_2_1_LORA_T2I_STEPS", 1000);
     let req = TrainingRequest {
         items,
         config: TrainingConfig {
@@ -877,14 +893,14 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
             moved >= ADAPTER_MOVES_FLOOR,
             "{tier}: the trained LoRA moved the same-seed render by only {moved:.3}/255"
         );
-        let (pb, pa) = (
-            case["paletteFractionBase"].as_f64().unwrap(),
-            case["paletteFractionAdapted"].as_f64().unwrap(),
+        let (db, da) = (
+            case["paletteDistanceBase"].as_f64().unwrap(),
+            case["paletteDistanceAdapted"].as_f64().unwrap(),
         );
         assert!(
-            pa >= pb + PALETTE_GAIN_FLOOR,
-            "{tier}: the LoRA did not move the render toward its training palette ({pb:.3} -> \
-             {pa:.3}, floor +{PALETTE_GAIN_FLOOR})"
+            da + PALETTE_DISTANCE_GAIN_FLOOR <= db,
+            "{tier}: the LoRA did not move the render toward its training palette (mean distance \
+             {db:.2} -> {da:.2}, floor -{PALETTE_DISTANCE_GAIN_FLOOR})"
         );
         assert_overlay_not_underpredicted(tier, &case["base"], &case["adapted"]);
         if let Some(identical) = case["scale0IdenticalToBase"].as_bool() {
@@ -894,6 +910,7 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
             );
         }
     }
+    assert_preflight_covers_step("t2i lora", &trained);
 }
 
 // ── 2. instruction-edit LoKr on two references ───────────────────────────────────────────────────
@@ -907,7 +924,8 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
 /// does not exceed the priced one. The run must carry the edit marker and peak inside its own
 /// preflight.
 ///
-/// `QWEN_IMAGE_2_1_LORA_EDIT_STEPS` (default 40) scales the run: every step attends over two
+/// `QWEN_IMAGE_2_1_LORA_EDIT_STEPS` (default 120 at [`TRAIN_LR`], ~30 s a step on an M5 Max, ~60
+/// min; 40 steps did not yet move the held-out edit toward the transform) scales the run: every step attends over two
 /// 1024-px-fitted references (~8k latent tokens), so it is the expensive one.
 #[test]
 #[ignore]
@@ -937,7 +955,7 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
             )
         })
         .collect();
-    let steps = env_u32("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", 40);
+    let steps = env_u32("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", 120);
     let req = TrainingRequest {
         items,
         config: TrainingConfig {
@@ -1026,6 +1044,7 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
         );
         assert_overlay_not_underpredicted(tier, &case["base"], &case["adapted"]);
     }
+    assert_preflight_covers_step("edit lokr", &trained);
 }
 
 // ── 3. two stacked adapters, independent strengths ───────────────────────────────────────────────
