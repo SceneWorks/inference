@@ -145,9 +145,9 @@ class PrecisionControlTests(unittest.TestCase):
             with self.subTest(platform=platform, visible=visible, order=order), \
                  self.assertRaisesRegex(RuntimeError, "PCI-ordered CUDA GPU0"):
                 IDLE.check_device_selection(platform, visible, order)
-        self.assertEqual(IDLE.RUN_ID, "37106146499")
+        self.assertEqual(IDLE.RUN_ID, "37122359802")
         self.assertEqual(IDLE.BASELINE_DIGEST,
-                         "1b6f2d9588b2e25da62f22eec80d406a8b8aeea578d913aefb74e4cc971ae112")
+                         "385b259d50051c2e8833fa15fde29ca982def4bbd8ae2954a9225962ffc63764")
         IDLE.check_dispatch(IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40)
         for run_id, engine, control, github in (
             ("36956986577", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
@@ -167,10 +167,10 @@ class PrecisionControlTests(unittest.TestCase):
                     IDLE.verify_artifact(Path(directory))
 
     def test_saved_runner_is_pinned_and_fresh_runner_matches_an_eligible_listener(self):
-        self.assertEqual(IDLE.BASELINE_RUNNER, "cuda-windows-2")
+        self.assertEqual(IDLE.BASELINE_RUNNER, "cuda-windows")
         source = {"completed": True, "targetPid": 38212, "engineSha": IDLE.BASELINE_ENGINE_SHA,
                   "controlSha": IDLE.BASELINE_CONTROL_SHA}
-        with patch.object(IDLE, "read_json", return_value={**source, "runner": "cuda-windows"}), \
+        with patch.object(IDLE, "read_json", return_value={**source, "runner": "cuda-windows-2"}), \
              self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
             IDLE.summarize(Path("unused"), baseline=True, pid=38212,
                            engine_sha=IDLE.BASELINE_ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
