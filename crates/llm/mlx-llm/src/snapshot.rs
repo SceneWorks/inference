@@ -431,7 +431,8 @@ pub fn write_snapshot(
                         expected
                     )));
                 }
-                let w = arr.as_dtype(STORE_DTYPE)?;
+                let w = read_then_cast(&arr)?;
+                drop(arr);
                 let stem = key
                     .strip_suffix(if key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) {
                         QWEN35_EXPERT_GATE_UP_SUFFIX
@@ -471,7 +472,8 @@ pub fn write_snapshot(
             }
             Some(spec) if is_packed_projection(&key) => {
                 let (q_dim, kv_dim, inter) = split_dims.expect("packed key implies parsed dims");
-                let w = arr.as_dtype(STORE_DTYPE)?;
+                let w = read_then_cast(&arr)?;
+                drop(arr);
                 let rows = w.shape()[0];
                 let (stem, names, points): (&str, &[&str], Vec<i32>) =
                     if key.ends_with(PACKED_QKV_SUFFIX) {
@@ -507,7 +509,8 @@ pub fn write_snapshot(
                 }
             }
             Some(spec) if is_projection(&key) => {
-                let w = arr.as_dtype(STORE_DTYPE)?;
+                let w = read_then_cast(&arr)?;
+                drop(arr);
                 let base = key.strip_suffix(".weight").unwrap_or(&key);
                 push_quantized(&mut out, base, &w, spec)?;
                 quantized_projections += 1;
@@ -558,6 +561,10 @@ pub fn write_snapshot(
     }
     write_json_string(&out_dir.join("config.json"), &config)?;
 
+    // Every quantized output is already resident (per tensor, above); what can still be lazy is the
+    // pass-through set. Read it here in bounded batches so `save_safetensors` evaluates nothing —
+    // see [`materialize_outputs`].
+    materialize_outputs(&out)?;
     Array::save_safetensors(
         out.iter().map(|(k, v)| (k.as_str(), v)),
         None,
@@ -589,9 +596,57 @@ fn push_quantized(
     spec: QuantSpec,
 ) -> Result<()> {
     let q = QuantizedLinear::quantize(w, spec.group_size, spec.bits, None)?;
+    // Evaluate the packed triple now, while `w` is the only dense transient: the GPU quantize runs
+    // over an already-resident input ([`read_then_cast`]) and the snapshot's dense peak stays one
+    // tensor instead of the whole model accumulating as a lazy graph for the save to evaluate.
+    mlx_rs::transforms::eval([&q.weight, &q.scales, &q.biases])?;
     out.push((format!("{base}.weight"), q.weight));
     out.push((format!("{base}.scales"), q.scales));
     out.push((format!("{base}.biases"), q.biases));
+    Ok(())
+}
+
+/// Read a projection's source bytes on the CPU, then cast it to [`STORE_DTYPE`] and evaluate the
+/// cast (sc-24245).
+///
+/// A [`Weights`] tensor is a lazy safetensors `Load`, which MLX runs on its CPU stream. A GPU op
+/// (the bf16 cast, the quantize kernel) over a not-yet-read `Load` makes the Metal command buffer
+/// wait on the disk read; with every projection of a multi-gigabyte model folded into the one eval
+/// `save_safetensors` performs, those waits outlast the GPU watchdog on a slow or cold drive
+/// (`kIOGPUCommandBufferCallbackErrorTimeout`, the JoyCaption Q4 prepare in the sc-24245 campaign).
+/// Reading the pending loads first ([`mlx_rs::transforms::eval_pending_loads`]) leaves every GPU op
+/// with a resident input. The same pattern as `mlx_gen::quant::quantize_map` and
+/// `mlx_gen::weights::Weights::materialize_batch`, which this crate cannot depend on (mlx-gen
+/// depends on mlx-llm).
+fn read_then_cast(arr: &Array) -> Result<Array> {
+    mlx_rs::transforms::eval_pending_loads([arr])?;
+    let w = arr.as_dtype(STORE_DTYPE)?;
+    w.eval()?;
+    Ok(w)
+}
+
+/// Upper bound on the bytes one [`materialize_outputs`] batch evaluates at once — the same bound as
+/// [`Weights::VERIFY_BATCH_BYTES`].
+const OUTPUT_BATCH_BYTES: usize = Weights::VERIFY_BATCH_BYTES;
+
+/// Force every snapshot output resident before `save_safetensors`, in batches of at most
+/// [`OUTPUT_BATCH_BYTES`], each batch's pending `Load`s read on the CPU stream before anything
+/// derived from them is evaluated (sc-24245; mirrors `mlx_gen::weights::Weights::materialize_batch`).
+/// The save therefore evaluates no graph at all, so no Metal command buffer can wait on the disk.
+/// Peak memory is unchanged: `save_safetensors` holds every output resident while it writes anyway.
+fn materialize_outputs(out: &[(String, Array)]) -> Result<()> {
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for end in 0..out.len() {
+        bytes = bytes.saturating_add(out[end].1.nbytes());
+        if bytes >= OUTPUT_BATCH_BYTES || end + 1 == out.len() {
+            let batch = &out[start..=end];
+            mlx_rs::transforms::eval_pending_loads(batch.iter().map(|(_, a)| a))?;
+            mlx_rs::transforms::eval(batch.iter().map(|(_, a)| a))?;
+            start = end + 1;
+            bytes = 0;
+        }
+    }
     Ok(())
 }
 
@@ -1467,6 +1522,100 @@ pub(crate) mod tests {
         assert_eq!(cfg.quantization, Some(QuantSpec::q4()));
         let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
         assert!(model.is_quantized());
+    }
+
+    fn assert_bit_equal(key: &str, got: &Array, expected: &Array) {
+        assert_eq!(got.shape(), expected.shape(), "{key}: shape");
+        assert_eq!(got.dtype(), expected.dtype(), "{key}: dtype");
+        let same = mlx_rs::ops::eq(got, expected)
+            .and_then(|m| m.all(None))
+            .and_then(|a| a.try_item::<bool>());
+        assert!(matches!(same, Ok(true)), "{key}: values differ ({same:?})");
+    }
+
+    /// sc-24245: the quantize-prepare path reads each projection's source bytes on the CPU and
+    /// evaluates its packed triple before returning, instead of leaving `Load → cast → quantize`
+    /// lazy for `save_safetensors` to evaluate as one GPU graph waiting on the disk.
+    ///
+    /// MUTATION: drop the `eval_pending_loads`/`eval` from `read_then_cast` and the triple `eval`
+    /// from `push_quantized`, and the truncated source makes the outputs unreadable — RED.
+    #[test]
+    fn quantize_prepare_reads_the_source_before_returning() {
+        let src = unique_dir("lazy-src");
+        std::fs::create_dir_all(&src).unwrap();
+        let path = src.join("model.safetensors");
+        let mut rng = SplitMix64::new(0x24245);
+        let dense = randn(&[128, 64], &mut rng);
+        Array::save_safetensors([("m.q_proj.weight", &dense)], None, &path).unwrap();
+        let spec = QuantSpec::q4();
+        let eager = QuantizedLinear::quantize(
+            &dense.as_dtype(STORE_DTYPE).unwrap(),
+            spec.group_size,
+            spec.bits,
+            None,
+        )
+        .unwrap();
+
+        let lazy = Weights::from_file(&path).unwrap().into_map();
+        let mut out = Vec::new();
+        let w = read_then_cast(&lazy["m.q_proj.weight"]).unwrap();
+        push_quantized(&mut out, "m.q_proj", &w, spec).unwrap();
+        drop((w, lazy));
+        // Nothing downstream has evaluated yet: pull the bytes out from under any deferred read.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        let got: HashMap<_, _> = out.into_iter().collect();
+        assert_bit_equal("weight", &got["m.q_proj.weight"], &eager.weight);
+        assert_bit_equal("scales", &got["m.q_proj.scales"], &eager.scales);
+        assert_bit_equal("biases", &got["m.q_proj.biases"], &eager.biases);
+    }
+
+    /// The HF prepare leaf end to end over a lazily loaded tiny snapshot: every projection is
+    /// stored as exactly the packed triple a direct bf16 → Q4 quantization produces, and every
+    /// other tensor round-trips unchanged.
+    #[test]
+    fn hf_q4_prepare_matches_direct_quantization_and_passes_the_rest_through() {
+        let src = unique_dir("hfq-direct-src");
+        let out = unique_dir("hfq-direct-out");
+        std::fs::create_dir_all(&src).unwrap();
+        let (tensors, config) = tiny_model();
+        std::fs::write(
+            src.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Array::save_safetensors(refs, None, src.join("model.safetensors")).unwrap();
+
+        let spec = QuantSpec::q4();
+        let report = write_hf_snapshot(&src, &out, Some(spec)).unwrap();
+        assert_eq!(report.quantized_projections, 14, "2 layers × 7 projections");
+
+        let stored = Weights::from_dir(&out).unwrap().into_map();
+        assert_eq!(stored.len(), report.num_tensors);
+        for (key, dense) in &tensors {
+            if is_projection(key) {
+                let base = key.strip_suffix(".weight").unwrap();
+                let q = QuantizedLinear::quantize(
+                    &dense.as_dtype(STORE_DTYPE).unwrap(),
+                    spec.group_size,
+                    spec.bits,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(q.weight.shape(), &[dense.shape()[0], dense.shape()[1] / 8]);
+                assert_bit_equal(key, &stored[&format!("{base}.weight")], &q.weight);
+                assert_bit_equal(key, &stored[&format!("{base}.scales")], &q.scales);
+                assert_bit_equal(key, &stored[&format!("{base}.biases")], &q.biases);
+            } else {
+                assert_bit_equal(key, &stored[key], dense);
+            }
+        }
     }
 
     /// A complete tiny Phi-3 tensor set (packed `qkv_proj` + `gate_up_proj`) with matching config:

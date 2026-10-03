@@ -16,6 +16,37 @@ use crate::protocol::{
     CotMode, GenerationConfig, Sampling, SamplingOverrides, SongRequest, SongRequestSpec,
 };
 
+#[test]
+fn cached_decode_records_the_current_vae_math_policy() {
+    let historical = json!({
+        "vae_dtype": "float32", "decoder_release": "standard",
+        "source_only": "retained",
+    });
+    let cuda_bf16 = json!({
+        "compute_policy": "bf16", "vae_dtype": "bfloat16", "decoder_release": "legacy",
+        "vae_cuda_bf16_math_policy": "disallow_reduced_precision_reduction_v1",
+    });
+    let decoded = Value::Object(cached_decode_current_config(&historical, &cuda_bf16));
+    assert_eq!(
+        decoded["vae_cuda_bf16_math_policy"],
+        cuda_bf16["vae_cuda_bf16_math_policy"]
+    );
+    assert_eq!(decoded["compute_policy"], "bf16");
+    assert_eq!(decoded["vae_dtype"], "bfloat16");
+    assert_eq!(decoded["decoder_release"], "legacy");
+    assert_eq!(decoded["source_only"], "retained");
+    assert!(historical.get("vae_cuda_bf16_math_policy").is_none());
+
+    // A new FP32 or Metal BF16 decode must not inherit the CUDA source's math mode.
+    for (policy, dtype) in [("fp32", "float32"), ("bf16", "bfloat16")] {
+        let current = json!({"compute_policy": policy, "vae_dtype": dtype});
+        let next = Value::Object(cached_decode_current_config(&decoded, &current));
+        assert!(next.get("vae_cuda_bf16_math_policy").is_none());
+        assert_eq!(next["compute_policy"], policy);
+        assert_eq!(next["vae_dtype"], dtype);
+    }
+}
+
 /// Small token budgets and two midpoint steps keep a whole song to seconds on the CPU.
 pub(crate) fn settings(decoder: VaeVariant) -> SongSettings {
     let o = |min: i64, max: i64| SamplingOverrides {
@@ -846,7 +877,7 @@ fn every_stage_identity_binds_every_input_it_depends_on() {
     };
     let b = ids(&base);
     // (key change, which of [plan, semantic, synthesis, nar, cached decode] must change)
-    let cases: [(&str, crate::engine::IdentityKeys, [bool; 5]); 7] = [
+    let cases: [(&str, crate::engine::IdentityKeys, [bool; 5]); 8] = [
         (
             "tier",
             crate::engine::IdentityKeys {
@@ -899,6 +930,14 @@ fn every_stage_identity_binds_every_input_it_depends_on() {
             "runtime",
             crate::engine::IdentityKeys {
                 runtime: "another-build",
+                ..base.clone()
+            },
+            [true, true, true, false, true],
+        ),
+        (
+            "compute policy",
+            crate::engine::IdentityKeys {
+                compute_policy: candle_audio::gen_core::Yue2ComputePolicy::Auto,
                 ..base.clone()
             },
             [true, true, true, false, true],

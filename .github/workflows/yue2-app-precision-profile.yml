@@ -1,0 +1,352 @@
+name: YuE2 app stage-precision admission profile
+
+# Dispatch only, once per owned CUDA or nax-macos-2 window. This runs exactly
+# seven off-plan app profiles; old acceptance, ten-case corpus and quality are untouched.
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        type: choice
+        required: true
+        options: [cuda, metal]
+      expected_engine_sha:
+        type: string
+        required: true
+        description: Exact 40-hex inference source revision and SceneWorks Cargo pin
+      expected_control_sha:
+        type: string
+        required: true
+        description: Exact 40-hex workflow/controller revision dispatched
+      expected_app_sha:
+        type: string
+        required: true
+        description: Exact 40-hex SceneWorks revision containing explicit precision profile support
+      metal_resource_approved:
+        type: boolean
+        required: false
+        default: false
+        description: Operator confirms a fresh nax-macos-2 resource window was approved
+      idle_cuda_context_run_id:
+        type: string
+        required: false
+        default: ""
+        description: Reviewed owner-window diagnostic run; empty keeps the CUDA mixed-context refusal
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
+  cancel-in-progress: false
+
+jobs:
+  cuda:
+    if: inputs.backend == 'cuda'
+    runs-on: [self-hosted, Windows, X64, cuda, real-weights]
+    timeout-minutes: 480
+    env:
+      EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+      EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
+      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_COMPUTE_CAP: "120"
+      APP_RUN_ROOT: 'E:\sceneworks-terminal\sc-23002-yue2-precision\${{ github.run_id }}-${{ github.run_attempt }}'
+      APP_EVIDENCE: 'E:\sceneworks-terminal\sc-23002-yue2-precision\${{ github.run_id }}-${{ github.run_attempt }}\evidence'
+      CARGO_TARGET_DIR: 'E:\sceneworks-terminal\sc-23002-yue2-precision\${{ github.run_id }}-${{ github.run_attempt }}\target'
+      CARGO_NET_OFFLINE: "true"
+    steps:
+      - name: Confirm exact dispatch and fresh run-owned path before provisioning
+        id: run-root
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+        run: |
+          if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_APP_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'exact lowercase SHA inputs required' }
+          if ($env:EXPECTED_CONTROL_SHA -cne $env:GITHUB_SHA) { throw 'dispatch ref must be the exact workflow control SHA' }
+          if (Test-Path -LiteralPath $env:APP_RUN_ROOT) { throw 'run-owned precision state already exists' }
+          New-Item -ItemType Directory -Path $env:APP_EVIDENCE -Force | Out-Null
+          nvidia-smi --query-gpu=index,name,compute_cap,memory.total,memory.used,memory.free,driver_version --format=csv > "$env:APP_EVIDENCE\hardware-before.csv"
+          if ($LASTEXITCODE -ne 0) { throw 'physical CUDA hardware probe failed' }
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: SceneWorks/SceneWorks
+          ref: ${{ inputs.expected_app_sha }}
+          path: app
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Download exact reviewed desktop-context receipt when requested
+        if: inputs.idle_cuda_context_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-3391f854565a5f5ea8eea48d4a8d9bad2e68c02d-37106146499-1
+          run-id: ${{ inputs.idle_cuda_context_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-reviewed-idle-context
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Resolve reviewed Python 3.12 and verify source/pin/idle device
+        shell: cmd
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+          "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_precision_profile.py verify-sources --app app --engine engine --control control --app-sha "%EXPECTED_APP_SHA%" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" --output "%APP_EVIDENCE%\sources.json" || exit /b 1
+          "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_precision_profile.py preflight --backend cuda --evidence "%APP_EVIDENCE%" --label initial || exit /b 1
+          "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_precision_profile.py prepare-cases --templates control\scripts\ci\yue2-app-precision-cases --destination "%APP_RUN_ROOT%\cases" --backend cuda || exit /b 1
+      - name: Select the app checkout's pinned Rust channel
+        shell: powershell
+        run: |
+          $pin = Select-String -Path app/rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1
+          if (-not $pin) { throw 'app Rust channel is not an exact version' }
+          Add-Content -Path $env:GITHUB_ENV -Value "RUSTUP_TOOLCHAIN=$($pin.Matches[0].Groups[1].Value)"
+      - uses: ./app/.github/actions/prepare-rust-runner
+      - name: Verify selected app Rust channel
+        shell: powershell
+        working-directory: app
+        run: |
+          $actual = (& rustc --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -notmatch [regex]::Escape($env:RUSTUP_TOOLCHAIN)) { throw "app Rust toolchain mismatch: $actual" }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Compile release API outside the profile sample windows
+        shell: cmd
+        working-directory: app
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: |
+          set "RUSTC_WRAPPER="
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set "NVCC_CCBIN=%VCToolsInstallDir%bin\Hostx64\x64"
+          node scripts\select-windows-cargo-cache.mjs || exit /b 1
+          cargo fetch --locked > "%APP_EVIDENCE%\fetch.log" 2>&1 || exit /b 1
+          cargo build --release --locked -p sceneworks-rust-api --features backend-candle > "%APP_EVIDENCE%\build-api.log" 2>&1 || exit /b 1
+      - name: Verify ffmpeg executable and recensus before model install
+        shell: powershell
+        run: |
+          $ffmpeg = (Get-Command ffmpeg.exe -CommandType Application -ErrorAction Stop).Source
+          if (-not [System.IO.Path]::IsPathRooted($ffmpeg)) { throw 'ffmpeg must resolve absolutely' }
+          $version = (& $ffmpeg -version | Select-Object -First 1)
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^ffmpeg version ') { throw 'ffmpeg probe failed' }
+          Add-Content -Path $env:GITHUB_ENV -Value "YUE2_FFMPEG_BIN=$ffmpeg"
+          & $env:REVIEWED_PYTHON control/scripts/ci/yue2_app_precision_profile.py preflight --backend cuda --evidence "$env:APP_EVIDENCE" --label before-install
+          if ($LASTEXITCODE -ne 0) { throw 'device became busy before install' }
+      - name: Install pinned BF16 model and both decoders through the app, without acceptance cases
+        shell: cmd
+        working-directory: app
+        run: |
+          set "RUSTC_WRAPPER="
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set "NVCC_CCBIN=%VCToolsInstallDir%bin\Hostx64\x64"
+          node scripts\yue2-acceptance.mjs --platform cuda --gpu-id 0 --profile-install-only --out "%APP_RUN_ROOT%\install" --data-dir "%APP_RUN_ROOT%\app-data" --hf-home "%APP_RUN_ROOT%\hf-home" --api-bin "%CARGO_TARGET_DIR%\release\sceneworks-rust-api.exe" --ffmpeg-bin "%YUE2_FFMPEG_BIN%" > "%APP_EVIDENCE%\install.log" 2>&1
+          if errorlevel 1 exit /b 1
+      - name: Capture exactly seven CUDA app precision profiles
+        id: capture
+        continue-on-error: true
+        shell: cmd
+        working-directory: app
+        run: |
+          set "RUSTC_WRAPPER="
+          set "HF_HOME=%APP_RUN_ROOT%\hf-home"
+          set "HF_HUB_CACHE="
+          set "HUGGINGFACE_HUB_CACHE="
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set "NVCC_CCBIN=%VCToolsInstallDir%bin\Hostx64\x64"
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_app_precision_profile.py run-captures --app . --engine ..\engine --data "%APP_RUN_ROOT%\app-data" --output "%APP_RUN_ROOT%\profile" --evidence "%APP_EVIDENCE%" --cases "%APP_RUN_ROOT%\cases" --backend cuda
+      - name: Upload CUDA JSON/log/raw-sampler receipts only
+        if: always() && steps.run-root.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-app-precision-cuda-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.APP_EVIDENCE }}
+            ${{ env.APP_RUN_ROOT }}/install/evidence/*.json
+            ${{ env.APP_RUN_ROOT }}/install/evidence/*.md
+          if-no-files-found: warn
+          retention-days: 30
+      # Internal listening review only (YuE2 weights/output: CC BY-NC 4.0).
+      # Keep WAVs separate from the metrics artifact and on the original host.
+      - name: Upload generated CUDA WAVs for internal listening
+        if: always() && steps.run-root.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-app-precision-cuda-listening-internal-cc-by-nc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.APP_RUN_ROOT }}/profile/**/run/audio.wav
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Enforce CUDA verdict after upload
+        if: always()
+        shell: powershell
+        env:
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        run: |
+          if ($env:CAPTURE_OUTCOME -ne 'success' -or -not (Test-Path "$env:APP_EVIDENCE\verdict.json")) { throw 'CUDA app precision profile incomplete; inspect retained receipts' }
+          Get-Content "$env:APP_EVIDENCE\verdict.json"
+
+  metal:
+    if: inputs.backend == 'metal'
+    runs-on: [self-hosted, macOS, ARM64, rw-audio]
+    timeout-minutes: 480
+    env:
+      APP_RUN_ROOT: /Volumes/Models/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}
+      APP_EVIDENCE: /Volumes/Models/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/evidence
+      CARGO_TARGET_DIR: /Volumes/Models/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/target
+    steps:
+      - name: Assert designated runner, exact dispatch, and fresh path before provisioning
+        id: run-root
+        shell: bash
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+          METAL_RESOURCE_APPROVED: ${{ inputs.metal_resource_approved }}
+        run: |
+          set -euo pipefail
+          test "$METAL_RESOURCE_APPROVED" = true
+          test "$RUNNER_NAME" = nax-macos-2
+          [[ "$EXPECTED_ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_APP_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_CONTROL_SHA" = "$GITHUB_SHA"
+          test -d /Volumes/Models
+          test ! -e "$APP_RUN_ROOT"
+          mkdir -p "$APP_EVIDENCE"
+          { hostname; sw_vers; sysctl hw.memsize; df -h /Volumes/Models; } > "$APP_EVIDENCE/hardware-before.txt"
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: SceneWorks/SceneWorks
+          ref: ${{ inputs.expected_app_sha }}
+          path: app
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Verify exact checkouts, app pin, resources, and idle device
+        shell: bash
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+        run: |
+          set -euo pipefail
+          command -v python3.12
+          command -v cargo rustc curl zstd
+          python3.12 control/scripts/ci/yue2_app_precision_profile.py verify-sources --app app --engine engine --control control --app-sha "$EXPECTED_APP_SHA" --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" --output "$APP_EVIDENCE/sources.json"
+          python3.12 control/scripts/ci/yue2_app_precision_profile.py preflight --backend metal --evidence "$APP_EVIDENCE" --label initial
+          python3.12 control/scripts/ci/yue2_app_precision_profile.py prepare-cases --templates control/scripts/ci/yue2-app-precision-cases --destination "$APP_RUN_ROOT/cases" --backend metal
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Stage the app's hash-verified macOS ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$APP_RUN_ROOT/tools"
+          python3.12 app/apps/desktop/scripts/stage-ffmpeg.py "$APP_RUN_ROOT/tools/ffmpeg"
+          "$APP_RUN_ROOT/tools/ffmpeg" -version | sed -n '1p'
+          echo "YUE2_FFMPEG_BIN=$APP_RUN_ROOT/tools/ffmpeg" >> "$GITHUB_ENV"
+      - name: Fetch the exact app pin's verified prebuilt MLX when available
+        working-directory: app
+        shell: bash
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --build-type Release --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "PMETAL_MLX_PREBUILT_DIR=" >> "$GITHUB_ENV"
+            echo "PMETAL_METALLIB_PATH=" >> "$GITHUB_ENV"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Compile release API outside profile sample windows
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset RUSTC_WRAPPER
+          cargo build --release --locked -p sceneworks-rust-api > "$APP_EVIDENCE/build-api.log" 2>&1 || { tail -100 "$APP_EVIDENCE/build-api.log"; exit 1; }
+          test -x "$CARGO_TARGET_DIR/release/sceneworks-rust-api"
+      - name: Recensus before fresh model installation
+        shell: bash
+        run: python3.12 control/scripts/ci/yue2_app_precision_profile.py preflight --backend metal --evidence "$APP_EVIDENCE" --label before-install
+      - name: Install pinned BF16 model and both decoders through the app, without acceptance cases
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset RUSTC_WRAPPER
+          node scripts/yue2-acceptance.mjs --platform metal --gpu-id 0 --profile-install-only \
+            --out "$APP_RUN_ROOT/install" --data-dir "$APP_RUN_ROOT/app-data" --hf-home "$APP_RUN_ROOT/hf-home" \
+            --api-bin "$CARGO_TARGET_DIR/release/sceneworks-rust-api" --ffmpeg-bin "$YUE2_FFMPEG_BIN" \
+            > "$APP_EVIDENCE/install.log" 2>&1
+      - name: Capture exactly seven Metal app precision profiles
+        id: capture
+        continue-on-error: true
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset RUSTC_WRAPPER HF_HUB_CACHE HUGGINGFACE_HUB_CACHE
+          export HF_HOME="$APP_RUN_ROOT/hf-home"
+          python3.12 ../control/scripts/ci/yue2_app_precision_profile.py run-captures \
+            --app . --engine ../engine --data "$APP_RUN_ROOT/app-data" --output "$APP_RUN_ROOT/profile" \
+            --evidence "$APP_EVIDENCE" --cases "$APP_RUN_ROOT/cases" --backend metal
+      - name: Upload Metal JSON/log/raw-sampler receipts only
+        if: always() && steps.run-root.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-app-precision-metal-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.APP_EVIDENCE }}
+            ${{ env.APP_RUN_ROOT }}/install/evidence/*.json
+            ${{ env.APP_RUN_ROOT }}/install/evidence/*.md
+          if-no-files-found: warn
+          retention-days: 30
+      # Internal listening review only (YuE2 weights/output: CC BY-NC 4.0).
+      # Keep WAVs separate from the metrics artifact and on the original host.
+      - name: Upload generated Metal WAVs for internal listening
+        if: always() && steps.run-root.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-app-precision-metal-listening-internal-cc-by-nc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.APP_RUN_ROOT }}/profile/**/run/audio.wav
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Enforce Metal verdict after upload
+        if: always()
+        shell: bash
+        env:
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        run: |
+          set -euo pipefail
+          test "$CAPTURE_OUTCOME" = success
+          test -f "$APP_EVIDENCE/verdict.json"
+          cat "$APP_EVIDENCE/verdict.json"
+          printf 'YuE2 precision app state retained for listening: %s\n' "$APP_RUN_ROOT" >> "$GITHUB_STEP_SUMMARY"

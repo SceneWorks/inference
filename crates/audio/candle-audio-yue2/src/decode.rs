@@ -209,6 +209,8 @@ pub struct DecodeMetadata {
     pub halo_frames: Option<usize>,
     /// Samples (over both channels) whose raw value lay outside `[-1, 1]` and were clamped.
     pub clamped_samples: usize,
+    /// Effective dtype of the VAE stage, distinct from the F32 output serialization.
+    pub vae_dtype: DType,
 }
 
 impl DecodeMetadata {
@@ -234,7 +236,11 @@ impl DecodeMetadata {
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "samples": self.samples,
-            "vae_dtype": "float32",
+            "vae_dtype": match self.vae_dtype {
+                DType::BF16 => "bfloat16",
+                DType::F32 => "float32",
+                _ => "unsupported",
+            },
             "vae_decode": self.vae_decode(),
             "vae_core_frames": core,
             "vae_halo_frames": halo,
@@ -289,7 +295,11 @@ pub fn decode_latents(
     on_progress: &mut dyn FnMut(usize, usize),
 ) -> Result<DecodedAudio, VaeError> {
     latents.verify()?;
-    let z = latents.to_decoder_input(vae.device())?;
+    // Refuse a changed CUDA BF16 handle before staging decoder input on that device.
+    vae.check_cuda_bf16_math()?;
+    let z = latents
+        .to_decoder_input(vae.device())?
+        .to_dtype(vae.dtype())?;
     let raw = match options.mode {
         DecodeMode::Tiled { core_frames } => {
             vae.decode_tiled(&z, core_frames, options.halo_frames, cancel, on_progress)?
@@ -333,6 +343,7 @@ pub fn decode_latents(
                 DecodeMode::Full => None,
             },
             clamped_samples: clamped,
+            vae_dtype: vae.dtype(),
         },
     })
 }

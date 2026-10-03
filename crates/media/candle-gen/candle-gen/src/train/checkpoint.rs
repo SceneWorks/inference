@@ -139,25 +139,7 @@ pub fn load_resume(
             "resume: unsupported snapshot format".into(),
         ));
     }
-    let saved_config = meta
-        .get("training_config")
-        .ok_or_else(|| CandleError::Msg("resume: missing training_config metadata".into()))?;
-    let requested_config = training_fingerprint(cfg);
-    if saved_config != &requested_config {
-        return Err(CandleError::Msg(format!(
-            "resume: training configuration differs (saved {saved_config:?}, requested \
-             {requested_config:?})"
-        )));
-    }
-    let saved_request = meta
-        .get("request_fingerprint")
-        .ok_or_else(|| CandleError::Msg("resume: missing request_fingerprint metadata".into()))?;
-    if saved_request != request_fingerprint {
-        return Err(CandleError::Msg(format!(
-            "resume: dataset/request fingerprint differs (saved {saved_request}, requested \
-             {request_fingerprint})"
-        )));
-    }
+    crate::gen_core::train::resume::check_resume_fingerprints(&meta, cfg, request_fingerprint)?;
     let tensors = candle_core::safetensors::load(path, &Device::Cpu)?;
     let factors: HashMap<String, Tensor> = tensors
         .iter()
@@ -175,23 +157,7 @@ pub fn load_resume(
 }
 
 fn training_fingerprint(cfg: &TrainingConfig) -> String {
-    format!(
-        "steps={};accum={};scheduler={:?};warmup={};rank={};alpha={};seed={};resolution={};loss={};dtype={};\
-         checkpoint={};timestep_type={};timestep_bias={}",
-        cfg.steps,
-        cfg.gradient_accumulation.max(1),
-        cfg.lr_scheduler,
-        cfg.lr_warmup_steps,
-        cfg.rank,
-        cfg.alpha,
-        cfg.seed,
-        cfg.resolution,
-        cfg.loss_type,
-        cfg.train_dtype,
-        cfg.gradient_checkpointing,
-        cfg.timestep_type,
-        cfg.timestep_bias
-    )
+    crate::gen_core::train::resume::training_config_fingerprint(cfg)
 }
 
 #[cfg(test)]

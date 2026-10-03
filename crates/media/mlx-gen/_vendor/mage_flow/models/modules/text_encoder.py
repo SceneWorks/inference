@@ -261,7 +261,7 @@ def model_forward(
     else:
         text_position_ids = position_ids[0]
 
-    if kwargs.get("cu_seqlens") is None:
+    if kwargs.get("text_cu_seqlens") is None:
         attention_mask = create_causal_mask(
             config=self.config,
             inputs_embeds=inputs_embeds,
@@ -328,7 +328,7 @@ def forward(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    cu_seqlens = kwargs.get("cu_seqlens", None)
+    cu_seqlens = kwargs.get("text_cu_seqlens", None)
 
     if cu_seqlens is None:
         attention_interface: Callable = eager_attention_forward
@@ -528,7 +528,9 @@ class TextEncoder(nn.Module):
         with torch.no_grad():
             forward_kwargs = {
                 "input_ids": input_ids_packed,
-                "cu_seqlens": cu_seqlens,
+                # Transformers 5.10 treats a bare `cu_seqlens` kwarg as precomputed vision
+                # patch boundaries (`get_vision_cu_seqlens`), so the text packing uses its own key.
+                "text_cu_seqlens": cu_seqlens,
                 "position_ids": position_ids_packed,
                 "output_hidden_states": False,
                 "max_seqlen": None,

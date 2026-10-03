@@ -177,9 +177,10 @@ pub use memory_phases::{
     StagedWeightSchedule, StreamedWeightFacts,
 };
 pub use memory_strategy::{
-    adapter_stack_identity, adapter_stack_resident_bytes, default_memory_strategy_safety_check,
-    default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
-    standard_memory_strategy_safety_check, validate_calibration_fingerprint, AdapterResidencyMode,
+    adapter_stack_identity, adapter_stack_resident_bytes, adapter_stack_upcast_resident_bytes,
+    default_memory_strategy_safety_check, default_registered_memory_strategy_safety_check,
+    standard_memory_behavior_context, standard_memory_strategy_safety_check,
+    validate_calibration_fingerprint, AdapterResidencyMode, LokrKroneckerDims,
     MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackend, MemoryBackendRealization,
     MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
     MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
@@ -197,8 +198,8 @@ pub use memory_strategy::{
     MemoryStrategyEngagementExclusion, MemoryStrategyParameters, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryStructuralResidentEvidence,
     MemoryStructuralResidentRequestIdentity, MemoryWarmRunSemantics, MemoryWindowMaterialization,
-    ResidentRequestMemory, TransformerComponent, MEMORY_CALIBRATION_ABI, MEMORY_DECODE_QUALITY_ABI,
-    MEMORY_EVIDENCE_SCHEMA_VERSION, MEMORY_EVIDENCE_V1_PREFIX,
+    ResidentRequestMemory, TransformerComponent, UpcastLoraCopy, MEMORY_CALIBRATION_ABI,
+    MEMORY_DECODE_QUALITY_ABI, MEMORY_EVIDENCE_SCHEMA_VERSION, MEMORY_EVIDENCE_V1_PREFIX,
     MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
 };
 pub use registry::{
@@ -228,9 +229,10 @@ pub use runtime::{
     HdrFrameSink, HdrOutputFrame, IdentityWeights, LoadPhase, LoadShape,
     LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
     Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, PromptEnhancementOutcome,
-    PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
-    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
-    LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
+    PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource, Yue2ArMode,
+    Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
+    COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT,
+    VAE_COMPONENT,
 };
 pub use sd3_encoder_artifacts::{
     resolve_sd3_text_encoder_artifacts, Sd3TextEncoderArtifactError, Sd3TextEncoderArtifacts,

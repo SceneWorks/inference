@@ -1,0 +1,16 @@
+{
+  "id": "yue2:bf16:cuda:strict-bf16-standard",
+  "tier": "bf16",
+  "decoder": "standard",
+  "computePolicy": "bf16",
+  "request": {
+    "planning": "off",
+    "style": "indie pop, female vocal, acoustic guitar, bass, steady drums",
+    "lyrics": "[verse]\nMorning light, I hear your song\n\n[chorus]\nHold on, sing along",
+    "seed": 831004,
+    "semanticSampling": {
+      "minTokens": 200,
+      "maxTokens": 200
+    }
+  }
+}

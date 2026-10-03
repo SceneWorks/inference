@@ -291,7 +291,11 @@ fn wan_candidates(family: &str, path: &str) -> Vec<LoraCandidate> {
         .collect()
 }
 
+/// Strip a raw PEFT `PeftModel.save_pretrained` wrapper (`base_model.model.`, sc-24158), then a
+/// leading [`wmeta::COMMON_LORA_PREFIXES`] namespace. No visitor path begins with `base_model`, so
+/// the wrapper strip only ever turns an unmatched key into its matching dotted path.
 fn strip_prefix(key: &str) -> &str {
+    let key = key.strip_prefix("base_model.model.").unwrap_or(key);
     for prefix in wmeta::COMMON_LORA_PREFIXES {
         if let Some(rest) = key.strip_prefix(prefix) {
             return rest;
@@ -720,6 +724,174 @@ mod tests {
             classify_lokr_key("transformer.layers.0.attn.q.lokr_w2_b"),
             Some(("layers.0.attn.q".into(), "lokr_w2_b"))
         );
+        // sc-24158: a raw PEFT `save_pretrained` wrapper, alone or over a namespace.
+        assert_eq!(
+            classify_lora_key("base_model.model.layers.0.attn.q.lora_A.weight"),
+            Some(("layers.0.attn.q".into(), Role::Down))
+        );
+        assert_eq!(
+            classify_lora_key("base_model.model.transformer.layers.0.attn.q.lora_B.weight"),
+            Some(("layers.0.attn.q".into(), Role::Up))
+        );
+    }
+
+    /// sc-24163 (E13): the installed LoRA is priced at what it actually holds on device. The
+    /// installer upcasts every factor to f32, and the first forward at the compute dtype caches one
+    /// more copy at that width. The file length is half of that f32 copy for a bf16 file, and that
+    /// is the size the overlay used to be priced at. Measured on CUDA (Qwen-Image 2.1, 768²): a
+    /// bf16 and an f32 LoRA with the same factors both added 6 B per factor element at the render
+    /// peak.
+    ///
+    /// *Mutations that red this:* pricing at the file length (`adapter_stack_resident_bytes`), or
+    /// dropping the prepared copy's width from `adapter_stack_upcast_resident_bytes`.
+    #[test]
+    fn the_overlay_price_covers_the_installed_factors_for_bf16_and_f32_files() {
+        use gen_core::{
+            adapter_stack_resident_bytes, adapter_stack_upcast_resident_bytes,
+            AdapterResidencyMode::Additive,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let (rank, in_dim, out_dim) = (8, 64, 32);
+        let elements = (rank * in_dim + out_dim * rank) as u64;
+        for file_dtype in [DType::BF16, DType::F32] {
+            let path = temp.path().join(format!("{file_dtype:?}.safetensors"));
+            let tensors = HashMap::from([
+                (
+                    "layers.0.proj.lora_A.weight".to_owned(),
+                    Tensor::ones((rank, in_dim), file_dtype, &device).unwrap(),
+                ),
+                (
+                    "layers.0.proj.lora_B.weight".to_owned(),
+                    Tensor::ones((out_dim, rank), file_dtype, &device).unwrap(),
+                ),
+            ]);
+            candle_core::safetensors::save(&tensors, &path).unwrap();
+            let specs = vec![AdapterSpec::new(path, 1.0, AdapterKind::Lora)];
+            // A half-precision host (the GPU tiers compute at bf16; CPU has an f16 matmul) and an
+            // f32 one, where the prepared copy is the f32 factors themselves.
+            for (compute, width) in [(DType::F16, 2u64), (DType::F32, 4)] {
+                let base = Tensor::zeros((out_dim, in_dim), compute, &device).unwrap();
+                let mut linear = AdaptLinear::from_dense(Linear::new(base, None), in_dim, out_dim);
+                install_dotted_adapters("fixture", &specs, &device, |visitor| {
+                    visitor("layers.0.proj", &mut linear)
+                })
+                .unwrap();
+                let x = Tensor::ones((1, 4, in_dim), compute, &device).unwrap();
+                linear.forward(&x).unwrap();
+                let resident = linear.frozen_adapter_bytes() as u64;
+                let prepared = if width == 4 { 0 } else { width };
+                assert_eq!(
+                    resident,
+                    elements * (4 + prepared),
+                    "{file_dtype:?} file on a {compute:?} host: f32 factors + the prepared copy"
+                );
+                let priced = adapter_stack_upcast_resident_bytes(
+                    &specs,
+                    Additive,
+                    width,
+                    gen_core::UpcastLoraCopy::Cached,
+                )
+                .unwrap();
+                assert!(
+                    priced >= resident,
+                    "{file_dtype:?} on {compute:?}: priced {priced} < resident {resident}"
+                );
+                assert_eq!(
+                    priced, resident,
+                    "{file_dtype:?} on {compute:?}: a plain LoRA is priced exactly"
+                );
+                if width == 2 {
+                    let file = adapter_stack_resident_bytes(&specs, Additive).unwrap();
+                    assert!(
+                        file < resident,
+                        "the file length ({file}) under-prices the installed factors ({resident})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// sc-24163 review: a **low-rank** LoKr is priced at what `LokrFactors::build` +
+    /// `push_lokr_structured` actually hold, not at its stored elements. The build materializes
+    /// `w2 = w2_a·w2_b` to its full `[b, d]` in f32 (here 32×16 = 512 elements against 96 stored),
+    /// and the forward caches `w1` and `w2ᵀ` at the compute width. The candle-gen-qwen-image edit
+    /// stack, the SDXL packed tiers and Qwen-Image 2.1 all install LoKr this way and all price it
+    /// through `gen_core::LokrKroneckerDims`.
+    ///
+    /// *Mutations that red this:* pricing LoKr tensors per stored element like a LoRA, dropping
+    /// the `w2ᵀ` copy from `LokrKroneckerDims::resident_bytes`, or dropping the `w1` copy at a
+    /// narrower compute width.
+    #[test]
+    fn the_overlay_price_covers_an_installed_low_rank_lokr() {
+        use gen_core::{
+            adapter_stack_upcast_resident_bytes, AdapterResidencyMode::Additive, UpcastLoraCopy,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        // w1 [2, 4] ⊗ w2 [32, 16] = [64, 64]; w2 low-rank r = 2.
+        let (a, c, b, d, r) = (2usize, 4usize, 32usize, 16usize, 2usize);
+        let ones = |shape: (usize, usize)| Tensor::ones(shape, DType::BF16, &device).unwrap();
+        let (w1, w2_a, w2_b) = (ones((a, c)), ones((b, r)), ones((r, d)));
+        let path = temp.path().join("lokr.safetensors");
+        let tensors = HashMap::from([
+            ("layers.0.proj.lokr_w1".to_owned(), w1.clone()),
+            ("layers.0.proj.lokr_w2_a".to_owned(), w2_a.clone()),
+            ("layers.0.proj.lokr_w2_b".to_owned(), w2_b.clone()),
+        ]);
+        safetensors::serialize_to_file(
+            tensors.into_iter().collect::<Vec<_>>(),
+            Some(HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "2".to_string()),
+                ("alpha".to_string(), "2".to_string()),
+            ])),
+            &path,
+        )
+        .unwrap();
+        let specs = vec![AdapterSpec::new(path, 1.0, AdapterKind::Lokr)];
+        for (compute, width) in [(DType::F16, 2u64), (DType::F32, 4)] {
+            let (out_f, in_f) = (a * b, c * d);
+            let base = Tensor::zeros((out_f, in_f), compute, &device).unwrap();
+            let mut linear = AdaptLinear::from_dense(Linear::new(base, None), in_f, out_f);
+            let factors = LokrFactors::build(
+                1.0,
+                (out_f, in_f),
+                Some(&w1),
+                None,
+                None,
+                None,
+                None,
+                Some(&w2_a),
+                Some(&w2_b),
+            )
+            .unwrap()
+            .expect("the factors reconstruct the projection");
+            linear.push_lokr_structured(factors).unwrap();
+            let x = Tensor::ones((1, 3, in_f), compute, &device).unwrap();
+            linear.forward(&x).unwrap();
+            let resident = linear.frozen_adapter_bytes() as u64;
+            let priced = adapter_stack_upcast_resident_bytes(
+                &specs,
+                Additive,
+                width,
+                UpcastLoraCopy::Cached,
+            )
+            .unwrap();
+            assert!(
+                priced >= resident,
+                "{compute:?}: priced {priced} < installed {resident}"
+            );
+            assert_eq!(
+                priced, resident,
+                "{compute:?}: a LoKr module is priced exactly"
+            );
+            let stored = ((a * c + b * r + r * d) as u64) * (4 + width);
+            assert!(
+                stored < resident,
+                "per-stored-element pricing ({stored}) under-prices the installed LoKr ({resident})"
+            );
+        }
     }
 
     #[test]

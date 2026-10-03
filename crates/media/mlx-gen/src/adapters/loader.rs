@@ -321,6 +321,10 @@ where
     // allocation-free) and unmatched groups add nothing to `projected_materialize`.
     let mut plans: Vec<LycorisPlan<F>> = Vec::new();
     let mut projected_materialize: usize = 0;
+    // Resolved module path → the raw key that claimed it. Two raw spellings of one module in one file
+    // (`lycoris_X` beside `lora_unet_X`, `diffusion_model.X` beside `X`) would otherwise BOTH install
+    // and double-apply the delta — refuse instead (sc-24158).
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
     for (raw, delta, factors) in groups {
         let dotted: String = match &resolution {
             LycorisKeyResolution::Dotted => raw.as_ref().to_string(),
@@ -328,6 +332,13 @@ where
                 .unwrap_or_else(|| strip_common_lora_prefix(raw.as_ref()))
                 .to_string(),
         };
+        if let Some(previous) = claimed.insert(dotted.clone(), raw.as_ref().to_string()) {
+            return Err(Error::Msg(format!(
+                "LyCORIS adapter carries both `{previous}` and `{}`, which resolve to the same \
+                 module `{dotted}`; refusing a double apply",
+                raw.as_ref()
+            )));
+        }
         let parts: Vec<&str> = dotted.split('.').collect();
         // SC-18319 — pass 1 only *reads* (is the base packed, how big is it), so it goes through the
         // PROBE half of the host surface. Taking the `&mut` here would unfuse every `FusedQkvProjection`
@@ -836,20 +847,42 @@ pub fn apply_lora_peft(
     let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
     for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
         // The down/up factors always carry the file's namespace prefix. `lora_A`/`lora_B` (PEFT) and
-        // `lora_down`/`lora_up` (diffusers/ComfyUI) are interchangeable spellings of the same role.
+        // `lora_down`/`lora_up` (diffusers/ComfyUI) are interchangeable spellings of the same role,
+        // and a PEFT export that kept its adapter name writes `lora_A.default` (sc-24158 — the
+        // candle `install_dotted_adapters` and the kohya loader below already accept it).
         if let Some(rest) = key.strip_prefix(prefix) {
             if let Some(path) = rest
                 .strip_suffix(".lora_A.weight")
+                .or_else(|| rest.strip_suffix(".lora_A.default.weight"))
                 .or_else(|| rest.strip_suffix(".lora_down.weight"))
             {
-                groups.entry(path.to_string()).or_default().a = Some(w.require(&key)?.clone());
+                let slot = &mut groups.entry(path.to_string()).or_default().a;
+                if slot.is_some() {
+                    // Two spellings of one factor (`lora_A` beside `lora_A.default` / `lora_down`):
+                    // refuse rather than keep whichever key sorts last (sc-24158).
+                    return Err(format!(
+                        "LoRA down/A factor for `{path}` is spelled twice (second: `{key}`); \
+                         refusing an ambiguous apply"
+                    )
+                    .into());
+                }
+                *slot = Some(w.require(&key)?.clone());
                 continue;
             }
             if let Some(path) = rest
                 .strip_suffix(".lora_B.weight")
+                .or_else(|| rest.strip_suffix(".lora_B.default.weight"))
                 .or_else(|| rest.strip_suffix(".lora_up.weight"))
             {
-                groups.entry(path.to_string()).or_default().b = Some(w.require(&key)?.clone());
+                let slot = &mut groups.entry(path.to_string()).or_default().b;
+                if slot.is_some() {
+                    return Err(format!(
+                        "LoRA up/B factor for `{path}` is spelled twice (second: `{key}`); \
+                         refusing an ambiguous apply"
+                    )
+                    .into());
+                }
+                *slot = Some(w.require(&key)?.clone());
                 continue;
             }
         }

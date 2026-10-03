@@ -5872,6 +5872,7 @@ mod tests {
                 "ltx_2_3",
                 "ltx_2_5_distilled",
                 "mage_flow_base",
+                "qwen_image_2_1",
                 "sd3_5_large",
                 "sd3_5_medium",
                 "sdxl",
@@ -5889,10 +5890,11 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
-        // where a surface change and a mapping change meet. Five of the seven trainer ids are also
-        // generator ids, which is why 56 generators + 2 trainer-only ids + 1 captioner + 2
-        // embedders are 61 distinct ids (sc-24109 adds `qwen_image_2_1`, a generator with its own
-        // component row).
+        // where a surface change and a mapping change meet. Fourteen of the sixteen trainer ids are
+        // also generator ids (`krea_2_control` and `ltx_2_3` are trainer-only), which is why 56
+        // generators + 2 trainer-only ids + 1 captioner + 2 embedders are 61 distinct ids (sc-24109
+        // adds `qwen_image_2_1`, a generator with its own component row; its sc-24160 trainer
+        // reuses that row).
         //
         // Registration is never conditioned on the mapping: 51 < 61 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in

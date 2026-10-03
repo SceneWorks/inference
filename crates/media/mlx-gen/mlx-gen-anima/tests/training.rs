@@ -89,6 +89,7 @@ fn tiny_magenta_dataset(n: usize) -> Vec<TrainingItem> {
             caption: "sksanima style, vivid magenta background, 1girl".into(),
             control_image_path: None,
             model_options: Default::default(),
+            reference_image_paths: Vec::new(),
         });
     }
     items
