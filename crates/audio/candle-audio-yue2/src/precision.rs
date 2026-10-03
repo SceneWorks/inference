@@ -45,9 +45,11 @@
 //!   for Candle's GGML `QMatMul`, then casts its result back to the stage dtype before the next
 //!   layer; the GGML blocks stay resident. RMSNorm reductions, NAR sinusoid construction,
 //!   logits/sampling, VAE posterior softplus and source-checkpoint weight-norm/Snake preparation
-//!   also use F32 numerical work. Durable latents and WAV output are serialized as F32. Explicit
-//!   BF16 means BF16 resident floating weights and inter-layer activations at every model stage,
-//!   not that every kernel accumulator or transient operand is BF16.
+//!   also use F32 numerical work. CUDA BF16 VAE convolutions use BF16 operands/output with a
+//!   fixed-order F32 kernel accumulator, independent of full-song or tile length. Durable latents
+//!   and WAV output are serialized as F32. Explicit BF16 means BF16 resident floating weights and
+//!   inter-layer activations at every model stage, not that every kernel accumulator or transient
+//!   operand is BF16.
 //!
 //! ## Shared AR / NAR weights
 //!

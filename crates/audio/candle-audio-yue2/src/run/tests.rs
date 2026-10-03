@@ -24,7 +24,7 @@ fn cached_decode_records_the_current_vae_math_policy() {
     });
     let cuda_bf16 = json!({
         "compute_policy": "bf16", "vae_dtype": "bfloat16", "decoder_release": "legacy",
-        "vae_cuda_bf16_math_policy": "disallow_reduced_precision_reduction_v1",
+        "vae_cuda_bf16_math_policy": "fixed_order_bf16_convolution_v1",
     });
     let decoded = Value::Object(cached_decode_current_config(&historical, &cuda_bf16));
     assert_eq!(
