@@ -40,6 +40,8 @@ SUPPORTED_RUNTIME_POLICIES = {
     # The M4 CUDA BF16 VAE used a private cuBLAS handle in this mode. A changed
     # arithmetic policy must be bound to its exact engine revision before capture.
     "825341ff8d0110ea448213485891b39d57806fa4": "disallow_reduced_precision_reduction_v1",
+    # M5 replaces only CUDA BF16 convolution leaves with fixed-order BF16 kernels.
+    "190e20e7c6b5bac006194c729baabd22c0c44a5d": "fixed_order_bf16_convolution_v1",
 }
 
 

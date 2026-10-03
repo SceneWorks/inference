@@ -18,6 +18,8 @@ control = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(control)
 M4_SHA = "825341ff8d0110ea448213485891b39d57806fa4"
 M4_POLICY = control.SUPPORTED_RUNTIME_POLICIES[M4_SHA]
+M5_SHA = "190e20e7c6b5bac006194c729baabd22c0c44a5d"
+M5_POLICY = "fixed_order_bf16_convolution_v1"
 
 
 class PrecisionControlTests(unittest.TestCase):
@@ -288,6 +290,115 @@ class PrecisionControlTests(unittest.TestCase):
             record.write_text(json.dumps(body), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "present on another backend"):
                 control.verify_record(record, "metal", "strict-bf16-standard", new_policy)
+
+    def test_m5_policy_requires_verified_clean_source_and_pin(self):
+        self.assertEqual(control.SUPPORTED_RUNTIME_POLICIES[M5_SHA], M5_POLICY)
+        self.assertEqual(control.SUPPORTED_RUNTIME_POLICIES[M4_SHA],
+                         "disallow_reduced_precision_reduction_v1")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, engine, evidence = (root / name for name in ("app", "engine", "evidence"))
+            for path in (app, engine, evidence):
+                path.mkdir()
+            app_sha, control_sha = "a" * 40, "c" * 40
+            source_control = MODULE_PATH.parents[2]
+            pin = app / "Cargo.toml"
+            pin.write_text(
+                f'candle-kernels = {{ git = "https://github.com/SceneWorks/inference", rev = "{M5_SHA}" }}\n',
+                encoding="utf-8",
+            )
+            checked_out = {app: app_sha, engine: M5_SHA, source_control: control_sha}
+            dirty = set()
+
+            def fake_git(path, *args):
+                return checked_out[path] if args[0] == "rev-parse" else (" M changed" if path in dirty else "")
+
+            with patch.dict("os.environ", {"GITHUB_SHA": control_sha}), patch.object(
+                control, "git", side_effect=fake_git
+            ):
+                source = control.verify_sources(app, engine, source_control,
+                                                app_sha, M5_SHA, control_sha)
+                (evidence / "sources.json").write_text(json.dumps(source), encoding="utf-8")
+                self.assertEqual(control.verified_runtime_policy(app, engine, evidence),
+                                 (M5_SHA, M5_POLICY))
+
+                dirty.add(engine)
+                with self.assertRaisesRegex(ValueError, "engine checkout is dirty"):
+                    control.verified_runtime_policy(app, engine, evidence)
+                dirty.clear()
+                pin.write_text(pin.read_text(encoding="utf-8").replace(M5_SHA, M4_SHA),
+                               encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "pin"):
+                    control.verified_runtime_policy(app, engine, evidence)
+                pin.write_text(pin.read_text(encoding="utf-8").replace(M4_SHA, M5_SHA),
+                               encoding="utf-8")
+                (evidence / "sources.json").write_text(
+                    json.dumps({**source, "control_sha": "d" * 40}), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, "workflow control SHA"):
+                    control.verified_runtime_policy(app, engine, evidence)
+
+                unknown_sha = "e" * 40
+                checked_out[engine] = unknown_sha
+                pin.write_text(pin.read_text(encoding="utf-8").replace(M5_SHA, unknown_sha),
+                               encoding="utf-8")
+                unknown_source = control.verify_sources(app, engine, source_control,
+                                                        app_sha, unknown_sha, control_sha)
+                (evidence / "sources.json").write_text(json.dumps(unknown_source), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "unsupported engine revision"):
+                    control.verified_runtime_policy(app, engine, evidence)
+
+    def test_m5_cuda_bf16_record_refuses_old_unknown_or_leaked_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            for name in ("strict-bf16-standard", "strict-bf16-legacy",
+                         "strict-bf16-q8-standard", "strict-bf16-q4-standard"):
+                _, case_name, decoder, policy, model_dtype, vae_dtype = control.CASES[name]
+                body = {
+                    "caseId": control.case_id("cuda", name), "backend": "cuda",
+                    "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae" + ("-legacy" if decoder == "legacy" else "")}},
+                    "request": {"name": case_name, "computePolicy": policy},
+                    "admission": {"outcome": "admitted"},
+                    "outcome": {"status": "completed", "engineComputePolicy": policy,
+                                "engineModelDtype": model_dtype, "engineVaeDtype": vae_dtype,
+                                "engineVaeCudaBf16MathPolicy": M5_POLICY},
+                    "measured": {"peakBytes": 1, "stages": {
+                        stage: {"peakBytes": 1, "samples": 1} for stage in control.STAGES}},
+                }
+
+                def check(backend="cuda"):
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    return control.verify_record(record, backend, name, M5_POLICY)
+
+                with self.subTest(name=name):
+                    self.assertEqual(check()["effective_vae_cuda_bf16_math_policy"], M5_POLICY)
+                    del body["outcome"]["engineVaeCudaBf16MathPolicy"]
+                    with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                        check()
+                    for wrong in (M4_POLICY, "unknown_policy"):
+                        body["outcome"]["engineVaeCudaBf16MathPolicy"] = wrong
+                        with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                            check()
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = M5_POLICY
+
+            body["caseId"] = control.case_id("metal", name)
+            body["backend"] = "metal"
+            with self.assertRaisesRegex(ValueError, "present on another backend"):
+                check("metal")
+            del body["outcome"]["engineVaeCudaBf16MathPolicy"]
+            self.assertIsNone(check("metal")["effective_vae_cuda_bf16_math_policy"])
+
+            name = "strict-fp32-standard"
+            _, case_name, _, policy, model_dtype, vae_dtype = control.CASES[name]
+            body["caseId"] = control.case_id("cuda", name)
+            body["backend"] = "cuda"
+            body["request"] = {"name": case_name, "computePolicy": policy}
+            body["outcome"].update(engineComputePolicy=policy, engineModelDtype=model_dtype,
+                                   engineVaeDtype=vae_dtype)
+            self.assertIsNone(check()["effective_vae_cuda_bf16_math_policy"])
+            body["outcome"]["engineVaeCudaBf16MathPolicy"] = M5_POLICY
+            with self.assertRaisesRegex(ValueError, "present on another backend"):
+                check()
 
     def test_busy_cuda_preflight_refuses_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:

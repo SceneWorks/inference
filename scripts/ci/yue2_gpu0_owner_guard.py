@@ -20,7 +20,7 @@ import urllib.request
 import re
 import signal
 
-ENGINE = "825341ff8d0110ea448213485891b39d57806fa4"
+ENGINE = "190e20e7c6b5bac006194c729baabd22c0c44a5d"
 RECEIPT = "37145909196"
 RECEIPT_DIGEST = "d67f8d2c7cd79040bbe48ada71e6e27722237a3316bf622e69808ca341f77a2c"
 REPO = "SceneWorks/inference"
@@ -460,7 +460,7 @@ class OwnerGuard:
                 os.environ.get("CUDA_VISIBLE_DEVICES") == "0" and
                 os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" and
                 re.fullmatch(r"[0-9a-f]{40}", self.control_sha) is not None and IS_WINDOWS,
-                "GPU0 mode is only the exact M4 CUDA owner-receipt attempt")
+                "GPU0 mode is only the exact reviewed CUDA owner-receipt attempt")
         self.background = reviewed_background()
         self.record({"event": "reviewed_background", "identity": self.background["identity"],
                      "luid": self.background["luid"], "engine_instances": sorted(self.background["counters"]["engine"])})
