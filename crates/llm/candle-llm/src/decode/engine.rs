@@ -3533,14 +3533,16 @@ mod tests {
     /// gain below [`core_llm::CLEAR_LOSS_GAIN`] (Bonsai-like lookup under CUDA graphs: accepting
     /// nothing at r = 2.4, gain 0.42; a companion MTP head at mal 0.75, r = 2.6, gain 0.67) — is
     /// demoted by the end of the probe and its first window: at the first step its measurement
-    /// holds [`core_llm::MIN_TIMED_WINDOW_STEPS`] timed steps past its shape's warm-up. A winner
+    /// holds [`core_llm::CLEAR_LOSS_MIN_TIMED_STEPS`] timed steps past its shape's warm-up, or — the
+    /// MTP-kind one, too lumpy (3 drafts every fourth step) for the optimistic gain to call
+    /// early — at its first window's end. A winner
     /// (Qwen3.8-like: mal 1.0 at r = 1.71, gain 1.17) is never demoted. The reference loop's tokens throughout.
     #[test]
     fn a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never() {
         let (_cfg, model) = text_model();
         let vocab = model.vocab_size();
         let first =
-            core_llm::SHAPE_WARMUP_STEPS as usize + core_llm::MIN_TIMED_WINDOW_STEPS as usize;
+            core_llm::SHAPE_WARMUP_STEPS as usize + core_llm::CLEAR_LOSS_MIN_TIMED_STEPS as usize;
         let config = greedy(64);
         let expected = reference(&model, &PROMPT, &config).tokens;
 
@@ -3571,7 +3573,7 @@ mod tests {
             at <= 1 + PROBE + WINDOW + 12,
             "within the first window: {at}"
         );
-        assert_eq!(head.proposals, first);
+        assert_eq!(head.proposals, WINDOW);
 
         // Qwen3.8-like: mal 1.0 at r = 1.71 (the dearest measured depth-3 MTP verify), gain 1.17.
         let mut right = Scripted::new(

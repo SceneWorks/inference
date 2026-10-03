@@ -17,7 +17,7 @@ use core_llm::{
 use crate::decode::graph::{
     REASON_CUDA_FEATURE_OFF, REASON_FLASH_ATTN_STREAM, REASON_LEGACY_STREAM, REASON_NOT_CUDA,
 };
-use crate::device::{select_device, CudaStreamKind, CUDA_STREAM_ENV};
+use crate::device::{select_eager_device, CudaStreamKind, CUDA_STREAM_ENV};
 
 /// This build's execution backend label (`candle-cuda`, `candle-metal`, `candle-cpu`).
 pub fn backend_label() -> &'static str {
@@ -37,7 +37,8 @@ pub fn backend_label() -> &'static str {
 /// `flash-attn` build (always the legacy stream) or `CANDLE_LLM_CUDA_STREAM=legacy`.
 ///
 /// Probed once per process (the device a load selects does not change while it runs) and cached;
-/// the probe opens the load device the way a load does and, on CUDA, builds the NVFP4 context
+/// the probe opens the load's device on the legacy stream ([`select_eager_device`]: it never
+/// captures, so it holds no stream or handles of its own) and, on CUDA, builds the NVFP4 context
 /// (a cuBLASLt handle and the fused quantizer's compile-once module, which a later NVFP4 load
 /// reuses). It never reads weights.
 pub fn backend_capabilities() -> BackendCapabilities {
@@ -47,7 +48,7 @@ pub fn backend_capabilities() -> BackendCapabilities {
     #[cfg(all(test, feature = "cuda"))]
     crate::decode::graph::hold_cuda_test_lock();
     CAPABILITIES
-        .get_or_init(|| match select_device() {
+        .get_or_init(|| match select_eager_device() {
             Ok(device) => capabilities_for_device(backend_label(), &device),
             Err(error) => no_device(backend_label(), &error.to_string()),
         })

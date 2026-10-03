@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 pub const CUDA_STREAM_ENV: &str = "CANDLE_LLM_CUDA_STREAM";
 
 /// [`CUDA_STREAM_ENV`]'s value, read once per process and cached.
-fn stream_env_value() -> Option<&'static str> {
+pub(crate) fn stream_env_value() -> Option<&'static str> {
     static VALUE: OnceLock<Option<String>> = OnceLock::new();
     VALUE
         .get_or_init(|| std::env::var(CUDA_STREAM_ENV).ok())
@@ -28,13 +28,17 @@ fn stream_env_value() -> Option<&'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CudaStreamKind {
     /// The legacy NULL stream `Device::new_cuda` uses, with cudarc's default event tracking —
-    /// the **default**. Every CUDA device a process creates on it shares the legacy stream of
-    /// the primary context, so work is ordered whichever device issued it. Stream capture is
-    /// not supported on it: the CUDA-graph runner refuses it (`legacy_stream`).
+    /// the stream whenever the CUDA-graph runner is off at [`select_device`] time, in every
+    /// `flash-attn` build, for every device a provider that never captures opens
+    /// ([`select_eager_device`]), or with `CANDLE_LLM_CUDA_STREAM=legacy`. Every CUDA device a
+    /// process creates on it shares the legacy stream of the primary context, so work is ordered
+    /// whichever device issued it. Stream capture is not supported on it: the CUDA-graph runner
+    /// refuses it (`legacy_stream`).
     Legacy,
     /// The model's **own** non-blocking stream (`Device::new_cuda_with_stream`) with cudarc's
     /// per-slice event tracking off — the only form a CUDA graph can be captured on. Selected
-    /// when the CUDA-graph runner is switched on at [`select_device`] time, or explicitly with
+    /// when the CUDA-graph runner is on at [`select_device`] time — the CUDA default since
+    /// sc-24446 (`core_llm::defaults::CANDLE_CUDA.cuda_graphs`) — or explicitly with
     /// `CANDLE_LLM_CUDA_STREAM=own`; never in a `flash-attn` build.
     Own,
 }
@@ -82,6 +86,13 @@ impl CudaStreamKind {
         ))
     }
 
+    /// The stream [`select_eager_device`] picks: [`from_env`](Self::from_env) with the graph
+    /// runner off on this thread — legacy unless `CANDLE_LLM_CUDA_STREAM=own` asks otherwise.
+    pub fn eager_from_env() -> Result<Self> {
+        let _eager = crate::decode::cuda_graphs_scope(Some(false));
+        Self::from_env()
+    }
+
     /// Stable lower-case label for logs and evidence rows.
     pub fn label(&self) -> &'static str {
         match self {
@@ -98,6 +109,18 @@ impl CudaStreamKind {
 /// a new stream (with its own cuBLAS / cuRAND handles) that candle's op-level device check —
 /// which compares the GPU ordinal only — cannot tell apart from the model's.
 pub fn select_device() -> Result<Device> {
+    select_device_on(CudaStreamKind::from_env)
+}
+
+/// [`select_device`] for a provider that never runs the CUDA-graph runner (LLaVA, StarVector,
+/// the capabilities probe): its CUDA device stays on the legacy stream
+/// ([`CudaStreamKind::eager_from_env`]) whatever the graph switch says, since an own stream only
+/// serves a capture and drops cudarc's cross-stream ordering. Same call-once rule.
+pub fn select_eager_device() -> Result<Device> {
+    select_device_on(CudaStreamKind::eager_from_env)
+}
+
+fn select_device_on(stream: fn() -> Result<CudaStreamKind>) -> Result<Device> {
     if let Some(selection) = std::env::var_os("CANDLE_LLM_DEVICE") {
         let selection = selection.to_string_lossy();
         if selection.eq_ignore_ascii_case("cpu") {
@@ -117,11 +140,13 @@ pub fn select_device() -> Result<Device> {
     #[cfg(all(test, feature = "cuda"))]
     crate::decode::graph::hold_cuda_test_lock();
     #[cfg(feature = "cuda")]
-    let dev = cuda_device(CudaStreamKind::from_env()?)?;
+    let dev = cuda_device(stream()?)?;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     let dev = Device::new_metal(0)?;
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let dev = Device::Cpu;
+    #[cfg(not(feature = "cuda"))]
+    let _ = stream;
     Ok(dev)
 }
 
@@ -250,6 +275,36 @@ mod tests {
             crate::decode::graph::CUDA_GRAPHS_DEFAULT,
             CANDLE_CUDA.cuda_graphs
         );
+    }
+
+    /// sc-24446: a provider that never captures (LLaVA, StarVector-1B / -8B, the capabilities
+    /// probe) opens its device through `select_eager_device`, whose stream resolves legacy with
+    /// the graph switch on — where `select_device` resolves own (outside a `flash-attn` build).
+    #[test]
+    fn providers_that_never_capture_resolve_the_legacy_stream() {
+        let _graphs = crate::decode::graph::cuda_graphs_policy_guard(Some(true));
+        if stream_env_value().is_none() {
+            assert_eq!(
+                CudaStreamKind::eager_from_env().unwrap(),
+                CudaStreamKind::Legacy
+            );
+            let graph_stream = if cfg!(feature = "flash-attn") {
+                CudaStreamKind::Legacy
+            } else {
+                CudaStreamKind::Own
+            };
+            assert_eq!(CudaStreamKind::from_env().unwrap(), graph_stream);
+        }
+        for (name, source) in [
+            ("llava.rs", include_str!("llava.rs")),
+            ("starvector.rs", include_str!("starvector.rs")),
+            ("starvector_8b.rs", include_str!("starvector_8b.rs")),
+            ("backend.rs", include_str!("backend.rs")),
+        ] {
+            let production = source.split("mod tests {").next().unwrap();
+            assert!(production.contains("select_eager_device()"), "{name}");
+            assert!(!production.contains("select_device()"), "{name}");
+        }
     }
 
     #[test]
@@ -394,6 +449,24 @@ mod cuda_tests {
             Some(expected_on),
             "graphs on: the own stream, tracking off"
         );
+    }
+
+    /// sc-24446: `select_eager_device` opens the legacy NULL stream (tracking on) even with the
+    /// graph runner on.
+    #[test]
+    fn select_eager_device_stays_on_the_legacy_stream_with_graphs_on() {
+        if std::env::var_os(CUDA_STREAM_ENV).is_some() {
+            eprintln!("skipping: {CUDA_STREAM_ENV} is set");
+            return;
+        }
+        let _guard = cuda_graphs_policy_guard(Some(true));
+        match select_eager_device() {
+            Ok(Device::Cuda(d)) => assert_eq!(
+                (d.cuda_stream().cu_stream().is_null(), d.is_event_tracking()),
+                (true, true)
+            ),
+            _ => eprintln!("skipping: no CUDA device"),
+        }
     }
 
     /// sc-24140 feature-end review: a test thread that opens a CUDA device — through

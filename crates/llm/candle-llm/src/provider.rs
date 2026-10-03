@@ -8778,11 +8778,17 @@ mod tests {
             (host.graph_param_cache_bytes, host.device_required_bytes),
             (0, None)
         );
-        // Unset (sc-24446), a load takes its device's row of the defaults table: a CUDA load the
-        // CUDA row's graph default (on: priced), a host load none (no graph runner there).
+        // Unset (sc-24446), a CUDA estimate takes the CUDA row's graph default (on: priced) from
+        // the `cuda` it is asked about, not from the device this process would open — on a
+        // CPU-only host as on a CUDA one. (A host estimate carries none whatever the switch: the
+        // `host` case above.)
         {
             let _switch = crate::decode::graph::cuda_graphs_policy_guard(None);
-            if std::env::var_os(crate::decode::graph::CUDA_GRAPHS_ENV).is_none() {
+            // Neither switch set, and a build that can capture (no candle-flash-attn).
+            if std::env::var_os(crate::decode::graph::CUDA_GRAPHS_ENV).is_none()
+                && std::env::var_os(crate::device::CUDA_STREAM_ENV).is_none()
+                && !cfg!(feature = "flash-attn")
+            {
                 let unset = |cuda| {
                     super::LlamaProvider::load_memory_estimate(
                         &core_llm::LoadSpec {
@@ -8800,7 +8806,6 @@ mod tests {
                     0
                 };
                 assert_eq!(unset(true), cuda_default);
-                assert_eq!(unset(false), 0);
             }
         }
         // The draft beside a graph-wrapped target: exactly room for its own unwrapped load.
