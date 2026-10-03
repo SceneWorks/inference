@@ -283,17 +283,23 @@ class OwnerGuard:
                     "foreign GPU1 workflow/driver source is not the reviewed exact bytes")
         self.holder(None)  # Last action before Popen; retains the existing full fresh29 preflight.
 
-    def start(self, child) -> None:
+    def arm(self) -> None:
+        # Flag cancellation rather than raising in the Popen constructor: after
+        # it returns, only our single waiter owns the newly assigned child tree.
         def interrupted(signum, frame):
-            raise KeyboardInterrupt(f"owned GPU0 controller interrupted by signal {signum}")
-        for name in ("SIGTERM", "SIGBREAK"):
+            self.fault = f"owned GPU0 controller interrupted by signal {signum}"
+            self.failed.set()
+        for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
             number = getattr(signal, name, None)
-            if number is not None:
+            if number is not None and number not in self.signals:
                 self.signals[number] = signal.getsignal(number)
                 signal.signal(number, interrupted)
+
+    def start(self, child) -> None:
+        self.arm()
         self.descendants = self.kind == "app"
         def monitor() -> None:
-            while not self.stop.is_set() and child.poll() is None:
+            while not self.stop.is_set() and not self.failed.is_set() and child.poll() is None:
                 try:
                     self.holder(child)
                 except Exception as error:
@@ -376,6 +382,8 @@ def guarded_command(argv: list[str], cwd: Path, env: dict, log, evidence: Path, 
     remaining = (int(stamp) + 480 * 60 * 1_000_000_000 - time.time_ns()) / 1_000_000_000 - 600
     require(remaining > 0, "app job no longer has its original 600-second owned cleanup/upload tail")
     child_env = {k: v for k, v in env.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
+    guard.arm()
+    require(not guard.failed.is_set(), "owner canceled before app command creation")
     child = subprocess.Popen(argv, cwd=cwd, env=child_env, stdout=log, stderr=subprocess.STDOUT)
     error = None
     try:

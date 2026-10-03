@@ -483,6 +483,9 @@ def execute(args: argparse.Namespace) -> None:
     faults: list[str] = []
     stop = threading.Event()
     with (evidence / "test.log").open("w", encoding="utf-8") as log:
+        if owner_guard is not None:
+            owner_guard.arm()
+            require(not owner_guard.failed.is_set(), "owner canceled before precision child creation")
         child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
         def loop() -> None:
             while not stop.is_set() and child.poll() is None:

@@ -284,7 +284,7 @@ class OwnerGuardTests(unittest.TestCase):
                 guard.guarded_command(["node", "unchanged-case"], evidence, {}, None, evidence, "case")
             launch.assert_not_called()
             child = Owned(); child.code = 0
-            with patch.object(guard.OwnerGuard, "preflight"), patch.object(guard.OwnerGuard, "start"), \
+            with patch.object(guard.OwnerGuard, "preflight"), patch.object(guard.OwnerGuard, "arm"), patch.object(guard.OwnerGuard, "start"), \
                  patch.object(guard.OwnerGuard, "finish"), patch.object(guard.subprocess, "Popen", return_value=child) as launch:
                 status = guard.guarded_command(["node", "unchanged-case"], evidence,
                                                {"GH_TOKEN": "secret", "GITHUB_TOKEN": "secret", "CUDA_VISIBLE_DEVICES": "0"},
@@ -325,6 +325,24 @@ class OwnerGuardTests(unittest.TestCase):
                  patch.object(control.subprocess, "Popen") as launch, self.assertRaisesRegex(RuntimeError, "exact holder lost"):
                 control.execute(args)
             launch.assert_not_called()
+
+    def test_signals_are_armed_before_popen_and_flag_instead_of_interrupting_handle_creation(self):
+        handlers = {}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(guard.signal, "signal", side_effect=lambda number, handler: handlers.update({number: handler})), \
+             patch.object(guard.signal, "getsignal", return_value="original"):
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40)
+            owner.arm()
+            handlers[guard.signal.SIGTERM](guard.signal.SIGTERM, None)
+            self.assertTrue(owner.failed.is_set())
+            child = Owned()
+            def kill(argv, **kwargs): child.code = -9; return Mock(returncode=0)
+            with patch.object(guard.subprocess, "run", side_effect=kill) as killer:
+                guard.wait(child, owner, 100)
+            self.assertEqual(killer.call_count, 1)
+            with self.assertRaises(RuntimeError): owner.finish()
+            self.assertEqual(owner.signals, {})
+            self.assertTrue(all(value == "original" for value in handlers.values()))
 
     def test_watchdog_network_fault_sets_failure_and_preserves_refusal(self):
         with tempfile.TemporaryDirectory() as directory:
