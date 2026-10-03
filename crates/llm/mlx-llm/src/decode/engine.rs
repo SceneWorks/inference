@@ -914,8 +914,10 @@ impl SpeculativeRun {
 /// [`SpeculativeRun::committed_cache_len`] is where the committed sequence ends. The draws, and so the
 /// output, are the same with or without pipelining ([`Pipelining::Off`]).
 ///
-/// The first token is handed to the device before step 1 is enqueued behind it, so its read-back
-/// waits for the prefill and its own draw only — never for step 1's forward (sc-24446).
+/// The run's first token is read back and emitted before step 1 is built or enqueued, so its
+/// delivery waits for the prefill and its own draw only — never for step 1's graph build and
+/// dispatch, nor its forward (sc-24446). Pipelining starts at step 2 (enqueued before step 1 is
+/// read back).
 ///
 /// A **speculative** step (any proposer) is not pipelined, even one whose proposer found nothing
 /// to draft: the proposer must read the committed token on the host — the n-gram context, the MTP
@@ -1514,9 +1516,11 @@ fn token_dispatches() -> u64 {
 ///
 /// Step `t + 1`'s forward and draw are enqueued on step `t`'s unread token and handed to the
 /// device before step `t`'s id is read back, so the device computes the next step while the host
-/// commits this one. `pending` itself is handed to the device first (sc-24446): otherwise its
-/// read-back, queued behind step `t + 1`, waits for that whole forward — the first token of every
-/// run would arrive one decode step late. The look-ahead is never enqueued past the budget, and a
+/// commits this one. `pending` itself — and every token drawn without a look-ahead — is handed to
+/// the device first (sc-24446): otherwise its read-back, queued behind step `t + 1`, waits for
+/// that whole forward. The run's first token (an empty `generated`) is read back before step 1 is
+/// built at all, so its delivery never waits for step 1's host-side graph build and dispatch. The
+/// look-ahead is never enqueued past the budget, and a
 /// look-ahead enqueued behind the token that ends the run is discarded unread and counted
 /// ([`SpeculativeStats::discarded`]). The caller has checked the draws are device-resident and
 /// independent of the host (no constraint, a sampler that does not read the history).
@@ -1543,10 +1547,19 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
     if let SampledToken::Device(id) = &pending {
         dispatch_token(id)?;
     }
+    // The run's first token is read back and emitted before anything is enqueued behind it: step
+    // 1's graph build and dispatch are host time spent ahead of the read, and a timed prefill is
+    // already synchronized, so there is no device work for them to overlap — they would only add
+    // to the time to first token (sc-24446). Step 1 is then enqueued and dispatched as soon as
+    // token 0 is out, and every later step overlaps the read of the one before it.
+    let mut first_read = generated.is_empty();
     loop {
         // Enqueue step t + 1 on step t's unread token, then read step t back while the device
         // runs it. Never past the budget; a host draw is already read back, so it waits.
-        let ahead = if pending.is_device() && generated.len() + 1 < config.max_new_tokens {
+        let ahead = if !std::mem::take(&mut first_read)
+            && pending.is_device()
+            && generated.len() + 1 < config.max_new_tokens
+        {
             let position = target.cache_len(cache) + position_delta;
             let out =
                 target.forward(cache, &pending.input()?, position, LogitsScope::Last, false)?;
@@ -1609,7 +1622,13 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
                     false,
                 )?;
                 stats.forwards += 1;
-                sampler.sample(&out.logits, history, None)?
+                let next = sampler.sample(&out.logits, history, None)?;
+                // Handed to the device now, so its read-back never waits for the step enqueued
+                // behind it on the next iteration.
+                if let SampledToken::Device(id) = &next {
+                    dispatch_token(id)?;
+                }
+                next
             }
         };
     }
@@ -2126,8 +2145,9 @@ pub(crate) mod tests {
             assert_eq!((report.proposed_tokens, report.accepted_tokens), (0, 0));
             assert_eq!(report.mean_accepted_length(), None, "{name}");
             assert_eq!(report.sampler, sampler, "{name}");
-            // Device draws pipeline every step after the first; host draws never do.
-            let pipelined = if sampler == "device" { 19 } else { 0 };
+            // Device draws pipeline every step after step 1 (token 0 is read back before step 1
+            // is enqueued, sc-24446); host draws never do.
+            let pipelined = if sampler == "device" { 18 } else { 0 };
             assert_eq!(run.stats.pipelined, pipelined, "{name}");
             assert_eq!(
                 run.stats.discarded, 0,
@@ -3779,7 +3799,7 @@ pub(crate) mod tests {
             let on = off_run(target, &config, Pipelining::Auto, None);
             assert_eq!(on.output.tokens, off.output.tokens, "{name}");
             assert_eq!(on.output.tokens.len(), 20, "{name}");
-            assert_eq!((on.stats.pipelined, off.stats.pipelined), (19, 0), "{name}");
+            assert_eq!((on.stats.pipelined, off.stats.pipelined), (18, 0), "{name}");
             assert_eq!(on.stats.discarded, 0, "{name}");
             assert_eq!(
                 on.report.target_forwards, off.report.target_forwards,
@@ -3861,7 +3881,7 @@ pub(crate) mod tests {
         fn check<T: SpeculativeTarget>(label: &str, model: &T) {
             let run = || off_run(model, &greedy(12), Pipelining::Auto, None);
             let on = run();
-            assert_eq!(on.stats.pipelined, 11, "{label}: pipelined when allowed");
+            assert_eq!(on.stats.pipelined, 10, "{label}: pipelined when allowed");
             assert_eq!(on.report.sampler, "device", "{label}");
             let unpipelined = PIPELINING.scoped(false, run);
             assert_eq!(unpipelined.stats.pipelined, 0, "{label}: the switch is off");
@@ -4011,13 +4031,14 @@ pub(crate) mod tests {
     }
 
     /// The pipelining is real: step `t + 1`'s forward is enqueued before token `t` is read back.
-    /// With the prefill first, the `k`-th forward (`k >= 1`) runs after `k - 1` token reads under
-    /// `Auto` — one behind the unpipelined loop, whose `k`-th forward follows `k` reads.
+    /// With the prefill first, the `k`-th forward (`k >= 2`) runs after `k - 1` token reads under
+    /// `Auto` — one behind the unpipelined loop, whose `k`-th forward follows `k` reads. Step 1 is
+    /// the exception (sc-24446): token 0 is read back before it is enqueued, as unpipelined.
     #[test]
     fn a_pipelined_step_is_enqueued_before_the_previous_token_is_read() {
         let model = causal();
         for (pipelining, expected) in [
-            (Pipelining::Auto, vec![0, 0, 1, 2, 3, 4, 5, 6]),
+            (Pipelining::Auto, vec![0, 1, 1, 2, 3, 4, 5, 6]),
             (Pipelining::Off, vec![0, 1, 2, 3, 4, 5, 6, 7]),
         ] {
             let target = ReadsAtForward {
@@ -4272,9 +4293,9 @@ pub(crate) mod tests {
     /// Token 0 is handed to the device before step 1 is enqueued behind it, so its read-back
     /// waits for the prefill and its draw only: at the `k`-th forward (`k >= 1`) `k` tokens have
     /// been dispatched — token 0 included — where the pre-fix loop had dispatched `k - 1` (token
-    /// 0 then waited for step 1's whole forward). Step 1 is still enqueued before token 0 is read
-    /// back ([`a_pipelined_step_is_enqueued_before_the_previous_token_is_read`]), so the overlap
-    /// is kept; the unpipelined loop dispatches nothing ahead of its reads.
+    /// 0 then waited for step 1's whole forward). Every later step is still enqueued before the
+    /// previous token is read back ([`a_pipelined_step_is_enqueued_before_the_previous_token_is_read`]),
+    /// so the overlap is kept; the unpipelined loop dispatches nothing ahead of its reads.
     #[test]
     fn the_first_token_is_dispatched_before_step_one_is_enqueued() {
         let model = causal();
@@ -4288,6 +4309,102 @@ pub(crate) mod tests {
             assert_eq!(target.dispatched.into_inner(), expected, "{pipelining:?}");
             let again = off_run(&model, &top_p(8), pipelining, None);
             assert_eq!(again.output.tokens, run.output.tokens, "{pipelining:?}");
+        }
+    }
+
+    /// A target that records, at each forward, how many tokens the run had delivered to its event
+    /// sink (`emitted`, which the sink advances) — when each step was enqueued relative to the
+    /// stream.
+    struct EmittedAtForward<'a, T> {
+        inner: &'a T,
+        emitted: &'a std::cell::Cell<usize>,
+        at: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl<T: SpeculativeTarget> SpeculativeTarget for EmittedAtForward<'_, T> {
+        type Cache = T::Cache;
+        type Rollback = T::Rollback;
+
+        fn new_cache(&self) -> T::Cache {
+            self.inner.new_cache()
+        }
+
+        fn cache_len(&self, cache: &T::Cache) -> i32 {
+            self.inner.cache_len(cache)
+        }
+
+        fn rollback(&self, width: usize) -> T::Rollback {
+            self.inner.rollback(width)
+        }
+
+        fn forward(
+            &self,
+            cache: &mut T::Cache,
+            ids: &Array,
+            rope_offset: i32,
+            scope: LogitsScope,
+            want_hidden: bool,
+        ) -> Result<TargetOutput> {
+            self.at.borrow_mut().push(self.emitted.get());
+            self.inner
+                .forward(cache, ids, rope_offset, scope, want_hidden)
+        }
+
+        fn attention_label(&self) -> &'static str {
+            self.inner.attention_label()
+        }
+    }
+
+    /// sc-24446 (pipelined TTFT): the first token reaches the stream before step 1 is built or
+    /// enqueued — its delivery never waits for step 1's host-side graph build and dispatch — and
+    /// from step 2 on every step is still enqueued before the previous token is delivered (the
+    /// overlap). Greedy and seeded output is the unpipelined run's.
+    #[test]
+    fn the_first_token_is_delivered_before_step_one_is_enqueued() {
+        for (name, config) in [("greedy", greedy(8)), ("top_p", top_p(8))] {
+            for (pipelining, expected) in [
+                (Pipelining::Auto, vec![0, 1, 1, 2, 3, 4, 5, 6]),
+                (Pipelining::Off, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            ] {
+                let model = causal();
+                let emitted = std::cell::Cell::new(0usize);
+                let target = EmittedAtForward {
+                    inner: &model,
+                    emitted: &emitted,
+                    at: Default::default(),
+                };
+                let mut tokens = Vec::new();
+                let run = generate_speculative(
+                    &target,
+                    &mut NoProposer,
+                    SpeculativePrompt::Tokens(&PROMPT),
+                    &config,
+                    0,
+                    &CancelFlag::new(),
+                    &mut |e| {
+                        if let StreamEvent::Token { id, .. } = e {
+                            emitted.set(emitted.get() + 1);
+                            tokens.push(id);
+                        }
+                    },
+                    EngineOptions {
+                        pipelining,
+                        ..EngineOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(tokens, run.output.tokens, "{name} {pipelining:?}");
+                assert_eq!(
+                    target.at.into_inner(),
+                    expected,
+                    "{name} {pipelining:?}: tokens delivered at each forward"
+                );
+                let off = off_run(&model, &config, Pipelining::Off, None);
+                assert_eq!(
+                    run.output.tokens, off.output.tokens,
+                    "{name} {pipelining:?}"
+                );
+            }
         }
     }
 
