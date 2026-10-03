@@ -525,7 +525,7 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertTrue((evidence / "external-samples.json").is_file())
             self.assertTrue((evidence / "census-after.txt").is_file())
 
-    def test_cuda_smokes_complete_in_order_before_real_weight_child(self):
+    def _simulate_cuda_smokes(self, zero_quant=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             evidence, reference, binary = root / "evidence", root / "reference", root / "binary"
@@ -540,10 +540,18 @@ class PrecisionControlTests(unittest.TestCase):
             baseline = {"completedUtc": "2026-10-03T00:00:00.0000000Z"}
             census = '{"diagnosticFiles":{},"diagnosticFileBytesB64":{}}'
             launched = []
-            def fake_child(path, name, label, backend, env, out, timeout, guard):
+            events = []
+            def identity(path, label, out):
+                events.append(f"identity-{label}")
+                return {"binary_sha256": "verified"}
+            def physical_census():
+                events.append("physical-census")
+                return census, []
+            def fake_child(path, name, label, backend, env, out, timeout, guard, identity):
+                events.append(f"launch-{label}")
                 launched.append((label, name, timeout))
                 (out / ("test.log" if label == "precision" else f"{label}-smoke.log")).write_text(
-                    f"test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n",
+                    f"running 1 test\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n",
                     encoding="utf-8")
                 if label == "precision":
                     (out / "precision-receipt.json").write_text("{}", encoding="utf-8")
@@ -552,9 +560,11 @@ class PrecisionControlTests(unittest.TestCase):
                 row = {"label": label, "name": name, "pid": 8000 + len(launched),
                        "exit_code": 0, "timed_out": False, "wait_error": None,
                        "released": True, "exact_one_test_passed": True,
-                       "sample_count": 1, "sampler_faults": [], "scheduling": {"mode": "shared-host"}}
+                       "binary_unchanged_after_child": True,
+                       "sample_count": 0 if zero_quant and label == "quant" else 1,
+                       "sampler_faults": [], "scheduling": {"mode": "shared-host"}}
                 sample = {"raw": "0,0,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}
-                return row, [sample], []
+                return row, ([] if zero_quant and label == "quant" else [sample]), []
             with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows-2", "CUDA_VISIBLE_DEVICES": "0",
                                         "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
                  patch.object(CONTROL, "sha256", return_value=CONTROL.REFERENCE_SHA256), \
@@ -562,20 +572,45 @@ class PrecisionControlTests(unittest.TestCase):
                  patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
                  patch.object(IDLE, "require_remaining_window", return_value=(baseline, root)), \
                  patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
-                 patch.object(CONTROL, "cuda_physical_census", return_value=(census, [])) as physical, \
+                 patch.object(CONTROL, "cuda_physical_census", side_effect=physical_census) as physical, \
                  patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
+                 patch.object(CONTROL, "verify_binary_identity", side_effect=identity), \
                  patch.object(CONTROL, "run_test_child", side_effect=fake_child), \
                  patch.object(CONTROL, "validate_receipt"), \
                  patch.object(CONTROL, "missing_stage_markers", return_value=[]), \
                  patch.object(CONTROL, "stage_markers", return_value=[{"stage": "test", "event": "start", "unixMs": 1}]), \
                  patch("builtins.print"):
-                CONTROL.execute(args)
-            self.assertEqual([row[0] for row in launched], ["quant", "vae", "precision"])
-            self.assertGreater(launched[0][2], launched[1][2])
-            self.assertGreater(launched[1][2], launched[2][2])
+                if zero_quant:
+                    with self.assertRaisesRegex(RuntimeError, "owned exact-test sequence failed"):
+                        CONTROL.execute(args)
+                else:
+                    CONTROL.execute(args)
+            self.assertEqual([row[0] for row in launched], ["quant"] if zero_quant else ["quant", "vae", "precision"])
+            if not zero_quant:
+                self.assertGreater(launched[0][2], launched[1][2])
+                self.assertGreater(launched[1][2], launched[2][2])
             report = json.loads((evidence / "control.json").read_text(encoding="utf-8"))
-            self.assertEqual([row["label"] for row in report["owned_children"]], ["quant", "vae", "precision"])
-            self.assertEqual(physical.call_count, 8)
+            self.assertEqual([row["label"] for row in report["owned_children"]],
+                             ["quant"] if zero_quant else ["quant", "vae", "precision"])
+            self.assertEqual(physical.call_count, 4 if zero_quant else 8)
+            for label in [row[0] for row in launched]:
+                start = events.index(f"identity-{label}")
+                launch = events.index(f"launch-{label}")
+                self.assertEqual(events[launch - 1], "physical-census")
+                self.assertLess(start, launch - 1)
+
+    def test_cuda_smokes_complete_in_order_before_real_weight_child(self):
+        self._simulate_cuda_smokes()
+
+    def test_zero_sample_smoke_refuses_before_next_child(self):
+        good = {"exit_code": 0, "timed_out": False, "wait_error": None,
+                "released": True, "exact_one_test_passed": True,
+                "binary_unchanged_after_child": True, "sample_count": 1,
+                "sampler_faults": [], "post_census_error": None, "post_census_busy": []}
+        self.assertTrue(CONTROL.child_stage_succeeded(good))
+        self.assertFalse(CONTROL.child_stage_succeeded(dict(good, sample_count=0)))
+        self.assertFalse(CONTROL.child_stage_succeeded(dict(good, binary_unchanged_after_child=False)))
+        self._simulate_cuda_smokes(zero_quant=True)
 
     def test_counter_status_and_missing_fields_refuse_instead_of_becoming_zero(self):
         luid = "luid_0x00000000_0x00020d46"
@@ -673,16 +708,24 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["/bin/ps", "-axo", "pid=,comm="])
 
     def test_one_exact_ignored_test_must_execute(self):
-        good = "test explicit_stage_precision_real_weights ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n"
+        good = "running 1 test\ntest explicit_stage_precision_real_weights ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n"
         self.assertTrue(CONTROL.one_test_executed(good))
         for bad in (good.replace("1 passed", "0 passed"), good.replace("explicit_stage_precision_real_weights", "wrong_test"), good.replace("0 ignored", "1 ignored")):
             self.assertFalse(CONTROL.one_test_executed(bad))
         for _, name in CONTROL.CUDA_SMOKES:
-            smoke = f"test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 9 filtered out\n"
+            smoke = f"running 1 test\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 9 filtered out\n"
             self.assertTrue(CONTROL.exact_one_test_executed(smoke, name))
             self.assertFalse(CONTROL.exact_one_test_executed(smoke.replace("1 passed", "0 passed"), name))
             self.assertFalse(CONTROL.exact_one_test_executed(smoke.replace(name, "wrong::test"), name))
             self.assertFalse(CONTROL.exact_one_test_executed(smoke + smoke, name))
+        captured_shape = ("running 1 test\n"
+                          f"test {CONTROL.TEST_NAME} ... YUE2_PRECISION_LISTENING_DIR E:\\audio\n"
+                          'YUE2_PRECISION_STAGE {"stage":"Bf16:registered_load","event":"start","unixMs":1}\n'
+                          "ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n")
+        self.assertTrue(CONTROL.one_test_executed(captured_shape))
+        self.assertFalse(CONTROL.one_test_executed(captured_shape.replace("\nok\n", "\nnot ok\n")))
+        self.assertFalse(CONTROL.one_test_executed(captured_shape.replace("running 1 test", "running 0 tests")))
+        self.assertFalse(CONTROL.one_test_executed(captured_shape.replace("\nok\n", "\ntest wrong::extra ... ok\n")))
 
     def test_exact_cargo_binary_identity_and_mutations(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -487,6 +487,7 @@ class OwnerGuardTests(unittest.TestCase):
             (reference / "vae_real_reference.safetensors").write_bytes(b"fixture")
             binary = root / "binary"; binary.write_bytes(b"binary")
             args = Mock(evidence=root / "evidence", reference=reference, binary=binary,
+                        quant_smoke_binary=binary, vae_smoke_binary=binary,
                         work_dir=root / "listening", engine_sha=guard.ENGINE, control_sha="a" * 40,
                         app_sha="", backend="cuda", cuda_scheduling_mode="owner-gpu0")
             with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0", "RUNNER_NAME": "cuda-windows",
@@ -496,6 +497,7 @@ class OwnerGuardTests(unittest.TestCase):
                  patch.object(existing.IDLE, "require_remaining_window", return_value=({}, root)), \
                  patch.object(control, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(control, "retain_cuda_physical_evidence", return_value=[]), \
+                 patch.object(control, "verify_binary_identity", return_value={}), \
                  patch.object(control, "cuda_physical_census", return_value=("raw", [])), \
                  patch.object(guard.OwnerGuard, "preflight", side_effect=RuntimeError("exact holder lost")), \
                  patch.object(control.subprocess, "Popen") as launch, self.assertRaisesRegex(RuntimeError, "exact holder lost"):

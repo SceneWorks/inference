@@ -401,9 +401,15 @@ def one_test_executed(output: str) -> bool:
 
 
 def exact_one_test_executed(output: str, name: str) -> bool:
-    passed = re.findall(r"^test (.+) \.\.\. ok\s*$", output, re.MULTILINE)
+    headers = list(re.finditer(r"^test (?!result:)(\S+) \.\.\.(.*)$", output, re.MULTILINE))
     verdicts = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", output, re.MULTILINE)
-    return passed == [name] and verdicts == [("1", "0", "0")]
+    if len(headers) != 1 or headers[0].group(1) != name or verdicts != [("1", "0", "0")]:
+        return False
+    if re.findall(r"^running (\d+) test(?:s)?\s*$", output, re.MULTILINE) != ["1"]:
+        return False
+    tail = headers[0].group(2).strip()
+    summary = output.find("test result:", headers[0].end())
+    return tail == "ok" or (summary >= 0 and re.search(r"(?m)^ok\s*$", output[headers[0].end():summary]) is not None)
 
 
 def remaining_cuda_budget(total_deadline: float, job_start_ns: int) -> float:
@@ -417,15 +423,24 @@ def remaining_cuda_budget(total_deadline: float, job_start_ns: int) -> float:
     return remaining
 
 
+def child_stage_succeeded(row: dict) -> bool:
+    return (row["exit_code"] == 0 and not row["timed_out"] and row["wait_error"] is None and
+            row["released"] and row["exact_one_test_passed"] and row["sample_count"] > 0 and
+            row["binary_unchanged_after_child"] and
+            not row["sampler_faults"] and not row.get("post_census_error") and
+            not row.get("post_census_busy"))
+
+
 def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
-                   evidence: Path, timeout: float | None, owner_guard) -> tuple[dict, list[dict], list[str]]:
+                   evidence: Path, timeout: float | None, owner_guard,
+                   identity: dict) -> tuple[dict, list[dict], list[str]]:
     """Run and reap one owned test before another child may enter the device."""
-    identity = verify_binary_identity(binary, label, evidence)
     command = [str(binary), "--ignored", "--exact", name, "--nocapture", "--test-threads", "1"]
     samples: list[dict] = []
     faults: list[str] = []
     stop = threading.Event()
     started = time.time_ns()
+    launched = time.monotonic()
     log_path = evidence / ("test.log" if label == "precision" else f"{label}-smoke.log")
     with log_path.open("w", encoding="utf-8") as log:
         if owner_guard is not None:
@@ -449,13 +464,25 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
                 stop.wait(0.25 if backend == "cuda" else 1.0)
         thread = threading.Thread(target=loop, daemon=True)
         try:
+            if owner_guard is not None:
+                owner_guard.start(child)
+            # Sample synchronously while the owned PID still exists. A fast
+            # smoke that exits before a valid sample is a refusal, not a zero.
+            if child.poll() is None:
+                try:
+                    first = sample_cuda() if backend == "cuda" else sample_metal(child.pid)
+                    if child.poll() is None:
+                        samples.append(first)
+                except Exception as error:
+                    if child.poll() is None:
+                        faults.append(f"{time.time_ns()}: {error}")
             thread.start()
+            wait_budget = max(0.0, timeout - (time.monotonic() - launched)) if timeout is not None else None
             if owner_guard is not None:
                 from yue2_gpu0_owner_guard import wait
-                owner_guard.start(child)
-                code, timed_out, wait_error = wait(child, owner_guard, timeout or 0)
+                code, timed_out, wait_error = wait(child, owner_guard, wait_budget or 0)
             else:
-                code, timed_out, wait_error = wait_owned_child(child, backend, timeout)
+                code, timed_out, wait_error = wait_owned_child(child, backend, wait_budget)
         except BaseException as error:
             if owner_guard is None and not isinstance(error, Exception):
                 raise
@@ -479,7 +506,9 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
             wait_error = f"{wait_error}; final holder: {error}"
     ended = time.time_ns()
     output = log_path.read_text(encoding="utf-8", errors="replace")
-    result = {"label": label, "name": name, "binary_sha256": sha256(binary), "build_identity": identity,
+    binary_digest = sha256(binary)
+    result = {"label": label, "name": name, "binary_sha256": binary_digest, "build_identity": identity,
+              "binary_unchanged_after_child": binary_digest == identity.get("binary_sha256"),
               "command": command, "log": log_path.name, "pid": child.pid,
               "started_utc_ns": started, "ended_utc_ns": ended, "exit_code": code,
               "timed_out": timed_out, "wait_error": wait_error,
@@ -643,6 +672,7 @@ def execute(args: argparse.Namespace) -> None:
     for label, name, binary in stages:
         try:
             remaining = remaining_cuda_budget(total_deadline, int(job_start)) if total_deadline is not None else None
+            identity = verify_binary_identity(binary, label, evidence)
             if scheduling == "owner-gpu0":
                 from yue2_gpu0_owner_guard import OwnerGuard
                 owner_guard = OwnerGuard(evidence, args.engine_sha, args.control_sha)
@@ -656,7 +686,7 @@ def execute(args: argparse.Namespace) -> None:
                     handoff_raw, handoff_busy, f"foreign process at {label} handoff"))
                 handoff_files.append(retain_cuda_physical_evidence(evidence, f"pre-{label}", handoff_raw))
             result, stage_samples, stage_faults = run_test_child(
-                binary, name, label, args.backend, env, evidence, remaining, owner_guard)
+                binary, name, label, args.backend, env, evidence, remaining, owner_guard, identity)
         except Exception as error:
             stage_refusals.append({"label": label, "name": name, "error": str(error),
                                    "observed_utc_ns": time.time_ns()})
@@ -676,9 +706,7 @@ def execute(args: argparse.Namespace) -> None:
                 result["post_census_error"] = str(error)
                 result["post_census_busy"] = []
         # A failed or ambiguous smoke never advances to the next child.
-        if (result["exit_code"] != 0 or result["timed_out"] or result["wait_error"] or
-                not result["released"] or not result["exact_one_test_passed"] or stage_faults or
-                result.get("post_census_error") or result.get("post_census_busy")):
+        if not child_stage_succeeded(result):
             break
     ended = time.time_ns()
     last_child = child_results[-1] if child_results else None
@@ -752,10 +780,7 @@ def execute(args: argparse.Namespace) -> None:
               "scheduling": owner_guard.summary() if owner_guard is not None else {"mode": "shared-host"}}
     write_json(evidence / "control.json", report)
     print(json.dumps(report, indent=2), flush=True)
-    require(len(child_results) == len(stages) and all(
-        row["exit_code"] == 0 and not row["timed_out"] and row["wait_error"] is None and
-        row["released"] and row["exact_one_test_passed"] and not row["sampler_faults"] and
-        not row.get("post_census_error") and not row.get("post_census_busy") for row in child_results),
+    require(len(child_results) == len(stages) and all(child_stage_succeeded(row) for row in child_results),
             f"owned exact-test sequence failed, timed out, or incomplete: {child_results}; "
             f"stage refusals: {stage_refusals}; see per-child logs")
     require(not timed_out and wait_error is None and code == 0,
