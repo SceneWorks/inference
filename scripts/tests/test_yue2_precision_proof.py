@@ -1,6 +1,7 @@
 """CPU-only controls for the dispatch-only precision proof."""
 import importlib.util
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -145,6 +146,35 @@ class PrecisionControlTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     check(changed)
 
+    def test_only_exact_read_only_owner_census_uses_gpu0_lane(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        block = re.search(r"(?m)^concurrency:\n((?: +[^\n]*\n)+)", source)
+        self.assertIsNotNone(block)
+        settings = dict(line.strip().split(": ", 1) for line in block[1].splitlines())
+        expression = settings["group"]
+        self.assertEqual(settings["queue"], "max")
+        self.assertEqual(settings["cancel-in-progress"], "false")
+        conditions, lanes = expression[4:-3].split(" && 'inference-yue2-owner-gpu0' || ")
+        self.assertEqual(lanes, "'inference-real-weights-physical-host'")
+        selectors = []
+        for clause in conditions.split(" && "):
+            match = re.fullmatch(r"inputs\.([a-z_]+) == '([^']*)'", clause)
+            self.assertIsNotNone(match)
+            selectors.append((match[1], match[2]))
+        self.assertEqual(dict(selectors), {"stage": "cuda-diagnostic",
+                         "expected_engine_sha": "4127a675fc8575555e029e01b7f6867488880a8f",
+                         "diagnostic_pid": "38212"})
+        def selected(values):
+            return all(values.get(key) == value for key, value in selectors)
+        exact = dict(selectors)
+        self.assertTrue(selected(exact))
+        for key, mutations in {"stage": ("fixture", "cuda", "metal", "unknown", ""),
+                               "expected_engine_sha": ("825341ff8d0110ea448213485891b39d57806fa4", "", "4" * 40),
+                               "diagnostic_pid": ("38213", "", "038212")}.items():
+            for mutation in mutations:
+                with self.subTest(key=key, mutation=mutation):
+                    self.assertFalse(selected({**exact, key: mutation}))
+
     def test_workflow_is_dispatch_only_and_selects_one_new_test(self):
         source = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", source)
@@ -153,7 +183,7 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("if: inputs.stage == 'fixture'", source)
         self.assertIn("if: inputs.stage == 'cuda'", source)
         self.assertIn("if: inputs.stage == 'metal'", source)
-        self.assertIn("group: inference-real-weights-physical-host", source)
+        self.assertIn("|| 'inference-real-weights-physical-host'", source)
         self.assertIn('CUDA_VISIBLE_DEVICES: "0"', source)
         self.assertEqual(source.count("path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav"), 2)
         self.assertEqual(source.count("if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}"), 2)
@@ -177,7 +207,7 @@ class PrecisionControlTests(unittest.TestCase):
         job = workflow.split("  cuda_diagnostic:\n", 1)[1].split("  reference:\n", 1)[0]
         probe = (ROOT / "scripts/ci/yue2_cuda_context_diagnostic.ps1").read_text(encoding="utf-8")
         self.assertIn("if: inputs.stage == 'cuda-diagnostic'", job)
-        self.assertIn("group: inference-real-weights-physical-host", workflow)
+        self.assertIn("|| 'inference-real-weights-physical-host'", workflow)
         self.assertIn("$env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA", job)
         self.assertIn("(git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA", job)
         self.assertIn("diagnostic_pid must be a positive decimal PID", job)

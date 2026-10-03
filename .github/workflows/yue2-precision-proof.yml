@@ -39,10 +39,11 @@ permissions:
   contents: read
   actions: read
 
-# Same physical lock as real-weights-yue.yml and real-weights.yml; all four Windows
-# CUDA listeners are one physical host. Metal uses a separate strict named runner.
+# Only the owner-bound read-only GPU0 census has a separate physical lane.
+# Every model/other diagnostic request retains the established shared-host lock.
 concurrency:
-  group: inference-real-weights-physical-host
+  group: ${{ inputs.stage == 'cuda-diagnostic' && inputs.expected_engine_sha == '4127a675fc8575555e029e01b7f6867488880a8f' && inputs.diagnostic_pid == '38212' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
+  queue: max
   cancel-in-progress: false
 
 env:
