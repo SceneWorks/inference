@@ -422,15 +422,48 @@ pub(crate) fn generate_with_timings(
         return Err(Error::Msg("generate_with_timings: empty prompt".into()));
     }
 
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let mut cache = decoder.make_cache();
+    generate_with_timings_on(
+        decoder,
+        cache.as_mut(),
+        prompt_ids,
+        config,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+    )
+}
+
+/// [`generate_with_timings`] on a caller-selected, empty `cache` — the production compressed-KV
+/// path picks its cache before any K/V mutation and reads the cache's evidence after the decode.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_with_timings_on(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> Result<TimedGenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    if prompt_ids.is_empty() || cache.offset() != 0 {
+        return Err(Error::Msg(
+            "generate_with_timings_on requires a prompt and an empty cache".into(),
+        ));
+    }
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let prompt = input_ids(prompt_ids);
     let mut timer = GenerationTimer::start();
-    let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
+    let logits = decoder.step(&prompt, cache, 0)?;
     timer.finish_prefill([&logits])?;
     let output = decode_loop(
         decoder,
-        cache.as_mut(),
+        cache,
         logits,
         rng,
         prompt_ids.to_vec(),

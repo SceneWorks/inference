@@ -408,6 +408,7 @@ impl TextLlm for CandleStarVector8bProvider {
             // `None` only when the bounded stream stopped on the static prefix, before a decode.
             decode: record.map(|record| record.report(false)),
             finish_reason: Some(map_finish(output.finish_reason)),
+            kv_cache: None,
         })
     }
 }

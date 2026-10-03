@@ -1581,19 +1581,12 @@ impl CompressedKvMethod {
 
     /// Build this method's retained fused reader once per campaign session.
     pub fn arm(self) -> Result<CompressedKvArm, String> {
+        // The same retained reader production generation builds (`kv_policy`), at this arm's
+        // code width: its identity and GPU-family profile are `representation_identity` and
+        // `kernel_gpu_family`.
         let reader = match self {
             Self::GroupAffine | Self::GroupAffine4 | Self::GroupAffine8 => {
-                let kernel = crate::primitives::PackedMetalKernel::for_identity_family_and_bits(
-                    self.representation_identity(),
-                    self.kernel_gpu_family(),
-                    self.code_bits(),
-                )
-                .map_err(|e| e.to_string())?;
-                // The single-threaded campaign worker owns this non-Send Metal object through the
-                // cache handle's `Arc`, exactly as the SC-20676 evidence worker does.
-                #[allow(clippy::arc_with_non_send_sync)]
-                let kernel = std::sync::Arc::new(kernel);
-                crate::primitives::CompiledKernelHandle::new(kernel)
+                crate::kv_policy::group_affine_reader(self.code_bits())?
             }
         };
         Ok(CompressedKvArm {
@@ -10303,6 +10296,18 @@ fn measure_product_dispatch<T>(
     let value = dispatch(observer)?;
     let wall_ms = dispatch_started.elapsed().as_secs_f64() * 1_000.0;
     let sampling_after_ms = observer.sampling_elapsed_ms();
+    let product_ms = sampling_adjusted_product(wall_ms, sampling_before_ms, sampling_after_ms)?;
+    Ok((value, product_ms))
+}
+
+/// The clock-free arithmetic of [`measure_product_dispatch`]: the dispatch's wall time less the
+/// observer sampling recorded across it, refused when any input or the result is not a positive,
+/// finite duration.
+fn sampling_adjusted_product(
+    wall_ms: f64,
+    sampling_before_ms: f64,
+    sampling_after_ms: f64,
+) -> core_llm::Result<f64> {
     let sampled_ms = sampling_after_ms - sampling_before_ms;
     let product_ms = wall_ms - sampled_ms;
     if !wall_ms.is_finite()
@@ -10316,7 +10321,7 @@ fn measure_product_dispatch<T>(
             "invalid sampling-adjusted product duration: wall={wall_ms:.6}ms sampled={sampled_ms:.6}ms product={product_ms:.6}ms"
         )));
     }
-    Ok((value, product_ms))
+    Ok(product_ms)
 }
 
 /// Execute the exact requested coordinate while a product observer is attached.  Quality fixtures
@@ -14295,22 +14300,32 @@ pub(crate) mod tests {
 
     #[test]
     fn compile_dispatch_excludes_slow_observer_sampling_callbacks() {
+        // Clock-free: the arithmetic is exact on injected durations, so a loaded runner's sleep
+        // overshoot cannot move it.
+        assert_eq!(sampling_adjusted_product(100.0, 5.0, 35.0).unwrap(), 70.0);
+        assert_eq!(sampling_adjusted_product(4.0, 7.0, 7.0).unwrap(), 4.0);
+        // Sampling that consumed the whole dispatch leaves no product time to report.
+        assert!(sampling_adjusted_product(30.0, 0.0, 30.0).is_err());
+        assert!(sampling_adjusted_product(30.0, 10.0, 5.0).is_err());
+        assert!(sampling_adjusted_product(f64::NAN, 0.0, 1.0).is_err());
+
+        // The wrapper charges the observer's in-dispatch sampling against the dispatch: an
+        // injected interval no test run can reach makes the product duration non-positive, so
+        // only a wrapper that failed to subtract it could return a duration.
         let mut observer = ProductObserver::new();
-        let wall_started = std::time::Instant::now();
-        let (_, product_ms) = measure_product_dispatch(&mut observer, |observer| {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            let sampling_started = std::time::Instant::now();
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            observer.sampling_elapsed_ms += sampling_started.elapsed().as_secs_f64() * 1_000.0;
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        let excluded = measure_product_dispatch(&mut observer, |observer| {
+            observer.sampling_elapsed_ms += 1.0e12;
+            Ok(())
+        });
+        assert!(excluded.is_err(), "{excluded:?}");
+        // Sampling recorded before the dispatch is not charged to it: the 1e12 ms already on the
+        // observer would leave no product time, so a wrapper that charged it would refuse here.
+        // (The sleep only guarantees a non-zero wall reading; nothing races it.)
+        measure_product_dispatch(&mut observer, |_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
             Ok(())
         })
-        .unwrap();
-        let wall_ms = wall_started.elapsed().as_secs_f64() * 1_000.0;
-        assert!(observer.sampling_elapsed_ms >= 25.0);
-        assert!(product_ms > 0.0);
-        assert!(product_ms < observer.sampling_elapsed_ms);
-        assert!((product_ms + observer.sampling_elapsed_ms - wall_ms).abs() < 10.0);
+        .expect("prior sampling must not be charged to this dispatch");
     }
 
     #[test]

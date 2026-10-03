@@ -39,7 +39,7 @@ pub(crate) use stream::generate_with_observer;
 pub(crate) use stream::{forced_greedy_decode, forced_greedy_decode_from, ForcedDecode};
 pub(crate) use stream::{
     generate_from_prefill_observed, generate_from_prefill_with_timings,
-    generate_with_cache_observed, generate_with_timings,
+    generate_with_cache_observed, generate_with_timings, generate_with_timings_on,
 };
 
 /// Generated tokens between releases of MLX's freed-buffer cache during decode. The KV block size

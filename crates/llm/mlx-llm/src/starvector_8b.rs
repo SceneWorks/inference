@@ -422,6 +422,7 @@ impl TextLlm for StarVector8bProvider {
             mtp: None,
             decode: None,
             finish_reason: Some(map_finish(output.finish_reason)),
+            kv_cache: None,
         })
     }
 }

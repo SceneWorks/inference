@@ -385,6 +385,7 @@ mod tests {
                 timings: None,
                 decode: None,
                 finish_reason: Some(core_llm::FinishReason::Stop),
+                kv_cache: None,
             })
         }
     }

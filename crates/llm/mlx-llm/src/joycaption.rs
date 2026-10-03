@@ -515,6 +515,7 @@ impl TextLlm for JoyCaptionProvider {
             mtp: None,
             decode: None,
             finish_reason: Some(finish),
+            kv_cache: None,
         })
     }
 }

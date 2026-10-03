@@ -171,6 +171,8 @@ impl ChatRequest {
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
+            // The shim exposes no compressed-KV opt-in: every request stays on the dense default.
+            kv_compression: Default::default(),
         })
     }
 }
