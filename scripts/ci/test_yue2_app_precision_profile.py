@@ -5,11 +5,12 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 MODULE_PATH = Path(__file__).with_name("yue2_app_precision_profile.py")
 spec = importlib.util.spec_from_file_location("yue2_app_precision_profile", MODULE_PATH)
@@ -54,7 +55,8 @@ class PrecisionControlTests(unittest.TestCase):
                 "request": {"name": "strict-bf16-legacy", "computePolicy": "bf16"},
                 "admission": {"outcome": "admitted"},
                 "outcome": {"status": "completed", "engineComputePolicy": "bf16",
-                            "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16"},
+                            "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16",
+                            "engineVaeCudaBf16MathPolicy": "disallow_reduced_precision_reduction_v1"},
                 "measured": {"peakBytes": 1024, "stages": stages},
             }
             record.write_text(json.dumps(body), encoding="utf-8")
@@ -69,29 +71,93 @@ class PrecisionControlTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "decoder identity"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy")
 
+    def test_effective_cuda_bf16_vae_math_policy_is_required_only_for_cuda_bf16(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            for backend, name in (("cuda", "strict-bf16-standard"),
+                                  ("cuda", "strict-fp32-standard"),
+                                  ("metal", "strict-bf16-standard")):
+                _, case_name, decoder, policy, model_dtype, vae_dtype = control.CASES[name]
+                body = {
+                    "caseId": control.case_id(backend, name), "backend": backend,
+                    "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
+                    "request": {"name": case_name, "computePolicy": policy},
+                    "admission": {"outcome": "admitted"},
+                    "outcome": {"status": "completed", "engineComputePolicy": policy,
+                                "engineModelDtype": model_dtype, "engineVaeDtype": vae_dtype},
+                    "measured": {"peakBytes": 1024, "stages": {
+                        stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
+                }
+                wanted = "disallow_reduced_precision_reduction_v1"
+                if backend == "cuda" and policy == "bf16":
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                        control.verify_record(record, backend, name)
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = "stale"
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
+                        control.verify_record(record, backend, name)
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = wanted
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    self.assertEqual(
+                        control.verify_record(record, backend, name)["effective_vae_cuda_bf16_math_policy"],
+                        wanted,
+                    )
+                else:
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    self.assertIsNone(
+                        control.verify_record(record, backend, name)["effective_vae_cuda_bf16_math_policy"]
+                    )
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = wanted
+                    record.write_text(json.dumps(body), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "present on another backend"):
+                        control.verify_record(record, backend, name)
+
     def test_exact_app_pin_and_clean_sources_required(self):
         with tempfile.TemporaryDirectory() as directory:
             app = Path(directory) / "app"
             engine = Path(directory) / "engine"
+            source_control = Path(directory) / "control"
             app.mkdir()
             engine.mkdir()
-            app_sha, engine_sha = "a" * 40, "b" * 40
+            source_control.mkdir()
+            app_sha, engine_sha, control_sha = "a" * 40, "b" * 40, "c" * 40
             (app / "Cargo.toml").write_text(
                 f'candle-kernels = {{ git = "https://github.com/SceneWorks/inference", rev = "{engine_sha}" }}\n',
                 encoding="utf-8",
             )
-            with patch.object(control, "git", side_effect=lambda root, *args:
-                              (app_sha if root == app else engine_sha) if args[0] == "rev-parse" else ""):
-                self.assertEqual(control.verify_sources(app, engine, app_sha, engine_sha)["app_pins"], [engine_sha])
+            with patch.dict("os.environ", {"GITHUB_SHA": control_sha}), \
+                 patch.object(control, "git", side_effect=lambda root, *args:
+                              {app: app_sha, engine: engine_sha, source_control: control_sha}[root]
+                              if args[0] == "rev-parse" else "") as git_mock:
+                self.assertEqual(control.verify_sources(app, engine, source_control, app_sha, engine_sha,
+                                                       control_sha)["control_sha"], control_sha)
+                with self.assertRaisesRegex(ValueError, "workflow control SHA"):
+                    control.verify_sources(app, engine, source_control, app_sha, engine_sha, "d" * 40)
+                git_mock.side_effect = lambda root, *args: (
+                    {app: app_sha, engine: "d" * 40, source_control: control_sha}[root]
+                    if args[0] == "rev-parse" else "")
+                with self.assertRaisesRegex(ValueError, "engine checkout SHA"):
+                    control.verify_sources(app, engine, source_control, app_sha, engine_sha, control_sha)
+                git_mock.side_effect = lambda root, *args: (
+                    {app: app_sha, engine: engine_sha, source_control: "d" * 40}[root]
+                    if args[0] == "rev-parse" else "")
+                with self.assertRaisesRegex(ValueError, "control checkout SHA"):
+                    control.verify_sources(app, engine, source_control, app_sha, engine_sha, control_sha)
+                git_mock.side_effect = lambda root, *args: (
+                    {app: app_sha, engine: engine_sha, source_control: control_sha}[root]
+                    if args[0] == "rev-parse" else "")
                 (app / "Cargo.toml").write_text((app / "Cargo.toml").read_text(encoding="utf-8").replace(engine_sha, "c" * 40), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "pin"):
-                    control.verify_sources(app, engine, app_sha, engine_sha)
+                    control.verify_sources(app, engine, source_control, app_sha, engine_sha, control_sha)
 
     def test_busy_cuda_preflight_refuses_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence"
-            census = types.SimpleNamespace(cuda_census=lambda: ("typed pmon rows", ["123 C worker"]),
-                                           metal_census=lambda: ("", []))
+            census = types.SimpleNamespace(cuda_physical_census=lambda: ("typed pmon rows", ["123 C worker"]),
+                                           metal_census=lambda: ("", []),
+                                           retain_cuda_physical_evidence=lambda *_: [],
+                                           retain_reviewed_baseline=lambda *_: [])
             with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
                  patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)):
                 with self.assertRaisesRegex(ValueError, "competing physical-device"):
@@ -99,6 +165,43 @@ class PrecisionControlTests(unittest.TestCase):
             record = json.loads((evidence / "preflight-before-test.json").read_text(encoding="utf-8"))
             self.assertFalse(record["admitted"])
             self.assertEqual(record["competing_processes"], ["123 C worker"])
+
+    def test_cuda_initial_preflight_refuses_short_owner_window_before_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            census = types.SimpleNamespace(cuda_physical_census=Mock(), metal_census=Mock(),
+                                           retain_cuda_physical_evidence=Mock(),
+                                           retain_reviewed_baseline=Mock())
+            guard = types.SimpleNamespace(require_remaining_window=Mock(
+                side_effect=RuntimeError("reviewed owner window cannot cover bounded run and postflight")))
+            with patch.dict("sys.modules", {"yue2_precision_proof": census,
+                                            "yue2_cuda_idle_context": guard}):
+                with self.assertRaisesRegex(RuntimeError, "cannot cover"):
+                    control.preflight("cuda", Path(directory) / "evidence", "initial")
+            guard.require_remaining_window.assert_called_once_with(480 * 60 + 600)
+            census.cuda_physical_census.assert_not_called()
+
+    def test_seven_case_verdict_requires_final_physical_release_census(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = root / "cases"
+            control.prepare_cases(MODULE_PATH.parent / "yue2-app-precision-cases", cases, "cuda")
+            labels = []
+            def preflight(_backend, _evidence, label):
+                labels.append(label)
+                if label == "after-cases":
+                    raise ValueError("post-case physical owner changed")
+            with patch.object(control, "preflight", side_effect=preflight), \
+                 patch.object(control.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)), \
+                 patch.object(control, "verify_record"), \
+                 patch.object(control, "verify_audio", return_value={"sha256": "a" * 64}), \
+                 patch.object(control, "collect") as collect:
+                with self.assertRaisesRegex(ValueError, "post-case physical owner changed"):
+                    control.run_captures(root, root, root / "data", root / "profile",
+                                         root / "evidence", cases, "cuda")
+                collect.assert_not_called()
+            self.assertEqual(len([label for label in labels if label.startswith("before-")]), 7)
+            self.assertEqual(labels[-1], "after-cases")
+            self.assertTrue((root / "evidence" / "cases-manifest.json").is_file())
 
     def test_listening_wav_inventory_is_run_owned_and_stream_hashed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -144,6 +247,8 @@ class PrecisionControlTests(unittest.TestCase):
                     "measured": {"peakBytes": 1024, "stages": {
                         stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
                 }
+                if policy == "bf16":
+                    body["outcome"]["engineVaeCudaBf16MathPolicy"] = "disallow_reduced_precision_reduction_v1"
                 (run.parent / "record.json").write_text(json.dumps(body), encoding="utf-8")
             verdict = control.collect(profile, evidence, "cuda")
             self.assertEqual(len(verdict["listening_audio"]), 7)
@@ -156,6 +261,12 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertEqual(workflow.count("if: always() && steps.run-root.outcome == 'success'"), 4)
         self.assertEqual(workflow.count("id: run-root"), 2)
         self.assertNotIn("${{ env.APP_EVIDENCE }}/**/audio.wav", workflow)
+        self.assertIn("expected_control_sha:", workflow)
+        self.assertIn("--control control --app-sha", workflow)
+        self.assertLess(workflow.index("Select the app checkout's pinned Rust channel"),
+                        workflow.index("uses: ./app/.github/actions/prepare-rust-runner"))
+        self.assertIn("RUSTUP_TOOLCHAIN=", workflow)
+        self.assertIn("Verify selected app Rust channel", workflow)
 
 
 if __name__ == "__main__":

@@ -7,12 +7,14 @@ process release, and raw external device/footprint observations for later audit.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,9 @@ import threading
 import time
 
 REFERENCE_SHA256 = "c4073edb3c7abfbf5d50a9c5bfa67c73b9b9a8ba20115570ddb616d00d5b72d4"
+CUDA_CHILD_TIMEOUT_SECONDS = 180 * 60  # Operational cap, not a measured runtime.
+CUDA_POSTFLIGHT_SECONDS = 600
+CUDA_JOB_TIMEOUT_SECONDS = 240 * 60
 TEST_NAME = "explicit_stage_precision_real_weights"
 DECODER_SHA256 = {
     "standard": "807ce9d5149fa27c5ad3e6582058469852e908f6c5acc8c8aa338e7ab7751346",
@@ -44,6 +49,14 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def verify_revisions(engine_sha: str, control_sha: str) -> None:
+    require(re.fullmatch(r"[0-9a-f]{40}", engine_sha) is not None, "engine SHA must be full lowercase hex")
+    require(re.fullmatch(r"[0-9a-f]{40}", control_sha) is not None, "control SHA must be full lowercase hex")
+    require(os.environ.get("GITHUB_SHA") == control_sha, "workflow control SHA differs from dispatch input")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, encoding="utf-8").stdout.strip()
+    require(head == engine_sha, "engine checkout differs from dispatch input")
+
+
 def resolve_binary(args: argparse.Namespace) -> None:
     candidates = []
     for line in args.build_json.read_text(encoding="utf-8").splitlines():
@@ -62,17 +75,35 @@ def resolve_binary(args: argparse.Namespace) -> None:
 
 
 def verify_reference(args: argparse.Namespace) -> None:
+    from yue2_precision_reference_transfer import (  # type: ignore[import-not-found]
+        LICENSE_SHA256, SOURCE_ARTIFACT_ID, SOURCE_ENGINE_SHA, SOURCE_METADATA_SHA256,
+        SOURCE_RUN_ID, SOURCE_ZIP_SHA256,
+    )
     metadata = json.loads((args.directory / "reference-provenance.json").read_text(encoding="utf-8"))
     source = args.directory / "vae_real_reference.safetensors"
     require(metadata.get("engine_sha") == args.engine_sha, "reference-stage engine SHA differs from this checkout")
+    require(metadata.get("control_sha") == args.control_sha and
+            metadata.get("transfer_run_id") == args.run_id and
+            metadata.get("transfer_run_attempt") == "1" and
+            metadata.get("runner") == "hosted-cpu-transfer" and
+            metadata.get("source_run_id") == SOURCE_RUN_ID and
+            metadata.get("source_run_attempt") == 1 and
+            metadata.get("source_engine_sha") == SOURCE_ENGINE_SHA and
+            metadata.get("source_artifact_id") == SOURCE_ARTIFACT_ID and
+            metadata.get("source_artifact_zip_sha256") == SOURCE_ZIP_SHA256 and
+            metadata.get("source_provenance_sha256") == SOURCE_METADATA_SHA256 and
+            metadata.get("noncommercial_sha256") == LICENSE_SHA256,
+            "reference transfer provenance differs from reviewed source/run")
     require(source.is_file(), "reference artifact is absent")
+    require(sha256(args.directory / "NONCOMMERCIAL.txt") == LICENSE_SHA256,
+            "reference noncommercial notice differs from reviewed source")
     digest = sha256(source)
     require(digest == REFERENCE_SHA256 == metadata.get("sha256"), "reference digest differs from committed fixture")
     print(f"pinned external reference verified: {digest}, {source.stat().st_size} bytes")
 
 
-def compute_capable_rows(output: str) -> list[str]:
-    rows = []
+def typed_compute_rows(output: str) -> list[tuple[str, int, str]]:
+    rows: list[tuple[str, int, str]] = []
     columns: dict[str, int] = {}
     for line in output.splitlines():
         if not line.strip():
@@ -97,9 +128,13 @@ def compute_capable_rows(output: str) -> list[str]:
         kind = fields[type_index]
         require(kind in {"C", "C+G", "G"}, f"unrecognized nvidia-smi pmon process type: {line}")
         if kind in {"C", "C+G"}:
-            rows.append(line)
+            rows.append((line, int(fields[pid_index]), kind))
     require(columns, "nvidia-smi pmon output lacks typed process columns")
     return rows
+
+
+def compute_capable_rows(output: str) -> list[str]:
+    return [line for line, _, _ in typed_compute_rows(output)]
 
 
 def query_compute_apps_rows(output: str) -> list[str]:
@@ -119,7 +154,21 @@ def cuda_census() -> tuple[str, list[str]]:
     command = ["nvidia-smi", "pmon", "-i", "0", "-c", "1", "-s", "um"]
     result = subprocess.run(command, capture_output=True, text=True, timeout=20, encoding="utf-8")
     if result.returncode == 0:
-        return result.stdout, compute_capable_rows(result.stdout)
+        typed = typed_compute_rows(result.stdout)
+        busy = [line for line, _, _ in typed]
+        # The normal typed guard still refuses every compute context. The only
+        # exception is a currently reverified, receipt-bound WDDM C+G context;
+        # pure C, multiple mixed rows, missing evidence, and faults stay busy.
+        if len(typed) == 1 and typed[0][2] == "C+G" and os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID"):
+            try:
+                from yue2_cuda_idle_context import census_mixed_context  # type: ignore[import-not-found]
+                raw, verified = census_mixed_context(typed[0][1], result.stdout)
+                if verified:
+                    return raw, []
+                return raw, busy
+            except Exception as error:
+                return f"{result.stdout}\nreviewed C+G guard refused: {error}", busy
+        return result.stdout, busy
     # Some Windows drivers do not expose pmon. The supported apps query has no
     # C/G type, so conservatively refuse every process it reports.
     fallback = subprocess.run(
@@ -130,6 +179,71 @@ def cuda_census() -> tuple[str, list[str]]:
             f"CUDA census unavailable: pmon: {result.stderr.strip()}; query-compute-apps: {fallback.stderr.strip()}")
     return (f"pmon unavailable: {result.stderr.strip()}\nquery-compute-apps:\n{fallback.stdout}",
             query_compute_apps_rows(fallback.stdout))
+
+
+def cuda_physical_census() -> tuple[str, list[str]]:
+    """Require the complete reviewed-owner fresh probe for production acceptance.
+
+    The current collector's seven families include one target process. An empty
+    or graphics-only GPU has no process to sample, so this route refuses it
+    rather than interpreting unsupported process telemetry as zero.
+    """
+    raw, busy = cuda_census()
+    if busy:
+        return raw, busy
+    try:
+        probe = json.loads(raw)
+        require(isinstance(probe, dict) and isinstance(probe.get("diagnosticFiles"), dict) and
+                isinstance(probe.get("diagnosticFileBytesB64"), dict) and
+                len(probe["diagnosticFiles"]) == len(probe["diagnosticFileBytesB64"]) == 29 and
+                set(probe["diagnosticFiles"]) == set(probe["diagnosticFileBytesB64"]) and
+                probe.get("commandExit") == 0 and
+                "refusal" not in probe, "complete selected-device physical probe absent")
+    except (ValueError, TypeError, RuntimeError):
+        return raw, ["complete selected-device seven-family physical proof absent"]
+    return raw, []
+
+
+def retain_cuda_physical_evidence(evidence: Path, label: str, raw: str) -> list[dict]:
+    probe = json.loads(raw)
+    files = probe["diagnosticFiles"]
+    raw_files = probe["diagnosticFileBytesB64"]
+    require(isinstance(files, dict) and isinstance(raw_files, dict) and
+            len(files) == len(raw_files) == 29 and set(files) == set(raw_files),
+            "fresh physical probe inventory incomplete")
+    directory = evidence / f"physical-{label}"
+    require(not directory.exists(), "refuse to replace a physical proof")
+    directory.mkdir()
+    inventory = []
+    for name, contents in sorted(files.items()):
+        require(re.fullmatch(r"[a-z0-9.-]+\.json", name) is not None and
+                isinstance(contents, str), "unsafe physical probe member")
+        data = base64.b64decode(raw_files[name], validate=True)
+        require(data.decode("utf-8-sig") == contents, "fresh physical probe raw bytes disagree")
+        path = directory / name
+        path.write_bytes(data)
+        inventory.append({"name": name, "bytes": path.stat().st_size, "sha256": sha256(path)})
+    return inventory
+
+
+def retain_reviewed_baseline(evidence: Path, directory: Path) -> list[dict]:
+    from yue2_cuda_idle_context import BASELINE_DIGEST, artifact_digest  # type: ignore[import-not-found]
+    target = evidence / "reviewed-idle-context"
+    require(not target.exists(), "refuse to replace reviewed owner receipt")
+    source_files = sorted(directory.iterdir())
+    require(len(source_files) == 28 and all(file.is_file() and not file.is_symlink() and
+                                           file.suffix == ".json" for file in source_files),
+            "reviewed owner receipt inventory changed")
+    target.mkdir()
+    inventory = []
+    for file in source_files:
+        copied = target / file.name
+        shutil.copyfile(file, copied)
+        require(sha256(file) == sha256(copied), "reviewed owner receipt changed during copy")
+        inventory.append({"name": file.name, "bytes": copied.stat().st_size, "sha256": sha256(copied)})
+    require(artifact_digest(target) == BASELINE_DIGEST,
+            "copied reviewed owner receipt differs from pinned baseline")
+    return inventory
 
 
 def metal_worker_executable(name: str) -> bool:
@@ -187,6 +301,28 @@ def sample_metal(pid: int) -> dict:
         return {"started_utc_ns": started, "ended_utc_ns": time.time_ns(),
                 "method": "Darwin phys_footprint", "pid": pid,
                 "phys_footprint_bytes": value}
+
+
+def wait_owned_child(child: subprocess.Popen, backend: str) -> tuple[int | None, bool, str | None]:
+    """Bound only the Popen-owned precision test, leaving other processes untouched."""
+    try:
+        return child.wait(timeout=CUDA_CHILD_TIMEOUT_SECONDS if backend == "cuda" else None), False, None
+    except subprocess.TimeoutExpired:
+        code, cleanup_error = reap_owned_child(child)
+        return code, True, cleanup_error
+    except Exception as error:
+        code, cleanup_error = reap_owned_child(child)
+        return code, False, f"{error}; cleanup: {cleanup_error}" if cleanup_error else str(error)
+
+
+def reap_owned_child(child: subprocess.Popen) -> tuple[int | None, str | None]:
+    try:
+        if child.poll() is None:
+            child.kill()  # Never signal a foreign PID or enumerate process names.
+            return child.wait(timeout=30), None
+        return child.poll(), None
+    except Exception as error:
+        return child.poll(), str(error)
 
 
 def one_test_executed(output: str) -> bool:
@@ -298,24 +434,32 @@ def execute(args: argparse.Namespace) -> None:
     require(args.binary.is_file(), f"test binary missing: {args.binary}")
     require(not args.work_dir.exists(), "refuse to reuse an earlier precision listening directory")
     require(args.work_dir.parent.is_dir(), "persistent listening parent is unavailable")
-    require(re.fullmatch(r"[0-9a-f]{40}", args.engine_sha) is not None, "engine SHA must be full lowercase hex")
+    verify_revisions(args.engine_sha, args.control_sha)
     require(not args.app_sha or re.fullmatch(r"[0-9a-f]{40}", args.app_sha) is not None,
             "optional caller app SHA must be full lowercase hex")
-    require(os.environ.get("GITHUB_SHA") == args.engine_sha, "checked-out engine SHA differs from dispatch input")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, encoding="utf-8").stdout.strip()
-    require(head == args.engine_sha, "engine checkout moved after build")
     dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
                            capture_output=True, text=True, check=True, encoding="utf-8").stdout
     require(not dirty.strip(), "engine source became dirty before hardware execution")
     runner = os.environ.get("RUNNER_NAME", "")
+    baseline_files = None
     if args.backend == "metal":
         require(runner == "nax-macos-2", f"Metal proof assigned to wrong runner: {runner}")
     else:
         require(os.environ.get("CUDA_VISIBLE_DEVICES") == "0",
                 "CUDA proof must bind the same physical GPU 0 used by its process census")
-    before_raw, before_busy = cuda_census() if args.backend == "cuda" else metal_census()
+        from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
+        job_start = os.environ.get("YUE2_PRECISION_JOB_STARTED_UTC_NS", "")
+        require(job_start.isdigit() and int(job_start) <= time.time_ns() and
+                time.time_ns() + (CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS) * 1_000_000_000 <=
+                int(job_start) + CUDA_JOB_TIMEOUT_SECONDS * 1_000_000_000,
+                "bounded CUDA child cannot finish before workflow upload tail")
+        baseline, baseline_dir = require_remaining_window(
+            CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS)
+        baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
+    before_raw, before_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
     (evidence / "census-before.txt").write_text(before_raw, encoding="utf-8")
     require(not before_busy, f"foreign/lingering accelerator executables before test: {before_busy}")
+    before_files = retain_cuda_physical_evidence(evidence, "before", before_raw) if args.backend == "cuda" else None
     env = os.environ.copy()
     env["YUE2_VAE_REFERENCE_DIR"] = str(args.reference)
     env["YUE2_PRECISION_RECEIPT"] = str(evidence / "precision-receipt.json")
@@ -336,18 +480,31 @@ def execute(args: argparse.Namespace) -> None:
                         faults.append(f"{time.time_ns()}: {error}")
                 stop.wait(0.25 if args.backend == "cuda" else 1.0)
         thread = threading.Thread(target=loop, daemon=True)
-        thread.start()
-        code = child.wait()
-        stop.set()
-        thread.join(timeout=25)
+        try:
+            thread.start()
+            code, timed_out, wait_error = wait_owned_child(child, args.backend)
+        except Exception as error:
+            code, cleanup_error = reap_owned_child(child)
+            timed_out = False
+            wait_error = f"sampler startup: {error}; cleanup: {cleanup_error}"
+        finally:
+            stop.set()
+            if thread.is_alive():
+                thread.join(timeout=25)
     ended = time.time_ns()
     post_census_error = None
     try:
-        after_raw, after_busy = cuda_census() if args.backend == "cuda" else metal_census()
+        after_raw, after_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
     except Exception as error:
         after_raw, after_busy = "", []
         post_census_error = str(error)
     (evidence / "census-after.txt").write_text(after_raw, encoding="utf-8")
+    after_files = None
+    if args.backend == "cuda" and post_census_error is None and not after_busy:
+        try:
+            after_files = retain_cuda_physical_evidence(evidence, "after", after_raw)
+        except Exception as error:
+            post_census_error = str(error)
     write_json(evidence / "external-samples.json", {"backend": args.backend, "samples": samples, "faults": faults})
     output = (evidence / "test.log").read_text(encoding="utf-8", errors="replace")
     markers = stage_markers(output)
@@ -377,7 +534,7 @@ def execute(args: argparse.Namespace) -> None:
         for wav in sorted(args.work_dir.rglob("*.wav")):
             local_audio.append({"path": str(wav), "sha256": sha256(wav), "bytes": wav.stat().st_size})
     report = {"schema": "yue2-precision-control-v1", "backend": args.backend,
-              "engine_sha": args.engine_sha, "caller_app_sha": args.app_sha,
+              "engine_sha": args.engine_sha, "control_sha": args.control_sha, "caller_app_sha": args.app_sha,
               "runner_name": runner, "binary_sha256": sha256(args.binary),
               "reference_sha256": sha256(reference), "started_utc_ns": started,
               "persistent_listening_dir": str(args.work_dir), "local_audio": local_audio,
@@ -388,12 +545,18 @@ def execute(args: argparse.Namespace) -> None:
               "external_peak_unit": "MiB global device used" if args.backend == "cuda" else "bytes owned phys_footprint",
               "sampler_faults": faults, "owned_test_pid": child.pid,
               "owned_test_released": child.poll() is not None,
+              "owned_test_timed_out": timed_out, "owned_test_wait_error": wait_error,
+              "cuda_child_timeout_seconds": CUDA_CHILD_TIMEOUT_SECONDS if args.backend == "cuda" else None,
+              "reviewed_baseline": baseline if args.backend == "cuda" else None,
+              "reviewed_baseline_files": baseline_files,
+              "fresh_physical_before_files": before_files, "fresh_physical_after_files": after_files,
               "post_census_busy": after_busy, "post_census_error": post_census_error,
               "receipt_sha256": sha256(receipt) if receipt.is_file() else None,
               "receipt_schema_error": receipt_schema_error}
     write_json(evidence / "control.json", report)
     print(json.dumps(report, indent=2), flush=True)
-    require(code == 0, f"precision test exited {code}; see test.log")
+    require(not timed_out and wait_error is None and code == 0,
+            f"precision test timed out or exited {code}; wait error: {wait_error}; see test.log")
     require(one_test_executed(output), "one exact ignored test did not execute")
     require(receipt.is_file(), "precision test did not produce its receipt")
     require(receipt_schema_error is None, f"precision receipt contract mismatch: {receipt_schema_error}")
@@ -414,6 +577,8 @@ def main() -> None:
     p = sub.add_parser("verify-reference")
     p.add_argument("--directory", type=Path, required=True)
     p.add_argument("--engine-sha", required=True)
+    p.add_argument("--control-sha", required=True)
+    p.add_argument("--run-id", required=True)
     p = sub.add_parser("run")
     p.add_argument("--backend", choices=("cuda", "metal"), required=True)
     p.add_argument("--binary", type=Path, required=True)
@@ -421,6 +586,7 @@ def main() -> None:
     p.add_argument("--evidence", type=Path, required=True)
     p.add_argument("--work-dir", type=Path, required=True)
     p.add_argument("--engine-sha", required=True)
+    p.add_argument("--control-sha", required=True)
     p.add_argument("--app-sha", default="")
     args = parser.parse_args()
     {"resolve-binary": resolve_binary, "verify-reference": verify_reference, "run": execute}[args.mode](args)

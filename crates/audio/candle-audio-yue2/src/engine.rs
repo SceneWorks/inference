@@ -55,7 +55,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use candle_audio::candle_core::{DType, Device};
+use candle_audio::candle_core::{DType, Device, DeviceLocation};
 use candle_audio::gen_core;
 use serde_json::{json, Map, Value};
 
@@ -542,6 +542,11 @@ fn policy_name(policy: gen_core::Yue2ComputePolicy) -> &'static str {
         gen_core::Yue2ComputePolicy::Bf16 => "bf16",
         gen_core::Yue2ComputePolicy::Fp32 => "fp32",
     }
+}
+
+fn cuda_bf16_vae_math_policy(dtype: DType, location: DeviceLocation) -> Option<&'static str> {
+    crate::vae::dedicated_cuda_vae_ordinal(dtype, location)
+        .map(|_| "disallow_reduced_precision_reduction_v1")
 }
 
 fn check_stage_compute(
@@ -1107,6 +1112,11 @@ impl Yue2Engine {
                 "ggml_quantized_matmul_operand_and_result": self.tier != Tier::Bf16,
             });
         }
+        if let Some(policy) = cuda_bf16_vae_math_policy(self.vae_dtype, self.device.location()) {
+            // This changes CUDA BF16 VAE output arithmetic. Keep it in identity_config so a
+            // cached waveform from the earlier handle policy cannot satisfy a new decode.
+            config["vae_cuda_bf16_math_policy"] = json!(policy);
+        }
         config
     }
 
@@ -1505,6 +1515,22 @@ mod identity_tests {
             "[Verse]\nla la la\n",
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn cuda_bf16_vae_math_policy_is_bound_to_result_identity_only_when_selected() {
+        assert_eq!(
+            cuda_bf16_vae_math_policy(DType::BF16, DeviceLocation::Cuda { gpu_id: 2 }),
+            Some("disallow_reduced_precision_reduction_v1")
+        );
+        for location in [DeviceLocation::Cpu, DeviceLocation::Metal { gpu_id: 0 }] {
+            assert_eq!(cuda_bf16_vae_math_policy(DType::BF16, location), None);
+        }
+        assert_eq!(
+            cuda_bf16_vae_math_policy(DType::F32, DeviceLocation::Cuda { gpu_id: 2 }),
+            None
+        );
+        assert!(!MEMORY_CONFIG_KEYS.contains(&"vae_cuda_bf16_math_policy"));
     }
 
     #[test]

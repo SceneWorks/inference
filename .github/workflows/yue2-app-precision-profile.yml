@@ -12,7 +12,11 @@ on:
       expected_engine_sha:
         type: string
         required: true
-        description: Exact 40-hex inference workflow revision and SceneWorks Cargo pin
+        description: Exact 40-hex inference source revision and SceneWorks Cargo pin
+      expected_control_sha:
+        type: string
+        required: true
+        description: Exact 40-hex workflow/controller revision dispatched
       expected_app_sha:
         type: string
         required: true
@@ -22,9 +26,15 @@ on:
         required: false
         default: false
         description: Operator confirms a fresh nax-macos-2 resource window was approved
+      idle_cuda_context_run_id:
+        type: string
+        required: false
+        default: ""
+        description: Reviewed owner-window diagnostic run; empty keeps the CUDA mixed-context refusal
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
@@ -36,7 +46,11 @@ jobs:
     runs-on: [self-hosted, Windows, X64, cuda, real-weights]
     timeout-minutes: 480
     env:
+      EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+      EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
       CUDA_VISIBLE_DEVICES: "0"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
       CUDA_COMPUTE_CAP: "120"
       APP_RUN_ROOT: 'E:\sceneworks-terminal\sc-23002-yue2-precision\${{ github.run_id }}-${{ github.run_attempt }}'
       APP_EVIDENCE: 'E:\sceneworks-terminal\sc-23002-yue2-precision\${{ github.run_id }}-${{ github.run_attempt }}\evidence'
@@ -48,10 +62,11 @@ jobs:
         shell: powershell
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
         run: |
-          if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_APP_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'exact lowercase SHA inputs required' }
-          if ($env:EXPECTED_ENGINE_SHA -cne $env:GITHUB_SHA) { throw 'dispatch ref must be the final exact engine SHA' }
+          if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_APP_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'exact lowercase SHA inputs required' }
+          if ($env:EXPECTED_CONTROL_SHA -cne $env:GITHUB_SHA) { throw 'dispatch ref must be the exact workflow control SHA' }
           if (Test-Path -LiteralPath $env:APP_RUN_ROOT) { throw 'run-owned precision state already exists' }
           New-Item -ItemType Directory -Path $env:APP_EVIDENCE -Force | Out-Null
           nvidia-smi --query-gpu=index,name,compute_cap,memory.total,memory.used,memory.free,driver_version --format=csv > "$env:APP_EVIDENCE\hardware-before.csv"
@@ -71,6 +86,15 @@ jobs:
           ref: ${{ inputs.expected_engine_sha }}
           path: engine
           persist-credentials: false
+      - name: Download exact reviewed desktop-context receipt when requested
+        if: inputs.idle_cuda_context_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-3391f854565a5f5ea8eea48d4a8d9bad2e68c02d-37073714206-1
+          run-id: ${{ inputs.idle_cuda_context_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-reviewed-idle-context
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: "0.12.3"
@@ -79,16 +103,29 @@ jobs:
         shell: cmd
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
         run: |
           uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
           for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
           if not defined REVIEWED_PYTHON exit /b 1
           echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
-          "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_precision_profile.py verify-sources --app app --engine engine --app-sha "%EXPECTED_APP_SHA%" --engine-sha "%EXPECTED_ENGINE_SHA%" --output "%APP_EVIDENCE%\sources.json" || exit /b 1
+          "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_precision_profile.py verify-sources --app app --engine engine --control control --app-sha "%EXPECTED_APP_SHA%" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" --output "%APP_EVIDENCE%\sources.json" || exit /b 1
           "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_precision_profile.py preflight --backend cuda --evidence "%APP_EVIDENCE%" --label initial || exit /b 1
           "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_precision_profile.py prepare-cases --templates control\scripts\ci\yue2-app-precision-cases --destination "%APP_RUN_ROOT%\cases" --backend cuda || exit /b 1
+      - name: Select the app checkout's pinned Rust channel
+        shell: powershell
+        run: |
+          $pin = Select-String -Path app/rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1
+          if (-not $pin) { throw 'app Rust channel is not an exact version' }
+          Add-Content -Path $env:GITHUB_ENV -Value "RUSTUP_TOOLCHAIN=$($pin.Matches[0].Groups[1].Value)"
       - uses: ./app/.github/actions/prepare-rust-runner
+      - name: Verify selected app Rust channel
+        shell: powershell
+        working-directory: app
+        run: |
+          $actual = (& rustc --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -notmatch [regex]::Escape($env:RUSTUP_TOOLCHAIN)) { throw "app Rust toolchain mismatch: $actual" }
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -140,7 +177,7 @@ jobs:
         if: always() && steps.run-root.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: yue2-app-precision-cuda-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: yue2-app-precision-cuda-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.APP_EVIDENCE }}
             ${{ env.APP_RUN_ROOT }}/install/evidence/*.json
@@ -180,6 +217,7 @@ jobs:
         shell: bash
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
           METAL_RESOURCE_APPROVED: ${{ inputs.metal_resource_approved }}
         run: |
@@ -187,8 +225,9 @@ jobs:
           test "$METAL_RESOURCE_APPROVED" = true
           test "$RUNNER_NAME" = nax-macos-2
           [[ "$EXPECTED_ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_APP_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$EXPECTED_ENGINE_SHA" = "$GITHUB_SHA"
+          test "$EXPECTED_CONTROL_SHA" = "$GITHUB_SHA"
           test -d /Volumes/Models
           test ! -e "$APP_RUN_ROOT"
           mkdir -p "$APP_EVIDENCE"
@@ -212,12 +251,13 @@ jobs:
         shell: bash
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
         run: |
           set -euo pipefail
           command -v python3.12
           command -v cargo rustc curl zstd
-          python3.12 control/scripts/ci/yue2_app_precision_profile.py verify-sources --app app --engine engine --app-sha "$EXPECTED_APP_SHA" --engine-sha "$EXPECTED_ENGINE_SHA" --output "$APP_EVIDENCE/sources.json"
+          python3.12 control/scripts/ci/yue2_app_precision_profile.py verify-sources --app app --engine engine --control control --app-sha "$EXPECTED_APP_SHA" --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" --output "$APP_EVIDENCE/sources.json"
           python3.12 control/scripts/ci/yue2_app_precision_profile.py preflight --backend metal --evidence "$APP_EVIDENCE" --label initial
           python3.12 control/scripts/ci/yue2_app_precision_profile.py prepare-cases --templates control/scripts/ci/yue2-app-precision-cases --destination "$APP_RUN_ROOT/cases" --backend metal
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -282,7 +322,7 @@ jobs:
         if: always() && steps.run-root.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: yue2-app-precision-metal-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: yue2-app-precision-metal-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.APP_EVIDENCE }}
             ${{ env.APP_RUN_ROOT }}/install/evidence/*.json

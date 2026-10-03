@@ -30,6 +30,9 @@ struct Behavior {
     /// On a cancelled-before-any-step run, returns the typed `Error::Canceled` (vs. a stringified
     /// `Error::Msg`).
     typed_cancel: bool,
+    /// `Some(text)` replaces the shared edit floor's refusal with `Error::Msg(text)` — the
+    /// flattened-variant / wrong-message class the edit honesty check must catch (sc-24161).
+    edit_refusal_override: Option<&'static str>,
 }
 
 impl Behavior {
@@ -39,6 +42,7 @@ impl Behavior {
             emit_progress: true,
             honor_cancel: true,
             typed_cancel: true,
+            edit_refusal_override: None,
         }
     }
 }
@@ -60,6 +64,7 @@ fn stub_desc(id: &'static str) -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -98,6 +103,12 @@ impl Trainer for StubTrainer {
         // Route through the shared capability floors (F-006), like a real family trainer.
         gen_core::train::validate_control_request(&self.desc, req)?;
         gen_core::train::validate_full_finetune_request(&self.desc, req)?;
+        gen_core::train::validate_edit_request(&self.desc, req).map_err(|e| {
+            match self.behavior.edit_refusal_override {
+                Some(text) => Error::Msg(text.to_owned()),
+                None => e,
+            }
+        })?;
         if req.items.is_empty() {
             return Err(Error::Msg("stub trainer: dataset is empty".to_owned()));
         }
@@ -201,6 +212,7 @@ fn item(name: &str) -> TrainingItem {
         caption: format!("a {name}"),
         control_image_path: None,
         model_options: Default::default(),
+        reference_image_paths: Vec::new(),
     }
 }
 
@@ -320,4 +332,52 @@ fn conformance_panics_on_a_broken_stub() {
         },
         &profile(&tmp),
     );
+}
+
+/// A stub advertising `max_reference_images = cap` with the given behavior.
+fn edit_stub(cap: u32, behavior: Behavior) -> StubTrainer {
+    let mut stub = StubTrainer::new(STUB_ID, behavior);
+    stub.desc.max_reference_images = cap;
+    stub
+}
+
+/// sc-24161: the edit honesty check passes an honest trainer at either kind of cap.
+#[test]
+fn honest_edit_refusals_pass_the_validate_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    for cap in [0, 3] {
+        check_trainer_validate(&edit_stub(cap, Behavior::good()), &profile(&tmp))
+            .unwrap_or_else(|e| panic!("cap {cap}: {e}"));
+    }
+}
+
+/// sc-24161: a non-edit trainer that refuses an edit dataset with a flattened `Msg` (the LTX-2.5
+/// preflight's old shape) fails the check — the refusal must stay a typed `Unsupported`.
+#[test]
+fn a_flattened_edit_refusal_fails_the_validate_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = edit_stub(
+        0,
+        Behavior {
+            edit_refusal_override: Some("edit training is not supported"),
+            ..Behavior::good()
+        },
+    );
+    let err = check_trainer_validate(&stub, &profile(&tmp)).unwrap_err();
+    assert!(err.contains("typed Error::Unsupported"), "got: {err}");
+}
+
+/// sc-24161: an edit-capable trainer whose over-cap refusal does not name the cap fails the check.
+#[test]
+fn an_over_cap_refusal_that_does_not_name_the_cap_fails_the_validate_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = edit_stub(
+        3,
+        Behavior {
+            edit_refusal_override: Some("bad dataset"),
+            ..Behavior::good()
+        },
+    );
+    let err = check_trainer_validate(&stub, &profile(&tmp)).unwrap_err();
+    assert!(err.contains("at most 3"), "got: {err}");
 }

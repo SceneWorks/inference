@@ -15,6 +15,14 @@
 //! validated bit-exact on real SDXL), and for `> 1` when `save_every` is a multiple of it. A snapshot
 //! taken mid-accumulation-window drops that window's partial gradients — a bounded drift affecting only
 //! the first post-resume update (training still continues correctly, just not bit-identically).
+//!
+//! **Run identity (opt-in, sc-24163).** [`save_resume_with_identity`] additionally records the run's
+//! [`ResumeIdentity`] — its training-config fingerprint and its dataset [`request_fingerprint`]
+//! (resolution, item order, captions, image / control / ordered edit-reference paths **and
+//! contents**) — and [`load_resume_with_identity`] refuses a bundle whose recorded identity differs
+//! from (or is missing for) this run, exactly as candle-gen's resume does: both run gen-core's one
+//! [`check_resume_fingerprints`]. [`save_resume`] / [`load_resume`] are unchanged, so trainers that
+//! have not opted in keep writing and reading the bundles they always have.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,8 +30,14 @@ use std::rc::Rc;
 
 use mlx_rs::Array;
 
+pub use gen_core::train::resume::{
+    check_resume_fingerprints, request_fingerprint, training_config_fingerprint,
+    REQUEST_FINGERPRINT_KEY, TRAINING_CONFIG_KEY,
+};
+
 use crate::train::lora::LoraParams;
 use crate::train::optim::TrainOptimizer;
+use crate::train::TrainingConfig;
 use crate::{Error, Result};
 
 /// `{stem}-step{step:06}.safetensors` — the intermediate adapter checkpoint filename (matches the
@@ -65,6 +79,42 @@ pub fn save_resume(
     opt: &TrainOptimizer,
     params: &LoraParams,
 ) -> Result<()> {
+    save_resume_inner(dir, stem, step, update_idx, opt, params, None)
+}
+
+/// What a fingerprinted resume bundle records about the run that wrote it, and what
+/// [`load_resume_with_identity`] requires a resuming run to match.
+#[derive(Clone, Copy, Debug)]
+pub struct ResumeIdentity<'a> {
+    /// The run's training config ([`training_config_fingerprint`] of it is recorded).
+    pub config: &'a TrainingConfig,
+    /// The run's dataset fingerprint ([`request_fingerprint`]).
+    pub request_fingerprint: &'a str,
+}
+
+/// [`save_resume`] plus the run's [`ResumeIdentity`] in the snapshot metadata (under
+/// [`TRAINING_CONFIG_KEY`] / [`REQUEST_FINGERPRINT_KEY`]), for [`load_resume_with_identity`].
+pub fn save_resume_with_identity(
+    dir: &Path,
+    stem: &str,
+    step: u32,
+    update_idx: u32,
+    opt: &TrainOptimizer,
+    params: &LoraParams,
+    identity: ResumeIdentity<'_>,
+) -> Result<()> {
+    save_resume_inner(dir, stem, step, update_idx, opt, params, Some(identity))
+}
+
+fn save_resume_inner(
+    dir: &Path,
+    stem: &str,
+    step: u32,
+    update_idx: u32,
+    opt: &TrainOptimizer,
+    params: &LoraParams,
+    identity: Option<ResumeIdentity<'_>>,
+) -> Result<()> {
     opt.save_state(dir.join(optimizer_state_filename(stem, step)))?;
 
     let entries: Vec<(String, &Array)> = params.iter().map(|(k, v)| (k.to_string(), v)).collect();
@@ -72,6 +122,16 @@ pub fn save_resume(
     meta.insert("step".to_string(), step.to_string());
     meta.insert("update_idx".to_string(), update_idx.to_string());
     meta.insert("optimizer".to_string(), opt.kind_tag().to_string());
+    if let Some(identity) = identity {
+        meta.insert(
+            TRAINING_CONFIG_KEY.to_string(),
+            training_config_fingerprint(identity.config),
+        );
+        meta.insert(
+            REQUEST_FINGERPRINT_KEY.to_string(),
+            identity.request_fingerprint.to_string(),
+        );
+    }
     Array::save_safetensors(
         entries,
         Some(&meta),
@@ -85,7 +145,29 @@ pub fn save_resume(
 /// fresh from the same config; its [`kind_tag`](TrainOptimizer::kind_tag) must match the snapshot) and
 /// returns the trainable factors + [`ResumeMeta`].
 pub fn load_resume(snapshot: &Path, opt: &mut TrainOptimizer) -> Result<(LoraParams, ResumeMeta)> {
+    load_resume_inner(snapshot, opt, None)
+}
+
+/// [`load_resume`] for a bundle written by [`save_resume_with_identity`]: refuses — before any
+/// optimizer state is restored — a snapshot whose recorded training config or dataset fingerprint
+/// differs from `identity`, or that records none (an unfingerprinted bundle's provenance is unknown).
+pub fn load_resume_with_identity(
+    snapshot: &Path,
+    opt: &mut TrainOptimizer,
+    identity: ResumeIdentity<'_>,
+) -> Result<(LoraParams, ResumeMeta)> {
+    load_resume_inner(snapshot, opt, Some(identity))
+}
+
+fn load_resume_inner(
+    snapshot: &Path,
+    opt: &mut TrainOptimizer,
+    identity: Option<ResumeIdentity<'_>>,
+) -> Result<(LoraParams, ResumeMeta)> {
     let (tensors, meta) = Array::load_safetensors_with_metadata(snapshot)?;
+    if let Some(identity) = identity {
+        check_resume_fingerprints(&meta, identity.config, identity.request_fingerprint)?;
+    }
     let field = |k: &str| -> Result<String> {
         meta.get(k).cloned().ok_or_else(|| {
             Error::Msg(format!(
@@ -280,5 +362,64 @@ mod tests {
                 "stem {stem} loaded the wrong expert's factors"
             );
         }
+    }
+
+    /// sc-24163: a fingerprinted bundle resumes only into the same config + dataset; a changed
+    /// dataset, a changed config and an unfingerprinted bundle are refused, while the plain
+    /// [`load_resume`] still reads a fingerprinted bundle (other trainers are unaffected).
+    ///
+    /// *Mutation that reds this:* dropping the `check_resume_fingerprints` call in
+    /// `load_resume_inner`, or not writing the identity in `save_resume_inner`.
+    #[test]
+    fn identity_bundles_refuse_a_changed_dataset_or_config() {
+        let params: LoraParams =
+            std::iter::once((Rc::from("blk.lora_A"), Array::from_slice(&[0.5f32], &[1]))).collect();
+        let opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+        let cfg = TrainingConfig::default();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path();
+        let identity = ResumeIdentity {
+            config: &cfg,
+            request_fingerprint: "dataset-a",
+        };
+        save_resume_with_identity(dir, "id", 2, 2, &opt, &params, identity).unwrap();
+        save_resume(dir, "plain", 2, 2, &opt, &params).unwrap();
+        let (found, _) = find_latest_resume(dir, "id").unwrap();
+        let fresh = || TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+
+        let (loaded, meta) = load_resume_with_identity(&found, &mut fresh(), identity).unwrap();
+        assert_eq!((meta.step, loaded.len()), (2, 1));
+        load_resume(&found, &mut fresh()).expect("the plain loader ignores the identity");
+
+        let other = ResumeIdentity {
+            request_fingerprint: "dataset-b",
+            ..identity
+        };
+        let err = load_resume_with_identity(&found, &mut fresh(), other)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dataset/request fingerprint differs"), "{err}");
+
+        let changed = TrainingConfig {
+            rank: cfg.rank + 1,
+            ..cfg.clone()
+        };
+        let err = load_resume_with_identity(
+            &found,
+            &mut fresh(),
+            ResumeIdentity {
+                config: &changed,
+                ..identity
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("training configuration differs"), "{err}");
+
+        let (plain, _) = find_latest_resume(dir, "plain").unwrap();
+        let err = load_resume_with_identity(&plain, &mut fresh(), identity)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing training_config"), "{err}");
     }
 }

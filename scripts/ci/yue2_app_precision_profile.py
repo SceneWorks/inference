@@ -92,16 +92,19 @@ def git(root: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(root), *args], text=True, encoding="utf-8").strip()
 
 
-def verify_sources(app: Path, engine: Path, app_sha: str, engine_sha: str) -> dict:
-    require(bool(HEX40.fullmatch(app_sha)) and bool(HEX40.fullmatch(engine_sha)), "exact lowercase 40-hex SHAs required")
-    for root, expected, label in ((app, app_sha, "app"), (engine, engine_sha, "engine")):
+def verify_sources(app: Path, engine: Path, control: Path, app_sha: str, engine_sha: str, control_sha: str) -> dict:
+    require(all(HEX40.fullmatch(sha) for sha in (app_sha, engine_sha, control_sha)),
+            "exact lowercase 40-hex SHAs required")
+    require(os.environ.get("GITHUB_SHA") == control_sha, "workflow control SHA differs from dispatch input")
+    for root, expected, label in ((app, app_sha, "app"), (engine, engine_sha, "engine"),
+                                  (control, control_sha, "control")):
         require(git(root, "rev-parse", "HEAD") == expected, f"{label} checkout SHA mismatch")
         require(not git(root, "status", "--porcelain", "--untracked-files=normal"), f"{label} checkout is dirty")
     pins = re.findall(r'SceneWorks/inference",\s*rev\s*=\s*"([0-9a-f]{40})"',
                       (app / "Cargo.toml").read_text(encoding="utf-8"))
     require(bool(pins) and all(pin == engine_sha for pin in pins),
             "app Cargo inference pins are not exact engine SHA")
-    return {"app_sha": app_sha, "engine_sha": engine_sha, "app_pins": pins}
+    return {"app_sha": app_sha, "engine_sha": engine_sha, "control_sha": control_sha, "app_pins": pins}
 
 
 def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
@@ -131,12 +134,23 @@ def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
 def preflight(backend: str, evidence: Path, label: str) -> dict:
     # The merged engine control owns the typed process census. Refuse if absent;
     # a generic process-name guess would weaken the shared physical-host lock.
-    from yue2_precision_proof import cuda_census, metal_census  # type: ignore[import-not-found]
+    from yue2_precision_proof import (  # type: ignore[import-not-found]
+        cuda_physical_census, metal_census, retain_cuda_physical_evidence,
+        retain_reviewed_baseline,
+    )
 
     require(backend in ("cuda", "metal"), "unsupported backend")
     if backend == "metal":
         require(os.environ.get("RUNNER_NAME") == "nax-macos-2", "Metal must run on nax-macos-2")
-    census, busy = (cuda_census if backend == "cuda" else metal_census)()
+    evidence.mkdir(parents=True, exist_ok=True)
+    baseline_files = None
+    if backend == "cuda" and label == "initial":
+        from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
+        _, baseline_dir = require_remaining_window(480 * 60 + 600)
+        baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
+    census, busy = (cuda_physical_census if backend == "cuda" else metal_census)()
+    physical_files = (retain_cuda_physical_evidence(evidence, label, census)
+                      if backend == "cuda" and not busy else None)
     disk = shutil.disk_usage(evidence.parent).free
     memory = None
     available = None
@@ -159,8 +173,9 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
               "hostname": os.environ.get("COMPUTERNAME") or subprocess.check_output(["hostname"], text=True, encoding="utf-8").strip(),
               "disk_free_bytes": disk, "physical_memory_bytes": memory, "available_memory_bytes": available,
               "minimum_disk_bytes": MIN_FREE_DISK, "observed_cpu_reference_peak_bytes": REFERENCE_PEAK,
-              "census": census, "competing_processes": busy, "admitted": not errors, "errors": errors}
-    evidence.mkdir(parents=True, exist_ok=True)
+              "census": census, "physical_files": physical_files,
+              "reviewed_baseline_files": baseline_files,
+              "competing_processes": busy, "admitted": not errors, "errors": errors}
     (evidence / f"preflight-{label}.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     require(not errors, "; ".join(errors))
     return record
@@ -184,6 +199,13 @@ def verify_record(record_path: Path, backend: str, name: str) -> dict:
     for key, wanted in (("engineComputePolicy", policy), ("engineModelDtype", model_dtype),
                         ("engineVaeDtype", vae_dtype)):
         require(outcome.get(key) == wanted, f"effective {key} does not match {wanted}")
+    math_policy = "disallow_reduced_precision_reduction_v1" if backend == "cuda" and policy == "bf16" else None
+    if math_policy is None:
+        require("engineVaeCudaBf16MathPolicy" not in outcome,
+                "effective CUDA BF16 VAE math policy is present on another backend or compute policy")
+    else:
+        require(outcome.get("engineVaeCudaBf16MathPolicy") == math_policy,
+                f"effective CUDA BF16 VAE math policy does not match {math_policy}")
     measured = row.get("measured", {})
     require(measured.get("peakBytes", 0) > 0, "profile has no overall measured peak")
     stages = measured.get("stages", {})
@@ -192,7 +214,8 @@ def verify_record(record_path: Path, backend: str, name: str) -> dict:
             "profile lacks a sampled stage")
     return {"case_id": row["caseId"], "backend": backend, "admission": "admitted",
             "effective_compute_policy": policy, "effective_model_dtype": model_dtype,
-            "effective_vae_dtype": vae_dtype, "peak_bytes": measured["peakBytes"],
+            "effective_vae_dtype": vae_dtype, "effective_vae_cuda_bf16_math_policy": math_policy,
+            "peak_bytes": measured["peakBytes"],
             "stage_samples": {stage: stages[stage]["samples"] for stage in STAGES},
             "record_sha256": sha256(record_path)}
 
@@ -307,6 +330,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                 json.dumps({"backend": backend, "status": "partial", "cases": completed_audio}, indent=2) + "\n",
                 encoding="utf-8",
             )
+        preflight(backend, evidence, "after-cases")
         return collect(output, evidence, backend)
     finally:
         copy_partial(output, evidence, backend)
@@ -316,7 +340,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     verify = sub.add_parser("verify-sources")
-    for field in ("app", "engine", "app-sha", "engine-sha", "output"):
+    for field in ("app", "engine", "control", "app-sha", "engine-sha", "control-sha", "output"):
         verify.add_argument(f"--{field}", required=True)
     prepare = sub.add_parser("prepare-cases")
     for field in ("templates", "destination", "backend"):
@@ -332,7 +356,8 @@ def main() -> int:
         captures.add_argument(f"--{field}", required=True)
     args = parser.parse_args()
     if args.command == "verify-sources":
-        result = verify_sources(Path(args.app), Path(args.engine), args.app_sha, args.engine_sha)
+        result = verify_sources(Path(args.app), Path(args.engine), Path(args.control),
+                                args.app_sha, args.engine_sha, args.control_sha)
         Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     elif args.command == "prepare-cases":
         result = prepare_cases(Path(args.templates), Path(args.destination), args.backend)

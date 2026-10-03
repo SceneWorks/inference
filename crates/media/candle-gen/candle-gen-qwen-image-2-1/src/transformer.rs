@@ -33,8 +33,8 @@
 //! dense path is a plain `candle_nn::Linear`.
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_gen::candle_nn::ops::{rms_norm, softmax_last_dim};
-use candle_gen::candle_nn::rotary_emb::rope_i;
+use candle_gen::candle_nn::ops::{rms_norm, rms_norm_slow, softmax, softmax_last_dim};
+use candle_gen::candle_nn::rotary_emb::{rope_i, rope_i_slow};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::quant::AdaptLinear;
 use candle_gen::{CandleError as Error, Result};
@@ -62,6 +62,52 @@ fn group_for(in_dim: usize) -> usize {
     } else {
         32
     }
+}
+
+/// The per-block adapter targets — every Linear inside `transformer_blocks.{i}` — relative to the
+/// block. The candle twin of `mlx_gen_qwen_image_2_1::transformer::BLOCK_ADAPTER_TARGETS` (same
+/// spellings, same order), and the trainer's default target surface (sc-24160).
+pub const BLOCK_ADAPTER_TARGETS: [&str; 7] = [
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "img_mlp.gate_layer",
+    "img_mlp.proj",
+    "img_mlp.out",
+];
+
+/// The adaptable Linears outside the blocks — the twin of the MLX crate's
+/// `GLOBAL_ADAPTER_TARGETS`. Reachable by an explicit trainer `lora_target_modules` list, never by
+/// the default.
+pub const GLOBAL_ADAPTER_TARGETS: [&str; 8] = [
+    "img_in",
+    "txt_in.in_layer",
+    "txt_in.out_layer",
+    "time_text_embed.timestep_embedder.linear_1",
+    "time_text_embed.timestep_embedder.linear_2",
+    "modulation.1",
+    "norm_out.linear",
+    "proj_out",
+];
+
+/// How the attention core's normalisation, rotation and softmax are realised.
+///
+/// * [`Ops::Fused`] — candle's fused kernels (`rms_norm`, `rope_i`, `softmax_last_dim`): the render
+///   path, byte-for-byte what it has always been.
+/// * [`Ops::Composable`] — their composable equivalents (`rms_norm_slow`, `rope_i_slow`, an
+///   f32-upcast `softmax`): the **training** path (sc-24160). The fused kernels are `CustomOp`s with
+///   no backward, so a loss built through them cannot reach the adapter factors. The softmax is
+///   taken in f32 whatever the compute dtype, so a bf16 CUDA run does not exponentiate in bf16.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ops {
+    Fused,
+    Composable,
+}
+
+/// Composable softmax over the last axis, computed in f32 and cast back.
+fn softmax_f32(x: &Tensor) -> candle_core::Result<Tensor> {
+    softmax(&x.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(x.dtype())
 }
 
 /// A bias-less, packed-detecting `[out, in]` projection at `base` (relative to `vb`). `base` is the
@@ -225,10 +271,14 @@ fn scale_residual(x: &Tensor, scale: &Tensor) -> Result<Tensor> {
 
 /// Adjacent-pair complex rotation of `x` `[B, H, S, D]` by `cos`/`sin` `[S, D/2]`, in f32. (The MLX
 /// twin rotates `[B, S, H, D]`; the rotation is per token and per head, so the transpose commutes.)
-fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, ops: Ops) -> Result<Tensor> {
     let dtype = x.dtype();
     let x32 = x.to_dtype(DType::F32)?.contiguous()?;
-    Ok(rope_i(&x32, cos, sin)?.to_dtype(dtype)?)
+    let rotated = match ops {
+        Ops::Fused => rope_i(&x32, cos, sin)?,
+        Ops::Composable => rope_i_slow(&x32, cos, sin)?,
+    };
+    Ok(rotated.to_dtype(dtype)?)
 }
 
 /// Per-axis RoPE sinusoid table from the integer position ids `[N, 3]` (mlx-gen's
@@ -324,6 +374,10 @@ fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 /// precisely so `chunked_and_unchunked_attention_agree_at_fixture_scale` can drive both branches on
 /// the real fixture geometry. On CUDA at every shipped preset the target call always chunks; on the
 /// fixtures it never would, which is why the test forces the budget instead of relying on size.
+///
+/// `softmax` is the score normaliser every call applies: the fused `softmax_last_dim` on the render
+/// path, the composable f32 one on the training path ([`Ops`]).
+#[allow(clippy::too_many_arguments)]
 fn block_causal_attention(
     q: &Tensor,
     k: &Tensor,
@@ -331,6 +385,7 @@ fn block_causal_attention(
     scale: f64,
     prefix_segments: &[(usize, usize, bool)],
     prefix_len: usize,
+    softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>,
     budget: usize,
 ) -> Result<Tensor> {
     let (_b, _h, s, _d) = q.dims4()?;
@@ -359,7 +414,7 @@ fn block_causal_attention(
             &vs,
             scale,
             mask.as_ref(),
-            softmax_last_dim,
+            softmax,
             budget,
         )?);
     }
@@ -370,7 +425,7 @@ fn block_causal_attention(
         &v.contiguous()?,
         scale,
         None,
-        softmax_last_dim,
+        softmax,
         budget,
     )?);
     Ok(Tensor::cat(&outputs, 2)?)
@@ -412,6 +467,7 @@ impl Attention {
         sin: &Tensor,
         prefix_segments: &[(usize, usize, bool)],
         prefix_len: usize,
+        ops: Ops,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (h, hd) = (self.heads, self.head_dim);
@@ -422,14 +478,20 @@ impl Attention {
         let k = heads(self.to_k.forward(x)?)?;
         let v = heads(self.to_v.forward(x)?)?;
         let norm = |y: &Tensor, w: &Tensor| -> Result<Tensor> {
-            Ok(
-                rms_norm(&y.to_dtype(DType::F32)?, &w.to_dtype(DType::F32)?, self.eps)?
-                    .to_dtype(v.dtype())?,
-            )
+            let (y32, w32) = (y.to_dtype(DType::F32)?, w.to_dtype(DType::F32)?);
+            let normed = match ops {
+                Ops::Fused => rms_norm(&y32, &w32, self.eps)?,
+                Ops::Composable => rms_norm_slow(&y32, &w32, self.eps)?,
+            };
+            Ok(normed.to_dtype(v.dtype())?)
         };
-        let q = apply_rope(&norm(&q, &self.norm_q)?, cos, sin)?;
-        let k = apply_rope(&norm(&k, &self.norm_k)?, cos, sin)?;
+        let q = apply_rope(&norm(&q, &self.norm_q)?, cos, sin, ops)?;
+        let k = apply_rope(&norm(&k, &self.norm_k)?, cos, sin, ops)?;
         let scale = (hd as f64).powf(-0.5);
+        let softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor> = match ops {
+            Ops::Fused => &softmax_last_dim,
+            Ops::Composable => &softmax_f32,
+        };
         let o = block_causal_attention(
             &q,
             &k,
@@ -437,6 +499,7 @@ impl Attention {
             scale,
             prefix_segments,
             prefix_len,
+            softmax,
             candle_gen::ATTN_SCORES_BUDGET,
         )?;
         let o = o.transpose(1, 2)?.reshape((b, s, h * hd))?;
@@ -505,22 +568,24 @@ impl Block {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         index: usize,
         x: &Tensor,
         m: &Modulation,
-        cos: &Tensor,
-        sin: &Tensor,
-        prefix_segments: &[(usize, usize, bool)],
-        prefix_len: usize,
+        geometry: &JointGeometry,
+        ops: Ops,
         trace: &mut Trace<'_>,
     ) -> Result<Tensor> {
         let h = scale_residual(&layer_norm(x, self.eps)?, &m.scale1)?;
-        let a = self
-            .attn
-            .forward(&h, cos, sin, prefix_segments, prefix_len)?;
+        let a = self.attn.forward(
+            &h,
+            &geometry.cos,
+            &geometry.sin,
+            &geometry.prefix_segments,
+            geometry.prefix_len,
+            ops,
+        )?;
         trace.push(format!("block_{index}_attn"), &a)?;
         let x = (x + m.gate1.tanh()?.broadcast_mul(&a)?)?;
         let h = scale_residual(&layer_norm(&x, self.eps)?, &m.scale2)?;
@@ -585,6 +650,92 @@ impl QwenImage21Transformer {
         })
     }
 
+    /// Visit every adaptable projection under its diffusers dotted key — the candle twin of the MLX
+    /// host's adapter module map, and the walk `candle_gen::quant::install_dotted_adapters` (and the
+    /// LoHa dense fold in [`crate::adapters`]) resolve adapter targets against. Each projection is
+    /// visited exactly once, in load order:
+    ///
+    /// * `img_in`, `txt_in.in_layer`, `txt_in.out_layer`,
+    ///   `time_text_embed.timestep_embedder.linear_{1,2}`, `modulation.1`;
+    /// * per block `transformer_blocks.{i}.attn.{to_q, to_k, to_v, to_out.0}` and
+    ///   `transformer_blocks.{i}.img_mlp.{gate_layer, proj, out}`;
+    /// * `norm_out.linear`, `proj_out`.
+    ///
+    /// These are exactly the weight keys the DiT loads (minus the norm vectors), so a PEFT/diffusers
+    /// adapter trained against the upstream module tree resolves 1:1.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_core::Result<()>,
+    ) -> candle_core::Result<()> {
+        visitor("img_in", &mut self.img_in)?;
+        visitor("txt_in.in_layer", &mut self.txt_in)?;
+        visitor("txt_in.out_layer", &mut self.txt_out)?;
+        visitor(
+            "time_text_embed.timestep_embedder.linear_1",
+            &mut self.time_in,
+        )?;
+        visitor(
+            "time_text_embed.timestep_embedder.linear_2",
+            &mut self.time_out,
+        )?;
+        visitor("modulation.1", &mut self.modulation)?;
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            let prefix = format!("transformer_blocks.{index}");
+            for (name, linear) in [
+                ("attn.to_q", &mut block.attn.to_q),
+                ("attn.to_k", &mut block.attn.to_k),
+                ("attn.to_v", &mut block.attn.to_v),
+                ("attn.to_out.0", &mut block.attn.to_out),
+                ("img_mlp.gate_layer", &mut block.mlp.gate_layer),
+                ("img_mlp.proj", &mut block.mlp.proj),
+                ("img_mlp.out", &mut block.mlp.out),
+            ] {
+                visitor(&format!("{prefix}.{name}"), linear)?;
+            }
+        }
+        visitor("norm_out.linear", &mut self.norm_out)?;
+        visitor("proj_out", &mut self.proj_out)
+    }
+
+    /// The weight-free twin of [`Self::visit_adaptable_mut`]: every adaptable projection's dotted
+    /// key and `[out, in]` base shape, in the same order, derived from `cfg` alone (sc-24157). The
+    /// adapter preflight and the memory contract resolve adapter targets against this before any
+    /// DiT weight is read; a test pins it to the visitor walk of a loaded DiT.
+    pub fn adaptable_projections(cfg: &TransformerConfig) -> Vec<(String, (usize, usize))> {
+        let inner = cfg.inner_dim();
+        let hidden = inner * cfg.mlp_ratio;
+        let mut out = vec![
+            ("img_in".to_owned(), (inner, cfg.in_channels)),
+            ("txt_in.in_layer".to_owned(), (inner, cfg.context_in_dim)),
+            ("txt_in.out_layer".to_owned(), (inner, inner)),
+            (
+                "time_text_embed.timestep_embedder.linear_1".to_owned(),
+                (inner, TIMESTEP_DIM),
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2".to_owned(),
+                (inner, inner),
+            ),
+            ("modulation.1".to_owned(), (4 * inner, inner)),
+        ];
+        for index in 0..cfg.num_layers {
+            for (name, shape) in [
+                ("attn.to_q", (inner, inner)),
+                ("attn.to_k", (inner, inner)),
+                ("attn.to_v", (inner, inner)),
+                ("attn.to_out.0", (inner, inner)),
+                ("img_mlp.gate_layer", (hidden, inner)),
+                ("img_mlp.proj", (hidden, inner)),
+                ("img_mlp.out", (inner, hidden)),
+            ] {
+                out.push((format!("transformer_blocks.{index}.{name}"), shape));
+            }
+        }
+        out.push(("norm_out.linear".to_owned(), (inner, inner)));
+        out.push(("proj_out".to_owned(), (cfg.out_channels, inner)));
+        out
+    }
+
     pub fn config(&self) -> &TransformerConfig {
         &self.cfg
     }
@@ -633,7 +784,7 @@ impl QwenImage21Transformer {
         timestep: f32,
         layout: &JointLayout,
     ) -> Result<Tensor> {
-        self.run_joint(text, images, timestep, layout, Trace(None))
+        self.run_joint(text, images, timestep, layout, Ops::Fused, Trace(None))
     }
 
     /// [`Self::forward_joint`] that also captures every named intermediate (`txt_in`, `img_in`,
@@ -648,7 +799,14 @@ impl QwenImage21Transformer {
         layout: &JointLayout,
     ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
         let mut trace = Vec::new();
-        let velocity = self.run_joint(text, images, timestep, layout, Trace(Some(&mut trace)))?;
+        let velocity = self.run_joint(
+            text,
+            images,
+            timestep,
+            layout,
+            Ops::Fused,
+            Trace(Some(&mut trace)),
+        )?;
         Ok((velocity, trace))
     }
 
@@ -658,8 +816,31 @@ impl QwenImage21Transformer {
         images: &[&Tensor],
         timestep: f32,
         layout: &JointLayout,
+        ops: Ops,
         mut trace: Trace<'_>,
     ) -> Result<Tensor> {
+        let prelude = self.prelude(text, images, timestep, layout, &mut trace)?;
+        let geometry = &prelude.geometry;
+        let m = geometry.modulation(&prelude.modulation)?;
+        let out_scale = geometry.select(&prelude.out_rows, 0)?;
+        let mut x = prelude.x.clone();
+        for (index, block) in self.blocks.iter().enumerate() {
+            x = block.forward(index, &x, &m, geometry, ops, &mut trace)?;
+        }
+        self.head(&x, &out_scale, geometry, &mut trace)
+    }
+
+    /// Everything before block 0: the text and image projections into one joint sequence, the
+    /// RoPE table, and the shared modulation / `norm_out` rows (still **unselected** — one row per
+    /// timestep; `JointGeometry::select` spreads them over the tokens).
+    fn prelude(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+        trace: &mut Trace<'_>,
+    ) -> Result<JointPrelude> {
         layout.validate()?;
         let dtype = self.compute_dtype();
         let eps = self.cfg.eps as f64;
@@ -723,7 +904,7 @@ impl QwenImage21Transformer {
                 }
             }
         }
-        let mut x = Tensor::cat(&pieces, 1)?.contiguous()?;
+        let x = Tensor::cat(&pieces, 1)?.contiguous()?;
         let s = x.dim(1)?;
 
         let (cos, sin) = self.rope(layout)?;
@@ -743,10 +924,8 @@ impl QwenImage21Transformer {
         let silu_temb = silu(&temb)?;
         let modulation = self.modulation.forward(&silu_temb)?; // [rows, 4·inner]
         trace.push("modulation", &modulation)?;
-        let inner = self.cfg.inner_dim();
         // `_select_modulation_rows`: target tokens take row 0 (their sample's timestep), every
-        // other token the trailing `t = 0` row. Expressed as `zero + (real − zero)·mask` for a 0/1
-        // mask, which is exactly `where(mask, real, zero)`.
+        // other token the trailing `t = 0` row (see `JointGeometry::select`).
         let target_mask = if self.cfg.causal_condition {
             let m: Vec<f32> = layout
                 .target_mask()
@@ -757,49 +936,203 @@ impl QwenImage21Transformer {
         } else {
             None
         };
-        let select = |rows: &Tensor, slot: usize, width: usize| -> Result<Tensor> {
-            let real = rows
-                .narrow(0, 0, 1)?
-                .narrow(1, slot * width, width)?
-                .reshape((1, 1, width))?;
-            let Some(mask) = target_mask.as_ref() else {
-                return Ok(real.broadcast_as((1, s, width))?.contiguous()?);
-            };
-            let zero = rows
-                .narrow(0, 1, 1)?
-                .narrow(1, slot * width, width)?
-                .reshape((1, 1, width))?;
-            Ok(zero.broadcast_add(&real.broadcast_sub(&zero)?.broadcast_mul(mask)?)?)
-        };
-        let m = Modulation {
-            scale1: select(&modulation, 0, inner)?,
-            gate1: select(&modulation, 1, inner)?,
-            scale2: select(&modulation, 2, inner)?,
-            gate2: select(&modulation, 3, inner)?,
-        };
-        let out_scale = select(&self.norm_out.forward(&silu_temb)?, 0, inner)?;
+        let out_rows = self.norm_out.forward(&silu_temb)?;
+        Ok(JointPrelude {
+            x,
+            modulation,
+            out_rows,
+            geometry: JointGeometry {
+                cos,
+                sin,
+                prefix_segments: layout.prefix_segments(),
+                prefix_len: layout.prefix_len(),
+                seq_len: s,
+                target_tokens: layout.target_tokens(),
+                target_mask,
+                inner: self.cfg.inner_dim(),
+            },
+        })
+    }
 
-        let prefix_segments = layout.prefix_segments();
-        let prefix_len = layout.prefix_len();
-        for (index, block) in self.blocks.iter().enumerate() {
-            x = block.forward(
-                index,
-                &x,
-                &m,
-                &cos,
-                &sin,
-                &prefix_segments,
-                prefix_len,
-                &mut trace,
-            )?;
-        }
-        let x = scale_residual(&layer_norm(&x, eps)?, &out_scale)?;
+    /// After the last block: the `norm_out` modulation, `proj_out`, and the target block's slice
+    /// as f32.
+    fn head(
+        &self,
+        x: &Tensor,
+        out_scale: &Tensor,
+        geometry: &JointGeometry,
+        trace: &mut Trace<'_>,
+    ) -> Result<Tensor> {
+        let x = scale_residual(&layer_norm(x, self.cfg.eps as f64)?, out_scale)?;
         trace.push("norm_out", &x)?;
         let out = self.proj_out.forward(&x)?;
         trace.push("proj_out", &out)?;
-        let target = layout.target_tokens();
+        let (s, target) = (geometry.seq_len, geometry.target_tokens);
         Ok(out.i((.., s - target..s, ..))?.to_dtype(DType::F32)?)
     }
+
+    // ── training (sc-24160) ─────────────────────────────────────────────────────────────────────
+
+    /// Number of transformer blocks.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// The **training** text-to-image forward: [`Self::forward`] with the attention core on its
+    /// composable, differentiable ops ([`Ops::Composable`]), so `loss.backward()` reaches every
+    /// trainable adapter factor. Same arguments, same `[1, h·w, out_channels]` f32 velocity.
+    pub fn forward_train(
+        &self,
+        latents: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        height: usize,
+        width: usize,
+    ) -> Result<Tensor> {
+        let layout = JointLayout::text_to_image(encoder_hidden_states.dim(1)?, height, width);
+        self.forward_train_joint(encoder_hidden_states, &[latents], timestep, &layout)
+    }
+
+    /// The **training** joint forward (sc-24162): [`Self::forward_joint`] — the render path's
+    /// general text/condition-image/target forward — on the composable, differentiable ops. Same
+    /// arguments (`images` = condition latents in order, target last), same target-block-only
+    /// `[1, target_tokens, out_channels]` f32 velocity, so a loss over it covers target tokens only.
+    pub fn forward_train_joint(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<Tensor> {
+        self.run_joint(text, images, timestep, layout, Ops::Composable, Trace(None))
+    }
+
+    /// The pre-block half of [`Self::forward_train`], for a gradient-checkpointed step: the joint
+    /// sequence entering block 0 plus the modulation rows every block (and the head) reads. The
+    /// global projections that produce it (`img_in`, `txt_in.*`, the timestep embedder,
+    /// `modulation.1`, `norm_out.linear`) run here, retained, so an adapter on one of them trains
+    /// through ordinary autograd.
+    pub fn train_prelude(
+        &self,
+        latents: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        height: usize,
+        width: usize,
+    ) -> Result<JointPrelude> {
+        let layout = JointLayout::text_to_image(encoder_hidden_states.dim(1)?, height, width);
+        self.train_prelude_joint(encoder_hidden_states, &[latents], timestep, &layout)
+    }
+
+    /// The pre-block half of [`Self::forward_train_joint`] (sc-24162) — [`Self::train_prelude`]
+    /// over a general joint layout (condition images first, target last).
+    pub fn train_prelude_joint(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<JointPrelude> {
+        self.prelude(text, images, timestep, layout, &mut Trace(None))
+    }
+
+    /// Block `index` of [`Self::forward_train`] on its own — one checkpoint segment. `modulation`
+    /// is [`JointPrelude::modulation`] (passed explicitly so a checkpointed backward can carry it
+    /// across the segment boundary as a differentiable input).
+    pub fn train_block(
+        &self,
+        index: usize,
+        x: &Tensor,
+        modulation: &Tensor,
+        geometry: &JointGeometry,
+    ) -> Result<Tensor> {
+        let block = self.blocks.get(index).ok_or_else(|| {
+            Error::Msg(format!(
+                "qwen_image_2_1: block {index} out of range ({} blocks)",
+                self.blocks.len()
+            ))
+        })?;
+        let m = geometry.modulation(modulation)?;
+        block.forward(index, x, &m, geometry, Ops::Composable, &mut Trace(None))
+    }
+
+    /// The post-block head of [`Self::forward_train`]: `out_rows` is [`JointPrelude::out_rows`].
+    /// Returns the target's `[1, h·w, out_channels]` velocity in f32.
+    pub fn train_head(
+        &self,
+        x: &Tensor,
+        out_rows: &Tensor,
+        geometry: &JointGeometry,
+    ) -> Result<Tensor> {
+        let out_scale = geometry.select(out_rows, 0)?;
+        self.head(x, &out_scale, geometry, &mut Trace(None))
+    }
+}
+
+/// The joint sequence's static geometry for one forward: the RoPE table, the block-causal segment
+/// runs, and the token mask that selects between the modulation rows. Constant across the blocks
+/// (it carries no trainable dependency).
+pub struct JointGeometry {
+    cos: Tensor,
+    sin: Tensor,
+    prefix_segments: Vec<(usize, usize, bool)>,
+    prefix_len: usize,
+    seq_len: usize,
+    target_tokens: usize,
+    /// `[1, S, 1]` 0/1 target mask under `causal_condition`, else `None`.
+    target_mask: Option<Tensor>,
+    inner: usize,
+}
+
+impl JointGeometry {
+    /// Tokens of the whole joint sequence.
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    /// `_select_modulation_rows` for slot `slot` of `rows` (`[rows, k·inner]`): target tokens take
+    /// row 0 (their sample's timestep), every other token the trailing `t = 0` row → `[1, S,
+    /// inner]`. Expressed as `zero + (real − zero)·mask` for a 0/1 mask, which is exactly
+    /// `where(mask, real, zero)`.
+    fn select(&self, rows: &Tensor, slot: usize) -> Result<Tensor> {
+        let (s, width) = (self.seq_len, self.inner);
+        let real = rows
+            .narrow(0, 0, 1)?
+            .narrow(1, slot * width, width)?
+            .reshape((1, 1, width))?;
+        let Some(mask) = self.target_mask.as_ref() else {
+            return Ok(real.broadcast_as((1, s, width))?.contiguous()?);
+        };
+        let zero = rows
+            .narrow(0, 1, 1)?
+            .narrow(1, slot * width, width)?
+            .reshape((1, 1, width))?;
+        Ok(zero.broadcast_add(&real.broadcast_sub(&zero)?.broadcast_mul(mask)?)?)
+    }
+
+    /// The four per-token block modulations from the `[rows, 4·inner]` shared modulation.
+    fn modulation(&self, rows: &Tensor) -> Result<Modulation> {
+        Ok(Modulation {
+            scale1: self.select(rows, 0)?,
+            gate1: self.select(rows, 1)?,
+            scale2: self.select(rows, 2)?,
+            gate2: self.select(rows, 3)?,
+        })
+    }
+}
+
+/// [`QwenImage21Transformer::train_prelude`]'s output: the differentiable state entering block 0
+/// and the static [`JointGeometry`].
+pub struct JointPrelude {
+    /// `[1, S, inner]` — the joint sequence entering block 0.
+    pub x: Tensor,
+    /// `[rows, 4·inner]` — the shared modulation rows (row 0 the sampled timestep, row 1 `t = 0`
+    /// under `causal_condition`).
+    pub modulation: Tensor,
+    /// `[rows, inner]` — the `norm_out.linear` rows the head modulates with.
+    pub out_rows: Tensor,
+    /// The static geometry every block and the head read.
+    pub geometry: JointGeometry,
 }
 
 #[cfg(test)]
@@ -918,9 +1251,28 @@ mod tests {
             "the sentinel must leave the query axis whole"
         );
 
-        let chunked = block_causal_attention(&q, &k, &v, scale, &segments, prefix, forced).unwrap();
-        let single =
-            block_causal_attention(&q, &k, &v, scale, &segments, prefix, usize::MAX).unwrap();
+        let chunked = block_causal_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            &segments,
+            prefix,
+            &softmax_last_dim,
+            forced,
+        )
+        .unwrap();
+        let single = block_causal_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            &segments,
+            prefix,
+            &softmax_last_dim,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(chunked.dims(), single.dims());
         let diff = (&chunked - &single)
             .unwrap()

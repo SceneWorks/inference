@@ -27,6 +27,19 @@ const BF16_MAX_TILE_ERROR: f32 = 1.0 / 64.0;
 const F32_MAX_ERROR: f32 = 2e-4;
 const F32_MIN_SNR_DB: f64 = 90.0;
 
+#[cfg(feature = "cuda")]
+fn cuda_math_mode(device: &Device) -> u32 {
+    use candle_audio::candle_core::cuda::cudarc::cublas::sys;
+
+    let cuda = device.as_cuda_device().unwrap();
+    cuda.cuda_stream().context().bind_to_thread().unwrap();
+    let blas = cuda.cublas_handle();
+    let mut mode = u32::MAX;
+    let status = unsafe { sys::cublasGetMathMode(*blas.handle(), (&mut mode as *mut u32).cast()) };
+    assert_eq!(status, sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS);
+    mode
+}
+
 fn timed<T>(stage: &str, work: impl FnOnce() -> T) -> T {
     let now_ms = || {
         SystemTime::now()
@@ -326,7 +339,17 @@ fn explicit_stage_precision_real_weights() {
         let strict_f32 = policy != Yue2ComputePolicy::Bf16;
         let dtype = if strict_f32 { DType::F32 } else { DType::BF16 };
         let generation = generate(&hub, policy, &work);
+        if backend == "cuda" && policy == Yue2ComputePolicy::Bf16 {
+            assert_eq!(
+                generation["config"]["vae_cuda_bf16_math_policy"],
+                "disallow_reduced_precision_reduction_v1"
+            );
+        } else {
+            assert!(generation["config"]["vae_cuda_bf16_math_policy"].is_null());
+        }
         let mut decoders = Vec::new();
+        #[cfg(feature = "cuda")]
+        let mut previous_bf16_vae: Option<Device> = None;
         for (id, key) in [
             (ComponentId::VaeStandard, "standard"),
             (ComponentId::VaeLegacy, "legacy"),
@@ -336,6 +359,33 @@ fn explicit_stage_precision_real_weights() {
                 Yue2Vae::load_with_dtype(&verified, VaeParts::Full, &device, dtype).unwrap()
             });
             assert_eq!(vae.dtype(), dtype);
+            #[cfg(feature = "cuda")]
+            let handle_evidence = if backend == "cuda" {
+                assert_eq!(
+                    cuda_math_mode(&device),
+                    0,
+                    "shared audio/MoT handle changed"
+                );
+                if dtype == DType::BF16 {
+                    assert!(!vae.device().same_device(&device));
+                    let shared = device.as_cuda_device().unwrap().cublas_handle();
+                    let private = vae.device().as_cuda_device().unwrap().cublas_handle();
+                    assert!(!std::sync::Arc::ptr_eq(&shared, &private));
+                    if let Some(previous) = &previous_bf16_vae {
+                        assert!(!vae.device().same_device(previous));
+                    }
+                    previous_bf16_vae = Some(vae.device().clone());
+                    assert_eq!(cuda_math_mode(vae.device()), 16);
+                } else {
+                    assert!(vae.device().same_device(&device));
+                    assert_eq!(cuda_math_mode(vae.device()), 0);
+                }
+                json!({"isolated": dtype == DType::BF16, "vaeMode": cuda_math_mode(vae.device()), "sharedMode": cuda_math_mode(&device)})
+            } else {
+                Value::Null
+            };
+            #[cfg(not(feature = "cuda"))]
+            let handle_evidence = Value::Null;
             assert_eq!(
                 vae.identity().weights_sha256,
                 meta["decoders"][key]["weights_sha256"]
@@ -399,6 +449,15 @@ fn explicit_stage_precision_real_weights() {
             let posterior = timed(&format!("{policy:?}:{key}:encoder"), || {
                 vae.encode(&r["clip"]).unwrap()
             });
+            #[cfg(feature = "cuda")]
+            if backend == "cuda" && dtype == DType::BF16 {
+                // The public encoder also accepts input from the shared CUDA DeviceId. Candle
+                // must copy it to the VAE's separate DeviceId before the BF16 forward.
+                let from_shared = vae.encode(&r["clip"].to_device(&device).unwrap()).unwrap();
+                assert_eq!(flat(&from_shared.mean), flat(&posterior.mean));
+                assert_eq!(cuda_math_mode(&device), 0);
+                assert_eq!(cuda_math_mode(vae.device()), 16);
+            }
             assert_eq!(posterior.mean.dtype(), dtype);
             assert_eq!(posterior.scale.dtype(), dtype);
             assert_eq!(posterior.stdev.dtype(), dtype);
@@ -417,7 +476,7 @@ fn explicit_stage_precision_real_weights() {
                 &flat(&r[&format!("{key}.encode_scale")]),
                 strict_f32,
             );
-            decoders.push(json!({"variant": key, "weightsSha256": vae.identity().weights_sha256, "parameterDtype": format!("{dtype:?}"), "activationDtype": format!("{dtype:?}"), "decodeCases": decode_cases, "encoderMean": mean, "encoderScale": scale}));
+            decoders.push(json!({"variant": key, "weightsSha256": vae.identity().weights_sha256, "parameterDtype": format!("{dtype:?}"), "activationDtype": format!("{dtype:?}"), "cudaMathHandle": handle_evidence, "decodeCases": decode_cases, "encoderMean": mean, "encoderScale": scale}));
         }
         cases.push(json!({"requestedPolicy": format!("{policy:?}"), "effectiveDtypes": {"ar": generation["config"]["model_dtype"], "nar": generation["config"]["model_dtype"], "vaeDecoder": generation["config"]["vae_dtype"], "vaeEncoder": if strict_f32 { "float32" } else { "bfloat16" }}, "generation": generation, "decoders": decoders}));
     }

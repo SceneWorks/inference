@@ -176,12 +176,24 @@ pub fn load_text_encoder(root: &Path) -> Result<QwenImage21TextEncoder> {
 
 /// The DiT from `<root>/transformer/`.
 pub fn load_transformer(root: &Path) -> Result<QwenImage21Transformer> {
+    let (w, transformer) = transformer_graph(root)?;
+    w.materialize_accessed()?;
+    Ok(transformer)
+}
+
+/// The DiT from `<root>/transformer/` as an **unevaluated** graph: the module tree with every
+/// parameter still a lazy safetensors load, so no weight is read. Only for resolving the adapter
+/// module tree at load time (sc-24156, `Sequential`); never run a forward through it.
+pub(crate) fn load_transformer_lazy(root: &Path) -> Result<QwenImage21Transformer> {
+    transformer_graph(root).map(|(_, transformer)| transformer)
+}
+
+fn transformer_graph(root: &Path) -> Result<(Weights, QwenImage21Transformer)> {
     let dir = root.join("transformer");
     let cfg = TransformerConfig::from_json_file(&dir.join("config.json"))?;
     let w = Weights::from_dir(&dir)?;
     let transformer = QwenImage21Transformer::from_weights(&w, &cfg)?;
-    w.materialize_accessed()?;
-    Ok(transformer)
+    Ok((w, transformer))
 }
 
 /// The RGBA VAE from `<root>/vae/`.
