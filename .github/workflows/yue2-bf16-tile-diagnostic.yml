@@ -17,7 +17,7 @@ on:
         type: choice
         required: true
         default: waveform
-        options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns]
+        options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns, native_convt_math_mode]
         description: One bounded diagnostic, with waveform preserving the existing default
       reference_run_id:
         type: string
@@ -69,7 +69,7 @@ jobs:
           path: engine
           persist-credentials: false
       - name: Check out the exact pinned Candle source for native-column observation
-        if: inputs.diagnostic == 'native_convt_columns'
+        if: inputs.diagnostic == 'native_convt_columns' || inputs.diagnostic == 'native_convt_math_mode'
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: huggingface/candle
@@ -126,6 +126,15 @@ jobs:
           if not defined REVIEWED_PYTHON exit /b 1
           "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py verify-reference --directory "%RUNNER_TEMP%\yue2-precision-reference" --engine-sha "${{ inputs.expected_engine_sha }}" || exit /b 1
           echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Authenticate and extract only immutable parent stage-2 inputs
+        if: inputs.diagnostic == 'native_convt_math_mode'
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_native_convt_math_parent.py --archive "%RUNNER_TEMP%\yue2-native-parent-370804.zip" --destination "%RUNNER_TEMP%\yue2-native-parent-370804" > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\parent-fetch.log" 2>&1
+          if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\parent-fetch.log"& exit /b 1)
+          echo YUE2_NATIVE_MATH_PARENT=%RUNNER_TEMP%\yue2-native-parent-370804>>"%GITHUB_ENV%"
       - name: Select checked Git Bash before pinned Rust
         shell: cmd
         run: |
@@ -141,6 +150,11 @@ jobs:
           set "RUSTC_WRAPPER="
           call "%VCVARS%" || exit /b 1
           if "%YUE2_DIAGNOSTIC_SELECTOR%"=="native_convt_columns" (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_native_convt_overlay.py --engine . --candle ..\candle-upstream --root "%RUNNER_TEMP%\yue2-native-convt-build" --trace-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\decoder-trace-vae.patch --weight-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-vae-weight.patch --backend-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-candle-core.patch --kernel-path-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-candle-kernel-path.patch --control-sha "%EXPECTED_CONTROL_SHA%" > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log" 2>&1
+            if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log"& exit /b 1)
+            set "TRACE_ROOT=%RUNNER_TEMP%\yue2-native-convt-build\engine-overlay"
+            set "CANDLE_ROOT=%RUNNER_TEMP%\yue2-native-convt-build\candle-overlay"
+          ) else if "%YUE2_DIAGNOSTIC_SELECTOR%"=="native_convt_math_mode" (
             "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_native_convt_overlay.py --engine . --candle ..\candle-upstream --root "%RUNNER_TEMP%\yue2-native-convt-build" --trace-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\decoder-trace-vae.patch --weight-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-vae-weight.patch --backend-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-candle-core.patch --kernel-path-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-candle-kernel-path.patch --control-sha "%EXPECTED_CONTROL_SHA%" > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log" 2>&1
             if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log"& exit /b 1)
             set "TRACE_ROOT=%RUNNER_TEMP%\yue2-native-convt-build\engine-overlay"
@@ -185,7 +199,7 @@ jobs:
           $binary = (Get-Content "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic\binary.txt" -Raw).Trim()
           $traceArgs = @()
           if ($env:YUE2_DIAGNOSTIC_SELECTOR -ceq 'decoder_trace') { $traceArgs = @('--overlay-root', "$env:RUNNER_TEMP\yue2-bf16-trace-build\engine-overlay") }
-          if ($env:YUE2_DIAGNOSTIC_SELECTOR -ceq 'native_convt_columns') { $traceArgs = @('--overlay-root', "$env:RUNNER_TEMP\yue2-native-convt-build\engine-overlay", '--native-candle-root', "$env:RUNNER_TEMP\yue2-native-convt-build\candle-overlay") }
+          if ($env:YUE2_DIAGNOSTIC_SELECTOR -cin @('native_convt_columns', 'native_convt_math_mode')) { $traceArgs = @('--overlay-root', "$env:RUNNER_TEMP\yue2-native-convt-build\engine-overlay", '--native-candle-root', "$env:RUNNER_TEMP\yue2-native-convt-build\candle-overlay") }
           & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_bf16_tile_diagnostic.py run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR" --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA" @traceArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload immutable diagnostic output and failures
@@ -208,7 +222,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
       - name: Upload native-column M3 and Candle source archives and declared patches
-        if: always() && inputs.diagnostic == 'native_convt_columns'
+        if: always() && (inputs.diagnostic == 'native_convt_columns' || inputs.diagnostic == 'native_convt_math_mode')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: yue2-native-convt-source-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

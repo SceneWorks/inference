@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 
 #[cfg(feature = "decoder_trace")]
 mod decoder_trace;
+#[cfg(all(feature = "native_convt_columns", feature = "cuda"))]
+mod native_math;
 
 const ENGINE_SHA: &str = "4127a675fc8575555e029e01b7f6867488880a8f";
 const ORIGINAL_BOUND: f32 = 1.0 / 64.0;
@@ -36,6 +38,7 @@ enum Diagnostic {
     FirstConvMath,
     DecoderTrace,
     NativeConvtColumns,
+    NativeConvtMathMode,
 }
 
 impl Diagnostic {
@@ -46,6 +49,7 @@ impl Diagnostic {
             "first_conv_math" => Ok(Self::FirstConvMath),
             "decoder_trace" => Ok(Self::DecoderTrace),
             "native_convt_columns" => Ok(Self::NativeConvtColumns),
+            "native_convt_math_mode" => Ok(Self::NativeConvtMathMode),
             _ => Err(format!("unsupported diagnostic {value:?}").into()),
         }
     }
@@ -949,6 +953,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     let verified = resolve_component(ComponentId::VaeStandard, &snapshots)?;
     fs::create_dir(&out)?;
     let device = Device::new_cuda(0)?;
+    if diagnostic == Diagnostic::NativeConvtMathMode {
+        #[cfg(all(feature = "native_convt_columns", feature = "cuda"))]
+        return native_math::run_native_math(
+            &out,
+            &required_env("YUE2_NATIVE_MATH_PARENT")?,
+            &verified,
+            &device,
+            &meta,
+            &reference_hash,
+        );
+        #[cfg(not(all(feature = "native_convt_columns", feature = "cuda")))]
+        return Err("native math mode requires the pinned CUDA derivative build".into());
+    }
     if diagnostic == Diagnostic::FirstConv {
         return run_first_conv(
             &engine,
@@ -1109,6 +1126,10 @@ mod tests {
         assert_eq!(
             Diagnostic::parse("native_convt_columns").unwrap(),
             Diagnostic::NativeConvtColumns
+        );
+        assert_eq!(
+            Diagnostic::parse("native_convt_math_mode").unwrap(),
+            Diagnostic::NativeConvtMathMode
         );
         assert!(Diagnostic::parse("full_vae").is_err());
     }

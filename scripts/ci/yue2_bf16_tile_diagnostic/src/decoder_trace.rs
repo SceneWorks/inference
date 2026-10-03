@@ -29,7 +29,7 @@ const ORIGINAL_CLAMPED: [[&str; 2]; 2] = [
     ],
 ];
 
-fn io_candle(error: impl std::fmt::Display) -> candle_core::Error {
+pub(super) fn io_candle(error: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(format!("decoder trace observation: {error}"))
 }
 
@@ -42,7 +42,7 @@ fn encode_native(value: f32, dtype: DType) -> Vec<u8> {
     }
 }
 
-fn tensor_record(
+pub(super) fn tensor_record(
     tensor: &Tensor,
     out: &Path,
     stem: &str,
@@ -93,7 +93,7 @@ fn tensor_record(
     )
 }
 
-fn raw_values(out: &Path, record: &Value) -> Result<Vec<(u32, f32)>, Box<dyn Error>> {
+pub(super) fn raw_values(out: &Path, record: &Value) -> Result<Vec<(u32, f32)>, Box<dyn Error>> {
     let file = record["file"].as_str().ok_or("missing trace file")?;
     let mut bytes = Vec::new();
     std::fs::File::open(out.join(file))?.read_to_end(&mut bytes)?;
@@ -123,7 +123,7 @@ fn raw_values(out: &Path, record: &Value) -> Result<Vec<(u32, f32)>, Box<dyn Err
 }
 
 #[cfg(feature = "native_convt_columns")]
-fn weight_record(
+pub(super) fn weight_record(
     vae: &Yue2Vae,
     out: &Path,
     label: &str,
@@ -172,13 +172,14 @@ fn weight_record(
 }
 
 #[cfg(all(feature = "native_convt_columns", feature = "cuda"))]
-fn native_column_record(
+pub(super) fn native_column_record(
     capture: candle_core::cuda::Yue2NativeConvtColumn,
     out: &Path,
     label: &str,
     slot: &str,
     expected_length: usize,
     weight_sha256: &str,
+    include_math_details: bool,
 ) -> Result<Value, Box<dyn Error>> {
     let dtype = capture.dtype;
     if !matches!(dtype, DType::BF16 | DType::F32)
@@ -210,16 +211,21 @@ fn native_column_record(
     let raw = json!({"file":file,"sha256":hash,"bytes":bytes,"layout":format!("blck_{suffix}"),
         "dtype":format!("{dtype:?}"),"shape":capture.shape});
     let _ = raw_values(out, &raw)?;
-    Ok(
-        json!({"raw":raw,"branch":capture.branch,"gemm":capture.gemm,
+    let mut record = json!({"raw":raw,"branch":capture.branch,"gemm":capture.gemm,
         "kernelLayoutStrides":capture.kernel_layout_strides,
         "mathModeReadback":capture.math_mode_readback,"captureCount":1,
-        "weightSha256":weight_sha256}),
-    )
+        "weightSha256":weight_sha256});
+    if include_math_details {
+        record["bf16ReducedPrecisionAtomic"] = json!(capture.bf16_reduced_precision_atomic);
+        record["effectiveComputeType"] = json!(capture.effective_compute_type);
+        record["handleAddress"] = json!(capture.handle_address);
+        record["streamObjectAddress"] = json!(capture.stream_object_address);
+    }
+    Ok(record)
 }
 
 #[cfg(feature = "native_convt_columns")]
-fn compare_native_contributors(
+pub(super) fn compare_native_contributors(
     out: &Path,
     full: &Value,
     tile: &Value,
@@ -451,7 +457,7 @@ fn waveform_peak(out: &Path, a: &Value, b: &Value) -> Result<f32, Box<dyn Error>
         .fold(0f32, f32::max))
 }
 
-fn tensor_from_record(
+pub(super) fn tensor_from_record(
     record: &Value,
     out: &Path,
     device: &Device,
@@ -564,8 +570,15 @@ fn replay_one(
                 [1, right - left, 1024, 12],
                 || replay().map_err(io_candle),
             )?;
-            let record =
-                native_column_record(capture, out, label, &slot, right - left, weight_sha256)?;
+            let record = native_column_record(
+                capture,
+                out,
+                label,
+                &slot,
+                right - left,
+                weight_sha256,
+                false,
+            )?;
             (output, Some(record))
         }
         #[cfg(not(all(feature = "native_convt_columns", feature = "cuda")))]

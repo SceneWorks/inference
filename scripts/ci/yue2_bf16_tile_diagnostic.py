@@ -19,12 +19,13 @@ import tomllib
 from yue2_precision_proof import (REFERENCE_SHA256, cuda_census, require, sample_cuda,
                                  DECODER_SHA256, sha256, verify_reference, verify_revisions, write_json)
 from yue2_decoder_trace_overlay import tree_digest
+from yue2_native_convt_math_parent import verify_extracted_parent
 
 ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
 LATENT_SHA256 = "f89f02851d08128baa12a3f50cc3e73c80fbb5578797b7c166888dd815dc70c9"
 HISTORICAL_STAGE2_PATH = Path(__file__).parent / "yue2_bf16_tile_diagnostic/historical-stage2.json"
 DIAGNOSTICS = ("waveform", "first_conv", "first_conv_math")
-DIAGNOSTICS += ("decoder_trace", "native_convt_columns")
+DIAGNOSTICS += ("decoder_trace", "native_convt_columns", "native_convt_math_mode")
 
 
 def verify_diagnostic_data(data: Path) -> None:
@@ -400,6 +401,151 @@ def preflight_decoder_trace_resources(evidence: Path, native_columns: bool = Fal
     return result
 
 
+def preflight_native_math_resources(evidence: Path, parent: dict) -> dict:
+    # Two arms, two stage-2 calls, one resident folded BF16 weight. The parent
+    # artifact was already authenticated and extracted outside this evidence dir.
+    weight = parent["records"]["weight"]["bytes"]
+    pair = sum(row["bytes"] for key, row in parent["records"].items() if key != "weight")
+    required_disk = 2 * (weight + 2 * pair)
+    required_host = 4 * weight + 2 * max(row["bytes"] for row in parent["records"].values())
+    disk_free = shutil.disk_usage(evidence).free
+    memory_free = available_physical_memory()
+    receipt = {"diskRequiredBytes": required_disk, "diskFreeBytes": disk_free,
+               "hostScratchRequiredBytes": required_host,
+               "hostMemoryAvailableBytes": memory_free,"parentRunId":parent["runId"]}
+    write_json(evidence / "native-math-resource-preflight.json", receipt)
+    require(disk_free >= required_disk and memory_free >= required_host,
+            "insufficient measured host resources for native stage-2 replay")
+    return receipt
+
+
+def verify_native_math_events(events: list[dict], handle: str, stream: str,
+                              thread: str) -> None:
+    actions = ["before_default_sync", "before_default_get", "after_default_sync", "after_default_get",
+               "before_flag_sync", "before_flag_get", "set_disallow", "read_disallow",
+               "before_restore_sync", "restore_default", "after_restore_sync", "read_restored"]
+    modes = [None, 0, None, 0, None, 0, 16, 16, None, 0, None, 0]
+    require(len(events) == len(actions) and all(
+        event.get("action") == action and event.get("rawMode") == mode and
+        event.get("status") == ("success" if action.endswith("sync") else "CUBLAS_STATUS_SUCCESS") and
+        event.get("handleAddress") == handle and
+        event.get("streamObjectAddress") == stream and event.get("thread") == thread and
+        event.get("deviceOrdinal") == 0 and event.get("bf16ReducedPrecisionAtomic") is False
+        for event, action, mode in zip(events, actions, modes)),
+        "native math-mode same-handle read/set/read/restore proof incomplete")
+
+
+def native_math_array(data: Path, row: dict, files: set[str],
+                      expected: dict | None = None) -> None:
+    name = row.get("file")
+    require(isinstance(name, str) and name == Path(name).name,
+            "native math raw name escaped evidence")
+    shape = row.get("shape")
+    require(isinstance(shape, list) and len(shape) in (3, 4) and
+            all(isinstance(dimension, int) and dimension > 0 for dimension in shape) and
+            row.get("layout") in {"bct_bf16le", "blck_bf16le", "cick_bf16le"} and
+            (len(shape) == 4) == (row.get("layout") == "blck_bf16le") and
+            row.get("dtype") == "BF16", "native math raw dtype/shape/layout changed")
+    elements = math.prod(shape)
+    path = data / name
+    require(path.is_file() and not path.is_symlink() and path.resolve().parent == data.resolve() and
+            row.get("bytes") == path.stat().st_size == elements * 2 and
+            row.get("sha256") == sha256(path), "native math raw array identity changed")
+    if expected is not None:
+        for key in ("sha256", "bytes", "dtype", "shape", "layout", "origin", "coordinateSystem",
+                    "cropPadding"):
+            if key in expected:
+                require(row.get(key) == expected[key], f"native math default changed parent {key}")
+    files.add(name)
+
+
+def verify_native_math_data(data: Path, source_provenance: dict, parent: dict) -> None:
+    report = json.loads((data / "report.json").read_text(encoding="utf-8"))
+    require(report.get("schemaVersion") == 6 and report.get("selector") == "native_convt_math_mode" and
+            report.get("purpose") == "diagnostic_only_no_gate_change" and
+            report.get("engineSha") == ENGINE_SHA and
+            report.get("derivativeSource") == source_provenance and
+            report.get("backend") == "cuda" and report.get("deviceOrdinal") == 0 and
+            report.get("stage") == 2 and report.get("dtype") == "BF16" and
+            report.get("acceptanceSatisfied") is False,
+            "native math diagnostic source/schema changed")
+    proof = json.loads((data.parent / "parent-proof.json").read_text(encoding="utf-8"))
+    require(report.get("parentProof") == proof and
+            report.get("parentAuditSha256") == parent["independentAuditSha256"] and
+            report.get("parentSourceZipSha256") == parent["sourceZipSha256"] and
+            report.get("parentWaveformParity") is True and
+            report.get("parentRawCheckpointsPerDtype") == 198 and
+            report.get("parentHistoricalRecords") == 28,
+            "native math parent proof changed")
+
+    files: set[str] = set()
+    weight = report.get("foldedWeight", {})
+    native_math_array(data, weight, files, parent["records"]["weight"])
+    runs = report.get("runs", {})
+    require(set(runs) == {"default", "disallowReducedPrecision"}, "native math pair absent")
+    mode_event = report.get("mathModeEvents", {})
+    handle = mode_event.get("handleAddress")
+    stream = mode_event.get("streamObjectAddress")
+    thread = mode_event.get("thread")
+    require(all(isinstance(v, str) and v for v in (handle, stream, thread)),
+            "native math handle/stream/thread identity absent")
+    for arm, mode in (("default", 0), ("disallowReducedPrecision", 16)):
+        require(set(runs[arm]) == {"full", "window"}, "native math full/window pair absent")
+        for slot, length in (("full", 75), ("window", 32)):
+            row = runs[arm][slot]
+            require(row.get("weightSha256") == weight["sha256"], "native math folded weight changed")
+            source_key = f"{slot}.replayInput"
+            require(row.get("sourceInput") == parent["records"][f"{slot}.sourceInput"],
+                    "native math source input changed")
+            native_math_array(data, row["replayInput"], files, parent["records"][source_key])
+            native_math_array(data, row["replayOutput"], files,
+                              parent["records"][f"{slot}.replayOutput"]
+                              if arm == "default" else None)
+            if arm == "default":
+                require(row["replayOutput"]["sha256"] ==
+                        parent["records"][f"{slot}.originalOutput"]["sha256"] and
+                        row["replayInput"]["sha256"] ==
+                        parent["records"][f"{slot}.sourceInput"]["sha256"],
+                        "native math default did not bind all historical input/output aliases")
+            native = row["nativeColumn"]
+            require(native.get("branch") == "native_col2im" and native.get("gemm") ==
+                    [1, length, 12288, 2048] and native.get("kernelLayoutStrides") == [0, 12288, 1] and
+                    native.get("mathModeReadback") == mode and
+                    native.get("bf16ReducedPrecisionAtomic") is False and
+                    native.get("effectiveComputeType") == "CUBLAS_COMPUTE_32F" and
+                    native.get("handleAddress") == handle and
+                    native.get("streamObjectAddress") == stream and
+                    native.get("weightSha256") == weight["sha256"] and
+                    native.get("raw", {}).get("shape") == [1, length, 1024, 12],
+                    "native math private GEMM mode/shape/handle changed")
+            native_math_array(data, native["raw"], files,
+                              parent["records"][f"{slot}.nativeColumn"]
+                              if arm == "default" else None)
+            steps = row.get("substeps", [])
+            require([step.get("name") for step in steps] ==
+                    ["native_unpadded_conv_transpose", "cropped", "biased"],
+                    "native math stage-2 substep call order changed")
+            for step in steps:
+                key = f"{slot}.{step['name']}"
+                native_math_array(data, step["capture"], files,
+                                  parent["records"][key] if arm == "default" else None)
+    event_file = data / "native-math-events.jsonl"
+    require(mode_event.get("file") == event_file.name and
+            mode_event.get("sha256") == sha256(event_file) and
+            mode_event.get("bytes") == event_file.stat().st_size,
+            "native math-mode event artifact changed")
+    events = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
+    verify_native_math_events(events, handle, stream, thread)
+    require(set(report.get("nativeContributors", {})) == set(runs) and
+            set(report.get("crossArm", {})) == {"full", "window"},
+            "native math contributor or cross-arm comparisons absent")
+    require(len(files) == 25, "native math raw arrays collided")
+    expected_files = files | {"report.json", "native-math-events.jsonl"}
+    require({path.name for path in data.iterdir()} == expected_files and
+            all(path.is_file() and not path.is_symlink() for path in data.iterdir()),
+            "native math diagnostic has missing or unreferenced arrays")
+
+
 def first_conv_array(data: Path, row: dict, dtype: str, shape: list[int]) -> tuple[list[float], list[int]]:
     require(row.get("dtype") == dtype and row.get("shape") == shape and
             row.get("layout") == "bct_f32le", "first Conv7 tensor dtype, shape, or layout changed")
@@ -719,7 +865,9 @@ def prepare_harness(args: argparse.Namespace) -> None:
     shutil.copy2(template / "src/main.rs", target / "src/main.rs")
     shutil.copy2(template / "src/decoder_trace.rs", target / "src/decoder_trace.rs")
     if native_candle:
+        shutil.copy2(template / "src/native_math.rs", target / "src/native_math.rs")
         shutil.copy2(template / "historical-stage2.json", target / "historical-stage2.json")
+        shutil.copy2(template / "native-convt-math-parent.json", target / "native-convt-math-parent.json")
     write_json(target.parent / "harness-provenance.json", {
         "engine_sha": args.engine_sha, "control_sha": args.control_sha,
         "standalone_lock_sha256": sha256(template / lock_name),
@@ -868,8 +1016,9 @@ def execute(args: argparse.Namespace) -> None:
     require(args.engine_sha == ENGINE_SHA, "diagnostic requires the exact failed M3 source")
     selector = getattr(args, "diagnostic", "waveform")
     require(selector in DIAGNOSTICS, "unknown diagnostic selector")
-    trace = selector in ("decoder_trace", "native_convt_columns")
-    native = selector == "native_convt_columns"
+    trace = selector in ("decoder_trace", "native_convt_columns", "native_convt_math_mode")
+    native = selector in ("native_convt_columns", "native_convt_math_mode")
+    native_math = selector == "native_convt_math_mode"
     overlay = getattr(args, "overlay_root", None)
     native_candle = getattr(args, "native_candle_root", None)
     if trace:
@@ -938,7 +1087,15 @@ def execute(args: argparse.Namespace) -> None:
             for name in ("native-convt-vae-weight.patch", "native-convt-candle-core.patch",
                          "native-convt-candle-kernel-path.patch"):
                 shutil.copy2(overlay.parent / name, args.evidence / name)
-        preflight_decoder_trace_resources(args.evidence, native_columns=native)
+        if native_math:
+            parent_dir = Path(os.environ.get("YUE2_NATIVE_MATH_PARENT", ""))
+            require(parent_dir.is_absolute() and parent_dir.is_dir(),
+                    "authenticated native stage-2 parent directory absent")
+            parent_anchor = verify_extracted_parent(parent_dir)
+            preflight_native_math_resources(args.evidence, parent_anchor)
+            shutil.copy2(parent_dir / "parent-proof.json", args.evidence / "parent-proof.json")
+        else:
+            preflight_decoder_trace_resources(args.evidence, native_columns=native)
     idle_run_id = os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID", "")
     idle_receipt = None
     if trace and idle_run_id:
@@ -965,6 +1122,8 @@ def execute(args: argparse.Namespace) -> None:
     env["YUE2_ENGINE_ROOT"] = str(Path.cwd().resolve())
     if trace:
         env["YUE2_DECODER_TRACE_PROVENANCE"] = str(provenance_path)
+    if native_math:
+        env["YUE2_NATIVE_MATH_PARENT"] = str(parent_dir)
     with (args.evidence / "diagnostic.log").open("w", encoding="utf-8") as log:
         child = subprocess.Popen([str(args.binary), "--diagnostic", selector,
                                   "--reference-dir", str(args.reference),
@@ -1028,7 +1187,10 @@ def execute(args: argparse.Namespace) -> None:
             "diagnostic accelerator release unverified")
     require((data / "report.json").is_file(), "diagnostic residual report absent")
     if trace:
-        verify_decoder_trace_data(data, provenance, native_columns=native)
+        if native_math:
+            verify_native_math_data(data, provenance, parent_anchor)
+        else:
+            verify_decoder_trace_data(data, provenance, native_columns=native)
     elif selector in ("first_conv", "first_conv_math"):
         meta = json.loads(Path("crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json").read_text(encoding="utf-8"))
         if selector == "first_conv_math":

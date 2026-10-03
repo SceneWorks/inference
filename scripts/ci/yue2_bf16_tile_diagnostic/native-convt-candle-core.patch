@@ -1,9 +1,6 @@
 --- a/candle-core/src/cuda_backend/mod.rs
 +++ b/candle-core/src/cuda_backend/mod.rs
-@@ -10,3 +10,132 @@
-     CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
- };
- use half::{bf16, f16};
+@@ -12,0 +13,160 @@
 +use std::cell::RefCell;
 +
 +// Diagnostic-only observation of the actual native ConvTranspose1d GEMM result.
@@ -16,6 +13,10 @@
 +    pub kernel_layout_strides: [usize; 3],
 +    pub dtype: DType,
 +    pub math_mode_readback: u32,
++    pub bf16_reduced_precision_atomic: bool,
++    pub effective_compute_type: &'static str,
++    pub handle_address: String,
++    pub stream_object_address: String,
 +    pub branch: &'static str,
 +}
 +
@@ -23,6 +24,8 @@
 +    expected_dtype: DType,
 +    expected_shape: [usize; 4],
 +    captured: Option<Yue2NativeConvtColumn>,
++    compute_type: Option<&'static str>,
++    compute_calls: usize,
 +}
 +
 +thread_local! {
@@ -53,6 +56,8 @@
 +                expected_dtype,
 +                expected_shape,
 +                captured: None,
++                compute_type: None,
++                compute_calls: 0,
 +            });
 +            true
 +        }
@@ -77,6 +82,20 @@
 +    YUE2_COLUMN_REQUEST.with(|slot| slot.borrow().is_some())
 +}
 +
++fn yue2_note_bf16_compute_type(compute_type: cudarc::cublas::sys::cublasComputeType_t) {
++    YUE2_COLUMN_REQUEST.with(|slot| {
++        if let Some(request) = slot.borrow_mut().as_mut() {
++            request.compute_calls += 1;
++            request.compute_type = Some(if compute_type ==
++                cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F {
++                "CUBLAS_COMPUTE_32F"
++            } else {
++                "CUBLAS_COMPUTE_32F_FAST_16BF"
++            });
++        }
++    });
++}
++
 +fn yue2_capture_native_column(
 +    col: &CudaStorage,
 +    device: &CudaDevice,
@@ -90,14 +109,19 @@
 +                request.expected_dtype,
 +                request.expected_shape,
 +                request.captured.is_some(),
++                request.compute_type,
++                request.compute_calls,
 +            )
 +        })
 +    });
-+    let Some((expected_dtype, expected_shape, already_captured)) = requested else {
++    let Some((expected_dtype, expected_shape, already_captured, compute_type, compute_calls)) = requested else {
 +        return Ok(());
 +    };
 +    if already_captured || col.dtype() != expected_dtype || shape != expected_shape {
 +        crate::bail!("native ConvTranspose1d column call, dtype, or shape changed")
++    }
++    if expected_dtype == DType::BF16 && (compute_calls != 1 || compute_type.is_none()) {
++        crate::bail!("native BF16 GEMM compute type was not observed exactly once")
 +    }
 +    device.synchronize()?;
 +    let mut math_mode = cudarc::cublas::sys::cublasMath_t::CUBLAS_DEFAULT_MATH;
@@ -128,15 +152,16 @@
 +            kernel_layout_strides,
 +            dtype: expected_dtype,
 +            math_mode_readback: math_mode as u32,
++            bf16_reduced_precision_atomic: gemm_reduced_precision_bf16(),
++            effective_compute_type: compute_type.unwrap_or("not_captured_f32"),
++            handle_address: format!("{:p}", *device.blas.handle()),
++            stream_object_address: format!("{:p}", std::sync::Arc::as_ptr(&device.stream)),
 +            branch: "native_col2im",
 +        });
 +    });
 +    Ok(())
 +}
-@@ -1928,12 +2057,22 @@
-                     &kernel_l_mm,
-                 )?
-             };
+@@ -1930,0 +2091,7 @@
 +            yue2_capture_native_column(
 +                &col,
 +                &device,
@@ -144,15 +169,9 @@
 +                [b_size, l_in, c_out * k_size, c_in],
 +                [0, k_size * c_out, 1],
 +            )?;
-             let col_l = Layout::contiguous((b_size, l_in, c_out, k_size));
-             Col2Im1D {
-                 stride: params.stride,
-             }
-             .map(&col.slice, &device, &col_l)?
-         } else {
+@@ -1936,0 +2104,3 @@
 +            if yue2_native_column_pending() {
 +                crate::bail!("requested native ConvTranspose1d used the fallback kernel")
 +            }
-             ConvTranspose1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?
-         };
-         Ok(Self { slice, device })
+@@ -2652,0 +2823 @@
++    yue2_note_bf16_compute_type(compute_type);
