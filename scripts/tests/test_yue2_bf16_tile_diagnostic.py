@@ -442,10 +442,10 @@ class DiagnosticGuards(unittest.TestCase):
     def test_explicit_selector_keeps_waveform_default_and_forwards_to_child(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("default: waveform", workflow)
-        self.assertIn("options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns]", workflow)
+        self.assertIn("options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns, native_convt_math_mode]", workflow)
         self.assertIn('run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR"', workflow)
         self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math",
-                                            "decoder_trace", "native_convt_columns"))
+                                            "decoder_trace", "native_convt_columns", "native_convt_math_mode"))
 
     def test_first_conv_math_conditional_arms_and_restore_receipt(self):
         for applicable in (False, True):
