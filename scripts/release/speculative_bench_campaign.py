@@ -724,7 +724,7 @@ def prepare_without_mtp(source: str, destination: str) -> bool:
             indices.append(relative)
         elif relative == Path("config.json"):
             try:
-                target.write_text(_config_without_mtp(file.read_text(encoding="utf-8")), "utf-8")
+                target.write_text(_config_without_mtp(file.read_text(encoding="utf-8")), encoding="utf-8")
             except ValueError as error:
                 raise CampaignError(f"{file}: {error}") from error
         elif file.suffix == ".safetensors" and any(map(_is_mtp, _safetensors_header(file)[1])):
@@ -747,7 +747,7 @@ def prepare_without_mtp(source: str, destination: str) -> bool:
             # Hugging Face writes it as a float on some checkpoints (Qwen3.6-35B-A3B).
             metadata["total_size"] = type(total)(total - sum(dropped.values()))
         (partial / relative).write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
-    (partial / WITHOUT_MTP_MARKER).write_text(json.dumps(stamp, indent=2) + "\n", "utf-8")
+    (partial / WITHOUT_MTP_MARKER).write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
     os.replace(partial, out)
     return True
 
