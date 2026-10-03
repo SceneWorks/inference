@@ -301,9 +301,12 @@ def collect(profile_dir: Path, evidence: Path, backend: str, app: Path, engine: 
     verdict = {"backend": backend, "cases": rows, "status": "completed",
                "engine_sha": engine_sha, "expected_cuda_bf16_vae_math_policy": cuda_bf16_math_policy,
                "listening_audio": [row["listening_audio"] for row in rows]}
-    if os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "owner-gpu0":
+    scheduling = os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host")
+    if scheduling in {"owner-gpu0", "owner-gpu0-mac-anchor"}:
         require(backend == "cuda", "GPU0 owner scheduling cannot grade Metal")
-        verdict["scheduling_acceptance"] = "provisional-holder-chronology"
+        verdict["scheduling_acceptance"] = ("provisional-mac-anchor-chronology"
+                                             if scheduling == "owner-gpu0-mac-anchor"
+                                             else "provisional-holder-chronology")
         verdict["holder_chronology_file"] = "gpu0-holder-chronology.jsonl"
     (evidence / "audio-inventory.json").write_text(
         json.dumps({"backend": backend, "status": "completed", "cases": verdict["listening_audio"]}, indent=2) + "\n",
@@ -340,7 +343,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
     evidence.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     scheduling = environment.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host")
-    require(scheduling in {"shared-host", "owner-gpu0"} and
+    require(scheduling in {"shared-host", "owner-gpu0", "owner-gpu0-mac-anchor"} and
             (scheduling == "shared-host" or backend == "cuda"), "invalid CUDA owner route")
     environment.pop("HF_HUB_CACHE", None)
     environment.pop("HUGGINGFACE_HUB_CACHE", None)
@@ -368,7 +371,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                 command.extend(("--budget-minutes", "120"))
             for label, argv in (("dry-run", [*command, "--dry-run"]), ("capture", command)):
                 with (evidence / f"{name}-{label}.log").open("w", encoding="utf-8") as log:
-                    if scheduling == "owner-gpu0":
+                    if scheduling in {"owner-gpu0", "owner-gpu0-mac-anchor"}:
                         from yue2_gpu0_owner_guard import guarded_command
                         status = guarded_command(argv, app, environment, log, evidence, f"{name}-{label}")
                     else:

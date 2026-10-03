@@ -677,9 +677,9 @@ def execute(args: argparse.Namespace) -> None:
             if total_deadline is not None:
                 remaining_cuda_budget(total_deadline, int(job_start))
             identity = verify_binary_identity(binary, label, evidence)
-            if scheduling == "owner-gpu0":
+            if scheduling in {"owner-gpu0", "owner-gpu0-mac-anchor"}:
                 from yue2_gpu0_owner_guard import OwnerGuard
-                owner_guard = OwnerGuard(evidence, args.engine_sha, args.control_sha)
+                owner_guard = OwnerGuard(evidence, args.engine_sha, args.control_sha, mode=scheduling)
                 owner_guard.preflight()
             if args.backend == "cuda":
                 # The preceding child's tree and watchdog have released; the
@@ -824,7 +824,7 @@ def main() -> None:
     p.add_argument("--engine-sha", required=True)
     p.add_argument("--control-sha", required=True)
     p.add_argument("--app-sha", default="")
-    p.add_argument("--cuda-scheduling-mode", choices=("shared-host", "owner-gpu0"), default="shared-host")
+    p.add_argument("--cuda-scheduling-mode", choices=("shared-host", "owner-gpu0", "owner-gpu0-mac-anchor"), default="shared-host")
     args = parser.parse_args()
     {"resolve-binary": resolve_binary, "verify-reference": verify_reference, "run": execute}[args.mode](args)
 

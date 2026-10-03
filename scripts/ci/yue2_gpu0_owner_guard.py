@@ -1,4 +1,4 @@
-"""Opt-in, provisional GPU0 proof while one exact old-group GPU1 holder runs.
+"""Opt-in, provisional GPU0 proof under an exact old-group barrier.
 
 Not a physical lease: polling bounds detection only. Root must exclude out-of-group
 jobs and independently authenticate server job chronology after BOTH jobs finish.
@@ -46,6 +46,21 @@ SOURCE_HASHES = {
     "scripts/ci/real-weights/candle-decode-speedups-bench/run-every-matrix-row.cmd": "157eb7ad92dcb1330e9dcbf8194ead42a262baf2723a3ab0b0f21a15b8a64756",
     "scripts/release/speculative_bench_campaign.py": "97b188879d5d8c5049b6490d146d6e6e670c278beb483fc4ab357019442c9b01",
 }
+MAC_RUN = 37127726908
+MAC_JOB = 111274364563
+MAC_SHA = "6cca130b55939e1223261a82b9eeaea876a9ba6b"
+MAC_NAME = "MLX Qwen-Image 2.1 LoRA/LoKr real weights"
+MAC_RUNNER = "nax-macos-2"
+MAC_RUNNER_ID = 5281
+MAC_STARTED = "2026-10-03T19:20:01Z"
+MAC_CREATED = "2026-10-03T13:53:28Z"
+PENDING_RUN = 37147597273
+PENDING_SHA = "0826a16cf7f2144b86d88c01b95fffb4e447884d"
+PENDING_CREATED = "2026-10-03T19:21:31Z"
+MAC_WORKFLOW_SHA256 = "62cbce54ddeb51c59e0bfc0b402b77ba40ac2f9473413302aad0548b243e6484"
+PENDING_WORKFLOW_SHA256 = "6d586177edd06a208d0bc72ed86e16eb207e2bf82b2c259ff7217a1d8a21f757"
+# Five full metadata reads plus one direct heartbeat and two Windows queries.
+MAC_CYCLE_LIMIT_SECONDS = 6 * API_TIMEOUT + 2 * PHYSICAL_QUERY_TIMEOUT + 10
 
 
 def require(ok: bool, message: str) -> None:
@@ -116,6 +131,25 @@ def active_group(payload: dict, group: str, run_id: int) -> None:
             active[0].get("job_id") is None and
             all(m.get("status") in {"pending", "in_progress", "queued"} for m in members),
             "exact workflow is no longer sole active group holder")
+
+
+def pending_identity(value: dict) -> None:
+    require(value.get("id") == PENDING_RUN and value.get("head_sha") == PENDING_SHA and
+            value.get("run_attempt") == 1 and value.get("event") == "workflow_dispatch" and
+            value.get("path") == ".github/workflows/real-weights.yml" and
+            value.get("repository", {}).get("full_name") == REPO and
+            value.get("created_at") == PENDING_CREATED and
+            value.get("status") == "pending" and value.get("conclusion") is None,
+            "exact pending old-group run changed or started")
+
+
+def mac_group_barrier(payload: dict) -> None:
+    members = payload.get("group_members", [])
+    require(payload.get("group_name") == OLD_GROUP and payload.get("total_count") == 2 and
+            len(members) == 2 and
+            {(member.get("run_id"), member.get("status"), member.get("job_id"))
+             for member in members} == {(MAC_RUN, "in_progress", None), (PENDING_RUN, "pending", None)},
+            "exact Mac-active/pending concurrency barrier changed")
 
 
 def owned_descendants(root_pid: int, record=None) -> set[int]:
@@ -308,9 +342,12 @@ def gpu0_actors(child_pid: int | None, descendants: bool = False, record=None, b
 
 
 class OwnerGuard:
-    def __init__(self, evidence: Path, engine_sha: str, control_sha: str, kind: str = "engine"):
+    def __init__(self, evidence: Path, engine_sha: str, control_sha: str, kind: str = "engine",
+                 mode: str = "owner-gpu0"):
         self.kind = kind
         require(kind in {"engine", "app"}, "unknown guarded workflow")
+        require(mode in {"owner-gpu0", "owner-gpu0-mac-anchor"}, "unknown GPU0 owner route")
+        self.mode = mode
         self.path = evidence / "gpu0-holder-chronology.jsonl"
         self.engine_sha = engine_sha
         self.control_sha = control_sha
@@ -333,6 +370,9 @@ class OwnerGuard:
     def holder(self, child=None) -> None:
         start = time.monotonic()
         self.cycle_started = start
+        if self.mode == "owner-gpu0-mac-anchor":
+            self.mac_holder(child, start)
+            return
         # One job heartbeat per 10s; full metadata at most once per 60s.
         # <=360+180 requests/hour steady, leaving budget for per-command setup.
         if self.metadata_checked is None or start - self.metadata_checked >= METADATA_SECONDS:
@@ -361,10 +401,50 @@ class OwnerGuard:
         self.record({"event": "gpu0_actors", "owned_pid": child_pid, "raw": raw})
         require(time.monotonic() - start <= CYCLE_LIMIT_SECONDS, "holder observation cycle stale")
 
+    def mac_holder(self, child, start: float) -> None:
+        # The pending run's backend is unknown. Its exact old-group scheduler
+        # barrier is authenticated on every full readback, never inferred from
+        # a job name or a momentary empty Windows process list.
+        if self.metadata_checked is None or start - self.metadata_checked >= METADATA_SECONDS:
+            reads = [api(f"actions/runs/{MAC_RUN}"),
+                     api(f"actions/runs/{MAC_RUN}/attempts/1/jobs?per_page=100"),
+                     api(f"actions/runs/{PENDING_RUN}"),
+                     api(f"actions/runs/{PENDING_RUN}/attempts/1/jobs?per_page=100"),
+                     api(f"actions/concurrency_groups/{OLD_GROUP}")]
+            self.record({"event": "mac_anchor_readback", "reads": reads})
+            run_identity(reads[0]["body"], MAC_RUN, MAC_SHA, ".github/workflows/real-weights.yml")
+            require(reads[0]["body"].get("created_at") == MAC_CREATED,
+                    "Mac anchor creation identity changed")
+            selected = selected_job(reads[1]["body"], MAC_JOB, MAC_NAME, MAC_RUNNER)
+            require(reads[1]["body"].get("total_count") == 55 and
+                    selected.get("runner_id") == MAC_RUNNER_ID and selected.get("started_at") == MAC_STARTED and
+                    selected.get("run_id") == MAC_RUN and selected.get("run_attempt") == 1 and
+                    selected.get("head_sha") == MAC_SHA and selected.get("workflow_name") == "Real-weight validation",
+                    "Mac anchor job inventory/runner/start changed")
+            pending_identity(reads[2]["body"])
+            require(reads[3]["body"].get("total_count") == 0 and reads[3]["body"].get("jobs") == [],
+                    "pending old-group run acquired jobs")
+            mac_group_barrier(reads[4]["body"])
+            self.metadata_checked = start
+        heartbeat = api(f"actions/jobs/{MAC_JOB}")
+        self.record({"event": "mac_anchor_job_heartbeat", "read": heartbeat})
+        job = heartbeat["body"]
+        selected_job({"total_count": 1, "jobs": [job]}, MAC_JOB, MAC_NAME, MAC_RUNNER)
+        require(job.get("run_id") == MAC_RUN and job.get("run_attempt") == 1 and
+                job.get("head_sha") == MAC_SHA and job.get("workflow_name") == "Real-weight validation" and
+                job.get("runner_id") == MAC_RUNNER_ID and job.get("started_at") == MAC_STARTED,
+                "Mac anchor heartbeat identity or liveness changed")
+        child_pid = child.pid if child is not None and child.poll() is None else None
+        raw = gpu0_actors(child_pid, descendants=self.descendants, record=self.record, background=self.background)
+        self.record({"event": "gpu0_actors", "owned_pid": child_pid, "raw": raw})
+        require(time.monotonic() - start <= MAC_CYCLE_LIMIT_SECONDS,
+                "Mac anchor observation cycle stale")
+
     def preflight(self) -> None:
-        self.record({"event": "preflight_started", "kind": self.kind,
+        self.record({"event": "preflight_started", "kind": self.kind, "mode": self.mode,
                      "engine_sha": self.engine_sha, "control_sha": self.control_sha,
-                     "holder_run_id": HOLDER_RUN, "holder_job_id": HOLDER_JOB})
+                     "holder_run_id": MAC_RUN if self.mode == "owner-gpu0-mac-anchor" else HOLDER_RUN,
+                     "holder_job_id": MAC_JOB if self.mode == "owner-gpu0-mac-anchor" else HOLDER_JOB})
         try:
             self._preflight()
         except BaseException as error:
@@ -405,13 +485,17 @@ class OwnerGuard:
                      ("yue2-precision-proof.yml" if self.kind == "engine" else "yue2-app-precision-profile.yml"))
         self.proof_job = selected_job(jobs["body"], None, "cuda", os.environ["RUNNER_NAME"])
         active_group(group["body"], GPU0_GROUP, own_id)
-        for path, digest in SOURCE_HASHES.items():
-            source = api(f"contents/{path}?ref={HOLDER_SHA}")
+        sources = ([(path, digest, HOLDER_SHA) for path, digest in SOURCE_HASHES.items()]
+                   if self.mode == "owner-gpu0" else
+                   [(".github/workflows/real-weights.yml", MAC_WORKFLOW_SHA256, MAC_SHA),
+                    (".github/workflows/real-weights.yml", PENDING_WORKFLOW_SHA256, PENDING_SHA)])
+        for path, digest, source_sha in sources:
+            source = api(f"contents/{path}?ref={source_sha}")
             self.record({"event": "holder_source", "read": source})
             body = source["body"]
             require(body.get("path") == path and body.get("encoding") == "base64" and
                     hashlib.sha256(base64.b64decode(body.get("content", ""))).hexdigest() == digest,
-                    "foreign GPU1 workflow/driver source is not the reviewed exact bytes")
+                    "foreign scheduling-barrier source is not the reviewed exact bytes")
         self.holder(None)  # Last action before Popen; retains the existing full fresh29 preflight.
 
     def arm(self) -> None:
@@ -448,12 +532,27 @@ class OwnerGuard:
             signal.signal(number, handler)
         self.signals.clear()
         if self.thread is not None:
-            self.thread.join(timeout=CYCLE_LIMIT_SECONDS + 2)
+            self.thread.join(timeout=(MAC_CYCLE_LIMIT_SECONDS if self.mode == "owner-gpu0-mac-anchor"
+                                      else CYCLE_LIMIT_SECONDS) + 2)
             require(not self.thread.is_alive(), "holder watchdog did not release")
         require(not self.failed.is_set(), f"holder watchdog refused: {self.fault}")
         self.holder(None)
 
     def summary(self) -> dict:
+        if self.mode == "owner-gpu0-mac-anchor":
+            return {"mode": self.mode, "acceptance": "provisional-mac-anchor-chronology",
+                    "anchor_run_id": MAC_RUN, "anchor_job_id": MAC_JOB, "anchor_attempt": 1,
+                    "anchor_sha": MAC_SHA, "pending_run_id": PENDING_RUN, "pending_sha": PENDING_SHA,
+                    "proof_job": self.proof_job, "fault": self.fault,
+                    "poll_seconds": POLL_SECONDS, "api_timeout_seconds": API_TIMEOUT,
+                    "physical_query_timeout_seconds": PHYSICAL_QUERY_TIMEOUT,
+                    "cycle_limit_seconds": MAC_CYCLE_LIMIT_SECONDS,
+                    "metadata_interval_seconds": METADATA_SECONDS,
+                    "maximum_group_detection_seconds": METADATA_SECONDS + POLL_SECONDS + MAC_CYCLE_LIMIT_SECONDS,
+                    "steady_requests_per_hour_upper_bound": 360 + 300,
+                    "maximum_detection_seconds": POLL_SECONDS + MAC_CYCLE_LIMIT_SECONDS,
+                    "chronology_file": self.path.name,
+                    "final_acceptance_requires": "Independent authenticated same-attempt Mac job completed_at strictly after the entire owned proof job completed_at, exact 54 skipped jobs, and exact pending old-group run still blocked throughout; polling is not a lease."}
         return {"mode": "owner-gpu0", "acceptance": "provisional-holder-chronology",
                 "holder_run_id": HOLDER_RUN, "holder_job_id": HOLDER_JOB, "holder_attempt": 1,
                 "holder_sha": HOLDER_SHA, "proof_job": self.proof_job, "fault": self.fault,
@@ -486,7 +585,8 @@ def wait(child, guard: OwnerGuard, timeout: float) -> tuple[int | None, bool, st
     deadline = time.monotonic() + timeout
     try:
         while True:
-            if guard.cycle_started is not None and time.monotonic() - guard.cycle_started > CYCLE_LIMIT_SECONDS + POLL_SECONDS:
+            cycle_limit = MAC_CYCLE_LIMIT_SECONDS if isinstance(guard, OwnerGuard) and guard.mode == "owner-gpu0-mac-anchor" else CYCLE_LIMIT_SECONDS
+            if guard.cycle_started is not None and time.monotonic() - guard.cycle_started > cycle_limit + POLL_SECONDS:
                 guard.fault = "holder watchdog exceeded bounded observation deadline"
                 guard.failed.set()
             if guard.failed.is_set():
@@ -507,7 +607,8 @@ def wait(child, guard: OwnerGuard, timeout: float) -> tuple[int | None, bool, st
 
 def guarded_command(argv: list[str], cwd: Path, env: dict, log, evidence: Path, label: str) -> int:
     """Wrap only an explicitly opted-in app-owned tree; preserve command bytes/cases."""
-    guard = OwnerGuard(evidence, os.environ["EXPECTED_ENGINE_SHA"], os.environ["EXPECTED_CONTROL_SHA"], "app")
+    mode = env.get("YUE2_CUDA_SCHEDULING_MODE", "owner-gpu0")
+    guard = OwnerGuard(evidence, os.environ["EXPECTED_ENGINE_SHA"], os.environ["EXPECTED_CONTROL_SHA"], "app", mode)
     guard.preflight()
     stamp = os.environ.get("YUE2_APP_PRECISION_JOB_STARTED_UTC_NS", "")
     require(stamp.isdigit() and int(stamp) <= time.time_ns(), "app owned job start is unavailable")
@@ -548,7 +649,7 @@ def main() -> None:
     require(args.argv and args.argv[0] == "--" and len(args.argv) > 1, "guard requires explicit owned command")
     args.evidence.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    if env.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "owner-gpu0":
+    if env.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") in {"owner-gpu0", "owner-gpu0-mac-anchor"}:
         code = guarded_command(args.argv[1:], Path.cwd(), env, None, args.evidence, args.label)
     else:
         require(env.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "shared-host", "unknown scheduling mode")

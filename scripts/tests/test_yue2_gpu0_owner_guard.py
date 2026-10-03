@@ -77,10 +77,10 @@ class OwnerGuardTests(unittest.TestCase):
             self.assertEqual(settings["queue"], "max")
             self.assertEqual(settings["cancel-in-progress"], "false")
             for stage in ("fixture", "cuda", "metal", "cuda-diagnostic", "", "unknown"):
-                for mode in ("shared-host", "owner-gpu0", "", "unknown"):
+                for mode in ("shared-host", "owner-gpu0", "owner-gpu0-mac-anchor", "", "unknown"):
                     for receipt in (guard.RECEIPT, "37122359802", "37106146499", "", "arbitrary"):
                         for engine in (guard.ENGINE, "a" * 40):
-                            opted = stage == "cuda" and mode == "owner-gpu0" and receipt == guard.RECEIPT and engine == guard.ENGINE
+                            opted = stage == "cuda" and mode in {"owner-gpu0", "owner-gpu0-mac-anchor"} and receipt == guard.RECEIPT and engine == guard.ENGINE
                             actual = routes.PrecisionControlTests.concurrency_group(settings["group"], stage, "101", mode, receipt, engine)
                             if opted:
                                 expected = guard.GPU0_GROUP
@@ -450,6 +450,49 @@ class OwnerGuardTests(unittest.TestCase):
             with patch.object(guard.subprocess, "run", return_value=Mock(stdout="dirty")), self.assertRaises(RuntimeError):
                 owner.preflight()
 
+    def test_mac_preflight_authenticates_both_foreign_workflow_revisions_before_launch(self):
+        environ = {"GITHUB_RUN_ID": "8888", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "cuda",
+                   "GITHUB_REPOSITORY": guard.REPO, "GITHUB_SHA": "a" * 40,
+                   "GITHUB_WORKSPACE": "/workspace", "RUNNER_NAME": "cuda-windows",
+                   "YUE2_IDLE_CONTEXT_RUN_ID": guard.RECEIPT, "CUDA_VISIBLE_DEVICES": "0",
+                   "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+        bytes_by_sha = {guard.MAC_SHA: b"reviewed mac workflow",
+                        guard.PENDING_SHA: b"reviewed pending workflow"}
+        digest_by_sha = {sha: hashlib.sha256(data).hexdigest() for sha, data in bytes_by_sha.items()}
+        def read(path):
+            if path == "actions/runs/8888":
+                body = run(8888, "a" * 40, ".github/workflows/yue2-precision-proof.yml")
+            elif path == "actions/runs/8888/attempts/1/jobs?per_page=100":
+                body = jobs(999, "cuda", "cuda-windows")
+            elif path == f"actions/concurrency_groups/{guard.GPU0_GROUP}":
+                body = group(guard.GPU0_GROUP, 8888)
+            else:
+                sha = path.split("?ref=")[1]
+                body = {"path": ".github/workflows/real-weights.yml", "encoding": "base64",
+                        "content": base64.b64encode(bytes_by_sha[sha]).decode()}
+            return {"body": body}
+        def git(argv, **kwargs):
+            return Mock(stdout=(guard.ENGINE if argv[2].endswith("/engine") else "a" * 40)
+                        if argv[-1] == "HEAD" else "")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, environ), \
+             patch.object(guard, "IS_WINDOWS", True), \
+             patch.object(guard, "MAC_WORKFLOW_SHA256", digest_by_sha[guard.MAC_SHA]), \
+             patch.object(guard, "PENDING_WORKFLOW_SHA256", digest_by_sha[guard.PENDING_SHA]), \
+             patch.object(guard, "reviewed_background", return_value=background()), \
+             patch.object(guard.subprocess, "run", side_effect=git), \
+             patch.object(guard, "api", side_effect=read) as api:
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40,
+                                     mode="owner-gpu0-mac-anchor")
+            with patch.object(owner, "holder"):
+                owner.preflight()
+                self.assertEqual(api.call_count, 5)
+                self.assertTrue(any(call.args[0].endswith("?ref=" + guard.MAC_SHA)
+                                    for call in api.call_args_list))
+                self.assertTrue(any(call.args[0].endswith("?ref=" + guard.PENDING_SHA)
+                                    for call in api.call_args_list))
+                with patch.object(guard, "PENDING_WORKFLOW_SHA256", "0" * 64), self.assertRaises(RuntimeError):
+                    owner.preflight()
+
     def test_failed_preflight_never_spawns_app_and_token_is_not_in_owned_child(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
             "EXPECTED_ENGINE_SHA": guard.ENGINE, "EXPECTED_CONTROL_SHA": "a" * 40,
@@ -469,6 +512,23 @@ class OwnerGuardTests(unittest.TestCase):
             self.assertEqual(launch.call_args.args[0], ["node", "unchanged-case"])
             self.assertEqual(launch.call_args.kwargs["env"], {"CUDA_VISIBLE_DEVICES": "0"})
             self.assertIn("provisional-holder-chronology", (evidence / "gpu0-holder-chronology.jsonl").read_text(encoding="utf-8"))
+
+    def test_app_mac_route_uses_forwarded_environment_and_refuses_before_child(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "EXPECTED_ENGINE_SHA": guard.ENGINE, "EXPECTED_CONTROL_SHA": "a" * 40}):
+            evidence = Path(directory)
+            seen = []
+            def refuse(owner):
+                seen.append(owner.mode)
+                raise RuntimeError("Mac barrier lost")
+            with patch.object(guard.OwnerGuard, "preflight", refuse), \
+                 patch.object(guard.subprocess, "Popen") as launch, \
+                 self.assertRaisesRegex(RuntimeError, "Mac barrier lost"):
+                guard.guarded_command(["node", "unchanged-case"], evidence,
+                                      {"YUE2_CUDA_SCHEDULING_MODE": "owner-gpu0-mac-anchor"},
+                                      None, evidence, "case")
+            launch.assert_not_called()
+            self.assertEqual(seen, ["owner-gpu0-mac-anchor"])
 
     def test_expired_app_job_tail_refuses_before_popen(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
@@ -541,6 +601,77 @@ class OwnerGuardTests(unittest.TestCase):
             self.assertEqual(summary["maximum_detection_seconds"], 65)
             self.assertEqual(summary["maximum_group_detection_seconds"], 125)
             self.assertEqual(summary["steady_requests_per_hour_upper_bound"], 540)
+            mac = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40,
+                                   mode="owner-gpu0-mac-anchor").summary()
+            self.assertEqual(mac["acceptance"], "provisional-mac-anchor-chronology")
+            self.assertEqual(mac["pending_run_id"], guard.PENDING_RUN)
+            self.assertIn("strictly after the entire owned proof job", mac["final_acceptance_requires"])
+
+    def test_mac_anchor_exact_barrier_and_pending_mutations_refuse(self):
+        pending = run(guard.PENDING_RUN, guard.PENDING_SHA)
+        pending.update(created_at=guard.PENDING_CREATED, status="pending")
+        group = {"group_name": guard.OLD_GROUP, "total_count": 2, "group_members": [
+            {"run_id": guard.MAC_RUN, "status": "in_progress"},
+            {"run_id": guard.PENDING_RUN, "status": "pending"}]}
+        guard.pending_identity(pending)
+        guard.mac_group_barrier(group)
+        for key, value in {"id": 1, "head_sha": "0" * 40, "run_attempt": 2,
+                           "created_at": "other", "status": "queued",
+                           "conclusion": "success", "path": "other.yml"}.items():
+            changed = {**pending, key: value}
+            with self.subTest(pending=key), self.assertRaises(RuntimeError):
+                guard.pending_identity(changed)
+        for mutate in (lambda x: x.update(total_count=3),
+                       lambda x: x["group_members"][0].update(status="completed"),
+                       lambda x: x["group_members"][1].update(status="in_progress"),
+                       lambda x: x["group_members"][1].update(run_id=99),
+                       lambda x: x["group_members"].append({"run_id": 99, "status": "pending"})):
+            changed = copy.deepcopy(group); mutate(changed)
+            with self.assertRaises(RuntimeError):
+                guard.mac_group_barrier(changed)
+
+    def test_mac_anchor_heartbeat_inventory_and_network_refuse_before_gpu_query(self):
+        mac = run(guard.MAC_RUN, guard.MAC_SHA)
+        mac["created_at"] = guard.MAC_CREATED
+        pending = run(guard.PENDING_RUN, guard.PENDING_SHA)
+        pending.update(created_at=guard.PENDING_CREATED, status="pending")
+        inventory = jobs(guard.MAC_JOB, guard.MAC_NAME, guard.MAC_RUNNER)
+        selected = inventory["jobs"][0]
+        selected.update(runner_id=guard.MAC_RUNNER_ID, started_at=guard.MAC_STARTED,
+                        run_id=guard.MAC_RUN, run_attempt=1, head_sha=guard.MAC_SHA,
+                        workflow_name="Real-weight validation")
+        group = {"group_name": guard.OLD_GROUP, "total_count": 2, "group_members": [
+            {"run_id": guard.MAC_RUN, "status": "in_progress"},
+            {"run_id": guard.PENDING_RUN, "status": "pending"}]}
+        responses = [mac, inventory, pending, {"total_count": 0, "jobs": []}, group, selected]
+        with tempfile.TemporaryDirectory() as directory:
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40,
+                                     mode="owner-gpu0-mac-anchor")
+            with patch.object(guard, "api", side_effect=[{"body": value} for value in responses]) as api, \
+                 patch.object(guard, "gpu0_actors", return_value="typed GPU0"):
+                owner.holder()
+                self.assertEqual(api.call_count, 6)
+            with patch.object(guard, "api", return_value={"body": selected}) as api, \
+                 patch.object(guard, "gpu0_actors", return_value="typed GPU0"):
+                owner.holder()
+                api.assert_called_once_with(f"actions/jobs/{guard.MAC_JOB}")
+            for index, mutation in ((0, lambda x: x.update(status="completed")),
+                                    (1, lambda x: x["jobs"][1].update(conclusion=None)),
+                                    (2, lambda x: x.update(status="in_progress")),
+                                    (3, lambda x: x.update(total_count=1)),
+                                    (4, lambda x: x["group_members"][1].update(run_id=99)),
+                                    (5, lambda x: x.update(runner_id=99))):
+                bad = copy.deepcopy(responses); mutation(bad[index])
+                owner.metadata_checked = None
+                with self.subTest(index=index), patch.object(guard, "api", side_effect=[{"body": value} for value in bad]), \
+                     patch.object(guard, "gpu0_actors") as physical, self.assertRaises(RuntimeError):
+                    owner.holder()
+                physical.assert_not_called()
+            owner.metadata_checked = None
+            with patch.object(guard, "api", side_effect=TimeoutError("API fault")), \
+                 patch.object(guard, "gpu0_actors") as physical, self.assertRaises(TimeoutError):
+                owner.holder()
+            physical.assert_not_called()
 
 
 if __name__ == "__main__": unittest.main()
