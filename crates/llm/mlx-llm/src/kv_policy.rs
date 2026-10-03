@@ -39,6 +39,14 @@ pub(crate) fn family_for(campaign_family: Option<&str>) -> Option<KvModelFamily>
     }
 }
 
+/// The campaign identity of a table family: the inverse of [`family_for`].
+pub(crate) const fn campaign_family(family: KvModelFamily) -> &'static str {
+    match family {
+        KvModelFamily::Llama => "llama",
+        KvModelFamily::Qwen3 => "qwen",
+    }
+}
+
 /// Why the fused reader cannot serve this decoder's attention, before any cache is built.
 pub(crate) fn geometry_refusal(cfg: &ModelConfig) -> Option<String> {
     let head_dim = usize::try_from(cfg.head_dim).unwrap_or(0);
@@ -340,6 +348,9 @@ mod tests {
         assert_eq!(family_for(Some("qwen")), Some(KvModelFamily::Qwen3));
         assert_eq!(family_for(Some("gemma")), None);
         assert_eq!(family_for(None), None);
+        for family in [KvModelFamily::Llama, KvModelFamily::Qwen3] {
+            assert_eq!(family_for(Some(campaign_family(family))), Some(family));
+        }
     }
 
     /// Every advertised format is the 8-bit, group-32 packed cache the fused reader reads.

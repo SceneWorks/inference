@@ -62,11 +62,17 @@ fn tokenizer_json() -> String {
 }
 
 fn write_snapshot() -> Fixture {
+    write_snapshot_with("", false)
+}
+
+/// The tiny synthetic snapshot with `identity` (extra leading `config.json` fields, each followed
+/// by a comma) and, for a Qwen3 decoder, unit per-head q/k RMSNorm weights.
+fn write_snapshot_with(identity: &str, qk_norm: bool) -> Fixture {
     let fixture = Fixture::new("candle-llm-conformance-", None);
     let dir = &*fixture;
     // eos_token_id outside the vocab so generation always runs to the token budget.
     let config = format!(
-        r#"{{
+        r#"{{ {identity}
             "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
             "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": {VOCAB},
             "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "tie_word_embeddings": false,
@@ -93,6 +99,10 @@ fn write_snapshot() -> Fixture {
         arrays.insert(p("mlp.gate_proj.weight"), randn((inter, h), &mut rng));
         arrays.insert(p("mlp.up_proj.weight"), randn((inter, h), &mut rng));
         arrays.insert(p("mlp.down_proj.weight"), randn((h, inter), &mut rng));
+        if qk_norm {
+            arrays.insert(p("self_attn.q_norm.weight"), ones(qd / 2));
+            arrays.insert(p("self_attn.k_norm.weight"), ones(qd / 2));
+        }
     }
     candle_core::safetensors::save(&arrays, dir.join("model.safetensors")).unwrap();
     fixture
@@ -414,5 +424,188 @@ fn gguf_resolves_through_load_for_model_and_probe_is_weightless() {
     assert!(
         candle_llm::provider::can_load(&tspec),
         "header-only (tensor-data-truncated) GGUF must still resolve — the probe is weightless"
+    );
+}
+
+// ---- sc-20683: compressed-KV policy parity (Candle runs dense, with the shared reason) ----
+
+const LLAMA_IDENTITY: &str = r#""architectures": ["LlamaForCausalLM"], "model_type": "llama","#;
+const QWEN3_IDENTITY: &str = r#""architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3","#;
+const MISTRAL_IDENTITY: &str =
+    r#""architectures": ["MistralForCausalLM"], "model_type": "mistral","#;
+
+fn load_kv_provider(identity: &str, qk_norm: bool) -> (Fixture, LlamaProvider) {
+    let dir = write_snapshot_with(identity, qk_norm);
+    let provider = LlamaProvider::load(&LoadSpec::dense(dir.to_str().unwrap().to_string()))
+        .expect("load synthetic provider");
+    (dir, provider)
+}
+
+/// AC2: the cross-backend compressed-KV conformance table (`core_llm_testkit::kv_policy_cases`) run
+/// through Candle's production plan — the same table MLX's plan passes with its fused reader. Every
+/// request reaches MLX's policy decision and reason, except that a request MLX runs compressed
+/// reports `ReaderUnavailable` here; no report claims a compressed format or counter.
+#[test]
+fn candle_kv_plan_conforms_to_the_cross_backend_policy_table() {
+    use core_llm::KvModelFamily;
+    use core_llm_testkit::{kv_policy_conformance, KvBackendDecision, KvReader};
+    let (_llama_dir, llama) = load_kv_provider(LLAMA_IDENTITY, false);
+    let (_qwen_dir, qwen) = load_kv_provider(QWEN3_IDENTITY, true);
+    // Mistral loads through the Llama decoder but is not a table family.
+    let (_mistral_dir, mistral) = load_kv_provider(MISTRAL_IDENTITY, false);
+    assert_eq!(llama.kv_model_family(), Some(KvModelFamily::Llama));
+    assert_eq!(qwen.kv_model_family(), Some(KvModelFamily::Qwen3));
+    assert_eq!(mistral.kv_model_family(), None);
+    kv_policy_conformance(KvReader::Unavailable, |case| {
+        let provider = match case.family {
+            Some(KvModelFamily::Llama) => &llama,
+            Some(KvModelFamily::Qwen3) => &qwen,
+            None => &mistral,
+        };
+        KvBackendDecision::Dense(provider.kv_cache_plan(
+            case.policy,
+            case.context_tokens,
+            case.max_new_tokens,
+            case.batch,
+            case.multimodal,
+        ))
+    });
+}
+
+/// AC1 through the production entry point: every generation reports a dense cache with the shared
+/// reason — `PolicyDisabled` un-opted, the table's refusal for a short context or an unnamed
+/// family — and opting in changes nothing about what Candle generates.
+#[test]
+fn candle_generations_report_the_dense_cache_and_generate_unchanged() {
+    use core_llm::{KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy};
+    let generate = |provider: &LlamaProvider, policy| {
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t5 t6 t7 t8")],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 8,
+            seed: Some(0),
+            kv_compression: policy,
+            ..Default::default()
+        };
+        core_llm::TextLlm::generate(provider, &request, &mut |_| {}).unwrap()
+    };
+    let (_qwen_dir, qwen) = load_kv_provider(QWEN3_IDENTITY, true);
+    let off = generate(&qwen, Policy::Off);
+    let opted_in = generate(&qwen, Policy::Qualified);
+    assert_eq!(
+        off.kv_cache,
+        Some(KvCacheReport::dense(Reason::PolicyDisabled, None))
+    );
+    assert_eq!(
+        opted_in.kv_cache,
+        Some(KvCacheReport::dense(Reason::BelowMinimumContext, None))
+    );
+    assert_eq!(
+        (opted_in.text.as_str(), opted_in.usage),
+        (off.text.as_str(), off.usage)
+    );
+    let (_mistral_dir, mistral) = load_kv_provider(MISTRAL_IDENTITY, false);
+    assert_eq!(
+        generate(&mistral, Policy::Qualified).kv_cache,
+        Some(KvCacheReport::dense(Reason::UnqualifiedModel, None))
+    );
+}
+
+/// AC1: a generation at Qwen3's qualified minimum context — one MLX runs on the fused compressed
+/// reader — runs dense on Candle as `ReaderUnavailable`, claims no compressed format or counter,
+/// and generates exactly what the un-opted request does.
+#[test]
+fn a_qualified_candle_generation_runs_dense_as_reader_unavailable() {
+    use core_llm::{
+        KvCacheCounters, KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy,
+        KvModelFamily, KV_COMPRESSION_QUALIFICATIONS,
+    };
+    let min = KV_COMPRESSION_QUALIFICATIONS
+        .iter()
+        .find(|row| row.family == KvModelFamily::Qwen3)
+        .unwrap()
+        .min_context_tokens;
+    let identity = format!(
+        "{QWEN3_IDENTITY} \"max_position_embeddings\": {},",
+        min + 1024
+    );
+    let (_dir, qwen) = load_kv_provider(&identity, true);
+    let words = (0..min)
+        .map(|i| format!("t{}", i % 26 + 6))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let generate = |policy| {
+        let request = TextLlmRequest {
+            messages: vec![Message::user(words.clone())],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            kv_compression: policy,
+            ..Default::default()
+        };
+        core_llm::TextLlm::generate(&qwen, &request, &mut |_| {}).unwrap()
+    };
+    let off = generate(Policy::Off);
+    let opted_in = generate(Policy::Qualified);
+    assert!(u64::from(opted_in.usage.prompt_tokens) >= min);
+    let report = opted_in
+        .kv_cache
+        .clone()
+        .expect("Candle reports its KV cache");
+    assert_eq!(report.fallback, Some(Reason::ReaderUnavailable));
+    assert!(report
+        .detail
+        .as_deref()
+        .is_some_and(|d| d.contains("Candle")));
+    assert_eq!(report.format, None);
+    assert_eq!(report.counters, KvCacheCounters::default());
+    assert!(!report.ran_compressed());
+    assert_eq!(
+        (opted_in.text.as_str(), opted_in.usage),
+        (off.text.as_str(), off.usage)
+    );
+}
+
+/// AC1: Candle bounds the final context like MLX — a qualified-length prompt whose token budget
+/// reaches past the evidenced window reports the table's `AboveQualifiedContext`, not
+/// `ReaderUnavailable`.
+#[test]
+fn a_candle_token_budget_past_the_qualified_window_reports_the_table_refusal() {
+    use core_llm::{
+        KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        KvModelFamily, KV_COMPRESSION_QUALIFICATIONS,
+    };
+    let row = KV_COMPRESSION_QUALIFICATIONS
+        .iter()
+        .find(|row| row.family == KvModelFamily::Qwen3)
+        .unwrap();
+    let max = row
+        .max_context_tokens
+        .expect("the Qwen3 row bounds its window");
+    let identity = format!(
+        "{QWEN3_IDENTITY} \"max_position_embeddings\": {},",
+        max + 1024
+    );
+    let (_dir, qwen) = load_kv_provider(&identity, true);
+    let words = (0..row.min_context_tokens)
+        .map(|i| format!("t{}", i % 26 + 6))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let request = TextLlmRequest {
+        messages: vec![Message::user(words)],
+        sampling: core_llm::Sampling::greedy(),
+        // The budget alone carries the final context past the window; every generated piece is
+        // `t<N>`, so the stop string ends the decode at its first token.
+        max_new_tokens: u32::try_from(max - row.min_context_tokens).unwrap(),
+        stop: vec!["t".into()],
+        seed: Some(0),
+        kv_compression: Policy::Qualified,
+        ..Default::default()
+    };
+    let output = core_llm::TextLlm::generate(&qwen, &request, &mut |_| {}).unwrap();
+    assert!(u64::from(output.usage.prompt_tokens) >= row.min_context_tokens);
+    assert_eq!(
+        output.kv_cache,
+        Some(KvCacheReport::dense(Reason::AboveQualifiedContext, None))
     );
 }

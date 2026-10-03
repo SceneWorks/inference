@@ -1586,13 +1586,10 @@ impl LlamaProvider {
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let campaign_family = match arch {
-            Architecture::Qwen3 => Some("qwen"),
-            Architecture::Llama if architecture_name.contains("llama") || model_type == "llama" => {
-                Some("llama")
-            }
-            _ => None,
-        };
+        // The shared (sc-20683) family rule, so Candle names the same checkpoint the same family.
+        let campaign_family =
+            core_llm::kv_model_family(arch.family(), &architecture_name, &model_type)
+                .map(crate::kv_policy::campaign_family);
         let weights = Weights::from_dir(dir).map_err(to_core)?;
         let is_prism =
             cfg_value.get("model_type").and_then(|v| v.as_str()) == Some("prism_hadamard_qwen35");
@@ -2746,65 +2743,73 @@ impl LlamaProvider {
         ))
     }
 
-    /// Decide the KV cache of one product generation against the qualification table: the
-    /// request's opt-in, this model's table family, the `context_tokens` prefilled before decode
-    /// and the final context after up to `max_new_tokens` more, then the request shape, the
-    /// decoder's attention geometry and the retained reader. Every refusal is a dense plan with
-    /// its reason.
+    /// Decide the KV cache of one product generation with the shared [`core_llm::plan_kv_cache`]
+    /// (sc-20683): the qualification table (the request's opt-in, the `batch`, this model's table
+    /// family, the `context_tokens` prefilled before decode and the final context after up to
+    /// `max_new_tokens` more), then the request shape, then this backend's reader stage — the
+    /// decoder's attention geometry and the retained fused reader. Every refusal is a dense plan
+    /// with its reason.
     fn plan_kv_cache(
         &self,
         policy: core_llm::KvCompressionPolicy,
         context_tokens: usize,
         max_new_tokens: u32,
+        batch: u64,
         multimodal: bool,
     ) -> KvPlan {
-        use core_llm::{KvCacheFallbackReason as Reason, KvCacheReport};
-        let dense =
-            |reason, detail: Option<String>| KvPlan::Dense(KvCacheReport::dense(reason, detail));
-        let context = u64::try_from(context_tokens).unwrap_or(u64::MAX);
-        let row = match core_llm::qualify_kv_compression(
+        use core_llm::KvCacheFallbackReason as Reason;
+        let unsupported_request = if multimodal {
+            Some("multimodal prefill splices embeddings outside the compressed cache".to_string())
+        } else if matches!(self.model, Decoder::Qwen35(_)) {
+            Some("the hybrid recurrent decoder has no compressed cache".to_string())
+        } else {
+            None
+        };
+        let request = core_llm::KvCacheRequest {
             policy,
-            self.kv_family,
-            context,
-            u64::from(max_new_tokens),
-            1,
-        ) {
-            Ok(row) => row,
-            Err(reason) => return dense(reason, None),
+            family: self.kv_family,
+            context_tokens: u64::try_from(context_tokens).unwrap_or(u64::MAX),
+            max_new_tokens: u64::from(max_new_tokens),
+            batch,
+            unsupported_request,
         };
-        if multimodal {
-            return dense(
-                Reason::UnsupportedRequest,
-                Some("multimodal prefill splices embeddings outside the compressed cache".into()),
-            );
-        }
-        let Decoder::Causal(model) = &self.model else {
-            return dense(
-                Reason::UnsupportedRequest,
-                Some("the hybrid recurrent decoder has no compressed cache".into()),
-            );
-        };
-        if let Some(refusal) = crate::kv_policy::geometry_refusal(model.config()) {
-            return dense(Reason::UnsupportedGeometry, Some(refusal));
-        }
-        let bits = crate::kv_policy::packed_code_bits(row.format);
-        match self
-            .kv_reader
-            .get_or_init(|| crate::kv_policy::group_affine_reader(bits))
-        {
-            Ok(reader) if reader.code_bits() == bits => KvPlan::Compressed {
-                format: row.format,
-                reader: reader.clone(),
-            },
-            Ok(reader) => dense(
-                Reason::ReaderUnavailable,
-                Some(format!(
-                    "the retained reader reads {}-bit codes, not {}",
-                    reader.code_bits().bits(),
-                    row.format.id()
+        let plan = core_llm::plan_kv_cache(request, |row| {
+            let Decoder::Causal(model) = &self.model else {
+                // The request-shape stage refuses the hybrid decoder before this stage runs.
+                return Err((
+                    Reason::UnsupportedRequest,
+                    "the hybrid recurrent decoder has no compressed cache".into(),
+                ));
+            };
+            if let Some(refusal) = crate::kv_policy::geometry_refusal(model.config()) {
+                return Err((Reason::UnsupportedGeometry, refusal));
+            }
+            let bits = crate::kv_policy::packed_code_bits(row.format);
+            match self
+                .kv_reader
+                .get_or_init(|| crate::kv_policy::group_affine_reader(bits))
+            {
+                Ok(reader) if reader.code_bits() == bits => Ok(reader.clone()),
+                Ok(reader) => Err((
+                    Reason::ReaderUnavailable,
+                    format!(
+                        "the retained reader reads {}-bit codes, not {}",
+                        reader.code_bits().bits(),
+                        row.format.id()
+                    ),
                 )),
-            ),
-            Err(error) => dense(Reason::ReaderUnavailable, Some(error.clone())),
+                Err(error) => Err((Reason::ReaderUnavailable, error.clone())),
+            }
+        });
+        match plan {
+            core_llm::KvCachePlan::Compressed {
+                qualification,
+                reader,
+            } => KvPlan::Compressed {
+                format: qualification.format,
+                reader,
+            },
+            core_llm::KvCachePlan::Dense(report) => KvPlan::Dense(report),
         }
     }
 
@@ -2962,6 +2967,7 @@ impl LlamaProvider {
                 req.kv_compression,
                 prompt_len,
                 req.max_new_tokens,
+                1,
                 multimodal || gemma4_mm_request,
             )
         };
@@ -6340,6 +6346,7 @@ mod tests {
             core_llm::KvCompressionPolicy::Qualified,
             prompt.len(),
             stream.len() as u32,
+            1,
             false,
         ) else {
             panic!("the qualified context must plan compressed");
@@ -6442,26 +6449,27 @@ mod tests {
             40_960,
             true,
         ));
-        let KvPlan::Dense(report) = qwen.plan_kv_cache(Policy::Qualified, 20_000, 0, true) else {
+        let KvPlan::Dense(report) = qwen.plan_kv_cache(Policy::Qualified, 20_000, 0, 1, true)
+        else {
             panic!("a multimodal request must plan dense");
         };
         assert_eq!(report.fallback, Some(Reason::UnsupportedRequest));
         assert!(matches!(
-            qwen.plan_kv_cache(Policy::Qualified, 20_000, 64, false),
+            qwen.plan_kv_cache(Policy::Qualified, 20_000, 64, 1, false),
             KvPlan::Compressed { .. }
         ));
         assert!(matches!(
-            qwen.plan_kv_cache(Policy::Off, 20_000, 64, false),
+            qwen.plan_kv_cache(Policy::Off, 20_000, 64, 1, false),
             KvPlan::Dense(report) if report.fallback == Some(Reason::PolicyDisabled)
         ));
         // The plan bounds the final context, not just the prompt: a fit-boundary prompt whose
         // budget runs past the evidenced 40 960-token window stays dense.
         assert!(matches!(
-            qwen.plan_kv_cache(Policy::Qualified, 40_448, 512, false),
+            qwen.plan_kv_cache(Policy::Qualified, 40_448, 512, 1, false),
             KvPlan::Compressed { .. }
         ));
         assert!(matches!(
-            qwen.plan_kv_cache(Policy::Qualified, 40_448, 513, false),
+            qwen.plan_kv_cache(Policy::Qualified, 40_448, 513, 1, false),
             KvPlan::Dense(report) if report.fallback == Some(Reason::AboveQualifiedContext)
         ));
     }
@@ -6519,9 +6527,58 @@ mod tests {
         assert_eq!(model.config().architecture, Architecture::Llama);
         let provider = LlamaProvider::from_parts(model, tokenizer, vec![99]);
         assert!(matches!(
-            provider.plan_kv_cache(Policy::Qualified, 40_000, 64, false),
+            provider.plan_kv_cache(Policy::Qualified, 40_000, 64, 1, false),
             KvPlan::Dense(report) if report.fallback == Some(Reason::UnqualifiedModel)
         ));
+    }
+
+    /// sc-20683 AC2: the cross-backend compressed-KV conformance table
+    /// (`core_llm_testkit::kv_policy_cases`) through MLX's production plan, with the fused reader:
+    /// the same table Candle's plan passes without one. The family each provider plans with is the
+    /// shared `core_llm::kv_model_family` of its loaded config.
+    #[test]
+    fn mlx_kv_plan_conforms_to_the_cross_backend_policy_table() {
+        use core_llm::KvModelFamily;
+        use core_llm_testkit::{kv_policy_conformance, KvBackendDecision, KvReader};
+        let load = |identity, qk_norm| load_tiny(&tiny_snapshot(identity, 2048, qk_norm));
+        let llama = load(
+            json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"}),
+            false,
+        );
+        let qwen = load(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            true,
+        );
+        // Mistral loads through the Llama decoder but is not a table family.
+        let mistral = load(
+            json!({"architectures": ["MistralForCausalLM"], "model_type": "mistral"}),
+            false,
+        );
+        for (provider, family) in [
+            (&llama, Some(KvModelFamily::Llama)),
+            (&qwen, Some(KvModelFamily::Qwen3)),
+            (&mistral, None),
+        ] {
+            assert_eq!(provider.kv_family, family);
+        }
+        kv_policy_conformance(KvReader::Fused, |case| {
+            let provider = match case.family {
+                Some(KvModelFamily::Llama) => &llama,
+                Some(KvModelFamily::Qwen3) => &qwen,
+                None => &mistral,
+            };
+            match provider.plan_kv_cache(
+                case.policy,
+                usize::try_from(case.context_tokens).unwrap(),
+                case.max_new_tokens,
+                case.batch,
+                case.multimodal,
+            ) {
+                KvPlan::Compressed { format, .. } => KvBackendDecision::Compressed(format),
+                KvPlan::Dense(report) => KvBackendDecision::Dense(report),
+                KvPlan::Unreported => panic!("a product plan always reports"),
+            }
+        });
     }
 
     /// A reader that binds to the K8V8 cache and faults on every dispatch.
