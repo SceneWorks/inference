@@ -183,22 +183,68 @@ def validate_background(value: dict, baseline: dict) -> None:
             "trusted background GPU0 engine instance set changed/incomplete")
 
 
+def background_query_paths(paths: list[str], baseline: dict) -> list[str]:
+    """Select the complete current receipt-owned engine set before sampling."""
+    require(isinstance(paths, list) and all(isinstance(path, str) for path in paths),
+            "background counter catalog is unavailable")
+    prefix = f"pid_{baseline['identity'][0]}_{baseline['luid']}_"
+    selected = {}
+    for path in paths:
+        match = re.fullmatch(r"\\GPU Engine\(([^()]+)\)\\Utilization Percentage", path, re.IGNORECASE)
+        if match is None or not match[1].lower().startswith(prefix):
+            continue
+        name = match[1].lower()
+        require(name not in selected, "background counter catalog has duplicate target instances")
+        selected[name] = path
+    require(selected and set(selected) == set(baseline["counters"]["engine"]),
+            "background counter catalog target set changed/incomplete")
+    return sorted(selected.values(), key=str.lower)
+
+
 def sample_background(baseline: dict, record=None) -> None:
     # Same identity/signature and GPU Engine schema as the reviewed collector,
     # restricted to the trusted background PID. Own model memory is not compared.
+    config = base64.b64encode(json.dumps({"pid": baseline["identity"][0], "luid": baseline["luid"],
+                                        "instances": sorted(baseline["counters"]["engine"])}).encode("utf-8")).decode("ascii")
     script = r"""
 $ErrorActionPreference = 'Stop'
-$item = Get-CimInstance Win32_Process -Filter 'ProcessId = 38212' -ErrorAction Stop
+$config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CONFIG__')) | ConvertFrom-Json
+$probe = @{counter=@{counter='\GPU Engine(*)\Utilization Percentage'; queryScope='receipt-pid-gpu0'; enumeratedPaths=@(); queryPaths=@(); samples=@()}}
+try {
+$item = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $config.pid) -ErrorAction Stop
 if ($null -eq $item -or -not $item.ExecutablePath) { throw 'background identity unavailable' }
 $sig = Get-AuthenticodeSignature -FilePath $item.ExecutablePath -ErrorAction Stop
-$set = Get-Counter -Counter '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
-$samples = @($set.CounterSamples | Where-Object {$_.InstanceName -match '(^|_)pid_38212(_|$)'} | ForEach-Object {
+$probe.process = @{pid=[int]$config.pid; name=$item.Name; executablePath=$item.ExecutablePath; creationDate=[string]$item.CreationDate;
+    signature=@{status=[string]$sig.Status; signerSubject=$sig.SignerCertificate.Subject; signerThumbprint=$sig.SignerCertificate.Thumbprint}}
+$catalog = Get-Counter -ListSet 'GPU Engine' -ErrorAction Stop
+$probe.counter.enumeratedPaths = @($catalog.PathsWithInstances)
+$prefix = 'pid_' + $config.pid + '_' + $config.luid + '_'
+$selected = @{}
+foreach ($path in $probe.counter.enumeratedPaths) {
+    if ($path -match '^\\GPU Engine\(([^()]+)\)\\Utilization Percentage$' -and $Matches[1].ToLowerInvariant().StartsWith($prefix)) {
+        $name = $Matches[1].ToLowerInvariant()
+        if ($selected.ContainsKey($name)) { throw 'background counter catalog duplicate target' }
+        $selected[$name] = $path
+    }
+}
+if ($selected.Count -ne $config.instances.Count -or @($config.instances | Where-Object {-not $selected.ContainsKey($_)}).Count -ne 0) {
+    throw 'background counter catalog target set changed/incomplete'
+}
+$probe.counter.queryPaths = @($selected.Values | Sort-Object)
+$set = Get-Counter -Counter $probe.counter.queryPaths -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
+$probe.counter.timestamp = [string]$set.Timestamp
+$probe.counter.samples = @($set.CounterSamples | ForEach-Object {
     @{path=$_.Path; instance=$_.InstanceName; cookedValue=$_.CookedValue; status=[string]$_.Status}
 })
-@{process=@{pid=38212; name=$item.Name; executablePath=$item.ExecutablePath; creationDate=[string]$item.CreationDate;
-            signature=@{status=[string]$sig.Status; signerSubject=$sig.SignerCertificate.Subject; signerThumbprint=$sig.SignerCertificate.Thumbprint}};
-  counter=@{counter='\GPU Engine(*)\Utilization Percentage'; timestamp=[string]$set.Timestamp; samples=$samples}} | ConvertTo-Json -Depth 8 -Compress
-"""
+$probe | ConvertTo-Json -Depth 8 -Compress
+} catch {
+    $probe.counter.error = [string]$_
+    $probe.counter.errorId = [string]$_.FullyQualifiedErrorId
+    $probe | ConvertTo-Json -Depth 8 -Compress
+    [Console]::Error.WriteLine(($_ | Out-String))
+    exit 1
+}
+""".replace("__CONFIG__", config)
     result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                             capture_output=True, text=True, encoding="utf-8", timeout=PHYSICAL_QUERY_TIMEOUT)
     if record is not None:
@@ -207,6 +253,12 @@ $samples = @($set.CounterSamples | Where-Object {$_.InstanceName -match '(^|_)pi
     require(result.returncode == 0, "bounded background identity/engine probe failed")
     value = json.loads(result.stdout)
     require(isinstance(value, dict), "background probe is not an object")
+    row = value.get("counter", {})
+    selected = background_query_paths(row.get("enumeratedPaths"), baseline)
+    require(row.get("queryScope") == "receipt-pid-gpu0" and isinstance(row.get("queryPaths"), list) and
+            sorted(row["queryPaths"], key=str.lower) == selected,
+            "background counter query scope differs from current reviewed catalog")
+    require(len(row.get("samples", [])) == len(selected), "background scoped sample set is incomplete/extra")
     validate_background(value, baseline)
 
 

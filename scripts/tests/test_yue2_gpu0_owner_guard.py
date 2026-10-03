@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -49,9 +50,11 @@ def background():
 
 def background_sample():
     baseline = background()
+    paths = [rf"\GPU Engine({key})\Utilization Percentage" for key in baseline["counters"]["engine"]]
     return {"process": dict(zip(("pid", "name", "executablePath", "creationDate"), baseline["identity"]),
                             signature=baseline["signature"]),
             "counter": {"counter": r"\GPU Engine(*)\Utilization Percentage",
+                        "queryScope": "receipt-pid-gpu0", "enumeratedPaths": paths, "queryPaths": paths,
                         "samples": [{"instance": key, "cookedValue": 0, "status": "0"}
                                     for key in baseline["counters"]["engine"]]}}
 
@@ -190,9 +193,54 @@ class OwnerGuardTests(unittest.TestCase):
         with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=json.dumps(background_sample()), stderr="")) as probe:
             guard.sample_background(background())
             self.assertEqual(probe.call_args.kwargs["timeout"], guard.PHYSICAL_QUERY_TIMEOUT)
-            self.assertIn("Get-Counter", probe.call_args.args[0][-1])
+            script = probe.call_args.args[0][-1]
+            self.assertIn("Get-Counter -ListSet 'GPU Engine' -ErrorAction Stop", script)
+            self.assertIn("Get-Counter -Counter $probe.counter.queryPaths", script)
+            self.assertNotIn("Get-Counter -Counter '\\GPU Engine(*)", script)
+            self.assertLess(script.index("$selected.Count -ne"), script.index("Get-Counter -Counter"))
+            pattern = script.split("$path -match '")[1].split("'")[0]
+            for path in background_sample()["counter"]["queryPaths"]:
+                self.assertIsNotNone(re.fullmatch(pattern, path, re.IGNORECASE))
+            config = json.loads(base64.b64decode(script.split("FromBase64String('")[1].split("')")[0]))
+            self.assertEqual(config, {"pid": 38212, "luid": background()["luid"],
+                                      "instances": sorted(background()["counters"]["engine"])})
         with patch.object(guard.subprocess, "run", return_value=Mock(returncode=1, stdout="", stderr="missing counters")), self.assertRaises(RuntimeError):
             guard.sample_background(background())
+
+    def test_current_catalog_exact_target_set_before_sampling(self):
+        baseline = background()
+        paths = background_sample()["counter"]["queryPaths"]
+        other_pid = paths[0].replace("pid_38212_", "pid_777_")
+        other_luid = paths[0].replace("00020d46", "0001f8b5")
+        self.assertEqual(guard.background_query_paths(paths + [other_pid, other_luid], baseline),
+                         sorted(paths, key=str.lower))
+        variants = [paths[:-1], paths + [paths[0]],
+                    paths + [paths[0].replace("eng_0_", "eng_99_")],
+                    [path.replace("00020d46", "0001f8b5") for path in paths], [], None]
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                guard.background_query_paths(value, baseline)
+
+    def test_scoped_query_provenance_and_returned_samples_fail_closed(self):
+        mutations = [lambda x: x["counter"]["enumeratedPaths"].pop(),
+                     lambda x: x["counter"]["enumeratedPaths"].append(x["counter"]["enumeratedPaths"][0].replace("eng_0_", "eng_99_")),
+                     lambda x: x["counter"]["queryPaths"].pop(),
+                     lambda x: x["counter"].update(queryScope="global"),
+                     lambda x: x["counter"]["samples"].append({"instance": "pid_777_other", "cookedValue": 0, "status": "0"}),
+                     lambda x: x["counter"]["samples"][0].update(cookedValue=1),
+                     lambda x: x["counter"]["samples"][0].update(status="1"),
+                     lambda x: x["counter"]["samples"][0].update(cookedValue=float("nan"))]
+        for index, mutate in enumerate(mutations):
+            value = background_sample(); mutate(value)
+            with self.subTest(index=index), patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=json.dumps(value), stderr="")), self.assertRaises(RuntimeError):
+                guard.sample_background(background())
+        failed = background_sample()
+        failed["counter"].update(error="CounterApiError", samples=[])
+        records = []
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=1, stdout=json.dumps(failed), stderr="invalid selected counter")), self.assertRaises(RuntimeError):
+            guard.sample_background(background(), records.append)
+        self.assertEqual(json.loads(records[0]["raw"])["counter"]["enumeratedPaths"], failed["counter"]["enumeratedPaths"])
+        self.assertEqual(records[0]["stderr"], "invalid selected counter")
 
     def test_cold_physical_queries_have_independent_bounded_budget(self):
         self.assertEqual(guard.API_TIMEOUT, 3)
