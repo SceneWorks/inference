@@ -342,7 +342,10 @@ pub fn decode_latents_to_video(
     // The AR denoise is done: its freed activations and superseded KV staging sit in MLX's buffer
     // cache, sized for DiT shapes the VAE never requests. Return them before the decode builds its
     // own working set so the two phases' buffers never coexist in the process footprint (see
-    // `encode_prompt`). Live arrays — the DiT, the latents — are untouched.
+    // `encode_prompt`). Live arrays — the DiT, the latents — are untouched. Measured (08ed6939f):
+    // SC-20684 W2 run 36798794462 aborted t2v-q8.paired at the 64 GiB child footprint cap with a
+    // ~33 GiB active peak (the rest MLX's buffer cache); with these phase-boundary releases the
+    // Krea six-cell phase completed (W2 C run 36866378379, exit 0).
     mlx_gen::memory_probe::clear_cache();
     // `decode_to_frames` reshapes `[C,F,H,W]` → `[1,C,F,H,W]`, decodes (single-pass or tiled), and
     // returns `[F_out, H_out, W_out, 3]` uint8; `frames_to_images` splits it into one `Image`/frame.

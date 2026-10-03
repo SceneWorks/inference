@@ -2789,8 +2789,8 @@ impl LlamaProvider {
     }
 
     /// Decode the requests `indices` of `reqs` together; their results (a request rejected
-    /// before decoding included). Requests left out — memory admission did not fit them — get no
-    /// result here and run on their own.
+    /// before decoding included). Requests left out — memory admission did not fit them, or only
+    /// one was left to decode — get no result here and run on their own.
     fn generate_text_batch(
         &self,
         reqs: &[TextLlmRequest],
@@ -2864,7 +2864,11 @@ impl LlamaProvider {
                 Err(error) => results.push((i, Err(error))),
             }
         }
-        if admitted.is_empty() {
+        // A lone survivor (the others cancelled before start, rejected, or not admitted beside
+        // it) is not a batch: it gets no result here and runs on its own through
+        // `TextLlm::generate`, the measured single-request path — compressed on the contiguous
+        // cache where it qualifies, never on the paged cache (sc-20688 review).
+        if admitted.len() < 2 {
             return results;
         }
 
@@ -2934,7 +2938,8 @@ impl LlamaProvider {
             model_identity: &self.kv_model_name,
             cancels: &cancels,
             policies: &policies,
-            // The product path: a batch of more than one decodes dense (`BatchedDecode`).
+            // The product path never arms the per-sequence paged compressed experiment.
+            #[cfg(test)]
             experimental_per_sequence_compression: false,
         };
         let config = crate::decode::ContinuousConfig {
@@ -7126,6 +7131,52 @@ pub(crate) mod tests {
         assert!(
             store.as_ref().is_none_or(|store| store.is_empty()),
             "no batched prompt was stored"
+        );
+    }
+
+    /// sc-20688 review round 2: a batch whose other request is cancelled before it starts leaves
+    /// one survivor, which is not decoded on the continuous path (no page pool, no prefix store):
+    /// it runs alone through the single-request path, compressed on the contiguous cache.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_lone_batch_survivor_runs_on_the_contiguous_path_not_paged() {
+        use core_llm::KvCompressionPolicy as Policy;
+        let provider = load_tiny(&tiny_snapshot(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            40_960,
+            true,
+        ));
+        let words = |count: usize, salt: usize| {
+            (0..count)
+                .map(|i| format!("w{}", (i * 7 + salt) % 26 + 6))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let request = |text: String| TextLlmRequest {
+            messages: vec![Message::text(Role::User, text)],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            kv_compression: Policy::Qualified,
+            ..Default::default()
+        };
+        let requests = vec![request(words(10_300, 0)), request(words(10_450, 3))];
+        requests[1].cancel.cancel();
+        let mut outputs = provider
+            .generate_batch(&requests, &mut |_, _| {})
+            .into_iter();
+        let survivor = outputs.next().unwrap().unwrap();
+        assert!(matches!(outputs.next().unwrap(), Err(CoreError::Canceled)));
+        let report = survivor.kv_cache.as_ref().unwrap();
+        assert!(report.ran_compressed(), "{report:?}");
+        assert_eq!(
+            report.counters.pool_held_bytes, 0,
+            "the contiguous cache, not a shared page pool"
+        );
+        let store = provider.kv_batch_store.borrow();
+        assert!(
+            store.as_ref().is_none_or(|store| store.is_empty()),
+            "nothing reached the paged prefix store"
         );
     }
 

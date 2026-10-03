@@ -4100,14 +4100,22 @@ impl PackedGroupAffineKvCache {
             ));
         }
         // The capacity is a reservation the cache's own growth produced: zero, or a power of two
-        // (`grow` doubles from one) holding at least the declared logical length (sc-20688
-        // review: a crafted capacity must not reach an unbounded reservation).
-        let capacity = nums[4] as usize;
-        if nums[5] > nums[4] || (capacity != 0 && !capacity.is_power_of_two()) {
+        // (`grow` doubles from one) holding at least the declared logical length. Anything else is
+        // refused. A cache trimmed after growing legitimately carries more than its length needs,
+        // so the reservation restored is bounded by what growth produces for the restored length
+        // — `grow` from empty yields the next power of two at or above it, and at least two —
+        // never the header's own figure (sc-20688 review: a crafted capacity must not reach an
+        // unbounded or overcommitted reservation).
+        let declared = nums[4] as usize;
+        if nums[5] > nums[4] || (declared != 0 && !declared.is_power_of_two()) {
             return Err(Error::Config(
                 "snapshot capacity/logical bounds mismatch".into(),
             ));
         }
+        let capacity = match nums[5] as usize {
+            0 => 0,
+            len => declared.min(len.next_power_of_two().max(2)),
+        };
         let mut restored = Vec::with_capacity(self.layers.len());
         let rows = self.rows();
         for _ in 0..self.layers.len() {
@@ -4956,9 +4964,11 @@ mod tests {
         assert_eq!(c.representation(), before);
     }
 
-    /// sc-20688 review (finding 10): a crafted snapshot whose header declares a capacity no
-    /// allocation can hold — or one the cache's doubling growth never produces — is refused with
-    /// `Err` (never a capacity-overflow panic), leaving the cache untouched.
+    /// sc-20688 review (findings 10 and round-2 5): a crafted snapshot whose header declares a
+    /// capacity the cache's doubling growth never produces is refused with `Err` (never a
+    /// capacity-overflow panic), leaving the cache untouched; a huge power-of-two capacity is
+    /// restored with only the reservation growth gives its logical length, not an overcommitted
+    /// one.
     #[test]
     fn a_crafted_snapshot_capacity_is_refused_not_reserved() {
         let mut c = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
@@ -4973,11 +4983,15 @@ mod tests {
             u64::from_le_bytes(honest[capacity_at..capacity_at + 8].try_into().unwrap()),
             c.capacity as u64
         );
-        for capacity in [1_u64 << 62, u64::MAX, 3] {
+        let craft = |capacity: u64| {
             let mut crafted = honest[..honest.len() - 8].to_vec();
             crafted[capacity_at..capacity_at + 8].copy_from_slice(&capacity.to_le_bytes());
             let sum = checksum(&crafted);
             crafted.extend(sum.to_le_bytes());
+            crafted
+        };
+        for capacity in [u64::MAX, 3, (1 << 34) + 1] {
+            let crafted = craft(capacity);
             let restored =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.restore(&crafted)));
             let error = restored
@@ -4985,6 +4999,19 @@ mod tests {
                 .expect_err("a crafted capacity is refused");
             assert!(error.to_string().contains("capacity"), "{error}");
             assert_eq!(c.representation(), before);
+        }
+        // Huge powers of two parse, but reserve only what growth gives the two restored tokens.
+        let mut reference = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
+        reference.restore(&honest).unwrap();
+        for capacity in [1_u64 << 34, 1 << 62] {
+            let mut restored = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
+            restored.restore(&craft(capacity)).unwrap();
+            assert_eq!(restored.capacity, 2, "capacity {capacity}");
+            assert_eq!(
+                restored.representation(),
+                reference.representation(),
+                "capacity {capacity}: the honest snapshot's reservation"
+            );
         }
         c.restore(&honest).unwrap();
         assert_eq!(

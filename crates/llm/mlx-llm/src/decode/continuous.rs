@@ -32,12 +32,13 @@
 //! ([`core_llm::qualify_kv_compression`]) with the run's batch — the sequences that decode
 //! together, `min(requests, max_batch)`. The table's evidence is single-sequence, so a run of more
 //! than one concurrent sequence decodes every request on the dense paged cache with
-//! [`KvCacheFallbackReason::BatchedDecode`] (sc-20688 review); a run that decodes one sequence at
-//! a time qualifies each on its own. Only a test-armed experiment
-//! ([`ContinuousKv::experimental_per_sequence_compression`]) qualifies each sequence of a batch
-//! on its own: a qualified request then decodes on K8V8 pages of one shared [`PackedPagePool`]
-//! read in place by the fused paged reader, every other request on the dense paged cache beside
-//! it. Each output carries its own [`KvCacheReport`] saying which it ran and why. In `Throughput` mode the compressed sequences of a step attend through one fused paged
+//! [`KvCacheFallbackReason::BatchedDecode`] (sc-20688 review). The paged compressed cache is never
+//! engaged by a product run: a lone qualified request on this path runs dense as
+//! [`KvCacheFallbackReason::UnsupportedRequest`] (a product serves a single request through the
+//! measured contiguous path instead). Only this crate's own tests arm the per-sequence
+//! experiment, under which each sequence of a batch qualifies on its own: a qualified request then
+//! decodes on K8V8 pages of one shared [`PackedPagePool`] read in place by the fused paged
+//! reader, every other request on the dense paged cache beside it. Each output carries its own [`KvCacheReport`] saying which it ran and why. In `Throughput` mode the compressed sequences of a step attend through one fused paged
 //! dispatch per layer — a page table and per-sequence lengths, no padding mask — so jagged
 //! sequences batch compressed. With a [`PagedPrefixCache`] a request starts on the longest stored
 //! prefix's pages (reference-counted, copy-on-write) and stores its own sequence back; a store of
@@ -139,13 +140,27 @@ pub struct ContinuousKv<'a> {
     /// Per-request opt-ins (one per request, or empty to apply [`Self::policy`] to all): a
     /// server batch mixes requests that opted in with requests that did not.
     pub policies: &'a [KvCompressionPolicy],
-    /// Experimental and test-only (never set by a product path): qualify every sequence of a
-    /// concurrent batch on its own, so the paged compressed machinery (shared page pool, fused
-    /// paged reader, prefix store, copy-on-write) can run beside other sequences. Off (the
-    /// default), a run of more than one concurrent sequence is
-    /// [`KvCacheFallbackReason::BatchedDecode`] for every request: the qualification evidence is
-    /// single-sequence.
-    pub experimental_per_sequence_compression: bool,
+    /// Experimental, and compiled only into this crate's own tests: qualify every sequence of a
+    /// run on its own, so the paged compressed machinery (shared page pool, fused paged reader,
+    /// prefix store, copy-on-write) can run. Without it — every build outside those tests — no
+    /// request runs paged compressed: a batch of more than one is
+    /// [`KvCacheFallbackReason::BatchedDecode`], a lone request
+    /// [`KvCacheFallbackReason::UnsupportedRequest`].
+    #[cfg(test)]
+    pub(crate) experimental_per_sequence_compression: bool,
+}
+
+impl ContinuousKv<'_> {
+    /// Whether this run arms the per-sequence paged compressed experiment (only ever in tests).
+    #[cfg(test)]
+    fn per_sequence_armed(&self) -> bool {
+        self.experimental_per_sequence_compression
+    }
+
+    #[cfg(not(test))]
+    fn per_sequence_armed(&self) -> bool {
+        false
+    }
 }
 
 impl Default for ContinuousKv<'_> {
@@ -160,6 +175,7 @@ impl Default for ContinuousKv<'_> {
             model_identity: "",
             cancels: &[],
             policies: &[],
+            #[cfg(test)]
             experimental_per_sequence_compression: false,
         }
     }
@@ -227,13 +243,16 @@ struct KvRun<'a> {
     /// The batch every request is qualified with: the run's concurrent sequences, or `1` for a
     /// test-armed per-sequence experiment.
     batch: u64,
+    /// The per-sequence paged compressed experiment is armed (tests only).
+    armed: bool,
 }
 
 impl<'a> KvRun<'a> {
     fn new(model: &CausalLm, config: &ContinuousConfig, kv: ContinuousKv<'a>, n: usize) -> Self {
         let cfg = model.config();
         let concurrent = n.min(config.max_batch);
-        let batch = if kv.experimental_per_sequence_compression {
+        let armed = kv.per_sequence_armed();
+        let batch = if armed {
             1
         } else {
             u64::try_from(concurrent).unwrap_or(u64::MAX)
@@ -252,12 +271,14 @@ impl<'a> KvRun<'a> {
             cancels: kv.cancels.to_vec(),
             policies: kv.policies.to_vec(),
             batch,
+            armed,
         };
         let any_opted_in = kv.policy != KvCompressionPolicy::Off
             || kv.policies.contains(&KvCompressionPolicy::Qualified);
-        // A batched run decodes dense: no page pool, reader or prefix store is engaged, and
-        // every opted-in request reports `BatchedDecode` from the shared qualification.
-        if !any_opted_in || batch > 1 {
+        // A product run decodes dense: no page pool, reader or prefix store is engaged. Every
+        // opted-in request of a batch reports `BatchedDecode` from the shared qualification, and
+        // a lone one `UnsupportedRequest` (see `select`).
+        if !any_opted_in || !armed {
             return run;
         }
         let new_pool = |page_tokens: usize| {
@@ -322,6 +343,14 @@ impl<'a> KvRun<'a> {
                 self.batch,
             ) {
                 Err(reason) => KvCacheReport::dense(reason, None),
+                Ok(_) if !self.armed => KvCacheReport::dense(
+                    KvCacheFallbackReason::UnsupportedRequest,
+                    Some(
+                        "continuous batching decodes dense; a single request runs compressed \
+                         on the contiguous path"
+                            .into(),
+                    ),
+                ),
                 Ok(_) => KvCacheReport::dense(
                     KvCacheFallbackReason::UnsupportedGeometry,
                     self.pool_refusal.clone(),
@@ -990,7 +1019,10 @@ mod tests {
     /// sc-20688 review: a product run (no test arm) of two concurrent qualified requests decodes
     /// both on the dense paged cache with `BatchedDecode` — the same reason the single-request
     /// plan gives a batch — engages no page or prefix store, and emits exactly the policy-off
-    /// tokens. A run that decodes one sequence at a time (`max_batch` 1) qualifies each request.
+    /// tokens. Unarmed, even a run that decodes one sequence at a time (`max_batch` 1) never
+    /// engages the paged compressed cache: each qualified request runs dense as
+    /// `UnsupportedRequest` (a product serves a lone request on the contiguous path); only the
+    /// test arm runs it compressed.
     #[test]
     fn concurrent_qualified_requests_decode_dense_as_batched_unless_test_armed() {
         let model = model();
@@ -1043,6 +1075,21 @@ mod tests {
             product(None),
         );
         for out in &serial {
+            assert_eq!(
+                out.kv_cache.fallback,
+                Some(KvCacheFallbackReason::UnsupportedRequest),
+                "{:?}",
+                out.kv_cache
+            );
+            assert_eq!(out.kv_cache.format, None);
+        }
+        let armed = run(
+            &model,
+            &requests,
+            &config(1, BatchExactness::Exact),
+            qualified(None),
+        );
+        for out in &armed {
             assert_compressed(out);
         }
     }

@@ -2062,9 +2062,8 @@ pub struct PagedCacheRequest<'a> {
     pub max_new_tokens: u64,
     /// The sequences the qualification counts as decoding together: more than one is
     /// [`core_llm::KvCacheFallbackReason::BatchedDecode`] (the table's evidence is single-sequence).
-    /// Only a test-armed per-sequence experiment
-    /// ([`ContinuousKv::experimental_per_sequence_compression`](crate::decode::ContinuousKv::experimental_per_sequence_compression))
-    /// qualifies a sequence of a batch as `1`.
+    /// Only this crate's test-armed per-sequence experiment qualifies a sequence of a batch as
+    /// `1`.
     pub batch: u64,
     /// The dense block pool every dense selection draws from.
     pub dense_pool: &'a Rc<RefCell<BlockPool>>,

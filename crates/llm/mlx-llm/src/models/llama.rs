@@ -499,12 +499,13 @@ impl CausalLm {
         PagedKvCache::new(self.cfg.num_layers, block_size)
     }
 
-    /// A single-sequence paged cache under the compressed-KV policy (sc-20680): with the
+    /// A single-sequence paged cache under the compressed-KV policy (sc-20680; crate-internal since
+    /// the sc-20688 review, so no external caller can arm per-sequence paged compression): with the
     /// qualified opt-in, a request the qualification table admits runs on K8V8 pages of
     /// `request.packed_pool` read in place by the fused paged reader; every other request runs the
     /// established dense [`PagedKvCache`] on `request.dense_pool`, with its reason in
     /// [`PagedCacheSelection::report`].
-    pub fn select_paged_cache(&self, request: PagedCacheRequest<'_>) -> PagedCacheSelection {
+    pub(crate) fn select_paged_cache(&self, request: PagedCacheRequest<'_>) -> PagedCacheSelection {
         crate::kv_policy::select_paged_cache(self, request)
     }
 

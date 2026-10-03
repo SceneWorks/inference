@@ -1895,6 +1895,9 @@ impl LlamaProvider {
     /// Test seam (sc-20688 review): plan this provider's KV cache as `family`, as if its loaded
     /// checkpoint were that family's measured architecture, so the shared policy can be exercised
     /// on synthetic weights. Production loads name a family only for a measured architecture.
+    /// Compiled only with the `test-kv-arm` feature, which this crate's own integration tests
+    /// enable; a product build cannot arm a family.
+    #[cfg(any(test, feature = "test-kv-arm"))]
     #[doc(hidden)]
     pub fn arm_kv_model_family_for_tests(&mut self, family: Option<core_llm::KvModelFamily>) {
         self.kv_family = family;
