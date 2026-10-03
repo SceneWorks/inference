@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""External, fail-closed all-listener watch for one shared-host YuE2 CUDA run.
+
+This does not grant a physical lease. The in-job GPU0 census and owned process
+cleanup remain mandatory; this watcher cancels only its exact run when an
+unreviewed GitHub actor appears on either repository's CUDA runners.
+"""
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import re
+import subprocess
+import time
+
+REPOS = ("SceneWorks/inference", "SceneWorks/SceneWorks")
+RUNNERS = {"cuda-windows": 2313, "cuda-windows-2": 2619,
+           "cuda-windows-3": 23, "cuda-windows-4": 24}
+LEGACY_ZERO_JOB = {
+    31120232778: ("74978f67ac33cade17a863ef109138d8d162b51c", 2,
+                  "2026-08-06T16:33:14Z", "2026-08-06T20:06:14Z"),
+    31116344133: ("ce5f4f068c2ccd6063c85cfc212c24ae67d873e8", 4,
+                  "2026-08-06T15:32:49Z", "2026-08-06T18:41:10Z"),
+}
+STATUSES = ("in_progress", "queued", "pending", "requested", "waiting")
+
+
+def require(value: bool, message: str) -> None:
+    if not value:
+        raise RuntimeError(message)
+
+
+def api(path: str, *, pages: bool = False) -> dict | list[dict]:
+    require(path.startswith(("repos/SceneWorks/inference/", "repos/SceneWorks/SceneWorks/",
+                            "orgs/SceneWorks/")) and ".." not in path,
+            "unexpected GitHub API path")
+    command = ["gh", "api", path, *( ["--paginate", "--slurp"] if pages else [])]
+    output = subprocess.check_output(command, text=True, encoding="utf-8", timeout=45)
+    return json.loads(output)
+
+
+def complete_pages(value: list[dict], key: str) -> list[dict]:
+    require(isinstance(value, list) and value and all(isinstance(page, dict) for page in value),
+            "missing paginated inventory")
+    counts = {page.get("total_count") for page in value}
+    rows = [row for page in value for row in page.get(key, [])]
+    require(len(counts) == 1 and counts.pop() == len(rows),
+            "truncated paginated inventory")
+    return rows
+
+
+def snapshot() -> dict:
+    started = time.monotonic()
+    queries = {"org": "orgs/SceneWorks/actions/runners?per_page=100",
+               "inference": "repos/SceneWorks/inference/actions/runners?per_page=100",
+               "app": "repos/SceneWorks/SceneWorks/actions/runners?per_page=100"}
+    queries.update({f"{repo}:{status}": f"repos/{repo}/actions/runs?status={status}&per_page=100"
+                    for repo in REPOS for status in STATUSES})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {name: pool.submit(api, path, pages=(":" in name)) for name, path in queries.items()}
+        responses = {name: future.result(timeout=50) for name, future in futures.items()}
+    runners = {}
+    for scope in ("org", "inference", "app"):
+        payload = responses[scope]
+        require(isinstance(payload, dict) and type(payload.get("total_count")) is int and
+                payload["total_count"] == len(payload.get("runners", [])),
+                "incomplete runner inventory")
+        runners[scope] = payload["runners"]
+    runs = {}
+    for repo in REPOS:
+        for status in STATUSES:
+            for run in complete_pages(responses[f"{repo}:{status}"], "workflow_runs"):
+                if run.get("status") != "completed":
+                    key = (repo, run["id"])
+                    require(key not in runs or runs[key] == run, "run status inventory inconsistent")
+                    runs[key] = run
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {key: pool.submit(api, f"repos/{key[0]}/actions/runs/{key[1]}/jobs?per_page=100",
+                                    pages=True) for key in runs}
+        jobs = {key: complete_pages(future.result(timeout=50), "jobs")
+                for key, future in futures.items()}
+    # The two old zero-job rows are exceptions only while a direct run read
+    # agrees with this cycle's status inventory and its fresh zero-job list.
+    legacy_direct = {key: api(f"repos/{key[0]}/actions/runs/{key[1]}")
+                     for key in runs if key[0] == "SceneWorks/inference" and
+                     key[1] in LEGACY_ZERO_JOB}
+    require(time.monotonic() - started <= 120, "cross-repository snapshot became stale")
+    return {"checked_at": datetime.now(timezone.utc).isoformat(), "runners": runners,
+            "runs": runs, "jobs": jobs, "legacy_direct": legacy_direct}
+
+
+def classify(data: dict, own_id: int, head: str, workflow: str) -> dict:
+    require(re.fullmatch(r"[0-9a-f]{40}", head) is not None and workflow in
+            ("yue2-precision-proof.yml", "yue2-app-precision-profile.yml"),
+            "invalid exact owned source")
+    runners = data["runners"]
+    observed = {}
+    for scope in ("org", "inference", "app"):
+        for row in runners[scope]:
+            labels = {item.get("name", "").lower() for item in row.get("labels", [])}
+            if "cuda" in labels or row.get("name", "").lower().startswith("cuda-windows"):
+                require(row["name"] not in observed, "duplicate physical CUDA listener")
+                observed[row["name"]] = (row, scope)
+    require(set(observed) == set(RUNNERS) and not any(
+        "cuda" in {item.get("name", "").lower() for item in row.get("labels", [])} or
+        row.get("name", "").lower().startswith("cuda-windows")
+        for row in runners["inference"]), "CUDA listener set changed")
+    for name, expected in RUNNERS.items():
+        row, scope = observed[name]
+        require(row.get("id") == expected and row.get("status") == "online" and
+                scope == ("org" if expected in (2313, 2619) else "app"),
+                "physical CUDA runner identity/offline state changed")
+    own_key = ("SceneWorks/inference", own_id)
+    own = data["runs"].get(own_key)
+    require(isinstance(own, dict) and own.get("head_sha") == head and
+            own.get("run_attempt") == 1 and own.get("event") == "workflow_dispatch" and
+            own.get("path") == f".github/workflows/{workflow}" and
+            own.get("status") == "in_progress" and own.get("conclusion") is None,
+            "owned run/source/attempt/status changed")
+    own_jobs = data["jobs"].get(own_key, [])
+    selected = [job for job in own_jobs if job.get("name") == "cuda" and
+                job.get("status") == "in_progress"]
+    require(len(selected) == 1 and selected[0].get("run_id") == own_id and
+            selected[0].get("run_attempt") == 1 and selected[0].get("head_sha") == head and
+            selected[0].get("conclusion") is None and
+            selected[0].get("runner_name") in ("cuda-windows", "cuda-windows-2") and
+            selected[0].get("runner_id") == RUNNERS[selected[0]["runner_name"]],
+            "exact owned CUDA job/runner missing")
+    owned = selected[0]
+    for name, (row, _) in observed.items():
+        require(row.get("busy") is (name == owned["runner_name"]),
+                f"unaccounted busy/free physical listener: {name}")
+    historical = []
+    for key, run in data["runs"].items():
+        if key == own_key:
+            require(all(job is owned or job.get("status") == "completed" for job in own_jobs),
+                    "another owned job is active")
+            continue
+        jobs = data["jobs"].get(key, [])
+        if key[0] == "SceneWorks/inference" and key[1] in LEGACY_ZERO_JOB:
+            expected = LEGACY_ZERO_JOB[key[1]]
+            direct = data.get("legacy_direct", {}).get(key)
+            require(isinstance(direct, dict) and all(direct.get(field) == run.get(field)
+                    for field in ("id", "head_sha", "run_attempt", "created_at", "updated_at",
+                                  "status", "conclusion", "event", "path")) and
+                    direct.get("repository", {}).get("full_name") == key[0],
+                    "historical direct run readback missing or changed")
+            require((run.get("head_sha"), run.get("run_attempt"), run.get("created_at"),
+                     run.get("updated_at")) == expected and
+                    run.get("status") == "queued" and run.get("conclusion") is None and
+                    run.get("event") == "pull_request" and
+                    run.get("path") == ".github/workflows/ci.yml" and not jobs,
+                    "historical zero-job exception changed")
+            historical.append(key[1])
+            continue
+        # An allocated job with exact non-CUDA labels cannot use these four
+        # listeners. A run without jobs, unassigned job, or missing labels may
+        # acquire one later, so it remains a reservation until proven otherwise.
+        require(jobs, f"foreign run has no allocated jobs: {key}")
+        active_count = 0
+        for job in jobs:
+            if job.get("status") == "completed":
+                continue
+            active_count += 1
+            labels = job.get("labels")
+            require(isinstance(labels, list) and labels and
+                    all(isinstance(label, str) and label for label in labels),
+                    f"foreign job labels unavailable: {key}")
+            lowered = {label.lower() for label in labels}
+            require("cuda" not in lowered and
+                    job.get("runner_name") not in RUNNERS and
+                    job.get("runner_id") not in RUNNERS.values() and
+                    job.get("status") == "in_progress" and
+                    isinstance(job.get("runner_name"), str) and
+                    isinstance(job.get("runner_id"), int),
+                    f"foreign CUDA or unknown job: {key}:{job.get('id')}")
+        require(active_count > 0, f"foreign run has no active assigned non-CUDA job: {key}")
+    return {"own_run": own_id, "own_job": owned["id"],
+            "own_runner": owned["runner_name"], "historical_zero_job_runs": historical,
+            "physical_lease": False}
+
+
+def owned_run(own_id: int, head: str, workflow: str) -> dict:
+    row = api(f"repos/SceneWorks/inference/actions/runs/{own_id}")
+    require(isinstance(row, dict) and row.get("id") == own_id and
+            row.get("head_sha") == head and row.get("run_attempt") == 1 and
+            row.get("event") == "workflow_dispatch" and
+            row.get("path") == f".github/workflows/{workflow}" and
+            row.get("repository", {}).get("full_name") == "SceneWorks/inference",
+            "owned run/source/attempt changed")
+    return row
+
+
+def bind_owned_job(own_id: int, head: str, workflow: str, job_id: int,
+                   runner_name: str, runner_id: int) -> dict:
+    run = owned_run(own_id, head, workflow)
+    require(run.get("status") == "in_progress" and run.get("conclusion") is None,
+            "owned run not active for binding")
+    require(isinstance(run.get("created_at"), str) and run["created_at"],
+            "owned run start identity unavailable")
+    job = api(f"repos/SceneWorks/inference/actions/jobs/{job_id}")
+    require(isinstance(job, dict) and job.get("id") == job_id and
+            job.get("run_id") == own_id and job.get("run_attempt") == 1 and
+            job.get("head_sha") == head and job.get("name") == "cuda" and
+            job.get("runner_name") == runner_name and job.get("runner_id") == runner_id and
+            job.get("status") == "in_progress" and job.get("conclusion") is None and
+            job.get("completed_at") is None and isinstance(job.get("started_at"), str),
+            "owned job/runner/start binding unavailable")
+    return {"run": run, "job": job, "start": job["started_at"]}
+
+
+def cancel_bound_run(own_id: int, head: str, workflow: str, binding: dict,
+                     *, identity_drift: bool) -> None:
+    if identity_drift:
+        return  # An observed positive identity drift revokes cancellation.
+    try:
+        current = api(f"repos/SceneWorks/inference/actions/runs/{own_id}")
+    except Exception:
+        current = None  # Only the previously authenticated immutable run/job may be canceled.
+    if current is not None:
+        if not isinstance(current, dict) or any((
+                current.get("id") != own_id,
+                current.get("head_sha") != head,
+                current.get("run_attempt") != 1,
+                current.get("event") != "workflow_dispatch",
+                current.get("path") != f".github/workflows/{workflow}",
+                current.get("repository", {}).get("full_name") != "SceneWorks/inference",
+                current.get("created_at") != binding["run"].get("created_at"))):
+            return  # Positive source/run drift revokes cancellation.
+        if current.get("status") == "completed":
+            return
+    require(binding["job"].get("id") == binding["job_id"] and
+            binding["start"] == binding["job"].get("started_at"),
+            "cached owned job binding changed")
+    subprocess.run(["gh", "run", "cancel", str(own_id), "-R", "SceneWorks/inference"],
+                   check=True, timeout=30)
+
+
+def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, interval: int,
+          job_id: int, runner_name: str, runner_id: int) -> None:
+    require(0 < seconds <= 480 * 60 and 5 <= interval <= 60 and not output.exists(),
+            "watch interval/duration/output invalid")
+    require((runner_name, runner_id) in (("cuda-windows", 2313), ("cuda-windows-2", 2619)),
+            "owned runner binding invalid")
+    # No cancellation if the initial direct run/job/runner authentication fails.
+    binding = bind_owned_job(own_id, head, workflow, job_id, runner_name, runner_id)
+    binding["job_id"] = job_id
+    output.mkdir(parents=True)
+    deadline = time.monotonic() + seconds
+    index = 0
+    identity_drift = False
+    while time.monotonic() < deadline:
+        index += 1
+        try:
+            direct = owned_run(own_id, head, workflow)
+            require(direct.get("created_at") == binding["run"].get("created_at") and
+                    direct.get("repository", {}).get("full_name") == "SceneWorks/inference",
+                    "owned immutable run identity drifted")
+            if direct.get("status") == "completed":
+                (output / "terminal.json").write_text(json.dumps(direct, indent=2) + "\n", encoding="utf-8")
+                return  # Final child/postflight and physical release still require independent audit.
+            data = snapshot()
+            observed_job = next((job for job in data["jobs"].get(("SceneWorks/inference", own_id), [])
+                                 if job.get("id") == job_id), None)
+            if observed_job is not None and any((
+                    observed_job.get("run_id") != own_id,
+                    observed_job.get("run_attempt") != 1,
+                    observed_job.get("head_sha") != head,
+                    observed_job.get("runner_id") != runner_id,
+                    observed_job.get("runner_name") != runner_name,
+                    observed_job.get("started_at") != binding["start"])):
+                raise RuntimeError("owned job identity drifted")
+            proof = classify(data, own_id, head, workflow)
+            require(proof["own_job"] == job_id and proof["own_runner"] == runner_name and
+                    observed_job is not None and observed_job.get("started_at") == binding["start"],
+                    "inventory differs from direct immutable owned job binding")
+            (output / f"{index:04d}.json").write_text(
+                json.dumps({"checked_at": data["checked_at"], "proof": proof,
+                            "runners": data["runners"], "runs": [
+                                {"repo": repo, "id": rid, "head_sha": run.get("head_sha"),
+                                 "status": run.get("status"), "run_attempt": run.get("run_attempt")}
+                                for (repo, rid), run in data["runs"].items()],
+                            "jobs": [{"repo": repo, "run": rid, "rows": [
+                                {"id": job.get("id"), "name": job.get("name"),
+                                 "status": job.get("status"), "runner_name": job.get("runner_name")}
+                                for job in rows]} for (repo, rid), rows in data["jobs"].items()]},
+                           indent=2) + "\n",
+                encoding="utf-8")
+        except BaseException as error:
+            if "identity drifted" in str(error) or "owned run/source/attempt changed" in str(error):
+                identity_drift = True
+            try:
+                current = owned_run(own_id, head, workflow)
+                if current.get("status") == "completed":
+                    (output / "terminal.json").write_text(
+                        json.dumps({"observed_after_error": str(error), "run": current}, indent=2) + "\n",
+                        encoding="utf-8")
+                    return
+            except Exception:
+                pass  # Source was authenticated before the watch; cancel that one run.
+            try:
+                (output / "refusal.txt").write_text(str(error) + "\n", encoding="utf-8")
+            finally:
+                cancel_bound_run(own_id, head, workflow, binding, identity_drift=identity_drift)
+            raise
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+    cancel_bound_run(own_id, head, workflow, binding, identity_drift=identity_drift)
+    raise TimeoutError("bounded shared-host watch ended; no physical release inferred")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--own-run-id", type=int, required=True)
+    parser.add_argument("--control-sha", required=True)
+    parser.add_argument("--workflow", choices=("yue2-precision-proof.yml", "yue2-app-precision-profile.yml"),
+                        required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--seconds", type=int, required=True)
+    parser.add_argument("--interval", type=int, default=30)
+    parser.add_argument("--expected-job-id", type=int, required=True)
+    parser.add_argument("--expected-runner-name", choices=("cuda-windows", "cuda-windows-2"), required=True)
+    parser.add_argument("--expected-runner-id", type=int, choices=(2313, 2619), required=True)
+    args = parser.parse_args()
+    watch(args.own_run_id, args.control_sha, args.workflow, args.output, args.seconds, args.interval,
+          args.expected_job_id, args.expected_runner_name, args.expected_runner_id)
+
+
+if __name__ == "__main__":
+    main()
