@@ -1237,7 +1237,7 @@ impl KvCache for DenseFallbackPackedDecoderCache {
 
     /// Arm exact speculative rollback (sc-20681): keep every layer's unquantized rows from its
     /// group-aligned quantized extent on, so the next truncate back to at least this position
-    /// restores the residual from them (see [`ContiguousSpeculation`]). The history stays
+    /// restores the residual from them (see `ContiguousSpeculation`). The history stays
     /// compressed. Only a host-staged (CPU reference) store, which keeps no device residual to
     /// window, moves to the recorded dense fallback.
     fn begin_speculation(&mut self) -> Result<()> {

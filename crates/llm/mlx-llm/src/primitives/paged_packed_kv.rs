@@ -48,7 +48,7 @@
 //!
 //! ## Serving lifecycles (story sc-20681)
 //!
-//! * **Batched decode.** [`paged_attention_batch`] serves one layer of several sequences on one
+//! * **Batched decode.** `paged_attention_batch` serves one layer of several sequences on one
 //!   pool with a single fused dispatch: a `[B, max_pages]` page table and per-sequence lengths
 //!   replace the padding mask a padded batch would need, so jagged sequences decode together
 //!   compressed. Each sequence's step stays its own whole-step transaction.
@@ -328,7 +328,7 @@ impl PackedPagePool {
         }
     }
 
-    /// Pages one growth (or a trim's rounding) adds: [`MIN_POOL_PAGES`], or 1/32 of the
+    /// Pages one growth (or a trim's rounding) adds: `MIN_POOL_PAGES`, or 1/32 of the
     /// current capacity once that is larger — a bounded over-allocation (≤ ~3 %), unlike doubling,
     /// which can hold twice the live pages.
     pub fn growth_chunk(&self) -> usize {
@@ -731,7 +731,7 @@ impl SpeculationWindow {
 #[derive(Clone, Debug, Default)]
 struct AcceptedCalls {
     fused: u64,
-    /// Of `fused`, the calls served by a batched dispatch ([`paged_attention_batch`]).
+    /// Of `fused`, the calls served by a batched dispatch (`paged_attention_batch`).
     batched: u64,
     kernel_paths: Vec<(PackedKernelSelection, u64)>,
     gathers: BTreeMap<PagedFallbackReason, (u64, String)>,
@@ -826,7 +826,7 @@ impl PagedPackedKvCache {
     }
 
     /// Of [`Self::fused_calls`], those served together with other sequences in one batched
-    /// dispatch ([`paged_attention_batch`]).
+    /// dispatch (`paged_attention_batch`).
     pub fn batched_calls(&self) -> u64 {
         self.accepted.batched
     }
