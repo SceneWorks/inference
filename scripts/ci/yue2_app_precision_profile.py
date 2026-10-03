@@ -36,6 +36,11 @@ CASE_SOURCE_SHA256 = {
     "strict-fp32-q4-standard": "3162d290206e8c16e24c1361f6f5abbe1ee738e6652a08bf3da47ee12aba1910",
     "experimental-fp8-auto": "56d5dee367c86ae4ff142dcd30c1f9a194201cddb4f0d4afad7440f15e4f36d7",
 }
+SUPPORTED_RUNTIME_POLICIES = {
+    # The M4 CUDA BF16 VAE used a private cuBLAS handle in this mode. A changed
+    # arithmetic policy must be bound to its exact engine revision before capture.
+    "825341ff8d0110ea448213485891b39d57806fa4": "disallow_reduced_precision_reduction_v1",
+}
 
 
 def names_for_backend(backend: str) -> tuple[str, ...]:
@@ -115,6 +120,21 @@ def verify_sources(app: Path, engine: Path, control: Path, app_sha: str, engine_
     return {"app_sha": app_sha, "engine_sha": engine_sha, "control_sha": control_sha, "app_pins": pins}
 
 
+def verified_runtime_policy(app: Path, engine: Path, evidence: Path,
+                            supported: dict[str, str] = SUPPORTED_RUNTIME_POLICIES) -> tuple[str, str]:
+    source = json.loads((evidence / "sources.json").read_text(encoding="utf-8"))
+    require(isinstance(source, dict) and
+            all(isinstance(source.get(key), str) for key in ("app_sha", "engine_sha", "control_sha")),
+            "source manifest lacks exact checkout identities")
+    verified = verify_sources(app, engine, Path(__file__).resolve().parents[2],
+                              source["app_sha"], source["engine_sha"], source["control_sha"])
+    require(source == verified, "source manifest differs from verified clean checkouts and app pin")
+    policy = supported.get(source["engine_sha"])
+    require(type(policy) is str and bool(policy),
+            f"unsupported engine revision for CUDA BF16 VAE math policy: {source['engine_sha']}")
+    return source["engine_sha"], policy
+
+
 def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
     names = names_for_backend(backend)
     require(not destination.exists(), "run-owned case directory already exists")
@@ -191,7 +211,7 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
     return record
 
 
-def verify_record(record_path: Path, backend: str, name: str) -> dict:
+def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_policy: str) -> dict:
     require(name in names_for_backend(backend), "unknown case/backend")
     row = json.loads(record_path.read_text(encoding="utf-8"))
     _, case_name, decoder, policy, model_dtype, vae_dtype = CASES[name]
@@ -212,7 +232,7 @@ def verify_record(record_path: Path, backend: str, name: str) -> dict:
     for key, wanted in (("engineComputePolicy", policy), ("engineModelDtype", model_dtype),
                         ("engineVaeDtype", vae_dtype)):
         require(outcome.get(key) == wanted, f"effective {key} does not match {wanted}")
-    math_policy = "disallow_reduced_precision_reduction_v1" if backend == "cuda" and policy == "bf16" else None
+    math_policy = cuda_bf16_math_policy if backend == "cuda" and policy == "bf16" else None
     if math_policy is None:
         require("engineVaeCudaBf16MathPolicy" not in outcome,
                 "effective CUDA BF16 VAE math policy is present on another backend or compute policy")
@@ -258,12 +278,13 @@ def verify_audio(profile_dir: Path, backend: str, name: str) -> dict:
             "sha256": sha256_stream(audio)}
 
 
-def collect(profile_dir: Path, evidence: Path, backend: str) -> dict:
+def collect(profile_dir: Path, evidence: Path, backend: str, app: Path, engine: Path) -> dict:
+    engine_sha, cuda_bf16_math_policy = verified_runtime_policy(app, engine, evidence)
     require(not (evidence / "profile").exists(), "profile receipts were already collected")
     rows = []
     for name in names_for_backend(backend):
         source = profile_dir / case_id(backend, name).replace(":", "__")
-        row = verify_record(source / "record.json", backend, name)
+        row = verify_record(source / "record.json", backend, name, cuda_bf16_math_policy)
         row["listening_audio"] = verify_audio(profile_dir, backend, name)
         rows.append(row)
         target = evidence / "profile" / name
@@ -278,6 +299,7 @@ def collect(profile_dir: Path, evidence: Path, backend: str) -> dict:
                 (target / "boundary").mkdir(exist_ok=True)
                 shutil.copy2(file, target / "boundary" / file.name)
     verdict = {"backend": backend, "cases": rows, "status": "completed",
+               "engine_sha": engine_sha, "expected_cuda_bf16_vae_math_policy": cuda_bf16_math_policy,
                "listening_audio": [row["listening_audio"] for row in rows]}
     if os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "owner-gpu0":
         require(backend == "cuda", "GPU0 owner scheduling cannot grade Metal")
@@ -312,6 +334,7 @@ def copy_partial(profile_dir: Path, evidence: Path, backend: str) -> None:
 
 def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Path,
                  cases: Path, backend: str) -> dict:
+    _, cuda_bf16_math_policy = verified_runtime_policy(app, engine, evidence)
     require(not output.exists(), "profile output already exists")
     output.mkdir(parents=True)
     evidence.mkdir(parents=True, exist_ok=True)
@@ -353,7 +376,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                                                 stdout=log, stderr=subprocess.STDOUT, check=False).returncode
                 require(status == 0, f"{name} {label} exited {status}; see retained log")
             record = output / case_id(backend, name).replace(":", "__") / "record.json"
-            verify_record(record, backend, name)
+            verify_record(record, backend, name, cuda_bf16_math_policy)
             with (evidence / f"{name}-check.log").open("w", encoding="utf-8") as log:
                 status = subprocess.run(["node", "--input-type=module", "-e", OFF_PLAN_CHECK,
                                          str(record), str(case)],
@@ -366,7 +389,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                 encoding="utf-8",
             )
         preflight(backend, evidence, "after-cases")
-        return collect(output, evidence, backend)
+        return collect(output, evidence, backend, app, engine)
     finally:
         copy_partial(output, evidence, backend)
 
@@ -384,7 +407,7 @@ def main() -> int:
     for field in ("backend", "evidence", "label"):
         flight.add_argument(f"--{field}", required=True)
     receipts = sub.add_parser("collect")
-    for field in ("profile", "evidence", "backend"):
+    for field in ("profile", "evidence", "backend", "app", "engine"):
         receipts.add_argument(f"--{field}", required=True)
     captures = sub.add_parser("run-captures")
     for field in ("app", "engine", "data", "output", "evidence", "cases", "backend"):
@@ -399,7 +422,8 @@ def main() -> int:
     elif args.command == "preflight":
         result = preflight(args.backend, Path(args.evidence), args.label)
     elif args.command == "collect":
-        result = collect(Path(args.profile), Path(args.evidence), args.backend)
+        result = collect(Path(args.profile), Path(args.evidence), args.backend,
+                         Path(args.app), Path(args.engine))
     else:
         result = run_captures(Path(args.app), Path(args.engine), Path(args.data),
                               Path(args.output), Path(args.evidence), Path(args.cases), args.backend)
