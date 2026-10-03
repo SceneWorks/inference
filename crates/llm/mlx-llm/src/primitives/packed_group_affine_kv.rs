@@ -636,9 +636,10 @@ impl DenseFallbackPackedDecoderCache {
         self.transition_admission = Some(admission);
     }
 
-    /// Bytes [`Self::transition_to_dense`] allocates for the resident history: every layer's dense
-    /// K/V at the dense cache's block-rounded capacity, plus the largest layer's reconstruction
-    /// transient (its Float32 dequantization beside the cast K/V it copies into the dense cache).
+    /// Bytes the dense transition (`transition_to_dense`) allocates for the resident history:
+    /// every layer's dense K/V at the dense cache's block-rounded capacity, plus the largest
+    /// layer's reconstruction transient (its Float32 dequantization beside the cast K/V it copies
+    /// into the dense cache).
     pub fn dense_reconstruction_bytes(&self) -> u64 {
         let rows = self.staged.batch.saturating_mul(self.staged.kv_heads);
         let block = usize::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).unwrap_or(256);
