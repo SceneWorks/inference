@@ -384,6 +384,10 @@ class DiagnosticGuards(unittest.TestCase):
                          "candle_derivative_tree_sha256"):
             self.assertIn(required, source)
         self.assertNotIn("cublasSetMathMode", source)
+        backend_patch = (CI / "yue2_bf16_tile_diagnostic/native-convt-candle-core.patch").read_text(
+            encoding="utf-8")
+        self.assertIn('std::sync::Arc::as_ptr(&device.cuda_stream())', backend_patch)
+        self.assertNotIn('Arc::as_ptr(&device.stream)', backend_patch)
 
     def test_decoder_trace_binary_mismatch_reaches_neither_census_nor_child(self):
         with tempfile.TemporaryDirectory() as directory:
