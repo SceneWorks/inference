@@ -165,6 +165,8 @@ pub fn check_resume_fingerprints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use crate::train::TrainingItem;
 
     fn request(dir: &Path) -> TrainingRequest {
@@ -181,38 +183,66 @@ mod tests {
     }
 
     /// The digest is the exact bytes candle-gen's resume bundles have always recorded: a change here
-    /// strands every existing candle resume snapshot.
+    /// strands every existing candle resume snapshot. The hex strings are **captured, not derived**:
+    /// they are what the pre-sc-24163 `candle_gen::train::flow_match::request_fingerprint`
+    /// (feature-branch base `d6f6388ad`) returned for these exact requests over the committed
+    /// `tests/fixtures/request_fingerprint/` files, addressed by the same relative paths (cargo runs
+    /// a package's tests from its manifest directory, so the path bytes are machine-independent).
     ///
-    /// *Mutation that reds this:* any change to the field tags, order or length framing.
+    /// *Mutation that reds this:* any change to a field tag byte, the field order, the length
+    /// framing, the file-size prefix or the format string.
     #[test]
     fn the_request_fingerprint_format_is_pinned() {
-        let dir = tempfile::tempdir().unwrap();
-        let req = request(dir.path());
-        let mut hasher = Sha256::new();
-        let tagged = |hasher: &mut Sha256, tag: &[u8], bytes: &[u8]| {
-            hasher.update((tag.len() as u64).to_le_bytes());
-            hasher.update(tag);
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
+        let fixture =
+            |name: &str| PathBuf::from(format!("tests/fixtures/request_fingerprint/{name}"));
+        let req = |items: Vec<TrainingItem>| TrainingRequest {
+            items,
+            config: TrainingConfig {
+                resolution: 512,
+                ..Default::default()
+            },
+            output_dir: PathBuf::from("out"),
+            file_name: "out.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
         };
-        tagged(&mut hasher, b"format", b"candle-training-request-v1");
-        tagged(
-            &mut hasher,
-            b"resolution",
-            &req.config.resolution.to_le_bytes(),
-        );
-        tagged(&mut hasher, b"item_count", &1u64.to_le_bytes());
-        tagged(&mut hasher, b"item_index", &0u64.to_le_bytes());
-        tagged(&mut hasher, b"caption", b"a cat");
-        let image = &req.items[0].image_path;
-        tagged(&mut hasher, b"image", image.to_string_lossy().as_bytes());
-        hasher.update(7u64.to_le_bytes());
-        hasher.update(b"image a");
-        tagged(&mut hasher, b"has_control", &[0]);
-        assert_eq!(
-            request_fingerprint(&req).unwrap(),
-            format!("{:x}", hasher.finalize())
-        );
+        let captioned = req(vec![TrainingItem::captioned(
+            fixture("target.bin"),
+            "a cat".into(),
+        )]);
+        let control = req(vec![TrainingItem::with_control(
+            fixture("target.bin"),
+            "a cat".into(),
+            fixture("control.bin"),
+        )]);
+        let edit = req(vec![TrainingItem::edit_pair(
+            fixture("target.bin"),
+            "make it blue".into(),
+            vec![fixture("ref_a.bin"), fixture("ref_b.bin")],
+        )]);
+        for (name, req, pinned) in [
+            (
+                "captioned",
+                captioned,
+                "d1b0e0c1313cd521a3bff8698c6ac823c5f021f7b6dc5e2233894bc1ad39a8f1",
+            ),
+            (
+                "control",
+                control,
+                "ac7457a124e2ed138e301c7821117f320b8e08bda98b931e2d298a944ad0f401",
+            ),
+            (
+                "edit",
+                edit,
+                "9a7112d8f77cb0ebd266d8b87fef582858b914f92dbb2184b539df1c52b6c4b7",
+            ),
+        ] {
+            assert_eq!(
+                request_fingerprint(&req).unwrap(),
+                pinned,
+                "{name}: the digest must stay the one candle resume bundles already record"
+            );
+        }
     }
 
     /// Ordered references are part of the identity: adding, reordering or editing one changes it.

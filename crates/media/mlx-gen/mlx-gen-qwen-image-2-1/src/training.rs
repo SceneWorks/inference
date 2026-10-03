@@ -1658,6 +1658,41 @@ impl QwenImage21Trainer {
             .unwrap_or_else(device_budget_bytes);
         check_training_footprint(&self.facts, &shape, budget)?;
 
+        // --- resume admission, before any model loads ---
+        // The run's identity (sc-24163): its training config and its dataset fingerprint (item
+        // order, captions, image / ordered reference paths and contents). Every resume bundle
+        // records it, and a resume whose config, dataset or training mode changed is refused HERE —
+        // from the snapshot's metadata alone, right after the preflight, as the candle twin does —
+        // so a refused resume never pays the text-encoder / VAE caching pass.
+        let stem = Path::new(&req.file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lora")
+            .to_string();
+        let fingerprint = checkpoint::request_fingerprint(req)?;
+        let identity = checkpoint::ResumeIdentity {
+            config: cfg,
+            request_fingerprint: &fingerprint,
+        };
+        let resume_from = if cfg.resume {
+            checkpoint::find_latest_resume(&req.output_dir, &stem)
+        } else {
+            None
+        };
+        if let Some((snapshot, step)) = &resume_from {
+            let meta = gen_core::weightsmeta::safetensors_file_metadata(
+                req.output_dir.join(checkpoint_filename(&stem, *step)),
+            )?;
+            check_resumed_mode(meta.get(EDIT_ADAPTER_MARKER.0).map(String::as_str), edit)?;
+            checkpoint::check_resume_fingerprints(
+                &gen_core::weightsmeta::safetensors_file_metadata(snapshot)?
+                    .into_iter()
+                    .collect::<std::collections::HashMap<_, _>>(),
+                cfg,
+                &fingerprint,
+            )?;
+        }
+
         // --- 1. captions: the Qwen3-VL tower, encoded ONCE, then dropped ---
         // Every prompt goes through the render path's own assembly: references preprocessed by
         // `prepare_conditioning_references`, the (image-conditioned, for edit) template encoded by
@@ -1796,37 +1831,18 @@ impl QwenImage21Trainer {
         let accum = cfg.gradient_accumulation.max(1);
         let (total_updates, warmup_updates) =
             schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("lora")
-            .to_string();
 
-        // --- resume: continue from the latest snapshot of THIS adapter in output_dir, if any ---
-        // The run's identity (sc-24163): its training config and its dataset fingerprint (item
-        // order, captions, image / ordered reference paths and contents). Every resume bundle
-        // records it, and a resume whose config or dataset changed is refused — the candle twin's
-        // rule, through the same gen-core check.
-        let fingerprint = checkpoint::request_fingerprint(req)?;
-        let identity = checkpoint::ResumeIdentity {
-            config: cfg,
-            request_fingerprint: &fingerprint,
-        };
+        // --- resume: continue from the snapshot admitted above (identity + mode already checked;
+        // `load_resume_with_identity` re-checks the identity against the bundle it restores) ---
         let mut update_idx: u32 = 0;
         let mut start_step: u32 = 0;
-        if cfg.resume {
-            if let Some((snapshot, step)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
-                let meta = gen_core::weightsmeta::safetensors_file_metadata(
-                    req.output_dir.join(checkpoint_filename(&stem, step)),
-                )?;
-                check_resumed_mode(meta.get(EDIT_ADAPTER_MARKER.0).map(String::as_str), edit)?;
-                let (loaded, meta) =
-                    checkpoint::load_resume_with_identity(&snapshot, &mut opt, identity)?;
-                check_resumed_params(&params, &loaded)?;
-                params = loaded;
-                start_step = meta.step;
-                update_idx = meta.update_idx;
-            }
+        if let Some((snapshot, _)) = &resume_from {
+            let (loaded, meta) =
+                checkpoint::load_resume_with_identity(snapshot, &mut opt, identity)?;
+            check_resumed_params(&params, &loaded)?;
+            params = loaded;
+            start_step = meta.step;
+            update_idx = meta.update_idx;
         }
 
         // Provenance + licence on every saved adapter; an edit adapter is also marked as one.

@@ -684,8 +684,8 @@ fn train_refuses_full_finetune_and_control_requests_without_a_prior_validate() {
 /// recorded dataset fingerprint (ordered reference paths + contents) differs — while the original
 /// dataset still resumes. The candle twin's rule, through the same gen-core check.
 ///
-/// *Mutation that reds this:* resuming through the plain `checkpoint::load_resume` (no identity
-/// check) — the swapped-reference run then continues the old adapter.
+/// *Mutation that reds this:* dropping both identity checks (the early metadata admission and
+/// `load_resume_with_identity`) — the swapped-reference run then continues the old adapter.
 #[test]
 fn a_changed_reference_set_refuses_resume() {
     let tmp = tempfile::tempdir().unwrap();
@@ -731,12 +731,20 @@ fn a_changed_reference_set_refuses_resume() {
         &out,
     );
     let mut t = trainer();
-    let (steps, result) = run(t.as_mut(), &swapped, |_| {});
+    let mut events = Vec::new();
+    let result = t.train(&swapped, &mut |p| events.push(format!("{p:?}")));
     let err = result.unwrap_err().to_string();
     assert!(err.contains("dataset/request fingerprint differs"), "{err}");
+    // The refusal is admitted from the snapshot's metadata right after the preflight, so it pays
+    // no model load. *Mutation that reds this:* checking the identity only at the post-cache
+    // `load_resume_with_identity`.
     assert!(
-        steps.is_empty(),
-        "no step runs on a refused resume: {steps:?}"
+        !events.iter().any(|e| e.starts_with("LoadingModel")),
+        "a refused resume loads no model: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.starts_with("Training")),
+        "no step runs on a refused resume: {events:?}"
     );
 
     let original = request(items(vec![ref_a, ref_b]), resume, &out);
