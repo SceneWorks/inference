@@ -419,6 +419,23 @@ impl LoraLinear {
         Ok(())
     }
 
+    /// Device bytes the additive inference residuals on this projection hold right now (sc-24163):
+    /// each LoRA's f32 factors, which every forward casts and drops (no cached copy), and each
+    /// structured LoKr's factors plus the compute-dtype copies its forwards have cached
+    /// ([`LokrFactors::device_bytes`]). The trainable adapter is not counted.
+    pub fn frozen_additive_bytes(&self) -> usize {
+        self.additive
+            .iter()
+            .map(|residual| match residual {
+                AdditiveResidual::Lora { a, b, .. } => {
+                    a.elem_count() * a.dtype().size_in_bytes()
+                        + b.elem_count() * b.dtype().size_in_bytes()
+                }
+                AdditiveResidual::LokrStructured { factors, .. } => factors.device_bytes(),
+            })
+            .sum()
+    }
+
     /// Attach a forward-time **additive structured LoKr** inference residual via the shared Kronecker
     /// vec-trick (sc-11103): the full `(alpha/rank)·strength` scale is baked into `factors`, so the
     /// `[out,in]` delta is never formed and the residual is memory-free on a packed base. Valid on any
