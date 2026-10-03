@@ -29,9 +29,15 @@ use crate::decode::stream::{
 };
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache, SEQ_AXIS};
 use crate::primitives::sampler::SplitMix64;
-use crate::primitives::{input_ids, CacheRoute};
+use crate::primitives::{
+    input_ids, token_digest, CacheRoute, CompiledKernelHandle, PackedPagePool, PagedCacheIdentity,
+    PagedCacheSnapshot, PagedModelKey, PagedPackedKvCache,
+};
 
 /// Cumulative reuse accounting for a [`PrefixCache`] — the measurable payoff of story 7168.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -509,6 +515,251 @@ fn slice_layers(stored: &[(Array, Array)], len: usize) -> Result<Vec<(Array, Arr
         }
     }
     Ok(out)
+}
+
+/// Cumulative accounting of a [`PagedPrefixCache`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PagedPrefixStats {
+    /// Lookups whose identity matched the store.
+    pub lookups: usize,
+    /// Lookups that started their sequence on stored pages.
+    pub hits: usize,
+    /// Positions those hits reused (prefill skipped).
+    pub reused_tokens: usize,
+    /// Sequences stored.
+    pub stored: usize,
+    /// Lookups, stores and restores refused for an identity or format mismatch (nothing reused).
+    pub refused: usize,
+}
+
+/// The outcome of one [`PagedPrefixCache::lookup`].
+#[derive(Debug)]
+pub enum PagedPrefixLookup {
+    /// A new sequence holding the first `tokens` positions of the prompt on shared pages; prefill
+    /// the rest from position `tokens`.
+    Hit {
+        cache: Box<PagedPackedKvCache>,
+        tokens: usize,
+    },
+    /// Nothing stored shares a reusable prefix with the prompt.
+    Miss,
+    /// The request's cache identity is not the store's: nothing was reused. The reason names the
+    /// first differing field.
+    Refused(String),
+}
+
+struct PagedPrefixEntry {
+    tokens: Vec<i32>,
+    cache: PagedPackedKvCache,
+}
+
+/// A bounded, LRU shared-prefix store over **paged compressed** KV (sc-20681): the paged
+/// counterpart of [`PrefixCache`]. An entry holds references to a finished (or still decoding)
+/// sequence's pages, not a copy of them; a lookup starts the new sequence on those pages with
+/// [`PagedPackedKvCache::fork_prefix`], so prefix sharing costs reference counts, and a sequence
+/// that writes into a shared page copies it first (copy-on-write). Evicting or clearing an entry
+/// drops its references; a page is freed when its last sequence or entry lets go of it.
+///
+/// Every entry is keyed by the store's [`PagedCacheIdentity`] — the model, the KV format version,
+/// the page layout version and the page geometry — and the token prefix. A lookup, store or
+/// restore under any other identity is refused and counted, never served from or into this store.
+pub struct PagedPrefixCache {
+    model: PagedModelKey,
+    identity: PagedCacheIdentity,
+    pool: Rc<RefCell<PackedPagePool>>,
+    index: PrefixIndex,
+    entries: HashMap<PrefixId, PagedPrefixEntry>,
+    stats: PagedPrefixStats,
+}
+
+impl PagedPrefixCache {
+    /// A store of at most `capacity` sequences on `pool`, for caches computed by `model` (its
+    /// name and [`crate::models::CausalLm::cache_fingerprint`]).
+    pub fn new(pool: Rc<RefCell<PackedPagePool>>, model: PagedModelKey, capacity: usize) -> Self {
+        let identity = pool.borrow().identity(&model);
+        Self {
+            model,
+            identity,
+            pool,
+            index: PrefixIndex::new(capacity),
+            entries: HashMap::new(),
+            stats: PagedPrefixStats::default(),
+        }
+    }
+
+    pub fn identity(&self) -> &PagedCacheIdentity {
+        &self.identity
+    }
+
+    /// The page pool every entry (and every sequence started from one) lives on.
+    pub fn pool(&self) -> &Rc<RefCell<PackedPagePool>> {
+        &self.pool
+    }
+
+    pub fn stats(&self) -> PagedPrefixStats {
+        self.stats
+    }
+
+    /// Stored sequences.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Every stored sequence's cache (for a pool compaction to remap).
+    pub fn caches_mut(&mut self) -> impl Iterator<Item = &mut PagedPackedKvCache> {
+        self.entries.values_mut().map(|entry| &mut entry.cache)
+    }
+
+    /// Distinct pages the entries reference.
+    pub fn held_pages(&self) -> usize {
+        self.entries
+            .values()
+            .flat_map(|entry| entry.cache.page_ids().iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    /// Count a request whose run could not use this store (another identity, or no identity).
+    pub fn record_refusal(&mut self) {
+        self.stats.refused += 1;
+    }
+
+    fn refuse(&mut self, identity: &PagedCacheIdentity) -> Option<String> {
+        let mismatch = identity.mismatch(&self.identity)?;
+        self.stats.refused += 1;
+        Some(mismatch)
+    }
+
+    /// Start a sequence of `identity` on the longest stored prefix of `prompt`: at most
+    /// `prompt.len() - 1` positions (the last prompt token is always prefilled, for its logits),
+    /// rounded as [`PagedPackedKvCache::fork_prefix`] rounds. Refused for another identity.
+    pub fn lookup(
+        &mut self,
+        identity: &PagedCacheIdentity,
+        prompt: &[i32],
+    ) -> Result<PagedPrefixLookup> {
+        if let Some(mismatch) = self.refuse(identity) {
+            return Ok(PagedPrefixLookup::Refused(mismatch));
+        }
+        self.stats.lookups += 1;
+        let Some(found) = self.index.longest_match(prompt) else {
+            return Ok(PagedPrefixLookup::Miss);
+        };
+        let Some(entry) = self.entries.get(&found.id) else {
+            return Ok(PagedPrefixLookup::Miss);
+        };
+        let wanted = found
+            .matched_len
+            .min(prompt.len().saturating_sub(1))
+            .min(entry.tokens.len());
+        let (cache, tokens) = entry.cache.fork_prefix(wanted)?;
+        if tokens == 0 {
+            return Ok(PagedPrefixLookup::Miss);
+        }
+        self.stats.hits += 1;
+        self.stats.reused_tokens += tokens;
+        Ok(PagedPrefixLookup::Hit {
+            cache: Box::new(cache),
+            tokens,
+        })
+    }
+
+    /// Store the sequence `cache` holds — whose positions are `tokens` (truncated to what the
+    /// cache holds) — by referencing its pages. Returns `false`, storing nothing, when the
+    /// identity is not the store's or the cache lives on another pool.
+    pub fn insert(
+        &mut self,
+        identity: &PagedCacheIdentity,
+        tokens: &[i32],
+        cache: &PagedPackedKvCache,
+    ) -> Result<bool> {
+        if self.refuse(identity).is_some() {
+            return Ok(false);
+        }
+        if !Rc::ptr_eq(cache.pool(), &self.pool) {
+            self.stats.refused += 1;
+            return Ok(false);
+        }
+        let held = (cache.offset().max(0) as usize).min(tokens.len());
+        if held == 0 {
+            return Ok(false);
+        }
+        let (entry, held) = cache.fork_prefix(held)?;
+        self.store(tokens[..held].to_vec(), entry)?;
+        Ok(true)
+    }
+
+    fn store(&mut self, tokens: Vec<i32>, cache: PagedPackedKvCache) -> Result<()> {
+        let outcome = self.index.insert(tokens.clone());
+        let mut released = false;
+        for evicted in &outcome.evicted {
+            released |= self.entries.remove(evicted).is_some();
+        }
+        if self.index.contains(outcome.id) {
+            released |= self
+                .entries
+                .insert(outcome.id, PagedPrefixEntry { tokens, cache })
+                .is_some();
+        }
+        self.stats.stored += 1;
+        if released {
+            // An evicted or replaced entry may have held the pool's top pages.
+            self.pool.borrow_mut().trim()?;
+        }
+        Ok(())
+    }
+
+    /// Every stored sequence as `(tokens, snapshot)`, each snapshot bound to its tokens
+    /// ([`PagedCacheSnapshot::bound_to`]), for saving across a process restart.
+    pub fn snapshots(&self) -> Result<Vec<(Vec<i32>, PagedCacheSnapshot)>> {
+        self.entries
+            .values()
+            .map(|entry| {
+                let snapshot = entry.cache.snapshot(&self.model)?.bound_to(&entry.tokens)?;
+                Ok((entry.tokens.clone(), snapshot))
+            })
+            .collect()
+    }
+
+    /// Restore a saved sequence into the store, read by `reader`. Refused — and counted — unless
+    /// the snapshot carries exactly the store's identity (model and fingerprint, KV format and
+    /// page layout versions, geometry) and is bound to exactly these token ids.
+    pub fn restore(
+        &mut self,
+        tokens: Vec<i32>,
+        snapshot: &PagedCacheSnapshot,
+        reader: CompiledKernelHandle,
+    ) -> Result<()> {
+        if let Some(mismatch) = self.refuse(snapshot.identity()) {
+            return Err(Error::Unsupported(format!(
+                "paged prefix restore refused: {mismatch}"
+            )));
+        }
+        if snapshot.tokens() != tokens.len()
+            || snapshot.tokens_sha256() != Some(token_digest(&tokens).as_str())
+        {
+            self.stats.refused += 1;
+            return Err(Error::Unsupported(format!(
+                "paged prefix restore refused: the snapshot is not bound to these {} token ids \
+                 (it holds {} positions)",
+                tokens.len(),
+                snapshot.tokens()
+            )));
+        }
+        let cache = PagedPackedKvCache::restore(snapshot, self.pool.clone(), reader, &self.model)?;
+        self.store(tokens, cache)
+    }
+
+    /// Drop every entry (and its page references), returning the pool's freed capacity.
+    pub fn clear(&mut self) -> Result<()> {
+        self.entries.clear();
+        self.index = PrefixIndex::new(self.index.capacity());
+        self.pool.borrow_mut().trim()
+    }
 }
 
 #[cfg(test)]

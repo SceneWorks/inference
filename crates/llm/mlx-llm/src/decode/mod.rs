@@ -20,14 +20,21 @@ pub mod stream;
 
 pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
-pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
-pub use prefix::{generate_cached, generate_cached_with, PrefixCache, PrefixStats};
+pub use continuous::{
+    generate_continuous, generate_continuous_kv, BatchExactness, ContinuousConfig, ContinuousKv,
+    ContinuousOutput,
+};
+pub use prefix::{
+    generate_cached, generate_cached_with, PagedPrefixCache, PagedPrefixLookup, PagedPrefixStats,
+    PrefixCache, PrefixStats,
+};
 pub use qwen35_mtp::{generate_qwen35_mtp, Qwen35MtpMultimodalPrompt, RewindableConstraintMask};
 pub(crate) use qwen35_mtp::{
     generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
 };
 pub use speculative::{
-    generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
+    generate_draft_speculative, generate_draft_speculative_on, generate_prompt_lookup,
+    generate_prompt_lookup_on, SpeculativeConfig, SpeculativeStats,
 };
 pub use stream::{
     generate, generate_from_prefill, generate_with, generate_with_cache, ConstraintMask, Decode,

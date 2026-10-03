@@ -301,8 +301,11 @@ pub enum KvCacheFallbackReason {
     /// The request takes a path the compressed cache is not wired through (multimodal prefill,
     /// multi-token prediction, a hybrid recurrent decoder).
     UnsupportedRequest,
-    /// More than one sequence decodes together: batched prefill attends through additive padding
-    /// masks, which the fused compressed reader cannot apply.
+    /// More than one sequence decodes together on a path without per-sequence paged compressed
+    /// caches (the contiguous single-sequence planner, the padded lockstep batch decoder): its
+    /// batched prefill attends through additive padding masks, which the fused compressed reader
+    /// cannot apply. A batch served by per-sequence paged caches (continuous batching) qualifies
+    /// each sequence on its own with [`qualify_kv_sequence`] and never reports this.
     BatchedDecode,
     /// The prompt is below the family's qualified minimum (short contexts decode slower
     /// compressed than dense).
@@ -356,6 +359,28 @@ impl KvCacheFallbackReason {
             Self::DenseGather => "dense_gather",
         }
     }
+}
+
+/// Decide one sequence against [`KV_COMPRESSION_QUALIFICATIONS`] on its own: the qualifying row,
+/// or why the sequence stays dense. The table's evidence is per sequence, so a batch whose
+/// sequences each own a paged compressed cache (and attend through per-sequence page tables and
+/// lengths, not padding masks) qualifies every sequence with this; a sequence it refuses runs dense
+/// beside the others with its reason. The checks run in a fixed order — policy, family, prompt
+/// minimum, final-context maximum.
+pub fn qualify_kv_sequence(
+    policy: KvCompressionPolicy,
+    family: Option<KvModelFamily>,
+    context_tokens: u64,
+    max_new_tokens: u64,
+) -> Result<&'static KvQualification, KvCacheFallbackReason> {
+    qualify_against(
+        KV_COMPRESSION_QUALIFICATIONS,
+        policy,
+        family,
+        context_tokens,
+        max_new_tokens,
+        1,
+    )
 }
 
 /// Decide one request against [`KV_COMPRESSION_QUALIFICATIONS`]: the qualifying row, or why the
@@ -432,8 +457,15 @@ pub struct KvCacheCounters {
     /// dequantized that sequence's pages for the one call and kept nothing dense afterwards.
     pub dense_gather_fallbacks: u64,
     /// Device bytes the compressed representation retained at the end of the generation (codes,
-    /// scale/zero metadata and the bounded not-yet-quantized residual).
+    /// scale/zero metadata and the bounded not-yet-quantized residual). For a paged cache this is
+    /// the generation's own live pages, not the shared pool's capacity — see
+    /// [`Self::pool_held_bytes`].
     pub compressed_cache_bytes: u64,
+    /// Device bytes the shared page pool held when the generation finished: every sequence's
+    /// pages plus the pool's unused capacity (sc-20681). What the paged cache actually holds
+    /// resident, as opposed to this generation's live share. `0` for a cache without a shared
+    /// pool.
+    pub pool_held_bytes: u64,
 }
 
 /// The KV cache one generation ran on, carried on
@@ -703,6 +735,35 @@ mod tests {
             qualify_kv_compression(ON, Some(KvModelFamily::Llama), 40_000, 0, 0),
             Err(KvCacheFallbackReason::BatchedDecode)
         );
+    }
+
+    #[test]
+    fn a_sequence_qualifies_on_its_own_row_whatever_batch_it_decodes_in() {
+        let qwen = Some(KvModelFamily::Qwen3);
+        // Exactly the batch-1 decision of the request-level qualification, for every outcome.
+        for (family, prompt, new) in [
+            (qwen, 20_000, 64),
+            (qwen, 10_239, 64),
+            (qwen, 40_448, 513),
+            (None, 20_000, 0),
+            (Some(KvModelFamily::Llama), 40_000, 0),
+        ] {
+            assert_eq!(
+                qualify_kv_sequence(ON, family, prompt, new),
+                qualify_kv_compression(ON, family, prompt, new, 1),
+                "{family:?} {prompt} + {new}"
+            );
+        }
+        assert_eq!(
+            qualify_kv_sequence(KvCompressionPolicy::Off, qwen, 20_000, 0),
+            Err(KvCacheFallbackReason::PolicyDisabled)
+        );
+        // A sequence of a batch the request-level planner refuses as batched still qualifies.
+        assert_eq!(
+            qualify_kv_compression(ON, qwen, 20_000, 64, 3),
+            Err(KvCacheFallbackReason::BatchedDecode)
+        );
+        assert!(qualify_kv_sequence(ON, qwen, 20_000, 64).is_ok());
     }
 
     #[test]

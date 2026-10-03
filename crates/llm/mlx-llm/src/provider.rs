@@ -954,6 +954,12 @@ pub struct LlamaProvider {
     /// qualification table admits and reused by every later one; `Err` is the build failure each
     /// such request then reports as [`core_llm::KvCacheFallbackReason::ReaderUnavailable`].
     kv_reader: OnceCell<Result<crate::primitives::CompiledKernelHandle, String>>,
+    /// The loaded checkpoint's name for compressed-cache keying (its load source; empty for a
+    /// provider assembled from parts, which then never shares compressed pages).
+    kv_model_name: String,
+    /// The batched decode's shared-prefix store over compressed pages (sc-20681), created on the
+    /// first batch.
+    kv_batch_store: RefCell<Option<crate::decode::PagedPrefixCache>>,
     /// Dense Prism `vision_tower.*` tensors retained verbatim for the native multimodal adapter.
     /// Text loading must not discard them merely because sc-23937 constructs only the decoder.
     _prism_vision_weights: Option<Weights>,
@@ -1748,6 +1754,8 @@ impl LlamaProvider {
             gemma4,
             campaign_prefix_cache: RefCell::new(None),
             kv_reader: OnceCell::new(),
+            kv_model_name: spec.source.clone(),
+            kv_batch_store: RefCell::new(None),
             _prism_vision_weights: prism_vision_weights,
         })
     }
@@ -1812,6 +1820,8 @@ impl LlamaProvider {
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
             kv_reader: OnceCell::new(),
+            kv_model_name: spec.source.clone(),
+            kv_batch_store: RefCell::new(None),
             _prism_vision_weights: None,
         })
     }
@@ -1850,6 +1860,8 @@ impl LlamaProvider {
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
             kv_reader: OnceCell::new(),
+            kv_model_name: String::new(),
+            kv_batch_store: RefCell::new(None),
             _prism_vision_weights: None,
         }
     }
@@ -2453,6 +2465,190 @@ fn emit_content(
     }
 }
 
+/// One generation's token-to-text pipeline (shared by the single-request decode and, sc-20681,
+/// the batched one): incremental detokenization (holding back lossy U+FFFD placeholders so a
+/// multi-byte character split across BPE tokens streams intact — sc-12452), the thinking
+/// segmenter (reasoning vs answer), the tool-call segmenter (lifts `<tool_call>` blocks out of the
+/// answer) and the stop matcher (trims a stop string and trips `halt`), emitting contract token
+/// events as text is released.
+struct TextPipeline<'a> {
+    tokenizer: &'a Tokenizer,
+    acc: Vec<u32>,
+    detok: IncrementalDetok,
+    segmenter: Option<ThinkingSegmenter>,
+    tool_seg: Option<ToolCallSegmenter>,
+    stop_matcher: StopMatcher,
+    /// Content emitted as the matchers release it.
+    streamed: String,
+    /// Reasoning text, accumulated from the Thinking channel (sc-7585).
+    thinking_buf: String,
+    /// Contract token index: a running counter over *emitted* events, not the raw decode step —
+    /// detok hold-backs and stripped `<think>`/`</think>` marker tokens produce no event, so this
+    /// stays gap-free (and equals the step in the common one-delta-per-token case).
+    emit_index: usize,
+    /// Id of the last emitted token, for flushed-tail events.
+    last_id: u32,
+}
+
+impl<'a> TextPipeline<'a> {
+    fn new(
+        tokenizer: &'a Tokenizer,
+        segmenter: Option<ThinkingSegmenter>,
+        tool_seg: Option<ToolCallSegmenter>,
+        stop_matcher: StopMatcher,
+    ) -> Self {
+        Self {
+            tokenizer,
+            acc: Vec::new(),
+            detok: IncrementalDetok::new(),
+            segmenter,
+            tool_seg,
+            stop_matcher,
+            streamed: String::new(),
+            thinking_buf: String::new(),
+            emit_index: 0,
+            last_id: 0,
+        }
+    }
+
+    /// One generated token: re-decode the running sequence, emit the new suffix through the
+    /// segmenters and the stop matcher.
+    fn push(&mut self, id: u32, halt: &std::cell::Cell<bool>, on_event: &mut dyn FnMut(CoreEvent)) {
+        self.acc.push(id);
+        let Ok(text) = self.tokenizer.decode(&self.acc, true) else {
+            return;
+        };
+        let Some(delta) = self.detok.push(&text) else {
+            return;
+        };
+        let delta = delta.to_string();
+        match self.segmenter.as_mut() {
+            Some(seg) => {
+                for span in seg.push(&delta) {
+                    match span.channel {
+                        Channel::Thinking => {
+                            self.thinking_buf.push_str(&span.text);
+                            self.last_id = id;
+                            on_event(CoreEvent::Token {
+                                id,
+                                text: span.text,
+                                index: self.emit_index,
+                                channel: Channel::Thinking,
+                            });
+                            self.emit_index += 1;
+                        }
+                        Channel::Content => {
+                            // Answer text → tool segmenter (lifts out tool-call blocks) → stop
+                            // matcher → emit.
+                            for piece in tool_pieces(&mut self.tool_seg, &span.text) {
+                                emit_content(
+                                    &piece,
+                                    id,
+                                    &mut self.stop_matcher,
+                                    &mut self.streamed,
+                                    &mut self.emit_index,
+                                    &mut self.last_id,
+                                    halt,
+                                    &mut *on_event,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                for piece in tool_pieces(&mut self.tool_seg, &delta) {
+                    emit_content(
+                        &piece,
+                        id,
+                        &mut self.stop_matcher,
+                        &mut self.streamed,
+                        &mut self.emit_index,
+                        &mut self.last_id,
+                        halt,
+                        &mut *on_event,
+                    );
+                }
+            }
+        }
+    }
+
+    /// End-of-generation tails, in pipeline order. First the thinking segmenter's held-back
+    /// partial marker (it turned out not to begin a marker) as current-channel text — reasoning
+    /// straight out, answer through the tool segmenter; then the tool segmenter's own tail (held
+    /// partial `<tool_call>` / an unterminated block surfaced as content); then the stop matcher's
+    /// held-back partial stop. Returns the streamed answer, the reasoning and the tool segmenter.
+    fn finish(
+        mut self,
+        halt: &std::cell::Cell<bool>,
+        stop_active: bool,
+        on_event: &mut dyn FnMut(CoreEvent),
+    ) -> (String, String, Option<ToolCallSegmenter>) {
+        if let Some(seg) = self.segmenter.as_mut() {
+            for span in seg.flush() {
+                match span.channel {
+                    Channel::Thinking => {
+                        self.thinking_buf.push_str(&span.text);
+                        on_event(CoreEvent::Token {
+                            id: self.last_id,
+                            text: span.text,
+                            index: self.emit_index,
+                            channel: Channel::Thinking,
+                        });
+                        self.emit_index += 1;
+                    }
+                    Channel::Content => {
+                        for piece in tool_pieces(&mut self.tool_seg, &span.text) {
+                            let id = self.last_id;
+                            emit_content(
+                                &piece,
+                                id,
+                                &mut self.stop_matcher,
+                                &mut self.streamed,
+                                &mut self.emit_index,
+                                &mut self.last_id,
+                                halt,
+                                &mut *on_event,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ts) = self.tool_seg.as_mut() {
+            for piece in ts.flush() {
+                let id = self.last_id;
+                emit_content(
+                    &piece,
+                    id,
+                    &mut self.stop_matcher,
+                    &mut self.streamed,
+                    &mut self.emit_index,
+                    &mut self.last_id,
+                    halt,
+                    &mut *on_event,
+                );
+            }
+        }
+        // If generation ended for any reason other than a stop string, flush the stop matcher's
+        // held-back tail (a partial stop-prefix that never completed) — real output to
+        // stream/return.
+        if stop_active && !halt.get() {
+            let tail = self.stop_matcher.flush();
+            if !tail.is_empty() {
+                self.streamed.push_str(&tail);
+                on_event(CoreEvent::Token {
+                    id: self.last_id,
+                    text: tail,
+                    index: self.emit_index,
+                    channel: Channel::Content,
+                });
+            }
+        }
+        (self.streamed, self.thinking_buf, self.tool_seg)
+    }
+}
+
 impl TextLlm for LlamaProvider {
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
@@ -2471,9 +2667,323 @@ impl TextLlm for LlamaProvider {
     ) -> CoreResult<TextLlmOutput> {
         self.generate_inner(req, on_event, None, None, None)
     }
+
+    /// Continuous batching of the requests the batched decode serves (sc-20681): plain text
+    /// generations on the causal decoder (no media, JSON constraint, tools or stop strings),
+    /// decoded together by [`crate::decode::generate_continuous_kv`] — each with its own
+    /// compressed-KV opt-in, qualification and report, its own cancellation, and the provider's
+    /// shared-prefix store over compressed pages. Every other request, and any request the batch's
+    /// memory admission does not fit, runs on its own through [`TextLlm::generate`] afterwards.
+    fn generate_batch(
+        &self,
+        reqs: &[TextLlmRequest],
+        on_event: &mut dyn FnMut(usize, CoreEvent),
+    ) -> Vec<CoreResult<TextLlmOutput>> {
+        let mut results: Vec<Option<CoreResult<TextLlmOutput>>> =
+            (0..reqs.len()).map(|_| None).collect();
+        let batchable = (0..reqs.len())
+            .filter(|&i| self.batchable(&reqs[i]))
+            .collect::<Vec<_>>();
+        if batchable.len() >= 2 {
+            for (i, result) in self.generate_text_batch(reqs, &batchable, on_event) {
+                results[i] = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(i, result)| {
+                result.unwrap_or_else(|| self.generate(&reqs[i], &mut |event| on_event(i, event)))
+            })
+            .collect()
+    }
 }
 
+/// Tokens per compressed page of the provider's batched decode.
+const BATCH_PAGE_TOKENS: usize = 64;
+
+/// Sequences the provider's shared-prefix store keeps (LRU past that).
+const BATCH_PREFIX_ENTRIES: usize = 4;
+
 impl LlamaProvider {
+    /// Whether `req` is a plain text generation the batched decode serves exactly as
+    /// [`TextLlm::generate`] would (sc-20681).
+    fn batchable(&self, req: &TextLlmRequest) -> bool {
+        matches!(self.model, Decoder::Causal(_))
+            && collect_images(&req.messages).is_empty()
+            && collect_videos(&req.messages).is_empty()
+            && collect_audio(&req.messages).is_empty()
+            && req.constraint.is_none()
+            && req.tools.is_empty()
+            && req.stop.is_empty()
+    }
+
+    /// The provider's shared-prefix store over compressed pages, created on first use for this
+    /// model's identity: its source and decoder fingerprint. `None` when no page pool fits the
+    /// decoder.
+    fn batch_prefix_store(
+        &self,
+        model: &CausalLm,
+    ) -> std::cell::RefMut<'_, Option<crate::decode::PagedPrefixCache>> {
+        let mut slot = self.kv_batch_store.borrow_mut();
+        if slot.is_none() {
+            let cfg = model.config();
+            if let Ok(pool) = crate::primitives::PackedPagePool::new(
+                cfg.num_layers,
+                usize::try_from(cfg.num_kv_heads).unwrap_or(0),
+                usize::try_from(cfg.head_dim).unwrap_or(0),
+                BATCH_PAGE_TOKENS,
+                crate::primitives::PackedCodeBits::Eight,
+            ) {
+                *slot = Some(crate::decode::PagedPrefixCache::new(
+                    pool,
+                    crate::primitives::PagedModelKey::new(
+                        self.kv_model_name.clone(),
+                        model.cache_fingerprint(),
+                    ),
+                    BATCH_PREFIX_ENTRIES,
+                ));
+            }
+        }
+        slot
+    }
+
+    /// Decode the requests `indices` of `reqs` together; their results (a request rejected
+    /// before decoding included). Requests left out — memory admission did not fit them — get no
+    /// result here and run on their own.
+    fn generate_text_batch(
+        &self,
+        reqs: &[TextLlmRequest],
+        indices: &[usize],
+        on_event: &mut dyn FnMut(usize, CoreEvent),
+    ) -> Vec<(usize, CoreResult<TextLlmOutput>)> {
+        let Decoder::Causal(model) = &self.model else {
+            return Vec::new();
+        };
+        let mut results = Vec::new();
+        let mut admitted: Vec<(usize, String, Vec<i32>)> = Vec::new();
+        let mut store = self.batch_prefix_store(model);
+        // The store's pages are resident: admission prices the batch against what is left.
+        let held = store.as_ref().map_or(0, |store| {
+            let storage = store.pool().borrow().storage();
+            storage.code_bytes.saturating_add(storage.metadata_bytes)
+        });
+        let available = core_llm::operational_memory_override()
+            .and_then(|operational| {
+                core_llm::effective_memory_budget(
+                    core_llm::available_host_memory_bytes(),
+                    operational,
+                )
+            })
+            .map(|budget| budget.saturating_sub(held));
+        let mut required_total = 0_u64;
+        for &i in indices {
+            let req = &reqs[i];
+            let prepared = (|| -> CoreResult<Option<(String, Vec<i32>)>> {
+                self.validate(req)?;
+                if req.cancel.is_cancelled() {
+                    return Err(CoreError::Canceled);
+                }
+                let (prompt, prompt_ids) = self.render_prompt(req, &req.messages)?;
+                let max_context = self.descriptor.capabilities.max_context_tokens;
+                validate_context_window(max_context, prompt_ids.len(), req.max_new_tokens)?;
+                let required = estimate_mlx_request_bytes(
+                    prompt_ids.len(),
+                    req.max_new_tokens,
+                    self.model.memory_geometry(),
+                    0,
+                    0,
+                    self.model.workspace_contract(),
+                )
+                .ok_or_else(|| {
+                    CoreError::InvalidRequest("request memory estimate overflow".into())
+                })?;
+                let available = available
+                    .as_ref()
+                    .map_err(|error| CoreError::InvalidRequest(error.to_string()))?;
+                // The batch is admitted request by request against the running total; one that
+                // does not fit beside the others runs alone later, under its own admission.
+                let total = required_total.saturating_add(required);
+                if core_llm::admit_request_memory_with_geometry(
+                    prompt_ids.len(),
+                    req.max_new_tokens,
+                    max_context,
+                    total,
+                    *available,
+                )
+                .is_err()
+                {
+                    return Ok(None);
+                }
+                required_total = total;
+                Ok(Some((prompt, prompt_ids)))
+            })();
+            match prepared {
+                Ok(Some((prompt, prompt_ids))) => admitted.push((i, prompt, prompt_ids)),
+                Ok(None) => {}
+                Err(error) => results.push((i, Err(error))),
+            }
+        }
+        if admitted.is_empty() {
+            return results;
+        }
+
+        let thinking_active = self.descriptor.capabilities.supports_thinking;
+        let halts = admitted
+            .iter()
+            .map(|_| std::cell::Cell::new(false))
+            .collect::<Vec<_>>();
+        let mut pipelines = admitted
+            .iter()
+            .map(|(_, prompt, _)| {
+                let mut segmenter = thinking_active.then(ThinkingSegmenter::default);
+                if let Some(seg) = segmenter.as_mut() {
+                    if prompt_opens_thinking(prompt) {
+                        let _ = seg.push("<think>");
+                    }
+                }
+                TextPipeline::new(
+                    &self.tokenizer,
+                    segmenter,
+                    None,
+                    StopMatcher::new(Vec::new()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch = admitted
+            .iter()
+            .map(|(i, _, prompt_ids)| {
+                let req = &reqs[*i];
+                crate::decode::BatchRequest {
+                    prompt_ids: prompt_ids.clone(),
+                    sampling: map_sampling(&req.sampling),
+                    seed: req.seed,
+                    max_new_tokens: req.max_new_tokens as usize,
+                    stop_tokens: self.stop_tokens.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let cancels = admitted
+            .iter()
+            .map(|(i, _, _)| reqs[*i].cancel.clone())
+            .collect::<Vec<_>>();
+        let policies = admitted
+            .iter()
+            .map(|(i, _, _)| reqs[*i].kv_compression)
+            .collect::<Vec<_>>();
+        let reader = policies
+            .contains(&core_llm::KvCompressionPolicy::Qualified)
+            .then(|| {
+                self.kv_reader
+                    .get_or_init(|| {
+                        crate::kv_policy::group_affine_reader(
+                            crate::primitives::PackedCodeBits::Eight,
+                        )
+                    })
+                    .clone()
+                    .ok()
+            })
+            .flatten();
+        let kv = crate::decode::ContinuousKv {
+            policy: core_llm::KvCompressionPolicy::Off,
+            family: self.kv_family,
+            page_tokens: BATCH_PAGE_TOKENS,
+            reader,
+            prefix: store.as_mut(),
+            pool: None,
+            model_identity: &self.kv_model_name,
+            cancels: &cancels,
+            policies: &policies,
+        };
+        let config = crate::decode::ContinuousConfig {
+            max_batch: batch.len(),
+            block_size: 16,
+            exactness: crate::decode::BatchExactness::Throughput,
+        };
+        let outputs = crate::decode::generate_continuous_kv(
+            model,
+            &batch,
+            &config,
+            kv,
+            &crate::decode::CancelFlag::new(),
+            &mut |b, event| {
+                if let StreamEvent::Token { id, .. } = event {
+                    let index = admitted[b].0;
+                    pipelines[b].push(id as u32, &halts[b], &mut |e| on_event(index, e));
+                }
+            },
+        );
+        let outputs = match outputs {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let message = error.to_string();
+                let mut error = Some(to_core(error));
+                for (i, _, _) in &admitted {
+                    let error = error
+                        .take()
+                        .unwrap_or_else(|| CoreError::Msg(message.clone()));
+                    results.push((*i, Err(error)));
+                }
+                return results;
+            }
+        };
+        for (((index, _, prompt_ids), (pipeline, halt)), out) in admitted
+            .iter()
+            .zip(pipelines.into_iter().zip(&halts))
+            .zip(outputs)
+        {
+            let (streamed, thinking_buf, _) =
+                pipeline.finish(halt, false, &mut |e| on_event(*index, e));
+            // The single-request rule: the streamed answer when thinking is active, else the
+            // decode of every generated token.
+            let text = if thinking_active {
+                Ok(streamed)
+            } else {
+                let ids = out
+                    .output
+                    .tokens
+                    .iter()
+                    .map(|&t| t as u32)
+                    .collect::<Vec<_>>();
+                self.tokenizer.decode(&ids, true)
+            };
+            let text = match text {
+                Ok(text) => text,
+                Err(error) => {
+                    results.push((*index, Err(error)));
+                    continue;
+                }
+            };
+            let finish = map_finish(out.output.finish_reason);
+            let usage = Usage {
+                prompt_tokens: prompt_ids.len() as u32,
+                generated_tokens: out.output.tokens.len() as u32,
+            };
+            on_event(
+                *index,
+                CoreEvent::Done {
+                    finish_reason: finish,
+                    usage,
+                },
+            );
+            results.push((
+                *index,
+                Ok(TextLlmOutput {
+                    text,
+                    thinking: (!thinking_buf.is_empty()).then_some(thinking_buf),
+                    tool_calls: Vec::new(),
+                    usage,
+                    mtp: None,
+                    timings: None,
+                    decode: None,
+                    kv_cache: Some(out.kv_cache),
+                    finish_reason: Some(finish),
+                }),
+            ));
+        }
+        results
+    }
+
     /// Campaign-only entrypoint. The observer is never installed on ordinary production calls.
     /// `packed` selects the compressed arm: the observed decode then runs on the packed
     /// group-affine cache with the retained fused reader (SC-20676 compressed rows).
@@ -3086,21 +3596,11 @@ impl LlamaProvider {
         // Matching is in the detokenization seam below (not the token-id loop) because a stop string
         // need not align to a token boundary. When no stops are requested the matcher is a
         // transparent pass-through, so streaming output stays byte-identical to before.
-        let mut stop_matcher = StopMatcher::new(req.stop.iter().cloned());
+        let stop_matcher = StopMatcher::new(req.stop.iter().cloned());
         let stop_active = !stop_matcher.is_empty();
         // A single-threaded latch the detok sink trips on a stop hit; the decode loop reads it after
         // each token via `should_stop` and halts with `FinishReason::Stopped`.
         let halt = std::cell::Cell::new(false);
-        // Content emitted as the matchers release it — the result text when stop strings or thinking
-        // are active (the plain path still decodes all tokens, byte-identical to before).
-        let mut streamed = String::new();
-        // Reasoning text, accumulated from the Thinking channel (sc-7585).
-        let mut thinking_buf = String::new();
-        // Contract token index: a running counter over *emitted* events, not the raw decode step —
-        // detok hold-backs and stripped `<think>`/`</think>` marker tokens produce no event, so this
-        // stays gap-free (and equals the step in the common one-delta-per-token case).
-        let mut emit_index = 0usize;
-        let mut last_id = 0u32; // id of the last emitted token, for flushed-tail events
 
         // A reasoning segmenter when the model advertises a thinking mode: it splits the decoded
         // stream into `<think>…</think>` reasoning vs answer (markers stripped). `None` otherwise, so
@@ -3125,78 +3625,18 @@ impl LlamaProvider {
         // text) and parses them into structured calls (sc-7636). `None` otherwise, so a no-tools
         // request flows straight through `tool_pieces` unchanged.
         let tools_active = self.tool_call_format.is_some() && !req.tools.is_empty();
-        let mut tool_seg = matches!(self.tool_call_format, Some(ToolCallFormat::Tagged))
+        let tool_seg = matches!(self.tool_call_format, Some(ToolCallFormat::Tagged))
             .then(|| ToolCallSegmenter::new(&req.tools));
 
-        // Drive the internal loop; translate token-id events to contract text-delta events via
-        // incremental detokenization (re-decode the running sequence, emit the new suffix). The
-        // `IncrementalDetok` guard holds back lossy U+FFFD placeholders so a multi-byte character
-        // split across BPE tokens streams intact (and never panics a mid-char slice) — sc-12452.
-        // The segmenter (when active) splits each delta into reasoning vs answer; answer text then
-        // feeds the stop matcher so a stop string is trimmed and halts generation.
+        // Drive the internal loop; translate token-id events to contract text-delta events through
+        // the token-to-text pipeline (see `TextPipeline`): the streamed answer is the result text
+        // when stop strings, thinking or tools are active.
         let tokenizer = &self.tokenizer;
+        let mut pipeline = TextPipeline::new(tokenizer, segmenter, tool_seg, stop_matcher);
         let (out, mtp_stats, timing) = {
-            let mut acc: Vec<u32> = Vec::new();
-            let mut detok = IncrementalDetok::new();
             let mut sink = |ev: StreamEvent| {
                 if let StreamEvent::Token { id, .. } = ev {
-                    let id = id as u32;
-                    acc.push(id);
-                    if let Ok(text) = tokenizer.decode(&acc, true) {
-                        if let Some(delta) = detok.push(&text) {
-                            let delta = delta.to_string();
-                            match segmenter.as_mut() {
-                                Some(seg) => {
-                                    for span in seg.push(&delta) {
-                                        match span.channel {
-                                            Channel::Thinking => {
-                                                thinking_buf.push_str(&span.text);
-                                                last_id = id;
-                                                on_event(CoreEvent::Token {
-                                                    id,
-                                                    text: span.text,
-                                                    index: emit_index,
-                                                    channel: Channel::Thinking,
-                                                });
-                                                emit_index += 1;
-                                            }
-                                            Channel::Content => {
-                                                // Answer text → tool segmenter (lifts out tool-call
-                                                // blocks) → stop matcher → emit.
-                                                for piece in tool_pieces(&mut tool_seg, &span.text)
-                                                {
-                                                    emit_content(
-                                                        &piece,
-                                                        id,
-                                                        &mut stop_matcher,
-                                                        &mut streamed,
-                                                        &mut emit_index,
-                                                        &mut last_id,
-                                                        &halt,
-                                                        &mut *on_event,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                None => {
-                                    for piece in tool_pieces(&mut tool_seg, &delta) {
-                                        emit_content(
-                                            &piece,
-                                            id,
-                                            &mut stop_matcher,
-                                            &mut streamed,
-                                            &mut emit_index,
-                                            &mut last_id,
-                                            &halt,
-                                            &mut *on_event,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    pipeline.push(id as u32, &halt, &mut *on_event);
                 }
             };
             let should_stop = || halt.get();
@@ -3483,70 +3923,9 @@ impl LlamaProvider {
             }
         };
 
-        // End-of-generation tails, in pipeline order. First the thinking segmenter's held-back
-        // partial marker (it turned out not to begin a marker) as current-channel text — reasoning
-        // straight out, answer through the tool segmenter; then the tool segmenter's own tail (held
-        // partial `<tool_call>` / an unterminated block surfaced as content); then the stop matcher's
-        // held-back partial stop.
-        if let Some(seg) = segmenter.as_mut() {
-            for span in seg.flush() {
-                match span.channel {
-                    Channel::Thinking => {
-                        thinking_buf.push_str(&span.text);
-                        on_event(CoreEvent::Token {
-                            id: last_id,
-                            text: span.text,
-                            index: emit_index,
-                            channel: Channel::Thinking,
-                        });
-                        emit_index += 1;
-                    }
-                    Channel::Content => {
-                        for piece in tool_pieces(&mut tool_seg, &span.text) {
-                            emit_content(
-                                &piece,
-                                last_id,
-                                &mut stop_matcher,
-                                &mut streamed,
-                                &mut emit_index,
-                                &mut last_id,
-                                &halt,
-                                &mut *on_event,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(ts) = tool_seg.as_mut() {
-            for piece in ts.flush() {
-                emit_content(
-                    &piece,
-                    last_id,
-                    &mut stop_matcher,
-                    &mut streamed,
-                    &mut emit_index,
-                    &mut last_id,
-                    &halt,
-                    &mut *on_event,
-                );
-            }
-        }
-        // If generation ended for any reason other than a stop string, flush the stop matcher's
-        // held-back tail (a partial stop-prefix that never completed) — real output to stream/return.
-        if stop_active && !halt.get() {
-            let tail = stop_matcher.flush();
-            if !tail.is_empty() {
-                streamed.push_str(&tail);
-                on_event(CoreEvent::Token {
-                    id: last_id,
-                    text: tail,
-                    index: emit_index,
-                    channel: Channel::Content,
-                });
-            }
-        }
-
+        // End-of-generation tails (thinking marker, tool block, stop prefix), in pipeline order.
+        let (streamed, thinking_buf, tool_seg) =
+            pipeline.finish(&halt, stop_active, &mut *on_event);
         // Result text: the streamed answer when stop strings, thinking, or tools are active (any of
         // which means the streamed channel is the authoritative answer with markup removed);
         // otherwise the original decode-all-tokens path (byte-identical to before). Reasoning and
@@ -4260,11 +4639,11 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    fn admit_any_transition() -> crate::primitives::DenseTransitionAdmission {
+    pub(crate) fn admit_any_transition() -> crate::primitives::DenseTransitionAdmission {
         crate::primitives::DenseTransitionAdmission::new(|_| Ok(()))
     }
 
@@ -5220,18 +5599,42 @@ mod tests {
     }
 
     /// Tiny synthetic two-layer Llama (hidden 128) with the given attention geometry.
-    fn tiny_causal_model(heads: i32, kv_heads: i32, head_dim: i32) -> CausalLm {
+    pub(crate) fn tiny_causal_model(heads: i32, kv_heads: i32, head_dim: i32) -> CausalLm {
+        synthetic_causal_model(128, 2, heads, kv_heads, head_dim)
+    }
+
+    /// A synthetic Llama of `layers` layers and `hidden` width (vocabulary 32) with the given
+    /// attention geometry; random weights from a fixed seed.
+    pub(crate) fn synthetic_causal_model(
+        hidden: i32,
+        layers: usize,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+    ) -> CausalLm {
+        synthetic_causal_model_with_rope(hidden, layers, heads, kv_heads, head_dim, 10000.0)
+    }
+
+    /// [`synthetic_causal_model`] with an explicit RoPE base (same weights for every base).
+    pub(crate) fn synthetic_causal_model_with_rope(
+        hidden: i32,
+        layers: usize,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+    ) -> CausalLm {
         use crate::primitives::sampler::{SplitMix64, TokenRng};
         let cfg = crate::config::ModelConfig {
-            hidden_size: 128,
+            hidden_size: hidden,
             intermediate_size: 64,
-            num_layers: 2,
+            num_layers: layers,
             num_heads: heads,
             num_kv_heads: kv_heads,
             head_dim,
             vocab_size: 32,
             rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
+            rope_theta,
             rope_scaling: None,
             tie_word_embeddings: false,
             architecture: crate::config::Architecture::Llama,
@@ -6590,6 +6993,77 @@ mod tests {
         }
     }
 
+    /// sc-20681 AC1 at the provider: `generate_batch` decodes the plain text requests together
+    /// (continuous batching on compressed pages where each qualifies), runs a short one dense
+    /// beside them with its reason, serves a request the batch cannot (a stop string) on its own,
+    /// streams every request's events under its own index with exactly one `Done` each, and keeps
+    /// the batched prompts in the provider's shared-prefix store.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generate_batch_runs_qualified_requests_compressed_and_the_rest_with_their_reasons() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        let provider = load_tiny(&tiny_snapshot(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            40_960,
+            true,
+        ));
+        let words = |count: usize, salt: usize| {
+            (0..count)
+                .map(|i| format!("w{}", (i * 7 + salt) % 26 + 6))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let request = |text: String, stop: Vec<String>| TextLlmRequest {
+            messages: vec![Message::text(Role::User, text)],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            kv_compression: Policy::Qualified,
+            stop,
+            ..Default::default()
+        };
+        let requests = vec![
+            request(words(10_300, 0), Vec::new()),
+            request(words(10_450, 3), Vec::new()),
+            request(words(64, 5), Vec::new()),
+            request(words(10_300, 1), vec!["never-emitted".into()]),
+        ];
+        let (mut tokens, mut dones) = (vec![0usize; 4], vec![0usize; 4]);
+        let outputs = provider
+            .generate_batch(&requests, &mut |i, event| match event {
+                CoreEvent::Token { .. } => tokens[i] += 1,
+                CoreEvent::Done { .. } => dones[i] += 1,
+            })
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(dones, vec![1; 4]);
+        for (i, out) in outputs.iter().enumerate() {
+            assert_eq!(out.usage.generated_tokens, 4, "request {i}");
+            assert!(tokens[i] > 0, "request {i} streamed");
+        }
+        for out in &outputs[..2] {
+            let report = out.kv_cache.as_ref().unwrap();
+            assert!(report.ran_compressed(), "{report:?}");
+            assert!(
+                report.counters.pool_held_bytes > 0,
+                "batched on the shared pool"
+            );
+        }
+        assert_eq!(
+            outputs[2].kv_cache.as_ref().unwrap().fallback,
+            Some(Reason::BelowMinimumContext)
+        );
+        // Served alone, on the single-request (contiguous) compressed path.
+        let alone = outputs[3].kv_cache.as_ref().unwrap();
+        assert!(alone.ran_compressed(), "{alone:?}");
+        assert_eq!(alone.counters.pool_held_bytes, 0);
+        let store = provider.kv_batch_store.borrow();
+        let store = store.as_ref().expect("the batch created the store");
+        assert!(!store.is_empty(), "the batched prompts were stored");
+        assert_eq!(store.stats().refused, 0, "a loaded provider keys its store");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn qwen3_compressed_kv_matches_dense_at_its_qualified_context() {
@@ -7608,7 +8082,17 @@ mod tests {
             // One layer's dense bf16 K of the history, the smallest gather a step could build.
             let one_dense_tensor = (offset as u64 + 1) * 4 * 128 * 2;
             assert!(one_dense_tensor > 4 * SLACK);
-            let allowance = (pool_bytes() - pool_before) + per_sequence + SLACK;
+            // A step that grows the pool copies it: the old arrays stay alive until the grown
+            // ones replace them, so that step's transient is the grown pool (sc-20681's bounded
+            // growth copies more often than doubling did). Any other step may add only its
+            // table, residuals and slack.
+            let pool_after = pool_bytes();
+            let growth_copy = if pool_after > pool_before {
+                2 * pool_after - pool_before
+            } else {
+                0
+            };
+            let allowance = growth_copy + per_sequence + SLACK;
             assert!(
                 transient <= allowance,
                 "decode step {i}: MLX peak rose {transient} B above the step's start; allowed \

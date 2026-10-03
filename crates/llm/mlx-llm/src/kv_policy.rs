@@ -243,12 +243,13 @@ pub(crate) fn select_paged_cache(
             KvCacheReport::dense(reason, detail),
         )
     };
-    let row = match core_llm::qualify_kv_compression(
+    // Each paged sequence owns its pages and is read through its own page-table row and length,
+    // so a sequence decoding beside others qualifies on its own (sc-20681).
+    let row = match core_llm::qualify_kv_sequence(
         request.policy,
         request.family,
         request.prompt_tokens,
         request.max_new_tokens,
-        1,
     ) {
         Ok(row) => row,
         Err(reason) => return dense(reason, None),
@@ -331,6 +332,7 @@ pub(crate) fn compressed_report(
             .unwrap_or(u64::MAX),
         dense_gather_fallbacks,
         compressed_cache_bytes,
+        pool_held_bytes: 0,
     };
     let fell_back = evidence.dense_active
         || !evidence.fallback_reasons.is_empty()

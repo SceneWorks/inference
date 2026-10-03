@@ -249,6 +249,16 @@ pub trait KvCache {
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
     fn reset(&mut self) -> Result<()>;
 
+    /// Arm exact speculative rollback at the current position (sc-20681): the next
+    /// [`KvCache::truncate`] to a length at or past this position must leave the cache exactly as
+    /// if only the kept positions had been appended. Speculative loops arm it before each verify
+    /// forward; the next truncate consumes it. A cache whose truncation is already exact (every
+    /// dense cache) needs nothing, which is the default; a quantizing cache keeps the unquantized
+    /// rows it appends until then.
+    fn begin_speculation(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Downcast hook so a decoder can recover its concrete cache from a `&mut dyn KvCache` — the
     /// hybrid Qwen3.6 cache (recurrent linear-attention state + KV) is driven natively rather than
     /// through the softmax-only [`KvCache::update`] path.
