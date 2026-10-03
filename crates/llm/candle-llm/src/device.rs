@@ -184,15 +184,25 @@ pub fn decode_backend(device: &Device) -> core_llm::DecodeBackend {
     }
 }
 
+/// Whether [`select_device`] would open a CUDA device in this process — a `cuda` build unless
+/// `CANDLE_LLM_DEVICE=cpu` — **without opening it** (a second CUDA device would put a second
+/// stream on the context).
+pub(crate) fn selected_device_is_cuda() -> bool {
+    cfg!(feature = "cuda") && !cpu_forced()
+}
+
+fn cpu_forced() -> bool {
+    std::env::var_os("CANDLE_LLM_DEVICE")
+        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("cpu"))
+}
+
 /// The decode-defaults row of the device [`select_device`] opens, from whether it is CUDA alone
 /// (a load estimate knows no more): CUDA, else Metal in a `metal` build that `CANDLE_LLM_DEVICE`
 /// does not force onto the CPU, else the CPU.
 pub(crate) fn decode_backend_for(cuda: bool) -> core_llm::DecodeBackend {
-    let cpu_forced = std::env::var_os("CANDLE_LLM_DEVICE")
-        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("cpu"));
     if cuda {
         core_llm::DecodeBackend::CandleCuda
-    } else if cfg!(feature = "metal") && !cpu_forced {
+    } else if cfg!(feature = "metal") && !cpu_forced() {
         core_llm::DecodeBackend::CandleMetal
     } else {
         core_llm::DecodeBackend::CandleCpu
@@ -209,8 +219,8 @@ mod tests {
     use super::*;
 
     /// sc-24446 (E5): a device maps onto its row of the defaults table, and the process switches
-    /// whose path exists only on CUDA (fused primitives, NVFP4 GEMV, CUDA graphs) take their unset
-    /// state from the Candle CUDA row.
+    /// whose path exists only on CUDA (fused primitives, NVFP4 GEMV) take their unset state from
+    /// the Candle CUDA row; the CUDA-graph switch takes the device's row (CUDA's on CUDA).
     #[test]
     fn devices_map_onto_their_defaults_row_and_the_cuda_switches_read_the_cuda_row() {
         use core_llm::defaults::CANDLE_CUDA;

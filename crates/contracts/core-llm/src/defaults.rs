@@ -4,11 +4,15 @@
 //! nor the CPU's costs).
 //!
 //! Every default is **on** unless a measured regression or a correctness limit justifies off, and
-//! that justification sits next to the value (`// justification:`). A value nobody has measured
-//! yet is marked `PROVISIONAL — sc-24446 campaign`: the epic's terminal benchmark campaign
-//! measures it on the real hardware and confirms or flips it **here**. A field the backend has no
-//! such path for is `false` with the reason `n/a`; a field marked `fixed` names a path the backend
-//! always takes (nothing reads the value, because there is no alternative to switch to).
+//! that justification sits next to the value (`// justification:`). A value the epic's terminal
+//! benchmark campaign (sc-24446) measured is marked `MEASURED` and names its evidence: the on-vs-off
+//! pairs of the compare reports `mlx-final-compare.md` (campaigns `mlx-campaign-4` and
+//! `mlx-campaign-6`) and `cuda-b4-compare.md` (campaign `cuda-campaign-b4`, CI run 37125806675),
+//! written by `scripts/release/speculative_bench_campaign.py compare`. A row the campaign had no
+//! host for (Candle on Metal, Candle on the CPU) follows the CUDA row's measured decision and says
+//! so. A field the backend has no such path for is `false` with the reason `n/a`; a field marked
+//! `fixed` names a path the backend always takes (nothing reads the value, because there is no
+//! alternative to switch to).
 //!
 //! The backends read their defaults from this table — process switches take their unset state
 //! from it ([`ProcessSwitch`](crate::switch::ProcessSwitch)), a provider applies
@@ -145,16 +149,16 @@ pub struct DecodeDefaults {
 /// **MLX** (`mlx-llm`, Apple silicon).
 pub const MLX: DecodeDefaults = DecodeDefaults {
     backend: DecodeBackend::Mlx,
-    // justification: PROVISIONAL — sc-24446 campaign. Off until measured: every proposer is
-    // greedy-exact (E1) so no correctness limit applies, but no real-weight measurement yet shows
-    // `auto` beating plain decode on every MLX family without a TTFT or decode-rate regression (E6).
+    // justification: off, MEASURED (mlx-final-compare.md, mlx-campaign-6): every proposer is
+    // greedy-exact (E1), but `auto` vs `off` regresses decode beyond the noise band on Qwen3-8B
+    // (chat -19.0%) and the Gemma 4 enhancer (chat -3.9%), so a request opts in per family.
     speculative: Speculative::Off,
     // justification: proposer-intrinsic depths (MTP: the checkpoints' upstream recommendation;
     // prompt lookup / draft model: sc-24433 / sc-24436), clamped per model to the backend max.
     recommended_depths: RECOMMENDED_DEPTHS,
-    // justification: PROVISIONAL — sc-24446 campaign. On (E5): an exact cross-turn reuse that skips
-    // prefill work; admission-clamped (E7), so it can never refuse or overrun a load. The campaign
-    // measures TTFT with it on vs 0 and confirms this budget.
+    // justification: on, MEASURED (mlx-final-compare.md, mlx-campaign-6): no on-vs-0 regression
+    // on any family (200 judged, 0 regression); a hit cuts TTFT 19.5–87.7%. An exact cross-turn
+    // reuse, admission-clamped (E7), so it can never refuse or overrun a load.
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
     // justification: n/a — MLX has no CUDA graphs.
     cuda_graphs: false,
@@ -163,7 +167,10 @@ pub const MLX: DecodeDefaults = DecodeDefaults {
     device_positions: true,
     // justification: on (sc-24439) — token-identical to the unpipelined loop by construction (the
     // look-ahead step is enqueued on the unread device token; E1 parity suite) and it hides the
-    // per-token read-back. Runtime switch `MLX_LLM_PIPELINING`.
+    // per-token read-back. MEASURED (mlx-final-compare.md, mlx-campaign-6, Qwen3-8B): no decode
+    // regression on vs off (40 judged: 20 pass, 19 inconclusive); the one flagged cell, a TTFT
+    // (chat +37.7%, band ±35.2%), was token 0 waiting behind step 1's build, which the loop now
+    // delivers first (sc-24446). Runtime switch `MLX_LLM_PIPELINING`.
     pipelining: true,
     // justification: on (sc-24439) — greedy is the device argmax (bit-identical); stochastic draws
     // keep the target distribution (same weights rule as the host reference). Runtime switch
@@ -194,24 +201,29 @@ pub const MLX: DecodeDefaults = DecodeDefaults {
 /// **Candle on CUDA** (`candle-llm`, `cuda` feature, CUDA device).
 pub const CANDLE_CUDA: DecodeDefaults = DecodeDefaults {
     backend: DecodeBackend::CandleCuda,
-    // justification: PROVISIONAL — sc-24446 campaign. Off until measured (as MLX): greedy-exact,
-    // but no real-weight CUDA measurement yet shows `auto` without an E6 regression.
+    // justification: off, MEASURED (cuda-b4-compare.md, cuda-campaign-b4): greedy-exact, but
+    // `auto` vs `off` regresses decode beyond the noise band on Bonsai (graphs on: -5.6..-18.3%),
+    // so a request opts in.
     speculative: Speculative::Off,
     // justification: proposer-intrinsic depths, clamped per model to the backend max.
     recommended_depths: RECOMMENDED_DEPTHS,
-    // justification: PROVISIONAL — sc-24446 campaign. On (E5), admission-clamped in the device
-    // domain (E7); the campaign confirms the budget against TTFT with 0.
+    // justification: on, MEASURED (cuda-b4-compare.md, cuda-campaign-b4): a hit cuts TTFT
+    // 15.1–96.9%; a miss leaves decode within -2.1..+13.1% and costs TTFT 0–4% on every cell with
+    // a tight band (one Qwen3-8B cell reads +21.6% inside a ±54.6% band). The tool's off verdict
+    // rests on two cells barely past their band (a +2.3% miss TTFT vs ±2.1%, a -7.3% hit decode
+    // vs ±3.9%), outweighed by the hit's TTFT cut. Admission-clamped in the device domain (E7).
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
-    // justification: PROVISIONAL — sc-24446 campaign. Off: until sc-24441 no production step was
-    // capturable, so no measurement of a captured production decode exists yet. Dense CausalLm /
-    // Qwen35 steps capture and are token-identical to eager by construction; the decode-rate win
-    // and the absence of an E6 regression are measured by the campaign, which sets this value.
-    // Runtime switch `CANDLE_LLM_CUDA_GRAPHS`; per load `LoadSpec::cuda_graphs`.
-    cuda_graphs: false,
-    // justification: PROVISIONAL — sc-24446 campaign. On: the device-positions step is what makes
-    // a CUDA graph capturable and moves the eager cached decode / verify onto the length-aware
-    // `decode_attention` kernel, so graphs on and off are one arithmetic. The campaign measures
-    // eager decode on both attentions. Runtime switch `CANDLE_LLM_DEVICE_POSITIONS`.
+    // justification: on, MEASURED (cuda-b4-compare.md, cuda-campaign-b4): 40 of 40 on-vs-off cells
+    // pass, decode +44–53% on Bonsai and +5% on Qwen3-8B (speculative `off`), TTFT unchanged.
+    // Captured steps are token-identical to eager by construction (bit-exact self-check). A step
+    // the runner cannot capture runs eager with a named reason. Runtime switch
+    // `CANDLE_LLM_CUDA_GRAPHS`; per load `LoadSpec::cuda_graphs`.
+    cuda_graphs: true,
+    // justification: on — a correctness prerequisite of `cuda_graphs`: without staged positions
+    // the dense and Qwen3.5 steps refuse capture (`positions_host_scalar`). MEASURED eager
+    // (cuda-b4-compare.md, cuda-campaign-b4, graphs off): decode within -2.3..+10.1% of the
+    // host-position path after the `decode_attention` rewrite; the one flagged cell is a +0.8%
+    // TTFT against a ±0.4% band. Runtime switch `CANDLE_LLM_DEVICE_POSITIONS`.
     device_positions: true,
     // justification: n/a — Candle's engine has no pipelined loop (CUDA graphs serve that role).
     pipelining: false,
@@ -243,11 +255,12 @@ pub const CANDLE_CUDA: DecodeDefaults = DecodeDefaults {
 /// **Candle on Metal** (`candle-llm`, `metal` feature, Metal device).
 pub const CANDLE_METAL: DecodeDefaults = DecodeDefaults {
     backend: DecodeBackend::CandleMetal,
-    // justification: PROVISIONAL — sc-24446 campaign (not a campaign host; follows CUDA).
+    // justification: off — follows CANDLE_CUDA's MEASURED value (Metal was not a campaign host).
     speculative: Speculative::Off,
     // justification: proposer-intrinsic depths.
     recommended_depths: RECOMMENDED_DEPTHS,
-    // justification: PROVISIONAL — sc-24446 campaign. On (E5), admission-clamped (E7).
+    // justification: on — follows CANDLE_CUDA's MEASURED value (Metal was not a campaign host);
+    // admission-clamped (E7).
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
     // justification: n/a — CUDA only.
     cuda_graphs: false,
@@ -280,15 +293,16 @@ pub const CANDLE_METAL: DecodeDefaults = DecodeDefaults {
 /// **Candle on the CPU** (`candle-llm`, any build, CPU device).
 pub const CANDLE_CPU: DecodeDefaults = DecodeDefaults {
     backend: DecodeBackend::CandleCpu,
-    // justification: PROVISIONAL — sc-24446 campaign (not a campaign host; follows CUDA).
+    // justification: off — follows CANDLE_CUDA's MEASURED value (the CPU was not a campaign host).
     speculative: Speculative::Off,
     // justification: proposer-intrinsic depths.
     recommended_depths: RECOMMENDED_DEPTHS,
-    // justification: PROVISIONAL — sc-24446 campaign. On (E5), admission-clamped in host memory.
+    // justification: on — follows CANDLE_CUDA's MEASURED value (the CPU was not a campaign host);
+    // admission-clamped in host memory.
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
     // justification: n/a — CUDA only.
     cuda_graphs: false,
-    // justification: PROVISIONAL — sc-24446 campaign. Off: no graph runner on the CPU, and the
+    // justification: off — no graph runner on the CPU, and the
     // CPU runs `write_rows_at` / `decode_attention` as host reference code that reads the staged
     // position back every step — an extra upload and read-back per step that buys nothing
     // without a graph to replay.
