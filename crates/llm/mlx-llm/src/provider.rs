@@ -991,9 +991,6 @@ pub struct LlamaProvider {
     /// The loaded checkpoint's name for compressed-cache keying (its load source; empty for a
     /// provider assembled from parts, which then never shares compressed pages).
     kv_model_name: String,
-    /// The batched decode's shared-prefix store over compressed pages (sc-20681), created on the
-    /// first batch.
-    kv_batch_store: RefCell<Option<crate::decode::PagedPrefixCache>>,
     /// Dense Prism `vision_tower.*` tensors retained verbatim for the native multimodal adapter.
     /// Text loading must not discard them merely because sc-23937 constructs only the decoder.
     _prism_vision_weights: Option<Weights>,
@@ -1792,7 +1789,6 @@ impl LlamaProvider {
             campaign_prefix_cache: RefCell::new(None),
             kv_reader: OnceCell::new(),
             kv_model_name: spec.source.clone(),
-            kv_batch_store: RefCell::new(None),
             _prism_vision_weights: prism_vision_weights,
         })
     }
@@ -1858,7 +1854,6 @@ impl LlamaProvider {
             campaign_prefix_cache: RefCell::new(None),
             kv_reader: OnceCell::new(),
             kv_model_name: spec.source.clone(),
-            kv_batch_store: RefCell::new(None),
             _prism_vision_weights: None,
         })
     }
@@ -1898,7 +1893,6 @@ impl LlamaProvider {
             campaign_prefix_cache: RefCell::new(None),
             kv_reader: OnceCell::new(),
             kv_model_name: String::new(),
-            kv_batch_store: RefCell::new(None),
             _prism_vision_weights: None,
         }
     }
@@ -2742,9 +2736,6 @@ impl TextLlm for LlamaProvider {
 /// Tokens per compressed page of the provider's batched decode.
 const BATCH_PAGE_TOKENS: usize = 64;
 
-/// Sequences the provider's shared-prefix store keeps (LRU past that).
-const BATCH_PREFIX_ENTRIES: usize = 4;
-
 impl LlamaProvider {
     /// Whether `req` is a plain text generation the batched decode serves exactly as
     /// [`TextLlm::generate`] would (sc-20681).
@@ -2756,36 +2747,6 @@ impl LlamaProvider {
             && req.constraint.is_none()
             && req.tools.is_empty()
             && req.stop.is_empty()
-    }
-
-    /// The provider's shared-prefix store over compressed pages, created on first use for this
-    /// model's identity: its source and decoder fingerprint. `None` when no page pool fits the
-    /// decoder.
-    fn batch_prefix_store(
-        &self,
-        model: &CausalLm,
-    ) -> std::cell::RefMut<'_, Option<crate::decode::PagedPrefixCache>> {
-        let mut slot = self.kv_batch_store.borrow_mut();
-        if slot.is_none() {
-            let cfg = model.config();
-            if let Ok(pool) = crate::primitives::PackedPagePool::new(
-                cfg.num_layers,
-                usize::try_from(cfg.num_kv_heads).unwrap_or(0),
-                usize::try_from(cfg.head_dim).unwrap_or(0),
-                BATCH_PAGE_TOKENS,
-                crate::primitives::PackedCodeBits::Eight,
-            ) {
-                *slot = Some(crate::decode::PagedPrefixCache::new(
-                    pool,
-                    crate::primitives::PagedModelKey::new(
-                        self.kv_model_name.clone(),
-                        model.cache_fingerprint(),
-                    ),
-                    BATCH_PREFIX_ENTRIES,
-                ));
-            }
-        }
-        slot
     }
 
     /// Decode the requests `indices` of `reqs` together; their results (a request rejected
@@ -2802,20 +2763,9 @@ impl LlamaProvider {
         };
         let mut results = Vec::new();
         let mut admitted: Vec<(usize, String, Vec<i32>)> = Vec::new();
-        let mut store = self.batch_prefix_store(model);
-        // The store's pages are resident: admission prices the batch against what is left.
-        let held = store.as_ref().map_or(0, |store| {
-            let storage = store.pool().borrow().storage();
-            storage.code_bytes.saturating_add(storage.metadata_bytes)
+        let available = core_llm::operational_memory_override().and_then(|operational| {
+            core_llm::effective_memory_budget(core_llm::available_host_memory_bytes(), operational)
         });
-        let available = core_llm::operational_memory_override()
-            .and_then(|operational| {
-                core_llm::effective_memory_budget(
-                    core_llm::available_host_memory_bytes(),
-                    operational,
-                )
-            })
-            .map(|budget| budget.saturating_sub(held));
         let mut required_total = 0_u64;
         for &i in indices {
             let req = &reqs[i];
@@ -2915,25 +2865,15 @@ impl LlamaProvider {
             .iter()
             .map(|(i, _, _)| reqs[*i].kv_compression)
             .collect::<Vec<_>>();
-        let reader = policies
-            .contains(&core_llm::KvCompressionPolicy::Qualified)
-            .then(|| {
-                self.kv_reader
-                    .get_or_init(|| {
-                        crate::kv_policy::group_affine_reader(
-                            crate::primitives::PackedCodeBits::Eight,
-                        )
-                    })
-                    .clone()
-                    .ok()
-            })
-            .flatten();
+        // The product's batched decode never arms the per-sequence paged compressed experiment
+        // (sc-20688 review), so it builds no fused reader, page pool or prefix store: every
+        // request decodes dense with its reason.
         let kv = crate::decode::ContinuousKv {
             policy: core_llm::KvCompressionPolicy::Off,
             family: self.kv_family,
             page_tokens: BATCH_PAGE_TOKENS,
-            reader,
-            prefix: store.as_mut(),
+            reader: None,
+            prefix: None,
             pool: None,
             model_identity: &self.kv_model_name,
             cancels: &cancels,
@@ -7085,6 +7025,23 @@ pub(crate) mod tests {
                 request(words(10_300, 1), vec!["never-emitted".into()], policy),
             ]
         };
+        // A batch of only plain requests builds no fused reader (nor page pool or prefix store):
+        // the product batch never arms paged compression, so it sets none of it up.
+        let fresh = load_tiny(&tiny_snapshot(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            40_960,
+            true,
+        ));
+        for out in fresh.generate_batch(&requests(Policy::Qualified)[..3], &mut |_, _| {}) {
+            assert_eq!(
+                out.unwrap().kv_cache.unwrap().fallback,
+                Some(Reason::BatchedDecode)
+            );
+        }
+        assert!(
+            fresh.kv_reader.get().is_none(),
+            "a batch that cannot run compressed builds no reader"
+        );
         // Each batched request on its own qualifies: the batch, not the request, refuses it.
         for (i, req) in requests(Policy::Qualified).iter().enumerate().take(2) {
             let prompt = provider.render_prompt(req, &req.messages).unwrap().1.len();
@@ -7127,11 +7084,6 @@ pub(crate) mod tests {
         let alone = outputs[3].kv_cache.as_ref().unwrap();
         assert!(alone.ran_compressed(), "{alone:?}");
         assert_eq!(alone.counters.pool_held_bytes, 0);
-        let store = provider.kv_batch_store.borrow();
-        assert!(
-            store.as_ref().is_none_or(|store| store.is_empty()),
-            "no batched prompt was stored"
-        );
     }
 
     /// sc-20688 review round 2: a batch whose other request is cancelled before it starts leaves
@@ -7172,11 +7124,6 @@ pub(crate) mod tests {
         assert_eq!(
             report.counters.pool_held_bytes, 0,
             "the contiguous cache, not a shared page pool"
-        );
-        let store = provider.kv_batch_store.borrow();
-        assert!(
-            store.as_ref().is_none_or(|store| store.is_empty()),
-            "nothing reached the paged prefix store"
         );
     }
 
