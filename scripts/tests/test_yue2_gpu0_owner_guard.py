@@ -75,7 +75,7 @@ class OwnerGuardTests(unittest.TestCase):
             self.assertEqual(settings["cancel-in-progress"], "false")
             for stage in ("fixture", "cuda", "metal", "cuda-diagnostic", "", "unknown"):
                 for mode in ("shared-host", "owner-gpu0", "", "unknown"):
-                    for receipt in (guard.RECEIPT, "37106146499", "", "arbitrary"):
+                    for receipt in (guard.RECEIPT, "37122359802", "37106146499", "", "arbitrary"):
                         for engine in (guard.ENGINE, "a" * 40):
                             opted = stage == "cuda" and mode == "owner-gpu0" and receipt == guard.RECEIPT and engine == guard.ENGINE
                             actual = routes.PrecisionControlTests.concurrency_group(settings["group"], stage, "101", mode, receipt, engine)

@@ -21,8 +21,8 @@ import re
 import signal
 
 ENGINE = "825341ff8d0110ea448213485891b39d57806fa4"
-RECEIPT = "37122359802"
-RECEIPT_DIGEST = "385b259d50051c2e8833fa15fde29ca982def4bbd8ae2954a9225962ffc63764"
+RECEIPT = "37135502627"
+RECEIPT_DIGEST = "1f0307e1056fa00b3a177002aa1cfafb40348c071676a7c894e938ebf2fd3991"
 REPO = "SceneWorks/inference"
 OLD_GROUP = "inference-real-weights-physical-host"
 GPU0_GROUP = "inference-yue2-owner-gpu0"

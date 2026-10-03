@@ -224,12 +224,13 @@ class PrecisionControlTests(unittest.TestCase):
             with self.subTest(platform=platform, visible=visible, order=order), \
                  self.assertRaisesRegex(RuntimeError, "PCI-ordered CUDA GPU0"):
                 IDLE.check_device_selection(platform, visible, order)
-        self.assertEqual(IDLE.RUN_ID, "37122359802")
+        self.assertEqual(IDLE.RUN_ID, "37135502627")
         self.assertEqual(IDLE.BASELINE_DIGEST,
-                         "385b259d50051c2e8833fa15fde29ca982def4bbd8ae2954a9225962ffc63764")
+                         "1f0307e1056fa00b3a177002aa1cfafb40348c071676a7c894e938ebf2fd3991")
         IDLE.check_dispatch(IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40)
         for run_id, engine, control, github in (
             ("36956986577", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
+            ("37122359802", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
             ("other", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
             (IDLE.RUN_ID, "bad", "a" * 40, "a" * 40),
             (IDLE.RUN_ID, IDLE.BASELINE_ENGINE_SHA, "a" * 40, "b" * 40),
@@ -244,6 +245,23 @@ class PrecisionControlTests(unittest.TestCase):
                 path.write_text('{"reviewed":false}', encoding="utf-8")
                 with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                     IDLE.verify_artifact(Path(directory))
+
+    def test_all_consumers_bind_one_exact_new_baseline(self):
+        import yue2_gpu0_owner_guard as owner
+        self.assertEqual(IDLE.BASELINE_ENGINE_SHA, "4127a675fc8575555e029e01b7f6867488880a8f")
+        self.assertEqual(IDLE.BASELINE_CONTROL_SHA, "e538120368ac279cc42176c44f9d88fa5af9c9b4")
+        self.assertEqual(owner.RECEIPT, IDLE.RUN_ID)
+        self.assertEqual(owner.RECEIPT_DIGEST, IDLE.BASELINE_DIGEST)
+        expected = (f"yue2-cuda-diagnostic-engine-{IDLE.BASELINE_ENGINE_SHA}"
+                    f"-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1")
+        for name in ("yue2-precision-proof.yml", "yue2-app-precision-profile.yml",
+                     "yue2-bf16-tile-diagnostic.yml"):
+            source = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+            self.assertEqual(source.count(f"name: {expected}\n"), 1, name)
+            self.assertNotIn("-37122359802-1", source)
+            if name != "yue2-bf16-tile-diagnostic.yml":
+                self.assertIn(f"inputs.idle_cuda_context_run_id == '{IDLE.RUN_ID}'", source)
+                self.assertNotIn("inputs.idle_cuda_context_run_id == '37122359802'", source)
 
     def test_saved_runner_is_pinned_and_fresh_runner_matches_an_eligible_listener(self):
         self.assertEqual(IDLE.BASELINE_RUNNER, "cuda-windows")
