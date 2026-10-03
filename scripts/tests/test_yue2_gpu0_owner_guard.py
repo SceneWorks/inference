@@ -39,6 +39,23 @@ def group(name=guard.OLD_GROUP, run_id=guard.HOLDER_RUN):
                               {"run_id": 123, "status": "pending"}]}
 
 
+def background():
+    prefix = "pid_38212_luid_0x00000000_0x00020d46_"
+    return {"identity": [38212, "signed-app.exe", "C:/signed-app.exe", "09/25/2026 07:02:03"],
+            "signature": {"status": "Valid", "signerSubject": "reviewed", "signerThumbprint": "reviewed"},
+            "luid": "luid_0x00000000_0x00020d46",
+            "counters": {"engine": {prefix + f"phys_0_eng_{i}_engtype_compute": 0 for i in range(22)}}}
+
+
+def background_sample():
+    baseline = background()
+    return {"process": dict(zip(("pid", "name", "executablePath", "creationDate"), baseline["identity"]),
+                            signature=baseline["signature"]),
+            "counter": {"counter": r"\GPU Engine(*)\Utilization Percentage",
+                        "samples": [{"instance": key, "cookedValue": 0, "status": "0"}
+                                    for key in baseline["counters"]["engine"]]}}
+
+
 class Owned:
     pid = 777
     code = None
@@ -66,7 +83,7 @@ class OwnerGuardTests(unittest.TestCase):
                                 expected = guard.GPU0_GROUP
                             elif selector == "stage" and stage == "fixture":
                                 expected = "inference-yue2-precision-fixture-101"
-                            elif selector == "backend" and stage != "cuda":
+                            elif (selector == "backend" and stage != "cuda") or stage == "metal":
                                 expected = "yue2-app-precision-nax-macos-2"
                             else:
                                 expected = guard.OLD_GROUP
@@ -112,18 +129,70 @@ class OwnerGuardTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): guard.active_group(data, guard.OLD_GROUP, guard.HOLDER_RUN)
 
     def test_typed_gpu0_only_owned_root_desktop_or_owned_descendants(self):
-        header = "# gpu pid type sm mem enc dec command\n"
-        good = header + "0 38212 C+G 0 0 0 0 desktop\n0 777 C 1 0 0 0 owned\n"
-        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=good)):
-            self.assertEqual(guard.gpu0_actors(777), good)
-            with self.assertRaises(RuntimeError): guard.gpu0_actors(None)
+        header = "# gpu pid type sm mem enc dec jpg ofa command\n"
+        good = header + "0 38212 C+G 0 0 0 0 0 0 desktop\n0 777 C 1 0 0 0 0 0 owned\n"
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=good)), patch.object(guard, "sample_background"):
+            self.assertEqual(guard.gpu0_actors(777, background=background()), good)
+            with self.assertRaises(RuntimeError): guard.gpu0_actors(None, background=background())
         for raw in (good.replace("777", "888"), good.replace(" C 1", " G 1"), good.replace("C+G", "G"),
-                    good.replace("0 777", "1 777"), "", "0 777 C 1 0 0 0 owned\n", good + "0 777 C 1 0 0 0 owned\n"):
-            with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=raw)), self.assertRaises(RuntimeError):
-                guard.gpu0_actors(777)
+                    good.replace("0 777", "1 777"), "", "0 777 C 1 0 0 0 owned\n", good + "0 777 C 1 0 0 0 0 0 owned\n"):
+            with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=raw)), patch.object(guard, "sample_background"), self.assertRaises(RuntimeError):
+                guard.gpu0_actors(777, background=background())
         with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=good.replace("777", "999"))), \
-             patch.object(guard, "owned_descendants", return_value={777, 888, 999}):
-            guard.gpu0_actors(777, True)
+             patch.object(guard, "owned_descendants", return_value={777, 888, 999}), patch.object(guard, "sample_background"):
+            guard.gpu0_actors(777, True, background=background())
+
+    def test_background_supported_activity_and_unsupported_rows_never_bypass_windows_identity(self):
+        good = "# gpu pid type sm mem enc dec jpg ofa command\n0 38212 C+G - - - - - - desktop\n0 777 C 80 50 0 0 0 0 owned\n"
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=good)), \
+             patch.object(guard, "sample_background") as probe:
+            guard.gpu0_actors(777, background=background())
+            probe.assert_called_once()
+        missing = "# gpu pid type sm mem enc dec jpg ofa command\n0 777 C 80 50 0 0 0 0 owned\n"
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=missing)), self.assertRaisesRegex(RuntimeError, "disappeared"):
+            guard.gpu0_actors(777, background=background())
+        for raw in (good.replace("C+G - -", "C+G 80 50"), good.replace("C+G - -", "C+G 0 50"),
+                    good.replace("C+G - -", "C+G NaN 0"), good.replace(" jpg ofa", "")):
+            with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=raw)), \
+                 patch.object(guard, "sample_background") as probe, self.assertRaises(RuntimeError):
+                guard.gpu0_actors(777, background=background())
+            probe.assert_not_called()
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=good)), \
+             patch.object(guard, "sample_background", side_effect=RuntimeError("live counter positive")), self.assertRaises(RuntimeError):
+            guard.gpu0_actors(777, background=background())
+
+    def test_live_background_counter_and_process_generation_mutations_refuse(self):
+        baseline, value = background(), background_sample()
+        guard.validate_background(value, baseline)
+        mutations = [lambda x: x["process"].update(pid=1), lambda x: x["process"].update(name="different"),
+                     lambda x: x["process"].update(creationDate="new start"),
+                     lambda x: x["process"].update(executablePath="different"),
+                     lambda x: x["process"]["signature"].update(status="NotSigned"),
+                     lambda x: x["process"]["signature"].update(signerThumbprint="new"),
+                     lambda x: x["counter"]["samples"].pop(),
+                     lambda x: x["counter"]["samples"].append({"instance": "pid_38212_luid_0x00000000_0x00020d46_extra", "cookedValue": 0, "status": "0"}),
+                     lambda x: x["counter"]["samples"].append(x["counter"]["samples"][0]),
+                     lambda x: x["counter"].update(error="unsupported")]
+        for number in (1, float("nan"), float("inf"), -1, True, None):
+            mutations.append(lambda x, n=number: x["counter"]["samples"][0].update(cookedValue=n))
+        mutations.extend([lambda x: x["counter"]["samples"][0].update(status="1"),
+                          lambda x: x["counter"]["samples"][0].update(instance=x["counter"]["samples"][0]["instance"].replace("00020d46", "0001f8b5"))])
+        for index, mutate in enumerate(mutations):
+            changed = copy.deepcopy(value); mutate(changed)
+            with self.subTest(index=index), self.assertRaises(RuntimeError):
+                guard.validate_background(changed, baseline)
+        # An unrelated LUID is not the physical GPU0 activity signal.
+        foreign = copy.deepcopy(value)
+        foreign["counter"]["samples"].append({"instance": "pid_38212_luid_0x00000000_0x0001f8b5_other", "cookedValue": 80, "status": "0"})
+        guard.validate_background(foreign, baseline)
+
+    def test_bounded_background_probe_uses_collector_schema_and_retains_failure_raw(self):
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=0, stdout=json.dumps(background_sample()), stderr="")) as probe:
+            guard.sample_background(background())
+            self.assertEqual(probe.call_args.kwargs["timeout"], guard.API_TIMEOUT)
+            self.assertIn("Get-Counter", probe.call_args.args[0][-1])
+        with patch.object(guard.subprocess, "run", return_value=Mock(returncode=1, stdout="", stderr="missing counters")), self.assertRaises(RuntimeError):
+            guard.sample_background(background())
 
     def test_descendants_are_parent_chain_only_not_names(self):
         rows = [{"ProcessId": 777, "ParentProcessId": 10}, {"ProcessId": 888, "ParentProcessId": 777},
@@ -259,6 +328,7 @@ class OwnerGuardTests(unittest.TestCase):
                         if argv[-1] == "HEAD" else "")
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, environ), \
              patch.object(guard, "IS_WINDOWS", True), patch.object(guard, "SOURCE_HASHES", hashes), \
+             patch.object(guard, "reviewed_background", return_value=background()), \
              patch.object(guard, "api", side_effect=read), patch.object(guard.subprocess, "run", side_effect=git), \
              patch.object(guard, "gpu0_actors", return_value="raw"):
             owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40)

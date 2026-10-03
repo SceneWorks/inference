@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -147,7 +148,64 @@ def owned_descendants(root_pid: int, record=None) -> set[int]:
     raise RuntimeError("ambiguous descendant chain")
 
 
-def gpu0_actors(child_pid: int | None, descendants: bool = False, record=None) -> str:
+def reviewed_background() -> dict:
+    from yue2_cuda_idle_context import reviewed_baseline, read_json
+    baseline, directory = reviewed_baseline()  # Original digest/source/device/12h checks.
+    value = {**baseline, "signature": read_json(directory, "process-before")["signature"]}
+    require(value["signature"].get("status") == "Valid", "reviewed background signature is invalid")
+    return value
+
+
+def validate_background(value: dict, baseline: dict) -> None:
+    process = value.get("process", {})
+    identity = (process.get("pid"), process.get("name"), process.get("executablePath"), process.get("creationDate"))
+    require(identity == tuple(baseline["identity"]) and process.get("signature") == baseline["signature"],
+            "trusted background process generation/image/signature changed")
+    row = value.get("counter", {})
+    require(row.get("counter") == r"\GPU Engine(*)\Utilization Percentage" and "error" not in row,
+            "background GPU Engine counter is unavailable")
+    prefix = f"pid_{baseline['identity'][0]}_{baseline['luid']}_"
+    samples = [item for item in row.get("samples", [])
+               if isinstance(item, dict) and item.get("instance", "").lower().startswith(prefix)]
+    counters = {}
+    for item in samples:
+        name, number = item["instance"].lower(), item.get("cookedValue")
+        require(name not in counters and str(item.get("status")) == "0" and
+                type(number) in (int, float) and math.isfinite(number) and number == 0,
+                "trusted background GPU engine active/invalid/duplicate")
+        counters[name] = number
+    require(counters and set(counters) == set(baseline["counters"]["engine"]),
+            "trusted background GPU0 engine instance set changed/incomplete")
+
+
+def sample_background(baseline: dict, record=None) -> None:
+    # Same identity/signature and GPU Engine schema as the reviewed collector,
+    # restricted to the trusted background PID. Own model memory is not compared.
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$item = Get-CimInstance Win32_Process -Filter 'ProcessId = 38212' -ErrorAction Stop
+if ($null -eq $item -or -not $item.ExecutablePath) { throw 'background identity unavailable' }
+$sig = Get-AuthenticodeSignature -FilePath $item.ExecutablePath -ErrorAction Stop
+$set = Get-Counter -Counter '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
+$samples = @($set.CounterSamples | Where-Object {$_.InstanceName -match '(^|_)pid_38212(_|$)'} | ForEach-Object {
+    @{path=$_.Path; instance=$_.InstanceName; cookedValue=$_.CookedValue; status=[string]$_.Status}
+})
+@{process=@{pid=38212; name=$item.Name; executablePath=$item.ExecutablePath; creationDate=[string]$item.CreationDate;
+            signature=@{status=[string]$sig.Status; signerSubject=$sig.SignerCertificate.Subject; signerThumbprint=$sig.SignerCertificate.Thumbprint}};
+  counter=@{counter='\GPU Engine(*)\Utilization Percentage'; timestamp=[string]$set.Timestamp; samples=$samples}} | ConvertTo-Json -Depth 8 -Compress
+"""
+    result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                            capture_output=True, text=True, encoding="utf-8", timeout=API_TIMEOUT)
+    if record is not None:
+        record({"event": "background_activity", "returncode": result.returncode,
+                "raw": result.stdout, "stderr": result.stderr})
+    require(result.returncode == 0, "bounded background identity/engine probe failed")
+    value = json.loads(result.stdout)
+    require(isinstance(value, dict), "background probe is not an object")
+    validate_background(value, baseline)
+
+
+def gpu0_actors(child_pid: int | None, descendants: bool = False, record=None, background=None) -> str:
     result = subprocess.run(["nvidia-smi", "pmon", "-i", "0", "-c", "1", "-s", "um"],
                             capture_output=True, text=True, encoding="utf-8", timeout=API_TIMEOUT)
     require(result.returncode == 0, "live GPU0 typed census unavailable")
@@ -173,10 +231,22 @@ def gpu0_actors(child_pid: int | None, descendants: bool = False, record=None) -
         require(pid.isdigit() and int(pid) not in seen, "ambiguous/duplicate GPU0 PID")
         pid = int(pid)
         seen.add(pid)
+        if pid == 38212 and kind == "C+G":
+            require(background is not None, "background PID has no authenticated receipt identity")
+            for metric in ("sm", "mem", "enc", "dec", "jpg", "ofa"):
+                require(metric in columns and len(fields) > columns[metric], "baseline pmon utilization is incomplete")
+                value = fields[columns[metric]]
+                require(value == "-" or (re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value) is not None and float(value) == 0),
+                        "trusted background pmon utilization is active/invalid")
+            # '-' never means zero; require the receipt-selected exact engine set
+            # and process generation even when pmon happens to support zeros.
+            sample_background(background, record)
         require((pid == 38212 and kind == "C+G") or
                 (child_pid is not None and pid in owned and kind in {"C", "C+G"}),
                 "unexpected GPU0 actor; owner proof must stop")
     require(bool(columns), "GPU0 census lacks typed columns")
+    require(background is None or background["identity"][0] in seen,
+            "authenticated background process disappeared from typed GPU0 census")
     return result.stdout
 
 
@@ -197,6 +267,7 @@ class OwnerGuard:
         self.signals = {}
         self.metadata_checked = None
         self.holder_started = None
+        self.background = None
 
     def record(self, event: dict) -> None:
         with self.path.open("a", encoding="utf-8") as output:
@@ -229,7 +300,7 @@ class OwnerGuard:
                 job.get("started_at") == self.holder_started,
                 "heartbeat run/attempt/head/workflow/start identity changed")
         child_pid = child.pid if child is not None and child.poll() is None else None
-        raw = gpu0_actors(child_pid, descendants=self.descendants, record=self.record)
+        raw = gpu0_actors(child_pid, descendants=self.descendants, record=self.record, background=self.background)
         self.record({"event": "gpu0_actors", "owned_pid": child_pid, "raw": raw})
         require(time.monotonic() - start <= CYCLE_LIMIT_SECONDS, "holder observation cycle stale")
 
@@ -253,6 +324,9 @@ class OwnerGuard:
                 os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" and
                 re.fullmatch(r"[0-9a-f]{40}", self.control_sha) is not None and IS_WINDOWS,
                 "GPU0 mode is only the exact M4 CUDA owner-receipt attempt")
+        self.background = reviewed_background()
+        self.record({"event": "reviewed_background", "identity": self.background["identity"],
+                     "luid": self.background["luid"], "engine_instances": sorted(self.background["counters"]["engine"])})
         control = Path(__file__).resolve().parents[2]
         workspace = Path(os.environ["GITHUB_WORKSPACE"])
         for directory, expected in ((control, self.control_sha), (workspace / "engine", self.engine_sha)):

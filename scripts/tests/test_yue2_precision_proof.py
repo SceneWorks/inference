@@ -71,7 +71,7 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("    if: inputs.stage == 'fixture'\n", fixture)
         self.assertIn("    runs-on: ubuntu-latest\n", fixture)
 
-    def test_every_accelerator_stage_retains_the_existing_shared_physical_group(self):
+    def test_accelerators_retain_their_exact_physical_host_groups(self):
         source = WORKFLOW.read_text(encoding="utf-8")
         settings = self.concurrency_settings(source)
         group = settings["group"]
@@ -79,6 +79,7 @@ class PrecisionControlTests(unittest.TestCase):
             for run_id in ("101", "102"):
                 with self.subTest(stage=stage, run_id=run_id):
                     self.assertEqual(self.concurrency_group(group, stage, run_id),
+                                     "yue2-app-precision-nax-macos-2" if stage == "metal" else
                                      "inference-real-weights-physical-host")
         # Keep all other workflow users of the accelerator lock byte-consistent.
         for name in ("real-weights.yml", "real-weights-yue.yml", "yue2-bf16-tile-diagnostic.yml",
@@ -94,6 +95,8 @@ class PrecisionControlTests(unittest.TestCase):
                                   ("metal", "yue2-app-precision-nax-macos-2")):
             self.assertEqual(self.concurrency_group(app["group"], backend, "101"), expected)
         self.assertEqual(app["cancel-in-progress"], "false")
+        self.assertEqual(self.concurrency_group(group, "metal", "101"),
+                         self.concurrency_group(app["group"], "metal", "102"))
 
     def test_precision_queue_preserves_existing_pending_and_running_work(self):
         settings = self.concurrency_settings(WORKFLOW.read_text(encoding="utf-8"))

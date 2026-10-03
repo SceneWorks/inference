@@ -51,10 +51,11 @@ permissions:
   actions: read
 
 # Hosted CPU fixture transfers do not hold the shared accelerator lock. Every accelerator
-# stage defaults to the existing physical group. Only the explicitly approved receipt-bound
+# Metal shares the app's exact nax-macos-2 group; other accelerators default to the existing
+# Windows physical group. Only the explicitly approved receipt-bound
 # CUDA route uses the fixed provisional GPU0 group; the controller authenticates the GPU1 holder.
 concurrency:
-  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37122359802' && inputs.expected_engine_sha == '825341ff8d0110ea448213485891b39d57806fa4' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
+  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || inputs.stage == 'metal' && 'yue2-app-precision-nax-macos-2' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37122359802' && inputs.expected_engine_sha == '825341ff8d0110ea448213485891b39d57806fa4' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
   queue: max
   cancel-in-progress: false
 
