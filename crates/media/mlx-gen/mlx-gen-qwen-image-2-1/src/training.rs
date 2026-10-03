@@ -590,6 +590,30 @@ fn device_budget_bytes() -> u64 {
     (mlx_rs::memory::get_memory_limit() as f64 * mlx_gen::memory::SAFE_FRAC) as u64
 }
 
+/// Caps MLX's freed-buffer pool (`set_cache_limit`) for one training run and restores the
+/// previous cap on drop. Installed as `min(previous, requested)`, like
+/// [`crate::memory_strategy::AllocatorBounds`]: a run only ever tightens what a harness set.
+struct TrainingPoolBound {
+    previous: usize,
+}
+
+impl TrainingPoolBound {
+    fn enter(limit_bytes: u64) -> Self {
+        let limit = usize::try_from(limit_bytes).unwrap_or(usize::MAX);
+        let previous = mlx_rs::memory::set_cache_limit(limit);
+        if previous < limit {
+            mlx_rs::memory::set_cache_limit(previous);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for TrainingPoolBound {
+    fn drop(&mut self) {
+        mlx_rs::memory::set_cache_limit(self.previous);
+    }
+}
+
 /// `(trainable elements, LoKr delta elements)` the targets get under `cfg` — exact, from the
 /// host's base shapes (the probe half; no weight is read). Trainable: LoRA `rank·(in + out)`; LoKr
 /// `w1` plus a full or low-rank `w2` by PEFT's `use_w2` rule, exactly as [`build_lokr_targets`]
@@ -1657,6 +1681,20 @@ impl QwenImage21Trainer {
             .memory_budget_override
             .unwrap_or_else(device_budget_bytes);
         check_training_footprint(&self.facts, &shape, budget)?;
+        // Bound MLX's freed-buffer pool for the rest of the run to the derived working set above
+        // the DiT. Unbounded, the allocator pools every freed buffer up to ~0.95 x the device's
+        // recommended working set, so the process footprint the OS sees climbs to that pool line
+        // whatever the run needs (the first real-weight edit run crossed the evidence lane's
+        // 100 GB phys_footprint ceiling). The render path bounds the pool per request the same way
+        // (`memory_strategy::AllocatorBounds`, sc-24114); training bounds ONLY the cache, never
+        // MLX's memory limit, so a figure the derived model rounds can never throttle a step.
+        let derived = training_footprint(&self.facts, &shape);
+        let _pool = TrainingPoolBound::enter(
+            derived
+                .train_phase
+                .saturating_sub(self.facts.dit_elements * shape.compute_width)
+                .max(1 << 30),
+        );
 
         // --- resume admission, before any model loads ---
         // The run's identity (sc-24163): its training config and its dataset fingerprint (item
