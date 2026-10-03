@@ -21,6 +21,9 @@ import re
 import signal
 
 ENGINE = "825341ff8d0110ea448213485891b39d57806fa4"
+# The diagnostic archives this exact M4 checkout and applies separately retained observation
+# patches. The derivative patch/tree hashes belong to the reviewed control source, not this SHA.
+PEDANTIC_ENGINE = ENGINE
 RECEIPT = "37135502627"
 RECEIPT_DIGEST = "1f0307e1056fa00b3a177002aa1cfafb40348c071676a7c894e938ebf2fd3991"
 REPO = "SceneWorks/inference"
@@ -258,7 +261,7 @@ def gpu0_actors(child_pid: int | None, descendants: bool = False, record=None, b
 class OwnerGuard:
     def __init__(self, evidence: Path, engine_sha: str, control_sha: str, kind: str = "engine"):
         self.kind = kind
-        require(kind in {"engine", "app"}, "unknown guarded workflow")
+        require(kind in {"engine", "app", "diagnostic"}, "unknown guarded workflow")
         self.path = evidence / "gpu0-holder-chronology.jsonl"
         self.engine_sha = engine_sha
         self.control_sha = control_sha
@@ -321,14 +324,16 @@ class OwnerGuard:
 
     def _preflight(self) -> None:
         from yue2_cuda_idle_context import BASELINE_DIGEST, RUN_ID
-        require(self.engine_sha == ENGINE and RUN_ID == RECEIPT and BASELINE_DIGEST == RECEIPT_DIGEST and
+        expected_engine = PEDANTIC_ENGINE if self.kind == "diagnostic" else ENGINE
+        require(bool(expected_engine) and self.engine_sha == expected_engine and
+                RUN_ID == RECEIPT and BASELINE_DIGEST == RECEIPT_DIGEST and
                 os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID") == RECEIPT and
                 os.environ.get("GITHUB_REPOSITORY") == REPO and os.environ.get("GITHUB_JOB") == "cuda" and
                 os.environ.get("GITHUB_RUN_ATTEMPT") == "1" and os.environ.get("GITHUB_SHA") == self.control_sha and
                 os.environ.get("CUDA_VISIBLE_DEVICES") == "0" and
                 os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" and
                 re.fullmatch(r"[0-9a-f]{40}", self.control_sha) is not None and IS_WINDOWS,
-                "GPU0 mode is only the exact M4 CUDA owner-receipt attempt")
+                "GPU0 mode is only the exact reviewed CUDA owner-receipt attempt")
         self.background = reviewed_background()
         self.record({"event": "reviewed_background", "identity": self.background["identity"],
                      "luid": self.background["luid"], "engine_instances": sorted(self.background["counters"]["engine"])})
@@ -349,8 +354,9 @@ class OwnerGuard:
         jobs = api(f"actions/runs/{own_id}/attempts/1/jobs?per_page=100")
         group = api(f"actions/concurrency_groups/{GPU0_GROUP}")
         self.record({"event": "own_source", "reads": [own, jobs, group]})
-        run_identity(own["body"], own_id, self.control_sha, ".github/workflows/" +
-                     ("yue2-precision-proof.yml" if self.kind == "engine" else "yue2-app-precision-profile.yml"))
+        workflow = {"engine": "yue2-precision-proof.yml", "app": "yue2-app-precision-profile.yml",
+                    "diagnostic": "yue2-bf16-tile-diagnostic.yml"}[self.kind]
+        run_identity(own["body"], own_id, self.control_sha, f".github/workflows/{workflow}")
         self.proof_job = selected_job(jobs["body"], None, "cuda", os.environ["RUNNER_NAME"])
         active_group(group["body"], GPU0_GROUP, own_id)
         for path, digest in SOURCE_HASHES.items():

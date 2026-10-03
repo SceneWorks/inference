@@ -1,6 +1,6 @@
 name: YuE2 bounded BF16 tile diagnosis
 
-# CUDA-only waveform, first-Conv7, or derivative decoder trace for failed M3 comparison; no acceptance, model
+# CUDA-only waveform, first-Conv7, derivative decoder trace, or exact-M4 stage-2 math comparison; no acceptance, model
 # generation, app profile, quality sweep, or Metal dispatch. Numerical gates unchanged.
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
       expected_engine_sha:
         type: string
         required: true
-        description: Exact failed M3 source, unchanged production implementation
+        description: Exact production source under diagnosis (M3 for older selectors; M4 for pedantic_stage2)
       expected_control_sha:
         type: string
         required: true
@@ -17,12 +17,12 @@ on:
         type: choice
         required: true
         default: waveform
-        options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns, native_convt_math_mode]
+        options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns, native_convt_math_mode, pedantic_stage2]
         description: One bounded diagnostic, with waveform preserving the existing default
       reference_run_id:
         type: string
         required: true
-        description: Existing M3 CPU reference run, never regenerated
+        description: Existing authenticated CPU reference run; pedantic_stage2 requires the M4 transfer
       idle_cuda_context_run_id:
         type: string
         required: false
@@ -34,7 +34,8 @@ permissions:
   actions: read
 
 concurrency:
-  group: inference-real-weights-physical-host
+  group: ${{ inputs.diagnostic == 'pedantic_stage2' && inputs.idle_cuda_context_run_id == '37135502627' && inputs.expected_engine_sha == '825341ff8d0110ea448213485891b39d57806fa4' && inputs.expected_control_sha == github.sha && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
+  queue: max
   cancel-in-progress: false
 
 env:
@@ -59,6 +60,13 @@ jobs:
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
+      - name: Record bounded pedantic job start before checkout
+        if: inputs.diagnostic == 'pedantic_stage2'
+        shell: powershell
+        working-directory: ${{ github.workspace }}
+        run: |
+          $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000000
+          Add-Content -Path $env:GITHUB_ENV -Value "YUE2_DIAGNOSTIC_JOB_STARTED_UTC_NS=$stamp"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           path: control
@@ -69,7 +77,7 @@ jobs:
           path: engine
           persist-credentials: false
       - name: Check out the exact pinned Candle source for native-column observation
-        if: inputs.diagnostic == 'native_convt_columns' || inputs.diagnostic == 'native_convt_math_mode'
+        if: inputs.diagnostic == 'native_convt_columns' || inputs.diagnostic == 'native_convt_math_mode' || inputs.diagnostic == 'pedantic_stage2'
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: huggingface/candle
@@ -124,7 +132,12 @@ jobs:
           uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
           for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
           if not defined REVIEWED_PYTHON exit /b 1
-          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py verify-reference --directory "%RUNNER_TEMP%\yue2-precision-reference" --engine-sha "${{ inputs.expected_engine_sha }}" || exit /b 1
+          if "%YUE2_DIAGNOSTIC_SELECTOR%"=="pedantic_stage2" (
+            if not "${{ inputs.reference_run_id }}"=="37138394196" exit /b 1
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_m4_pedantic_driver.py --verify-teacher "%RUNNER_TEMP%\yue2-precision-reference" || exit /b 1
+          ) else (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py verify-reference --directory "%RUNNER_TEMP%\yue2-precision-reference" --engine-sha "${{ inputs.expected_engine_sha }}" || exit /b 1
+          )
           echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Authenticate and extract only immutable parent stage-2 inputs
         if: inputs.diagnostic == 'native_convt_math_mode'
@@ -144,12 +157,18 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
-      - name: Build the external M3 VAE diagnostic harness
+      - name: Build the external VAE diagnostic harness
         shell: cmd
         run: |
           set "RUSTC_WRAPPER="
           call "%VCVARS%" || exit /b 1
-          if "%YUE2_DIAGNOSTIC_SELECTOR%"=="native_convt_columns" (
+          if "%YUE2_DIAGNOSTIC_SELECTOR%"=="pedantic_stage2" (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_m4_pedantic_source.py --engine . --candle ..\candle-upstream --root "%RUNNER_TEMP%\yue2-m4-pedantic-build" --harness ..\control\scripts\ci\yue2_m4_pedantic --control-sha "%EXPECTED_CONTROL_SHA%" > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log" 2>&1
+            if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log"& exit /b 1)
+            set "TRACE_ROOT=%RUNNER_TEMP%\yue2-m4-pedantic-build\engine-overlay"
+            set "CANDLE_ROOT=%RUNNER_TEMP%\yue2-m4-pedantic-build\candle-overlay"
+            set "PEDANTIC_ROOT=%RUNNER_TEMP%\yue2-m4-pedantic-build"
+          ) else if "%YUE2_DIAGNOSTIC_SELECTOR%"=="native_convt_columns" (
             "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_native_convt_overlay.py --engine . --candle ..\candle-upstream --root "%RUNNER_TEMP%\yue2-native-convt-build" --trace-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\decoder-trace-vae.patch --weight-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-vae-weight.patch --backend-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-candle-core.patch --kernel-path-patch ..\control\scripts\ci\yue2_bf16_tile_diagnostic\native-convt-candle-kernel-path.patch --control-sha "%EXPECTED_CONTROL_SHA%" > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log" 2>&1
             if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\overlay.log"& exit /b 1)
             set "TRACE_ROOT=%RUNNER_TEMP%\yue2-native-convt-build\engine-overlay"
@@ -166,24 +185,29 @@ jobs:
           ) else (
             set "TRACE_ROOT="
           )
-          if defined CANDLE_ROOT (
+          if defined PEDANTIC_ROOT (
+            if not exist "%PEDANTIC_ROOT%\harness\Cargo.lock" exit /b 1
+          ) else if defined CANDLE_ROOT (
             "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py prepare-harness --template ..\control\scripts\ci\yue2_bf16_tile_diagnostic --destination "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" --overlay-root "%TRACE_ROOT%" --native-candle-root "%CANDLE_ROOT%" || exit /b 1
           ) else if defined TRACE_ROOT (
             "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py prepare-harness --template ..\control\scripts\ci\yue2_bf16_tile_diagnostic --destination "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" --overlay-root "%TRACE_ROOT%" || exit /b 1
           ) else (
             "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py prepare-harness --template ..\control\scripts\ci\yue2_bf16_tile_diagnostic --destination "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" || exit /b 1
           )
-          cargo fetch --locked --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --target x86_64-pc-windows-msvc > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\fetch.log" 2>&1
+          if defined PEDANTIC_ROOT (set "HARNESS_ROOT=%PEDANTIC_ROOT%\harness") else (set "HARNESS_ROOT=%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness")
+          cargo fetch --locked --manifest-path "%HARNESS_ROOT%\Cargo.toml" --target x86_64-pc-windows-msvc > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\fetch.log" 2>&1
           if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\fetch.log"& exit /b 1)
           if defined CANDLE_ROOT (
-            cargo build --locked --offline --release --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --features cuda,native_convt_columns --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
+            cargo build --locked --offline --release --manifest-path "%HARNESS_ROOT%\Cargo.toml" --features cuda,native_convt_columns --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
           ) else if not defined TRACE_ROOT (
-            cargo build --locked --offline --release --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --features cuda --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
+            cargo build --locked --offline --release --manifest-path "%HARNESS_ROOT%\Cargo.toml" --features cuda --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
           ) else (
-            cargo build --locked --offline --release --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --features cuda,decoder_trace --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
+            cargo build --locked --offline --release --manifest-path "%HARNESS_ROOT%\Cargo.toml" --features cuda,decoder_trace --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
           )
           if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"& exit /b 1)
-          if defined CANDLE_ROOT (
+          if defined PEDANTIC_ROOT (
+            "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" --output "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\binary.txt" --overlay-root "%TRACE_ROOT%" --native-candle-root "%CANDLE_ROOT%" || exit /b 1
+          ) else if defined CANDLE_ROOT (
             "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" --output "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\binary.txt" --overlay-root "%TRACE_ROOT%" --native-candle-root "%CANDLE_ROOT%" || exit /b 1
           ) else if defined TRACE_ROOT (
             "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" --output "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\binary.txt" --overlay-root "%TRACE_ROOT%" || exit /b 1
@@ -195,12 +219,17 @@ jobs:
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          GH_TOKEN: ${{ inputs.diagnostic == 'pedantic_stage2' && github.token || '' }}
         run: |
           $binary = (Get-Content "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic\binary.txt" -Raw).Trim()
           $traceArgs = @()
           if ($env:YUE2_DIAGNOSTIC_SELECTOR -ceq 'decoder_trace') { $traceArgs = @('--overlay-root', "$env:RUNNER_TEMP\yue2-bf16-trace-build\engine-overlay") }
           if ($env:YUE2_DIAGNOSTIC_SELECTOR -cin @('native_convt_columns', 'native_convt_math_mode')) { $traceArgs = @('--overlay-root', "$env:RUNNER_TEMP\yue2-native-convt-build\engine-overlay", '--native-candle-root', "$env:RUNNER_TEMP\yue2-native-convt-build\candle-overlay") }
-          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_bf16_tile_diagnostic.py run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR" --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA" @traceArgs
+          if ($env:YUE2_DIAGNOSTIC_SELECTOR -ceq 'pedantic_stage2') {
+            & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_m4_pedantic_driver.py --selector pedantic_stage2 --binary "$binary" --build-json "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic\build.jsonl" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --source-provenance "$env:RUNNER_TEMP\yue2-m4-pedantic-build\m4-pedantic-source.json" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic\pedantic-evidence" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA"
+          } else {
+            & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_bf16_tile_diagnostic.py run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR" --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA" @traceArgs
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload immutable diagnostic output and failures
         if: always()
@@ -235,5 +264,19 @@ jobs:
             ${{ runner.temp }}/yue2-native-convt-build/native-convt-candle-kernel-path.patch
             ${{ runner.temp }}/yue2-native-convt-build/overlay-provenance.json
             ${{ runner.temp }}/yue2-native-convt-build/native-provenance.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload exact M4 stage-2 diagnostic source and declared patches
+        if: always() && inputs.diagnostic == 'pedantic_stage2'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-m4-pedantic-source-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/yue2-m4-pedantic-build/m4-tracked-source.tar.gz
+            ${{ runner.temp }}/yue2-m4-pedantic-build/m4-vae-observation.patch
+            ${{ runner.temp }}/yue2-m4-pedantic-build/pinned-candle-tracked-source.tar.gz
+            ${{ runner.temp }}/yue2-m4-pedantic-build/candle-column.patch
+            ${{ runner.temp }}/yue2-m4-pedantic-build/candle-kernel-path.patch
+            ${{ runner.temp }}/yue2-m4-pedantic-build/m4-pedantic-source.json
           if-no-files-found: error
           retention-days: 30

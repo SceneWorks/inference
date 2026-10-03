@@ -372,7 +372,7 @@ class DiagnosticGuards(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("repository: huggingface/candle", workflow)
         self.assertIn("ref: 1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", workflow)
-        self.assertIn('if: inputs.diagnostic == \'native_convt_columns\'', workflow)
+        self.assertIn("inputs.diagnostic == 'native_convt_columns'", workflow)
         self.assertIn("--features cuda,native_convt_columns", workflow)
         self.assertIn("--native-candle-root", workflow)
         self.assertIn("native-convt-candle-kernel-path.patch", workflow)
@@ -446,7 +446,7 @@ class DiagnosticGuards(unittest.TestCase):
     def test_explicit_selector_keeps_waveform_default_and_forwards_to_child(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("default: waveform", workflow)
-        self.assertIn("options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns, native_convt_math_mode]", workflow)
+        self.assertIn("options: [waveform, first_conv, first_conv_math, decoder_trace, native_convt_columns, native_convt_math_mode, pedantic_stage2]", workflow)
         self.assertIn('run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR"', workflow)
         self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math",
                                             "decoder_trace", "native_convt_columns", "native_convt_math_mode"))
@@ -665,20 +665,22 @@ class DiagnosticGuards(unittest.TestCase):
 
     @staticmethod
     def assert_locked_fetch_before_offline_build(workflow: str) -> None:
-        step = workflow.split("      - name: Build the external M3 VAE diagnostic harness\n", 1)[1].split(
+        step = workflow.split("      - name: Build the external VAE diagnostic harness\n", 1)[1].split(
             "      - name: Run only the bounded same-input VAE diagnostic\n", 1)[0]
         lines = [line.strip() for line in step.splitlines()]
         prepare = next(i for i, line in enumerate(lines) if "prepare-harness" in line)
         fetch = next(i for i, line in enumerate(lines) if line.startswith("cargo fetch "))
         builds = [i for i, line in enumerate(lines) if line.startswith("cargo build ")]
         assert len(builds) == 3 and prepare < fetch < min(builds)
+        assert any(line.startswith('if defined PEDANTIC_ROOT (set "HARNESS_ROOT=%PEDANTIC_ROOT%\\harness")')
+                   for line in lines)
         assert lines[fetch] == (
-            'cargo fetch --locked --manifest-path "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\harness\\Cargo.toml" '
+            'cargo fetch --locked --manifest-path "%HARNESS_ROOT%\\Cargo.toml" '
             '--target x86_64-pc-windows-msvc > "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\fetch.log" 2>&1')
         assert lines[fetch + 1] == (
             'if errorlevel 1 (type "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\fetch.log"& exit /b 1)')
         prefix = ('cargo build --locked --offline --release --manifest-path '
-                  '"%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\harness\\Cargo.toml" --features ')
+                  '"%HARNESS_ROOT%\\Cargo.toml" --features ')
         suffix = (' --message-format=json > "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\build.jsonl" '
                   '2> "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\build.log"')
         assert {lines[i].removeprefix(prefix).removesuffix(suffix) for i in builds} == {
