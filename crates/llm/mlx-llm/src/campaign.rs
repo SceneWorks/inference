@@ -120,6 +120,13 @@ pub const REQUIRED_PHASES: [&str; 8] = [
 /// a turn-2 forced continuation), and each arm's per-turn cache record is sealed.
 pub const RECEIPT_SCHEMA_VERSION: u32 = 7;
 pub const RECEIPT_HARNESS_VERSION: &str = "sc-20671-kv-baseline-v7";
+/// The chat template's `date_string` on every campaign render. Llama 3.2's pinned template dates
+/// its system header (`Today Date:`) from `strftime_now` when no `date_string` is passed, so
+/// unpinned prompts — and their hashes, token counts and answers — changed with the calendar day a
+/// row ran on (A2 v5 vs the terminal run). This is the template's own fallback date; Qwen3 and
+/// Llama 3.1's pinned templates read no clock. Recorded per receipt as
+/// [`ReceiptProvenance::chat_template_date_string`].
+pub const CAMPAIGN_CHAT_TEMPLATE_DATE_STRING: &str = "26 Jul 2024";
 /// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v5).
 pub const QUALITY_CONTRACT_HASH: &str =
     "8461b072e36493f4f4559e7fc858a286a239a43e8ca8d8ea93179bcf33f344ca";
@@ -1764,6 +1771,11 @@ pub struct ReceiptProvenance {
     pub campaign_session_id: String,
     pub campaign_cache_state_version: u64,
     pub coordinate_operation_sha256: String,
+    /// The `date_string` every chat render of this row used
+    /// ([`CAMPAIGN_CHAT_TEMPLATE_DATE_STRING`]). Absent only on a receipt written before the pin,
+    /// whose Llama prompts were dated by the wall clock and so are not comparable across days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_date_string: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3762,6 +3774,12 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || p.command_template.replace("{mode}", &receipt.mode) != p.command
     {
         return Err("provenance is incomplete".into());
+    }
+    if p.chat_template_date_string
+        .as_deref()
+        .is_some_and(|date| date != CAMPAIGN_CHAT_TEMPLATE_DATE_STRING)
+    {
+        return Err("provenance chat-template date is not the campaign's pinned date".into());
     }
     validate_host_states(receipt)?;
     let g = &receipt.geometry;
@@ -13283,6 +13301,7 @@ fn product_receipt(
             campaign_session_id: observation.session_id.clone(),
             campaign_cache_state_version: observation.cache_state_version,
             coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate),
+            chat_template_date_string: Some(CAMPAIGN_CHAT_TEMPLATE_DATE_STRING.into()),
         },
         matrix: ReceiptMatrix {
             family: coordinate.family.into(),
@@ -16349,6 +16368,7 @@ pub(crate) mod tests {
                 campaign_session_id: "e".repeat(64),
                 campaign_cache_state_version: 1,
                 coordinate_operation_sha256: "f".repeat(64),
+                chat_template_date_string: Some(CAMPAIGN_CHAT_TEMPLATE_DATE_STRING.into()),
             },
             matrix: ReceiptMatrix {
                 family: "llama".into(),

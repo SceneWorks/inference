@@ -984,6 +984,11 @@ pub struct LlamaProvider {
     gemma4: Option<Gemma4Runtime>,
     /// Campaign-only prefix cache; ordinary serving never consults this state.
     campaign_prefix_cache: RefCell<Option<crate::decode::PrefixCache>>,
+    /// The chat template's `date_string` kwarg. `None` (every production load) keeps the
+    /// template's own dating — `strftime_now`, the current date, on Llama 3.2. Only
+    /// [`Self::load_for_campaign`] pins it ([`crate::campaign::CAMPAIGN_CHAT_TEMPLATE_DATE_STRING`])
+    /// so a campaign's rendered prompts never depend on the day the row runs.
+    campaign_template_date: Option<&'static str>,
     /// The retained fused compressed-KV reader (sc-20679), built on the first request the
     /// qualification table admits and reused by every later one; `Err` is the build failure each
     /// such request then reports as [`core_llm::KvCacheFallbackReason::ReaderUnavailable`].
@@ -1572,7 +1577,14 @@ impl LlamaProvider {
     /// Ordinary serving keeps MLX's lazy-load behavior; the sealed memory campaign needs an exact
     /// parameter-only materialization boundary before it samples `weights-loaded`.
     pub(crate) fn load_for_campaign(spec: &LoadSpec) -> CoreResult<Self> {
-        Self::load_inner(spec, true)
+        Self::load_inner(spec, true).map(Self::pin_campaign_template_date)
+    }
+
+    /// Fix the chat template's `date_string` to the campaign constant, so every campaign render
+    /// (turn 1, turn 2, fixtures) is the same prompt on any day.
+    fn pin_campaign_template_date(mut self) -> Self {
+        self.campaign_template_date = Some(crate::campaign::CAMPAIGN_CHAT_TEMPLATE_DATE_STRING);
+        self
     }
 
     fn load_inner(spec: &LoadSpec, materialize_campaign_weights: bool) -> CoreResult<Self> {
@@ -1791,6 +1803,7 @@ impl LlamaProvider {
             vision,
             gemma4,
             campaign_prefix_cache: RefCell::new(None),
+            campaign_template_date: None,
             kv_reader: OnceCell::new(),
             kv_model_name: spec.source.clone(),
             _prism_vision_weights: prism_vision_weights,
@@ -1856,6 +1869,7 @@ impl LlamaProvider {
             vision,
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
+            campaign_template_date: None,
             kv_reader: OnceCell::new(),
             kv_model_name: spec.source.clone(),
             _prism_vision_weights: None,
@@ -1895,6 +1909,7 @@ impl LlamaProvider {
             vision: None,
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
+            campaign_template_date: None,
             kv_reader: OnceCell::new(),
             kv_model_name: String::new(),
             _prism_vision_weights: None,
@@ -2388,6 +2403,7 @@ pub(crate) fn campaign_preflight_request_tokens(
             reasoning_effort: request.reasoning_effort,
             preserve_thinking: request.preserve_thinking,
             tools: &request.tools,
+            date_string: Some(crate::campaign::CAMPAIGN_CHAT_TEMPLATE_DATE_STRING),
         },
     )?;
     u64::try_from(tokenizer.encode(&prompt, false)?.len())
@@ -3008,6 +3024,7 @@ impl LlamaProvider {
                 reasoning_effort: req.reasoning_effort,
                 preserve_thinking: req.preserve_thinking,
                 tools: &req.tools,
+                date_string: self.campaign_template_date,
             },
         )?;
         let prompt_ids: Vec<i32> = self
@@ -5288,6 +5305,7 @@ pub(crate) mod tests {
                         reasoning_effort: None,
                         preserve_thinking: None,
                         tools: &[],
+                        date_string: None,
                     },
                 )
                 .expect("render");
@@ -6127,6 +6145,75 @@ pub(crate) mod tests {
         let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, a)| (k.as_str(), a)).collect();
         Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
         dir
+    }
+
+    /// Campaign prompts must not depend on the day a row runs. The pinned Llama 3.2 template dates
+    /// its system header (`Today Date:`) from `strftime_now`; under two mocked "now" days the
+    /// campaign provider renders the multi-turn fixture's turn 2 to identical ids, dated with the
+    /// campaign constant, while a production load keeps the template's own clock dating.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn campaign_multi_turn_prompt_ids_do_not_depend_on_the_date() {
+        let snapshot = tiny_packed_capable_snapshot();
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "models/testdata/llama32_tokenizer_config_template.json"
+        ))
+        .unwrap();
+        std::fs::write(
+            snapshot.path().join("tokenizer_config.json"),
+            pinned.to_string(),
+        )
+        .unwrap();
+        // The tiny vocabulary plus the date header's words, so a changed date changes the ids.
+        let tokenizer_path = snapshot.path().join("tokenizer.json");
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&tokenizer_path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        for word in [
+            "Today", "Date", "03", "04", "26", "Jul", "Oct", "2024", "2026",
+        ] {
+            let id = vocab.len();
+            vocab.insert(word.into(), json!(id));
+        }
+        std::fs::write(&tokenizer_path, tokenizer.to_string()).unwrap();
+        let spec = core_llm::LoadSpec::dense(snapshot.path().to_string_lossy().to_string());
+        let campaign = LlamaProvider::load_for_campaign(&spec).unwrap();
+        let production = LlamaProvider::load(&spec).unwrap();
+        let turn2 = TextLlmRequest {
+            messages: vec![
+                Message::text(Role::User, "w6 w7 w8 Repeat the stable baseline fact."),
+                Message::text(Role::Assistant, "w9 w10 w11"),
+                Message::text(Role::User, crate::campaign::MULTI_TURN_FIXTURE_FOLLOW_UP),
+            ],
+            ..Default::default()
+        };
+        // 2026-10-03 and 2026-10-04, UTC: a row run either side of midnight.
+        let (day_one, day_two) = (20_729 * 86_400, 20_730 * 86_400);
+        let render = |provider: &LlamaProvider, now| {
+            core_llm::template::with_template_clock(now, || {
+                provider.render_prompt(&turn2, &turn2.messages).unwrap()
+            })
+        };
+        let (text_one, ids_one) = render(&campaign, day_one);
+        let (text_two, ids_two) = render(&campaign, day_two);
+        assert_eq!(ids_one, ids_two, "campaign prompt ids moved with the date");
+        assert_eq!(text_one, text_two);
+        let header = format!(
+            "Today Date: {}",
+            crate::campaign::CAMPAIGN_CHAT_TEMPLATE_DATE_STRING
+        );
+        assert!(text_one.contains(&header), "{text_one}");
+        let (production_one, production_ids_one) = render(&production, day_one);
+        let (production_two, production_ids_two) = render(&production, day_two);
+        assert!(
+            production_one.contains("Today Date: 03 Oct 2026"),
+            "{production_one}"
+        );
+        assert!(
+            production_two.contains("Today Date: 04 Oct 2026"),
+            "{production_two}"
+        );
+        assert_ne!(production_ids_one, production_ids_two);
     }
 
     /// SC-20671 contract v4 multi-turn prompt-cache fixture on the product provider path, at
