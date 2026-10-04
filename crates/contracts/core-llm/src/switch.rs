@@ -39,6 +39,8 @@ pub struct ProcessSwitch {
     env: &'static str,
     unset: bool,
     parse: fn(&str) -> bool,
+    /// Whether a blank value (empty after trimming) reads as unset rather than as `parse("")`.
+    blank_is_unset: bool,
     policy: AtomicU8,
     /// The environment's setting, read once: `None` when the variable is unset.
     from_env: OnceLock<Option<bool>>,
@@ -49,10 +51,26 @@ impl ProcessSwitch {
     /// A switch read from `env`: `unset` is its state when the variable is not set, and `parse`
     /// says whether a set value (trimmed and lower-cased first) means **on**.
     pub const fn new(env: &'static str, unset: bool, parse: fn(&str) -> bool) -> Self {
+        Self::build(env, unset, parse, false)
+    }
+
+    /// [`new`](Self::new), except that a blank value (`VAR=` or whitespace) reads as **unset** —
+    /// the switch keeps its default — rather than as whatever `parse("")` says.
+    pub const fn new_blank_unset(env: &'static str, unset: bool, parse: fn(&str) -> bool) -> Self {
+        Self::build(env, unset, parse, true)
+    }
+
+    const fn build(
+        env: &'static str,
+        unset: bool,
+        parse: fn(&str) -> bool,
+        blank_is_unset: bool,
+    ) -> Self {
         Self {
             env,
             unset,
             parse,
+            blank_is_unset,
             policy: AtomicU8::new(POLICY_ENV),
             from_env: OnceLock::new(),
             lock: ThreadLock::new(),
@@ -80,11 +98,21 @@ impl ProcessSwitch {
 
     /// The variable's parsed value, read once per process; `None` when it is unset.
     fn env_setting(&self) -> Option<bool> {
-        *self.from_env.get_or_init(|| {
-            std::env::var(self.env)
-                .ok()
-                .map(|v| (self.parse)(&v.trim().to_ascii_lowercase()))
-        })
+        *self
+            .from_env
+            .get_or_init(|| self.parse_setting(std::env::var(self.env).ok().as_deref()))
+    }
+
+    /// What a raw environment value means for this switch: `None` (unset) for no value — or a
+    /// blank one on a [`new_blank_unset`](Self::new_blank_unset) switch — else the parsed value
+    /// (trimmed and lower-cased first).
+    #[doc(hidden)]
+    pub fn parse_setting(&self, raw: Option<&str>) -> Option<bool> {
+        let value = raw?.trim().to_ascii_lowercase();
+        if self.blank_is_unset && value.is_empty() {
+            return None;
+        }
+        Some((self.parse)(&value))
     }
 
     /// What was **asked for** explicitly: the runtime override if one is set, else the
@@ -283,6 +311,23 @@ mod tests {
         ProcessSwitch::new("CORE_LLM_TEST_SWITCH_UNSET_A", false, on_words);
     static DEFAULT_ON: ProcessSwitch =
         ProcessSwitch::new("CORE_LLM_TEST_SWITCH_UNSET_B", true, on_words);
+
+    /// A blank value is unset on a `new_blank_unset` switch and a parsed (here: off) value on a
+    /// plain one; a set value parses trimmed and lower-cased either way.
+    #[test]
+    fn a_blank_value_is_unset_only_on_a_blank_unset_switch() {
+        static BLANK_UNSET: ProcessSwitch =
+            ProcessSwitch::new_blank_unset("CORE_LLM_TEST_SWITCH_UNSET_C", true, on_words);
+        for raw in ["", "  "] {
+            assert_eq!(BLANK_UNSET.parse_setting(Some(raw)), None, "{raw:?}");
+            assert_eq!(DEFAULT_ON.parse_setting(Some(raw)), Some(false), "{raw:?}");
+        }
+        for switch in [&BLANK_UNSET, &DEFAULT_ON] {
+            assert_eq!(switch.parse_setting(None), None);
+            assert_eq!(switch.parse_setting(Some(" ON ")), Some(true));
+            assert_eq!(switch.parse_setting(Some("0")), Some(false));
+        }
+    }
 
     #[test]
     fn the_override_wins_and_none_returns_to_the_default() {

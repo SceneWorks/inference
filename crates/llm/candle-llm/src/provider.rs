@@ -1629,7 +1629,12 @@ impl LlamaProvider {
         )?;
         let draft_estimate = match &draft {
             Some((draft_spec, None)) => {
-                Some(Self::load_memory_estimate(draft_spec, device.is_cuda())?)
+                // As a draft (never graph-wrapped), the price `admit_draft` admitted it at.
+                Some(Self::load_memory_estimate_as(
+                    draft_spec,
+                    device.is_cuda(),
+                    false,
+                )?)
             }
             _ => None,
         };
@@ -1968,7 +1973,7 @@ impl LlamaProvider {
     /// source is [`CoreError::Load`].
     ///
     /// A CUDA load whose decoder the CUDA-graph runner wraps (its policy: `spec.cuda_graphs`,
-    /// else the process switch) also prices the parameter cache the runner's captures leave
+    /// else the process switch, else the CUDA row's default) also prices the parameter cache the runner's captures leave
     /// resident for the process ([`LoadMemoryEstimate::graph_param_cache_bytes`], sc-24441) —
     /// doubled for a load with an MTP head, whose hidden-row steps are captures of their own
     /// (sc-24446).
@@ -2047,7 +2052,10 @@ impl LlamaProvider {
             load_memory_requirements(payload, staging, projector, cuda, working)
                 .ok_or_else(overflow)?;
         let on_device = |bytes: u64| if cuda { bytes } else { 0 };
-        let graphs = target && spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
+        let graphs = target
+            && spec
+                .cuda_graphs
+                .unwrap_or_else(|| crate::decode::graph::cuda_graphs_default_for(cuda));
         let graph_param_cache = if graphs {
             on_device(crate::decode::graph_param_cache_load_bytes(hidden_steps))
         } else {
@@ -4099,7 +4107,13 @@ impl TextLlm for LlamaProvider {
         // The load's CUDA-graph policy (sc-24139) governs everything this request does on this
         // thread — admission's workspace pricing, wrapping the step model, the runner's switch —
         // and the report says which switch it ran under.
-        let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(self.load_record.cuda_graphs);
+        // A provider built from parts (no load settled a policy) takes its model's device's
+        // default — never the default of the device this process would select (sc-24446: a CPU
+        // model in a CUDA build would otherwise price graph memory it can never capture).
+        let policy = self.load_record.cuda_graphs.unwrap_or_else(|| {
+            crate::decode::graph::cuda_graphs_default_for(self.model.device().is_cuda())
+        });
+        let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(Some(policy));
         let cuda_graphs_on = cuda_graphs_enabled();
 
         // Multimodal (Qwen-VL + image/video content): replace image/video blocks with the Qwen-VL
@@ -8775,6 +8789,36 @@ mod tests {
             (host.graph_param_cache_bytes, host.device_required_bytes),
             (0, None)
         );
+        // Unset (sc-24446), a CUDA estimate takes the CUDA row's graph default (on: priced) from
+        // the `cuda` it is asked about, not from the device this process would open — on a
+        // CPU-only host as on a CUDA one. (A host estimate carries none whatever the switch: the
+        // `host` case above.)
+        {
+            let _switch = crate::decode::graph::cuda_graphs_policy_guard(None);
+            // Neither switch set, and a build that can capture (no candle-flash-attn).
+            if std::env::var_os(crate::decode::graph::CUDA_GRAPHS_ENV).is_none()
+                && std::env::var_os(crate::device::CUDA_STREAM_ENV).is_none()
+                && !cfg!(feature = "flash-attn")
+            {
+                let unset = |cuda| {
+                    super::LlamaProvider::load_memory_estimate(
+                        &core_llm::LoadSpec {
+                            cuda_graphs: None,
+                            ..fixture.spec_with_draft()
+                        },
+                        cuda,
+                    )
+                    .unwrap()
+                    .graph_param_cache_bytes
+                };
+                let cuda_default = if core_llm::defaults::CANDLE_CUDA.cuda_graphs {
+                    on.graph_param_cache_bytes
+                } else {
+                    0
+                };
+                assert_eq!(unset(true), cuda_default);
+            }
+        }
         // The draft beside a graph-wrapped target: exactly room for its own unwrapped load.
         let draft = super::LlamaProvider::load_memory_estimate(
             &core_llm::LoadSpec {
@@ -8889,7 +8933,8 @@ mod tests {
         let spec = fixture.spec_with_draft();
         let draft_source = fixture.draft.to_string_lossy().into_owned();
         let target = admitted_bytes(&core_llm::LoadSpec::dense(fixture.target.to_string_lossy()));
-        let draft = admitted_bytes(&super::draft_load_spec(&spec, &draft_source));
+        // A draft is never graph-wrapped: priced as a draft, not as a target.
+        let draft = admitted_bytes_as(&super::draft_load_spec(&spec, &draft_source), false);
         let provider =
             super::with_load_budget(target + draft - 1, || super::LlamaProvider::load(&spec))
                 .expect("the target fits and loads alone");
@@ -10400,12 +10445,32 @@ mod tests {
     /// a CUDA test host (the operational budget is device headroom there, and the prefix cache
     /// settles in it), the host's otherwise.
     fn admitted_bytes(spec: &core_llm::LoadSpec) -> u64 {
+        admitted_bytes_as(spec, true)
+    }
+
+    /// What load admission prices `spec` at on this host's load device — as the provider's target
+    /// (`target`: wrapped by the graph runner under its policy) or as a resident draft (never
+    /// wrapped: no graph parameter cache).
+    fn admitted_bytes_as(spec: &core_llm::LoadSpec, target: bool) -> u64 {
         let cuda = crate::device::select_device().unwrap().is_cuda();
-        let estimate = super::LlamaProvider::load_memory_estimate(spec, cuda).unwrap();
+        let estimate = super::LlamaProvider::load_memory_estimate_as(spec, cuda, target).unwrap();
         match cuda {
             true => estimate.device_required_bytes.unwrap(),
             false => estimate.host_required_bytes,
         }
+    }
+
+    /// The graph parameter cache `spec` adds over `base` on this host's load device: non-zero only
+    /// where the runner wraps the load (CUDA, graphs on) and `spec` asks for hidden-row captures
+    /// (an MTP head) that `base` does not.
+    fn graph_cache_over(spec: &core_llm::LoadSpec, base: &core_llm::LoadSpec) -> u64 {
+        let cuda = crate::device::select_device().unwrap().is_cuda();
+        let cache = |s| {
+            super::LlamaProvider::load_memory_estimate(s, cuda)
+                .unwrap()
+                .graph_param_cache_bytes
+        };
+        cache(spec) - cache(base)
     }
 
     fn with_head(target: &tempfile::TempDir, head: &std::path::Path) -> core_llm::LoadSpec {
@@ -10620,8 +10685,10 @@ mod tests {
         let source = target.path().display().to_string();
         let mut spec = with_head(&target, head.path()).with_draft(source.clone());
         spec.prefix_cache_bytes = Some(u64::MAX / 4);
-        let target_bytes = admitted_bytes(&core_llm::LoadSpec::dense(source.clone()));
-        let draft_bytes = admitted_bytes(&super::draft_load_spec(&spec, &source));
+        // The target as this spec loads it (with a head, the graph runner's hidden-row captures
+        // are priced too), the draft as a draft (never graph-wrapped).
+        let target_bytes = admitted_bytes(&with_head(&target, head.path()));
+        let draft_bytes = admitted_bytes_as(&super::draft_load_spec(&spec, &source), false);
 
         let short = super::with_load_budget(target_bytes + draft_bytes + head_bytes - 1, || {
             super::LlamaProvider::load(&spec)
@@ -10675,13 +10742,14 @@ mod tests {
         assert_eq!(head_bytes, payload + repack + norms);
 
         let spec = with_head(&target, head.path());
-        let target_bytes = admitted_bytes(&core_llm::LoadSpec::dense(
-            target.path().display().to_string(),
-        ));
+        let dense = core_llm::LoadSpec::dense(target.path().display().to_string());
+        // The head's bytes are admitted on top of the target's own price, which a head changes
+        // only by the graph runner's hidden-row captures (sc-24446: CUDA with graphs on).
+        let target_bytes = admitted_bytes(&spec);
         assert_eq!(
-            admitted_bytes(&spec),
             target_bytes,
-            "the target's own price is unchanged; the head is admitted on top of it"
+            admitted_bytes(&dense) + graph_cache_over(&spec, &dense),
+            "the target's own price; the head is admitted on top of it"
         );
         let short = super::with_load_budget(target_bytes + head_bytes - 1, || {
             super::LlamaProvider::load(&spec)

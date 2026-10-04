@@ -75,8 +75,9 @@
 //! then neither the graph's state nor the eager one can be trusted.
 //!
 //! ## Switch and accounting
-//! `CANDLE_LLM_CUDA_GRAPHS` (`1` / `on` / `true` / `yes` enable; the default is
-//! [`CUDA_GRAPHS_DEFAULT`], the one place it is set) or [`set_cuda_graphs`] at runtime; a load's own `LoadSpec::cuda_graphs`
+//! `CANDLE_LLM_CUDA_GRAPHS` (`1` / `on` / `true` / `yes` enable; unset, the device's row of the
+//! defaults table: [`CUDA_GRAPHS_DEFAULT`] on CUDA, off on Metal and the CPU —
+//! [`cuda_graphs_default_for`]) or [`set_cuda_graphs`] at runtime; a load's own `LoadSpec::cuda_graphs`
 //! overrides both for that model — its load (the stream it lands on) and every generation on it
 //! ([`cuda_graphs_scope`], sc-24139). Admission prices graph memory up front with
 //! [`graph_workspace_admission_bytes`] (E6); [`GraphRunner::workspace`] reports what a runner
@@ -100,13 +101,15 @@ use crate::primitives::decode_cache::DecodeCache;
 use crate::primitives::switch::{ProcessSwitch, SwitchGuard};
 
 /// Environment switch: `1` / `on` / `true` / `yes` enable the graph runner; anything else leaves
-/// it off, and unset leaves [`CUDA_GRAPHS_DEFAULT`].
+/// it off, and unset — or blank, as `CANDLE_LLM_CUDA_STREAM` reads a blank value — leaves the
+/// device's default ([`cuda_graphs_default_for`]).
 pub const CUDA_GRAPHS_ENV: &str = "CANDLE_LLM_CUDA_GRAPHS";
 
 /// **The Candle CUDA-graph default** (epic sc-24432 E5): whether the runner captures when neither
 /// [`CUDA_GRAPHS_ENV`], [`set_cuda_graphs`] nor a load's `LoadSpec::cuda_graphs` says otherwise —
 /// read from the per-backend defaults table ([`core_llm::defaults::CANDLE_CUDA`]), where the
-/// value and its justification live (PROVISIONAL until the sc-24446 campaign measures it).
+/// value and its justification live (on, measured by the sc-24446 campaign). It is the CUDA
+/// device's default; Metal and the CPU take their own rows (off: no graph runner there).
 pub const CUDA_GRAPHS_DEFAULT: bool = core_llm::defaults::CANDLE_CUDA.cuda_graphs;
 
 /// Fallback reason: the switch is off.
@@ -174,10 +177,11 @@ fn env_value_enables(v: &str) -> bool {
     matches!(v, "1" | "on" | "true" | "yes")
 }
 
-/// The process CUDA-graph switch (off unless the environment turns it on), on the crate's one
-/// switch implementation, [`ProcessSwitch`].
+/// The process CUDA-graph switch, on the crate's one switch implementation, [`ProcessSwitch`]. Its
+/// unset state is per device ([`cuda_graphs_default_for`]), so it is read through
+/// [`ProcessSwitch::explicit`].
 static SWITCH: ProcessSwitch =
-    ProcessSwitch::new(CUDA_GRAPHS_ENV, CUDA_GRAPHS_DEFAULT, env_value_enables);
+    ProcessSwitch::new_blank_unset(CUDA_GRAPHS_ENV, CUDA_GRAPHS_DEFAULT, env_value_enables);
 
 thread_local! {
     /// The thread-scoped switch ([`cuda_graphs_scope`]); `None` defers to the process switch.
@@ -189,10 +193,42 @@ thread_local! {
 /// scoped over its load and each of its generations by [`cuda_graphs_scope`] — wins over the
 /// process switch ([`set_cuda_graphs`] / [`CUDA_GRAPHS_ENV`]).
 pub fn cuda_graphs_enabled() -> bool {
+    cuda_graphs_default_for(crate::device::selected_device_is_cuda())
+}
+
+/// [`cuda_graphs_enabled`] for a load on a CUDA device (`cuda`) or not, without opening one (a
+/// load estimate knows no more): the thread's scoped policy, else what the process asked for
+/// ([`set_cuda_graphs`], else [`CUDA_GRAPHS_ENV`]), else that device's row of the defaults table —
+/// [`CUDA_GRAPHS_DEFAULT`] on CUDA, off on Metal and the CPU, where no graph runner exists — and
+/// off on a CUDA build that can never capture: a `flash-attn` build or
+/// `CANDLE_LLM_CUDA_STREAM=legacy` (both pin the legacy stream). A default left on there would
+/// only price graph memory and name a refusal on every load.
+pub fn cuda_graphs_default_for(cuda: bool) -> bool {
     if let Some(enabled) = REQUEST_POLICY.with(Cell::get) {
         return enabled;
     }
-    SWITCH.enabled()
+    SWITCH.explicit().unwrap_or_else(|| {
+        unset_default(
+            cuda,
+            cfg!(feature = "flash-attn"),
+            crate::device::stream_env_value(),
+        )
+    })
+}
+
+/// The switch's unset state for a `cuda` load in a build with (`flash_attn`) or without
+/// candle-flash-attn, under the raw `CANDLE_LLM_CUDA_STREAM` value `stream_env`: the device's row
+/// of the defaults table unless the load is pinned to the legacy stream, which no capture runs on.
+fn unset_default(cuda: bool, flash_attn: bool, stream_env: Option<&str>) -> bool {
+    let legacy = matches!(
+        crate::device::CudaStreamKind::parse(stream_env),
+        Ok(Some(crate::device::CudaStreamKind::Legacy))
+    );
+    !flash_attn
+        && !legacy
+        && crate::device::decode_backend_for(cuda)
+            .defaults()
+            .cuda_graphs
 }
 
 /// Override the switch for the process: `Some(true)` / `Some(false)` force it, `None` returns to
@@ -1810,20 +1846,63 @@ mod tests {
     }
 
     #[test]
-    fn switch_env_default_is_off_and_runtime_override_round_trips() {
+    fn switch_env_default_is_the_devices_row_and_runtime_override_round_trips() {
         let _guard = cuda_graphs_policy_guard(None);
-        // The environment is not set in the test process: the default is off.
-        if std::env::var_os(CUDA_GRAPHS_ENV).is_none() {
-            assert!(!cuda_graphs_enabled());
+        // The environment is not set in the test process: the default is the selected device's
+        // row of the defaults table (CUDA's on a CUDA build, off on Metal and the CPU).
+        let unset = std::env::var_os(CUDA_GRAPHS_ENV).is_none();
+        let default = crate::device::decode_backend_for(crate::device::selected_device_is_cuda())
+            .defaults()
+            .cuda_graphs;
+        let pinned_legacy = cfg!(feature = "flash-attn")
+            || std::env::var(crate::device::CUDA_STREAM_ENV)
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("legacy"));
+        if unset {
+            assert_eq!(cuda_graphs_enabled(), default && !pinned_legacy);
+            assert_eq!(
+                cuda_graphs_default_for(true),
+                CUDA_GRAPHS_DEFAULT && !pinned_legacy
+            );
+            assert!(!cuda_graphs_default_for(false));
         }
         set_cuda_graphs(Some(true));
         assert!(cuda_graphs_enabled());
         set_cuda_graphs(Some(false));
         assert!(!cuda_graphs_enabled());
         set_cuda_graphs(None);
-        if std::env::var_os(CUDA_GRAPHS_ENV).is_none() {
-            assert!(!cuda_graphs_enabled());
+        if unset {
+            assert_eq!(cuda_graphs_enabled(), default && !pinned_legacy);
         }
+    }
+
+    /// sc-24446: a CUDA build that can never capture — candle-flash-attn, or the stream switch
+    /// pinned to legacy — takes graphs off when nothing asks; any other stream setting leaves the
+    /// CUDA row's default, and a host load is off whatever the stream.
+    #[test]
+    fn the_unset_default_is_off_where_no_capture_can_run() {
+        assert_eq!(unset_default(true, false, None), CUDA_GRAPHS_DEFAULT);
+        assert_eq!(unset_default(true, false, Some("")), CUDA_GRAPHS_DEFAULT);
+        assert_eq!(unset_default(true, false, Some("own")), CUDA_GRAPHS_DEFAULT);
+        assert!(!unset_default(true, true, None), "flash-attn build");
+        assert!(
+            !unset_default(true, false, Some(" LEGACY ")),
+            "legacy stream"
+        );
+        assert!(!unset_default(false, false, Some("own")), "host load");
+    }
+
+    /// sc-24446: a blank `CANDLE_LLM_CUDA_GRAPHS=` is unset (the device's default), as a blank
+    /// `CANDLE_LLM_CUDA_STREAM` is; a set value still parses.
+    #[test]
+    fn a_blank_graph_switch_is_unset() {
+        assert_eq!(SWITCH.parse_setting(Some("")), None);
+        assert_eq!(SWITCH.parse_setting(Some("  ")), None);
+        assert_eq!(SWITCH.parse_setting(Some(" On ")), Some(true));
+        assert_eq!(SWITCH.parse_setting(Some("0")), Some(false));
+        assert_eq!(
+            crate::device::CudaStreamKind::parse(Some("  ")).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1858,19 +1937,20 @@ mod tests {
 
     #[test]
     fn the_policy_guard_restores_the_switch_it_found() {
-        let outer = cuda_graphs_policy_guard(Some(false));
-        assert!(!cuda_graphs_enabled());
-        drop(outer);
-        {
-            let _inner = cuda_graphs_policy_guard(Some(true));
-            assert!(cuda_graphs_enabled());
-        }
-        let _check = cuda_graphs_policy_guard(None);
-        if std::env::var_os(CUDA_GRAPHS_ENV).is_none() {
-            assert!(
-                !cuda_graphs_enabled(),
-                "the guard must restore the previous policy"
-            );
+        for found in [Some(false), Some(true), None] {
+            let _outer = cuda_graphs_policy_guard(found);
+            let before = (SWITCH.explicit(), cuda_graphs_enabled());
+            for inner in [Some(true), Some(false)] {
+                {
+                    let _inner = cuda_graphs_policy_guard(inner);
+                    assert_eq!(cuda_graphs_enabled(), inner.unwrap());
+                }
+                assert_eq!(
+                    (SWITCH.explicit(), cuda_graphs_enabled()),
+                    before,
+                    "the guard must restore the previous policy ({found:?} under {inner:?})"
+                );
+            }
         }
     }
 

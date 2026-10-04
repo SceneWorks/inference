@@ -137,7 +137,13 @@ fn provider_records_the_decode_path_it_ran() {
     use candle_llm::primitives::{AttnFormulation, KvCacheKind};
 
     let guard = write_thinking_snapshot();
-    let spec = LoadSpec::dense(guard.path().to_str().unwrap().to_string());
+    // The eager loop's accounting (one host sync per token): graphs pinned off, since a CUDA
+    // load captures by default (sc-24446) and a capture's bit-exact self-check reads its outputs
+    // back too — `causal_engine_requests_record_the_graph_runner` covers the graph path.
+    let spec = LoadSpec {
+        cuda_graphs: Some(false),
+        ..LoadSpec::dense(guard.path().to_str().unwrap().to_string())
+    };
     let mut p = LlamaProvider::load(&spec).expect("load thinking provider");
     assert!(p.last_decode_record().is_none(), "no request yet");
     // On CUDA the decoder stages device positions by default, so both loops' cached steps run

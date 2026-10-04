@@ -697,6 +697,47 @@ pub const MIN_TIMED_WINDOW_STEPS: u32 = ACCEPTANCE_PROBE_VERIFIES / 2;
 /// left to gain.
 pub const MEASURED_GAIN_MARGIN: f64 = 0.05;
 
+/// A measured gain below which `auto`'s proposer is a **clear** loser, demoted at the first step
+/// its measurement can decide (sc-24446) — once it holds [`CLEAR_LOSS_MIN_TIMED_STEPS`] timed
+/// speculative steps, before the request's first window measured — rather than at the end of a
+/// [`ACCEPTANCE_PROBE_VERIFIES`]-step window. The gain checked is an **optimistic** one: the
+/// timed steps' tokens per step at [`CLEAR_LOSS_CONFIDENCE_Z`] standard errors above their mean,
+/// so a winner's unlucky stretch of acceptance does not read as a loss.
+///
+/// Why (cuda-campaign-b4 @0826a16cf, attached to Shortcut epic 24432): under CUDA graphs Bonsai's
+/// `auto` prompt lookup lost 5.6–18.3 % on every prompt against its `off` twin even though each
+/// request was demoted on a measured gain of 0.66–0.87 — the window's 16 slow verify steps (at
+/// 2.0–3.1 plain steps each) and their shapes' warm-ups are most of that loss. Where the verify
+/// widths keep changing (a lookup's draft count), the first window's steps are mostly shape
+/// warm-ups, so it had too few timed steps to measure and fell back to the static 0.21 the
+/// grounded `rag_answer` passed (mal 1.31) — demoted one window later (step 78) at gain 0.66.
+///
+/// 0.8 is four times [`MEASURED_GAIN_MARGIN`] below break-even, so in-process timing noise
+/// (CUDA p95 2.2 %, MLX p95 10 %) cannot reach it from a winner. A request whose verify step
+/// costs `r` measures a gain of at least `1 / r`, so no proposer with `r < 1.25` can fall below
+/// it — the campaigns' measured winners (Qwen3-8B lookup on Candle, `r` 1.02–1.18, gain
+/// 1.13–1.24; Qwen3.8 MTP, gain 1.16–1.56; Qwen3.6 MTP, gain 1.08–1.72) sit at or above 1.08;
+/// every request between 0.8 and 0.95 is still judged on its whole window.
+///
+/// Acceptance is lumpy, so a point estimate over a short stretch is not enough: a Qwen3.6-like
+/// MTP request (`r` 2.0, mal 1.25 at depth 3) accepts at most 4 drafts in 8 steps about 5 % of
+/// the time, which reads as gain < 0.8, and re-testing a running mean every step from the eighth
+/// demoted such a winner in about half of 150-step requests (seeded simulation, sc-24446
+/// review). Hence the optimistic gain, a longer stretch ([`CLEAR_LOSS_MIN_TIMED_STEPS`]) and a
+/// check that stops once a window has measured (from then on its window decides): the same
+/// simulation demotes well under 1 % of such winners, while a clear loser still goes before its
+/// second window ends.
+pub const CLEAR_LOSS_GAIN: f64 = 0.8;
+
+/// Timed speculative steps the clear-loss check needs before it can decide: three quarters of a
+/// window.
+pub const CLEAR_LOSS_MIN_TIMED_STEPS: u32 = ACCEPTANCE_PROBE_VERIFIES * 3 / 4;
+
+/// Standard errors (of the timed steps' tokens per step, from their sample variance) the
+/// clear-loss check adds to the mean before comparing the gain with [`CLEAR_LOSS_GAIN`]: the
+/// one-sided 95 % normal quantile.
+pub const CLEAR_LOSS_CONFIDENCE_Z: f64 = 1.645;
+
 /// One engine step as the monitor sees it (sc-24446).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepObservation {
@@ -738,11 +779,12 @@ impl DemotionBasis {
 pub struct MonitorDecision {
     /// The window's 1-based index among the request's speculative windows.
     pub window: u32,
-    /// Verify steps in the window.
+    /// Verify steps in the window — for a clear-loss decision ([`CLEAR_LOSS_GAIN`]), in the
+    /// stretch it judged (since the speculative phase began).
     pub verifies: u32,
-    /// Drafts accepted in the window.
+    /// Drafts accepted over those verify steps.
     pub accepted: u64,
-    /// The window's timed steps (past their shape's warm-up, with a non-zero mark).
+    /// The timed steps among them (past their shape's warm-up, with a non-zero mark).
     pub timed_steps: u32,
     /// Tokens those steps committed (`1 + accepted` each).
     pub timed_tokens: u64,
@@ -792,8 +834,11 @@ impl MonitorDecision {
 /// runs a short plain probe ([`probing`](Self::probing), [`PLAIN_PROBE_MAX_STEPS`] steps) and
 /// then decides each window on its **measured gain** against the request's own plain-step cost
 /// (see the cost-aware notes above [`SHAPE_WARMUP_STEPS`]); where timing cannot decide, and for
-/// an untimed monitor, a window below the proposer's static [`demotion_threshold`] demotes. The
-/// first demoting window ends the proposer for the request — no more proposals, no more draft
+/// an untimed monitor, a window below the proposer's static [`demotion_threshold`] demotes. A
+/// clear loser — measured gain below [`CLEAR_LOSS_GAIN`] over the timed steps since the last
+/// measured window — is demoted at the first step that measurement holds
+/// [`MIN_TIMED_WINDOW_STEPS`] timed steps, without waiting for its window to close. The
+/// first demoting decision ends the proposer for the request — no more proposals, no more draft
 /// rows, the rest decoded token-at-a-time (on MLX through the pipelined loop) — and the report
 /// records where ([`DecodeReport::speculative_demoted_at`](crate::DecodeReport::speculative_demoted_at))
 /// and on what ([`last_decision`](Self::last_decision)). The demotion is irreversible for the
@@ -838,6 +883,19 @@ pub struct AcceptanceMonitor {
     timed_steps: u32,
     timed_tokens: u64,
     timed_ns: u64,
+    /// Since the request's speculative phase began — a window with too few timed steps to
+    /// measure carries its own forward — the verify steps and the drafts they accepted, and the
+    /// timed steps among them with the tokens they committed (and the squares, for their
+    /// variance) and their wall time: what [`CLEAR_LOSS_GAIN`] is checked against after every
+    /// step until a window measures.
+    clear_verifies: u32,
+    clear_accepted: u64,
+    clear_steps: u32,
+    clear_tokens: u64,
+    clear_tokens_sq: u64,
+    clear_ns: u64,
+    /// Whether a window has decided on its measured gain (the clear-loss check stops there).
+    measured: bool,
     demoted: bool,
     last: Option<MonitorDecision>,
 }
@@ -893,6 +951,13 @@ impl AcceptanceMonitor {
             timed_steps: 0,
             timed_tokens: 0,
             timed_ns: 0,
+            clear_verifies: 0,
+            clear_accepted: 0,
+            clear_steps: 0,
+            clear_tokens: 0,
+            clear_tokens_sq: 0,
+            clear_ns: 0,
+            measured: false,
             demoted: false,
             last: None,
         }
@@ -930,7 +995,8 @@ impl AcceptanceMonitor {
     }
 
     /// Observe one engine step. Returns `true` exactly once — on the step that closes the first
-    /// demoting window — when the engine must demote; `false` otherwise, including every probe
+    /// demoting window, or the earlier step at which a clear loser's measured gain falls below
+    /// [`CLEAR_LOSS_GAIN`] — when the engine must demote; `false` otherwise, including every probe
     /// step and every step after the demotion.
     pub fn observe_step(&mut self, step: StepObservation) -> bool {
         if self.demoted {
@@ -961,15 +1027,28 @@ impl AcceptanceMonitor {
         }
         self.verifies += 1;
         self.accepted += step.accepted as u64;
+        self.clear_verifies += 1;
+        self.clear_accepted += step.accepted as u64;
         if let Some(ns) = elapsed_ns {
+            let tokens = 1 + step.accepted as u64;
             self.timed_steps += 1;
-            self.timed_tokens += 1 + step.accepted as u64;
+            self.timed_tokens += tokens;
             self.timed_ns = self.timed_ns.saturating_add(ns);
+            self.clear_steps += 1;
+            self.clear_tokens += tokens;
+            self.clear_tokens_sq += tokens * tokens;
+            self.clear_ns = self.clear_ns.saturating_add(ns);
         }
-        if self.verifies < ACCEPTANCE_PROBE_VERIFIES {
+        let decision = if let Some(clear) = self.clear_loss() {
+            clear
+        } else if self.verifies < ACCEPTANCE_PROBE_VERIFIES {
             return false;
+        } else {
+            self.decide()
+        };
+        if decision.basis == DemotionBasis::Measured {
+            self.measured = true;
         }
-        let decision = self.decide();
         self.last = Some(decision);
         self.demoted = decision.demoted;
         self.verifies = 0;
@@ -980,14 +1059,60 @@ impl AcceptanceMonitor {
         self.demoted
     }
 
-    /// Judge the window just closed (see the cost-aware notes above [`SHAPE_WARMUP_STEPS`]).
-    fn decide(&mut self) -> MonitorDecision {
-        self.windows += 1;
-        let plain_step_ns = (self.plain_ns.len() >= PLAIN_PROBE_STEPS as usize).then(|| {
+    /// The request's plain-step cost: the median timed single-token step, once it holds
+    /// [`PLAIN_PROBE_STEPS`] samples.
+    fn plain_step_ns(&self) -> Option<u64> {
+        (self.plain_ns.len() >= PLAIN_PROBE_STEPS as usize).then(|| {
             let mut sorted = self.plain_ns.clone();
             sorted.sort_unstable();
             sorted[sorted.len() / 2]
-        });
+        })
+    }
+
+    /// The demoting decision for a **clear** loser ([`CLEAR_LOSS_GAIN`]): `Some` as soon as no
+    /// window has measured yet, the timed steps since the speculative phase began number
+    /// [`CLEAR_LOSS_MIN_TIMED_STEPS`] and even their optimistic gain
+    /// ([`CLEAR_LOSS_CONFIDENCE_Z`]) is below it — mid-window; the decision reports those steps:
+    /// their verify and acceptance counts with the timed steps among them. `None` otherwise (the
+    /// window decides at its end as usual).
+    fn clear_loss(&mut self) -> Option<MonitorDecision> {
+        if self.measured || self.clear_steps < CLEAR_LOSS_MIN_TIMED_STEPS {
+            return None;
+        }
+        let plain_step_ns = self.plain_step_ns()?;
+        let decision = MonitorDecision {
+            window: self.windows + 1,
+            verifies: self.clear_verifies,
+            accepted: self.clear_accepted,
+            timed_steps: self.clear_steps,
+            timed_tokens: self.clear_tokens,
+            timed_ns: self.clear_ns,
+            plain_step_ns: Some(plain_step_ns),
+            basis: DemotionBasis::Measured,
+            demoted: true,
+        };
+        let gain = decision.gain()?;
+        let optimistic = gain * self.optimistic_tokens_factor();
+        if optimistic.is_nan() || optimistic >= CLEAR_LOSS_GAIN {
+            return None;
+        }
+        self.windows += 1;
+        Some(decision)
+    }
+
+    /// The clear-loss check's optimism: the timed steps' mean tokens per step plus
+    /// [`CLEAR_LOSS_CONFIDENCE_Z`] standard errors (their sample variance), over the mean.
+    fn optimistic_tokens_factor(&self) -> f64 {
+        let n = f64::from(self.clear_steps);
+        let mean = self.clear_tokens as f64 / n;
+        let variance = ((self.clear_tokens_sq as f64 / n - mean * mean) * n / (n - 1.0)).max(0.0);
+        (mean + CLEAR_LOSS_CONFIDENCE_Z * (variance / n).sqrt()) / mean
+    }
+
+    /// Judge the window just closed (see the cost-aware notes above [`SHAPE_WARMUP_STEPS`]).
+    fn decide(&mut self) -> MonitorDecision {
+        self.windows += 1;
+        let plain_step_ns = self.plain_step_ns();
         let mut decision = MonitorDecision {
             window: self.windows,
             verifies: self.verifies,
@@ -1822,8 +1947,9 @@ mod tests {
     }
 
     /// The decision the coordinator's evidence asks for: a Bonsai-like request (verify r = 2.4,
-    /// mal 0.75 — above Candle's static 0.5 at depth 3) is demoted on its measured gain at the
-    /// end of its first window; a Qwen3.8-like one (r = 1.5, mal 1.25) keeps its proposer for
+    /// mal 0.75 — above Candle's static 0.5 at depth 3; gain 0.73) is demoted on its measured
+    /// gain at the end of its first window — its acceptance (3 drafts every fourth step) is too
+    /// lumpy for the clear-loss check's optimistic gain to call earlier; a Qwen3.8-like one (r = 1.5, mal 1.25) keeps its proposer for
     /// every window — on Candle and on MLX's unpipelined path alike.
     #[test]
     fn a_dear_verify_demotes_and_a_cheap_one_keeps_at_the_same_scale_of_acceptance() {
@@ -1844,24 +1970,22 @@ mod tests {
                     }
                 },
             );
+            // The first three depth-3 steps are the shape's warm-up, then thirteen timed steps.
             assert_eq!(at, Some(window - 1), "{plain:?}");
             let d = bonsai.last_decision().unwrap();
             assert_eq!(
                 (d.basis, d.demoted, d.window),
                 (DemotionBasis::Measured, true, 1)
             );
-            assert!((d.mean_accepted_length() - 0.75).abs() < 1e-12);
+            // Every fourth of the sixteen accepted 3.
+            assert_eq!((d.verifies, d.accepted), (window as u32, 12));
             assert_eq!(d.plain_step_ns, Some(10 * MS));
-            // The first three depth-3 steps are the shape's warm-up: 13 timed steps.
-            assert_eq!(
-                d.timed_steps,
-                ACCEPTANCE_PROBE_VERIFIES - SHAPE_WARMUP_STEPS
-            );
+            assert_eq!(d.timed_steps, window as u32 - SHAPE_WARMUP_STEPS);
             assert!((d.verify_cost_ratio().unwrap() - 2.4).abs() < 1e-9);
             assert!(d.gain().unwrap() < 1.0 - MEASURED_GAIN_MARGIN);
             // The static threshold alone would have kept it.
             if plain == PlainDecode::Candle {
-                assert!(d.mean_accepted_length() >= bonsai.threshold().unwrap());
+                assert!(0.75 >= bonsai.threshold().unwrap());
             }
             // Qwen3.8-like: mal 1.25 at r = 1.5 — gain 1.5, kept to the end.
             let (at, qwen) = drive(
@@ -2034,6 +2158,331 @@ mod tests {
         }
         // 4 probe samples at 2 ms, 16 window samples at 4 ms: the median is 4 ms.
         assert_eq!(m.last_decision().unwrap().plain_step_ns, Some(4 * MS));
+    }
+
+    /// sc-24446 (cuda-campaign-b4): a clear loser is demoted by the end of the probe and its first
+    /// window on every plain loop — at the first step its measurement holds
+    /// [`CLEAR_LOSS_MIN_TIMED_STEPS`] timed steps when even its optimistic gain is a clear loss,
+    /// else on its window's measured gain; one between [`CLEAR_LOSS_GAIN`] and break-even is
+    /// judged on its whole window. Bonsai-like lookup under CUDA graphs: verify `r` 2.0–3.1, mal
+    /// 0.44–1.5.
+    #[test]
+    fn a_clear_loser_is_demoted_within_its_first_window() {
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        let first = (SHAPE_WARMUP_STEPS + CLEAR_LOSS_MIN_TIMED_STEPS) as usize;
+        assert!(
+            first <= window,
+            "the clear-loss check can decide inside the first window"
+        );
+        for plain in [
+            PlainDecode::Candle,
+            PlainDecode::MlxUnpipelined,
+            PlainDecode::MlxPipelined,
+        ] {
+            for (proposer, depth, ratio, accepted, demoted_at) in [
+                // code_edit: mal 0.44 at r 2.25 — gain 0.64 (optimistic 0.71): clear.
+                (
+                    ProposerKind::PromptLookup,
+                    4,
+                    2.25,
+                    [1, 0, 0, 1, 0, 1, 0, 0],
+                    first - 1,
+                ),
+                // chat: mal 1.375 at r 3.1 — gain 0.77 (optimistic 0.84): its window decides.
+                (
+                    ProposerKind::PromptLookup,
+                    4,
+                    3.1,
+                    [2, 1, 1, 2, 1, 2, 1, 1],
+                    window - 1,
+                ),
+                // A companion MTP head: mal 0.75 at r 2.6 — gain 0.67, but 3 drafts every fourth
+                // step is too lumpy to call early (optimistic 0.92): its window decides.
+                (
+                    ProposerKind::Mtp,
+                    3,
+                    2.6,
+                    [3, 0, 0, 0, 3, 0, 0, 0],
+                    window - 1,
+                ),
+            ] {
+                let label = format!("{plain:?} {proposer:?} r {ratio}");
+                let (at, m) = drive(
+                    timed(proposer, depth, plain),
+                    50 * MS,
+                    ratio,
+                    depth as usize,
+                    4 * window,
+                    |i| accepted[i % 8],
+                );
+                assert_eq!(at, Some(demoted_at), "{label}");
+                let d = m.last_decision().unwrap();
+                assert_eq!(
+                    (d.basis, d.demoted, d.window),
+                    (DemotionBasis::Measured, true, 1),
+                    "{label}"
+                );
+                assert!(d.gain().unwrap() < CLEAR_LOSS_GAIN, "{label}: {d:?}");
+            }
+            // gain 0.83 (mal 1.0 at r 2.4): a loser, but not a clear one — its window decides.
+            let (at, m) = drive(
+                timed(ProposerKind::PromptLookup, 4, plain),
+                50 * MS,
+                2.4,
+                4,
+                4 * window,
+                |_| 1,
+            );
+            assert_eq!(at, Some(window - 1), "{plain:?}");
+            assert_eq!(
+                m.last_decision().unwrap().verifies,
+                ACCEPTANCE_PROBE_VERIFIES
+            );
+        }
+    }
+
+    /// sc-24446 (cuda-campaign-b4 `rag_answer`): a lookup whose draft count keeps changing shape
+    /// spends its first window mostly on shape warm-ups — too few timed steps to measure, so the
+    /// window falls back to its static threshold (mal 1.0 passes Candle's 0.21) — but its timed
+    /// steps carry forward, and it is demoted as soon as they number
+    /// [`CLEAR_LOSS_MIN_TIMED_STEPS`] (gain 2 / 3 = 0.67), not at the end of its second window.
+    /// The decision reports the stretch it judged: every verify since the speculative phase
+    /// began, and the timed steps among them.
+    #[test]
+    fn a_clear_losers_timed_steps_carry_past_an_unmeasured_window() {
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        let mut m = timed(ProposerKind::PromptLookup, 4, PlainDecode::Candle);
+        while m.probing() {
+            m.observe_step(plain_step(Some(10 * MS)));
+        }
+        // Widths 2..=5 in turn, each step 3 plain steps, one draft accepted.
+        let at = (0..4 * window).find(|&i| {
+            m.observe_step(StepObservation {
+                accepted: 1,
+                drafts: 1 + i % 4,
+                elapsed: Some(Duration::from_millis(30)),
+            })
+        });
+        // Four widths in turn, three warm-ups each: steps 12..16 are the first window's only
+        // timed steps (static: kept), and the twelfth timed step is step 23 — the second window's
+        // eighth, where the window-end decision waits for step 31.
+        assert_eq!(at, Some(23));
+        let d = m.last_decision().unwrap();
+        assert_eq!(
+            (d.basis, d.demoted, d.window, d.timed_steps),
+            (DemotionBasis::Measured, true, 2, CLEAR_LOSS_MIN_TIMED_STEPS)
+        );
+        // Steps 0..=23, one draft accepted each.
+        assert_eq!((d.verifies, d.accepted), (24, 24));
+        assert!((d.gain().unwrap() - 2.0 / 3.0).abs() < 1e-9, "{d:?}");
+    }
+
+    /// sc-24446 review: once a window has decided on its measured gain, the clear-loss check
+    /// stops and every later window decides at its end — a request that passed its first window
+    /// (gain 2 / 2.1 = 0.95) and then accepts nothing is demoted by its second window's end, not
+    /// by a mid-window check over every timed step so far.
+    #[test]
+    fn the_clear_loss_check_stops_once_a_window_has_measured() {
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        let (at, m) = drive(
+            timed(ProposerKind::Mtp, 3, PlainDecode::Candle),
+            10 * MS,
+            2.1,
+            3,
+            4 * window,
+            |i| usize::from(i < window),
+        );
+        assert_eq!(at, Some(2 * window - 1));
+        let d = m.last_decision().unwrap();
+        assert_eq!(
+            (d.basis, d.demoted, d.window, d.verifies, d.accepted),
+            (
+                DemotionBasis::Measured,
+                true,
+                2,
+                ACCEPTANCE_PROBE_VERIFIES,
+                0
+            )
+        );
+    }
+
+    /// sc-24446: the campaigns' measured winners are never demoted — not by the clear-loss check
+    /// on any eight-step stretch, nor by a window — over a long request with lumpy acceptance:
+    /// Qwen3-8B summary lookup on Candle (`r` 1.18, gain ≈ 1.22), Qwen3.8 MTP at depth 3 (`r` 1.71,
+    /// the dearest measured, gain ≈ 1.17) and Qwen3.6 MTP (`r` 2.0, gain ≈ 1.13).
+    #[test]
+    fn measured_winners_are_never_demoted() {
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        type Pattern = [usize; 16];
+        type Case<'a> = (&'a str, ProposerKind, u32, f64, Pattern, &'a [PlainDecode]);
+        let cases: [Case<'_>; 3] = [
+            (
+                "qwen3-8b summary lookup",
+                ProposerKind::PromptLookup,
+                4,
+                1.18,
+                // mal 0.44: a 4-token run, then long stretches of nothing.
+                [4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0],
+                &[PlainDecode::Candle],
+            ),
+            (
+                "qwen3.8 mtp",
+                ProposerKind::Mtp,
+                3,
+                1.71,
+                // mal 1.0.
+                [3, 0, 0, 1, 3, 0, 0, 1, 3, 0, 0, 1, 3, 0, 0, 1],
+                &[PlainDecode::Candle, PlainDecode::MlxUnpipelined],
+            ),
+            (
+                "qwen3.6 mtp",
+                ProposerKind::Mtp,
+                3,
+                2.0,
+                // mal 1.25.
+                [3, 0, 2, 0, 3, 0, 2, 0, 3, 0, 2, 0, 3, 0, 2, 0],
+                &[PlainDecode::MlxUnpipelined, PlainDecode::MlxPipelined],
+            ),
+        ];
+        for (label, proposer, depth, ratio, pattern, plains) in cases {
+            for &plain in plains {
+                let (at, m) = drive(
+                    timed(proposer, depth, plain),
+                    10 * MS,
+                    ratio,
+                    depth as usize,
+                    16 * window,
+                    |i| pattern[i % 16],
+                );
+                assert_eq!(at, None, "{label} {plain:?}");
+                let d = m.last_decision().unwrap();
+                assert_eq!(
+                    (d.basis, d.demoted, d.window),
+                    (DemotionBasis::Measured, false, 16),
+                    "{label} {plain:?}"
+                );
+                assert!(d.gain().unwrap() > 1.05, "{label} {plain:?}: {d:?}");
+            }
+        }
+    }
+
+    /// One seeded timed `auto` request for the clear-loss property tests: acceptance from a
+    /// two-state (good / bad) Markov chain switching with probability 0.3 per step — each draft
+    /// of a step accepted in turn with the state's probability, up to the step's drafts — and
+    /// every step's time (probe and verify) jittered uniformly by ±8.7 % (σ 5 %, about the MLX
+    /// in-process p90). `varying` cycles the draft count 1..=4 (a lookup, whose shapes keep
+    /// warming up); otherwise every step drafts `depth`. Returns the 0-based speculative step
+    /// that demoted, and whether a clear-loss decision did it (not a window's end).
+    fn seeded_request(
+        seed: u64,
+        proposer: ProposerKind,
+        depth: usize,
+        ratio: f64,
+        (good, bad): (f32, f32),
+        varying: bool,
+        steps: usize,
+    ) -> Option<(usize, bool)> {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let plain_ns = 10.0 * MS as f64;
+        let jittered = |rng: &mut Rng, cost: f64| {
+            let u = f64::from(rng.next()) * 2.0 - 1.0;
+            Duration::from_nanos((plain_ns * cost * (1.0 + 0.087 * u)) as u64)
+        };
+        let mut m = timed(proposer, depth as u32, PlainDecode::Candle);
+        while m.probing() {
+            let elapsed = jittered(&mut rng, 1.0);
+            m.observe_step(StepObservation {
+                accepted: 0,
+                drafts: 0,
+                elapsed: Some(elapsed),
+            });
+        }
+        let mut in_good = rng.next() < 0.5;
+        for i in 0..steps {
+            if rng.next() < 0.3 {
+                in_good = !in_good;
+            }
+            let p = if in_good { good } else { bad };
+            let drafts = if varying { 1 + i % 4 } else { depth };
+            let mut accepted = 0;
+            while accepted < drafts && rng.next() < p {
+                accepted += 1;
+            }
+            let elapsed = jittered(&mut rng, ratio);
+            if m.observe_step(StepObservation {
+                accepted,
+                drafts,
+                elapsed: Some(elapsed),
+            }) {
+                let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+                let at_window_end = m.last_decision().is_some_and(|d| {
+                    d.verifies == ACCEPTANCE_PROBE_VERIFIES && (i + 1) % window == 0
+                });
+                return Some((i, !at_window_end));
+            }
+        }
+        None
+    }
+
+    /// sc-24446 review: the clear-loss check does not demote the campaigns' measured winners on
+    /// a bursty stretch of acceptance under timing jitter — Qwen3.6-like MTP (`r` 2.0, mal 1.25
+    /// at depth 3), Qwen3.8 MTP (`r` 1.71, mal 1.0) and Qwen3-8B lookup (`r` 1.18, mal 0.44) —
+    /// over 400 seeded 160-step requests each: at most 1 % (a running point estimate from the
+    /// eighth timed step demoted about half of the Qwen3.6-like ones). Bonsai-like clear losers
+    /// whose shapes keep warming up (a lookup at `r` 2.25 / mal 0.44 and `r` 3.0 / mal 1.0) are
+    /// still all demoted by the end of their second window, and the clear-loss check takes most
+    /// of them before it.
+    #[test]
+    fn seeded_bursty_winners_keep_their_proposer_and_clear_losers_go_early() {
+        const REQUESTS: u64 = 400;
+        // (label, proposer, depth, r, (good, bad) per-draft acceptance): mal from the chain.
+        let winners = [
+            ("qwen3.6 mtp", ProposerKind::Mtp, 3, 2.0, (0.772, 0.42)),
+            ("qwen3.8 mtp", ProposerKind::Mtp, 3, 1.71, (0.694, 0.338)),
+            (
+                "qwen3-8b lookup",
+                ProposerKind::PromptLookup,
+                4,
+                1.18,
+                (0.457, 0.069),
+            ),
+        ];
+        for (label, proposer, depth, ratio, chain) in winners {
+            let clear = (0..REQUESTS)
+                .filter(|&seed| {
+                    seeded_request(seed, proposer, depth, ratio, chain, false, 160)
+                        .is_some_and(|(_, clear)| clear)
+                })
+                .count() as u64;
+            assert!(
+                clear * 100 <= REQUESTS,
+                "{label}: {clear} of {REQUESTS} demoted by clear loss"
+            );
+        }
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        let losers = [
+            ("code_edit lookup", 2.25, (0.457, 0.069)),
+            ("rag_answer lookup", 3.0, (0.669, 0.279)),
+        ];
+        for (label, ratio, chain) in losers {
+            let mut at: Vec<usize> = (0..REQUESTS)
+                .map(|seed| {
+                    seeded_request(seed, ProposerKind::PromptLookup, 4, ratio, chain, true, 160)
+                        .unwrap_or_else(|| panic!("{label} seed {seed}: never demoted"))
+                        .0
+                })
+                .collect();
+            at.sort_unstable();
+            assert!(
+                at[at.len() - 1] < 2 * window,
+                "{label}: by the second window's end"
+            );
+            assert!(
+                at[at.len() / 2] < 2 * window - 1,
+                "{label}: the median request goes before its second window ends (median {})",
+                at[at.len() / 2]
+            );
+        }
     }
 
     #[test]
