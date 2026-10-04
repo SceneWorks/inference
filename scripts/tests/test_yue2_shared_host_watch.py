@@ -164,6 +164,29 @@ class SharedHostWatchTests(unittest.TestCase):
             snapshots.assert_called_once()
             self.assertTrue(cancel.call_args.kwargs["identity_drift"])
 
+    def test_inventory_retry_auth_transport_loss_cancels_only_cached_owned_run(self):
+        data = own_snapshot()
+        direct = {**data["runs"][("SceneWorks/inference", 7)],
+                  "repository": {"full_name": "SceneWorks/inference"},
+                  "created_at": "2026-10-04T20:00:00Z"}
+        job = {**data["jobs"][("SceneWorks/inference", 7)][0],
+               "started_at": "2026-10-04T20:01:00Z"}
+        bound = {"run": direct, "job": job, "job_id": 70, "start": job["started_at"]}
+        incomplete = watch.InventorySnapshotError("truncated paginated inventory", "queued", [])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "watch"
+            with patch.object(watch, "bind_owned_job", side_effect=[
+                    bound, subprocess.TimeoutExpired(["gh", "api"], 45)]), \
+                 patch.object(watch, "owned_run", return_value=direct), \
+                 patch.object(watch, "snapshot", side_effect=incomplete), \
+                 patch.object(watch, "cancel_bound_run") as cancel:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    watch.watch(7, SHA, "yue2-precision-proof.yml", output,
+                                60, 30, 70, "cuda-windows", 2313, mode="shared-gpu1")
+            cancel.assert_called_once_with(7, SHA, "yue2-precision-proof.yml", bound,
+                                           identity_drift=False)
+            self.assertIn("inventory-attempt-0001-1.json", {p.name for p in output.iterdir()})
+
     def test_shared_gpu1_observes_foreign_jobs_without_revoking_owned_run(self):
         data = own_snapshot()
         data["runners"]["org"][1]["busy"] = True

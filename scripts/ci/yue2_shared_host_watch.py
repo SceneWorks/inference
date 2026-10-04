@@ -401,9 +401,12 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
                     try:
                         fresh = bind_owned_job(own_id, head, workflow, job_id, runner_name,
                                                runner_id, own_job_name=own_job_name)
-                    except Exception as identity_error:
+                    except RuntimeError as identity_error:
+                        # bind_owned_job uses RuntimeError for a positive run/job identity
+                        # mismatch. API transport and decoding failures are not drift: the
+                        # previously authenticated binding still permits owned-only cancel.
                         raise RuntimeError(
-                            "owned identity drifted or unavailable during inventory retry"
+                            "owned identity drifted during inventory retry"
                         ) from identity_error
                     require(fresh["run"].get("created_at") == binding["run"].get("created_at") and
                             fresh["job"].get("id") == binding["job_id"] and
