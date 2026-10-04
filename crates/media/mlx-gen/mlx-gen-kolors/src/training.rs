@@ -123,7 +123,7 @@ impl SdxlFamilyHooks for KolorsHooks {
 
     /// Kolors micro-conditioning `time_ids = (H, W, 0, 0, H, W)` at the real (bucketed) `edge`.
     fn time_ids(&self, batch: i32, edge: u32) -> Array {
-        kolors_time_ids(batch, edge as i32, edge as i32)
+        kolors_train_time_ids(batch, edge)
     }
 
     /// Sample a **uniform integer** DDPM timestep over `[0, num_train_timesteps)` — diffusers'
@@ -195,7 +195,13 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-2127 (epic 2123): honors `resolution_buckets` — the shared SDXL-family backbone caches
+        // one latent (+ its edge's real-resolution `time_ids`) per bucket and walks them through a
+        // `BucketSchedule`.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -291,6 +297,13 @@ impl Trainer for KolorsTrainer {
     }
 }
 
+/// The training micro-conditioning `time_ids` for a square bucket `edge`: the inference
+/// [`kolors_time_ids`] `(H, W, 0, 0, H, W)` at `H = W = edge`. The shared backbone builds one per
+/// resolution bucket (sc-2127), so each cached latent trains under its own size's ids.
+fn kolors_train_time_ids(batch: i32, edge: u32) -> Array {
+    kolors_time_ids(batch, edge as i32, edge as i32)
+}
+
 /// Discrete DDPM `add_noise` at integer timestep `t`: `√ᾱ_t·x0 + √(1−ᾱ_t)·noise` (diffusers
 /// `DDPMScheduler.add_noise`, the noising the torch Kolors LoRA script uses). The `√ᾱ_t` / `√(1−ᾱ_t)`
 /// coefficients are host f32 off the MLX-built `alphas_cumprod`, matching the reference's
@@ -335,6 +348,32 @@ mod preflight_tests {
     fn projection_monotonic_and_bf16_below_f32() {
         assert!(projected_dense_peak_gb(4096.0, false) < projected_dense_peak_gb(16384.0, false));
         assert!(projected_dense_peak_gb(16384.0, true) < projected_dense_peak_gb(16384.0, false));
+    }
+
+    /// sc-2127 / epic 2123 E7: with buckets `[512, 1024]` the pre-flight guard projects the 1024
+    /// bucket's peak — equal to a 1024-only run and above a 512-only run.
+    #[test]
+    fn guard_projection_sizes_for_the_largest_bucket() {
+        use mlx_gen_sdxl::training::family::dense_peak_for_edges;
+        for bf16 in [false, true] {
+            let mixed = dense_peak_for_edges(projected_dense_peak_gb, &[512, 1024], bf16);
+            let at_1024 = dense_peak_for_edges(projected_dense_peak_gb, &[1024], bf16);
+            let at_512 = dense_peak_for_edges(projected_dense_peak_gb, &[512], bf16);
+            assert_eq!(mixed, at_1024);
+            assert!(mixed.1 > at_512.1);
+        }
+    }
+
+    /// sc-2127: the Kolors trainer declares multi-resolution bucket support, and its
+    /// micro-conditioning `time_ids` follow the bucket edge (`(H, W, 0, 0, H, W)` at that edge).
+    #[test]
+    fn descriptor_declares_resolution_buckets_and_time_ids_follow_the_edge() {
+        assert!(super::trainer_descriptor().techniques.resolution_buckets);
+        for edge in [512u32, 768, 1024] {
+            let ids = super::kolors_train_time_ids(1, edge);
+            let e = edge as f32;
+            assert_eq!(ids.as_slice::<f32>(), &[e, e, 0.0, 0.0, e, e]);
+        }
     }
 }
 

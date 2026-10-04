@@ -277,8 +277,9 @@ pub use ::core_llm;
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{
-    LrSchedule, NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
-    TrainingOutput, TrainingProgress, TrainingRequest, TrainingTechniques,
+    BucketSchedule, LrSchedule, NetworkType, ResolutionBucket, Trainer, TrainerDescriptor,
+    TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingTechniques, MAX_RESOLUTION_BUCKETS,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,

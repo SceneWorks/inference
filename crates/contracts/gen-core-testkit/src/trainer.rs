@@ -24,7 +24,8 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use gen_core::{
-    Error, NetworkType, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
+    Error, NetworkType, ResolutionBucket, Trainer, TrainingConfig, TrainingItem, TrainingProgress,
+    TrainingRequest,
 };
 
 /// Parameters for a conformance run. Keep `config.steps` and the dataset tiny — the suite trains a
@@ -171,6 +172,7 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
     // refused for a full base fine-tune (E5). The shared `validate_training_techniques` floor
     // enforces all three; assert the trainer routes through it.
     check_weight_noise_validate(t, &ok)?;
+    check_resolution_buckets_validate(t, &ok)?;
 
     // Negative (sc-24161): instruction-edit datasets. A trainer that does NOT advertise
     // `max_reference_images` must refuse an edit dataset — never silently train a text-to-image
@@ -252,22 +254,107 @@ fn check_weight_noise_validate(t: &dyn Trainer, ok: &TrainingRequest) -> Result<
     Ok(())
 }
 
+/// The "technique on" resolution-bucket probe (sc-2127): the profile's own resolution at two
+/// repeats plus twice that resolution at one — a real two-bucket mix that stays as cheap as the
+/// profile allows.
+fn probe_buckets(config: &TrainingConfig) -> Vec<ResolutionBucket> {
+    let base = config.resolution.max(32);
+    vec![
+        ResolutionBucket {
+            resolution: base,
+            repeats: 2,
+        },
+        ResolutionBucket {
+            resolution: base * 2,
+            repeats: 1,
+        },
+    ]
+}
+
+/// Resolution-bucket half of [`check_trainer_validate`] (sc-2127) — `ok` is the accepted base
+/// request. Undeclared ⇒ typed `Unsupported`; declared ⇒ accepted; a zero repeat count is refused
+/// either way (the floor's malformed-list check).
+fn check_resolution_buckets_validate(t: &dyn Trainer, ok: &TrainingRequest) -> Result<(), String> {
+    let desc = t.descriptor();
+    let id = desc.id;
+    let mut bucketed = ok.clone();
+    bucketed.config.resolution_buckets = probe_buckets(&ok.config);
+    match (t.validate(&bucketed), desc.techniques.resolution_buckets) {
+        (Ok(()), false) => {
+            return Err(format!(
+                "technique-honesty[{id}]: a resolution_buckets request was accepted by validate() \
+                 despite techniques.resolution_buckets == false — it must be refused, not silently \
+                 trained at one resolution (epic 2123 E3)"
+            ))
+        }
+        (Err(Error::Unsupported(_)), false) | (Ok(()), true) => {}
+        (Err(other), false) => {
+            return Err(format!(
+                "technique-honesty[{id}]: an unsupported resolution_buckets request must be \
+                 refused with a typed Error::Unsupported, got {other:?}"
+            ))
+        }
+        (Err(e), true) => {
+            return Err(format!(
+                "technique-honesty[{id}]: a resolution_buckets request was rejected by validate() \
+                 despite techniques.resolution_buckets == true: {e}"
+            ))
+        }
+    }
+    let mut zero = bucketed;
+    zero.config.resolution_buckets[0].repeats = 0;
+    if t.validate(&zero).is_ok() {
+        return Err(format!(
+            "technique-honesty[{id}]: a resolution bucket with repeats == 0 was accepted by \
+             validate()"
+        ));
+    }
+    Ok(())
+}
+
 /// **Technique refusal at the `train` entry point** (epic 2123 E3, sc-24826). A caller that skips
 /// `validate` and calls `train` directly with a technique the trainer does not declare must get a
 /// typed `Err(Error::Unsupported)` **before training starts** — no `Caching`/`Training`/`Saving`
-/// event, so nothing is loaded, cached or written. A trainer that declares every probed technique
-/// passes vacuously (its positive path is covered by [`check_trainer_progress`]).
+/// event, so nothing is loaded, cached or written. Every undeclared technique is probed on its own
+/// fresh trainer; a trainer that declares every probed technique passes vacuously (its positive
+/// path is covered by [`check_trainer_progress`] / [`check_trainer_bucketed_progress`]).
 pub fn check_trainer_technique_refusal(
     make: &dyn Fn() -> Box<dyn Trainer>,
     profile: &TrainerProfile,
 ) -> Result<(), String> {
+    let techniques = make().descriptor().techniques;
+    if !techniques.weight_noise {
+        let mut req = base_request(profile);
+        req.config.weight_noise_sigma = WEIGHT_NOISE_PROBE_SIGMA;
+        refuse_at_train(
+            make,
+            req,
+            "weight_noise_sigma > 0",
+            "techniques.weight_noise",
+        )?;
+    }
+    if !techniques.resolution_buckets {
+        let mut req = base_request(profile);
+        req.config.resolution_buckets = probe_buckets(&req.config);
+        refuse_at_train(
+            make,
+            req,
+            "resolution_buckets set",
+            "techniques.resolution_buckets",
+        )?;
+    }
+    Ok(())
+}
+
+/// One undeclared-technique probe of [`check_trainer_technique_refusal`].
+fn refuse_at_train(
+    make: &dyn Fn() -> Box<dyn Trainer>,
+    req: TrainingRequest,
+    knob: &str,
+    flag: &str,
+) -> Result<(), String> {
     let mut t = make();
     let id = t.descriptor().id;
-    if t.descriptor().techniques.weight_noise {
-        return Ok(());
-    }
-    let mut req = base_request(profile);
-    req.config.weight_noise_sigma = WEIGHT_NOISE_PROBE_SIGMA;
     let mut started = false;
     let result = t.train(&req, &mut |p| {
         if matches!(
@@ -282,19 +369,55 @@ pub fn check_trainer_technique_refusal(
     match result {
         Err(Error::Unsupported(_)) if !started => Ok(()),
         Err(Error::Unsupported(_)) => Err(format!(
-            "technique-refusal[{id}]: train() refused weight noise only after training had started \
+            "technique-refusal[{id}]: train() refused {knob} only after training had started \
              (caching/training/saving progress was emitted) — refuse before any work (E3)"
         )),
         Ok(out) => Err(format!(
-            "technique-refusal[{id}]: train() ran {} steps with weight_noise_sigma > 0 despite \
-             techniques.weight_noise == false — the knob was silently ignored (E3)",
+            "technique-refusal[{id}]: train() ran {} steps with {knob} despite {flag} == false — \
+             the knob was silently ignored (E3)",
             out.steps
         )),
         Err(other) => Err(format!(
-            "technique-refusal[{id}]: train() with an unsupported weight-noise request must return \
-             a typed Err(Error::Unsupported), got {other:?}"
+            "technique-refusal[{id}]: train() with an unsupported request ({knob}) must return a \
+             typed Err(Error::Unsupported), got {other:?}"
         )),
     }
+}
+
+/// **Bucketed progress** (sc-2127). A trainer that declares
+/// [`resolution_buckets`](gen_core::TrainingTechniques::resolution_buckets) must complete a
+/// two-bucket run end to end: `Caching` still counts dataset items (`1..=items.len()`, every bucket
+/// of an item is cached under its one event) and `Training` still counts `1..=config.steps`. An
+/// undeclared trainer passes vacuously (its refusal is [`check_trainer_technique_refusal`]).
+pub fn check_trainer_bucketed_progress(
+    make: &dyn Fn() -> Box<dyn Trainer>,
+    profile: &TrainerProfile,
+) -> Result<(), String> {
+    let mut t = make();
+    if !t.descriptor().techniques.resolution_buckets {
+        return Ok(());
+    }
+    let id = t.descriptor().id;
+    let mut req = base_request(profile);
+    req.config.resolution_buckets = probe_buckets(&req.config);
+    let mut caching: Vec<(u32, u32)> = Vec::new();
+    let mut training: Vec<(u32, u32)> = Vec::new();
+    let out = t
+        .train(&req, &mut |p| match p {
+            TrainingProgress::Caching { current, total } => caching.push((current, total)),
+            TrainingProgress::Training { step, total, .. } => training.push((step, total)),
+            _ => {}
+        })
+        .map_err(|e| format!("bucketed-progress[{id}]: train() failed on a two-bucket run: {e}"))?;
+    check_monotone(id, "Caching", &caching, profile.items.len() as u32)?;
+    check_monotone(id, "Training", &training, profile.config.steps)?;
+    if out.steps != profile.config.steps {
+        return Err(format!(
+            "bucketed-progress[{id}]: TrainingOutput.steps ({}) != config.steps ({})",
+            out.steps, profile.config.steps
+        ));
+    }
+    Ok(())
 }
 
 /// **Progress.** A completed (uncancelled) run streams `TrainingProgress::Caching` over exactly
@@ -464,7 +587,8 @@ pub fn check_trainer_registry(
 
 /// Run the full trainer conformance suite. `make` constructs a fresh trainer (it is invoked several
 /// times — once for the validate/registry pair, once for the progress run, once per cancellation
-/// path, and once for the technique-refusal probe — because `train` is `&mut self` and several families are single-use). Panics with every
+/// path, once per undeclared-technique refusal probe, and once for the bucketed run of a
+/// bucket-capable trainer — because `train` is `&mut self` and several families are single-use). Panics with every
 /// failure aggregated.
 pub fn trainer_conformance(make: impl Fn() -> Box<dyn Trainer>, profile: &TrainerProfile) {
     let mut failures: Vec<String> = Vec::new();
@@ -495,6 +619,10 @@ pub fn trainer_conformance(make: impl Fn() -> Box<dyn Trainer>, profile: &Traine
     }
 
     if let Err(e) = check_trainer_technique_refusal(&make, profile) {
+        failures.push(e);
+    }
+
+    if let Err(e) = check_trainer_bucketed_progress(&make, profile) {
         failures.push(e);
     }
 

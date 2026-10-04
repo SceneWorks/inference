@@ -93,13 +93,14 @@ use candle_gen::gen_core::train::{
     TrainingRequest,
 };
 use candle_gen::gen_core::{
-    self, CancelFlag, Image, LoadSpec, Modality, NetworkType, Precision, Progress, RgbaImage,
+    self, BucketSchedule, CancelFlag, Image, LoadSpec, Modality, NetworkType, Precision, Progress,
+    RgbaImage,
 };
 use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{
     checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
 };
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
     self, apply_update, create_output_dir, effective_weight_decay, request_fingerprint,
     sample_seed, save_adapter, validate_flow_match_request, velocity_loss,
@@ -118,7 +119,7 @@ use crate::config::{
 };
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decode_rgb, denoise, encode_references, joint_branch, joint_images,
+    create_noise, decode_rgb, denoise, encode_references, joint_branch, joint_images, joint_layout,
     missing_vision_tower, pack_latents, prepare_conditioning_references, DenoiseInputs,
     JointBranch, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
 };
@@ -431,12 +432,17 @@ pub struct AdapterFootprint {
 /// The shape of one training run, as far as memory is concerned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingShape {
-    /// Bucketed square training edge, in pixels.
+    /// Bucketed square training edge, in pixels — the **largest** resolution bucket's edge when
+    /// the run trains several (sc-2127, epic 2123 E7).
     pub edge: u32,
     /// Latent tokens of the largest **target**. `0` means the square `edge × edge` target every
     /// text-to-image item trains at; an edit run keeps each target's aspect ratio
     /// (`edit_target_size`), so it prices its largest target explicitly.
     pub target_tokens: u64,
+    /// Target latent tokens cached across the whole dataset — every item at every resolution
+    /// bucket (sc-2127). `0` means one target per item at [`target_tokens`](Self::target_tokens)
+    /// (the single-bucket cache).
+    pub target_cache_tokens: u64,
     /// The longest conditioning sequence (caption or preview prompt), in **text** tokens — the
     /// vision slots of an edit prompt are counted by [`reference_tokens`](Self::reference_tokens).
     pub caption_tokens: u64,
@@ -464,7 +470,8 @@ pub struct TrainingShape {
     /// of the keys and values up to its end and of those keys transposed, and the graph retains those
     /// copies. `0` falls back to `4 ·` the prefix.
     pub prefix_copy_rows: u64,
-    /// Dataset items (each caches one caption feature and one latent).
+    /// Dataset items (each caches one caption feature, and one target latent per resolution
+    /// bucket — [`target_cache_tokens`](Self::target_cache_tokens)).
     pub items: u64,
     /// Bytes per element of the DiT compute dtype (2 for bf16, 4 for f32). The text encoder's
     /// and the VAE's widths are already folded into [`FootprintFacts`]' byte counts.
@@ -538,11 +545,16 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
         .max(image_tokens * token_pixels)
         .max(shape.largest_reference_tokens * token_pixels);
 
-    // Caches (f32): caption text rows and packed latents (targets + edit references), per item.
+    // Caches (f32): caption text rows (shared by an item's bucket entries) and packed latents
+    // (targets at every bucket + edit references).
     let caption_cache = shape.items * text * facts.text_hidden * F32_WIDTH;
-    let latent_cache = (shape.items * image_tokens + shape.reference_cache_tokens)
-        * facts.latent_channels
-        * F32_WIDTH;
+    let target_cache = if shape.target_cache_tokens > 0 {
+        shape.target_cache_tokens
+    } else {
+        shape.items * image_tokens
+    };
+    let latent_cache =
+        (target_cache + shape.reference_cache_tokens) * facts.latent_channels * F32_WIDTH;
 
     // 1. captions: the language tower + one caption's per-layer live set. An edit caption also
     //    runs the vision tower (resident, plus one reference's patch stream and its full patch
@@ -837,7 +849,12 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Instruction-edit datasets (sc-24162), capped at the render path's own reference limit —
         // the one constant `collect_references`/`validate_reference_count` enforce.
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-2127 (epic 2123): honors `resolution_buckets` — every item (captioned or edit pair)
+        // is cached once per bucket edge and the loop walks a `BucketSchedule`.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -1152,13 +1169,6 @@ fn caption_tokens(tokenizer: &TextTokenizer, drop: usize, caption: &str) -> Resu
     Ok(tokens.ids.len().saturating_sub(drop) as u64)
 }
 
-/// Encode a dataset image into the packed denoiser-space latent the DiT trains on: centre-crop +
-/// resize to `[1, 3, edge, edge]` in `[−1, 1]`, then [`encode_rgb_latents`] →
-/// `[1, (edge/16)², z_dim]` (f32).
-fn encode_latents(vae: &QwenImage21Vae, path: &Path, edge: u32, device: &Device) -> Result<Tensor> {
-    encode_rgb_latents(vae, load_image_tensor(path, edge, device)?)
-}
-
 /// An RGB NCHW `[1, 3, h, w]` image in `[−1, 1]` → its packed latent: widen to opaque RGBA (a
 /// constant `+1` alpha plane) when the VAE takes four channels, take the posterior **mode**,
 /// normalise `(z − mean)/std`, and flatten unpatched to `[1, (h/16)·(w/16), z_dim]` (f32).
@@ -1174,17 +1184,28 @@ fn encode_rgb_latents(vae: &QwenImage21Vae, rgb: Tensor) -> Result<Tensor> {
     Ok(pack_latents(&vae.normalize(&mode)?)?.detach())
 }
 
-/// Decode `path` and resize the **whole** picture (no crop) to `width × height` (Lanczos, the
-/// dataset loader's filter) → RGB NCHW `[1, 3, height, width]` in `[−1, 1]` (`px/127.5 − 1`, the
-/// dataset loader's normalisation) on `device`. An edit target's encode input.
-fn load_image_resized(path: &Path, width: u32, height: u32, device: &Device) -> Result<Tensor> {
-    let img = image::open(path)
+/// Decode `path` as RGB8 — the **whole** picture, no crop: an edit target's encode source, decoded
+/// once however many bucket edges it trains at (sc-2127).
+fn decode_target_picture(path: &Path) -> Result<image::RgbImage> {
+    Ok(image::open(path)
         .map_err(|e| Error::Msg(format!("{LABEL}: open image {}: {e}", path.display())))?
-        .to_rgb8();
+        .to_rgb8())
+}
+
+/// Resize a [`decode_target_picture`] picture to `width × height` (Lanczos, the dataset loader's
+/// filter) → RGB NCHW `[1, 3, height, width]` in `[−1, 1]` (`px/127.5 − 1`, the dataset loader's
+/// normalisation)
+/// on `device`. An edit target's encode input at one bucket edge.
+fn rgb_resized_tensor(
+    img: &image::RgbImage,
+    width: u32,
+    height: u32,
+    device: &Device,
+) -> Result<Tensor> {
     let resized = if img.dimensions() == (width, height) {
-        img
+        img.clone()
     } else {
-        image::imageops::resize(&img, width, height, image::imageops::FilterType::Lanczos3)
+        image::imageops::resize(img, width, height, image::imageops::FilterType::Lanczos3)
     };
     let (w, h) = (width as usize, height as usize);
     let mut data = vec![0f32; 3 * h * w];
@@ -1440,22 +1461,49 @@ fn target_tokens((width, height): (u32, u32)) -> u64 {
     (width / VAE_SCALE_FACTOR) as u64 * (height / VAE_SCALE_FACTOR) as u64
 }
 
-/// An item's packed target latent at [`edit_target_size`]: a captioned item's centre-cropped square
-/// (unchanged), an edit pair's whole picture at its aspect-preserving fit.
-fn encode_item_target(
+/// The target-latent sizing of a bucketed run (sc-2127): the latent tokens of the single largest
+/// target (every item at its [`edit_target_size`] for every bucket edge — the largest edge decides
+/// it, epic 2123 E7) and the target tokens the latent cache holds across the dataset (every item
+/// once per edge). With one edge the cache total is the per-item sum the single-bucket cache held.
+/// Reads only image headers.
+fn bucketed_target_tokens(items: &[TrainingItem], edges: &[u32]) -> Result<(u64, u64)> {
+    let (mut largest, mut cached) = (0u64, 0u64);
+    for item in items {
+        for &edge in edges {
+            let tokens = target_tokens(edit_target_size(item, edge)?);
+            largest = largest.max(tokens);
+            cached += tokens;
+        }
+    }
+    Ok((largest, cached))
+}
+
+/// An item's packed target latents, one per bucket edge in `edges` order (sc-2127), each at
+/// [`edit_target_size`] for that edge: a captioned item's centre-cropped square (unchanged), an
+/// edit pair's whole picture at its aspect-preserving fit. The image is decoded ONCE (the dataset
+/// kit's decode + centre crop for a captioned item, the whole picture for an edit pair) and resized
+/// per edge, so every bucket entry is exactly the single-bucket latent at that edge.
+fn encode_item_targets(
     vae: &QwenImage21Vae,
     item: &TrainingItem,
-    edge: u32,
+    edges: &[u32],
     device: &Device,
-) -> Result<Tensor> {
+) -> Result<Vec<Tensor>> {
     if item.is_edit_pair() {
-        let (width, height) = edit_target_size(item, edge)?;
-        encode_rgb_latents(
-            vae,
-            load_image_resized(&item.image_path, width, height, device)?,
-        )
+        let picture = decode_target_picture(&item.image_path)?;
+        edges
+            .iter()
+            .map(|&edge| {
+                let (width, height) = edit_target_size(item, edge)?;
+                encode_rgb_latents(vae, rgb_resized_tensor(&picture, width, height, device)?)
+            })
+            .collect()
     } else {
-        encode_latents(vae, &item.image_path, edge, device)
+        let square = decode_square(&item.image_path)?;
+        edges
+            .iter()
+            .map(|&edge| encode_rgb_latents(vae, square_image_tensor(&square, edge, device)?))
+            .collect()
     }
 }
 
@@ -1480,20 +1528,40 @@ fn encode_branch(
 }
 
 /// One dataset item's text side, exactly as phase 1 caches it: its ordered references
-/// host-preprocessed by [`prepare_conditioning_references`], then [`encode_branch`] at the item's
-/// target size ([`edit_target_size`]). Returns the branch and the prepared references (the first
-/// item's also condition edit previews).
-fn item_branch(
+/// host-preprocessed by [`prepare_conditioning_references`], the conditioning encoded **once**,
+/// then one [`JointBranch`] per bucket edge in `edges` order (sc-2127) at the item's target size
+/// for that edge ([`edit_target_size`]). The branches share one detached f32 text-row tensor; only
+/// the layout (the target block's grid) differs per edge. With one edge this is exactly
+/// [`encode_branch`]. Returns the branches and the prepared references (the first item's also
+/// condition edit previews).
+fn item_branches(
     encoder: &QwenImage21TextEncoder,
     tokenizer: &TextTokenizer,
     drop: usize,
     item: &TrainingItem,
-    edge: u32,
-) -> Result<(JointBranch, Vec<PreparedReference>)> {
+    edges: &[u32],
+) -> Result<(Vec<JointBranch>, Vec<PreparedReference>)> {
     let references = prepare_conditioning_references(encoder, &decode_references(item)?)?;
-    let size = edit_target_size(item, edge)?;
-    let branch = encode_branch(encoder, tokenizer, drop, &item.caption, &references, size)?;
-    Ok((branch, references))
+    let conditioning = encoder.encode_conditioning(tokenizer, &item.caption, drop, &references)?;
+    let mut branches: Vec<JointBranch> = Vec::with_capacity(edges.len());
+    for &edge in edges {
+        let (width, height) = edit_target_size(item, edge)?;
+        let branch = match branches.first() {
+            None => {
+                let branch = joint_branch(&conditioning, &references, width, height)?;
+                JointBranch {
+                    text: branch.text.to_dtype(DType::F32)?.detach(),
+                    layout: branch.layout,
+                }
+            }
+            Some(first) => JointBranch {
+                text: first.text.clone(),
+                layout: joint_layout(&conditioning.image_pad_mask, &references, width, height)?,
+            },
+        };
+        branches.push(branch);
+    }
+    Ok((branches, references))
 }
 
 /// An edit item's reference latents, in reference order, through the render path's own host
@@ -1786,7 +1854,11 @@ impl QwenImage21Trainer {
         };
 
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). Every item trains at each edge; the preflight and the previews size for the
+        // largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
+        let edge = edges.iter().copied().max().unwrap_or(0);
 
         // --- preflight: the derived peak against this device, before any weight is read ---
         // Edit previews condition on the first item's references (see `render_sample`). A bad
@@ -1799,11 +1871,8 @@ impl QwenImage21Trainer {
         let mut longest = 0u64;
         let (mut reference_tokens, mut largest_reference_tokens, mut reference_cache_tokens) =
             (0u64, 0u64, 0u64);
-        let mut largest_target_tokens = 0u64;
-        for item in &req.items {
-            largest_target_tokens =
-                largest_target_tokens.max(target_tokens(edit_target_size(item, edge)?));
-        }
+        let (largest_target_tokens, target_cache_tokens) =
+            bucketed_target_tokens(&req.items, &edges)?;
         let (mut prefix_scores, mut largest_prefix_call, mut prefix_copy_rows) = (0u64, 0u64, 0u64);
         let mut prompts: Vec<PreflightPrompt<'_>> = Vec::new();
         for item in &req.items {
@@ -1859,6 +1928,7 @@ impl QwenImage21Trainer {
         let shape = TrainingShape {
             edge,
             target_tokens: largest_target_tokens,
+            target_cache_tokens,
             caption_tokens: longest,
             reference_tokens,
             largest_reference_tokens,
@@ -1908,15 +1978,16 @@ impl QwenImage21Trainer {
                     (edge, edge),
                 )
             };
-            let mut branches: Vec<JointBranch> = Vec::with_capacity(req.items.len());
+            // One `Vec` of per-edge branches per item (sc-2127), in `edges` order.
+            let mut branches: Vec<Vec<JointBranch>> = Vec::with_capacity(req.items.len());
             let mut sample_references = Vec::new();
             for (i, item) in req.items.iter().enumerate() {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
-                let (branch, references) =
-                    item_branch(&encoder, &self.tokenizer, self.drop_count, item, edge)?;
-                branches.push(branch);
+                let (per_edge, references) =
+                    item_branches(&encoder, &self.tokenizer, self.drop_count, item, &edges)?;
+                branches.push(per_edge);
                 if i == 0 && edit && sampling_requested {
                     sample_references = references;
                 }
@@ -1939,8 +2010,10 @@ impl QwenImage21Trainer {
         //        is then dropped ---
         let mut vae = loader::load_vae(&self.root, &device)?;
         let total = req.items.len() as u32;
-        let mut cache: Vec<Cached> = Vec::with_capacity(req.items.len());
-        for (i, (item, branch)) in req.items.iter().zip(branches).enumerate() {
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). An item's bucket entries
+        // share its text rows and reference latents (refcounted clones).
+        let mut cache: Vec<Cached> = Vec::with_capacity(req.items.len() * edges.len());
+        for (i, (item, per_edge)) in req.items.iter().zip(branches).enumerate() {
             if req.cancel.is_cancelled() {
                 break;
             }
@@ -1948,14 +2021,16 @@ impl QwenImage21Trainer {
                 current: i as u32 + 1,
                 total,
             });
-            let x0 = encode_item_target(&vae, item, edge, &device)?;
+            let targets = encode_item_targets(&vae, item, &edges, &device)?;
             let references = encode_item_references(&vae, vision.as_ref(), item, &device)?;
-            cache.push(Cached {
-                x0,
-                text: branch.text,
-                layout: branch.layout,
-                references,
-            });
+            for (x0, branch) in targets.into_iter().zip(per_edge) {
+                cache.push(Cached {
+                    x0,
+                    text: branch.text,
+                    layout: branch.layout,
+                    references: references.clone(),
+                });
+            }
         }
         // Cancelled during caching: nothing has trained, so write nothing (and skip the DiT load).
         if req.cancel.is_cancelled() {
@@ -2024,6 +2099,10 @@ impl QwenImage21Trainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) entry each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<GradStore> = None;
         let mut pending = 0u32;
         let mut last_loss = 0.0f32;
@@ -2035,7 +2114,7 @@ impl QwenImage21Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[((step - 1) as usize) % cache.len()];
+            let sample = &cache[schedule.cache_index((step - 1) as usize)];
             let t = flow_match::sample_unit_timestep(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -2206,6 +2285,28 @@ mod tests {
             .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/tiny-snapshot")
     }
 
+    /// The single-bucket branch of [`item_branches`] (the pre-bucket `item_branch`).
+    fn item_branch(
+        encoder: &QwenImage21TextEncoder,
+        tokenizer: &TextTokenizer,
+        drop: usize,
+        item: &TrainingItem,
+        edge: u32,
+    ) -> Result<(JointBranch, Vec<PreparedReference>)> {
+        let (mut branches, references) = item_branches(encoder, tokenizer, drop, item, &[edge])?;
+        Ok((branches.remove(0), references))
+    }
+
+    /// The single-bucket latent of [`encode_item_targets`] (the pre-bucket `encode_item_target`).
+    fn encode_item_target(
+        vae: &QwenImage21Vae,
+        item: &TrainingItem,
+        edge: u32,
+        device: &Device,
+    ) -> Result<Tensor> {
+        Ok(encode_item_targets(vae, item, &[edge], device)?.remove(0))
+    }
+
     /// A per-process scratch directory, removed on drop.
     fn scratch(tag: &str) -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -2295,6 +2396,9 @@ mod tests {
         assert!(d.supports_lora && d.supports_lokr);
         assert!(!d.supports_control && !d.supports_full_finetune);
         assert_eq!(d.max_reference_images as usize, MAX_REFERENCE_IMAGES);
+        // sc-2127: multi-resolution buckets are honored (the shared floor would refuse them
+        // otherwise).
+        assert!(d.techniques.resolution_buckets);
     }
 
     #[test]
@@ -2712,6 +2816,7 @@ mod tests {
         TrainingShape {
             edge,
             target_tokens: 0,
+            target_cache_tokens: 0,
             caption_tokens: 64,
             reference_tokens: 0,
             largest_reference_tokens: 0,
@@ -2815,6 +2920,7 @@ mod tests {
         let base = TrainingShape {
             edge,
             target_tokens: side * side,
+            target_cache_tokens: 0,
             caption_tokens: 25,
             reference_tokens: 0,
             largest_reference_tokens: 0,
@@ -3104,6 +3210,85 @@ mod tests {
         let per_item = 64 * facts.text_hidden * F32_WIDTH
             + (1024 / 16) * (1024 / 16) * facts.latent_channels * F32_WIDTH;
         assert_eq!(many - few, 1000 * per_item);
+    }
+
+    /// sc-2127 (epic 2123 E7): a bucketed run's preflight prices its **largest** target (the
+    /// largest edge decides it) and a latent cache that holds every item at every bucket; one
+    /// bucket is exactly the single-bucket cache.
+    ///
+    /// *Mutations that red this:* `bucketed_target_tokens` sizing `largest` from the first edge,
+    /// or caching only one edge per item; `training_footprint` ignoring `target_cache_tokens`.
+    #[test]
+    fn bucketed_preflight_sizes_for_the_largest_edge_and_caches_every_bucket() {
+        let captioned = |n: usize| -> Vec<TrainingItem> {
+            (0..n)
+                .map(|i| {
+                    TrainingItem::captioned(
+                        PathBuf::from(format!("/nonexistent/{i}.png")),
+                        "x".into(),
+                    )
+                })
+                .collect()
+        };
+        let (t512, t1024) = ((512 / 16) * (512 / 16), (1024 / 16) * (1024 / 16));
+        assert_eq!(
+            bucketed_target_tokens(&captioned(3), &[512, 1024]).unwrap(),
+            (t1024, 3 * (t512 + t1024))
+        );
+        assert_eq!(
+            bucketed_target_tokens(&captioned(3), &[1024, 512]).unwrap(),
+            (t1024, 3 * (t512 + t1024)),
+            "order-independent"
+        );
+        assert_eq!(
+            bucketed_target_tokens(&captioned(3), &[1024]).unwrap(),
+            (t1024, 3 * t1024)
+        );
+
+        // An edit pair's aspect-preserving target is priced per edge too.
+        let tmp = scratch("bucket_tokens");
+        let wide = write_png(tmp.path(), "wide.png", 256, 128, 1);
+        let reference = write_png(tmp.path(), "ref.png", 64, 64, 2);
+        let pair = [TrainingItem::edit_pair(wide, "w".into(), vec![reference])];
+        let (small, large) = (
+            target_tokens(edit_target_size(&pair[0], 64).unwrap()),
+            target_tokens(edit_target_size(&pair[0], 128).unwrap()),
+        );
+        assert_eq!(large, (192 / 16) * (96 / 16));
+        assert!(small < large);
+        assert_eq!(
+            bucketed_target_tokens(&pair, &[64, 128]).unwrap(),
+            (large, small + large)
+        );
+
+        // The footprint: buckets [512, 1024] price the 1024 step plus the 512 latents cached on
+        // top; an explicit single-bucket cache equals the `0` default.
+        let facts = production_facts();
+        let at_1024 = training_footprint(&facts, &shape(1024, true));
+        let at_512 = training_footprint(&facts, &shape(512, true));
+        let (largest, cached) = bucketed_target_tokens(&captioned(20), &[512, 1024]).unwrap();
+        let bucketed = training_footprint(
+            &facts,
+            &TrainingShape {
+                target_tokens: largest,
+                target_cache_tokens: cached,
+                ..shape(1024, true)
+            },
+        );
+        let extra = 20 * t512 * facts.latent_channels * F32_WIDTH;
+        assert_eq!(bucketed.latent_phase - at_1024.latent_phase, extra);
+        assert_eq!(bucketed.train_phase - at_1024.train_phase, extra);
+        assert!(bucketed.peak() > at_512.peak());
+        assert_eq!(
+            training_footprint(
+                &facts,
+                &TrainingShape {
+                    target_cache_tokens: 20 * t1024,
+                    ..shape(1024, true)
+                }
+            ),
+            at_1024
+        );
     }
 
     /// The preflight's adapter sizing on the tiny DiT, against the factors the install really
@@ -4299,6 +4484,122 @@ mod tests {
         );
         let square = encode_item_target(&vae, &captioned, edge, &dev).unwrap();
         assert_eq!(square.dim(1).unwrap(), (128 / 16) * (128 / 16));
+    }
+
+    /// sc-2127: each item caches one branch and one target latent per bucket edge, in edge order —
+    /// the conditioning encoded once (shared text rows), the target block / latent sized for that
+    /// edge — and each bucket entry is bit-identical to a single-bucket run at that edge. Covers
+    /// a captioned item (square) and an edit pair (aspect-preserving per edge).
+    ///
+    /// *Mutations that red this:* `item_branches` building every layout at the first edge;
+    /// `encode_item_targets` encoding every latent at one edge.
+    #[test]
+    fn an_item_caches_one_branch_and_latent_per_bucket_edge() {
+        use crate::transformer::Segment as S;
+        let root = tiny_snapshot();
+        let tmp = scratch("per_bucket");
+        let square = write_png(tmp.path(), "sq.png", 160, 160, 3);
+        let wide = write_png(tmp.path(), "wide.png", 256, 128, 5);
+        let reference = write_png(tmp.path(), "ref.png", 64, 64, 9);
+        let dev = Device::Cpu;
+        let tokenizer = loader::load_tokenizer(&root).unwrap();
+        let drop = system_prompt_drop_count(&tokenizer).unwrap();
+        let encoder = loader::load_text_encoder(&root, &dev).unwrap();
+        let vae = loader::load_vae(&root, &dev).unwrap();
+        let edges = [64u32, 128];
+        for item in [
+            TrainingItem::captioned(square, "a swatch".into()),
+            TrainingItem::edit_pair(wide, "widen it".into(), vec![reference]),
+        ] {
+            let (branches, _) = item_branches(&encoder, &tokenizer, drop, &item, &edges).unwrap();
+            let targets = encode_item_targets(&vae, &item, &edges, &dev).unwrap();
+            assert_eq!((branches.len(), targets.len()), (2, 2));
+            for (b, &edge) in edges.iter().enumerate() {
+                let (w, h) = edit_target_size(&item, edge).unwrap();
+                let (gw, gh) = ((w / 16) as usize, (h / 16) as usize);
+                assert_eq!(
+                    branches[b].layout.segments.last(),
+                    Some(&S::Image {
+                        height: gh,
+                        width: gw
+                    }),
+                    "bucket {b} (edge {edge}) target block"
+                );
+                assert_eq!(targets[b].dim(1).unwrap(), gw * gh, "bucket {b} latent");
+                let (single, _) = item_branch(&encoder, &tokenizer, drop, &item, edge).unwrap();
+                assert_eq!(branches[b].layout, single.layout);
+                assert_bit_equal("text rows", &branches[b].text, &single.text);
+                assert_bit_equal(
+                    "target latent",
+                    &targets[b],
+                    &encode_item_target(&vae, &item, edge, &dev).unwrap(),
+                );
+            }
+            assert_ne!(
+                branches[0].layout, branches[1].layout,
+                "the two buckets train different grids"
+            );
+        }
+    }
+
+    /// sc-2127: a bucketed run trains end-to-end on the tiny snapshot — every step's cached entry
+    /// (latent, layout, text rows) agrees on its bucket's grid, so a 32 px and a 64 px bucket both
+    /// reach the DiT — with ONE `Caching` event per item, and the extra bucket changes the trained
+    /// factors versus the single-bucket run at the smaller edge.
+    ///
+    /// *Mutations that red this:* `item_branches` building every layout at the first edge (the
+    /// 64 px latent then meets a 32 px layout and the step errors); caching only the first edge
+    /// (the adapter equals the single-bucket run's).
+    #[test]
+    fn a_bucketed_run_trains_every_bucket_end_to_end() {
+        use candle_gen::gen_core::ResolutionBucket;
+        let dir = scratch("buckets");
+        let items = dataset(dir.path(), 2);
+        let bucketed_cfg = TrainingConfig {
+            steps: 6,
+            resolution_buckets: vec![
+                ResolutionBucket {
+                    resolution: 32,
+                    repeats: 2,
+                },
+                ResolutionBucket {
+                    resolution: 64,
+                    repeats: 1,
+                },
+            ],
+            ..base_config()
+        };
+        let mut caching = Vec::new();
+        let mut req = request(dir.path(), items.clone(), bucketed_cfg.clone());
+        req.output_dir = dir.path().join("bucketed");
+        let out = trainer()
+            .train(&req, &mut |p| {
+                if let TrainingProgress::Caching { current, total } = p {
+                    caching.push((current, total));
+                }
+            })
+            .unwrap();
+        assert_eq!(out.steps, 6);
+        assert_eq!(caching, vec![(1, 2), (2, 2)], "one Caching event per item");
+        let bucketed = tensors(&req.output_dir.join(&req.file_name));
+
+        let mut single = request(
+            dir.path(),
+            items,
+            TrainingConfig {
+                resolution_buckets: Vec::new(),
+                ..bucketed_cfg
+            },
+        );
+        single.output_dir = dir.path().join("single");
+        trainer().train(&single, &mut |_| {}).unwrap();
+        let single = tensors(&single.output_dir.join(&single.file_name));
+        assert_eq!(bucketed.len(), single.len());
+        let f32 = |t: &Tensor| t.to_dtype(DType::F32).unwrap();
+        let differs = bucketed
+            .iter()
+            .any(|(k, t)| max_abs(&(f32(t) - f32(&single[k])).unwrap()) > 0.0);
+        assert!(differs, "the 64 px bucket must change the trained factors");
     }
 
     /// A reference the Qwen3-VL processor would rebind (its fit leaves the pixel budget) is refused

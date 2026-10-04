@@ -20,6 +20,20 @@ pub fn bucket_resolution(resolution: u32) -> u32 {
     ((resolution / 32) * 32).max(32)
 }
 
+/// The bucketed training edges of `config` (epic 2123 sc-2127) — one per
+/// [`TrainingConfig::training_buckets`](gen_core::TrainingConfig::training_buckets) entry, in order,
+/// each floored by [`bucket_resolution`]. With no `resolution_buckets` this is exactly
+/// `[bucket_resolution(config.resolution)]`, the single edge every trainer used before buckets
+/// existed. A trainer caches each item once per edge (item-major) and walks the cache through a
+/// [`gen_core::BucketSchedule`].
+pub fn bucket_edges(config: &gen_core::TrainingConfig) -> Vec<u32> {
+    config
+        .training_buckets()
+        .iter()
+        .map(|b| bucket_resolution(b.resolution))
+        .collect()
+}
+
 /// Center-crop `image` to its largest centered square (`side = min(w, h)`). A no-op when already
 /// square. The family then resizes the square to the bucketed training edge.
 pub fn center_crop_square(image: &Image) -> Image {
@@ -45,6 +59,30 @@ pub fn center_crop_square(image: &Image) -> Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_edges_floor_every_bucket_and_default_to_the_legacy_edge() {
+        let mut cfg = gen_core::TrainingConfig {
+            resolution: 1000,
+            ..Default::default()
+        };
+        assert_eq!(bucket_edges(&cfg), vec![992]);
+        cfg.resolution_buckets = vec![
+            gen_core::ResolutionBucket {
+                resolution: 512,
+                repeats: 16,
+            },
+            gen_core::ResolutionBucket {
+                resolution: 770,
+                repeats: 4,
+            },
+            gen_core::ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+        ];
+        assert_eq!(bucket_edges(&cfg), vec![512, 768, 1024]);
+    }
 
     #[test]
     fn bucket_floors_to_multiple_of_32() {

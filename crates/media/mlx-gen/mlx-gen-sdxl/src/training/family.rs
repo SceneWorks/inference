@@ -29,8 +29,9 @@
 
 use std::path::Path;
 
+use mlx_gen::gen_core::BucketSchedule;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
     TrainAdapter,
@@ -252,14 +253,38 @@ pub fn compute_loss_grads<H: SdxlFamilyHooks>(
     Ok((val[0].item::<f32>(), grads))
 }
 
+/// The dense first-step peak projection a run over `edges` must fit (epic 2123 E7, sc-2127): the
+/// largest of the family's fitted `peak_gb` curve over every bucketed training edge, with the edge
+/// that produces it. `p = ⌈edge/8⌉²` (the SDXL VAE downscales /8). The latent cache is not part of
+/// the curve (it models the per-step U-Net working set, and the cached latents are a few hundred KB
+/// each), so caching one latent per bucket does not move it.
+pub fn dense_peak_for_edges(
+    peak_gb: impl Fn(f64, bool) -> f64,
+    edges: &[u32],
+    bf16: bool,
+) -> (u32, f64) {
+    edges
+        .iter()
+        .map(|&edge| {
+            let latent_side = (edge as f64 / 8.0).ceil();
+            (edge, peak_gb(latent_side * latent_side, bf16))
+        })
+        .fold((0, f64::NEG_INFINITY), |best, cur| {
+            if cur.1 > best.1 {
+                cur
+            } else {
+                best
+            }
+        })
+}
+
 /// Refuse a run whose dense first step would exceed this machine's memory budget, returning a
 /// catchable, actionable error instead of risking an uncatchable SIGKILL (sc-4874/sc-4941). Only
-/// consulted when gradient checkpointing is OFF. `edge` is the bucketed training edge; the projection
-/// is the family's fitted [`SdxlFamilyHooks::peak_gb`] curve.
-fn preflight_memory_guard<H: SdxlFamilyHooks>(hooks: &H, edge: u32, bf16: bool) -> Result<()> {
-    let latent_side = (edge as f64 / 8.0).ceil();
-    let p = latent_side * latent_side;
-    let projected = hooks.peak_gb(p, bf16);
+/// consulted when gradient checkpointing is OFF. `edges` are the bucketed training edges; the guard
+/// sizes for the most expensive one ([`dense_peak_for_edges`] over the family's fitted
+/// [`SdxlFamilyHooks::peak_gb`] curve).
+fn preflight_memory_guard<H: SdxlFamilyHooks>(hooks: &H, edges: &[u32], bf16: bool) -> Result<()> {
+    let (edge, projected) = dense_peak_for_edges(|p, b| hooks.peak_gb(p, b), edges, bf16);
     let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
     if projected > safe {
@@ -274,6 +299,49 @@ fn preflight_memory_guard<H: SdxlFamilyHooks>(hooks: &H, edge: u32, bf16: bool) 
         .into());
     }
     Ok(())
+}
+
+/// One cached training sample: an item's clean latent at ONE bucket edge, its (shared, refcounted)
+/// conditioning/pooled, and the family micro-conditioning `time_ids` built for that same edge. Keeping
+/// `time_ids` in the entry means a step can never pair a latent with ids built for another bucket
+/// (sc-2127 — Kolors' ids are the real `(H, W, 0, 0, H, W)`).
+struct CachedSample {
+    x0: Array,
+    cond: Array,
+    pooled: Array,
+    time_ids: Array,
+}
+
+/// Push one dataset item's cache entries — one per bucket edge, in `edges` order (the item-major
+/// layout [`BucketSchedule::cache_index`] indexes) — encoding the latent per edge via
+/// `encode_latent` and pairing it with `time_ids[bucket]` (built for that edge). The item's
+/// conditioning is encoded once by the caller and cloned (refcounted) into each entry.
+fn push_bucket_entries(
+    cache: &mut Vec<CachedSample>,
+    edges: &[u32],
+    time_ids: &[Array],
+    cond: &Array,
+    pooled: &Array,
+    mut encode_latent: impl FnMut(u32) -> Result<Array>,
+) -> Result<()> {
+    debug_assert_eq!(edges.len(), time_ids.len());
+    for (&edge, ids) in edges.iter().zip(time_ids) {
+        let x0 = encode_latent(edge)?;
+        eval([&x0])?;
+        cache.push(CachedSample {
+            x0,
+            cond: cond.clone(),
+            pooled: pooled.clone(),
+            time_ids: ids.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The cache entry the 1-based training `step` reads: the schedule's `(step - 1)`-th sample. For a
+/// single bucket this is the pre-bucket round-robin `(step - 1) % n_items`.
+fn step_cache_index(schedule: &BucketSchedule, step: u32) -> usize {
+    schedule.cache_index((step - 1) as usize)
 }
 
 /// Decode a dataset image file (PNG/JPEG) into the core RGB8 [`Image`](mlx_gen::media::Image).
@@ -304,7 +372,10 @@ pub fn train_family<H: SdxlFamilyHooks>(
     let cfg = &req.config;
     let label = hooks.label();
     on_progress(TrainingProgress::Preparing);
-    let edge = bucket_resolution(cfg.resolution);
+    // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
+    // The memory guard and preview renders size for the largest (epic 2123 E7).
+    let edges = bucket_edges(cfg);
+    let max_edge = edges.iter().copied().max().unwrap_or(0);
 
     // sc-4941 — training compute dtype. bf16 (the worker default, passed through since sc-4881) halves
     // the activation working set and is the ecosystem-standard mixed precision; the trainable factors /
@@ -336,7 +407,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
     let use_checkpoint =
         matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
     if !use_checkpoint {
-        preflight_memory_guard(hooks, edge, use_bf16)?;
+        preflight_memory_guard(hooks, &edges, use_bf16)?;
     }
     unet.set_sdpa_checkpoint(false);
     if use_bf16 {
@@ -346,7 +417,11 @@ pub fn train_family<H: SdxlFamilyHooks>(
     // --- prepare → load → cache: VAE-latents + (conditioning, pooled) into memory ---
     on_progress(TrainingProgress::LoadingModel); // base already resident from load_trainer
     let total = req.items.len() as u32;
-    let mut cache: Vec<(Array, Array, Array)> = Vec::with_capacity(req.items.len());
+    // Family micro-conditioning `time_ids` per bucket edge (B=1) — matches the inference path so the
+    // LoRA trains under the conditioning it is applied under, at the size each latent was cached at.
+    let time_ids: Vec<Array> = edges.iter().map(|&e| hooks.time_ids(1, e)).collect();
+    // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+    let mut cache: Vec<CachedSample> = Vec::with_capacity(req.items.len() * edges.len());
     for (i, item) in req.items.iter().enumerate() {
         if req.cancel.is_cancelled() {
             break;
@@ -356,10 +431,12 @@ pub fn train_family<H: SdxlFamilyHooks>(
             total,
         });
         let img = center_crop_square(&decode_image(&item.image_path)?);
-        let x0 = encode_init_latents(vae, &img, edge, edge)?; // scaled latent [1,h,w,4]
         let (cond, pooled) = hooks.encode_prompt(&item.caption)?;
-        eval([&x0, &cond, &pooled])?;
-        cache.push((x0, cond, pooled));
+        eval([&cond, &pooled])?;
+        // scaled latent [1,h,w,4] per bucket edge
+        push_bucket_entries(&mut cache, &edges, &time_ids, &cond, &pooled, |edge| {
+            encode_init_latents(vae, &img, edge, edge)
+        })?;
     }
     if cache.is_empty() {
         // sc-4895 — a cancel tripped during caching is a genuine cancellation → typed
@@ -403,10 +480,6 @@ pub fn train_family<H: SdxlFamilyHooks>(
     // reclaiming their footprint for the U-Net working set.
     hooks.free_text_encoders();
     mlx_rs::memory::clear_cache();
-
-    // Family micro-conditioning `time_ids`, built once and shared (B=1) — matches the inference path so
-    // the LoRA trains under the conditioning it is applied under.
-    let time_ids = hooks.time_ids(1, edge);
 
     // --- adapter targets + params (LoRA or LoKr) + optimizer ---
     let target_paths = resolve_target_paths(unet, cfg);
@@ -468,6 +541,10 @@ pub fn train_family<H: SdxlFamilyHooks>(
     }
 
     // --- train loop ---
+    // sc-2127: which cached (item, bucket) sample each step trains on (round-robin over items for a
+    // single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+    let schedule =
+        BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
     let mut accumulated: Option<LoraParams> = None;
     let mut last_loss = 0.0f32;
     let mut steps_run = start_step;
@@ -475,7 +552,12 @@ pub fn train_family<H: SdxlFamilyHooks>(
         if req.cancel.is_cancelled() {
             break;
         }
-        let (x0, cond, pooled) = &cache[((step - 1) as usize) % cache.len()];
+        let CachedSample {
+            x0,
+            cond,
+            pooled,
+            time_ids,
+        } = &cache[step_cache_index(&schedule, step)];
         let t =
             hooks.sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64))?;
         let noise = random::normal::<f32>(
@@ -496,7 +578,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
             x0,
             cond,
             pooled,
-            &time_ids,
+            time_ids,
             t,
             &noise,
             mae,
@@ -583,7 +665,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
                     pooled,
                     cfg.sample_guidance_scale,
                     sample_seed,
-                    edge,
+                    max_edge,
                     cfg.sample_steps.max(1) as usize,
                     compute_dtype,
                 ) {
@@ -630,4 +712,101 @@ pub fn train_family<H: SdxlFamilyHooks>(
         steps: steps_run,
         final_loss: last_loss,
     })
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+    use mlx_gen::gen_core::ResolutionBucket;
+
+    fn bucket(resolution: u32, repeats: u32) -> ResolutionBucket {
+        ResolutionBucket {
+            resolution,
+            repeats,
+        }
+    }
+
+    /// sc-2127: with one bucket the step → cache-entry walk is exactly the pre-bucket
+    /// `(step - 1) % n_items` round-robin, so a bucket-less run trains in today's order.
+    #[test]
+    fn one_bucket_step_index_is_the_pre_bucket_round_robin() {
+        let n_items = 7;
+        for repeats in [1, 3] {
+            let schedule = BucketSchedule::new(n_items, &[bucket(1024, repeats)], 42);
+            for step in 1..=200u32 {
+                assert_eq!(
+                    step_cache_index(&schedule, step),
+                    ((step - 1) as usize) % n_items,
+                    "step {step} (repeats {repeats})"
+                );
+            }
+        }
+    }
+
+    /// sc-2127: over one epoch of a `[512×16, 768×4, 1024×1]` schedule every item is visited
+    /// 16:4:1 across its three cached buckets (cache stride 3, item-major).
+    #[test]
+    fn multi_bucket_steps_mix_16_4_1_per_item() {
+        let n_items = 3;
+        let schedule = BucketSchedule::new(
+            n_items,
+            &[bucket(512, 16), bucket(768, 4), bucket(1024, 1)],
+            7,
+        );
+        let epoch = n_items * 21;
+        let mut counts = vec![[0u32; 3]; n_items];
+        for step in 1..=epoch as u32 {
+            let idx = step_cache_index(&schedule, step);
+            counts[idx / 3][idx % 3] += 1;
+        }
+        for (item, c) in counts.iter().enumerate() {
+            assert_eq!(*c, [16, 4, 1], "item {item}");
+        }
+    }
+
+    /// sc-2127: each item is cached once per bucket edge, item-major, and every entry's
+    /// micro-conditioning `time_ids` is the one built for the edge its latent was encoded at (the
+    /// Kolors `(H, W, 0, 0, H, W)` shape), so a step never pairs a latent with another bucket's ids.
+    #[test]
+    fn bucket_entries_pair_each_latent_with_its_edges_time_ids() {
+        let edges = [512u32, 768, 1024];
+        let time_ids: Vec<Array> = edges
+            .iter()
+            .map(|&e| {
+                let e = e as f32;
+                Array::from_slice(&[e, e, 0.0, 0.0, e, e], &[1, 6])
+            })
+            .collect();
+        let cond = Array::from_slice(&[1.0f32], &[1, 1]);
+        let pooled = Array::from_slice(&[2.0f32], &[1, 1]);
+        let mut cache = Vec::new();
+        for _item in 0..2 {
+            push_bucket_entries(&mut cache, &edges, &time_ids, &cond, &pooled, |edge| {
+                let side = (edge / 8) as i32;
+                Ok(mlx_rs::ops::zeros::<f32>(&[1, side, side, 4])?)
+            })
+            .unwrap();
+        }
+        assert_eq!(cache.len(), 2 * edges.len());
+        for (k, entry) in cache.iter().enumerate() {
+            let latent_edge = entry.x0.shape()[1] as u32 * 8;
+            assert_eq!(
+                latent_edge,
+                edges[k % edges.len()],
+                "entry {k} is item-major"
+            );
+            let ids: Vec<f32> = entry.time_ids.as_slice::<f32>().to_vec();
+            let e = latent_edge as f32;
+            assert_eq!(ids, vec![e, e, 0.0, 0.0, e, e], "entry {k} time_ids");
+        }
+    }
+
+    /// sc-2127 / epic 2123 E7: the projection is the most expensive bucket, independent of order.
+    #[test]
+    fn dense_peak_sizes_for_the_largest_edge() {
+        let curve = |p: f64, _bf16: bool| 1.0 + p;
+        let (edge, gb) = dense_peak_for_edges(curve, &[1024, 512, 768], true);
+        assert_eq!(edge, 1024);
+        assert_eq!(gb, 1.0 + 128.0 * 128.0);
+    }
 }

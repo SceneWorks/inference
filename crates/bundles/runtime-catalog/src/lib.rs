@@ -690,6 +690,8 @@ pub struct TrainerCapabilitySnapshot {
     pub max_reference_images: u32,
     /// Honors `TrainingConfig::weight_noise_sigma` (epic 2123 weight noising, sc-24826).
     pub supports_weight_noise: bool,
+    /// Honors `TrainingConfig::resolution_buckets` (epic 2123 multi-resolution buckets, sc-2127).
+    pub supports_resolution_buckets: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -705,6 +707,7 @@ impl TrainerCapabilitySnapshot {
             supports_full_finetune: descriptor.supports_full_finetune,
             max_reference_images: descriptor.max_reference_images,
             supports_weight_noise: descriptor.techniques.weight_noise,
+            supports_resolution_buckets: descriptor.techniques.resolution_buckets,
         }
     }
 
@@ -720,6 +723,7 @@ impl TrainerCapabilitySnapshot {
             "supports_full_finetune": self.supports_full_finetune,
             "max_reference_images": self.max_reference_images,
             "supports_weight_noise": self.supports_weight_noise,
+            "supports_resolution_buckets": self.supports_resolution_buckets,
         })
     }
 }
@@ -1004,6 +1008,11 @@ mod tests {
         noisy.techniques.weight_noise = true;
         let noisy_json = TrainerCapabilitySnapshot::from_descriptor(&noisy).to_json();
         assert_eq!(noisy_json["supports_weight_noise"], true);
+        assert_eq!(json["supports_resolution_buckets"], false);
+        let mut bucketed = descriptor;
+        bucketed.techniques.resolution_buckets = true;
+        let bucketed_json = TrainerCapabilitySnapshot::from_descriptor(&bucketed).to_json();
+        assert_eq!(bucketed_json["supports_resolution_buckets"], true);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {

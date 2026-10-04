@@ -171,6 +171,24 @@ pub struct TrainingConfig {
     /// [`weight_noise`](TrainingTechniques::weight_noise), and by every trainer for a
     /// [`full_finetune`](Self::full_finetune) run — see [`validate_training_techniques`].
     pub weight_noise_sigma: f32,
+    /// **Multi-resolution buckets with per-bucket repeat counts** (epic 2123, sc-2127), ported from
+    /// ai-toolkit-perceptual's dataset `resolution: [..]` + `num_repeats: [..]` lists. Each dataset
+    /// item is cached once **per bucket** (square-cropped to that bucket's edge, which the trainer
+    /// floors to its latent stride exactly as it does [`resolution`](Self::resolution)), and every
+    /// epoch visits each item `repeats` times per bucket — so buckets `512/768/1024` with repeats
+    /// `16/4/1` train on a `16:4:1` per-image sample mix at those three latent sizes. The order is
+    /// a shuffle seeded from [`seed`](Self::seed) and the epoch index (E4), see [`BucketSchedule`].
+    ///
+    /// Empty (the default) is **off**: the trainer caches one latent per item at
+    /// [`resolution`](Self::resolution) and walks the cache round-robin exactly as before. A single
+    /// bucket is never shuffled, so a single bucket equal to today's resolution reproduces today's
+    /// sample order. A non-empty list is refused (typed [`crate::Error::Unsupported`]) by any
+    /// trainer whose [`TrainerDescriptor::techniques`] does not declare
+    /// [`resolution_buckets`](TrainingTechniques::resolution_buckets); a malformed list (a zero
+    /// resolution or repeat count, a duplicate resolution, more than [`MAX_RESOLUTION_BUCKETS`]) is
+    /// refused by [`validate_training_techniques`]. Memory pre-flights size for
+    /// [`max_training_resolution`](Self::max_training_resolution) (E7).
+    pub resolution_buckets: Vec<ResolutionBucket>,
 }
 
 impl Default for TrainingConfig {
@@ -216,8 +234,172 @@ impl Default for TrainingConfig {
             // Weight noising is OFF by default (epic 2123 E1): a caller that does not opt in trains
             // exactly as before.
             weight_noise_sigma: 0.0,
+            // Resolution buckets are OFF by default (epic 2123 E1): one bucket at `resolution`,
+            // walked round-robin exactly as before.
+            resolution_buckets: Vec::new(),
         }
     }
+}
+
+/// Most resolution buckets one training run may declare (epic 2123 sc-2127). Each bucket adds one
+/// cached latent per dataset item and one more latent size the trainer must fit, so the list is
+/// kept short; SceneWorks validates the same bound at submit time.
+pub const MAX_RESOLUTION_BUCKETS: usize = 8;
+
+/// One training resolution bucket (see [`TrainingConfig::resolution_buckets`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolutionBucket {
+    /// Square training edge in pixels, floored to the trainer's latent stride exactly like
+    /// [`TrainingConfig::resolution`].
+    pub resolution: u32,
+    /// How many times each item is visited at this resolution per epoch (`>= 1`).
+    pub repeats: u32,
+}
+
+impl TrainingConfig {
+    /// The buckets this run trains on: [`resolution_buckets`](Self::resolution_buckets) when set,
+    /// otherwise the single legacy bucket `{ resolution, repeats: 1 }`. Every trainer caches one
+    /// latent per item per returned bucket, in this order.
+    pub fn training_buckets(&self) -> Vec<ResolutionBucket> {
+        if self.resolution_buckets.is_empty() {
+            vec![ResolutionBucket {
+                resolution: self.resolution,
+                repeats: 1,
+            }]
+        } else {
+            self.resolution_buckets.clone()
+        }
+    }
+
+    /// The largest training edge of [`training_buckets`](Self::training_buckets) — the resolution
+    /// every memory pre-flight / estimate must size for (epic 2123 E7).
+    pub fn max_training_resolution(&self) -> u32 {
+        self.training_buckets()
+            .iter()
+            .map(|b| b.resolution)
+            .max()
+            .unwrap_or(self.resolution)
+    }
+}
+
+/// The per-step sample order over a bucketed latent cache (epic 2123 sc-2127).
+///
+/// Trainers cache `n_items × n_buckets` latents laid out item-major (`item * n_buckets + bucket`,
+/// buckets in [`TrainingConfig::training_buckets`] order) and ask
+/// [`cache_index`](Self::cache_index) which entry the `k`-th sample (0-based; usually `step - 1`)
+/// reads.
+///
+/// - **One bucket** — `k % n_items`, unshuffled: exactly the round-robin walk every trainer used
+///   before buckets existed, so a single bucket at today's resolution gives today's order. (A lone
+///   bucket's repeat count cannot change a one-bucket per-image mix, so it is not consulted.)
+/// - **Several buckets** — each epoch holds every `(item, bucket)` pair `repeats[bucket]` times
+///   (`epoch_len = n_items · Σ repeats`), shuffled with a Fisher–Yates permutation whose RNG is
+///   derived from the job seed and the epoch index (E4): reproducible, and a fresh order each
+///   epoch.
+#[derive(Clone, Debug)]
+pub struct BucketSchedule {
+    n_items: usize,
+    n_buckets: usize,
+    seed: u64,
+    /// One epoch's unshuffled `(item, bucket)` multiset (empty for the single-bucket walk).
+    epoch: Vec<(usize, usize)>,
+    /// The most recently shuffled epoch `(epoch index, order)`, so consecutive steps reuse one
+    /// permutation instead of reshuffling the whole epoch per sample.
+    shuffled: std::cell::RefCell<Option<ShuffledEpoch>>,
+}
+
+/// A shuffled epoch: `(epoch index, (item, bucket) order)`.
+type ShuffledEpoch = (usize, Vec<(usize, usize)>);
+
+impl BucketSchedule {
+    /// Build the schedule for `n_items` cached items over `buckets` (from
+    /// [`TrainingConfig::training_buckets`]).
+    pub fn new(n_items: usize, buckets: &[ResolutionBucket], seed: u64) -> Self {
+        let n_buckets = buckets.len().max(1);
+        let mut epoch = Vec::new();
+        if n_buckets > 1 {
+            for (b, bucket) in buckets.iter().enumerate() {
+                for item in 0..n_items {
+                    for _ in 0..bucket.repeats {
+                        epoch.push((item, b));
+                    }
+                }
+            }
+        }
+        Self {
+            n_items,
+            n_buckets,
+            seed,
+            epoch,
+            shuffled: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Number of buckets each item is cached at (the cache stride).
+    pub fn n_buckets(&self) -> usize {
+        self.n_buckets
+    }
+
+    /// Samples per epoch (`n_items` for one bucket; `n_items · Σ repeats` otherwise).
+    pub fn epoch_len(&self) -> usize {
+        if self.n_buckets == 1 {
+            self.n_items
+        } else {
+            self.epoch.len()
+        }
+    }
+
+    /// The `(item, bucket)` the `k`-th sample (0-based) trains on.
+    ///
+    /// # Panics
+    /// When the schedule is empty (no items); every trainer refuses an empty cache before looping.
+    pub fn sample(&self, k: usize) -> (usize, usize) {
+        let len = self.epoch_len();
+        assert!(len > 0, "BucketSchedule::sample on an empty schedule");
+        if self.n_buckets == 1 {
+            return (k % len, 0);
+        }
+        let (epoch_idx, pos) = (k / len, k % len);
+        let mut shuffled = self.shuffled.borrow_mut();
+        if let Some((cached_epoch, order)) = shuffled.as_ref() {
+            if *cached_epoch == epoch_idx {
+                return order[pos];
+            }
+        }
+        let order = self.shuffle_epoch(epoch_idx);
+        let sample = order[pos];
+        *shuffled = Some((epoch_idx, order));
+        sample
+    }
+
+    /// Epoch `epoch_idx`'s order: Fisher–Yates over a splitmix64 stream seeded from (job seed,
+    /// epoch index) — a pure function of both, so resume and re-runs see the same order.
+    fn shuffle_epoch(&self, epoch_idx: usize) -> Vec<(usize, usize)> {
+        let mut order = self.epoch.clone();
+        let mut state = self
+            .seed
+            .wrapping_add(0x5EED_B0C4_E7A0_0001)
+            .wrapping_add((epoch_idx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93));
+        for i in (1..order.len()).rev() {
+            let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        order
+    }
+
+    /// The cache entry (`item * n_buckets + bucket`) the `k`-th sample (0-based) reads.
+    pub fn cache_index(&self, k: usize) -> usize {
+        let (item, bucket) = self.sample(k);
+        item * self.n_buckets + bucket
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// One training example. Paths are resolved by the caller (the worker resolves the dataset's
@@ -430,12 +612,16 @@ pub struct TrainerDescriptor {
 pub struct TrainingTechniques {
     /// Honors [`TrainingConfig::weight_noise_sigma`] (relative-mode adapter weight noising).
     pub weight_noise: bool,
+    /// Honors [`TrainingConfig::resolution_buckets`] (multi-resolution buckets with per-bucket
+    /// repeat counts, sc-2127).
+    pub resolution_buckets: bool,
 }
 
 impl TrainingTechniques {
     /// No optional technique supported — every technique knob must stay at its off value.
     pub const NONE: Self = Self {
         weight_noise: false,
+        resolution_buckets: false,
     };
 }
 
@@ -449,6 +635,10 @@ impl TrainingTechniques {
 /// - `weight_noise_sigma > 0` with [`TrainingConfig::full_finetune`] ⇒ typed
 ///   [`crate::Error::Unsupported`]: weight noise perturbs adapter factors only and must never touch
 ///   base weights (E5).
+/// - `resolution_buckets` non-empty but malformed (a zero resolution or repeat count, a duplicate
+///   resolution, more than [`MAX_RESOLUTION_BUCKETS`]) ⇒ [`crate::Error::Msg`]; well formed on a
+///   trainer that lacks [`resolution_buckets`](TrainingTechniques::resolution_buckets) ⇒ typed
+///   [`crate::Error::Unsupported`].
 /// - every technique off ⇒ no-op.
 pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
@@ -475,6 +665,46 @@ pub fn validate_training_techniques(
                 desc.id
             )));
         }
+    }
+    validate_resolution_buckets(desc, &req.config.resolution_buckets)
+}
+
+/// Resolution-bucket half of [`validate_training_techniques`] (sc-2127): an empty list is off; a
+/// non-empty one must be well formed (`Msg`) and declared by the trainer (`Unsupported`).
+fn validate_resolution_buckets(
+    desc: &TrainerDescriptor,
+    buckets: &[ResolutionBucket],
+) -> crate::Result<()> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    if buckets.len() > MAX_RESOLUTION_BUCKETS {
+        return Err(crate::Error::Msg(format!(
+            "{}: resolution_buckets has {} buckets; at most {MAX_RESOLUTION_BUCKETS} are allowed",
+            desc.id,
+            buckets.len()
+        )));
+    }
+    for (i, b) in buckets.iter().enumerate() {
+        if b.resolution == 0 || b.repeats == 0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets[{i}] needs a resolution and a repeat count >= 1, got \
+                 resolution {} repeats {}",
+                desc.id, b.resolution, b.repeats
+            )));
+        }
+        if buckets[..i].iter().any(|p| p.resolution == b.resolution) {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets lists resolution {} twice",
+                desc.id, b.resolution
+            )));
+        }
+    }
+    if !desc.techniques.resolution_buckets {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: multi-resolution buckets (resolution_buckets) are not supported by this trainer",
+            desc.id
+        )));
     }
     Ok(())
 }
@@ -852,6 +1082,131 @@ mod tests {
             let err = validate_training_techniques(&noisy_desc, &r).unwrap_err();
             assert!(matches!(err, crate::Error::Msg(_)), "{bad}: {err:?}");
         }
+    }
+
+    fn rb(resolution: u32, repeats: u32) -> ResolutionBucket {
+        ResolutionBucket {
+            resolution,
+            repeats,
+        }
+    }
+
+    #[test]
+    fn validate_resolution_buckets_floor() {
+        // sc-2127 (epic 2123 E3): buckets are refused unless declared; malformed lists are refused
+        // regardless of support; an empty list is off everywhere.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut bucketed = trainer_desc(false);
+        bucketed.techniques.resolution_buckets = true;
+
+        let off = train_req(None, items);
+        assert!(off.config.resolution_buckets.is_empty());
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.resolution_buckets = vec![rb(512, 16), rb(768, 4), rb(1024, 1)];
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("resolution_buckets")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&bucketed, &on).is_ok());
+
+        let too_many: Vec<_> = (1..=MAX_RESOLUTION_BUCKETS as u32 + 1)
+            .map(|i| rb(256 * i, 1))
+            .collect();
+        for bad in [
+            vec![rb(512, 0)],
+            vec![rb(0, 1)],
+            vec![rb(512, 1), rb(512, 2)],
+            too_many,
+        ] {
+            let mut r = off.clone();
+            r.config.resolution_buckets = bad.clone();
+            let err = validate_training_techniques(&bucketed, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad:?}: {err:?}");
+        }
+        // The cap itself is accepted.
+        let mut at_cap = off.clone();
+        at_cap.config.resolution_buckets = (1..=MAX_RESOLUTION_BUCKETS as u32)
+            .map(|i| rb(256 * i, 1))
+            .collect();
+        assert!(validate_training_techniques(&bucketed, &at_cap).is_ok());
+    }
+
+    #[test]
+    fn training_buckets_default_to_the_legacy_resolution() {
+        let mut cfg = TrainingConfig {
+            resolution: 768,
+            ..TrainingConfig::default()
+        };
+        assert_eq!(cfg.training_buckets(), vec![rb(768, 1)]);
+        assert_eq!(cfg.max_training_resolution(), 768);
+        cfg.resolution_buckets = vec![rb(512, 16), rb(1024, 1), rb(768, 4)];
+        assert_eq!(cfg.training_buckets(), cfg.resolution_buckets);
+        assert_eq!(cfg.max_training_resolution(), 1024);
+    }
+
+    #[test]
+    fn single_bucket_schedule_is_the_legacy_round_robin() {
+        // AC: a single bucket equal to today's resolution gives today's sample order — the exact
+        // `cache[(step - 1) % cache.len()]` walk — whatever its repeat count.
+        for repeats in [1, 3] {
+            let s = BucketSchedule::new(5, &[rb(1024, repeats)], 42);
+            assert_eq!(s.n_buckets(), 1);
+            for k in 0..37 {
+                assert_eq!(s.cache_index(k), k % 5, "repeats {repeats} k {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_bucket_schedule_mixes_16_4_1_per_image() {
+        // AC: buckets 512/768/1024 with repeats 16/4/1 ⇒ each image is sampled 16:4:1 across the
+        // three buckets every epoch.
+        let buckets = [rb(512, 16), rb(768, 4), rb(1024, 1)];
+        let n_items = 3;
+        let s = BucketSchedule::new(n_items, &buckets, 7);
+        assert_eq!(s.epoch_len(), n_items * 21);
+        for epoch in 0..3 {
+            let mut counts = vec![[0usize; 3]; n_items];
+            for k in epoch * s.epoch_len()..(epoch + 1) * s.epoch_len() {
+                let (item, bucket) = s.sample(k);
+                counts[item][bucket] += 1;
+                assert_eq!(s.cache_index(k), item * 3 + bucket);
+            }
+            for (item, c) in counts.iter().enumerate() {
+                assert_eq!(*c, [16, 4, 1], "epoch {epoch} item {item}");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_bucket_schedule_is_seeded_and_reshuffled_per_epoch() {
+        // E4: the order is a pure function of the job seed; a different seed reorders; each epoch
+        // gets its own permutation.
+        let buckets = [rb(512, 2), rb(1024, 1)];
+        let order = |seed: u64, range: std::ops::Range<usize>| {
+            let s = BucketSchedule::new(4, &buckets, seed);
+            range.map(|k| s.sample(k)).collect::<Vec<_>>()
+        };
+        assert_eq!(order(11, 0..24), order(11, 0..24));
+        // The memoized epoch never leaks across epochs: random access matches a sequential walk.
+        let s = BucketSchedule::new(4, &buckets, 11);
+        let mut backwards: Vec<_> = (0..24).rev().map(|k| s.sample(k)).collect();
+        backwards.reverse();
+        assert_eq!(backwards, order(11, 0..24));
+        assert_ne!(order(11, 0..12), order(12, 0..12));
+        assert_ne!(order(11, 0..12), order(11, 12..24));
+        // Not the unshuffled multiset order.
+        let unshuffled: Vec<_> = (0..2)
+            .flat_map(|b| (0..4).flat_map(move |i| std::iter::repeat_n((i, b), [2, 1][b])))
+            .collect();
+        assert_ne!(order(11, 0..12), unshuffled);
     }
 
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {
