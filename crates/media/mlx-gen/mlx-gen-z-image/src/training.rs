@@ -35,8 +35,8 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
-    TrainAdapter,
+    accumulate_grads, apply_weight_noise, average_grads, build_lokr_targets, build_lora_targets,
+    LoraParams, TrainAdapter,
 };
 // Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
 // unchanged (the host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
@@ -115,6 +115,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // sc-24826 (epic 2123): honors `weight_noise_sigma` — `apply_weight_noise` after every
+        // optimizer update.
+        techniques: gen_core::train::TrainingTechniques { weight_noise: true },
     }
 }
 
@@ -237,6 +240,9 @@ impl Trainer for ZImageTurboTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would resolve
@@ -258,6 +264,9 @@ impl Trainer for ZImageTurboTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
+        // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -564,13 +573,7 @@ impl ZImageTurboTrainer {
                         .expect("an update fires only after accumulation"),
                     window,
                 )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
+                optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx)?;
                 update_idx += 1;
             }
 
@@ -675,6 +678,31 @@ impl ZImageTurboTrainer {
             final_loss: last_loss,
         })
     }
+}
+
+/// One real optimizer update over the (already window-averaged) adapter gradients: clip to unit
+/// global norm, step the optimizer, materialize the factors, then — epic 2123 weight noising
+/// (sc-24826) — perturb the freshly-stepped adapter factors by `cfg.weight_noise_sigma · rms(w)`
+/// noise seeded from `(cfg.seed, update_idx)`. Only ever called once per *update* (never per
+/// gradient-accumulation micro-step), and only `params` (adapter factors) is touched — the frozen
+/// base weights live in the transformer and are not reachable from here. At `sigma == 0` this is
+/// exactly the pre-sc-24826 update (clip → step → eval).
+fn optimizer_update(
+    opt: &mut TrainOptimizer,
+    params: &mut LoraParams,
+    avg_grads: &LoraParams,
+    cfg: &TrainingConfig,
+    update_idx: u32,
+) -> Result<()> {
+    let (clipped, _norm) = clip_grad_norm(avg_grads, 1.0)?;
+    let clipped: LoraParams = clipped
+        .into_iter()
+        .map(|(k, v)| (k, v.into_owned()))
+        .collect();
+    opt.step(params, &clipped)?;
+    eval(params.values())?;
+    apply_weight_noise(params, cfg.weight_noise_sigma, cfg.seed, update_idx)?;
+    Ok(())
 }
 
 /// Projected DENSE (non-block-checkpointed) first-step peak memory, in GB, as a function of the
@@ -1632,5 +1660,158 @@ mod validate_request_tests {
         assert!(with(|c| c.loss_type = "L1".into()).is_ok());
         // A default request (sigmoid / balanced / mse) is accepted.
         assert!(validate_request(&request(1, 100, 16)).is_ok());
+    }
+}
+
+/// sc-24826 (epic 2123 weight noising) — the Z-Image optimizer-update seam on a tiny synthetic
+/// adapter host: real `build_lora_targets`/`build_lokr_targets` factors, a real `TrainOptimizer`, and
+/// the same [`optimizer_update`] `train_impl` calls. Seconds, < 1 MB.
+#[cfg(test)]
+mod weight_noise_update_tests {
+    use super::*;
+    use mlx_gen::adapters::AdaptableLinear;
+
+    struct OneLin(AdaptableLinear);
+    impl AdaptableHost for OneLin {
+        fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+            (path == ["to_q"]).then_some(&mut self.0)
+        }
+        fn adaptable_paths(&self) -> Vec<String> {
+            vec!["to_q".to_string()]
+        }
+    }
+
+    fn host() -> OneLin {
+        let w =
+            random::normal::<f32>(&[64, 64], None, None, Some(&random::key(3).unwrap())).unwrap();
+        OneLin(AdaptableLinear::dense(w, None))
+    }
+
+    fn base_weight(h: &OneLin) -> Vec<f32> {
+        let (w, _) = h.0.dense_weight().expect("dense host");
+        eval([w]).unwrap();
+        w.as_slice::<f32>().to_vec()
+    }
+
+    fn vals(a: &Array) -> Vec<f32> {
+        eval([a]).unwrap();
+        a.as_slice::<f32>().to_vec()
+    }
+
+    fn rms(v: &[f32]) -> f64 {
+        (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+    }
+
+    /// Fixed synthetic gradients for every factor (sorted keys ⇒ deterministic).
+    fn grads(params: &LoraParams, update: u32) -> LoraParams {
+        let mut keys: Vec<_> = params.keys().cloned().collect();
+        keys.sort();
+        keys.into_iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let key = random::key(1000 + 31 * update as u64 + i as u64).unwrap();
+                let g = random::normal::<f32>(params[&k].shape(), None, None, Some(&key)).unwrap();
+                (k, g)
+            })
+            .collect()
+    }
+
+    fn setup(kind: NetworkType) -> (OneLin, TrainAdapter, LoraParams) {
+        let mut h = host();
+        let paths = vec!["to_q".to_string()];
+        let (adapter, params) = match kind {
+            NetworkType::Lora => {
+                let (t, p) = build_lora_targets(&mut h, &paths, 8, 7).unwrap();
+                (TrainAdapter::Lora { targets: t }, p)
+            }
+            NetworkType::Lokr => {
+                let (t, p) = build_lokr_targets(&mut h, &paths, 8, -1, 7).unwrap();
+                (TrainAdapter::Lokr { targets: t }, p)
+            }
+        };
+        (h, adapter, params)
+    }
+
+    fn run(kind: NetworkType, sigma: f32, updates: u32) -> (LoraParams, Vec<f32>, Vec<f32>) {
+        let (mut h, adapter, mut params) = setup(kind);
+        let base_before = base_weight(&h);
+        let cfg = TrainingConfig {
+            seed: 7,
+            weight_noise_sigma: sigma,
+            ..Default::default()
+        };
+        let mut opt = TrainOptimizer::from_config("adamw", 1e-2, 0.0).unwrap();
+        for u in 0..updates {
+            let g = grads(&params, u);
+            optimizer_update(&mut opt, &mut params, &g, &cfg, u).unwrap();
+            // Install exactly as a train step does — the base must survive it untouched.
+            adapter
+                .install(&mut h, &params, 8.0, 8.0, LOKR_DTYPE)
+                .unwrap();
+        }
+        (params, base_before, base_weight(&h))
+    }
+
+    /// AC1: a sigma-0.0125 update differs from the sigma-0 update by noise whose RMS is
+    /// `sigma · rms(w)` per adapter tensor (LoRA A/B and every LoKr factor), and the base weight is
+    /// bit-identical before and after training.
+    #[test]
+    fn sigma_noise_is_rms_relative_per_adapter_tensor_and_base_is_untouched() {
+        let sigma = 0.0125f32;
+        for kind in [NetworkType::Lora, NetworkType::Lokr] {
+            let (clean, _, _) = run(kind, 0.0, 1);
+            let (noisy, base_before, base_after) = run(kind, sigma, 1);
+            assert_eq!(base_before, base_after, "{kind:?}: base weight changed");
+            assert_eq!(clean.len(), noisy.len());
+            for (k, c) in &clean {
+                let c = vals(c);
+                let n = vals(&noisy[k]);
+                let delta: Vec<f32> = c.iter().zip(&n).map(|(a, b)| b - a).collect();
+                let ratio = rms(&delta) / (sigma as f64 * rms(&c));
+                assert!(
+                    (0.8..1.2).contains(&ratio),
+                    "{kind:?} {k}: delta rms / (sigma·rms(w)) = {ratio} (n={})",
+                    c.len()
+                );
+            }
+        }
+    }
+
+    /// AC3 (E1): with sigma 0 the update is bit-identical to the pre-sc-24826 update (clip → step →
+    /// eval, no noise call), over several updates.
+    #[test]
+    fn sigma_zero_update_matches_the_legacy_update_bit_for_bit() {
+        let (new, _, _) = run(NetworkType::Lora, 0.0, 3);
+        let (_, _, mut legacy) = setup(NetworkType::Lora);
+        let mut opt = TrainOptimizer::from_config("adamw", 1e-2, 0.0).unwrap();
+        for u in 0..3 {
+            let g = grads(&legacy, u);
+            let (clipped, _) = clip_grad_norm(&g, 1.0).unwrap();
+            let clipped: LoraParams = clipped
+                .into_iter()
+                .map(|(k, v)| (k, v.into_owned()))
+                .collect();
+            opt.step(&mut legacy, &clipped).unwrap();
+            eval(legacy.values()).unwrap();
+        }
+        for (k, v) in &legacy {
+            assert_eq!(vals(v), vals(&new[k]), "{k} differs at sigma 0");
+        }
+    }
+
+    /// E4: two seeded noisy runs produce the same adapter.
+    #[test]
+    fn seeded_noisy_runs_are_reproducible() {
+        let (a, _, _) = run(NetworkType::Lora, 0.0125, 3);
+        let (b, _, _) = run(NetworkType::Lora, 0.0125, 3);
+        for (k, v) in &a {
+            assert_eq!(vals(v), vals(&b[k]), "{k} not reproducible");
+        }
+    }
+
+    /// E3: the Z-Image MLX descriptor declares weight noise, so the shared floor accepts it.
+    #[test]
+    fn descriptor_declares_weight_noise() {
+        assert!(trainer_descriptor().techniques.weight_noise);
     }
 }

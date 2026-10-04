@@ -278,7 +278,7 @@ pub use ::core_llm;
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{
     LrSchedule, NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
-    TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingOutput, TrainingProgress, TrainingRequest, TrainingTechniques,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,

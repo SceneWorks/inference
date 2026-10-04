@@ -178,6 +178,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // every DiT weight and writes a full checkpoint rather than an adapter.
         supports_full_finetune: true,
         max_reference_images: 0,
+        techniques: gen_core::train::TrainingTechniques::NONE,
     }
 }
 
@@ -346,6 +347,9 @@ impl Trainer for MageFlowTrainer {
         // anyway so the capability claim and the acceptance stay one fact (and the conformance
         // suite's validate-honesty check exercises the same seam for every family).
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         // `lora_target_modules` only scopes the LoRA/LoKr adapter; a full base fine-tune trains every
@@ -370,6 +374,9 @@ impl Trainer for MageFlowTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
+        // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
