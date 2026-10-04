@@ -31,9 +31,16 @@ const UNKNOWN_BUDGET_GIB: f64 = 8.0;
 /// compares against in its `"[metal::malloc] … maximum allowed buffer size"` check, queried through
 /// MLX's own `device_info` C API so it reflects the *same* device MLX allocates on.
 pub fn max_buffer_length_gib() -> Option<f64> {
-    /// MLX `device_info` key for `MTLDevice.maxBufferLength`
-    /// (`mlx/backend/metal/device_info.cpp`).
-    const KEY: &[u8] = b"max_buffer_length\0";
+    // MLX device_info key for MTLDevice.maxBufferLength (metal/device_info.cpp).
+    device_info_bytes(b"max_buffer_length\0").map(|bytes| bytes as f64 / GIB)
+}
+
+/// Metal's actual recommended aggregate working set, in bytes, for host evidence admission.
+pub fn recommended_working_set_bytes() -> Option<u64> {
+    device_info_bytes(b"max_recommended_working_set_size\0")
+}
+
+fn device_info_bytes(key: &[u8]) -> Option<u64> {
     // SAFETY: `mlx_device_new`/`mlx_get_default_device`/`mlx_device_info_*` are plain C value-query
     // functions: they allocate opaque handles we free below, write through out-pointers, and read the
     // device's static property map. No aliasing of Rust-owned memory; the key is a static NUL-terminated
@@ -42,16 +49,16 @@ pub fn max_buffer_length_gib() -> Option<f64> {
         use std::os::raw::c_char;
         let mut dev = mlx_sys::mlx_device_new();
         let got_default = mlx_sys::mlx_get_default_device(&mut dev) == 0;
-        let mut cap: Option<f64> = None;
+        let mut cap = None;
         if got_default {
             let mut info = mlx_sys::mlx_device_info_new();
             if mlx_sys::mlx_device_info_get(&mut info, dev) == 0 {
                 let mut val: usize = 0;
-                if mlx_sys::mlx_device_info_get_size(&mut val, info, KEY.as_ptr() as *const c_char)
+                if mlx_sys::mlx_device_info_get_size(&mut val, info, key.as_ptr() as *const c_char)
                     == 0
                     && val > 0
                 {
-                    cap = Some(val as f64 / GIB);
+                    cap = Some(val as u64);
                 }
             }
             mlx_sys::mlx_device_info_free(info);

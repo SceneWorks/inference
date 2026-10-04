@@ -295,6 +295,8 @@ pub fn decode_latents(
     on_progress: &mut dyn FnMut(usize, usize),
 ) -> Result<DecodedAudio, VaeError> {
     latents.verify()?;
+    // Refuse a changed CUDA BF16 handle before staging decoder input on that device.
+    vae.check_cuda_bf16_math()?;
     let z = latents
         .to_decoder_input(vae.device())?
         .to_dtype(vae.dtype())?;

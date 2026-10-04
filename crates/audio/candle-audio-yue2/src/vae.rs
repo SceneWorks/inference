@@ -1,4 +1,4 @@
-//! Native FP32 port of the YuE2 Oobleck VAE (sc-22993) — `yue2/modeling_vae.py` at the pinned
+//! Native YuE2 Oobleck VAE (sc-22993) — `yue2/modeling_vae.py` at the pinned
 //! commit, for **both** published decoders (`m-a-p/YuE2-Vae`, the standard listening decoder, and
 //! `m-a-p/YuE2-Vae-legacy`, the benchmark decoder). The two releases share this architecture and
 //! config and differ in `release_variant` and in their **decoder** weights only: all 218 encoder
@@ -23,16 +23,19 @@
 //! SnakeBeta(x)    = x + (exp(β) + 1e-9)⁻¹ · sin²(exp(α) · x)          (log-scale α, β)
 //! ```
 //!
-//! Precision (epic E8): the released VAE is FP32-only — upstream refuses any other dtype and any
-//! non-F32 tensor — and so does this port: weights are loaded, weight-norm-folded and run in FP32,
-//! and a non-F32 tensor is a load error. There is no reduced-precision VAE path.
+//! Precision (epic E8): released checkpoints and weight-norm/Snake preparation are FP32.
+//! Resident weights and stage activations use the selected FP32 or BF16 dtype. CUDA BF16 VAEs
+//! route both convolution leaves through fixed-order reductions over native BF16 operands and
+//! cast each output once to BF16. FP32 is used only for the kernel accumulator, as for the prior
+//! GEMM path; the full decoder remains a genuine full-length run. A separate cuBLAS handle retains
+//! the existing fail-closed math-mode guard, but those convolution leaves do not call cuBLAS.
 //!
 //! Chunked decoding ([`Yue2Vae::decode_tiled`]) is upstream's exact-boundary halo/crop scheme:
 //! every tile carries at least [`Yue2Vae::required_halo`] latent frames of context on each side
 //! (derived from the decoder's actual layers by upstream's audited dependency-interval rule), and
 //! only each tile's core is kept — no crossfade, no smoothing, no zero padding of the song. The
-//! full decode ([`Yue2Vae::decode_full`]) is retained as the reference FP32 path for fidelity
-//! validation; the two agree to FP32 rounding.
+//! full decode ([`Yue2Vae::decode_full`]) is retained as the fidelity reference; full/tiled
+//! agreement is assessed under the selected dtype's numerical bounds.
 //!
 //! Loading goes through [`Yue2Vae::load`], which only accepts a [`VerifiedComponent`] for one of
 //! the two VAE components and loads only its verified `config.json` / `model.safetensors`.
@@ -41,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use candle_audio::candle_core::{self, DType, Device, Tensor, D};
+use candle_audio::candle_core::{self, DType, Device, DeviceLocation, Tensor, D};
 use candle_audio::neural_codec::fold_weight_norm;
 use serde_json::{json, Value};
 
@@ -97,6 +100,9 @@ pub enum VaeError {
     /// A decode memory budget is invalid or too small for any tile.
     #[error("YuE2 VAE decode budget: {0}")]
     MemoryBudget(String),
+    /// The dedicated CUDA BF16 VAE handle could not maintain its required math mode.
+    #[error("YuE2 VAE CUDA BF16 math policy: {0}")]
+    CudaMath(String),
     /// The caller cancelled between tiles.
     #[error("YuE2 VAE decode cancelled after {completed} of {total} tiles")]
     Cancelled {
@@ -111,6 +117,111 @@ pub enum VaeError {
 }
 
 type Result<T> = std::result::Result<T, VaeError>;
+
+#[cfg(any(feature = "cuda", test))]
+const CUDA_BF16_DISALLOW_REDUCED_REDUCTION: u32 = 16;
+
+pub(crate) fn dedicated_cuda_vae_ordinal(dtype: DType, location: DeviceLocation) -> Option<usize> {
+    match (dtype, location) {
+        (DType::BF16, DeviceLocation::Cuda { gpu_id }) => Some(gpu_id),
+        _ => None,
+    }
+}
+
+fn vae_device(device: &Device, dtype: DType) -> Result<(Device, bool)> {
+    let Some(gpu_id) = dedicated_cuda_vae_ordinal(dtype, device.location()) else {
+        return Ok((device.clone(), false));
+    };
+    #[cfg(feature = "cuda")]
+    {
+        // Candle gives each new device its own cuBLAS handle. The same ordinal retains CUDA's
+        // primary context and default stream; MoT and other audio providers keep their handle.
+        Ok((Device::new_cuda(gpu_id)?, true))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = gpu_id;
+        Err(VaeError::CudaMath("CUDA backend is not compiled".into()))
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+trait CudaBf16Math {
+    fn synchronize(&self) -> Result<()>;
+    fn current_mode(&self) -> Result<u32>;
+    fn set_disallow_reduced_reduction(&self) -> Result<()>;
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn configure_cuda_bf16_math(mode: &impl CudaBf16Math) -> Result<()> {
+    mode.synchronize()?;
+    let initial = mode.current_mode()?;
+    if initial != 0 {
+        return Err(VaeError::CudaMath(format!(
+            "new VAE handle started in mode {initial}, expected default 0"
+        )));
+    }
+    mode.set_disallow_reduced_reduction()?;
+    require_cuda_bf16_math(mode)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn require_cuda_bf16_math(mode: &impl CudaBf16Math) -> Result<()> {
+    let current = mode.current_mode()?;
+    if current != CUDA_BF16_DISALLOW_REDUCED_REDUCTION {
+        return Err(VaeError::CudaMath(format!(
+            "VAE handle mode {current}, expected disallow-reduced-reduction mode 16"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+impl CudaBf16Math for Device {
+    fn synchronize(&self) -> Result<()> {
+        Device::synchronize(self).map_err(VaeError::from)
+    }
+
+    fn current_mode(&self) -> Result<u32> {
+        use candle_core::cuda::cudarc::cublas::sys;
+
+        let cuda = self.as_cuda_device()?;
+        cuda.cuda_stream()
+            .context()
+            .bind_to_thread()
+            .map_err(|e| VaeError::CudaMath(format!("binding CUDA context: {e}")))?;
+        let blas = cuda.cublas_handle();
+        let mut current = u32::MAX;
+        // Read into a raw integer: a foreign/unknown enum discriminant must never become a Rust
+        // enum value. The policy rejects every value except the two modes it expects.
+        let status =
+            unsafe { sys::cublasGetMathMode(*blas.handle(), (&mut current as *mut u32).cast()) };
+        status
+            .result()
+            .map_err(|e| VaeError::CudaMath(format!("reading cuBLAS math mode: {e}")))?;
+        Ok(current)
+    }
+
+    fn set_disallow_reduced_reduction(&self) -> Result<()> {
+        use candle_core::cuda::cudarc::cublas::sys;
+
+        let cuda = self.as_cuda_device()?;
+        cuda.cuda_stream()
+            .context()
+            .bind_to_thread()
+            .map_err(|e| VaeError::CudaMath(format!("binding CUDA context: {e}")))?;
+        let blas = cuda.cublas_handle();
+        let status = unsafe {
+            sys::cublasSetMathMode(
+                *blas.handle(),
+                sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+            )
+        };
+        status
+            .result()
+            .map_err(|e| VaeError::CudaMath(format!("configuring cuBLAS math mode: {e}")))
+    }
+}
 
 /// One Oobleck stack's shape (`encoder_config` / `decoder_config`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -401,8 +512,26 @@ struct Conv {
     dilation: usize,
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn stable_bf16_convolution(dtype: DType, location: DeviceLocation) -> bool {
+    dtype == DType::BF16 && matches!(location, DeviceLocation::Cuda { .. })
+}
+
 impl Conv {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        let y = if stable_bf16_convolution(x.dtype(), x.device().location()) {
+            candle_quant_kernels::yue2_stable_conv::conv1d(
+                x,
+                &self.weight,
+                self.stride,
+                self.padding,
+                self.dilation,
+            )?
+        } else {
+            x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?
+        };
+        #[cfg(not(feature = "cuda"))]
         let y = x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?;
         match &self.bias {
             Some(b) => y.broadcast_add(&b.reshape((1, (), 1))?),
@@ -433,9 +562,16 @@ struct ConvT {
 
 impl ConvT {
     /// Runs the unpadded transposed conv and crops `padding` samples from each end — exactly torch's
-    /// `padding` semantics for a transposed conv, and it keeps Candle on its col2im fast path
-    /// (which requires `padding == 0`).
+    /// `padding` semantics. The CUDA BF16 leaf uses the fixed reduction; other dtypes retain
+    /// Candle's col2im path (which requires `padding == 0`).
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        let y = if stable_bf16_convolution(x.dtype(), x.device().location()) {
+            candle_quant_kernels::yue2_stable_conv::conv_transpose1d(x, &self.weight, self.stride)?
+        } else {
+            x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1)?
+        };
+        #[cfg(not(feature = "cuda"))]
         let y = x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1)?;
         let len = y.dim(D::Minus1)? - 2 * self.padding;
         y.narrow(D::Minus1, self.padding, len)?
@@ -818,6 +954,7 @@ pub struct Yue2Vae {
     encoder: Option<Vec<Layer>>,
     device: Device,
     dtype: DType,
+    cuda_bf16_math: bool,
 }
 
 impl Yue2Vae {
@@ -912,6 +1049,7 @@ impl Yue2Vae {
                 "YuE2 VAE stage dtype {dtype:?} is unsupported on {device:?}"
             )));
         }
+        let (device, cuda_bf16_math) = vae_device(device, dtype)?;
         let text = fs::read_to_string(config_path)
             .map_err(|e| VaeError::Config(format!("reading {}: {e}", config_path.display())))?;
         let config = VaeConfig::parse(&text)?;
@@ -931,7 +1069,7 @@ impl Yue2Vae {
             let mut map = BTreeMap::new();
             for (name, _) in st.tensors() {
                 if name.starts_with(prefix) {
-                    let t = st.load(&name, device)?;
+                    let t = st.load(&name, &device)?;
                     if t.dtype() != DType::F32 {
                         return Err(VaeError::Weights(format!(
                             "`{name}` is {:?}; the validated VAE requires FP32",
@@ -970,14 +1108,30 @@ impl Yue2Vae {
                 "tensors outside encoder./decoder.: {foreign:?}"
             )));
         }
+        // The weights and activations have already been cast to BF16. Configure only this
+        // unpublished VAE's dedicated handle; an error drops it without touching the shared
+        // audio/MoT handle. The mode remains fixed for the handle's entire lifetime.
+        if cuda_bf16_math {
+            #[cfg(feature = "cuda")]
+            configure_cuda_bf16_math(&device)?;
+        }
         Ok(Self {
             config,
             identity,
             decoder,
             encoder,
-            device: device.clone(),
+            device,
             dtype,
+            cuda_bf16_math,
         })
+    }
+
+    pub(crate) fn check_cuda_bf16_math(&self) -> Result<()> {
+        if self.cuda_bf16_math {
+            #[cfg(feature = "cuda")]
+            require_cuda_bf16_math(&self.device)?;
+        }
+        Ok(())
     }
 
     /// The validated config.
@@ -1057,9 +1211,10 @@ impl Yue2Vae {
         Ok(())
     }
 
-    /// The reference FP32 full decode: `[B, 64, T]` → unclamped `[B, 2, 1920·T − 64]`
+    /// Full decode in the selected dtype: `[B, 64, T]` → unclamped `[B, 2, 1920·T − 64]`
     /// (upstream `YuE2VAE.decode`).
     pub fn decode_full(&self, z: &Tensor) -> Result<Tensor> {
+        self.check_cuda_bf16_math()?;
         self.check_latent(z)?;
         Ok(forward_all(&self.decoder, &z.to_device(&self.device)?)?)
     }
@@ -1067,7 +1222,8 @@ impl Yue2Vae {
     /// Halo/crop tiled decode (upstream `YuE2VAE.decode_tiled`): tiles of `core_frames` latent
     /// frames, each decoded with `halo_frames` of context per side (at least
     /// [`Self::required_halo`]), cropped to its core and concatenated on the CPU. Returns the same
-    /// unclamped `[B, 2, 1920·T − 64]` waveform as [`Self::decode_full`] up to FP32 rounding.
+    /// unclamped `[B, 2, 1920·T − 64]` waveform as [`Self::decode_full`] within the selected
+    /// dtype's numerical bounds.
     /// `cancel` is polled before every tile; `on_progress(completed, total)` runs after each.
     pub fn decode_tiled(
         &self,
@@ -1077,6 +1233,7 @@ impl Yue2Vae {
         cancel: &dyn Fn() -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<Tensor> {
+        self.check_cuda_bf16_math()?;
         self.check_latent(z)?;
         if core_frames < 1 {
             return Err(VaeError::Input(
@@ -1100,6 +1257,11 @@ impl Yue2Vae {
                     completed: index,
                     total: tiles,
                 });
+            }
+            // The progress callback runs between tiles; refuse unexpected handle drift before
+            // the next GPU forward rather than continuing with a different reduction policy.
+            if index > 0 {
+                self.check_cuda_bf16_math()?;
             }
             let end = frames.min(start + core_frames);
             let left = start.saturating_sub(halo_frames);
@@ -1125,6 +1287,7 @@ impl Yue2Vae {
     /// Encode FP32 stereo audio `[B, 2, S]` (`S ≥ 1920`) to the posterior (upstream
     /// `YuE2VAE.encode(return_info=True)`). Requires [`VaeParts::Full`].
     pub fn encode(&self, audio: &Tensor) -> Result<Posterior> {
+        self.check_cuda_bf16_math()?;
         let encoder = self.encoder.as_ref().ok_or_else(|| {
             VaeError::Input("Encoder not loaded; reload with VaeParts::Full".into())
         })?;
@@ -1165,6 +1328,7 @@ impl Yue2Vae {
         audio: &Tensor,
         noise: Option<&Tensor>,
     ) -> Result<AcousticLatents> {
+        self.check_cuda_bf16_math()?;
         let audio = audio.to_dtype(DType::F32)?;
         let audio_sha256 = sha256_f32(&audio.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?);
         let posterior = self.encode(&audio.unsqueeze(0)?)?;
@@ -1186,7 +1350,212 @@ impl Yue2Vae {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::path::PathBuf;
+
+    #[test]
+    fn fixed_order_leaves_are_selected_only_for_cuda_bf16() {
+        assert!(stable_bf16_convolution(
+            DType::BF16,
+            DeviceLocation::Cuda { gpu_id: 0 }
+        ));
+        for location in [DeviceLocation::Cpu, DeviceLocation::Metal { gpu_id: 0 }] {
+            assert!(!stable_bf16_convolution(DType::BF16, location));
+        }
+        assert!(!stable_bf16_convolution(
+            DType::F32,
+            DeviceLocation::Cuda { gpu_id: 0 }
+        ));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an owned CUDA device; uses only committed tiny fixture weights"]
+    fn bf16_cuda_both_vae_variants_decode_full_tiled_and_encode() {
+        let device = Device::new_cuda(0).unwrap();
+        let base = latent_bct();
+        let z = Tensor::cat(&[&base, &base, &base], 2).unwrap();
+        for variant in [VaeVariant::Standard, VaeVariant::Legacy] {
+            let dir = fixture_dir().join("vae_tiny").join(variant_name(variant));
+            let identity = DecoderIdentity {
+                component_key: format!("tiny_{}", variant_name(variant)),
+                repo: "fixture/vae_tiny".into(),
+                revision: "fixture".into(),
+                release_variant: variant,
+                config_sha256: sha256_file(&dir.join("config.json")).unwrap(),
+                weights_sha256: sha256_file(&dir.join("model.safetensors")).unwrap(),
+            };
+            let vae = Yue2Vae::load_files_with_dtype(
+                &dir.join("config.json"),
+                &dir.join("model.safetensors"),
+                identity,
+                VaeParts::Full,
+                &device,
+                DType::BF16,
+            )
+            .unwrap();
+            let full = vae.decode_full(&z).unwrap();
+            assert_eq!(full.dtype(), DType::BF16);
+            let tiled = vae
+                .decode_tiled(&z, 4, DEFAULT_HALO_FRAMES, &|| false, &mut |_, _| {})
+                .unwrap();
+            assert_eq!(tiled.dtype(), DType::BF16);
+            let full_cpu = full
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap();
+            let tiled_cpu = tiled.to_dtype(DType::F32).unwrap();
+            assert!(max_abs_diff(&full_cpu, &tiled_cpu) <= 1.0 / 64.0);
+            let posterior = vae.encode(&full_cpu).unwrap();
+            assert_eq!(posterior.mean.dtype(), DType::BF16);
+            let mean = posterior
+                .mean
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap();
+            assert!(mean
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .all(|x| x.is_finite()));
+        }
+    }
+
+    struct MockMath {
+        mode: Cell<u32>,
+        gets: Cell<usize>,
+        sets: Cell<usize>,
+        fail_sync: bool,
+        fail_get_at: Option<usize>,
+        fail_set: bool,
+        armed_mode: u32,
+    }
+
+    impl MockMath {
+        fn new(mode: u32) -> Self {
+            Self {
+                mode: Cell::new(mode),
+                gets: Cell::new(0),
+                sets: Cell::new(0),
+                fail_sync: false,
+                fail_get_at: None,
+                fail_set: false,
+                armed_mode: CUDA_BF16_DISALLOW_REDUCED_REDUCTION,
+            }
+        }
+    }
+
+    impl CudaBf16Math for MockMath {
+        fn synchronize(&self) -> Result<()> {
+            if self.fail_sync {
+                Err(VaeError::CudaMath("sync failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn current_mode(&self) -> Result<u32> {
+            let call = self.gets.get() + 1;
+            self.gets.set(call);
+            if self.fail_get_at == Some(call) {
+                Err(VaeError::CudaMath("get failed".into()))
+            } else {
+                Ok(self.mode.get())
+            }
+        }
+
+        fn set_disallow_reduced_reduction(&self) -> Result<()> {
+            self.sets.set(self.sets.get() + 1);
+            if self.fail_set {
+                return Err(VaeError::CudaMath("set failed".into()));
+            }
+            self.mode.set(self.armed_mode);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_cuda_bf16_uses_a_dedicated_vae_handle() {
+        assert_eq!(
+            dedicated_cuda_vae_ordinal(DType::BF16, DeviceLocation::Cuda { gpu_id: 2 }),
+            Some(2),
+            "selected GPU ordinal must propagate rather than defaulting to zero"
+        );
+        assert_eq!(
+            dedicated_cuda_vae_ordinal(DType::BF16, DeviceLocation::Cpu),
+            None
+        );
+        assert_eq!(
+            dedicated_cuda_vae_ordinal(DType::BF16, DeviceLocation::Metal { gpu_id: 0 }),
+            None
+        );
+        assert_eq!(
+            dedicated_cuda_vae_ordinal(DType::F32, DeviceLocation::Cuda { gpu_id: 2 }),
+            None
+        );
+        let original = Device::Cpu;
+        let (selected, isolated) = vae_device(&original, DType::F32).unwrap();
+        assert!(!isolated);
+        assert!(original.same_device(&selected));
+    }
+
+    #[test]
+    fn cuda_bf16_handle_is_published_only_after_verified_configuration() {
+        let mode = MockMath::new(0);
+        configure_cuda_bf16_math(&mode).unwrap();
+        assert_eq!(mode.mode.get(), 16);
+        assert_eq!(mode.gets.get(), 2);
+        assert_eq!(mode.sets.get(), 1);
+
+        let mode = MockMath::new(2);
+        assert!(configure_cuda_bf16_math(&mode).is_err());
+        assert_eq!(
+            mode.sets.get(),
+            0,
+            "unexpected prior mode must not be overwritten"
+        );
+
+        let mut mode = MockMath::new(0);
+        mode.fail_sync = true;
+        assert!(configure_cuda_bf16_math(&mode).is_err());
+        assert_eq!(mode.gets.get(), 0);
+
+        let mut mode = MockMath::new(0);
+        mode.fail_get_at = Some(1);
+        assert!(configure_cuda_bf16_math(&mode).is_err());
+        assert_eq!(mode.sets.get(), 0);
+
+        let mut mode = MockMath::new(0);
+        mode.fail_set = true;
+        assert!(configure_cuda_bf16_math(&mode).is_err());
+        assert_eq!(mode.sets.get(), 1);
+
+        let mut mode = MockMath::new(0);
+        mode.fail_get_at = Some(2);
+        assert!(configure_cuda_bf16_math(&mode).is_err());
+        assert_eq!(mode.sets.get(), 1);
+
+        let mut mode = MockMath::new(0);
+        mode.armed_mode = 0;
+        assert!(configure_cuda_bf16_math(&mode).is_err());
+        assert_eq!(mode.gets.get(), 2);
+    }
+
+    #[test]
+    fn cuda_bf16_entry_refuses_mode_drift_and_readback_failure() {
+        let mode = MockMath::new(16);
+        require_cuda_bf16_math(&mode).unwrap();
+        mode.mode.set(0);
+        assert!(require_cuda_bf16_math(&mode).is_err());
+
+        let mut mode = MockMath::new(16);
+        mode.fail_get_at = Some(1);
+        assert!(require_cuda_bf16_math(&mode).is_err());
+    }
 
     pub(crate) fn sha256_file(path: &Path) -> Result<String> {
         crate::durable::sha256_file(path)

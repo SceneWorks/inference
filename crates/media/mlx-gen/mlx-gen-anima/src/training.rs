@@ -331,6 +331,7 @@ fn trainer_descriptor_for(variant: Variant) -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -404,6 +405,7 @@ impl Trainer for AnimaTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         if resolve_target_paths(&self.dit, &self.conditioner, &req.config).is_empty() {
             return Err(format!(
@@ -1125,6 +1127,7 @@ mod tests {
                     caption: "1girl, silver hair".into(),
                     control_image_path: None,
                     model_options: Default::default(),
+                    reference_image_paths: Vec::new(),
                 })
                 .collect(),
             config: TrainingConfig {

@@ -39,6 +39,8 @@
 //!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
+//! - [`yue2_stable_conv`] — YuE2 VAE BF16 convolution leaves with fixed-order FP32 accumulation
+//!   and BF16 operands/output across full and tiled decoder shapes.
 //!
 //! Device code is behind `cfg(feature = "cuda")`; a CPU or Metal build compiles the codec, the
 //! capability floors, the kernel descriptors and the fused primitives' input checks only.
@@ -54,6 +56,7 @@ pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
 pub mod nvrtc;
 pub mod sm120_gate;
+pub mod yue2_stable_conv;
 
 pub use cublaslt::{
     compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
@@ -100,7 +103,7 @@ pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSour
 
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
 /// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer, the length-aware
-/// decode attention and the indexed MoE GEMV.
+/// decode attention, the indexed MoE GEMV, and YuE2 VAE convolutions.
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
@@ -112,6 +115,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     cublaslt::NVFP4_QUANT_SRC,
     DECODE_ATTENTION_SRC,
     MOE_GEMV_SRC,
+    yue2_stable_conv::YUE2_STABLE_CONV_SRC,
 ];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 

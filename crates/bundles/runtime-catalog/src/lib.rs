@@ -685,6 +685,9 @@ pub struct TrainerCapabilitySnapshot {
     pub supports_lokr: bool,
     pub supports_control: bool,
     pub supports_full_finetune: bool,
+    /// Most ordered reference images one instruction-edit training item may carry (sc-24161);
+    /// `0` = the trainer refuses edit-pair datasets.
+    pub max_reference_images: u32,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -698,6 +701,7 @@ impl TrainerCapabilitySnapshot {
             supports_lokr: descriptor.supports_lokr,
             supports_control: descriptor.supports_control,
             supports_full_finetune: descriptor.supports_full_finetune,
+            max_reference_images: descriptor.max_reference_images,
         }
     }
 
@@ -711,6 +715,7 @@ impl TrainerCapabilitySnapshot {
             "supports_lokr": self.supports_lokr,
             "supports_control": self.supports_control,
             "supports_full_finetune": self.supports_full_finetune,
+            "max_reference_images": self.max_reference_images,
         })
     }
 }
@@ -959,6 +964,7 @@ mod tests {
             supports_lokr: false,
             supports_control: false,
             supports_full_finetune: true,
+            max_reference_images: 0,
         };
         let snapshot = TrainerCapabilitySnapshot::from_descriptor(&descriptor);
         let json = snapshot.to_json();
@@ -966,6 +972,7 @@ mod tests {
         assert_eq!(json["supports_lokr"], false);
         assert_eq!(json["supports_control"], false);
         assert_eq!(json["supports_full_finetune"], true);
+        assert_eq!(json["max_reference_images"], 0);
 
         let mut mutated = descriptor;
         mutated.supports_full_finetune = false;
@@ -973,6 +980,17 @@ mod tests {
             TrainerCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
             TrainerCapabilitySnapshot::from_descriptor(&mutated).to_json(),
             "a trainer descriptor mutation must change the machine-readable snapshot"
+        );
+
+        // sc-24161: the edit-pair reference cap is part of the advertised training surface.
+        let mut edit = descriptor;
+        edit.max_reference_images = 10;
+        let edit_json = TrainerCapabilitySnapshot::from_descriptor(&edit).to_json();
+        assert_eq!(edit_json["max_reference_images"], 10);
+        assert_ne!(
+            TrainerCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
+            edit_json,
+            "the reference cap must be anti-restamp protected"
         );
     }
 
