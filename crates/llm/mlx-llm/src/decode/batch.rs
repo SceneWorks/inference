@@ -146,6 +146,10 @@ pub(crate) fn generate_batch_with_observer(
         .collect();
 
     let mut cache = model.make_cache();
+    // Ownership events are recorded only for an attached campaign observer.
+    if observer.is_some() {
+        cache.record_events();
+    }
     let mut observed_cache_events = 0;
 
     // ---- Prefill: left-pad every prompt to `max_prompt` and run one batched forward. ----

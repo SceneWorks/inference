@@ -274,6 +274,12 @@ impl PrefixCache {
         self.store.reclaim_for(required, available)
     }
 
+    /// [`reclaim_for`](Self::reclaim_for) that never evicts the entry the last
+    /// [`restore`](Self::restore) hit (the most recently used), whose state the request reuses.
+    pub fn reclaim_for_keeping_latest(&mut self, required: u64, available: u64) -> u64 {
+        self.store.reclaim_for_keeping_latest(required, available)
+    }
+
     /// Request admission with the cache (E7): evict so the request and the snapshot it would
     /// leave behind (`snapshot_bytes`, an upper bound) fit, or run it without keeping one (see
     /// [`PrefixStore::admit`]).
@@ -610,6 +616,10 @@ pub(crate) fn generate_cached_with_observer(
     // Reuse the longest cached prefix (or start cold), then prefill only the uncached suffix.
     let (mut cache, matched_len) =
         request_cache(model, prompt_ids, prefix_cache, compressed, &mut observer)?;
+    // Ownership events are recorded only for an attached campaign observer.
+    if observer.is_some() {
+        cache.record_events();
+    }
     let mut observed_cache = ObservedCache::default();
     let suffix = input_ids(&prompt_ids[matched_len..]);
     let logits = model.decode_logits(&suffix, cache.as_mut(), matched_len as i32)?;

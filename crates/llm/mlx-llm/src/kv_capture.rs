@@ -215,6 +215,10 @@ impl KvCache for CaptureCache {
         self.inner.compressed_dense_fallback()
     }
 
+    fn record_events(&mut self) {
+        self.inner.record_events()
+    }
+
     fn update(
         &mut self,
         layer: usize,

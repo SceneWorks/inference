@@ -3857,6 +3857,26 @@ impl LlamaProvider {
                     total,
                 )
             });
+        // A compressed request looks its dense prefix up before admission, so the reclaim below
+        // never evicts the entry it is about to import (the restored cache shares the entry's
+        // buffers: it holds them, no copy).
+        let mut compressed_prefix = if prefix_route && compressed_format.is_some() {
+            self.prefix
+                .borrow_mut()
+                .restore::<ContiguousKvCache>(&prompt_ids, false)
+                .map_err(to_core)?
+        } else {
+            None
+        };
+        let keeps_hit = compressed_prefix.is_some();
+        let reclaim = |required: u64, available: u64| {
+            let mut prefix = self.prefix.borrow_mut();
+            if keeps_hit {
+                prefix.reclaim_for_keeping_latest(required, available)
+            } else {
+                prefix.reclaim_for(required, available)
+            }
+        };
         let available = core_llm::effective_memory_budget(
             core_llm::available_host_memory_bytes(),
             core_llm::operational_memory_override()?,
@@ -3871,7 +3891,7 @@ impl LlamaProvider {
                 .admit(required, snapshot_bytes, available)
         } else {
             core_llm::PrefixAdmission {
-                available: self.prefix.borrow_mut().reclaim_for(required, available),
+                available: reclaim(required, available),
                 snapshot: false,
             }
         };
@@ -3903,7 +3923,7 @@ impl LlamaProvider {
                 core_llm::available_host_memory_bytes(),
                 core_llm::operational_memory_override()?,
             )?;
-            let available = self.prefix.borrow_mut().reclaim_for(required, available);
+            let available = reclaim(required, available);
             core_llm::admit_request_memory_with_geometry(
                 admitted_prompt,
                 req.max_new_tokens,
@@ -4319,23 +4339,25 @@ impl LlamaProvider {
                                 admit_dense()?;
                             }
                             let mut cache: Box<dyn KvCache + '_> = cache;
-                            // A dense prefix hit is imported into the compressed cache by
-                            // quantize-on-append — never a reconstruction; a cache that declines
-                            // it prefills the whole prompt instead (sc-20681).
+                            // A dense prefix hit (looked up before admission) is imported into the
+                            // compressed cache by quantize-on-append — never a reconstruction —
+                            // from views of the stored entry's own buffers, no dense copy; a cache
+                            // that declines it prefills the whole prompt instead, by name
+                            // (sc-20681).
                             let mut reused = 0usize;
-                            if prefix_route {
-                                let restored = self
-                                    .prefix
-                                    .borrow_mut()
-                                    .restore::<ContiguousKvCache>(&prompt_ids, false)
-                                    .map_err(to_core)?;
-                                if let Some(restored) = restored {
-                                    let layers = restored.cache.export().map_err(to_core)?;
-                                    if let Some(layers) = layers {
-                                        if cache.import_prefix(&layers).map_err(to_core)? {
-                                            reused = restored.reused;
-                                        }
+                            if let Some(restored) = compressed_prefix.take() {
+                                let layers = restored.cache.share_live().map_err(to_core)?;
+                                let imported = match layers {
+                                    Some(layers) => {
+                                        cache.import_prefix(&layers).map_err(to_core)?
                                     }
+                                    None => false,
+                                };
+                                if imported {
+                                    reused = restored.reused;
+                                } else {
+                                    prefix_reason =
+                                        Some(core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED);
                                 }
                             }
                             if req.cancel.is_cancelled() {
@@ -8009,10 +8031,7 @@ pub(crate) mod tests {
         TextLlmRequest {
             messages: vec![Message::user("t3 t9 t40 t11 t3 t9 t40 t11 t7")],
             sampling: Sampling::greedy(),
-            // Since sc-20671 the Prism decoder computes in BF16, and this fixture's greedy run
-            // reaches a one-ulp near-tie (top-2 margin 0.0625) at step 16, which a multi-row
-            // verify or a prefix-hit suffix prefill may round either way: stop short of it.
-            max_new_tokens: 16,
+            max_new_tokens: 20,
             seed: Some(3),
             speculative: Some(speculative),
             ..Default::default()
@@ -8047,7 +8066,60 @@ pub(crate) mod tests {
             .is_none());
         assert!(provider.descriptor().capabilities.mtp.is_none());
         let (_, ids) = run(&provider, &prism_request(core_llm::Speculative::Off));
-        assert_eq!(ids.len(), 16);
+        assert_eq!(ids.len(), 20);
+    }
+
+    /// Per step of `req`'s plain greedy run on `provider`'s hybrid decoder: whether the step is a
+    /// BF16 near-tie — its top-2 logit margin within two BF16 ulps at the top logit's magnitude,
+    /// where a different (and equally correct) BF16 reduction order, a multi-row verify or a
+    /// prefix-hit suffix prefill, may pick the other token. Stepped token by token on the run's own
+    /// stream, the reference `off` is.
+    fn prism_near_ties(provider: &LlamaProvider, req: &TextLlmRequest, off: &[u32]) -> Vec<bool> {
+        let (_, mut ids) = provider.render_prompt(req, &req.messages).unwrap();
+        let Decoder::Qwen35(model) = &provider.model else {
+            panic!("a Prism snapshot loads the hybrid decoder");
+        };
+        let mut cache = model.new_cache();
+        let mut logits = model
+            .decode_logits(&crate::primitives::input_ids(&ids), &mut cache, 0)
+            .unwrap();
+        let mut near = Vec::with_capacity(off.len());
+        for &token in off {
+            let mut row = crate::primitives::nn::to_f32_host(&logits).unwrap();
+            row.sort_by(|a, b| b.total_cmp(a));
+            let ulp = (2f32).powi(row[0].abs().max(f32::MIN_POSITIVE).log2().floor() as i32 - 7);
+            near.push(row[0] - row[1] <= 2.0 * ulp);
+            ids.push(token as i32);
+            let offset = cache.offset();
+            logits = model
+                .decode_logits(
+                    &crate::primitives::input_ids(&[token as i32]),
+                    &mut cache,
+                    offset,
+                )
+                .unwrap();
+        }
+        near
+    }
+
+    /// `ids` is `off`'s greedy run up to its first BF16 near-tie ([`prism_near_ties`]) and may
+    /// part from it only there: the first differing step must be a near-tie of `off`'s, and with
+    /// no near-tie the runs are identical.
+    fn assert_bf16_greedy_parity(label: &str, ids: &[u32], off: &[u32], near_ties: &[bool]) {
+        assert_eq!(ids.len(), off.len(), "{label}: length");
+        match ids.iter().zip(off).position(|(a, b)| a != b) {
+            None => {}
+            Some(step) => assert!(
+                near_ties[step],
+                "{label}: diverged at step {step}, which is not a BF16 near-tie of the off run \
+                 (near-ties at {:?}): {ids:?} vs {off:?}",
+                near_ties
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &n)| n.then_some(i))
+                    .collect::<Vec<_>>()
+            ),
+        }
     }
 
     /// Story sc-24444 AC2: a Prism snapshot loaded with a companion head advertises MTP, and
@@ -8073,7 +8145,7 @@ pub(crate) mod tests {
         assert_eq!(advertised.recommended_depth, MLX_ROW.recommended_depths.mtp);
 
         let (off, off_ids) = run(&provider, &prism_request(Speculative::Off));
-        assert_eq!(off_ids.len(), 16);
+        assert_eq!(off_ids.len(), 20);
         let distinct: std::collections::BTreeSet<_> = off_ids.iter().collect();
         assert!(
             distinct.len() > 2,
@@ -8084,10 +8156,15 @@ pub(crate) mod tests {
             plain_loop(&provider, &prism_request(Speculative::Off))
         );
         assert_eq!(off.decode.unwrap().proposer, ProposerKind::None);
+        // Since sc-20671 the Prism decoder computes in BF16: the head's verify (a multi-row
+        // forward) and a prefix-hit prefill keep `off`'s tokens up to a BF16 near-tie — this
+        // fixture has one at step 16 — and may part only there. The f32 twin is strict
+        // (`prism_companion_head_in_f32_keeps_the_off_tokens_exactly`).
+        let near_ties = prism_near_ties(&provider, &prism_request(Speculative::Off), &off_ids);
         for depth in [1, 3, advertised.max_depth] {
             let req = prism_request(Speculative::proposer(SpeculativeProposer::Mtp, depth));
             let (out, ids) = run(&provider, &req);
-            assert_eq!(ids, off_ids, "depth {depth}");
+            assert_bf16_greedy_parity(&format!("depth {depth}"), &ids, &off_ids, &near_ties);
             let report = out.decode.expect("the engine reports its path");
             assert_eq!(report.proposer, ProposerKind::Mtp, "depth {depth}");
             assert_eq!(report.draft_tokens, Some(depth), "depth {depth}");
@@ -8107,6 +8184,46 @@ pub(crate) mod tests {
             .proposer(SpeculativeProposer::Mtp)
             .is_none());
         assert_eq!(run(&bare, &prism_request(Speculative::Off)).1, off_ids);
+    }
+
+    /// The f32 twin of the BF16 companion-head parity above: the same Prism fixture computing in
+    /// f32 keeps `off`'s greedy tokens exactly over the whole run — every MTP depth, `auto`, and a
+    /// prefix-cache hit — so the BF16 run's only allowance is its rounding.
+    #[test]
+    fn prism_companion_head_in_f32_keeps_the_off_tokens_exactly() {
+        use core_llm::Speculative;
+        crate::models::qwen35::with_compute_dtype(Dtype::Float32, || {
+            let fx = prism_load(None);
+            let spec = LoadSpec::dense(fx.target.to_str().unwrap())
+                .with_mtp_head(fx.head.to_str().unwrap());
+            let provider = LlamaProvider::load(&spec).unwrap();
+            let advertised = provider
+                .descriptor()
+                .capabilities
+                .proposer(SpeculativeProposer::Mtp)
+                .expect("the attached head is advertised");
+            let (_, off_ids) = run(&provider, &prism_request(Speculative::Off));
+            assert_eq!(off_ids.len(), 20);
+            assert_eq!(
+                off_ids,
+                plain_loop(&provider, &prism_request(Speculative::Off))
+            );
+            let (again, again_ids) = run(&provider, &prism_request(Speculative::Off));
+            assert!(
+                again.decode.unwrap().prefix_hit_tokens > 0,
+                "a prefix-cache hit"
+            );
+            assert_eq!(again_ids, off_ids, "the prefix-cache hit");
+            for depth in [1, 3, advertised.max_depth] {
+                let req = prism_request(Speculative::proposer(SpeculativeProposer::Mtp, depth));
+                assert_eq!(run(&provider, &req).1, off_ids, "depth {depth}");
+            }
+            assert_eq!(
+                run(&provider, &prism_request(Speculative::Auto)).1,
+                off_ids,
+                "auto"
+            );
+        })
     }
 
     /// Story sc-24444 AC2 / E2: a head whose geometry does not match, a missing head, and a head
@@ -8138,7 +8255,7 @@ pub(crate) mod tests {
             .proposer(SpeculativeProposer::Mtp)
             .is_none());
         let (out, ids) = run(&provider, &prism_request(Speculative::Off));
-        assert_eq!(ids.len(), 16);
+        assert_eq!(ids.len(), 20);
         assert!(out.decode.unwrap().fallbacks.is_empty());
         // An explicit MTP request (not advertised) decodes plainly with the reason named (E2,
         // never refused), and `auto` names why it ran no MTP by choosing prompt lookup.
@@ -8146,7 +8263,10 @@ pub(crate) mod tests {
             &provider,
             &prism_request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
         );
-        assert_eq!(mtp_ids, ids, "the plain path's tokens");
+        // BF16 (sc-20671): this run's prefill is a prefix-cache hit of the first's, which keeps
+        // its tokens up to a near-tie (`prism_near_ties`).
+        let near_ties = prism_near_ties(&provider, &prism_request(Speculative::Off), &ids);
+        assert_bf16_greedy_parity("the plain path's tokens", &mtp_ids, &ids, &near_ties);
         let mtp = mtp.decode.unwrap();
         assert_eq!(mtp.proposer, ProposerKind::None);
         assert_eq!(mtp.fallbacks.len(), 1, "{:?}", mtp.fallbacks);
@@ -8156,7 +8276,7 @@ pub(crate) mod tests {
             mtp.fallbacks
         );
         let (auto, auto_ids) = run(&provider, &prism_request(Speculative::Auto));
-        assert_eq!(auto_ids, ids);
+        assert_bf16_greedy_parity("auto", &auto_ids, &ids, &near_ties);
         assert_eq!(auto.decode.unwrap().proposer, ProposerKind::PromptLookup);
 
         let missing = LoadSpec::dense(fx.target.to_str().unwrap())
@@ -9822,6 +9942,7 @@ pub(crate) mod tests {
         // default cache retired one per growth into MLX's buffer cache, past the row's cap).
         let long_prompt = (0..600).map(|index| index % 31).collect::<Vec<_>>();
         let mut cache = chunked_prefill_cache(&model, long_prompt.len() + 64).unwrap();
+        KvCache::record_events(&mut cache);
         chunked_prefill(&model, &mut cache, &long_prompt, 64).unwrap();
         assert_eq!(cache.offset(), 600);
         assert!(
@@ -9835,6 +9956,7 @@ pub(crate) mod tests {
             Decoder::Causal(model) => model.new_cache(),
             Decoder::Qwen35(_) => unreachable!(),
         };
+        KvCache::record_events(&mut grown);
         chunked_prefill(&model, &mut grown, &long_prompt, 64).unwrap();
         assert!(
             grown
@@ -10352,7 +10474,18 @@ pub(crate) mod tests {
             speculative: Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 4)),
             ..Default::default()
         };
-        let output = provider.generate(&request, &mut |_| {}).unwrap();
+        // The same request run plainly on the compressed cache: the tokens speculation must keep.
+        let off_request = TextLlmRequest {
+            speculative: Some(Speculative::Off),
+            ..request.clone()
+        };
+        let (off, off_ids) = run(&provider, &off_request);
+        assert!(off.kv_cache.as_ref().is_some_and(|kv| kv.ran_compressed()));
+        let (output, ids) = run(&provider, &request);
+        assert_eq!(
+            ids, off_ids,
+            "speculation on the compressed cache keeps the plain tokens"
+        );
         let kv = output.kv_cache.expect("a generation reports its KV cache");
         assert!(kv.ran_compressed(), "{kv:?}");
         assert!(kv.counters.fused_attention_calls > 0, "{kv:?}");
@@ -10368,6 +10501,97 @@ pub(crate) mod tests {
             Some(core_llm::PREFIX_COMPRESSED_NOT_STORED)
         );
         assert!(provider.prefix.borrow().is_empty(), "nothing was stored");
+    }
+
+    /// The Qwen3 fixture at its compressed qualification row, and the row's minimum context.
+    fn qualified_qwen3_fixture() -> (tempfile::TempDir, usize) {
+        let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
+            .iter()
+            .find(|row| row.family == core_llm::KvModelFamily::Qwen3)
+            .unwrap();
+        let snapshot = tiny_snapshot_with(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            row.min_context_tokens + 1024,
+            true,
+            CONTEXT_SENSITIVE_GAINS,
+        );
+        (snapshot, usize::try_from(row.min_context_tokens).unwrap())
+    }
+
+    /// Dense → compressed prefix reuse (sc-24437 × sc-20681): a dense turn stores its KV; the
+    /// compressed turn of the same prompt hits it — imported into the compressed cache, so only
+    /// the suffix is prefilled — and decodes exactly a cold compressed run's tokens, while the
+    /// store is left as the dense turn left it (a compressed cache never re-enters it).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_compressed_turn_imports_the_dense_turns_prefix() {
+        use core_llm::KvCompressionPolicy as Policy;
+        let (snapshot, words) = qualified_qwen3_fixture();
+        const NEW: u32 = 12;
+        let cold = load_tiny(&snapshot);
+        let (cold_out, _, cold_ids) =
+            kv_generate_words(&cold, words, (7, 26), Policy::Qualified, NEW);
+        assert!(cold_out.kv_cache.unwrap().ran_compressed());
+        assert_eq!(cold_out.decode.unwrap().prefix_hit_tokens, 0);
+
+        let provider = load_tiny(&snapshot);
+        kv_generate(&provider, words, Policy::Off, NEW);
+        let stored = (
+            provider.prefix.borrow().keys(),
+            provider.prefix.borrow().resident_bytes(),
+        );
+        assert_eq!(stored.0.len(), 1, "the dense turn stores its KV");
+        let (out, prompt_ids, ids) =
+            kv_generate_words(&provider, words, (7, 26), Policy::Qualified, NEW);
+        let kv = out.kv_cache.unwrap();
+        assert!(kv.ran_compressed(), "{kv:?}");
+        let decode = out.decode.unwrap();
+        assert_eq!(decode.prefix_cache.path, "hit", "{decode:?}");
+        assert_eq!(decode.prefix_hit_tokens as usize, prompt_ids.len() - 1);
+        assert_eq!(
+            decode.prefix_cache.reason.as_deref(),
+            Some(core_llm::PREFIX_COMPRESSED_NOT_STORED)
+        );
+        assert_eq!(
+            ids, cold_ids,
+            "the imported prefix decodes the cold compressed run"
+        );
+        assert_eq!(
+            (
+                provider.prefix.borrow().keys(),
+                provider.prefix.borrow().resident_bytes()
+            ),
+            stored,
+            "the compressed turn leaves the store unchanged"
+        );
+    }
+
+    /// A compressed turn whose cache declines the stored dense prefix (here: a reader its cache
+    /// cannot bind, so the selection runs dense) prefills the whole prompt and says so: no reuse
+    /// reported, the declined import named.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_declined_prefix_import_is_named_not_counted_as_reuse() {
+        use core_llm::KvCompressionPolicy as Policy;
+        let (snapshot, words) = qualified_qwen3_fixture();
+        let provider = load_tiny(&snapshot);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let reader =
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(UnbindableReader));
+        assert!(provider.kv_reader.set(Ok(reader)).is_ok());
+        kv_generate(&provider, words, Policy::Off, 4);
+        let out = kv_generate(&provider, words, Policy::Qualified, 4);
+        assert_eq!(
+            out.kv_cache.unwrap().fallback,
+            Some(core_llm::KvCacheFallbackReason::ReaderUnavailable)
+        );
+        let decode = out.decode.unwrap();
+        assert_eq!(decode.prefix_hit_tokens, 0, "{decode:?}");
+        assert_eq!(decode.prefix_cache.path, "miss", "{decode:?}");
+        assert_eq!(
+            decode.prefix_cache.reason.as_deref(),
+            Some(core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED)
+        );
     }
 
     #[cfg(target_os = "macos")]

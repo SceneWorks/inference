@@ -238,6 +238,12 @@ pub const PREFIX_COPY_FAILED: &str = "not kept: the snapshot copy failed";
 pub const PREFIX_COMPRESSED_NOT_STORED: &str =
     "not kept: a compressed KV cache is not stored (a dense hit is imported into it)";
 
+/// Why a compressed request's prefix-cache hit was not reused: its compressed KV cache declined to
+/// import the stored dense prefix (a refused selection runs dense, or the geometry does not
+/// match), so the whole prompt was prefilled on it.
+pub const PREFIX_COMPRESSED_IMPORT_DECLINED: &str =
+    "not reused: the compressed KV cache declined the stored dense prefix";
+
 /// Why a request on a paged KV cache keeps no snapshot: its blocks are shared through the pool's
 /// own copy-on-write, and the prefix cache does not copy them out.
 pub const PREFIX_PAGED_NOT_SNAPSHOTTED: &str = "not kept: paged KV backing is not snapshotted";
@@ -505,6 +511,18 @@ impl<S> PrefixStore<S> {
     pub fn reclaim_for(&mut self, required: u64, available: u64) -> u64 {
         let shortfall = required.saturating_sub(available);
         if shortfall == 0 || shortfall > self.resident_bytes {
+            return available;
+        }
+        available.saturating_add(self.evict_at_least(shortfall))
+    }
+
+    /// [`reclaim_for`](Self::reclaim_for) that never evicts the most-recently-used entry — the one
+    /// a [`lookup`](Self::lookup) just hit, whose state the request is about to reuse (an evicted
+    /// entry would leave its bytes held by the request yet counted as freed).
+    pub fn reclaim_for_keeping_latest(&mut self, required: u64, available: u64) -> u64 {
+        let kept = self.entries.back().map_or(0, |e| e.bytes);
+        let shortfall = required.saturating_sub(available);
+        if shortfall == 0 || shortfall > self.resident_bytes - kept {
             return available;
         }
         available.saturating_add(self.evict_at_least(shortfall))
@@ -799,6 +817,24 @@ mod store_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reclaim beside a hit never evicts the hit entry (the most recently used): what the other
+    /// entries free is all it can grant, and a shortfall they cannot cover evicts nothing.
+    #[test]
+    fn reclaim_keeping_latest_never_evicts_the_hit_entry() {
+        let mut store = PrefixStore::new(1_000);
+        store.insert(vec![1, 2], PrefixReuse::AnyPrefix, 100, "old");
+        store.insert(vec![7, 8], PrefixReuse::AnyPrefix, 300, "hit");
+        assert!(store.lookup(&[7, 8, 9], |_| Some(2)).is_some());
+        assert_eq!(store.reclaim_for_keeping_latest(500, 450), 550);
+        assert_eq!(store.keys(), vec![&[7, 8][..]]);
+        assert_eq!(
+            store.reclaim_for_keeping_latest(500, 450),
+            450,
+            "nothing left to free"
+        );
+        assert_eq!(store.keys(), vec![&[7, 8][..]]);
+    }
 
     /// E8: the shared pre-lookup rule — off, bypassed (named) for a multimodal prompt, else miss.
     #[test]

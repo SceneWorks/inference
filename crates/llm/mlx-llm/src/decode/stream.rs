@@ -241,6 +241,10 @@ pub(crate) fn generate_with_observer(
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let output = {
         let mut cache = decoder.make_cache();
+        // Ownership events are recorded only for an attached campaign observer.
+        if observer.is_some() {
+            cache.record_events();
+        }
         let mut observed_cache = ObservedCache::default();
         // Prefill the whole prompt at offset 0; logits are for the last prompt position.  The
         // observation is deliberately after dispatch so a sampler sees the actual prefill peak.
@@ -1390,6 +1394,8 @@ mod tests {
             has_mask: false,
         };
         let mut cache = select_decoder_cache_with_reader(request, handle).into_cache();
+        // What a campaign observer asks of the cache it observes (events are opt-in).
+        cache.record_events();
         let values = (0..64).map(|i| (i % 7) as f32 * 0.01).collect::<Vec<_>>();
         let kv = Array::from_slice(&values, &[1, 1, 1, 64])
             .as_dtype(mlx_rs::Dtype::Float16)

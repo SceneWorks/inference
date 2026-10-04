@@ -113,8 +113,9 @@ pub use paging::BlockAllocator;
 pub use prefix::{
     prefix_cache_budget, prefix_path_before_lookup, requested_prefix_cache_bytes, InsertOutcome,
     PrefixAdmission, PrefixHit, PrefixId, PrefixIndex, PrefixInsert, PrefixMatch, PrefixReuse,
-    PrefixStats, PrefixStore, PREFIX_COMPRESSED_NOT_STORED, PREFIX_COPY_FAILED,
-    PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED, PREFIX_PAGED_NOT_SNAPSHOTTED,
+    PrefixStats, PrefixStore, PREFIX_COMPRESSED_IMPORT_DECLINED, PREFIX_COMPRESSED_NOT_STORED,
+    PREFIX_COPY_FAILED, PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED,
+    PREFIX_PAGED_NOT_SNAPSHOTTED,
 };
 pub use prepare::{
     detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,

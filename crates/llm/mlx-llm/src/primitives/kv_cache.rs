@@ -259,6 +259,11 @@ pub trait KvCache {
         Ok(())
     }
 
+    /// Start recording campaign ownership events ([`ContiguousKvCache::events`]) — only a campaign
+    /// observer asks, before the cache's first mutation. Off by default: a production cache never
+    /// records.
+    fn record_events(&mut self) {}
+
     /// Downcast hook so a decoder can recover its concrete cache from a `&mut dyn KvCache` — the
     /// hybrid Qwen3.6 cache (recurrent linear-attention state + KV) is driven natively rather than
     /// through the softmax-only [`KvCache::update`] path.
@@ -343,7 +348,10 @@ pub struct ContiguousKvCache {
     layers: Vec<Option<LayerSlot>>,
     /// Growth granularity along the sequence axis.
     block: i32,
-    events: Vec<CacheEvent>,
+    /// Ownership events, recorded only once a campaign observer asked for them
+    /// ([`KvCache::record_events`]); `None` — no recording — on every production cache, so a
+    /// long generation never accumulates one event per layer per step.
+    events: Option<Vec<CacheEvent>>,
 }
 
 impl ContiguousKvCache {
@@ -358,7 +366,7 @@ impl ContiguousKvCache {
         assert!(block >= 1, "kv cache block must be at least one position");
         Self {
             layers: (0..num_layers).map(|_| None).collect(),
-            events: Vec::new(),
+            events: None,
             block,
         }
     }
@@ -391,16 +399,28 @@ impl ContiguousKvCache {
             .collect()
     }
 
-    /// Ownership events since construction, for the campaign producer only.
+    /// Ownership events since recording began ([`KvCache::record_events`]), for the campaign
+    /// producer only; empty when nothing asked for them.
     pub fn events(&self) -> &[CacheEvent] {
-        &self.events
+        self.events.as_deref().unwrap_or(&[])
+    }
+
+    /// Whether this cache records ownership events.
+    pub fn records_events(&self) -> bool {
+        self.events.is_some()
+    }
+
+    fn note(&mut self, event: CacheEvent) {
+        if let Some(events) = self.events.as_mut() {
+            events.push(event);
+        }
     }
 
     /// Drop the ownership events recorded so far — a cache kept beyond its request (a prefix-cache
     /// entry, sc-24437) carries no campaign evidence, which would otherwise grow with every update
     /// the request made and stay resident as long as the entry.
     pub(crate) fn clear_events(&mut self) {
-        self.events = Vec::new();
+        self.events = None;
     }
 
     /// Actual scalar width of the retained key/value arrays.
@@ -516,7 +536,7 @@ impl ContiguousKvCache {
                 })
                 .collect(),
             block: KV_BLOCK_TOKENS,
-            events: Vec::new(),
+            events: None,
         }
     }
 
@@ -602,7 +622,7 @@ impl ContiguousKvCache {
         Ok(Self {
             layers,
             block: self.block,
-            events: Vec::new(),
+            events: None,
         })
     }
 
@@ -705,7 +725,7 @@ impl KvCache for ContiguousKvCache {
             // pre-growth buffer, so that is the transient: recording old + new here would count
             // the new buffer twice against a peak floor of persistent + transient.
             if let Some(prior_bytes) = prior_bytes {
-                self.events.push(CacheEvent {
+                self.note(CacheEvent {
                     layer,
                     operation: "dense_block_growth_retired_buffer",
                     role: "output",
@@ -715,7 +735,7 @@ impl KvCache for ContiguousKvCache {
                 });
             }
         }
-        self.events.push(CacheEvent {
+        self.note(CacheEvent {
             layer,
             operation: "append",
             role: "cache",
@@ -786,7 +806,7 @@ impl KvCache for ContiguousKvCache {
                 })
             })?;
         if bytes > 0 {
-            self.events.push(CacheEvent {
+            self.note(CacheEvent {
                 layer: usize::MAX,
                 operation: "cache_release",
                 role: "cache",
@@ -799,6 +819,10 @@ impl KvCache for ContiguousKvCache {
             *slot = None;
         }
         Ok(())
+    }
+
+    fn record_events(&mut self) {
+        self.events.get_or_insert_with(Vec::new);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -930,6 +954,7 @@ mod tests {
     fn cache_events_account_for_block_growth_and_release() {
         on_cpu(|| {
             let mut cache = ContiguousKvCache::with_block_tokens(1, 4);
+            cache.record_events();
             let k0 = arange4(1, 2, 3, 4);
             cache.update(0, &k0, &k0).unwrap();
             let k1 = arange4(1, 2, 1, 4); // one new token
@@ -963,6 +988,35 @@ mod tests {
         })
     }
 
+    /// Ownership events are campaign evidence, recorded only once asked for: a production cache —
+    /// any number of updates, growths and a reset — holds none, so a long generation never grows
+    /// one event per layer per step; once asked, every update and release is recorded, and a
+    /// clone keeps recording.
+    #[test]
+    fn a_cache_records_events_only_once_asked() {
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::with_block_tokens(2, 4);
+            let one = arange4(1, 2, 1, 4);
+            for _ in 0..9 {
+                for layer in 0..2 {
+                    cache.update(layer, &one, &one).unwrap();
+                }
+            }
+            cache.reset().unwrap();
+            assert!(!cache.records_events());
+            assert!(cache.events().is_empty(), "{:?}", cache.events());
+
+            cache.record_events();
+            for layer in 0..2 {
+                cache.update(layer, &one, &one).unwrap();
+            }
+            assert_eq!(cache.events().len(), 2);
+            assert!(cache.clone().records_events());
+            cache.reset().unwrap();
+            assert_eq!(cache.events().last().unwrap().operation, "cache_release");
+        })
+    }
+
     /// A chunk that lands exactly on a block boundary, then growth: persistent + the largest
     /// transient equals the true coexistence peak (every layer's grown buffer plus one retired
     /// buffer), never the double-counted old + new.
@@ -971,6 +1025,7 @@ mod tests {
         on_cpu(|| {
             const LAYERS: usize = 2;
             let mut cache = ContiguousKvCache::with_block_tokens(LAYERS, 4);
+            cache.record_events();
             let chunk = arange4(1, 2, 4, 4); // lands exactly on the 4-token block boundary
             let one = arange4(1, 2, 1, 4);
             for layer in 0..LAYERS {
@@ -1121,6 +1176,7 @@ mod tests {
             // the result equals prefix + suffix in order.
             let prefix = arange4(1, 1, 5, 2);
             let mut cache = ContiguousKvCache::seeded(vec![(prefix.clone(), prefix.clone())]);
+            cache.record_events();
             assert_eq!(cache.offset(), 5);
             assert_eq!(cache.batch_size(), 1);
             let suffix = tok(99.0);

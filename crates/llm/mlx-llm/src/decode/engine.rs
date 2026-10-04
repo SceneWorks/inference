@@ -618,6 +618,10 @@ impl KvCache for BorrowedCache<'_> {
         self.0.begin_speculation()
     }
 
+    fn record_events(&mut self) {
+        self.0.record_events()
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self.0.as_any_mut()
     }
@@ -2367,6 +2371,61 @@ pub(crate) mod tests {
     /// constrained — on the Causal target (direct truncation) and the Qwen35 hybrid (its DeltaNet
     /// checkpoint ring, sc-24435: direct, never a replay forward), while actually proposing,
     /// accepting and rejecting.
+    /// The production decode records no cache ownership events (sc-20669 evidence is opt-in): a
+    /// run past a block growth — the engine's pipelined loop, then prompt lookup's verify and
+    /// rollback — leaves the caller's cache with none, while the same run on a cache asked to
+    /// record ([`KvCache::record_events`], what only a campaign observer does) records them.
+    #[test]
+    fn a_production_decode_records_no_cache_events() {
+        let model = causal();
+        let run = |record: bool, drafts: usize| {
+            let mut cache = model.new_cache();
+            if record {
+                cache.record_events();
+            }
+            let logits = SpeculativeTarget::forward(
+                &model,
+                &mut cache,
+                &input_ids(&PROMPT),
+                0,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap()
+            .logits;
+            let mut proposer = NgramProposer::default();
+            let mut plain = NoProposer;
+            let proposer: &mut dyn Proposer<CausalLm> = if drafts > 0 {
+                &mut proposer
+            } else {
+                &mut plain
+            };
+            generate_speculative(
+                &model,
+                proposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &PROMPT,
+                    position_delta: 0,
+                },
+                &greedy(300),
+                drafts,
+                &CancelFlag::new(),
+                &mut |_| {},
+                EngineOptions::default(),
+            )
+            .unwrap();
+            assert!(cache.offset() > 256, "the run crosses a block growth");
+            cache.events().len()
+        };
+        for drafts in [0, 3] {
+            assert_eq!(run(false, drafts), 0, "drafts {drafts}");
+            assert!(run(true, drafts) > 0, "drafts {drafts}");
+        }
+    }
+
     #[test]
     fn greedy_prompt_lookup_is_the_plain_loop_and_recovers_both_ways() {
         let causal = causal();
@@ -4253,9 +4312,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// `src` without its `#[cfg(...test...)] mod` blocks — the production code, wherever a test
+    /// module sits in the file (a `cfg(test)` module can precede production items).
+    fn without_test_modules(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim_start();
+            if line.starts_with("#[cfg(") && line.contains("test") {
+                // The item the attribute gates: past any further attributes and doc comments.
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let next = lines[j].trim_start();
+                    if next.starts_with("#[") || next.starts_with("///") || next.starts_with("//!")
+                    {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let item = lines.get(j).map_or("", |l| l.trim_start());
+                let is_mod =
+                    item.starts_with("mod ") || (item.starts_with("pub") && item.contains(" mod "));
+                if is_mod && item.trim_end().ends_with('{') {
+                    let mut depth = 0i64;
+                    let mut k = j;
+                    loop {
+                        depth += lines[k].matches('{').count() as i64;
+                        depth -= lines[k].matches('}').count() as i64;
+                        k += 1;
+                        if depth <= 0 || k >= lines.len() {
+                            break;
+                        }
+                    }
+                    i = k;
+                    continue;
+                }
+            }
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        }
+        out
+    }
+
     /// Every device-to-host read a decode loop makes goes through the counted sampling seam
     /// ([`SampledToken::resolve`], the sampler's row copy), so the AC2 counter sees them all: no
-    /// loop in `decode/` reads an array back itself. A source scan of the non-test code.
+    /// loop in `decode/` reads an array back itself. A source scan of the non-test code — every
+    /// line outside a `cfg(test)` module, before and after one.
     #[test]
     fn decode_loops_make_no_uncounted_host_read() {
         let sources = [
@@ -4276,13 +4381,19 @@ pub(crate) mod tests {
             "as_slice_unchecked",
         ];
         for (name, src) in sources {
-            let code = src
-                .split("\n#[cfg(test)]")
-                .next()
-                .unwrap()
-                .split("\n#[cfg(all(test")
-                .next()
-                .unwrap();
+            let code = without_test_modules(src);
+            // The scan covers the production code past the first `cfg(test)` item — the pipelined
+            // loop after engine.rs's test counters, the MTP proposer after proposers.rs's test
+            // accessor — and drops the test modules.
+            let sentinel = match name {
+                "engine.rs" => Some("fn pipelined_steps<"),
+                "proposers.rs" => Some("pub struct MtpProposer<"),
+                _ => None,
+            };
+            if let Some(sentinel) = sentinel {
+                assert!(code.contains(sentinel), "{name}: {sentinel} not scanned");
+            }
+            assert!(!code.contains("fn decode_loops_make_no_uncounted_host_read"));
             for read in host_reads {
                 assert!(
                     !code.contains(read),
