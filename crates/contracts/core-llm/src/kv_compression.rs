@@ -374,8 +374,8 @@ impl KvQualification {
 ///
 /// Evidence: terminal campaign run 37201786765 (inference `32dea7a3c`, SceneWorks `1f4bb8282`),
 /// with the group-affine-8 (A2) and dense noise-floor (NF) arms on the same UTC day and matching
-/// prompt hashes. The same run measured Llama-3.1-8B and Qwen3-8B, which both failed at K8V8 with
-/// real compression error rather than dense noise; neither has a row, so both stay dense
+/// prompt hashes. Llama-3.1-8B and Qwen3-8B were measured in run 37201786765 and fail the K8V8
+/// gates (Llama-8B on multi-turn, Qwen3-8B on greedy); both stay dense
 /// ([`KvCacheFallbackReason::UnqualifiedModel`]). History: A2 v5 run 37004025116 and noise-floor
 /// runs 37035827730 and 37076039109.
 pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
