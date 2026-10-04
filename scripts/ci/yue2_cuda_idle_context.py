@@ -456,7 +456,9 @@ def _empty_gpu0_summary(directory: Path) -> dict:
             row = rows.get(path)
             require(isinstance(row, dict) and "error" not in row,
                     f"empty-device {path} unavailable")
-            samples = [sample for sample in row.get("samples", [])
+            require(isinstance(row.get("samples"), list),
+                    f"empty-device {path} samples unavailable")
+            samples = [sample for sample in row["samples"]
                        if luid in sample.get("instance", "").lower()]
             require(all(str(sample.get("status")) == "0" and
                         type(sample.get("cookedValue")) in (int, float) and

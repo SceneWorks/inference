@@ -170,6 +170,7 @@ class EmptyDeviceTests(unittest.TestCase):
                         {"instance": f"pid_999_{LUID}_phys_0", "status": "0", "cookedValue": 0})),
                     ("windows-counters-1", lambda row: row["counters"][0]["samples"][0].__setitem__(
                         "cookedValue", 1)),
+                    ("windows-counters-1", lambda row: row["counters"][0].__setitem__("samples", None)),
                     ("windows-counters-1", lambda row: row["counters"][2].__setitem__("error", "unavailable")),
                     ("windows-counters-1", lambda row: row["counters"][3]["samples"][0].__setitem__(
                         "cookedValue", float("nan"))),
@@ -185,6 +186,27 @@ class EmptyDeviceTests(unittest.TestCase):
                         with self.assertRaises(RuntimeError):
                             idle._empty_gpu0_summary(root)
                         (root / f"{name}.json").write_bytes(original)
+                # Identical missing fields in every epoch are still missing
+                # telemetry, not a stable empty process/engine family.
+                for family in ("engine", "processDedicated"):
+                    with self.subTest(missing_samples=family):
+                        saved_counters = {}
+                        try:
+                            for index in range(3):
+                                path = root / f"windows-counters-{index}.json"
+                                saved_counters[path] = path.read_bytes()
+                                row = json.loads(saved_counters[path])
+                                required = {"engine": r"\GPU Engine(*)\Utilization Percentage",
+                                            "processDedicated": r"\GPU Process Memory(*)\Dedicated Usage"}
+                                selected = next(item for item in row["counters"]
+                                                if item["counter"] == required[family])
+                                selected.pop("samples")
+                                path.write_text(json.dumps(row), encoding="utf-8")
+                            with self.assertRaisesRegex(RuntimeError, "samples unavailable"):
+                                idle._empty_gpu0_summary(root)
+                        finally:
+                            for path, original in saved_counters.items():
+                                path.write_bytes(original)
                 # A stable Windows counter reservation is allowed; actual
                 # selected-card NVML residency still must remain zero.
                 names = [*(f"gpu-sample-{index}" for index in range(3)),
