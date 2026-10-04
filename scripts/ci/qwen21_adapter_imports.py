@@ -29,10 +29,14 @@ def validate_manifest(manifest):
         receipt = (manifest.get("purpose") == "DIAGNOSTIC_ONLY"
                    and entry.get("name") == "training_receipt"
                    and entry.get("kind") == "diagnostic_training_receipt")
-        suffix = "json" if receipt else "safetensors"
+        replay = (manifest.get("purpose") == "DIAGNOSTIC_ONLY"
+                  and manifest.get("acceptanceEvidence") is False
+                  and entry.get("name") in ("q4_edit_base", "q4_edit_mlx_lokr")
+                  and entry.get("kind") == "q4_replay_png")
+        suffix = "json" if receipt else "png" if replay else "safetensors"
         if not re.fullmatch(rf"[A-Za-z0-9_-]+\.{suffix}", entry.get("file", "")):
             raise ValueError("adapter file must be one safe safetensors basename")
-        if entry.get("kind") not in ("lora", "lokr") and not receipt:
+        if entry.get("kind") not in ("lora", "lokr") and not (receipt or replay):
             raise ValueError("adapter kind must be lora or lokr")
         if not re.fullmatch(r"[0-9a-f]{64}", entry.get("sha256", "")):
             raise ValueError("adapter SHA-256 is required")

@@ -52,11 +52,23 @@ def collect_identity(messages, lock):
     }
 
 
+def collect_lib_test_identity(messages):
+    records = [m for m in messages if m.get("reason") == "compiler-artifact"
+               and m.get("target", {}).get("name") == "mlx_gen_qwen_image_2_1"
+               and m.get("target", {}).get("kind") == ["lib"]
+               and m.get("profile", {}).get("test") is True
+               and m.get("executable")]
+    if len(records) != 1:
+        raise ValueError("expected exactly one family-local cfg(test) library executable")
+    return file_identity(Path(records[0]["executable"]))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--messages", type=Path, required=True)
     parser.add_argument("--lock", type=Path, default=Path("Cargo.lock"))
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--test-target", choices=["lib"])
     args = parser.parse_args()
     messages = []
     for line in args.messages.read_text(encoding="utf-8").splitlines():
@@ -65,6 +77,8 @@ def main():
         except json.JSONDecodeError:
             pass  # cargo stderr diagnostics are preserved in the same log
     identity = collect_identity(messages, tomllib.loads(args.lock.read_text(encoding="utf-8")))
+    if args.test_target == "lib":
+        identity["libTestExecutable"] = collect_lib_test_identity(messages)
     args.out.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(identity, indent=2))
 
