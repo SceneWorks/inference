@@ -30,7 +30,18 @@ class PrecisionControlTests(unittest.TestCase):
         block = re.search(r"(?m)^concurrency:\n((?: +[^\n]*\n)+)", source)
         if block is None:
             raise AssertionError("workflow concurrency block missing")
-        return dict(line.strip().split(": ", 1) for line in block[1].splitlines())
+        settings = {}
+        current = None
+        for line in block[1].splitlines():
+            if line.startswith("  ") and not line.startswith("    "):
+                key, value = line.strip().split(": ", 1)
+                current = key if value == ">-" else None
+                settings[key] = "" if current else value
+            elif current and line.startswith("    "):
+                settings[current] += (" " if settings[current] else "") + line.strip()
+            else:
+                raise AssertionError("unexpected workflow concurrency layout")
+        return settings
 
     @staticmethod
     def concurrency_group(group, stage, run_id, scheduling="shared-host", receipt="", engine=""):
@@ -86,8 +97,16 @@ class PrecisionControlTests(unittest.TestCase):
                      "ltx25-quant-campaign.yml", "ltx25-quant-promotion.yml"):
             other = self.concurrency_settings(WORKFLOW.with_name(name).read_text(encoding="utf-8"))
             with self.subTest(workflow=name):
-                self.assertEqual(other["group"],
-                                 self.concurrency_group(group, "cuda", "101"))
+                if name == "real-weights.yml":
+                    self.assertEqual(other["group"],
+                                     "${{ github.event_name == 'workflow_dispatch' && "
+                                     "inputs.profile == 'qwen-image-2-1-lora-mlx' && "
+                                     "inputs.qwen_image_2_1_lora_runner == 'rw-starvector' && "
+                                     "'inference-real-weights-qwen21-primary-mac' || "
+                                     "'inference-real-weights-physical-host' }}")
+                else:
+                    self.assertEqual(other["group"],
+                                     self.concurrency_group(group, "cuda", "101"))
                 self.assertEqual(other["cancel-in-progress"], "false")
         app = self.concurrency_settings(
             WORKFLOW.with_name("yue2-app-precision-profile.yml").read_text(encoding="utf-8"))
