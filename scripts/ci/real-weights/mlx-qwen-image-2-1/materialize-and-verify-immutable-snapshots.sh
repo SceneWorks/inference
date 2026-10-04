@@ -1,36 +1,8 @@
 python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-# WHERE THE BYTES LAND (run 37121517158). On nax-macos-2 `~/.cache/huggingface/hub` resolves onto
-# /Volumes/Models, a separate volume that had ~3.6 GB free, while `df $HOME` (what the shared
-# headroom step prints) reported the 1 TiB Data volume -- so the fetch hit ENOSPC 75 s in with the
-# headroom record looking healthy. Print the RESOLVED location of every path the fetch writes to.
-# If the shared hub cannot hold this lane's ~66 GB, materialize into a cache-shaped hub under this
-# job's own RUNNER_TEMP (wiped by the runner after the job) rather than touching the shared cache.
-required_kib=$((70 * 1024 * 1024))
-for p in "$HOME/.cache" "$HOME/.cache/huggingface" "$MLX_GEN_MODELS_ROOT" "$HOME/.cache/huggingface/xet" "${HF_HOME:-}" "${HF_XET_CACHE:-}" "${TMPDIR:-}" "$RUNNER_TEMP"; do
-  [[ -n "$p" && -e "$p" ]] || continue
-  real="$(cd "$p" 2>/dev/null && pwd -P)"
-  echo "path: $p -> ${real:-?} (device $(stat -f %Sd "$p" 2>/dev/null || echo ?))"
-  df -h "${real:-$p}" 2>/dev/null | tail -n 1
-done
-hub_real="$(cd "$MLX_GEN_MODELS_ROOT" 2>/dev/null && pwd -P || echo "$MLX_GEN_MODELS_ROOT")"
-hub_free_kib="$(df -k "$hub_real" 2>/dev/null | awk 'NR == 2 { print $4 }')"
-if [[ -z "$hub_free_kib" || "$hub_free_kib" -lt "$required_kib" ]]; then
-  lane_hub="$RUNNER_TEMP/qwen-image-2-1-hub"
-  echo "::warning::shared hub $MLX_GEN_MODELS_ROOT -> $hub_real has ${hub_free_kib:-unknown} KiB free (< 70 GiB); materializing into job-temp $lane_hub instead"
-  mkdir -p "$lane_hub" "$RUNNER_TEMP/hf-xet"
-  export HF_XET_CACHE="$RUNNER_TEMP/hf-xet"
-  for v in MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT; do
-    tail_path="${!v#"$MLX_GEN_MODELS_ROOT"/}"
-    printf -v "$v" '%s' "$lane_hub/$tail_path"
-    export "$v"
-    echo "$v=${!v}" >> "$GITHUB_ENV"
-  done
-  MLX_GEN_MODELS_ROOT="$lane_hub"
-  export MLX_GEN_MODELS_ROOT
-  echo "MLX_GEN_MODELS_ROOT=$lane_hub" >> "$GITHUB_ENV"
-  echo "HF_XET_CACHE=$HF_XET_CACHE" >> "$GITHUB_ENV"
-  echo "job-temp hub $lane_hub (shared hub $hub_real had ${hub_free_kib:-?} KiB free)" > "$QWEN_IMAGE_2_1_RENDER_OUT/snapshot-location.txt"
-fi
+# The lane binds a task-owned persistent cache before this step. Record the actual filesystem.
+hub_real="$(cd "$MLX_GEN_MODELS_ROOT" && pwd -P)"
+df -h "$hub_real"
+echo "persistent hub $MLX_GEN_MODELS_ROOT -> $hub_real" > "$QWEN_IMAGE_2_1_RENDER_OUT/snapshot-location.txt"
 PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-2-1 --snapshot "$MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"
 PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-2-1-mlx-tiers --snapshot "$MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"
 # The optional third-party adapter (dispatch input `qwen_image_2_1_third_party_lora`). Pinned to a

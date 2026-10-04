@@ -59,6 +59,7 @@ pub mod reference;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod training;
+mod training_memory;
 pub mod transformer;
 pub mod vae;
 

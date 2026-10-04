@@ -137,6 +137,12 @@ on:
     - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
+      qwen_image_2_1_lora_phase:
+        description: "MLX 2.1 LoRA: bounded two-step probe, corrected edit, imports, or full campaign"
+        type: choice
+        required: false
+        default: full
+        options: [probe, edit, imports, full]
       profile:
         description: Real-weight profile to run
         type: choice
@@ -4926,6 +4932,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     timeout-minutes: 300
+    permissions:
+      contents: write # authenticated GET of hash-pinned unpublished transfer assets
     env:
       # Composed from the ONE `~/`-relative hub-root variable every macOS lane already shares; the
       # resolve step below expands the `~/` against whichever Mac claimed the job. The names on the
@@ -4935,6 +4943,7 @@ jobs:
       MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--SceneWorks--qwen-image-2-1-mlx/snapshots/1691de01c24a070131e0a28bf4c065fd027f4fe9
       # Through env, never interpolated into a script: the materialize step validates its shape.
       QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC: ${{ inputs.qwen_image_2_1_third_party_lora }}
+      QWEN_IMAGE_2_1_LORA_PHASE: ${{ inputs.qwen_image_2_1_lora_phase }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Resolve runner-local snapshot paths
@@ -4959,8 +4968,15 @@ jobs:
       # reads as build time in the step timings.
       - name: Build the Qwen-Image 2.1 MLX test binary
         run: cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration --no-run
+      - name: Prove trained velocity survives adapter save and reload
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
       - name: Materialize and verify immutable snapshots
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
+      - name: Materialize hash-pinned transferred adapters
+        if: inputs.qwen_image_2_1_lora_phase != 'probe'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-hash-pinned-transferred-adapters.sh
       - name: Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh
       - name: Keep the Qwen-Image 2.1 MLX evidence

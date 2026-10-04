@@ -10,9 +10,10 @@
 //! install runs, so every route gets the same adapters.
 
 use mlx_gen::adapters::loader::{apply_adapters_strict, ApplyReport};
-use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::Result;
+use mlx_rs::Dtype;
 
 use crate::model::MODEL_ID;
 
@@ -28,5 +29,28 @@ pub fn apply_qwen_image_2_1_adapters(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
 ) -> Result<ApplyReport> {
-    apply_adapters_strict(host, specs, MODEL_ID)
+    let report = apply_adapters_strict(host, specs, MODEL_ID)?;
+    // The trainer uses f32 master factors but computes with the folded factors cast to the
+    // DiT dtype. A saved master must follow that same path on reload: narrowing only the
+    // final f32 residual changes the trained velocity. Packed DiTs compute in bf16.
+    for path in host.adaptable_paths() {
+        let parts: Vec<_> = path.split('.').collect();
+        if let Some(linear) = host.adaptable_mut(&parts) {
+            let dtype = linear.weight_dtype().unwrap_or(Dtype::Bfloat16);
+            let adapters = linear
+                .adapters()
+                .iter()
+                .map(|adapter| match adapter {
+                    Adapter::Lora { a, b, scale } => Ok(Adapter::Lora {
+                        a: a.as_dtype(dtype)?,
+                        b: b.as_dtype(dtype)?,
+                        scale: *scale,
+                    }),
+                    other => Ok(other.clone()),
+                })
+                .collect::<mlx_gen::Result<Vec<_>>>()?;
+            linear.set_adapters(adapters);
+        }
+    }
+    Ok(report)
 }

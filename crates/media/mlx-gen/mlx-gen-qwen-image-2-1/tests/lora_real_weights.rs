@@ -23,6 +23,10 @@
 //! 4. [`third_party_lora_applies_strictly_and_moves_every_tier`] — a public third-party 2.1 LoRA
 //!    (operator-supplied via `QWEN_IMAGE_2_1_THIRD_PARTY_LORA`; the lane runs it only when the
 //!    dispatch names one).
+//! 5. [`imported_adapters_move_t2i_and_two_reference_edit_every_tier`] — the hash-pinned CUDA
+//!    LoRA/LoKr and preserved MLX 1000-step LoRA, plus this candidate's corrected edit LoKr in
+//!    `edit`/`full` phases, on both routes at every tier. `probe` runs two training steps per mode
+//!    without renders; `edit` reuses the completed T2I file; `imports` runs only donor/public cells.
 //!
 //! EVERY TEST WRITES ITS EVIDENCE BEFORE IT ASSERTS. The PNGs and the `<test>.json` metrics
 //! (per-render mean |Δ|, the learned-direction scores, MLX active peaks, process footprint and the
@@ -63,6 +67,7 @@ use mlx_gen::{
 use mlx_gen_qwen_image_2_1::memory_strategy::memory_strategy_contract;
 use mlx_gen_qwen_image_2_1::{provider_registry, QwenImage21Trainer, TRAINER_ID};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::e2e_real_weights::phys_footprint;
 
@@ -114,7 +119,7 @@ const EDIT_ADAPTER: &str = "qwen21_edit_lokr.safetensors";
 
 const T2I_EVAL_PROMPT: &str = "zxq style, a lighthouse on a rocky coast at dusk";
 const EDIT_INSTRUCTION: &str =
-    "zxq edit: invert the colours of image 1 and posterize them to the four grey levels of image 2";
+    "zxq edit: invert each RGB colour channel of image 1 independently, then quantize each channel to the four numeric levels 0, 85, 170, 255 shown in image 2; preserve the shapes and keep the result in colour";
 
 /// The T2I training style: concentric rings in exactly these three colours.
 const PALETTE: [[u8; 3]; 3] = [[0, 150, 150], [240, 120, 20], [250, 220, 60]];
@@ -161,6 +166,24 @@ fn env_u32(var: &str, default: u32) -> u32 {
                 .unwrap_or_else(|_| panic!("{var}={v} is not a u32"))
         })
         .unwrap_or(default)
+}
+
+fn training_steps(var: &str, default: u32) -> u32 {
+    let probe = std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1");
+    let steps = env_u32(var, if probe { 2 } else { default });
+    assert!(
+        steps > 0 && (!probe || steps <= 3),
+        "{var}: a probe requires 1–3 steps"
+    );
+    steps
+}
+
+#[test]
+fn edit_instruction_and_target_use_independent_rgb_levels() {
+    let source = image::RgbImage::from_pixel(1, 1, image::Rgb([0, 85, 170]));
+    assert_eq!(edit_transform(&source).get_pixel(0, 0).0, [255, 170, 85]);
+    assert!(EDIT_INSTRUCTION.contains("independently"));
+    assert!(EDIT_INSTRUCTION.contains("keep the result in colour"));
 }
 
 /// The three render tiers: the dense bf16 base, and the published packed q8 / q4 snapshots.
@@ -813,7 +836,7 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
             )
         })
         .collect();
-    let steps = env_u32("QWEN_IMAGE_2_1_LORA_T2I_STEPS", 1000);
+    let steps = training_steps("QWEN_IMAGE_2_1_LORA_T2I_STEPS", 1000);
     let req = TrainingRequest {
         items,
         config: TrainingConfig {
@@ -835,6 +858,17 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
         cancel: Default::default(),
     };
     let trained = train(&req, &guard, &adapters.join(T2I_ADAPTER), 10);
+
+    if std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1") {
+        assert!(
+            steps <= 3,
+            "a bounded probe must not train more than three steps"
+        );
+        write_json(&out_dir(), "t2i_probe", &trained.facts);
+        assert_trained("t2i probe", &trained, steps, false);
+        assert_preflight_covers_step("t2i probe", &trained);
+        return;
+    }
 
     let request = t2i_request();
     let mut cases = Vec::new();
@@ -955,7 +989,7 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
             )
         })
         .collect();
-    let steps = env_u32("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", 120);
+    let steps = training_steps("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", 120);
     let req = TrainingRequest {
         items,
         config: TrainingConfig {
@@ -977,6 +1011,17 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
         cancel: Default::default(),
     };
     let trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
+
+    if std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1") {
+        assert!(
+            steps <= 3,
+            "a bounded probe must not train more than three steps"
+        );
+        write_json(&out_dir(), "edit_probe", &trained.facts);
+        assert_trained("edit probe", &trained, steps, true);
+        assert_preflight_covers_step("edit probe", &trained);
+        return;
+    }
 
     // The held-out edit: a source the run never saw, the same key, the same instruction.
     let eval_src = edit_source(99, RENDER_EDGE);
@@ -1246,5 +1291,139 @@ fn third_party_lora_applies_strictly_and_moves_every_tier() {
             "{tier}: the third-party adapter moved the same-seed render by only {moved:.3}/255"
         );
         assert_overlay_not_underpredicted(tier, &case["base"], &case["adapted"]);
+    }
+}
+
+/// Hash-pinned CUDA LoRA/LoKr and the completed MLX 1000-step LoRA must install and move BOTH
+/// routes at all three tiers. Every cell is written before assertions; no missing environment
+/// or empty manifest may skip an advertised part of this matrix.
+#[test]
+#[ignore]
+fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
+    let manifest_path = PathBuf::from(
+        std::env::var("QWEN_IMAGE_2_1_IMPORT_MANIFEST")
+            .expect("set QWEN_IMAGE_2_1_IMPORT_MANIFEST to the materialized hash-pinned manifest"),
+    );
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let directory = PathBuf::from(manifest["directory"].as_str().unwrap());
+    let entries = manifest["adapters"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        3,
+        "the complete transfer matrix has three adapters"
+    );
+    let mut imports = Vec::new();
+    for entry in entries {
+        let file_name = entry["file"].as_str().unwrap();
+        assert!(Path::new(file_name).components().count() == 1);
+        let file = directory.join(file_name);
+        let actual = format!("{:x}", Sha256::digest(std::fs::read(&file).unwrap()));
+        assert_eq!(
+            actual,
+            entry["sha256"].as_str().unwrap(),
+            "transferred adapter hash"
+        );
+        let kind = match entry["kind"].as_str().unwrap() {
+            "lora" => AdapterKind::Lora,
+            "lokr" => AdapterKind::Lokr,
+            other => panic!("unknown transferred kind {other}"),
+        };
+        imports.push((entry["name"].as_str().unwrap(), file, kind));
+    }
+    assert_eq!(
+        imports
+            .iter()
+            .map(|x| x.0)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["cuda_lora", "cuda_lokr", "mlx_t2i_1000_steps"]
+            .into_iter()
+            .collect()
+    );
+    // The corrected edit run is a fourth identity produced by this same candidate. Keep its
+    // hash/provenance with the matrix, and exercise T2I too rather than relying on the edit
+    // learning check to certify both routes. An imports-only dispatch covers the pinned donors.
+    let corrected_edit = std::env::var("QWEN_IMAGE_2_1_CORRECTED_EDIT_ADAPTER")
+        .ok()
+        .map(|file| {
+            let file = PathBuf::from(file);
+            let metadata = safetensors_file_metadata(&file).unwrap();
+            assert_eq!(
+                metadata.get("trainingMode").map(String::as_str),
+                Some("edit")
+            );
+            assert_eq!(
+                metadata.get("family").map(String::as_str),
+                Some("qwen-image-2-1")
+            );
+            let sha = format!("{:x}", Sha256::digest(std::fs::read(&file).unwrap()));
+            imports.push(("mlx_corrected_edit_lokr", file.clone(), AdapterKind::Lokr));
+            json!({"file": file, "sha256": sha, "metadata": metadata,
+                "sourceCandidate": std::env::var("GITHUB_SHA").ok()})
+        });
+    let out = out_dir().join("imports");
+    std::fs::create_dir_all(&out).unwrap();
+    let guard = Footprint::start(&out);
+    let edit = GenerationRequest {
+        prompt: EDIT_INSTRUCTION.to_owned(),
+        conditioning: vec![Conditioning::MultiReference {
+            images: vec![
+                to_image(edit_source(99, RENDER_EDGE)),
+                to_image(edit_key(RENDER_EDGE)),
+            ],
+        }],
+        ..t2i_request()
+    };
+    let mut cases = Vec::new();
+    let mut images = Vec::new();
+    for (tier, quant) in tiers() {
+        for (mode, request) in [("t2i", t2i_request()), ("two_reference_edit", edit.clone())] {
+            let spec = tier_spec(tier, quant);
+            let (base, base_facts) = render(
+                &format!("{tier}_{mode}_base"),
+                &spec,
+                &request,
+                &guard,
+                &out,
+            );
+            for (name, file, kind) in &imports {
+                let label = format!("{tier}_{mode}_{name}");
+                let (adapted, adapted_facts) = render(
+                    &label,
+                    &spec.clone().with_adapters(vec![adapter(file, 1.0, *kind)]),
+                    &request,
+                    &guard,
+                    &out,
+                );
+                cases.push(json!({"tier": tier, "mode": mode, "adapter": name,
+                    "base": base_facts, "adapted": adapted_facts,
+                    "meanAbsDiff": mean_abs_diff(&adapted, &base),
+                    "paletteDistanceGain": palette_distance(&base) - palette_distance(&adapted),
+                }));
+                images.push((label, base.clone(), adapted));
+            }
+        }
+    }
+    write_json(
+        &out_dir(),
+        "imported_adapters",
+        &json!({"manifest": manifest, "correctedEditAdapter": corrected_edit, "renders": cases}),
+    );
+    assert_eq!(
+        cases.len(),
+        imports.len() * 6,
+        "every adapter × two routes × three tiers"
+    );
+    for ((label, base, adapted), case) in images.iter().zip(&cases) {
+        assert_sane(label, base);
+        assert_sane(label, adapted);
+        assert!(
+            case["meanAbsDiff"].as_f64().unwrap() >= ADAPTER_MOVES_FLOOR,
+            "{label}: imported adapter must move the same-seed render"
+        );
+        assert_overlay_not_underpredicted(label, &case["base"], &case["adapted"]);
+        if case["adapter"] == "mlx_t2i_1000_steps" && case["mode"] == "t2i" {
+            assert!(case["paletteDistanceGain"].as_f64().unwrap() >= PALETTE_DISTANCE_GAIN_FLOOR,
+                "{label}: the preserved 1000-step adapter must still move toward its learned palette");
+        }
     }
 }
