@@ -594,6 +594,7 @@ fn device_budget_bytes() -> u64 {
 /// [`crate::memory_strategy::AllocatorBounds`]: a run only ever tightens what a harness set.
 struct TrainingPoolBound {
     previous: usize,
+    effective: usize,
 }
 
 impl TrainingPoolBound {
@@ -603,7 +604,61 @@ impl TrainingPoolBound {
         if previous < limit {
             mlx_rs::memory::set_cache_limit(previous);
         }
-        Self { previous }
+        Self {
+            previous,
+            effective: previous.min(limit),
+        }
+    }
+}
+
+/// Explicit operator-owned diagnostic output; unset for normal training. These
+/// Foreground snapshots at existing serialized phase boundaries. MLX's scalar
+/// counters are not an atomic snapshot; no extra array evaluation or Metal sync
+/// is introduced for sampling. Background physical samples can only be aligned
+/// approximately by timestamp. No allocator limit or peak accounting is changed.
+fn training_memory_trace(
+    stage: &str,
+    preflight: Option<TrainingFootprint>,
+    cache_limit: Option<usize>,
+) {
+    use std::io::Write;
+    let Some(directory) = std::env::var_os("QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let event = serde_json::json!({
+        "unixMillis": time, "stage": stage,
+        "counterScope": "foreground_non_atomic_snapshot_no_added_eval_or_sync",
+        "activeBytes": mlx_rs::memory::get_active_memory(),
+        "cacheBytes": mlx_rs::memory::get_cache_memory(),
+        "peakActiveBytes": mlx_rs::memory::get_peak_memory(),
+        "mlxMemoryLimitBytes": mlx_rs::memory::get_memory_limit(),
+        "configuredCacheLimitBytes": if preflight.is_none() { cache_limit } else { None },
+    });
+    let write = || -> std::io::Result<()> {
+        if let Some(fp) = preflight {
+            std::fs::write(
+                directory.join("training-preflight.json"),
+                serde_json::json!({
+                    "peakBytes": fp.peak(), "captionBytes": fp.caption_phase,
+                    "latentBytes": fp.latent_phase, "trainBytes": fp.train_phase,
+                    "requestedCacheLimitBytes": cache_limit,
+                })
+                .to_string(),
+            )?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("training-stages.jsonl"))?;
+        writeln!(file, "{event}")
+    };
+    if let Err(error) = write() {
+        eprintln!("training memory diagnostic write failed: {error}");
     }
 }
 
@@ -1700,6 +1755,20 @@ impl QwenImage21Trainer {
                 training_footprint(&self.facts, &shape)
             );
         }
+        let derived = training_footprint(&self.facts, &shape);
+        training_memory_trace(
+            "preflight",
+            Some(derived),
+            Some(
+                usize::try_from(
+                    derived
+                        .train_phase
+                        .saturating_sub(self.facts.dit_elements * shape.compute_width)
+                        .max(1 << 30),
+                )
+                .unwrap_or(usize::MAX),
+            ),
+        );
         check_training_footprint(&self.facts, &shape, budget)?;
         // Bound MLX's freed-buffer pool for the rest of the run to the derived working set above
         // the DiT. Unbounded, the allocator pools every freed buffer up to ~0.95 x the device's
@@ -1708,13 +1777,13 @@ impl QwenImage21Trainer {
         // 100 GB phys_footprint ceiling). The render path bounds the pool per request the same way
         // (`memory_strategy::AllocatorBounds`, sc-24114); training bounds ONLY the cache, never
         // MLX's memory limit, so a figure the derived model rounds can never throttle a step.
-        let derived = training_footprint(&self.facts, &shape);
         let _pool = TrainingPoolBound::enter(
             derived
                 .train_phase
                 .saturating_sub(self.facts.dit_elements * shape.compute_width)
                 .max(1 << 30),
         );
+        training_memory_trace("pool_bound", None, Some(_pool.effective));
 
         // --- resume admission, before any model loads ---
         // The run's identity (sc-24163): its training config and its dataset fingerprint (item
@@ -1801,7 +1870,13 @@ impl QwenImage21Trainer {
             (branches, sample_caps, sample_neg)
             // `encoder` drops here: every caption is cached, the tower is idle from now on.
         };
+        training_memory_trace(
+            "caption_tower_dropped_before_clear",
+            None,
+            Some(_pool.effective),
+        );
         mlx_rs::memory::clear_cache();
+        training_memory_trace("caption_cache_cleared", None, Some(_pool.effective));
 
         // --- 2. latents: the VAE encodes each image ONCE; the encoder half is then dropped ---
         let mut vae = loader::load_vae(&self.root)?;
@@ -1833,7 +1908,13 @@ impl QwenImage21Trainer {
         }
         vae.drop_encoder();
         let vae: Option<QwenImage21Vae> = (!sample_caps.is_empty()).then_some(vae);
+        training_memory_trace(
+            "vae_encoder_dropped_before_clear",
+            None,
+            Some(_pool.effective),
+        );
         mlx_rs::memory::clear_cache();
+        training_memory_trace("latent_cache_cleared", None, Some(_pool.effective));
         // Cancelled during caching: nothing has trained, so write nothing (and skip the DiT load).
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1847,6 +1928,7 @@ impl QwenImage21Trainer {
         if transformer.compute_dtype() != compute_dtype {
             transformer.cast_weights(compute_dtype)?;
         }
+        training_memory_trace("dit_loaded", None, Some(_pool.effective));
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let rank = cfg.rank as f32;
@@ -1928,6 +2010,7 @@ impl QwenImage21Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            training_memory_trace(&format!("step_{step}_begin"), None, Some(_pool.effective));
             let item = &cache[((step - 1) as usize) % cache.len()];
             let t = sample_sigma(
                 &cfg.timestep_type,
@@ -1956,6 +2039,11 @@ impl QwenImage21Trainer {
                 },
             )?;
             last_loss = loss;
+            training_memory_trace(
+                &format!("step_{step}_gradients_returned"),
+                None,
+                Some(_pool.effective),
+            );
             steps_run = step;
             accumulate_grads(&mut accumulated, grads)?;
 
@@ -1986,6 +2074,11 @@ impl QwenImage21Trainer {
                 update_idx += 1;
             }
 
+            training_memory_trace(
+                &format!("step_{step}_before_progress"),
+                None,
+                Some(_pool.effective),
+            );
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,

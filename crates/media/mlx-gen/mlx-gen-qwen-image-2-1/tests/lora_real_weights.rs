@@ -38,9 +38,11 @@
 //! silently dropped it, a stacked strength that leaks into its neighbour); the JSON carries the
 //! measured margin so they can be re-sized from evidence.
 //!
-//! A footprint guard aborts the process above `QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB` (default 100 GB
-//! of `phys_footprint`): the host has been kernel-panicked by an unguarded MLX run before, and an
-//! abort is recoverable where a panic of the box is not.
+//! A physical watchdog admits training from its exact preflight, measured baseline overhead,
+//! available RAM and Metal working-set policy. Physical bytes are sampled in the background;
+//! allocator bytes are foreground stage snapshots with limited timestamp-based attribution. An
+//! explicit `QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB` further constrains that ceiling. Inference retains
+//! the 100 GB default. Aborts leave an exact-byte receipt before stopping the process.
 //!
 //! ```sh
 //! MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1/snapshots/790c9263… \
@@ -211,54 +213,211 @@ fn tier_spec(label: &str, quant: Option<Quant>) -> LoadSpec {
 
 /// A 50 ms `phys_footprint` sampler that keeps a resettable phase high-water mark and aborts the
 /// process above the ceiling (writing a marker into the evidence dir first).
+#[path = "support/physical_watchdog.rs"]
+mod physical_watchdog;
+
+fn host_census() -> (physical_watchdog::Host, Value) {
+    use std::process::Command;
+    let command = |program: &str, args: &[&str]| {
+        let result = Command::new(program)
+            .args(args)
+            .output()
+            .expect("host census command starts");
+        assert!(
+            result.status.success(),
+            "host census {program} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).expect("host census is UTF-8")
+    };
+    let total = command("sysctl", &["-n", "hw.memsize"])
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    let vm = command("vm_stat", &[]);
+    let pressure = command("sysctl", &["-n", "kern.memorystatus_vm_pressure_level"])
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    let pressure_query = command("memory_pressure", &["-Q"]);
+    // Once on the main thread before weights, matching e2e_real_weights::memory_line.
+    // Never read limits by changing them from the background sampler.
+    let cache_limit = mlx_rs::memory::set_cache_limit(0);
+    mlx_rs::memory::set_cache_limit(cache_limit);
+    let host = physical_watchdog::Host {
+        total,
+        available: physical_watchdog::reclaimable_bytes(&vm).unwrap(),
+        pressure,
+        recommended: mlx_gen::memory::recommended_working_set_bytes().unwrap_or(0),
+        mlx_limit: mlx_rs::memory::get_memory_limit() as u64,
+        baseline_physical: phys_footprint().0,
+        baseline_active: mlx_rs::memory::get_active_memory() as u64,
+        baseline_cache: mlx_rs::memory::get_cache_memory() as u64,
+        cache_limit: cache_limit as u64,
+    };
+    let receipt = json!({"totalBytes": host.total, "reclaimableBytes": host.available,
+        "recommendedWorkingSetBytes": host.recommended, "mlxMemoryLimitBytes": host.mlx_limit,
+        "initialCacheLimitBytes": host.cache_limit, "pressureLevel": pressure,
+        "baselinePhysBytes": host.baseline_physical, "baselineActiveBytes": host.baseline_active,
+        "baselineCacheBytes": host.baseline_cache, "vmStat": vm, "memoryPressureQuery": pressure_query,
+        "physicalSamplerScope": "background_physical_and_host_only_no_MLX_calls",
+        "allocatorAttribution": "foreground_non_atomic_stage_snapshots_joined_by_unixMillis_no_added_eval_or_sync"});
+    (host, receipt)
+}
+
 struct Footprint {
     phase_max: Arc<AtomicU64>,
+    ceiling: Arc<AtomicU64>,
+    explicit_cap: Option<u64>,
+    out: PathBuf,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Footprint {
     fn start(out: &Path) -> Self {
-        let ceiling_gb: f64 = std::env::var("QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB")
+        use std::io::Write;
+        let explicit_cap = std::env::var("QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB")
             .ok()
             .map(|v| {
-                v.parse()
-                    .expect("QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB is a number")
-            })
-            .unwrap_or(100.0);
-        let ceiling = (ceiling_gb * 1e9) as u64;
+                let gb: f64 = v
+                    .parse()
+                    .expect("physical ceiling is a finite positive number");
+                assert!(
+                    gb.is_finite() && gb > 0.0,
+                    "physical ceiling must be positive and finite"
+                );
+                (gb * 1e9) as u64
+            });
+        let (_, census) = host_census();
+        std::fs::write(
+            out.join("host-memory-census.json"),
+            serde_json::to_vec_pretty(&census).unwrap(),
+        )
+        .unwrap();
+        let ceiling = Arc::new(AtomicU64::new(explicit_cap.unwrap_or(100_000_000_000)));
         let phase_max = Arc::new(AtomicU64::new(0));
         let shared = phase_max.clone();
-        let marker = out.join("FOOTPRINT_CEILING_EXCEEDED.txt");
-        std::thread::spawn(move || loop {
-            let (fp, _) = phys_footprint();
-            shared.fetch_max(fp, Ordering::Relaxed);
-            if fp > ceiling {
-                let msg = format!(
-                    "phys_footprint {:.2} GB exceeded the {ceiling_gb:.1} GB ceiling; aborting \
-                     before the host does\n",
-                    fp as f64 / 1e9
-                );
-                eprint!("{msg}");
-                let _ = std::fs::write(&marker, &msg);
+        let shared_ceiling = ceiling.clone();
+        let directory = out.to_path_buf();
+        let (stop, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            // A failed sampler must stop the GPU process, not silently leave it unguarded.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut file =
+                    std::fs::File::create(directory.join("physical-allocator-samples.jsonl"))
+                        .unwrap();
+                let mut ticks = 0u64;
+                let mut pressure = census["pressureLevel"].as_u64().unwrap();
+                let mut available = census["reclaimableBytes"].as_u64().unwrap();
+                loop {
+                    // No MLX calls on this thread: upstream counters are plain C++ scalars.
+                    // Foreground stage snapshots align by timestamp with this physical trace.
+                    let (fp, lifetime) = phys_footprint();
+                    shared.fetch_max(fp, Ordering::Relaxed);
+                    if ticks.is_multiple_of(20) {
+                        let read = |program: &str, args: &[&str]| {
+                            std::process::Command::new(program)
+                                .args(args)
+                                .output()
+                                .ok()
+                                .filter(|v| v.status.success())
+                                .and_then(|v| String::from_utf8(v.stdout).ok())
+                        };
+                        pressure = read("sysctl", &["-n", "kern.memorystatus_vm_pressure_level"])
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        available = read("vm_stat", &[])
+                            .and_then(|v| physical_watchdog::reclaimable_bytes(&v).ok())
+                            .unwrap_or(0);
+                    }
+                    ticks += 1;
+                    let ceiling = shared_ceiling.load(Ordering::Relaxed);
+                    let sample = json!({
+                        "unixMillis": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+                        "physFootprintBytes": fp, "lifetimePhysPeakBytes": lifetime,
+                        "physicalCeilingBytes": ceiling, "pressureLevel": pressure,
+                        "reclaimableBytes": available,
+                    });
+                    writeln!(file, "{sample}").unwrap();
+                    file.flush().unwrap();
+                    if fp > ceiling || pressure != 1 || available == 0 {
+                        let message = format!("physical watchdog aborted: footprint={fp} bytes ceiling={ceiling} bytes pressure={pressure} available={available} bytes\n");
+                        eprint!("{message}");
+                        let _ = std::fs::write(
+                            directory.join("FOOTPRINT_CEILING_EXCEEDED.txt"),
+                            message,
+                        );
+                        let _ = std::fs::write(
+                            directory.join("physical-watchdog-abort.json"),
+                            serde_json::to_vec_pretty(&sample).unwrap(),
+                        );
+                        std::process::abort();
+                    }
+                    match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => break,
+                    }
+                }
+            }));
+            if result.is_err() {
+                let message = "physical watchdog sampler failed; refusing unguarded GPU work\n";
+                eprint!("{message}");
+                let _ = std::fs::write(directory.join("MEMORY_SAMPLER_FAILED.txt"), message);
                 std::process::abort();
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
         });
-        Self { phase_max }
+        Self {
+            phase_max,
+            ceiling,
+            explicit_cap,
+            out: out.to_path_buf(),
+            stop: Some(stop),
+            handle: Some(handle),
+        }
     }
 
-    /// Start a phase: reset MLX's active-peak counter and the footprint high-water mark.
+    fn admit_training(&self, preflight: &Value) {
+        let (mut host, census) = host_census();
+        host.cache_limit = host
+            .cache_limit
+            .min(preflight["requestedCacheLimitBytes"].as_u64().unwrap());
+        let envelope = preflight["peakBytes"].as_u64().unwrap();
+        let result = physical_watchdog::admit(host, envelope, self.explicit_cap);
+        let receipt = json!({"host": census, "preflight": preflight,
+            "requestedPoolBoundBytes": host.cache_limit, "physicalCeilingBytes": result.as_ref().ok(),
+            "refusal": result.as_ref().err(), "policy": "preflight_plus_measured_overhead_and_cache_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
+        std::fs::write(
+            self.out.join("physical-admission.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+        let ceiling =
+            result.expect("selected training case cannot safely fit; see physical-admission.json");
+        self.ceiling.store(ceiling, Ordering::Relaxed);
+        eprintln!("admitted training: preflight={envelope} physicalCeiling={ceiling} bytes");
+    }
+
     fn begin(&self) {
         mlx_rs::memory::reset_peak_memory();
         self.phase_max.store(0, Ordering::Relaxed);
     }
 
-    /// `(MLX active peak, phys_footprint max)` since [`begin`](Self::begin), in bytes.
     fn end(&self) -> (u64, u64) {
         let (fp, _) = phys_footprint();
         (
             mlx_rs::memory::get_peak_memory() as u64,
             self.phase_max.load(Ordering::Relaxed).max(fp),
         )
+    }
+}
+
+impl Drop for Footprint {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("memory sampler finishes");
+        }
     }
 }
 
@@ -572,8 +731,8 @@ struct Trained {
     facts: Value,
     /// Observed MLX active peak of the step phase, and the preflight's predicted train phase.
     train_peak: u64,
-    predicted_train_gib: Option<f64>,
-    predicted_peak_gib: Option<f64>,
+    predicted_train_bytes: u64,
+    predicted_peak_bytes: u64,
     remaining_steps_peak: u64,
 }
 
@@ -583,7 +742,37 @@ struct Trained {
 /// the full preflight envelope, and subsequent steps against its train phase. Copy
 /// the adapter to `canonical` if the trainer wrote it elsewhere.
 fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: u32) -> Trained {
+    // The tests run serially. Scope the explicit trace output to this evidence directory and
+    // restore the caller's environment even on an unwinding assertion.
+    struct DiagnosticOutput(Option<std::ffi::OsString>);
+    impl Drop for DiagnosticOutput {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::env::set_var("QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT", previous);
+            } else {
+                std::env::remove_var("QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT");
+            }
+        }
+    }
+    let _diagnostics =
+        DiagnosticOutput(std::env::var_os("QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT"));
+    std::env::set_var("QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT", &guard.out);
+    for name in ["training-preflight.json", "training-stages.jsonl"] {
+        let previous = guard.out.join(name);
+        if previous.exists() {
+            std::fs::remove_file(previous).expect("remove previous owned diagnostic receipt");
+        }
+    }
     let (predicted_message, predicted_train_gib) = predicted_training_footprint(req);
+    let preflight: Value = serde_json::from_slice(
+        &std::fs::read(guard.out.join("training-preflight.json")).expect("exact preflight receipt"),
+    )
+    .expect("valid exact preflight receipt");
+    let predicted_train_bytes = preflight["trainBytes"].as_u64().expect("exact train bytes");
+    let predicted_peak_bytes = preflight["peakBytes"]
+        .as_u64()
+        .expect("exact envelope bytes");
+    guard.admit_training(&preflight);
     let predicted_peak_gib = predicted_message
         .split("derived peak memory is ~")
         .nth(1)
@@ -701,6 +890,31 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     }
     let metadata = safetensors_file_metadata(canonical).unwrap();
     let cfg = &req.config;
+    let stage_names = std::fs::read_to_string(guard.out.join("training-stages.jsonl"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|event| event["stage"].as_str().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+    let stage_trace_complete = [
+        "pool_bound",
+        "caption_cache_cleared",
+        "latent_cache_cleared",
+        "dit_loaded",
+    ]
+    .iter()
+    .all(|stage| stage_names.contains(*stage))
+        && (1..=output.steps).all(|step| {
+            ["begin", "gradients_returned", "before_progress"]
+                .iter()
+                .all(|stage| stage_names.contains(&format!("step_{step}_{stage}")))
+        });
     let facts = json!({
         "adapter": canonical.file_name().unwrap().to_string_lossy(),
         "adapterBytes": std::fs::metadata(canonical).unwrap().len(),
@@ -725,17 +939,21 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
         "residentAfterFirstStepBytes": resident,
         "stepTransientPeakBytes": train_peak.saturating_sub(resident),
         "stepSamples": samples,
+        "trainingStageTraceComplete": stage_trace_complete,
         "predictedPreflight": predicted_message,
         "predictedTrainPhaseGiB": predicted_train_gib,
         "predictedFullEnvelopeGiB": predicted_peak_gib,
+        "predictedTrainPhaseBytes": predicted_train_bytes,
+        "predictedFullEnvelopeBytes": predicted_peak_bytes,
+        "physicalWatchdogCeilingBytes": guard.ceiling.load(Ordering::Relaxed),
         "metadata": metadata,
     });
     Trained {
         adapter: canonical.to_path_buf(),
         facts,
         train_peak,
-        predicted_train_gib,
-        predicted_peak_gib,
+        predicted_train_bytes,
+        predicted_peak_bytes,
         remaining_steps_peak: remaining_steps.0,
     }
 }
@@ -744,6 +962,11 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
 fn assert_trained(label: &str, trained: &Trained, steps: u32, edit: bool) {
     let facts = &trained.facts;
     assert_eq!(facts["stepsRun"], json!(steps), "{label}: steps run");
+    assert_eq!(
+        facts["trainingStageTraceComplete"],
+        json!(true),
+        "{label}: cache, DiT and every completed step require a valid diagnostic trace"
+    );
     let losses = facts["losses"].as_array().unwrap();
     assert_eq!(losses.len(), steps as usize, "{label}: one loss per step");
     assert!(
@@ -776,24 +999,17 @@ fn assert_trained(label: &str, trained: &Trained, steps: u32, edit: bool) {
 /// and later steps use its training phase. Checked LAST in each training test, after every
 /// render-side assertion, so a red run still exercises (and reports) the adapter's own checks.
 fn assert_preflight_covers_step(label: &str, trained: &Trained) {
-    let predicted = trained
-        .predicted_train_gib
-        .unwrap_or_else(|| panic!("{label}: could not read the preflight's train figure"));
-    let predicted_bytes = (predicted * (1u64 << 30) as f64) as u64;
     assert!(
-        trained.remaining_steps_peak <= predicted_bytes + PREDICTION_SLACK_BYTES,
-        "{label}: remaining training steps exceed their derived train phase"
+        trained.remaining_steps_peak <= trained.predicted_train_bytes + PREDICTION_SLACK_BYTES,
+        "{label}: remaining training steps exceed their exact derived train phase"
     );
-    let full_envelope = trained
-        .predicted_peak_gib
-        .expect("full preflight envelope must parse");
-    let predicted_bytes = (full_envelope * (1u64 << 30) as f64) as u64;
     assert!(
-        trained.train_peak <= predicted_bytes + PREDICTION_SLACK_BYTES,
-        "{label}: caching/first-step plus remaining steps peaked at {:.2} GiB, over the preflight's full {full_envelope:.1} \
-         GiB (+{:.0} GiB slack) — the training footprint under-predicts",
-        gib(trained.train_peak),
-        gib(PREDICTION_SLACK_BYTES)
+        trained.train_peak <= trained.predicted_peak_bytes + PREDICTION_SLACK_BYTES,
+        "{label}: caching/first-step plus remaining steps peaked at {} bytes, over the exact full \
+         envelope {} bytes (+{} bytes historical slack) — the training footprint under-predicts",
+        trained.train_peak,
+        trained.predicted_peak_bytes,
+        PREDICTION_SLACK_BYTES
     );
 }
 
