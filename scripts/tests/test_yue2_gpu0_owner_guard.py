@@ -69,6 +69,48 @@ class Owned:
 
 
 class OwnerGuardTests(unittest.TestCase):
+    def test_reviewed_gpu1_heartbeat_and_clean_completion_transition(self):
+        import yue2_reviewed_gpu1 as gpu1
+        active_run = {"id": gpu1.RUN, "head_sha": gpu1.HEAD, "run_attempt": 1,
+                      "event": "workflow_dispatch", "path": ".github/workflows/real-weights.yml",
+                      "repository": {"full_name": "SceneWorks/inference"},
+                      "created_at": gpu1.CREATED, "name": "Real-weight validation",
+                      "status": "in_progress", "conclusion": None}
+        active_job = {"id": gpu1.JOB, "run_id": gpu1.RUN, "run_attempt": 1,
+                      "head_sha": gpu1.HEAD, "name": gpu1.NAME,
+                      "workflow_name": "Real-weight validation", "runner_name": gpu1.RUNNER,
+                      "runner_id": gpu1.RUNNER_ID, "started_at": gpu1.STARTED,
+                      "status": "in_progress", "conclusion": None, "completed_at": None}
+        inventory = {"total_count": 55, "jobs": [active_job] +
+                     [{"id": 1000 + number, "status": "completed", "conclusion": "skipped"}
+                      for number in range(54)]}
+        group = {"group_name": gpu1.GROUP, "total_count": 1,
+                 "group_members": [{"run_id": gpu1.RUN, "status": "in_progress", "job_id": None}]}
+        replies = {f"actions/runs/{gpu1.RUN}": {"body": active_run},
+                   f"actions/jobs/{gpu1.JOB}": {"body": active_job},
+                   f"actions/runs/{gpu1.RUN}/attempts/1/jobs?per_page=100": {"body": inventory},
+                   f"actions/concurrency_groups/{gpu1.GROUP}": {"body": group}}
+        with tempfile.TemporaryDirectory() as directory:
+            owner = guard.OwnerGuard(Path(directory), guard.ENGINE, "a" * 40,
+                                     mode="gpu0-with-reviewed-gpu1")
+            owner.proof_job = {"id": 70}
+            with patch.object(guard, "api", side_effect=lambda path: replies[path]), \
+                 patch.object(guard, "gpu0_actors", return_value="# gpu pid type\n"):
+                owner.holder(None)
+            self.assertFalse(owner.foreign_completed)
+            terminal_job = {**active_job, "status": "completed", "conclusion": "success",
+                            "completed_at": "2026-10-04T15:00:00Z"}
+            replies[f"actions/jobs/{gpu1.JOB}"] = {"body": terminal_job}
+            with patch.object(guard, "api", side_effect=lambda path: replies[path]), \
+                 patch.object(guard, "gpu0_actors", return_value="# gpu pid type\n"), \
+                 patch.dict(guard.os.environ, {"GITHUB_RUN_ID": "7"}), \
+                 patch("yue2_shared_host_watch.snapshot", return_value={"checked_at": "now"}) as snapshot, \
+                 patch("yue2_shared_host_watch.classify", return_value={
+                     "own_job": 70, "own_runner": "cuda-windows-2", "reviewed_gpu1": "completed"}):
+                owner.holder(None)
+                snapshot.assert_called_once_with(reviewed_gpu1=True)
+            self.assertTrue(owner.foreign_completed)
+
     def test_routing_is_one_fixed_group_only_exact_cuda_owner_mode(self):
         for filename, selector in (("yue2-precision-proof.yml", "stage"),
                                    ("yue2-app-precision-profile.yml", "backend")):
@@ -77,12 +119,17 @@ class OwnerGuardTests(unittest.TestCase):
             self.assertEqual(settings["queue"], "max")
             self.assertEqual(settings["cancel-in-progress"], "false")
             for stage in ("fixture", "cuda", "metal", "cuda-diagnostic", "", "unknown"):
-                for mode in ("shared-host", "owner-gpu0", "owner-gpu0-mac-anchor", "", "unknown"):
+                for mode in ("shared-host", "owner-gpu0", "owner-gpu0-mac-anchor",
+                             "gpu0-with-reviewed-gpu1", "", "unknown"):
                     for receipt in (guard.RECEIPT, "37122359802", "37106146499", "", "arbitrary"):
                         for engine in (guard.ENGINE, "a" * 40):
                             opted = stage == "cuda" and mode in {"owner-gpu0", "owner-gpu0-mac-anchor"} and receipt == guard.RECEIPT and engine == guard.ENGINE
+                            reviewed_gpu1 = (filename == "yue2-precision-proof.yml" and
+                                             stage in {"cuda", "cuda-diagnostic"} and
+                                             mode == "gpu0-with-reviewed-gpu1" and
+                                             receipt == "" and engine == guard.ENGINE)
                             actual = routes.PrecisionControlTests.concurrency_group(settings["group"], stage, "101", mode, receipt, engine)
-                            if opted:
+                            if opted or reviewed_gpu1:
                                 expected = guard.GPU0_GROUP
                             elif selector == "stage" and stage == "fixture":
                                 expected = "inference-yue2-precision-fixture-101"
@@ -91,7 +138,7 @@ class OwnerGuardTests(unittest.TestCase):
                             else:
                                 expected = guard.OLD_GROUP
                             self.assertEqual(actual, expected, (filename, stage, mode, receipt, engine))
-                            if opted:
+                            if opted or reviewed_gpu1:
                                 self.assertEqual(actual, routes.PrecisionControlTests.concurrency_group(settings["group"], stage, "102", mode, receipt, engine))
             cuda = source.split("  cuda:\n", 1)[1].split("\n  metal:", 1)[0]
             self.assertIn("      YUE2_CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}", cuda)

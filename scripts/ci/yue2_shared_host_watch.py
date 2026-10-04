@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+import yue2_reviewed_gpu1 as gpu1
 
 REPOS = ("SceneWorks/inference", "SceneWorks/SceneWorks")
 RUNNERS = {"cuda-windows": 2313, "cuda-windows-2": 2619,
@@ -52,7 +53,7 @@ def complete_pages(value: list[dict], key: str) -> list[dict]:
     return rows
 
 
-def snapshot() -> dict:
+def snapshot(*, reviewed_gpu1: bool = False) -> dict:
     started = time.monotonic()
     queries = {"org": "orgs/SceneWorks/actions/runners?per_page=100",
                "inference": "repos/SceneWorks/inference/actions/runners?per_page=100",
@@ -87,15 +88,56 @@ def snapshot() -> dict:
     legacy_direct = {key: api(f"repos/{key[0]}/actions/runs/{key[1]}")
                      for key in runs if key[0] == "SceneWorks/inference" and
                      key[1] in LEGACY_ZERO_JOB}
+    companion = None
+    if reviewed_gpu1:
+        foreign = api(f"repos/SceneWorks/inference/actions/runs/{gpu1.RUN}")
+        companion = {"run": foreign,
+                     "job": api(f"repos/SceneWorks/inference/actions/jobs/{gpu1.JOB}"),
+                     "jobs": api(f"repos/SceneWorks/inference/actions/runs/{gpu1.RUN}/attempts/1/jobs?per_page=100")}
+        if foreign.get("status") == "in_progress" and companion["job"].get("status") == "in_progress":
+            companion["group"] = api(f"repos/SceneWorks/inference/actions/concurrency_groups/{gpu1.GROUP}")
     require(time.monotonic() - started <= 120, "cross-repository snapshot became stale")
     return {"checked_at": datetime.now(timezone.utc).isoformat(), "runners": runners,
-            "runs": runs, "jobs": jobs, "legacy_direct": legacy_direct}
+            "runs": runs, "jobs": jobs, "legacy_direct": legacy_direct,
+            "reviewed_gpu1": companion}
 
 
-def classify(data: dict, own_id: int, head: str, workflow: str) -> dict:
+def classify(data: dict, own_id: int, head: str, workflow: str,
+             *, mode: str = "shared-host", own_job_name: str = "cuda") -> dict:
     require(re.fullmatch(r"[0-9a-f]{40}", head) is not None and workflow in
             ("yue2-precision-proof.yml", "yue2-app-precision-profile.yml"),
             "invalid exact owned source")
+    require(mode in {"shared-host", "gpu0-with-reviewed-gpu1"} and
+            (mode != "gpu0-with-reviewed-gpu1" or workflow == "yue2-precision-proof.yml"),
+            "unreviewed GPU1 scheduling mode/workflow")
+    require(own_job_name == "cuda" or
+            (mode == "gpu0-with-reviewed-gpu1" and own_job_name == "cuda_diagnostic"),
+            "unreviewed owned GPU job name")
+    companion_state = None
+    if mode == "gpu0-with-reviewed-gpu1":
+        companion = data.get("reviewed_gpu1")
+        require(isinstance(companion, dict), "reviewed GPU1 direct inventory missing")
+        foreign = companion["run"]
+        companion_state = "completed" if companion["job"].get("status") == "completed" else "active"
+        gpu1.run(foreign, active=foreign.get("status") == "in_progress")
+        require(foreign.get("status") in {"in_progress", "completed"} and
+                (companion_state != "active" or foreign.get("status") == "in_progress"),
+                "reviewed GPU1 run/job state changed")
+        gpu1.job(companion["job"], active=companion_state == "active")
+        gpu1.inventory(companion["jobs"], active=companion_state == "active")
+        if companion_state == "active":
+            group = companion.get("group", {})
+            members = group.get("group_members", [])
+            require(group.get("group_name") == gpu1.GROUP and
+                    group.get("total_count") == len(members) and
+                    len([row for row in members if row.get("status") == "in_progress"]) == 1 and
+                    any(row.get("run_id") == gpu1.RUN and row.get("status") == "in_progress" and
+                        row.get("job_id") is None for row in members) and
+                    all(row.get("status") in {"pending", "queued", "in_progress"} for row in members),
+                    "reviewed GPU1 old-group reservation changed")
+        else:
+            require(companion.get("group") is None,
+                    "completed GPU1 job retained an ambiguous group reservation")
     runners = data["runners"]
     observed = {}
     for scope in ("org", "inference", "app"):
@@ -121,7 +163,7 @@ def classify(data: dict, own_id: int, head: str, workflow: str) -> dict:
             own.get("status") == "in_progress" and own.get("conclusion") is None,
             "owned run/source/attempt/status changed")
     own_jobs = data["jobs"].get(own_key, [])
-    selected = [job for job in own_jobs if job.get("name") == "cuda" and
+    selected = [job for job in own_jobs if job.get("name") == own_job_name and
                 job.get("status") == "in_progress"]
     require(len(selected) == 1 and selected[0].get("run_id") == own_id and
             selected[0].get("run_attempt") == 1 and selected[0].get("head_sha") == head and
@@ -130,14 +172,32 @@ def classify(data: dict, own_id: int, head: str, workflow: str) -> dict:
             selected[0].get("runner_id") == RUNNERS[selected[0]["runner_name"]],
             "exact owned CUDA job/runner missing")
     owned = selected[0]
+    if mode == "gpu0-with-reviewed-gpu1":
+        require(owned["runner_name"] == "cuda-windows-2" and owned["runner_id"] == 2619,
+                "reviewed GPU1 route must own the other Windows listener")
     for name, (row, _) in observed.items():
-        require(row.get("busy") is (name == owned["runner_name"]),
+        expected_busy = name == owned["runner_name"] or (
+            mode == "gpu0-with-reviewed-gpu1" and companion_state == "active" and
+            name == gpu1.RUNNER)
+        require(row.get("busy") is expected_busy,
                 f"unaccounted busy/free physical listener: {name}")
     historical = []
     for key, run in data["runs"].items():
         if key == own_key:
             require(all(job is owned or job.get("status") == "completed" for job in own_jobs),
                     "another owned job is active")
+            continue
+        if mode == "gpu0-with-reviewed-gpu1" and key == ("SceneWorks/inference", gpu1.RUN):
+            listed_jobs = data["jobs"].get(key, [])
+            gpu1.inventory({"total_count": len(listed_jobs), "jobs": listed_jobs},
+                           active=companion_state == "active")
+            require(all(run.get(field) == data["reviewed_gpu1"]["run"].get(field)
+                        for field in ("id", "head_sha", "run_attempt", "event", "path", "created_at")) and
+                    ({row.get("id") for row in listed_jobs} ==
+                     {row.get("id") for row in data["reviewed_gpu1"]["jobs"]["jobs"]}) and
+                    (companion_state == "active" or
+                     all(row.get("status") == "completed" for row in listed_jobs)),
+                    "reviewed GPU1 snapshot/direct identity changed")
             continue
         jobs = data["jobs"].get(key, [])
         if key[0] == "SceneWorks/inference" and key[1] in LEGACY_ZERO_JOB:
@@ -178,8 +238,13 @@ def classify(data: dict, own_id: int, head: str, workflow: str) -> dict:
                     isinstance(job.get("runner_id"), int),
                     f"foreign CUDA or unknown job: {key}:{job.get('id')}")
         require(active_count > 0, f"foreign run has no active assigned non-CUDA job: {key}")
+    if mode == "gpu0-with-reviewed-gpu1":
+        require(companion_state != "active" or
+                ("SceneWorks/inference", gpu1.RUN) in data["runs"],
+                "reviewed GPU1 active run absent from complete inventory")
     return {"own_run": own_id, "own_job": owned["id"],
             "own_runner": owned["runner_name"], "historical_zero_job_runs": historical,
+            "reviewed_gpu1": companion_state,
             "physical_lease": False}
 
 
@@ -195,7 +260,8 @@ def owned_run(own_id: int, head: str, workflow: str) -> dict:
 
 
 def bind_owned_job(own_id: int, head: str, workflow: str, job_id: int,
-                   runner_name: str, runner_id: int) -> dict:
+                   runner_name: str, runner_id: int,
+                   *, own_job_name: str = "cuda") -> dict:
     run = owned_run(own_id, head, workflow)
     require(run.get("status") == "in_progress" and run.get("conclusion") is None,
             "owned run not active for binding")
@@ -204,7 +270,7 @@ def bind_owned_job(own_id: int, head: str, workflow: str, job_id: int,
     job = api(f"repos/SceneWorks/inference/actions/jobs/{job_id}")
     require(isinstance(job, dict) and job.get("id") == job_id and
             job.get("run_id") == own_id and job.get("run_attempt") == 1 and
-            job.get("head_sha") == head and job.get("name") == "cuda" and
+            job.get("head_sha") == head and job.get("name") == own_job_name and
             job.get("runner_name") == runner_name and job.get("runner_id") == runner_id and
             job.get("status") == "in_progress" and job.get("conclusion") is None and
             job.get("completed_at") is None and isinstance(job.get("started_at"), str),
@@ -240,21 +306,39 @@ def cancel_bound_run(own_id: int, head: str, workflow: str, binding: dict,
 
 
 def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, interval: int,
-          job_id: int, runner_name: str, runner_id: int) -> None:
+          job_id: int, runner_name: str, runner_id: int,
+          *, mode: str = "shared-host", own_job_name: str = "cuda") -> None:
     require(0 < seconds <= 480 * 60 and 5 <= interval <= 60 and not output.exists(),
             "watch interval/duration/output invalid")
     require((runner_name, runner_id) in (("cuda-windows", 2313), ("cuda-windows-2", 2619)),
             "owned runner binding invalid")
+    require(mode in {"shared-host", "gpu0-with-reviewed-gpu1"} and
+            (mode != "gpu0-with-reviewed-gpu1" or
+             (workflow == "yue2-precision-proof.yml" and runner_name == "cuda-windows-2" and runner_id == 2619)),
+            "unreviewed GPU1 watcher placement")
+    require(own_job_name == "cuda" or
+            (mode == "gpu0-with-reviewed-gpu1" and own_job_name == "cuda_diagnostic"),
+            "unreviewed owned GPU job name")
     # No cancellation if the initial direct run/job/runner authentication fails.
-    binding = bind_owned_job(own_id, head, workflow, job_id, runner_name, runner_id)
+    binding = bind_owned_job(own_id, head, workflow, job_id, runner_name, runner_id,
+                             own_job_name=own_job_name)
     binding["job_id"] = job_id
-    output.mkdir(parents=True)
+    try:
+        output.mkdir(parents=True)
+    except BaseException:
+        cancel_bound_run(own_id, head, workflow, binding, identity_drift=False)
+        raise
     deadline = time.monotonic() + seconds
     index = 0
     identity_drift = False
+    source_checked = False
     while time.monotonic() < deadline:
         index += 1
         try:
+            if mode == "gpu0-with-reviewed-gpu1" and not source_checked:
+                for path in gpu1.SOURCES:
+                    gpu1.source(api(f"repos/SceneWorks/inference/contents/{path}?ref={gpu1.HEAD}"), path)
+                source_checked = True
             direct = owned_run(own_id, head, workflow)
             require(direct.get("created_at") == binding["run"].get("created_at") and
                     direct.get("repository", {}).get("full_name") == "SceneWorks/inference",
@@ -262,7 +346,7 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
             if direct.get("status") == "completed":
                 (output / "terminal.json").write_text(json.dumps(direct, indent=2) + "\n", encoding="utf-8")
                 return  # Final child/postflight and physical release still require independent audit.
-            data = snapshot()
+            data = snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
             observed_job = next((job for job in data["jobs"].get(("SceneWorks/inference", own_id), [])
                                  if job.get("id") == job_id), None)
             if observed_job is not None and any((
@@ -273,7 +357,7 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
                     observed_job.get("runner_name") != runner_name,
                     observed_job.get("started_at") != binding["start"])):
                 raise RuntimeError("owned job identity drifted")
-            proof = classify(data, own_id, head, workflow)
+            proof = classify(data, own_id, head, workflow, mode=mode, own_job_name=own_job_name)
             require(proof["own_job"] == job_id and proof["own_runner"] == runner_name and
                     observed_job is not None and observed_job.get("started_at") == binding["start"],
                     "inventory differs from direct immutable owned job binding")
@@ -323,9 +407,14 @@ def main() -> None:
     parser.add_argument("--expected-job-id", type=int, required=True)
     parser.add_argument("--expected-runner-name", choices=("cuda-windows", "cuda-windows-2"), required=True)
     parser.add_argument("--expected-runner-id", type=int, choices=(2313, 2619), required=True)
+    parser.add_argument("--mode", choices=("shared-host", "gpu0-with-reviewed-gpu1"),
+                        default="shared-host")
+    parser.add_argument("--expected-job-name", choices=("cuda", "cuda_diagnostic"),
+                        default="cuda")
     args = parser.parse_args()
     watch(args.own_run_id, args.control_sha, args.workflow, args.output, args.seconds, args.interval,
-          args.expected_job_id, args.expected_runner_name, args.expected_runner_id)
+          args.expected_job_id, args.expected_runner_name, args.expected_runner_id,
+          mode=args.mode, own_job_name=args.expected_job_name)
 
 
 if __name__ == "__main__":

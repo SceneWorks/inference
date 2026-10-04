@@ -19,6 +19,7 @@ import time
 import urllib.request
 import re
 import signal
+import yue2_reviewed_gpu1 as gpu1
 
 ENGINE = "190e20e7c6b5bac006194c729baabd22c0c44a5d"
 RECEIPT = "37145909196"
@@ -61,6 +62,9 @@ MAC_WORKFLOW_SHA256 = "62cbce54ddeb51c59e0bfc0b402b77ba40ac2f9473413302aad0548b2
 PENDING_WORKFLOW_SHA256 = "6d586177edd06a208d0bc72ed86e16eb207e2bf82b2c259ff7217a1d8a21f757"
 # Five full metadata reads plus one direct heartbeat and two Windows queries.
 MAC_CYCLE_LIMIT_SECONDS = 6 * API_TIMEOUT + 2 * PHYSICAL_QUERY_TIMEOUT + 10
+# The transition's full two-repository inventory is bounded at 120 seconds,
+# followed by the same owned GPU0 pmon and two authenticated job reads.
+GPU1_CYCLE_LIMIT_SECONDS = 120 + 2 * API_TIMEOUT + API_TIMEOUT + 16
 
 
 def require(ok: bool, message: str) -> None:
@@ -346,7 +350,8 @@ class OwnerGuard:
                  mode: str = "owner-gpu0"):
         self.kind = kind
         require(kind in {"engine", "app"}, "unknown guarded workflow")
-        require(mode in {"owner-gpu0", "owner-gpu0-mac-anchor"}, "unknown GPU0 owner route")
+        require(mode in {"owner-gpu0", "owner-gpu0-mac-anchor", "gpu0-with-reviewed-gpu1"},
+                "unknown GPU0 owner route")
         self.mode = mode
         self.path = evidence / "gpu0-holder-chronology.jsonl"
         self.engine_sha = engine_sha
@@ -362,6 +367,7 @@ class OwnerGuard:
         self.metadata_checked = None
         self.holder_started = None
         self.background = None
+        self.foreign_completed = False
 
     def record(self, event: dict) -> None:
         with self.path.open("a", encoding="utf-8") as output:
@@ -372,6 +378,9 @@ class OwnerGuard:
         self.cycle_started = start
         if self.mode == "owner-gpu0-mac-anchor":
             self.mac_holder(child, start)
+            return
+        if self.mode == "gpu0-with-reviewed-gpu1":
+            self.gpu1_holder(child, start)
             return
         # One job heartbeat per 10s; full metadata at most once per 60s.
         # <=360+180 requests/hour steady, leaving budget for per-command setup.
@@ -400,6 +409,50 @@ class OwnerGuard:
         raw = gpu0_actors(child_pid, descendants=self.descendants, record=self.record, background=self.background)
         self.record({"event": "gpu0_actors", "owned_pid": child_pid, "raw": raw})
         require(time.monotonic() - start <= CYCLE_LIMIT_SECONDS, "holder observation cycle stale")
+
+    def gpu1_holder(self, child, start: float) -> None:
+        # The exact GPU1 job may finish during our GPU0 proof. A completed job
+        # is not a reservation: admit that transition only with a fresh full
+        # four-listener, two-repository inventory and no replacement actor.
+        foreign_run = api(f"actions/runs/{gpu1.RUN}")
+        foreign_job = api(f"actions/jobs/{gpu1.JOB}")
+        self.record({"event": "reviewed_gpu1_heartbeat", "reads": [foreign_run, foreign_job]})
+        ended = foreign_job["body"].get("status") == "completed"
+        gpu1.run(foreign_run["body"], active=foreign_run["body"].get("status") == "in_progress")
+        require(foreign_run["body"].get("status") in {"in_progress", "completed"},
+                "reviewed GPU1 run state changed")
+        require(ended or foreign_run["body"].get("status") == "in_progress",
+                "reviewed GPU1 run completed before the selected job")
+        gpu1.job(foreign_job["body"], active=not ended)
+        if ended:
+            if not self.foreign_completed or self.metadata_checked is None or start - self.metadata_checked >= METADATA_SECONDS:
+                from yue2_shared_host_watch import classify, snapshot
+                own_id = int(os.environ["GITHUB_RUN_ID"])
+                observed = snapshot(reviewed_gpu1=True)
+                proof = classify(observed, own_id, self.control_sha,
+                                 "yue2-precision-proof.yml", mode="gpu0-with-reviewed-gpu1")
+                require(proof["own_job"] == self.proof_job["id"] and
+                        proof["own_runner"] == "cuda-windows-2" and
+                        proof["reviewed_gpu1"] == "completed",
+                        "reviewed GPU1 completion has no clean physical replacement census")
+                self.record({"event": "gpu1_completed_full_inventory", "proof": proof,
+                             "checked_at": observed["checked_at"]})
+                self.foreign_completed = True
+                self.metadata_checked = start
+        else:
+            require(not self.foreign_completed, "reviewed GPU1 run returned to active")
+            if self.metadata_checked is None or start - self.metadata_checked >= METADATA_SECONDS:
+                inventory = api(f"actions/runs/{gpu1.RUN}/attempts/1/jobs?per_page=100")
+                group = api(f"actions/concurrency_groups/{gpu1.GROUP}")
+                self.record({"event": "reviewed_gpu1_inventory", "reads": [inventory, group]})
+                gpu1.inventory(inventory["body"], active=True)
+                active_group(group["body"], gpu1.GROUP, gpu1.RUN)
+                self.metadata_checked = start
+        child_pid = child.pid if child is not None and child.poll() is None else None
+        raw = gpu0_actors(child_pid, descendants=self.descendants, record=self.record, background=None)
+        self.record({"event": "gpu0_actors", "owned_pid": child_pid, "raw": raw})
+        require(time.monotonic() - start <= GPU1_CYCLE_LIMIT_SECONDS,
+                "reviewed GPU1 observation cycle stale")
 
     def mac_holder(self, child, start: float) -> None:
         # The pending run's backend is unknown. Its exact old-group scheduler
@@ -452,6 +505,9 @@ class OwnerGuard:
             raise
 
     def _preflight(self) -> None:
+        if self.mode == "gpu0-with-reviewed-gpu1":
+            self.gpu1_preflight()
+            return
         from yue2_cuda_idle_context import BASELINE_DIGEST, RUN_ID
         require(self.engine_sha == ENGINE and RUN_ID == RECEIPT and BASELINE_DIGEST == RECEIPT_DIGEST and
                 os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID") == RECEIPT and
@@ -498,6 +554,58 @@ class OwnerGuard:
                     "foreign scheduling-barrier source is not the reviewed exact bytes")
         self.holder(None)  # Last action before Popen; retains the existing full fresh29 preflight.
 
+    def gpu1_preflight(self) -> None:
+        from yue2_cuda_idle_context import check_empty_dispatch
+        require(self.kind == "engine" and self.engine_sha == ENGINE and
+                os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID") == "" and
+                os.environ.get("GITHUB_REPOSITORY") == REPO and
+                os.environ.get("GITHUB_JOB") == "cuda" and
+                os.environ.get("GITHUB_RUN_ATTEMPT") == "1" and
+                os.environ.get("GITHUB_SHA") == self.control_sha and
+                os.environ.get("RUNNER_NAME") == "cuda-windows-2" and
+                os.environ.get("CUDA_VISIBLE_DEVICES") == "0" and
+                os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" and
+                re.fullmatch(r"[0-9a-f]{40}", self.control_sha) is not None and IS_WINDOWS,
+                "reviewed GPU1 route requires exact engine/GPU0/other-runner source")
+        check_empty_dispatch()
+        control = Path(__file__).resolve().parents[2]
+        workspace = Path(os.environ["GITHUB_WORKSPACE"])
+        for directory, expected in ((control, self.control_sha), (workspace / "engine", self.engine_sha)):
+            head = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, encoding="utf-8", check=True, timeout=3).stdout.strip()
+            dirty = subprocess.run(["git", "-C", str(directory), "status", "--porcelain", "--untracked-files=normal"],
+                                   capture_output=True, text=True, encoding="utf-8", check=True, timeout=3).stdout
+            require(head == expected and not dirty.strip(), "reviewed GPU1 source checkout differs/is dirty")
+        own_id = int(os.environ["GITHUB_RUN_ID"])
+        own = api(f"actions/runs/{own_id}")
+        jobs = api(f"actions/runs/{own_id}/attempts/1/jobs?per_page=100")
+        group = api(f"actions/concurrency_groups/{GPU0_GROUP}")
+        self.record({"event": "own_source", "reads": [own, jobs, group]})
+        run_identity(own["body"], own_id, self.control_sha,
+                     ".github/workflows/yue2-precision-proof.yml")
+        self.proof_job = selected_job(jobs["body"], None, "cuda", "cuda-windows-2")
+        require(self.proof_job.get("runner_id") == 2619 and
+                self.proof_job.get("run_id") == own_id and
+                self.proof_job.get("head_sha") == self.control_sha and
+                self.proof_job.get("run_attempt") == 1,
+                "reviewed GPU1 route owned job identity changed")
+        active_group(group["body"], GPU0_GROUP, own_id)
+        for path in gpu1.SOURCES:
+            value = api(f"contents/{path}?ref={gpu1.HEAD}")
+            self.record({"event": "reviewed_gpu1_source", "read": value})
+            gpu1.source(value["body"], path)
+        from yue2_shared_host_watch import classify, snapshot
+        observed = snapshot(reviewed_gpu1=True)
+        proof = classify(observed, own_id, self.control_sha,
+                         "yue2-precision-proof.yml", mode="gpu0-with-reviewed-gpu1")
+        require(proof["own_job"] == self.proof_job["id"] and
+                proof["own_runner"] == "cuda-windows-2" and
+                proof["reviewed_gpu1"] == "active",
+                "reviewed GPU1 preflight lacks the exact foreign/owned reservation")
+        self.record({"event": "preflight_full_inventory", "proof": proof,
+                     "checked_at": observed["checked_at"]})
+        self.holder(None)
+
     def arm(self) -> None:
         # Flag cancellation rather than raising in the Popen constructor: after
         # it returns, only our single waiter owns the newly assigned child tree.
@@ -532,13 +640,24 @@ class OwnerGuard:
             signal.signal(number, handler)
         self.signals.clear()
         if self.thread is not None:
-            self.thread.join(timeout=(MAC_CYCLE_LIMIT_SECONDS if self.mode == "owner-gpu0-mac-anchor"
+            self.thread.join(timeout=(GPU1_CYCLE_LIMIT_SECONDS if self.mode == "gpu0-with-reviewed-gpu1" else
+                                      MAC_CYCLE_LIMIT_SECONDS if self.mode == "owner-gpu0-mac-anchor"
                                       else CYCLE_LIMIT_SECONDS) + 2)
             require(not self.thread.is_alive(), "holder watchdog did not release")
         require(not self.failed.is_set(), f"holder watchdog refused: {self.fault}")
         self.holder(None)
 
     def summary(self) -> dict:
+        if self.mode == "gpu0-with-reviewed-gpu1":
+            return {"mode": self.mode, "acceptance": "provisional-reviewed-GPU1-current-job",
+                    "foreign_run_id": gpu1.RUN, "foreign_job_id": gpu1.JOB,
+                    "foreign_sha": gpu1.HEAD, "foreign_runner": gpu1.RUNNER,
+                    "foreign_completed": self.foreign_completed,
+                    "proof_job": self.proof_job, "fault": self.fault,
+                    "chronology_file": self.path.name,
+                    "cycle_limit_seconds": GPU1_CYCLE_LIMIT_SECONDS,
+                    "physical_lease": False,
+                    "final_acceptance_requires": "Independent full four-listener inventory and selected GPU0 telemetry through release; source-bound GPU1 job only, no future-use guarantee."}
         if self.mode == "owner-gpu0-mac-anchor":
             return {"mode": self.mode, "acceptance": "provisional-mac-anchor-chronology",
                     "anchor_run_id": MAC_RUN, "anchor_job_id": MAC_JOB, "anchor_attempt": 1,
@@ -585,7 +704,8 @@ def wait(child, guard: OwnerGuard, timeout: float) -> tuple[int | None, bool, st
     deadline = time.monotonic() + timeout
     try:
         while True:
-            cycle_limit = MAC_CYCLE_LIMIT_SECONDS if isinstance(guard, OwnerGuard) and guard.mode == "owner-gpu0-mac-anchor" else CYCLE_LIMIT_SECONDS
+            cycle_limit = (GPU1_CYCLE_LIMIT_SECONDS if isinstance(guard, OwnerGuard) and guard.mode == "gpu0-with-reviewed-gpu1" else
+                           MAC_CYCLE_LIMIT_SECONDS if isinstance(guard, OwnerGuard) and guard.mode == "owner-gpu0-mac-anchor" else CYCLE_LIMIT_SECONDS)
             if guard.cycle_started is not None and time.monotonic() - guard.cycle_started > cycle_limit + POLL_SECONDS:
                 guard.fault = "holder watchdog exceeded bounded observation deadline"
                 guard.failed.set()

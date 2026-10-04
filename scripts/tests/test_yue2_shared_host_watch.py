@@ -8,6 +8,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 import yue2_shared_host_watch as watch
+import yue2_reviewed_gpu1 as gpu1
 
 SHA = "a" * 40
 
@@ -32,7 +33,108 @@ def own_snapshot():
             "jobs": {("SceneWorks/inference", 7): [job]}}
 
 
+def reviewed_gpu1_snapshot():
+    data = own_snapshot()
+    data["runners"]["org"][0]["busy"] = True
+    data["runners"]["org"][1]["busy"] = True
+    own_job = data["jobs"][("SceneWorks/inference", 7)][0]
+    own_job["runner_name"], own_job["runner_id"] = "cuda-windows-2", 2619
+    run = {"id": gpu1.RUN, "head_sha": gpu1.HEAD, "run_attempt": 1,
+           "event": "workflow_dispatch", "path": ".github/workflows/real-weights.yml",
+           "repository": {"full_name": "SceneWorks/inference"}, "created_at": gpu1.CREATED,
+           "name": "Real-weight validation", "status": "in_progress", "conclusion": None}
+    selected = {"id": gpu1.JOB, "run_id": gpu1.RUN, "run_attempt": 1,
+                "head_sha": gpu1.HEAD, "name": gpu1.NAME,
+                "workflow_name": "Real-weight validation", "runner_name": gpu1.RUNNER,
+                "runner_id": gpu1.RUNNER_ID, "started_at": gpu1.STARTED,
+                "status": "in_progress", "conclusion": None, "completed_at": None}
+    jobs = [selected] + [{"id": 1000 + i, "status": "completed", "conclusion": "skipped"}
+                         for i in range(54)]
+    data["runs"][("SceneWorks/inference", gpu1.RUN)] = run.copy()
+    data["jobs"][("SceneWorks/inference", gpu1.RUN)] = [row.copy() for row in jobs]
+    data["reviewed_gpu1"] = {"run": run, "job": selected.copy(),
+                             "jobs": {"total_count": 55, "jobs": jobs},
+                             "group": {"group_name": gpu1.GROUP, "total_count": 1,
+                                       "group_members": [{"run_id": gpu1.RUN,
+                                                          "status": "in_progress"}]}}
+    return data
+
+
 class SharedHostWatchTests(unittest.TestCase):
+    def test_reviewed_gpu1_exact_job_and_clean_completion_transition(self):
+        data = reviewed_gpu1_snapshot()
+        self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                                        mode="gpu0-with-reviewed-gpu1")["reviewed_gpu1"], "active")
+        for field, bad in (("head_sha", "b" * 40), ("runner_name", "cuda-windows-2"),
+                           ("runner_id", 2619), ("started_at", "changed"),
+                           ("status", "completed")):
+            broken = reviewed_gpu1_snapshot()
+            broken["reviewed_gpu1"]["job"][field] = bad
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                watch.classify(broken, 7, SHA, "yue2-precision-proof.yml",
+                               mode="gpu0-with-reviewed-gpu1")
+        data["runners"]["org"][0]["busy"] = False
+        data["reviewed_gpu1"]["job"].update(status="completed", conclusion="success",
+                                             completed_at="2026-10-04T15:00:00Z")
+        data["reviewed_gpu1"]["jobs"]["jobs"][0] = data["reviewed_gpu1"]["job"].copy()
+        data["jobs"][("SceneWorks/inference", gpu1.RUN)][0] = data["reviewed_gpu1"]["job"].copy()
+        del data["reviewed_gpu1"]["group"]
+        self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                                        mode="gpu0-with-reviewed-gpu1")["reviewed_gpu1"], "completed")
+        # A newly queued reservation remains unknown after GPU1 is free.
+        data["runs"][("SceneWorks/inference", 999)] = {"id": 999, "status": "queued"}
+        data["jobs"][("SceneWorks/inference", 999)] = []
+        with self.assertRaisesRegex(RuntimeError, "foreign run has no allocated jobs"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                           mode="gpu0-with-reviewed-gpu1")
+
+    def test_reviewed_gpu1_source_and_group_mutations_refuse(self):
+        data = reviewed_gpu1_snapshot()
+        data["reviewed_gpu1"]["group"]["group_members"][0]["run_id"] = 1
+        with self.assertRaisesRegex(RuntimeError, "old-group reservation"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                           mode="gpu0-with-reviewed-gpu1")
+
+    def test_reviewed_gpu1_read_only_diagnostic_uses_same_other_runner(self):
+        data = reviewed_gpu1_snapshot()
+        data["jobs"][("SceneWorks/inference", 7)][0]["name"] = "cuda_diagnostic"
+        self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                                        mode="gpu0-with-reviewed-gpu1",
+                                        own_job_name="cuda_diagnostic")["own_runner"],
+                         "cuda-windows-2")
+        with self.assertRaisesRegex(RuntimeError, "unreviewed owned GPU job name"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                           mode="shared-host", own_job_name="cuda_diagnostic")
+        data = reviewed_gpu1_snapshot()
+        data["runners"]["app"][0]["busy"] = True
+        with self.assertRaisesRegex(RuntimeError, "unaccounted busy"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                           mode="gpu0-with-reviewed-gpu1")
+
+    def test_reviewed_gpu1_watch_cancels_only_owned_on_new_unknown_actor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = reviewed_gpu1_snapshot()
+            data["runs"][("SceneWorks/SceneWorks", 999)] = {"id": 999, "status": "queued"}
+            data["jobs"][("SceneWorks/SceneWorks", 999)] = []
+            own = data["runs"][("SceneWorks/inference", 7)]
+            direct = {**own, "repository": {"full_name": "SceneWorks/inference"},
+                      "created_at": "2026-10-04T14:00:00Z"}
+            job = data["jobs"][("SceneWorks/inference", 7)][0]
+            job["started_at"] = "2026-10-04T14:01:00Z"
+            binding = {"run": direct, "job": job, "job_id": 70, "start": job["started_at"]}
+            with patch.object(watch, "bind_owned_job", return_value=binding), \
+                 patch.object(watch, "owned_run", return_value=direct), \
+                 patch.object(watch, "api", return_value=direct), \
+                 patch.object(gpu1, "source"), \
+                 patch.object(watch, "snapshot", return_value=data), \
+                 patch.object(watch.subprocess, "run") as cancel:
+                with self.assertRaisesRegex(RuntimeError, "foreign run has no allocated jobs"):
+                    watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
+                                60, 30, 70, "cuda-windows-2", 2619,
+                                mode="gpu0-with-reviewed-gpu1")
+            cancel.assert_called_once()
+            self.assertEqual(cancel.call_args.args[0],
+                             ["gh", "run", "cancel", "7", "-R", "SceneWorks/inference"])
     def test_only_exact_owned_job_and_four_known_idle_other_runners_pass(self):
         data = own_snapshot()
         self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml")["own_job"], 70)

@@ -15,8 +15,8 @@ on:
         type: choice
         required: false
         default: shared-host
-        options: [shared-host, owner-gpu0, owner-gpu0-mac-anchor]
-        description: Owner-approved provisional GPU0 lane; exact Windows holder or Mac anchor/pending barrier must remain active
+        options: [shared-host, owner-gpu0, owner-gpu0-mac-anchor, gpu0-with-reviewed-gpu1]
+        description: Owner-approved GPU0 lane; exact reviewed actor and selected-device proof remain required
       expected_engine_sha:
         type: string
         required: true
@@ -62,7 +62,7 @@ permissions:
 # CUDA route uses the fixed provisional GPU0 group; the controller authenticates
 # the selected Windows holder or the exact Mac-active/pending scheduler barrier.
 concurrency:
-  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || inputs.stage == 'metal' && 'yue2-app-precision-nax-macos-2' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
+  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || inputs.stage == 'metal' && 'yue2-app-precision-nax-macos-2' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'gpu0-with-reviewed-gpu1' && inputs.idle_cuda_context_run_id == '' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda-diagnostic' && inputs.cuda_scheduling_mode == 'gpu0-with-reviewed-gpu1' && inputs.idle_cuda_context_run_id == '' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
   queue: max
   cancel-in-progress: false
 
@@ -96,6 +96,7 @@ jobs:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           DIAGNOSTIC_PID: ${{ inputs.diagnostic_pid }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_engine_sha must be 40 lowercase hex' }
           if ($env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_control_sha must be 40 lowercase hex' }
@@ -104,6 +105,33 @@ jobs:
           if ((git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA) { throw 'engine SHA mismatch' }
           if (git status --porcelain --untracked-files=normal) { throw 'workflow control checkout is dirty' }
           if (git -C ../engine status --porcelain --untracked-files=normal) { throw 'engine checkout is dirty' }
+          if ('${{ inputs.cuda_scheduling_mode }}' -eq 'gpu0-with-reviewed-gpu1') {
+            if ($env:RUNNER_NAME -cne 'cuda-windows-2' -or '${{ inputs.idle_cuda_context_run_id }}' -ne '') { throw 'reviewed GPU1 diagnostic requires the other Windows listener and empty receipt' }
+            $jobs = gh api "repos/SceneWorks/inference/actions/runs/$env:GITHUB_RUN_ID/attempts/1/jobs?per_page=100" | ConvertFrom-Json
+            $selected = @($jobs.jobs | Where-Object { $_.name -eq 'cuda_diagnostic' -and $_.status -eq 'in_progress' })
+            if ($jobs.total_count -ne $jobs.jobs.Count -or $selected.Count -ne 1 -or $selected[0].runner_name -cne 'cuda-windows-2' -or $selected[0].runner_id -ne 2619 -or $selected[0].run_id -ne [int64]$env:GITHUB_RUN_ID -or $selected[0].head_sha -cne $env:EXPECTED_CONTROL_SHA) { throw 'reviewed GPU1 diagnostic runner/job identity differs' }
+            $foreignRun = gh api 'repos/SceneWorks/inference/actions/runs/37203890421' | ConvertFrom-Json
+            $foreignJob = gh api 'repos/SceneWorks/inference/actions/jobs/111441010524' | ConvertFrom-Json
+            $foreignJobs = gh api 'repos/SceneWorks/inference/actions/runs/37203890421/attempts/1/jobs?per_page=100' | ConvertFrom-Json
+            if ($foreignRun.id -ne 37203890421 -or $foreignRun.head_sha -cne 'e13f235d5d371b301e4a04f209e8ad621b1fda9f' -or $foreignRun.run_attempt -ne 1 -or $foreignRun.created_at -cne '2026-10-04T12:57:12Z' -or $foreignRun.status -cne 'in_progress' -or $foreignRun.path -cne '.github/workflows/real-weights.yml') { throw 'reviewed GPU1 run identity differs' }
+            if ($foreignJob.id -ne 111441010524 -or $foreignJob.run_id -ne 37203890421 -or $foreignJob.head_sha -cne $foreignRun.head_sha -or $foreignJob.name -cne 'Decode-speedups benchmark campaign (Candle/CUDA)' -or $foreignJob.status -cne 'in_progress' -or $foreignJob.runner_name -cne 'cuda-windows' -or $foreignJob.runner_id -ne 2313 -or $foreignJob.started_at -cne '2026-10-04T12:57:29Z') { throw 'reviewed GPU1 job/runner/start differs' }
+            if ($foreignJobs.total_count -ne 55 -or $foreignJobs.jobs.Count -ne 55 -or @($foreignJobs.jobs | Where-Object { $_.id -eq 111441010524 -and $_.status -eq 'in_progress' }).Count -ne 1 -or @($foreignJobs.jobs | Where-Object { $_.id -ne 111441010524 -and ($_.status -cne 'completed' -or $_.conclusion -cne 'skipped') }).Count -ne 0) { throw 'reviewed GPU1 job set differs' }
+            $foreignGroup = gh api 'repos/SceneWorks/inference/actions/concurrency_groups/inference-real-weights-physical-host' | ConvertFrom-Json
+            if ($foreignGroup.group_name -cne 'inference-real-weights-physical-host' -or $foreignGroup.total_count -ne $foreignGroup.group_members.Count -or @($foreignGroup.group_members | Where-Object { $_.status -eq 'in_progress' }).Count -ne 1 -or @($foreignGroup.group_members | Where-Object { $_.status -eq 'in_progress' -and $_.run_id -eq 37203890421 -and $null -eq $_.job_id }).Count -ne 1) { throw 'reviewed GPU1 group reservation differs' }
+            $reviewedSources = @{
+              '.github/workflows/real-weights.yml' = '6d586177edd06a208d0bc72ed86e16eb207e2bf82b2c259ff7217a1d8a21f757'
+              'scripts/ci/real-weights/candle-decode-speedups-bench/run-every-matrix-row.cmd' = '157eb7ad92dcb1330e9dcbf8194ead42a262baf2723a3ab0b0f21a15b8a64756'
+              'scripts/release/speculative_bench_campaign.py' = '97b188879d5d8c5049b6490d146d6e6e670c278beb483fc4ab357019442c9b01'
+            }
+            foreach ($path in $reviewedSources.Keys) {
+              $source = gh api "repos/SceneWorks/inference/contents/${path}?ref=e13f235d5d371b301e4a04f209e8ad621b1fda9f" | ConvertFrom-Json
+              if ($source.path -cne $path -or $source.encoding -cne 'base64') { throw 'reviewed GPU1 source metadata differs' }
+              $bytes = [Convert]::FromBase64String($source.content)
+              $hash = [Security.Cryptography.SHA256]::Create()
+              try { $digest = ([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() } finally { $hash.Dispose() }
+              if ($digest -cne $reviewedSources[$path]) { throw 'reviewed GPU1 source bytes differ' }
+            }
+          }
       - name: Collect bounded read-only context and adapter evidence
         shell: powershell
         env:
