@@ -1937,19 +1937,20 @@ mod tests {
 
     #[test]
     fn the_policy_guard_restores_the_switch_it_found() {
-        let outer = cuda_graphs_policy_guard(Some(false));
-        assert!(!cuda_graphs_enabled());
-        drop(outer);
-        {
-            let _inner = cuda_graphs_policy_guard(Some(true));
-            assert!(cuda_graphs_enabled());
-        }
-        let _check = cuda_graphs_policy_guard(None);
-        if std::env::var_os(CUDA_GRAPHS_ENV).is_none() {
-            assert!(
-                !cuda_graphs_enabled(),
-                "the guard must restore the previous policy"
-            );
+        for found in [Some(false), Some(true), None] {
+            let _outer = cuda_graphs_policy_guard(found);
+            let before = (SWITCH.explicit(), cuda_graphs_enabled());
+            for inner in [Some(true), Some(false)] {
+                {
+                    let _inner = cuda_graphs_policy_guard(inner);
+                    assert_eq!(cuda_graphs_enabled(), inner.unwrap());
+                }
+                assert_eq!(
+                    (SWITCH.explicit(), cuda_graphs_enabled()),
+                    before,
+                    "the guard must restore the previous policy ({found:?} under {inner:?})"
+                );
+            }
         }
     }
 
