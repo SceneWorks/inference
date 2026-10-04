@@ -27,7 +27,7 @@
 //! 7169); the [`core_llm::Scheduler`] already carries per-sequence offsets so that lands without
 //! reworking the policy.
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use core_llm::schedule::{Scheduler, SeqId, SeqSpec};
 use core_llm::FinishReason as CoreFinish;
@@ -37,6 +37,7 @@ use crate::decode::stream::{default_seed, Decode, FinishReason, GenerationOutput
 use crate::decode::{record_lane_token, BufferRelease, LaneStep};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
+use crate::primitives::kv_cache::ContiguousKvCache;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 
 /// The pad token id stuffed into the left-pad region. Any in-vocabulary id works — the attention
@@ -87,6 +88,19 @@ pub fn generate_batch(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(usize, StreamEvent),
 ) -> Result<Vec<GenerationOutput>> {
+    generate_batch_with_observer(model, requests, cancel, on_event, None)
+}
+
+/// Campaign-only observer variant of [`generate_batch`].  The observer follows the actual batched
+/// prefill/decode path; it is never installed for ordinary scheduling.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_batch_with_observer(
+    model: &CausalLm,
+    requests: &[BatchRequest],
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(usize, StreamEvent),
+    mut observer: Option<&mut dyn crate::campaign::Observer>,
+) -> Result<Vec<GenerationOutput>> {
     if requests.is_empty() {
         return Err(Error::Msg("generate_batch: no requests".into()));
     }
@@ -132,6 +146,7 @@ pub fn generate_batch(
         .collect();
 
     let mut cache = model.make_cache();
+    let mut observed_cache_events = 0;
 
     // ---- Prefill: left-pad every prompt to `max_prompt` and run one batched forward. ----
     let (ids, positions, mask_h) = build_prefill(requests, max_prompt);
@@ -141,10 +156,18 @@ pub fn generate_batch(
     // Positions rather than pre-built RoPE tables: a per-layer-type model (Gemma 4) needs one
     // table per layer type, and only the model knows how many it has.
     let logits = model.decode_logits_masked_at(&ids, cache.as_mut(), &positions, &mask)?;
+    if let Some(observer) = observer.as_deref_mut() {
+        let logits_f32 = logits.as_dtype(Dtype::Float32)?;
+        let values = logits_f32.as_slice::<f32>().to_vec();
+        observer.logits("prefill", &values);
+        observer.phase("prefill-peak");
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer)?;
+    }
 
     // Sample the first token per sequence; keep the lanes that did not immediately retire.
     let mut active: Vec<Lane> = Vec::new();
     let mut keep: Vec<i32> = Vec::new();
+    let mut observed_first_token = false;
     for (ri, mut lane) in std::mem::take(&mut lanes).into_iter().enumerate() {
         if !sched.is_active(lane.seq) {
             // Zero-budget sequence: admitted already finished, never generates.
@@ -158,7 +181,21 @@ pub fn generate_batch(
             continue;
         }
         let tok = sample_row(&logits, ri, &mut lane)?;
-        if let LaneStep::Continue = record_token(&mut sched, &mut lane, tok, on_event) {
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.token_probability(
+                "decode",
+                tok,
+                selected_token_probability(&logits, ri, tok)?,
+            );
+        }
+        if let LaneStep::Continue = record_token_observed(
+            &mut sched,
+            &mut lane,
+            tok,
+            on_event,
+            &mut observer,
+            &mut observed_first_token,
+        ) {
             keep.push(ri as i32);
             active.push(lane);
         }
@@ -209,7 +246,21 @@ pub fn generate_batch(
         let mut next_active: Vec<Lane> = Vec::new();
         for (row, mut lane) in std::mem::take(&mut active).into_iter().enumerate() {
             let tok = sample_row(&logits, row, &mut lane)?;
-            if let LaneStep::Continue = record_token(&mut sched, &mut lane, tok, on_event) {
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.token_probability(
+                    "decode",
+                    tok,
+                    selected_token_probability(&logits, row, tok)?,
+                );
+            }
+            if let LaneStep::Continue = record_token_observed(
+                &mut sched,
+                &mut lane,
+                tok,
+                on_event,
+                &mut observer,
+                &mut observed_first_token,
+            ) {
                 next_keep.push(row as i32);
                 next_active.push(lane);
             }
@@ -225,6 +276,18 @@ pub fn generate_batch(
         active = next_active;
     }
 
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.phase("decode-steady");
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer)?;
+        if cancel.is_cancelled() {
+            observer.phase("cancellation-cleanup");
+        }
+    }
+    cache.reset()?;
+    if let Some(observer) = observer {
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer)?;
+    }
+
     // ---- Assemble per-request outputs in request order. ----
     Ok(seq_ids
         .iter()
@@ -238,6 +301,30 @@ pub fn generate_batch(
             },
         })
         .collect())
+}
+
+fn observe_cache_events(
+    cache: &mut dyn crate::primitives::kv_cache::KvCache,
+    seen: &mut usize,
+    observer: &mut dyn crate::campaign::Observer,
+) -> Result<()> {
+    let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
+        return Ok(());
+    };
+    for event in cache.events().iter().skip(*seen) {
+        if event.role == "cache" && event.lifetime == "persistent" {
+            continue;
+        } else if event.lifetime == "released" {
+            observer.release_event(event.operation, event.role, event.bytes);
+        } else {
+            observer.allocation_event(event.operation, event.role, event.lifetime, event.bytes);
+        }
+    }
+    *seen = cache.events().len();
+    if let Some((bytes, tokens, capacity, element_bytes)) = cache.retained_snapshot()? {
+        observer.cache_snapshot(bytes, tokens, capacity, element_bytes);
+    }
+    Ok(())
 }
 
 /// Build the left-padded prefill inputs: token ids, per-row RoPE positions, and the additive
@@ -317,4 +404,60 @@ fn record_token(
         &mut lane.next_token,
         on_event,
     )
+}
+
+fn record_token_observed(
+    sched: &mut Scheduler,
+    lane: &mut Lane,
+    tok: i32,
+    on_event: &mut dyn FnMut(usize, StreamEvent),
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    observed_first_token: &mut bool,
+) -> LaneStep {
+    let mut observed = |request_index, event| {
+        if !*observed_first_token && matches!(event, StreamEvent::Token { .. }) {
+            *observed_first_token = true;
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.phase("first-token");
+            }
+        }
+        on_event(request_index, event);
+    };
+    record_token(sched, lane, tok, &mut observed)
+}
+
+fn selected_token_probability(logits: &Array, row: usize, token: i32) -> Result<f64> {
+    if token < 0 {
+        return Err(Error::Msg("negative sampled token id".into()));
+    }
+    let logits_f32 = logits.as_dtype(Dtype::Float32)?;
+    let values = logits_f32.as_slice::<f32>().to_vec();
+    let shape = logits.shape();
+    let width = shape
+        .get(1)
+        .copied()
+        .filter(|width| *width > 0)
+        .ok_or_else(|| Error::Msg("batch logits have no vocabulary axis".into()))?
+        as usize;
+    let token = token as usize;
+    let start = row
+        .checked_mul(width)
+        .ok_or_else(|| Error::Msg("batch logits row overflow".into()))?;
+    let row_values = values
+        .get(start..start + width)
+        .ok_or_else(|| Error::Msg("sampled batch token is outside logits".into()))?;
+    if token >= row_values.len() || row_values.iter().any(|value| !value.is_finite()) {
+        return Err(Error::Msg(
+            "sampled batch token is outside finite logits".into(),
+        ));
+    }
+    let max = row_values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let denom = row_values
+        .iter()
+        .map(|value| (value - max).exp() as f64)
+        .sum::<f64>();
+    if !denom.is_finite() || denom <= 0.0 {
+        return Err(Error::Msg("invalid batch softmax denominator".into()));
+    }
+    Ok(((row_values[token] - max).exp() as f64) / denom)
 }

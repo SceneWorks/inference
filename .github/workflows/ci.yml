@@ -912,6 +912,17 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv for Windows supervisor smoke
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12 for Windows supervisor smoke
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
+      - name: Exercise Windows media supervisor process tree (no GPU)
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" -m unittest scripts.tests.test_media_campaign_supervisor.WindowsSupervisorTests -v'
       - name: Select Git Bash
         shell: cmd
         run: |

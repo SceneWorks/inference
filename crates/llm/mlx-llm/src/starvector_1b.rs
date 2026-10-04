@@ -363,19 +363,37 @@ impl TextLlm for StarVector1bProvider {
                 });
             }
         })?;
-        Ok(TextLlmOutput {
-            timings: None,
-            text: output.svg.unwrap_or_default(),
-            thinking: None,
-            tool_calls: Vec::new(),
-            usage: Usage {
+        Ok(svg_text_output(
+            output.svg,
+            Usage {
                 prompt_tokens: IMAGE_TOKENS as u32 + 1,
                 generated_tokens: output.generated_tokens,
             },
-            mtp: None,
-            decode: None,
-            finish_reason: Some(map_finish(output.finish_reason)),
-        })
+            map_finish(output.finish_reason),
+            request.kv_compression,
+        ))
+    }
+}
+
+/// The text output of one SVG generation: the SVG source (empty when none closed), and — the
+/// StarVector wrapper having no compressed-KV table family — the dense KV-cache report for the
+/// request's `policy` (sc-20683).
+fn svg_text_output(
+    svg: Option<String>,
+    usage: Usage,
+    finish: FinishReason,
+    policy: core_llm::KvCompressionPolicy,
+) -> TextLlmOutput {
+    TextLlmOutput {
+        timings: None,
+        text: svg.unwrap_or_default(),
+        thinking: None,
+        tool_calls: Vec::new(),
+        usage,
+        mtp: None,
+        decode: None,
+        finish_reason: Some(finish),
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(policy)),
     }
 }
 
@@ -573,6 +591,22 @@ mod tests {
     use core_llm_testkit::{
         check_starvector_bounded_fixture, starvector_conformance, StarVectorProfile,
     };
+
+    /// sc-20683: every SVG text output reports the dense KV cache with the shared reason for its
+    /// policy.
+    #[test]
+    fn svg_text_output_reports_the_dense_kv_cache_for_the_policy() {
+        use core_llm::{
+            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        };
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let output = svg_text_output(None, Usage::default(), FinishReason::Stop, policy);
+            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
+        }
+    }
 
     fn exact_snapshot_config() -> Value {
         json!({

@@ -55,6 +55,7 @@ pub mod model_vace_fun;
 pub mod pipeline;
 pub mod quant;
 pub mod rope;
+pub mod sc20686_observer;
 pub mod scheduler;
 mod text_encode;
 pub mod text_encoder;
@@ -158,7 +159,10 @@ use candle_gen::gen_core::{
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
     OffloadPolicy, Progress, Quant, WeightsSource,
 };
-use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
+use candle_gen::{
+    check_cancel as product_check_cancel, run_three_stage_sequential, CandleError,
+    Result as CResult,
+};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
@@ -169,6 +173,12 @@ use rope::WanRope;
 use scheduler::{flow_shift, FlowScheduler, Sampler};
 use text_encoder::Umt5Encoder;
 use transformer::WanTransformer;
+
+fn check_cancel(cancel: &CancelFlag) -> CResult<()> {
+    product_check_cancel(cancel).inspect_err(|_| {
+        sc20686_observer::observe_cancelled();
+    })
+}
 
 /// The DiT source is resolved exactly once when the generator is loaded. The native-GGUF seam is
 /// process-global today, but generation must never re-read it: doing so could make a generator whose
@@ -557,10 +567,38 @@ impl Pipeline {
         // Text K/V is invariant for the full request. Keep the cache local to this denoise call so it
         // cannot outlive the request, while both CFG branches reuse their own payload exactly once.
         check_cancel(cancel)?;
+        crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, cos.dim(0)? as u64, 0, "");
         let pos_kv = dit.prepare_cross_kv(ctx_pos)?;
+        if let Some((pos_bytes, pos_shape, pos_dtype)) = pos_kv.evidence() {
+            crate::sc20686_observer::observe_tensor(
+                "cross-kv-prepared",
+                "prepare",
+                pos_bytes,
+                0,
+                0,
+                pos_shape,
+                pos_dtype,
+                "none",
+                "applied",
+            );
+            crate::sc20686_observer::observe("cross-kv-reuse", pos_bytes, 0, 1);
+        }
         let neg_kv = ctx_neg
             .map(|context| dit.prepare_cross_kv(context))
             .transpose()?;
+        if let Some((bytes, shape, dtype)) = neg_kv.as_ref().and_then(|kv| kv.evidence()) {
+            crate::sc20686_observer::observe_tensor(
+                "cross-kv-prepared",
+                "prepare-negative",
+                bytes,
+                0,
+                0,
+                shape,
+                dtype,
+                "none",
+                "applied",
+            );
+        }
         const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
         let latents = if let Some(name) = sampler_name.filter(|n| FOLDIN.contains(n)) {
             if ti2v.is_some() {
@@ -590,6 +628,7 @@ impl Pipeline {
                         }
                         None => v_pos,
                     };
+                    check_cancel(cancel)?;
                     Ok(v)
                 },
             )?
@@ -620,6 +659,7 @@ impl Pipeline {
                     }
                     None => v_pos,
                 };
+                check_cancel(cancel)?;
                 latents = sched.step(&v, &latents)?;
                 if let Some(conditioning) = ti2v {
                     latents =
@@ -643,10 +683,12 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
         let knobs = self.resolve_knobs(req);
 
         // Text encode (pos + optional neg for CFG), then project to the DiT context once.
         let pos_embeds = self.encode(comps, &req.prompt)?;
+        crate::sc20686_observer::observe("weights-loaded", 0, 0, 0);
         let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
         let ctx_neg = if knobs.guidance > 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
@@ -658,6 +700,7 @@ impl Pipeline {
         let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
         let noise = pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
         let (latents0, ti2v) = self.prepare_ti2v(req, &comps.vae, &noise, t_lat, h_lat, w_lat)?;
+        crate::sc20686_observer::observe("prefill-peak", 0, 0, 0);
 
         let latents = self.denoise(
             &comps.dit,
@@ -673,6 +716,7 @@ impl Pipeline {
             &req.cancel,
             on_progress,
         )?;
+        crate::sc20686_observer::observe("decode-steady", 0, 0, 0);
 
         on_progress(Progress::Decoding);
         // Memory-bounded z48 vae22 decode (sc-7111): the per-frame streaming `decode` already bounds
@@ -685,6 +729,7 @@ impl Pipeline {
             decode_cap,
         )?;
         let images = pipeline::frames_to_images(&decoded)?;
+        crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok((images, knobs.fps))
     }
 
@@ -1096,6 +1141,25 @@ impl Generator for WanGenerator {
             i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
         run_serialized_request(&self.lifecycle, || {
+            let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
+            let (latent_frames, latent_height, latent_width) =
+                pipeline::latent_dims(frames, req.width, req.height);
+            let _campaign = crate::sc20686_observer::activate_requested(
+                &self.root,
+                &req.cancel,
+                MODEL_ID,
+                1,
+                frames,
+                req.width,
+                req.height,
+                latent_frames as u32,
+                latent_height as u32,
+                latent_width as u32,
+                &req.prompt,
+                req.guidance,
+                0,
+            )
+            .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
             let pipe = self.pipeline();
             // Sequential offload (sc-12757): stage load→use→drop each heavy component so the
             // denoise peak is the DiT alone. A request-selected staged transition must first evict a

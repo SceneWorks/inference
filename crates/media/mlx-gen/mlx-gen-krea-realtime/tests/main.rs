@@ -9,6 +9,8 @@
 //! `cargo test -p <crate> --test integration -- <name>::`.
 
 // --- shared modules (hand-maintained; preserved by regen) ---
+// The SC-20684 receipt contains a deeply nested JSON observation.
+#![recursion_limit = "256"]
 // --- generated modules (do not edit) ---
 
 #[path = "ar_generate.rs"]

@@ -702,7 +702,7 @@ fn read_to_string_if_exists(path: &Path) -> Result<Option<String>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::ModelConfig;
     use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
@@ -767,7 +767,7 @@ mod tests {
         (t, config)
     }
 
-    fn tiny_qwen35(moe: bool) -> (Vec<(String, Array)>, Value) {
+    pub(crate) fn tiny_qwen35(moe: bool) -> (Vec<(String, Array)>, Value) {
         let (h, vocab, inter, layers) = (64i32, 8i32, 128i32, 4usize);
         let mut rng = SplitMix64::new(if moe { 0x35A3B } else { 0x3527B });
         let mut t = Vec::new();

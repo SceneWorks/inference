@@ -701,15 +701,15 @@ fn gemma4_sliding_window_attention_ignores_keys_outside_the_window() {
     );
 }
 
-/// The sliding mask survives the prefill path too (`q_len > 8` chunks through MLX's
-/// broken-kernel mitigation), where the mask is sliced per chunk rather than applied whole.
+/// The sliding mask survives the prefill path too (`q_len > 8` chunks through the 8-row prefill
+/// path), where the mask is sliced per chunk rather than applied whole.
 #[test]
 fn gemma4_sliding_window_prefill_matches_the_eager_reference() {
-    // `head_dim = 64` and `q_len = 16` deliberately land on MLX's broken-fused-kernel envelope
-    // (`q_len > 8`, multi-head, power-of-two head dim), so `sdpa` routes this through the chunked
-    // prefill — the path that slices the materialized window mask's query axis per chunk. At a
-    // smaller head dim the chunker never runs and this test would prove nothing about it.
-    let (heads, seq, head_dim, window) = (2i32, 16i32, 64i32, 5i32);
+    // `head_dim = 256` (Gemma's) and `q_len = 16` deliberately land on `sdpa`'s 8-row prefill route
+    // (`q_len > 8`, multi-head, a power-of-two head dim MLX's fused full kernel does not serve) —
+    // the path that slices the materialized window mask's query axis per chunk. Head dims 64/80/128
+    // run 16 rows as one fused block and would prove nothing about the slicing.
+    let (heads, seq, head_dim, window) = (2i32, 16i32, 256i32, 5i32);
     let mut rng = SplitMix64::new(0xB0B);
     let randn = |n: usize, rng: &mut SplitMix64| -> Vec<f32> {
         (0..n).map(|_| (rng.next_f32() - 0.5) * 2.0).collect()

@@ -42,6 +42,22 @@ use crate::patchify::{patchify, unpatchify};
 use crate::rope::RopeTable;
 use crate::text_encoder::gelu_tanh;
 
+/// Optional experimental owner of cached causal-attention reads.  The standard path passes no
+/// backend and remains byte-for-byte on MLX fused SDPA.  A provider can instead receive q plus this
+/// layer's post-RoPE/current K/V and dispatch an owned packed-cache kernel without exposing Wan's
+/// private attention blocks or materializing a dense historical window.
+pub trait CausalPackedAttention {
+    fn attend(
+        &mut self,
+        layer: usize,
+        q: &Array,
+        current_k: &Array,
+        current_v: &Array,
+        mask: Option<&Array>,
+        scale: f32,
+    ) -> Result<Option<Array>>;
+}
+
 // sc-2957: when on, the Wan DiT's fusable elementwise *glue* (adaLN affine, gated residual,
 // gated-GELU FFN activation, RoPE rotation) runs through `mx.compile` so MLX fuses each chain into a
 // single kernel (vs one Metal kernel per primitive op when eager) — **bit-exact** and **+14.1% /
@@ -193,6 +209,25 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
         );
         Ok(compile(gelu_ffn_impl, true)(x)?)
     }
+}
+
+/// Zero-pad one prompt's trimmed T5 embedding `[L_text, text_dim]` to `[text_len, text_dim]` — the
+/// reference text context: the original Wan `WanModel` and diffusers' Wan pipelines
+/// (`_get_t5_prompt_embeds`: `u[:seq_len]` then `torch.cat([u, u.new_zeros(max_sequence_length -
+/// len, dim)])`, `max_sequence_length = 512`) pad with zeros, and the transformer then projects and
+/// attends over all `text_len` tokens with no mask. Shared by base Wan's [`WanTransformer::embed_text`]
+/// and the VACE pipelines, so both build the context the reference way. A prompt already at or past
+/// `text_len` (the tokenizer truncates to it) is returned unchanged.
+pub fn pad_text_context(t5_embed: &Array, text_len: usize) -> Result<Array> {
+    let text_len = text_len as i32;
+    let l = t5_embed.shape()[0];
+    let dim_text = t5_embed.shape()[1];
+    Ok(if l < text_len {
+        let pad = Array::zeros::<f32>(&[text_len - l, dim_text])?.as_dtype(t5_embed.dtype())?;
+        concatenate_axis(&[t5_embed, &pad], 0)?
+    } else {
+        t5_embed.clone()
+    })
 }
 
 #[cfg(test)]
@@ -555,6 +590,7 @@ impl SelfAttention {
     /// concatenates + scores. Returns `(out [B, S, dim] bf16, new_k [B, n, S, d] bf16,
     /// new_v [B, n, S, d] bf16)`: `new_k`/`new_v` are **this chunk's** post-RoPE k / raw v for the
     /// caller to append to its running cache. Inference-only (no SDPA checkpointing).
+    #[allow(clippy::too_many_arguments)]
     fn forward_causal(
         &self,
         x_mod: &Array,
@@ -563,6 +599,7 @@ impl SelfAttention {
         prev_k: Option<&Array>,
         prev_v: Option<&Array>,
         mask: Option<&Array>,
+        packed_attention: Option<(&mut dyn CausalPackedAttention, usize)>,
     ) -> Result<(Array, Array, Array)> {
         // q/k/v projection + qk-RMSNorm + offset-RoPE + head split — byte-identical to `forward`.
         let xw = bf16(x_mod)?;
@@ -600,9 +637,22 @@ impl SelfAttention {
             _ => (k.clone(), v.clone()),
         };
 
-        let out = match mask {
-            Some(m) => scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, m, None)?,
-            None => scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, None, None)?,
+        let out = match packed_attention {
+            Some((backend, layer)) => match backend.attend(layer, &q, &k, &v, mask, self.scale)? {
+                Some(out) => out,
+                None => match mask {
+                    Some(m) => {
+                        scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, m, None)?
+                    }
+                    None => {
+                        scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, None, None)?
+                    }
+                },
+            },
+            None => match mask {
+                Some(m) => scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, m, None)?,
+                None => scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, None, None)?,
+            },
         };
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         Ok((self.o.forward(&out)?, k, v))
@@ -657,6 +707,9 @@ fn sdpa_maybe_checkpoint(
         .next()
         .ok_or_else(|| Error::Msg("wan: checkpoint SDPA produced no output".into()))
 }
+
+/// SC-20686 operation name of one Wan cross-attention read over its cached text K/V (Metal lane).
+pub(crate) const SC20686_CROSS_KV_READ: &str = "CrossAttention::forward(cached-text-kv)";
 
 #[derive(Clone)]
 struct CrossAttention {
@@ -778,6 +831,12 @@ impl CrossAttention {
         let q = rms_norm(&self.q.forward(&bf16(x)?)?, &self.norm_q, self.eps)?
             .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
+        // SC-20686 Metal lane: a read window only for a registered campaign cache (`None` — no
+        // evaluation, no allocation — for every ordinary render and every non-campaign caller).
+        let sc20686 = mlx_gen::sc20686::begin_read(
+            mlx_gen::sc20686::cross_kv_cache_id(kv).map(mlx_gen::sc20686::ReadTarget::Cache),
+            &[&q, &kv.0, &kv.1],
+        )?;
         let out = sdpa_maybe_checkpoint(
             &q,
             &kv.0,
@@ -786,6 +845,7 @@ impl CrossAttention {
             self.ckpt_sdpa,
             self.attn_budget,
         )?;
+        mlx_gen::sc20686::finish_read(sc20686, &out, SC20686_CROSS_KV_READ, true)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
@@ -1015,6 +1075,7 @@ impl Block {
         prev_k: Option<&Array>,
         prev_v: Option<&Array>,
         mask: Option<&Array>,
+        packed_attention: Option<(&mut dyn CausalPackedAttention, usize)>,
     ) -> Result<(Array, Array, Array)> {
         // adaLN-6vec modulation — identical to `forward`.
         let dim = self.self_attn.num_heads as i32 * self.self_attn.head_dim as i32;
@@ -1027,9 +1088,15 @@ impl Block {
 
         // Self-attention — the causal cached delta.
         let x_mod = modulate(&ln(x, self.eps)?, &e1, &e0)?;
-        let (y, new_k, new_v) = self
-            .self_attn
-            .forward_causal(&x_mod, cos, sin, prev_k, prev_v, mask)?;
+        let (y, new_k, new_v) = self.self_attn.forward_causal(
+            &x_mod,
+            cos,
+            sin,
+            prev_k,
+            prev_v,
+            mask,
+            packed_attention,
+        )?;
         let x = gated(x, &y, &e2)?;
 
         // Cross-attention (reused verbatim — text context, position-independent).
@@ -1507,16 +1574,8 @@ impl WanTransformer {
     /// Embed a single T5 prompt embedding `[L_text, text_dim]` → `[1, text_len, dim]` (bf16),
     /// zero-padded to `text_len`. Mirrors `WanModel.embed_text` for one prompt.
     pub fn embed_text(&self, t5_embed: &Array) -> Result<Array> {
-        let text_len = self.cfg.text_len as i32;
-        let l = t5_embed.shape()[0];
-        let dim_text = t5_embed.shape()[1];
-        let ctx = if l < text_len {
-            let pad = Array::zeros::<f32>(&[text_len - l, dim_text])?.as_dtype(t5_embed.dtype())?;
-            concatenate_axis(&[t5_embed, &pad], 0)?
-        } else {
-            t5_embed.clone()
-        };
-        let ctx = ctx.reshape(&[1, text_len, dim_text])?;
+        let ctx = pad_text_context(t5_embed, self.cfg.text_len)?;
+        let ctx = ctx.reshape(&[1, self.cfg.text_len as i32, t5_embed.shape()[1]])?;
         let h = self.text_embedding_0.forward(&ctx)?;
         let h = gelu_tanh(&h)?;
         // Cast to bf16 (the reference's `.astype(model_dtype)`); the cross-attn K/V run bf16.
@@ -2021,7 +2080,63 @@ impl WanTransformer {
                 Some((k, v)) => (Some(k), Some(v)),
                 None => (None, None),
             };
-            let (xo, nk, nv) = block.forward_causal(&x, &e0, kv, cos, sin, pk, pv, mask)?;
+            let (xo, nk, nv) = block.forward_causal(&x, &e0, kv, cos, sin, pk, pv, mask, None)?;
+            x = xo;
+            new_self_kv.push((nk, nv));
+        }
+        Ok((self.apply_head(&x, &e)?, new_self_kv))
+    }
+
+    /// Experimental variant of [`Self::forward_causal_chunk`] that gives a provider-owned packed
+    /// cache backend one exact per-layer opportunity to consume q/current-K/current-V directly.
+    /// Returning `Ok(None)` from the backend is a deterministic dense fallback before it changes
+    /// any provider cache state; this method otherwise preserves the normal Wan block ordering,
+    /// RoPE, head mapping, residuals, and returned post-RoPE K/raw-V append contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_causal_chunk_with_packed_attention(
+        &self,
+        tokens: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        prev_self_kv: &[(Array, Array)],
+        mask: Option<&Array>,
+        backend: &mut dyn CausalPackedAttention,
+    ) -> Result<(Array, Vec<(Array, Array)>)> {
+        if cross_kv.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "wan causal packed: expected one cross-attention cache per layer ({}), got {}",
+                self.blocks.len(),
+                cross_kv.len()
+            )));
+        }
+        if !prev_self_kv.is_empty() && prev_self_kv.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "wan causal: prev_self_kv must be empty or one (k,v) per layer ({}), got {}",
+                self.blocks.len(),
+                prev_self_kv.len()
+            )));
+        }
+        let (e, e0) = self.time_embed(t)?;
+        let mut x = tokens.clone();
+        let mut new_self_kv = Vec::with_capacity(self.blocks.len());
+        for (i, (block, kv)) in self.blocks.iter().zip(cross_kv.iter()).enumerate() {
+            let (pk, pv) = match prev_self_kv.get(i) {
+                Some((k, v)) => (Some(k), Some(v)),
+                None => (None, None),
+            };
+            let (xo, nk, nv) = block.forward_causal(
+                &x,
+                &e0,
+                kv,
+                cos,
+                sin,
+                pk,
+                pv,
+                mask,
+                Some((&mut *backend, i)),
+            )?;
             x = xo;
             new_self_kv.push((nk, nv));
         }
