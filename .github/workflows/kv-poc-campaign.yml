@@ -48,6 +48,16 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 #   `mode=w2` runs probe (plus the W2 disk/asset report) -> w2-assets -> w2-build -> phases.
 #   Empty `phases` = every phase of the mode.
 #
+# HF HUB OVERRIDE (one run only). `hf_hub_override` (run json key or dispatch input) names an
+# absolute directory strictly under the runner user's home on its internal disk, e.g.
+# /Users/MTrefry/kv-poc-hub-20669, used instead of /Volumes/Models/huggingface/hub by every job of
+# the run: created when missing, nothing seeded (every pinned file is downloaded into it, then the
+# usual byte/sha256 checks and the parents' own inventories bind content, so evidence identity is
+# unchanged), the disk precheck measures its volume, and the summaries record it. The `cleanup` job
+# then ALWAYS deletes it once every other job has finished, behind the same validation
+# (.github/kv-poc/hub.sh): it can never touch /Volumes/Models or anything outside that path. A run
+# that safe-stopped therefore re-downloads on its re-dispatch.
+#
 # WHERE STATE LIVES (.github/kv-poc/common.sh): $HOME/kv-poc on the runner, outside the workspace:
 # stable inference + SceneWorks clones at the frozen SHAs (the bins check both HEADs at run time),
 # the sealed frozen dirs (frozen/ for W1, frozen-w2/ for W2; reused, never rebuilt, once they
@@ -130,6 +140,10 @@ on:
         description: "Empty = all sixteen nf rows. One SC-20671 coordinate = that row's dense noise floor only, in its own -only-<name> dirs"
         type: string
         default: ""
+      hf_hub_override:
+        description: "Empty = /Volumes/Models/huggingface/hub. An absolute dir strictly under the runner user's home on its internal disk (e.g. /Users/MTrefry/kv-poc-hub-20669) used as the HF hub for this run only; every pinned file is downloaded into it and the cleanup job deletes it afterwards"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -161,6 +175,7 @@ jobs:
       a2_methods: ${{ steps.resolve.outputs.a2_methods }}
       a2_only_coordinate: ${{ steps.resolve.outputs.a2_only_coordinate }}
       nf_only_coordinate: ${{ steps.resolve.outputs.nf_only_coordinate }}
+      hf_hub_override: ${{ steps.resolve.outputs.hf_hub_override }}
       runs_on: ${{ steps.resolve.outputs.runs_on }}
       runner_name: ${{ steps.resolve.outputs.runner_name }}
     steps:
@@ -183,6 +198,7 @@ jobs:
           DISPATCH_A2_METHODS: ${{ inputs.a2_methods }}
           DISPATCH_A2_ONLY_COORDINATE: ${{ inputs.a2_only_coordinate }}
           DISPATCH_NF_ONLY_COORDINATE: ${{ inputs.nf_only_coordinate }}
+          DISPATCH_HF_HUB_OVERRIDE: ${{ inputs.hf_hub_override }}
         run: bash .github/kv-poc/config.sh
 
   probe:
@@ -193,6 +209,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_MODE: ${{ needs.config.outputs.mode }}
     steps:
@@ -213,6 +230,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -241,6 +259,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "660"
     steps:
@@ -279,6 +298,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       BASELINE_EVIDENCE_SHA: ${{ needs.config.outputs.baseline_evidence_sha }}
       KV_A3_BITS: ${{ needs.config.outputs.a3_bits }}
@@ -320,6 +340,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_A2_METHODS: ${{ needs.config.outputs.a2_methods }}
       KV_A2_ONLY_COORDINATE: ${{ needs.config.outputs.a2_only_coordinate }}
@@ -361,6 +382,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "60"
     steps:
@@ -403,6 +425,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_NF_ONLY_COORDINATE: ${{ needs.config.outputs.nf_only_coordinate }}
       KV_SOFT_BUDGET_MIN: "240"
@@ -437,6 +460,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -460,6 +484,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -483,6 +508,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "240"
     steps:
@@ -520,6 +546,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "360"
     steps:
@@ -558,6 +585,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "240"
     steps:
@@ -580,3 +608,26 @@ jobs:
           path: ${{ runner.temp }}/kv-poc-artifact/d-control/
           if-no-files-found: warn
           retention-days: 30
+
+  cleanup:
+    name: Delete the run's HF hub override
+    needs: [config, probe, build, a1, a3, a2, b, nf, w2-assets, w2-build, c, d, d-control]
+    if: ${{ always() && needs.config.result == 'success' && needs.config.outputs.hf_hub_override != '' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 30
+    env:
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Delete the validated override directory (never /Volumes/Models)
+        run: |
+          if [ "${RUNNER_NAME:-}" != "$KV_EXPECTED_RUNNER" ]; then
+            echo "::error title=wrong runner::cleanup landed on '${RUNNER_NAME:-?}', the override lives on '$KV_EXPECTED_RUNNER'"
+            exit 1
+          fi
+          bash .github/kv-poc/hub.sh cleanup "$KV_HF_HUB_OVERRIDE" "$HOME"

@@ -15,6 +15,10 @@
 # campaign) into its own `-only-<name>` resume + evidence dirs, so it never touches a full A2.
 # nf_only_coordinate (optional, default ""): run the nf dense noise floor as `--only-coordinate
 # <name>` (one scheduled SC-20671 coordinate) into its own `-only-<name>` dirs.
+# hf_hub_override (optional, default ""): an absolute directory strictly under the runner user's
+# home (e.g. /Users/MTrefry/kv-poc-hub-20669) that replaces /Volumes/Models/huggingface/hub for the
+# whole run; the `cleanup` job deletes it afterwards (hub.sh). Its syntax is checked here; the
+# runner re-checks it against its own $HOME, volume and symlinks before creating or deleting it.
 # Either way every value is validated here, so a typo fails in seconds on a hosted runner instead
 # of queueing a self-hosted job on a label no runner carries (which waits silently forever).
 set -euo pipefail
@@ -33,6 +37,7 @@ if [ "$EVENT_NAME" = "push" ]; then
   a2_methods="$(read_key a2_methods group-affine)"
   a2_only_coordinate="$(read_key a2_only_coordinate "")"
   nf_only_coordinate="$(read_key nf_only_coordinate "")"
+  hf_hub_override="$(read_key hf_hub_override "")"
   source_desc="$file @ ${GITHUB_SHA}"
 else
   mode="$DISPATCH_MODE"
@@ -45,6 +50,7 @@ else
   a2_methods="${DISPATCH_A2_METHODS:-group-affine}"
   a2_only_coordinate="${DISPATCH_A2_ONLY_COORDINATE:-}"
   nf_only_coordinate="${DISPATCH_NF_ONLY_COORDINATE:-}"
+  hf_hub_override="${DISPATCH_HF_HUB_OVERRIDE:-}"
   source_desc="workflow_dispatch inputs"
 fi
 
@@ -139,6 +145,14 @@ only_coordinate() { # <key> <value>: empty or one scheduled coordinate; sets $li
 only_coordinate a2_only_coordinate "$a2_only_coordinate"; a2_only_coordinate="$listed"
 only_coordinate nf_only_coordinate "$nf_only_coordinate"; nf_only_coordinate="$listed"
 
+# shellcheck source=.github/kv-poc/hub.sh
+source "$(dirname "$0")/hub.sh"
+if [ -n "$hf_hub_override" ]; then
+  hub_problem="$(hub_override_syntax_problem "$hf_hub_override" "")" || fail "$hub_problem"
+fi
+hub_desc="\`$KV_DEFAULT_HF_HUB\` (default)"
+[ -z "$hf_hub_override" ] || hub_desc="\`$hf_hub_override\` (one-run OVERRIDE: created on the runner, deleted by the cleanup job)"
+
 runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l | split(" "))')"
 {
   echo "mode=$mode"
@@ -152,6 +166,7 @@ runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l 
   echo "a2_methods=$a2_methods"
   echo "a2_only_coordinate=$a2_only_coordinate"
   echo "nf_only_coordinate=$nf_only_coordinate"
+  echo "hf_hub_override=$hf_hub_override"
   echo "runs_on=$runs_on"
   echo "runner_name=$runner_name"
 } >> "$GITHUB_OUTPUT"
@@ -171,6 +186,7 @@ runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l 
   echo "| A3 --kv-bits | \`$a3_bits\` |"
   echo "| A2 --kv-method | \`$a2_methods\` |"
   echo "| A2 --only-coordinate | ${a2_only_coordinate:+\`$a2_only_coordinate\` (PARTIAL, non-publishable)}${a2_only_coordinate:-all sixteen rows} |"
+  echo "| HF hub | $hub_desc |"
   echo "| NF --only-coordinate | ${nf_only_coordinate:+\`$nf_only_coordinate\`}${nf_only_coordinate:-all sixteen rows} |"
 } >> "$GITHUB_STEP_SUMMARY"
 cat "$GITHUB_STEP_SUMMARY"

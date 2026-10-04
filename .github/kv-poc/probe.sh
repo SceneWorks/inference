@@ -70,7 +70,8 @@ row "zstd (prebuilt MLX)" "$(code "$zstd_v")"
 row "hf CLI" "$(code "$hf_v")"
 row "thermal" "$(code "${therm:-unknown}")"
 row "HF hub $KV_HF_HUB" "$hub_state"
-for d in "$HOME" /Volumes/Models; do
+row "HF hub source" "${KV_HF_HUB_OVERRIDE:+one-run OVERRIDE (hf_hub_override; deleted by the cleanup job)}${KV_HF_HUB_OVERRIDE:-default}"
+for d in "$HOME" /Volumes/Models "$KV_HF_HUB"; do
   if [ -d "$d" ]; then row "disk free $d" "$(df -h "$d" | awk 'NR==2 {print $4 " free of " $2 " (" $5 " used)"}')"; fi
 done
 

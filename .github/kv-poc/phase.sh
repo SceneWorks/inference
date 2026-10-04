@@ -152,6 +152,10 @@ fi
 
 # 2. Precheck. Fails the job with the reason; never stops or kills anything.
 problems=""
+# Provenance: which hub this phase's weights are read from (the parents still sha256 every file).
+hub_line="HF hub: $KV_HF_HUB${KV_HF_HUB_OVERRIDE:+ (one-run hf_hub_override; deleted by the cleanup job)}"
+echo "$hub_line" | tee -a "$LOG"
+summary "- $hub_line"
 # RAM: only the phase policy's host reserve (16 GiB for llm.json, capture.json and media-64). The
 # parent admits each unit by estimate-plus-reserve-v1 (available >= that unit's estimate + reserve,
 # recorded in its admission) and refuses, unaccepted, any unit that does not fit at its start.
