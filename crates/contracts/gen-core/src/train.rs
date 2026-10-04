@@ -171,6 +171,139 @@ pub struct TrainingConfig {
     /// [`weight_noise`](TrainingTechniques::weight_noise), and by every trainer for a
     /// [`full_finetune`](Self::full_finetune) run — see [`validate_training_techniques`].
     pub weight_noise_sigma: f32,
+    /// **Depth anchoring** (epic 2123, sc-2125) — an auxiliary perceptual loss that keeps the
+    /// adapter's predicted geometry consistent with the training image: the model's x0 prediction
+    /// is decoded with the family's small differentiable decoder, run through a frozen
+    /// Depth-Anything-V2, and compared (scale-and-shift-invariant L1 + multi-scale gradient
+    /// matching) against the depth of the training image's own encode→decode round trip, cached
+    /// once per image. Off by default ([`AuxLossSchedule::weight`] `0`); refused (typed
+    /// [`crate::Error::Unsupported`]) by any trainer whose [`TrainerDescriptor::techniques`] does
+    /// not declare [`depth_anchoring`](TrainingTechniques::depth_anchoring) — see
+    /// [`validate_training_techniques`].
+    pub depth_anchoring: DepthAnchoringConfig,
+    /// Directory holding the family's **small differentiable x0 decoder** (TAEF1 for the Flux-VAE
+    /// 16-channel families, TAESD/TAESDXL for SD/SDXL, …) — the decoder every decoded-x0
+    /// perceptual loss (depth anchoring, and the identity/body losses that reuse the same shared
+    /// path) runs the model's x0 prediction through. Required (a typed refusal otherwise) whenever
+    /// such a loss is enabled; ignored when none is. `None` by default.
+    pub perceptual_decoder_dir: Option<PathBuf>,
+}
+
+/// Schedule of one **auxiliary perceptual loss** (epic 2123 E8: depth anchoring here; the
+/// identity, landmark, body and latent losses reuse it): its weight, the noise-level window it
+/// fires in, and how it alternates with the diffusion loss.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AuxLossSchedule {
+    /// Loss weight. `0` (the default) is **off** — the loss is never computed and the run trains
+    /// exactly as it would without it.
+    pub weight: f32,
+    /// Inclusive lower bound of the noise-level window the loss fires in — the flow-match `σ`
+    /// (or the normalized timestep `t / T` for ε/v-prediction families): `0` = clean, `1` = pure
+    /// noise.
+    pub t_min: f32,
+    /// Inclusive upper bound of the noise-level window (see [`t_min`](Self::t_min)).
+    pub t_max: f32,
+    /// Alternation period, in micro-steps (1-based step numbering):
+    /// - `1` — the weighted aux loss is **added** to the diffusion loss on every in-window step;
+    /// - `n ≥ 2` — every `n`-th step (`step % n == 0`) is an **aux-only** step on which the
+    ///   diffusion loss contributes **zero**; every other step is diffusion-only. An aux-only step
+    ///   whose sampled noise level falls outside the window trains the diffusion loss instead, so
+    ///   no step is wasted. `2` (the default) is the upstream strict alternation.
+    pub every_n: u32,
+}
+
+impl AuxLossSchedule {
+    /// The off schedule: weight `0`, full window `[0, 1]`, strict alternation.
+    pub const OFF: Self = Self {
+        weight: 0.0,
+        t_min: 0.0,
+        t_max: 1.0,
+        every_n: 2,
+    };
+
+    /// Whether the loss is turned on (`weight > 0`).
+    pub fn is_enabled(&self) -> bool {
+        self.weight > 0.0
+    }
+
+    /// Whether noise level `t` lies inside the inclusive window.
+    pub fn in_window(&self, t: f32) -> bool {
+        t >= self.t_min && t <= self.t_max
+    }
+
+    /// Reject a malformed schedule: a non-finite or negative weight, a window outside `[0, 1]` or
+    /// with `t_min > t_max`, or `every_n == 0`. `name` labels the error.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        if !self.weight.is_finite() || self.weight < 0.0 {
+            return Err(format!(
+                "{name} weight must be a finite value >= 0, got {}",
+                self.weight
+            ));
+        }
+        let unit = |v: f32| v.is_finite() && (0.0..=1.0).contains(&v);
+        if !unit(self.t_min) || !unit(self.t_max) || self.t_min > self.t_max {
+            return Err(format!(
+                "{name} timestep window [{}, {}] must satisfy 0 <= t_min <= t_max <= 1",
+                self.t_min, self.t_max
+            ));
+        }
+        if self.every_n == 0 {
+            return Err(format!("{name} alternation period every_n must be >= 1"));
+        }
+        Ok(())
+    }
+}
+
+impl Default for AuxLossSchedule {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
+/// Which Depth-Anything-V2 checkpoint depth anchoring runs (all three share one module graph).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DepthModelSize {
+    /// ViT-S/14 (~25M params) — the default and the upstream-calibrated choice.
+    #[default]
+    Small,
+    /// ViT-B/14 (~98M params).
+    Base,
+    /// ViT-L/14 (~335M params) — much larger gradients; upstream suggests a far smaller weight.
+    Large,
+}
+
+impl DepthModelSize {
+    /// Parse the contract string (`small`/`base`/`large`, case-insensitive); `None` otherwise.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "small" => Some(Self::Small),
+            "base" => Some(Self::Base),
+            "large" => Some(Self::Large),
+            _ => None,
+        }
+    }
+
+    /// The contract string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Base => "base",
+            Self::Large => "large",
+        }
+    }
+}
+
+/// [`TrainingConfig::depth_anchoring`] — the depth-anchoring loss schedule plus the frozen
+/// Depth-Anything-V2 checkpoint it runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DepthAnchoringConfig {
+    /// Weight / window / alternation. Off by default.
+    pub schedule: AuxLossSchedule,
+    /// Which DA2 checkpoint [`model_dir`](Self::model_dir) holds.
+    pub model_size: DepthModelSize,
+    /// Directory holding the DA2 `*-hf` checkpoint (`model.safetensors`). Required (a typed
+    /// refusal otherwise) when the loss is enabled.
+    pub model_dir: Option<PathBuf>,
 }
 
 impl Default for TrainingConfig {
@@ -216,6 +349,9 @@ impl Default for TrainingConfig {
             // Weight noising is OFF by default (epic 2123 E1): a caller that does not opt in trains
             // exactly as before.
             weight_noise_sigma: 0.0,
+            // Depth anchoring is OFF by default (epic 2123 E1): weight 0, no aux model loaded.
+            depth_anchoring: DepthAnchoringConfig::default(),
+            perceptual_decoder_dir: None,
         }
     }
 }
@@ -419,7 +555,7 @@ pub struct TrainerDescriptor {
 }
 
 /// Per-technique support flags for the optional training techniques of epic 2123 (weight noising
-/// today; gradient noise, aspect buckets, masked loss, depth anchoring and the perceptual
+/// and depth anchoring today; gradient noise, aspect buckets, masked loss, depth anchoring and the perceptual
 /// identity/body/latent losses join here as their stories land). Each flag gates exactly one
 /// [`TrainingConfig`] knob through [`validate_training_techniques`].
 ///
@@ -430,12 +566,15 @@ pub struct TrainerDescriptor {
 pub struct TrainingTechniques {
     /// Honors [`TrainingConfig::weight_noise_sigma`] (relative-mode adapter weight noising).
     pub weight_noise: bool,
+    /// Honors [`TrainingConfig::depth_anchoring`] (decoded-x0 Depth-Anything-V2 anchoring loss).
+    pub depth_anchoring: bool,
 }
 
 impl TrainingTechniques {
     /// No optional technique supported — every technique knob must stay at its off value.
     pub const NONE: Self = Self {
         weight_noise: false,
+        depth_anchoring: false,
     };
 }
 
@@ -449,6 +588,11 @@ impl TrainingTechniques {
 /// - `weight_noise_sigma > 0` with [`TrainingConfig::full_finetune`] ⇒ typed
 ///   [`crate::Error::Unsupported`]: weight noise perturbs adapter factors only and must never touch
 ///   base weights (E5).
+/// - a malformed [`TrainingConfig::depth_anchoring`] schedule ⇒ [`crate::Error::Msg`].
+/// - depth anchoring enabled on a trainer whose descriptor lacks
+///   [`depth_anchoring`](TrainingTechniques::depth_anchoring) ⇒ typed [`crate::Error::Unsupported`].
+/// - depth anchoring enabled without a [`DepthAnchoringConfig::model_dir`] or a
+///   [`TrainingConfig::perceptual_decoder_dir`] ⇒ [`crate::Error::Msg`] naming the missing model.
 /// - every technique off ⇒ no-op.
 pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
@@ -472,6 +616,34 @@ pub fn validate_training_techniques(
         if !desc.techniques.weight_noise {
             return Err(crate::Error::Unsupported(format!(
                 "{}: weight noising (weight_noise_sigma {sigma}) is not supported by this trainer",
+                desc.id
+            )));
+        }
+    }
+    let depth = &req.config.depth_anchoring;
+    depth
+        .schedule
+        .validate("depth anchoring")
+        .map_err(|m| crate::Error::Msg(format!("{}: {m}", desc.id)))?;
+    if depth.schedule.is_enabled() {
+        if !desc.techniques.depth_anchoring {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: depth anchoring (weight {}) is not supported by this trainer",
+                desc.id, depth.schedule.weight
+            )));
+        }
+        if depth.model_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: depth anchoring needs the Depth-Anything-V2 {} checkpoint \
+                 (depth_anchoring.model_dir is unset)",
+                desc.id,
+                depth.model_size.as_str()
+            )));
+        }
+        if req.config.perceptual_decoder_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: depth anchoring needs the family's small x0 decoder \
+                 (perceptual_decoder_dir is unset)",
                 desc.id
             )));
         }
@@ -852,6 +1024,113 @@ mod tests {
             let err = validate_training_techniques(&noisy_desc, &r).unwrap_err();
             assert!(matches!(err, crate::Error::Msg(_)), "{bad}: {err:?}");
         }
+    }
+
+    #[test]
+    fn validate_training_techniques_depth_anchoring_floor() {
+        // sc-2125 (epic 2123 E3): depth anchoring is refused unless the descriptor declares it,
+        // needs both aux models named, and a malformed schedule is refused outright.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut depth_desc = trainer_desc(false);
+        depth_desc.techniques.depth_anchoring = true;
+
+        // Off (the default) ⇒ no-op everywhere.
+        let off = train_req(None, items);
+        assert_eq!(off.config.depth_anchoring.schedule, AuxLossSchedule::OFF);
+        assert!(!off.config.depth_anchoring.schedule.is_enabled());
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.depth_anchoring.schedule.weight = 0.1;
+        on.config.depth_anchoring.model_dir = Some(PathBuf::from("/m/da2"));
+        on.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("depth anchoring")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&depth_desc, &on).is_ok());
+
+        // Missing aux models ⇒ a message naming the missing model.
+        let mut no_da2 = on.clone();
+        no_da2.config.depth_anchoring.model_dir = None;
+        let err = validate_training_techniques(&depth_desc, &no_da2).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("Depth-Anything-V2")));
+        let mut no_dec = on.clone();
+        no_dec.config.perceptual_decoder_dir = None;
+        let err = validate_training_techniques(&depth_desc, &no_dec).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")));
+
+        // Malformed schedules ⇒ Msg, regardless of support.
+        let bad = [
+            AuxLossSchedule {
+                weight: -0.1,
+                ..AuxLossSchedule::OFF
+            },
+            AuxLossSchedule {
+                weight: f32::NAN,
+                ..AuxLossSchedule::OFF
+            },
+            AuxLossSchedule {
+                t_min: 0.6,
+                t_max: 0.4,
+                ..AuxLossSchedule::OFF
+            },
+            AuxLossSchedule {
+                t_max: 1.5,
+                ..AuxLossSchedule::OFF
+            },
+            AuxLossSchedule {
+                every_n: 0,
+                ..AuxLossSchedule::OFF
+            },
+        ];
+        for schedule in bad {
+            let mut r = on.clone();
+            r.config.depth_anchoring.schedule = AuxLossSchedule {
+                weight: if schedule.weight == 0.0 {
+                    0.1
+                } else {
+                    schedule.weight
+                },
+                ..schedule
+            };
+            let err = validate_training_techniques(&depth_desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{schedule:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn aux_loss_schedule_window_is_inclusive() {
+        let s = AuxLossSchedule {
+            weight: 1.0,
+            t_min: 0.2,
+            t_max: 0.8,
+            every_n: 2,
+        };
+        assert!(s.in_window(0.2) && s.in_window(0.8) && s.in_window(0.5));
+        assert!(!s.in_window(0.19) && !s.in_window(0.81));
+    }
+
+    #[test]
+    fn depth_model_size_round_trips() {
+        for size in [
+            DepthModelSize::Small,
+            DepthModelSize::Base,
+            DepthModelSize::Large,
+        ] {
+            assert_eq!(DepthModelSize::parse(size.as_str()), Some(size));
+        }
+        assert_eq!(
+            DepthModelSize::parse(" LARGE "),
+            Some(DepthModelSize::Large)
+        );
+        assert_eq!(DepthModelSize::parse("giant"), None);
+        assert_eq!(DepthModelSize::default(), DepthModelSize::Small);
     }
 
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {

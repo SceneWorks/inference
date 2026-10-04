@@ -465,3 +465,42 @@ fn declared_but_rejected_weight_noise_fails_the_validate_check() {
         "got: {err}"
     );
 }
+
+/// sc-2125: a trainer that declares weight noise but silently accepts an undeclared depth-anchoring
+/// request fails the validate check and the train-entry refusal check on the depth probe.
+#[test]
+fn silently_ignored_depth_anchoring_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques.weight_noise = true;
+        stub
+    };
+    let err = check_trainer_validate(&make(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.depth_anchoring == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(
+        &|| -> Box<dyn Trainer> { Box::new(make()) },
+        &profile(&tmp),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("depth-anchoring") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-2125: a trainer that declares depth anchoring (and routes through the floor) passes.
+#[test]
+fn declared_depth_anchoring_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.depth_anchoring = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}

@@ -690,6 +690,8 @@ pub struct TrainerCapabilitySnapshot {
     pub max_reference_images: u32,
     /// Honors `TrainingConfig::weight_noise_sigma` (epic 2123 weight noising, sc-24826).
     pub supports_weight_noise: bool,
+    /// Honors `TrainingConfig::depth_anchoring` (epic 2123 depth anchoring, sc-2125).
+    pub supports_depth_anchoring: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -705,6 +707,7 @@ impl TrainerCapabilitySnapshot {
             supports_full_finetune: descriptor.supports_full_finetune,
             max_reference_images: descriptor.max_reference_images,
             supports_weight_noise: descriptor.techniques.weight_noise,
+            supports_depth_anchoring: descriptor.techniques.depth_anchoring,
         }
     }
 
@@ -720,6 +723,7 @@ impl TrainerCapabilitySnapshot {
             "supports_full_finetune": self.supports_full_finetune,
             "max_reference_images": self.max_reference_images,
             "supports_weight_noise": self.supports_weight_noise,
+            "supports_depth_anchoring": self.supports_depth_anchoring,
         })
     }
 }
@@ -1004,6 +1008,15 @@ mod tests {
         noisy.techniques.weight_noise = true;
         let noisy_json = TrainerCapabilitySnapshot::from_descriptor(&noisy).to_json();
         assert_eq!(noisy_json["supports_weight_noise"], true);
+        assert_eq!(noisy_json["supports_depth_anchoring"], false);
+
+        // sc-2125: depth anchoring is advertised from its own flag.
+        assert_eq!(json["supports_depth_anchoring"], false);
+        let mut depth = descriptor;
+        depth.techniques.depth_anchoring = true;
+        let depth_json = TrainerCapabilitySnapshot::from_descriptor(&depth).to_json();
+        assert_eq!(depth_json["supports_depth_anchoring"], true);
+        assert_eq!(depth_json["supports_weight_noise"], false);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {
