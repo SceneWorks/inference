@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -59,7 +60,8 @@ MIN_FREE_DISK = 4 * 7_261_441_640  # Pinned model checkpoint equivalents for fre
 REFERENCE_PEAK = 23_184_818_176  # Measured CPU F32 reference, a preflight floor, not a safe GPU bound.
 RECEIPT_FILES = (
     "case.json", "admission.json", "stages.jsonl", "outcome.json", "record.json",
-    "cuda-samples.jsonl", "watchdog.jsonl",
+    "cuda-samples.jsonl", "cuda-owned-samples.jsonl", "cuda-owned-faults.jsonl",
+    "profile-process.json", "watchdog.jsonl",
 )
 OFF_PLAN_CHECK = """
 import { readFileSync } from 'node:fs';
@@ -344,6 +346,46 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
                     own_stages[stage]["peakBytes"] <= estimated[stage]["deviceBytes"] + 2 * 1024 ** 3
                     for stage in STAGES),
                 "shared CUDA owned-stage peak is absent or exceeds admitted estimate plus reserve")
+        require(type(owned.get("peakBytes")) is int and owned["peakBytes"] > 0 and
+                owned["peakBytes"] >= max(own_stages[stage]["peakBytes"] for stage in STAGES),
+                "shared CUDA owned overall peak is inconsistent with stage peaks")
+        source_dir = record_path.parent
+        process_file = source_dir / "profile-process.json"
+        owned_journal = source_dir / "cuda-owned-samples.jsonl"
+        fault_journal = source_dir / "cuda-owned-faults.jsonl"
+        require(all(path.is_file() and not path.is_symlink() for path in
+                    (process_file, owned_journal, fault_journal)) and
+                json.loads(process_file.read_text(encoding="utf-8")) == {"processId": process["pid"]},
+                "shared CUDA native test process receipt missing or changed")
+        require(sha256(owned_journal) == owned["journalSha256"] and
+                fault_journal.stat().st_size == 0,
+                "shared CUDA owned counter journal changed or has faults")
+        raw_samples = [json.loads(line) for line in
+                       owned_journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+        instance = f"pid_{process['pid']}_{device['luid']}_phys_0".lower()
+        def safe_nonnegative_integer(value: object) -> bool:
+            return type(value) in (int, float) and math.isfinite(value) and \
+                value == int(value) and 0 <= value <= 2 ** 53 - 1
+        def valid_owned_sample(sample: object) -> bool:
+            if not isinstance(sample, dict) or type(sample.get("pid")) is not int or sample["pid"] != process["pid"] or \
+                    sample.get("luid") != device["luid"] or type(sample.get("bytes")) is not int or sample["bytes"] < 0 or \
+                    any(type(sample.get(key)) not in (int, float) or not math.isfinite(sample[key])
+                        for key in ("at", "startedAt")):
+                return False
+            counter = sample.get("counter")
+            if not isinstance(counter, dict) or counter.get("pid") != process["pid"] or \
+                    counter.get("parentPid") != process["parentPid"] or \
+                    counter.get("counter") != r"\GPU Process Memory(*)\Dedicated Usage" or \
+                    not isinstance(counter.get("rows"), list) or not counter["rows"]:
+                return False
+            rows = counter["rows"]
+            return all(isinstance(item, dict) and isinstance(item.get("instance"), str) and
+                       item["instance"].lower() == instance and item.get("status") == "0" and
+                       safe_nonnegative_integer(item.get("cookedValue"))
+                       for item in rows) and sum(item["cookedValue"] for item in rows) == sample["bytes"]
+        require(len(raw_samples) >= sum(own_stages[stage]["samples"] for stage in STAGES) and
+                all(valid_owned_sample(sample) for sample in raw_samples),
+                "shared CUDA owned counter journal lacks bound stage samples")
     result = {"case_id": row["caseId"], "backend": backend, "admission": "admitted",
               "effective_compute_policy": policy, "effective_model_dtype": model_dtype,
               "effective_vae_dtype": vae_dtype, "effective_vae_cuda_bf16_math_policy": math_policy,

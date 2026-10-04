@@ -44,6 +44,29 @@ def measured_scope(backend: str) -> dict:
                 "stages": {stage: {"peakBytes": 1, "samples": 1} for stage in control.STAGES}}}
 
 
+def write_record(record: Path, body: dict) -> None:
+    record.parent.mkdir(parents=True, exist_ok=True)
+    if body.get("backend") == "cuda":
+        owned = body.get("measured", {}).get("owned")
+        if isinstance(owned, dict):
+            (record.parent / "profile-process.json").write_text(
+                json.dumps({"processId": owned["process"]["pid"]}) + "\n", encoding="utf-8")
+            journal = record.parent / "cuda-owned-samples.jsonl"
+            pid = owned["process"]["pid"]
+            luid = owned["selectedLuid"]
+            counter = {"pid": pid, "parentPid": owned["process"]["parentPid"],
+                       "counter": r"\GPU Process Memory(*)\Dedicated Usage",
+                       "rows": [{"instance": f"pid_{pid}_{luid}_phys_0", "status": "0",
+                                 "cookedValue": 1.0}]}
+            journal.write_text("".join(json.dumps({"at": index + 1, "startedAt": index + 1,
+                                                    "bytes": 1, "pid": owned["process"]["pid"],
+                                                    "luid": owned["selectedLuid"], "counter": counter}) + "\n"
+                                       for index, _ in enumerate(control.STAGES)), encoding="utf-8")
+            (record.parent / "cuda-owned-faults.jsonl").write_bytes(b"")
+            owned["journalSha256"] = control.sha256(journal)
+    record.write_text(json.dumps(body), encoding="utf-8")
+
+
 class PrecisionControlTests(unittest.TestCase):
     def test_eight_cuda_cases_and_seven_metal_cases_keep_exact_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,29 +115,58 @@ class PrecisionControlTests(unittest.TestCase):
                             "engineVaeCudaBf16MathPolicy": M4_POLICY},
                 "measured": {"peakBytes": 1024, "stages": stages, **measured_scope("cuda")},
             }
-            record.write_text(json.dumps(body), encoding="utf-8")
+            write_record(record, body)
             self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)["effective_vae_dtype"], "bfloat16")
             self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
                              ["owned_peak_bytes"], 1)
             self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
                              ["selected_device_global_used_peak_bytes"], 1024)
-            del body["measured"]["scope"]
+            body["measured"]["owned"]["peakBytes"] = 0
+            write_record(record, body)
+            with self.assertRaisesRegex(ValueError, "owned overall peak"):
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+            body["measured"]["owned"]["peakBytes"] = 1
+            write_record(record, body)
+            (record.parent / "cuda-owned-samples.jsonl").write_text("mutated\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "journal changed"):
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+            write_record(record, body)
+            lines = (record.parent / "cuda-owned-samples.jsonl").read_text(encoding="utf-8").splitlines()
+            altered = json.loads(lines[0])
+            altered["counter"]["rows"][0]["cookedValue"] = 2
+            lines[0] = json.dumps(altered)
+            journal = record.parent / "cuda-owned-samples.jsonl"
+            journal.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            body["measured"]["owned"]["journalSha256"] = control.sha256(journal)
             record.write_text(json.dumps(body), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "counter journal lacks bound"):
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+            write_record(record, body)
+            (record.parent / "profile-process.json").write_text('{"processId":999}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "process receipt"):
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+            write_record(record, body)
+            (record.parent / "cuda-owned-faults.jsonl").write_text('{"fault":"missing"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "journal changed or has faults"):
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+            write_record(record, body)
+            del body["measured"]["scope"]
+            write_record(record, body)
             with self.assertRaisesRegex(ValueError, "global selected-device"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
             body["measured"].update(measured_scope("cuda"))
             del body["admission"]["estimate"]["stages"]["load"]
-            record.write_text(json.dumps(body), encoding="utf-8")
+            write_record(record, body)
             with self.assertRaisesRegex(ValueError, "modeled stage"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
             body["admission"]["estimate"]["stages"] = estimated_stages()
             body["outcome"]["engineVaeDtype"] = "float32"
-            record.write_text(json.dumps(body), encoding="utf-8")
+            write_record(record, body)
             with self.assertRaisesRegex(ValueError, "effective engineVaeDtype"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
             body["outcome"]["engineVaeDtype"] = "bfloat16"
             body["identity"]["decoder"]["repo"] = "m-a-p/YuE2-Vae"
-            record.write_text(json.dumps(body), encoding="utf-8")
+            write_record(record, body)
             with self.assertRaisesRegex(ValueError, "decoder identity"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
 
@@ -137,27 +189,27 @@ class PrecisionControlTests(unittest.TestCase):
                 }
                 wanted = M4_POLICY
                 if backend == "cuda" and policy == "bf16":
-                    record.write_text(json.dumps(body), encoding="utf-8")
+                    write_record(record, body)
                     with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
                         control.verify_record(record, backend, name, M4_POLICY)
                     for wrong in ("stale", "fixed_order_bf16_convolution_v1"):
                         body["outcome"]["engineVaeCudaBf16MathPolicy"] = wrong
-                        record.write_text(json.dumps(body), encoding="utf-8")
+                        write_record(record, body)
                         with self.assertRaisesRegex(ValueError, "effective CUDA BF16 VAE math policy"):
                             control.verify_record(record, backend, name, M4_POLICY)
                     body["outcome"]["engineVaeCudaBf16MathPolicy"] = wanted
-                    record.write_text(json.dumps(body), encoding="utf-8")
+                    write_record(record, body)
                     self.assertEqual(
                         control.verify_record(record, backend, name, M4_POLICY)["effective_vae_cuda_bf16_math_policy"],
                         wanted,
                     )
                 else:
-                    record.write_text(json.dumps(body), encoding="utf-8")
+                    write_record(record, body)
                     self.assertIsNone(
                         control.verify_record(record, backend, name, M4_POLICY)["effective_vae_cuda_bf16_math_policy"]
                     )
                     body["outcome"]["engineVaeCudaBf16MathPolicy"] = wanted
-                    record.write_text(json.dumps(body), encoding="utf-8")
+                    write_record(record, body)
                     with self.assertRaisesRegex(ValueError, "present on another backend"):
                         control.verify_record(record, backend, name, M4_POLICY)
 
@@ -178,7 +230,7 @@ class PrecisionControlTests(unittest.TestCase):
                     stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
             }
             def check():
-                record.write_text(json.dumps(body), encoding="utf-8")
+                write_record(record, body)
                 return control.verify_record(record, "cuda", name, M4_POLICY)
             self.assertEqual(check()["effective_compute_policy"], "auto")
             self.assertEqual(check()["effective_ar_quantization"], "fp8")
@@ -314,17 +366,17 @@ class PrecisionControlTests(unittest.TestCase):
                             "engineVaeCudaBf16MathPolicy": M4_POLICY},
                 "measured": {"peakBytes": 1, **measured_scope("cuda"), "stages": stages},
             }
-            record.write_text(json.dumps(body), encoding="utf-8")
+            write_record(record, body)
             new_policy = "fixed_order_bf16_convolution_v1"
             with self.assertRaisesRegex(ValueError, "does not match"):
                 control.verify_record(record, "cuda", "strict-bf16-standard", new_policy)
             body["outcome"]["engineVaeCudaBf16MathPolicy"] = new_policy
-            record.write_text(json.dumps(body), encoding="utf-8")
+            write_record(record, body)
             self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-standard", new_policy)
                              ["effective_vae_cuda_bf16_math_policy"], new_policy)
             body["caseId"] = control.case_id("metal", "strict-bf16-standard")
             body["backend"] = "metal"
-            record.write_text(json.dumps(body), encoding="utf-8")
+            write_record(record, body)
             with self.assertRaisesRegex(ValueError, "present on another backend"):
                 control.verify_record(record, "metal", "strict-bf16-standard", new_policy)
 
@@ -404,7 +456,7 @@ class PrecisionControlTests(unittest.TestCase):
                 }
 
                 def check(backend="cuda"):
-                    record.write_text(json.dumps(body), encoding="utf-8")
+                    write_record(record, body)
                     return control.verify_record(record, backend, name, M5_POLICY)
 
                 with self.subTest(name=name):
@@ -614,7 +666,7 @@ class PrecisionControlTests(unittest.TestCase):
                                  encoding="utf-8")
                 selected["sha256"] = control.sha256(proof)
                 body["measured"]["owned"]["proofSha256"] = selected["sha256"]
-                (run.parent / "record.json").write_text(json.dumps(body), encoding="utf-8")
+                write_record(run.parent / "record.json", body)
             with patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)):
                 verdict = control.collect(profile, evidence, "cuda", root, root)
             self.assertEqual(len(verdict["listening_audio"]), 8)
