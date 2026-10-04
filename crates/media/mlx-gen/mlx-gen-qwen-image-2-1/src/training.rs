@@ -3697,16 +3697,64 @@ mod tests {
                     )
                     .unwrap();
                 let saved = Weights::from_file(&file).unwrap();
+                let schema = crate::q4_diagnostic::math::export_schema(
+                    &params.keys().map(ToString::to_string).collect::<Vec<_>>(),
+                    &paths,
+                    network == NetworkType::Lora,
+                    &saved.keys().map(ToString::to_string).collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let expected_network = if network == NetworkType::Lora {
+                    "lora"
+                } else {
+                    "lokr"
+                };
+                crate::q4_diagnostic::math::validate_export_metadata(
+                    expected_network,
+                    cfg.rank,
+                    cfg.alpha,
+                    (
+                        saved.metadata("networkType"),
+                        saved.metadata("rank"),
+                        saved.metadata("alpha"),
+                    ),
+                )
+                .unwrap();
+                if network == NetworkType::Lokr {
+                    assert_eq!(
+                        saved.metadata("decomposeFactor"),
+                        Some(cfg.decompose_factor.to_string().as_str())
+                    );
+                }
+                for (key, value) in &provenance {
+                    assert_eq!(saved.metadata(key), Some(*value));
+                }
+                if !edit {
+                    assert_eq!(saved.metadata(EDIT_ADAPTER_MARKER.0), None);
+                }
+                for key in &schema.alphas {
+                    let value = saved.require(key).unwrap();
+                    crate::q4_diagnostic::math::validate_alpha(
+                        value.item::<f32>(),
+                        cfg.alpha,
+                        value.shape(),
+                        value.dtype() == Dtype::Float32,
+                    )
+                    .unwrap();
+                }
+                let alpha_tensor_count = schema.alphas.len();
                 let mut readback = LoraParams::new();
-                for key in saved.keys() {
-                    let mapped = key
-                        .replace(".lora_A.weight", ".lora_a")
-                        .replace(".lora_B.weight", ".lora_b");
-                    let value = saved.require(key).unwrap().clone();
+                for (serialized, mapped) in schema.factors {
+                    let value = saved.require(&serialized).unwrap().clone();
                     assert_eq!(
                         value.dtype(),
                         Dtype::Float32,
                         "export preserves raw trained masters"
+                    );
+                    assert_eq!(
+                        value.shape(),
+                        params[mapped.as_str()].shape(),
+                        "export preserves raw trained master shape"
                     );
                     readback.insert(Rc::from(mapped), value);
                 }
@@ -3821,6 +3869,8 @@ mod tests {
                     };
                     println!("PACKED_DIRECT {network:?} edit={edit} q{bits} img_in_packed=true group64 compute=Float32 export_error={export_error} production_representation_error={representation_error}");
                     receipts.push(serde_json::json!({"network":format!("{network:?}"),"edit":edit,"bits":bits,
+                        "exportSchemaExact":true,"serializedTensorCount":saved.keys().count(),"rawTrainedParameterCount":params.len(),
+                        "alphaTensorCount":alpha_tensor_count,"alphaMetadataAndTensorContractValidated":true,
                         "imgInPacked":true,"groupSize":64,"computeDtype":"Float32","denseControlActivationAndResidualDtype":"Bfloat16","directTrainedExportError":export_error,
                         "productionRepresentationError":representation_error,"directReferenceNeverSubstituted":true,"residualOracle":oracle}));
                 }

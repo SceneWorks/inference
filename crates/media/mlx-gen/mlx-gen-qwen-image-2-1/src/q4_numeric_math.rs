@@ -84,6 +84,86 @@ pub fn observe(actual: f64, reference: f64) -> Result<ArithmeticObservation, Str
     })
 }
 
+pub struct ExportSchema {
+    pub factors: Vec<(String, String)>, // serialized key, exact trained key
+    pub alphas: Vec<String>,
+}
+
+/// The LoRA writer adds one scalar alpha tensor per target. LoKr stores alpha
+/// only in string metadata. Neither kind may add/drop any trained factor.
+pub fn export_schema(
+    params: &[String],
+    paths: &[String],
+    lora: bool,
+    saved: &[String],
+) -> Result<ExportSchema, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut factors = BTreeMap::new();
+    for key in params {
+        let serialized = if lora {
+            if let Some(path) = key.strip_suffix(".lora_a") {
+                format!("{path}.lora_A.weight")
+            } else if let Some(path) = key.strip_suffix(".lora_b") {
+                format!("{path}.lora_B.weight")
+            } else {
+                return Err(format!("unexpected trained LoRA key {key}"));
+            }
+        } else {
+            key.clone()
+        };
+        if factors.insert(serialized, key.clone()).is_some() {
+            return Err("duplicate trained factor key".into());
+        }
+    }
+    let alphas: Vec<_> = if lora {
+        paths.iter().map(|p| format!("{p}.alpha")).collect()
+    } else {
+        vec![]
+    };
+    let expected: BTreeSet<_> = factors.keys().chain(alphas.iter()).cloned().collect();
+    let actual: BTreeSet<_> = saved.iter().cloned().collect();
+    if expected.len() != factors.len() + alphas.len()
+        || actual.len() != saved.len()
+        || actual != expected
+    {
+        return Err("serialized factor/alpha keys differ from exact export schema".into());
+    }
+    Ok(ExportSchema {
+        factors: factors.into_iter().collect(),
+        alphas,
+    })
+}
+
+pub fn validate_alpha(
+    actual: f32,
+    expected: f32,
+    shape: &[i32],
+    f32_dtype: bool,
+) -> Result<(), String> {
+    if !f32_dtype || shape != [1] || !actual.is_finite() || actual != expected {
+        return Err("exported scalar alpha value/shape/dtype differs from training config".into());
+    }
+    Ok(())
+}
+
+pub fn validate_export_metadata(
+    network: &str,
+    rank: u32,
+    alpha: f32,
+    actual: (Option<&str>, Option<&str>, Option<&str>),
+) -> Result<(), String> {
+    if actual
+        != (
+            Some(network),
+            Some(rank.to_string().as_str()),
+            Some(alpha.to_string().as_str()),
+        )
+    {
+        return Err("exported network/rank/alpha metadata differs from training config".into());
+    }
+    Ok(())
+}
+
 pub fn within(got: f64, expected: f64, bound: f64) -> bool {
     got.is_finite() && expected.is_finite() && bound.is_finite() && (got - expected).abs() <= bound
 }
@@ -134,6 +214,62 @@ mod tests {
             assert!(observe(1.0, invalid).is_err());
         }
         assert!(observe(f64::MAX, -f64::MAX).is_err());
+    }
+    #[test]
+    fn exact_export_schema_distinguishes_alphas_and_rejects_drop_extra_or_renamed_factors() {
+        let params = vec!["block.lora_a".into(), "block.lora_b".into()];
+        let paths = vec!["block".into()];
+        let saved = vec![
+            "block.lora_A.weight".into(),
+            "block.lora_B.weight".into(),
+            "block.alpha".into(),
+        ];
+        let schema = export_schema(&params, &paths, true, &saved).unwrap();
+        assert_eq!(schema.factors.len(), 2);
+        assert_eq!(schema.alphas, ["block.alpha"]);
+        assert!(schema.factors.iter().all(|(_, key)| params.contains(key)));
+        for dropped in 0..saved.len() {
+            let mut altered = saved.clone();
+            altered.remove(dropped);
+            assert!(export_schema(&params, &paths, true, &altered).is_err());
+        }
+        let mut altered = saved.clone();
+        altered.push("block.unexpected_param".into());
+        assert!(export_schema(&params, &paths, true, &altered).is_err());
+        let mut altered = saved.clone();
+        altered[0] = "other.lora_A.weight".into();
+        assert!(export_schema(&params, &paths, true, &altered).is_err());
+        let mut altered = saved.clone();
+        altered.push(saved[0].clone());
+        assert!(export_schema(&params, &paths, true, &altered).is_err());
+        let params = vec!["block.lokr_w1".into(), "block.lokr_w2".into()];
+        assert!(export_schema(&params, &paths, false, &params)
+            .unwrap()
+            .alphas
+            .is_empty());
+        let mut altered = params.clone();
+        altered.push("block.alpha".into());
+        assert!(export_schema(&params, &paths, false, &altered).is_err());
+    }
+    #[test]
+    fn alpha_contract_rejects_wrong_value_shape_dtype_and_nonfinite() {
+        assert!(validate_alpha(2.5, 2.5, &[1], true).is_ok());
+        assert!(validate_alpha(2.0, 2.5, &[1], true).is_err());
+        assert!(validate_alpha(2.5, 2.5, &[1, 1], true).is_err());
+        assert!(validate_alpha(2.5, 2.5, &[1], false).is_err());
+        assert!(validate_alpha(f32::NAN, 2.5, &[1], true).is_err());
+        assert!(
+            validate_export_metadata("lora", 4, 2.5, (Some("lora"), Some("4"), Some("2.5")))
+                .is_ok()
+        );
+        for metadata in [
+            (Some("lokr"), Some("4"), Some("2.5")),
+            (Some("lora"), Some("16"), Some("2.5")),
+            (Some("lora"), Some("4"), Some("2")),
+            (Some("lora"), Some("4"), None),
+        ] {
+            assert!(validate_export_metadata("lora", 4, 2.5, metadata).is_err());
+        }
     }
     #[test]
     fn f32_component_bound_rejects_drop_scale_and_axis_mutants() {
