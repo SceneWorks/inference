@@ -464,11 +464,21 @@ def _empty_gpu0_summary(directory: Path) -> dict:
                         for sample in samples), f"empty-device {path} invalid")
             if key.startswith("adapter"):
                 require(len(samples) == 1, f"empty-device {path} adapter ambiguous")
-                result[key] = samples[0]["cookedValue"]
+                result[key] = (samples[0]["instance"].lower(), samples[0]["cookedValue"])
             else:
-                require(all(sample["cookedValue"] == 0 for sample in samples),
-                        f"empty-device {path} process active/resident")
-                result[key] = sorted(sample["instance"].lower() for sample in samples)
+                instances = [sample["instance"].lower() for sample in samples]
+                require(len(set(instances)) == len(instances),
+                        f"empty-device {path} process instances ambiguous")
+                if key == "engine":
+                    require(all(sample["cookedValue"] == 0 for sample in samples),
+                            f"empty-device {path} process active")
+                    result[key] = sorted(instances)
+                else:
+                    # WDDM may retain a small allocation even while NVML reports
+                    # 0 MiB and no CUDA actor. Preserve every selected-LUID byte
+                    # and instance; any change across epochs still refuses.
+                    result[key] = sorted((sample["instance"].lower(), sample["cookedValue"])
+                                         for sample in samples)
         counters.append(result)
     require(all(row == counters[0] for row in counters),
             "empty-device Windows adapter/process counters changed")
