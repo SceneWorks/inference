@@ -1437,10 +1437,10 @@ mod engine_tests {
         assert_eq!(cache.positions(), prompt.len());
     }
 
-    /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward,
-    /// and the snapshot it stores is the one a prefill split at the boundary into two forwards
-    /// stores (to the GEMM's reduction order); a later hit restoring it decodes the same greedy
-    /// tokens as a hit on the split prefill's snapshot.
+    /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward
+    /// — the uncached prefill's, bit for bit and step for step — and the snapshot it stores is the
+    /// one a prefill split at the boundary into two forwards stores (to rounding); a later hit
+    /// restoring it decodes the same greedy tokens as a hit on the split prefill's snapshot.
     /// A conversation shorter than one Gated DeltaNet chunk and one long enough to run chunkwise.
     #[test]
     fn a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state() {
@@ -1450,19 +1450,41 @@ mod engine_tests {
             let mut p1 = conversation.clone();
             p1.extend_from_slice(&[40, 41, 42, 43, 44]);
             let counted = Counted::new(&model);
-            let mut cache = counted.new_cache_for(p1.len() + 8, 2).unwrap();
-            let pre = prefill_restored(
-                &counted,
-                &mut cache,
-                None,
-                &p1,
-                Some(conv_len),
-                false,
-                &CancelFlag::new(),
-            )
-            .unwrap();
+            let prefill = |boundary: Option<usize>| {
+                let mut cache = counted.new_cache_for(p1.len() + 8, 2).unwrap();
+                let (pre, steps, _) = crate::primitives::gated_delta::counters::counting(|| {
+                    prefill_restored(
+                        &counted,
+                        &mut cache,
+                        None,
+                        &p1,
+                        boundary,
+                        false,
+                        &CancelFlag::new(),
+                    )
+                    .unwrap()
+                });
+                (pre, steps)
+            };
+            let (uncached, uncached_steps) = prefill(None);
+            counted.take();
+            counted.calls.set(0);
+            let (pre, steps) = prefill(Some(conv_len));
             assert_eq!(counted.calls.get(), 1, "{conv_len}: one forward");
             assert_eq!(counted.take(), p1.len(), "{conv_len}: the whole prompt");
+            // The miss is the uncached prefill plus the capture (cuda-campaign-a4f1: a split
+            // recurrence put Qwen3.8's misses 50–90 ms behind it): the same per-token recurrence
+            // steps — none past one chunk — and the same logits, bit for bit.
+            assert_eq!(
+                steps, uncached_steps,
+                "{conv_len}: per-token recurrence steps"
+            );
+            let host = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(
+                host(&pre.logits),
+                host(&uncached.logits),
+                "{conv_len}: the miss's logits are the uncached prefill's"
+            );
 
             // The reference: the prefill split at the boundary, snapshotted between the forwards.
             let mut split = model.new_cache_for(p1.len() + 8, 2).unwrap();
@@ -1481,8 +1503,8 @@ mod engine_tests {
             };
             assert_eq!(state.len(), conv_len);
             // Equal up to the GEMM's row-count-dependent reduction order: one forward of `T` rows
-            // vs `b` then `T - b` (bit-identical on the Apple CPU; last-ulp on x86, the S2
-            // finding). The recurrence itself is split exactly where the two forwards split it.
+            // vs `b` then `T - b` (last-ulp on x86, the S2 finding), and the chunkwise
+            // recurrence's state at the boundary read off its chunk rather than run to it.
             let close = |g: &[f32], w: &[f32], what: &str| {
                 assert_eq!(g.len(), w.len(), "{conv_len}: {what}");
                 let scale = w.iter().fold(1.0f32, |m, x| m.max(x.abs()));
@@ -1498,7 +1520,6 @@ mod engine_tests {
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 close(g, w, &format!("snapshot tensor {i}"));
             }
-            let host = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             close(&host(&pre.logits), &host(&split_logits), "logits");
 
             // A later hit on each snapshot decodes the same.

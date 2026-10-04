@@ -131,16 +131,7 @@ pub fn gated_delta_recurrence_with_sink(
 ) -> Result<(Tensor, Tensor)> {
     let t = q.dim(1)?;
     let chunked = sink_from.min(t);
-    #[cfg(test)]
-    let chunked = if FORCE_PER_TOKEN.with(|f| f.get()) {
-        0
-    } else {
-        chunked
-    };
-    // The defaults table's row for this device (E5) may keep every token on the per-token step.
-    if chunked < CHUNKED_PREFILL_MIN_TOKENS
-        || !crate::device::decode_defaults(q.device()).gdn_chunked_prefill
-    {
+    if !runs_chunked(chunked, q.device()) {
         return gated_delta_recurrence_per_token(q, k, v, g, beta, state, sink);
     }
     let head = |x: &Tensor| x.narrow(1, 0, chunked);
@@ -169,6 +160,71 @@ pub fn gated_delta_recurrence_with_sink(
         &mut |ti, s| sink(chunked + ti, s),
     )?;
     Ok((Tensor::cat(&[&y_head, &y_tail], 1)?, s_tail))
+}
+
+/// Whether a run of `tokens` un-checkpointed tokens computes chunkwise: at least
+/// [`CHUNKED_PREFILL_MIN_TOKENS`] of them, on a device whose defaults-table row (E5) enables it.
+fn runs_chunked(tokens: usize, device: &candle_core::Device) -> bool {
+    #[cfg(test)]
+    if FORCE_PER_TOKEN.with(|f| f.get()) {
+        return false;
+    }
+    tokens >= CHUNKED_PREFILL_MIN_TOKENS
+        && crate::device::decode_defaults(device).gdn_chunked_prefill
+}
+
+/// [`gated_delta_recurrence`] that also returns the state after the first `at` tokens
+/// (`0 < at < T`) — the prefix cache's boundary capture (sc-24446) — **without changing the
+/// recurrence**: `y` and the final state are bit for bit those of the uncaptured call. The
+/// per-token form hands the state out on the way; the chunkwise form reads it off the chunk
+/// holding `at` ([`gated_delta_chunked`]'s hand-off, a few extra ops for that one chunk).
+///
+/// Why not split the recurrence at `at` (two calls, as two prefill forwards would): the boundary
+/// is the end of the conversation before its generation prompt, so the tail is a handful of
+/// tokens, which ran on the per-token reference — `tail × linear layers` sequential steps of a
+/// dozen small kernels each. On Candle CUDA that put a prefix-cache miss of Qwen3.8 (48 linear
+/// layers, a 5-token tail) 50–90 ms behind an uncached prefill of the same prompt
+/// (cuda-campaign-a4f1 `f1-qwen38-cache` against `-graphs-on`, +20..+32 % TTFT).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_recurrence_capturing(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Option<&Tensor>,
+    at: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let t = q.dim(1)?;
+    if at == 0 || at >= t {
+        return Err(Error::Msg(format!(
+            "gated_delta_recurrence_capturing: a capture after {at} of {t} tokens is not inside \
+             the run"
+        )));
+    }
+    if !runs_chunked(t, q.device()) {
+        let mut captured = None;
+        let (y, last) = gated_delta_recurrence_per_token(q, k, v, g, beta, state, &mut |ti, s| {
+            if ti + 1 == at {
+                captured = Some(s.clone());
+            }
+            Ok(())
+        })?;
+        let captured = captured.ok_or_else(|| {
+            Error::Msg("gated_delta_recurrence_capturing: no state at the capture".into())
+        })?;
+        return Ok((y, last, captured));
+    }
+    let (y, last, captured) = chunked(q, k, v, g, beta, state, Some(at))?;
+    let state_dtype = state.map_or(q.dtype(), Tensor::dtype);
+    let captured = captured.ok_or_else(|| {
+        Error::Msg("gated_delta_recurrence_capturing: no state at the capture".into())
+    })?;
+    Ok((
+        y.to_dtype(q.dtype())?,
+        last.to_dtype(state_dtype)?,
+        captured.to_dtype(state_dtype)?,
+    ))
 }
 
 /// Test-only counts of the recurrence's per-token steps and the checkpoint ring's slot writes
@@ -320,6 +376,24 @@ pub fn gated_delta_chunked(
     beta: &Tensor,
     state: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
+    let (y, state, _) = chunked(q, k, v, g, beta, state, None)?;
+    Ok((y, state))
+}
+
+/// [`gated_delta_chunked`], also returning the state after the first `capture` tokens when asked
+/// (`0 < capture < T`, f32 `[B, Hv, Dv, Dk]`): at a chunk boundary it is the hand-off state
+/// there; inside chunk `[c₀, c₀ + C)` at `r = capture − c₀` tokens in, it is that chunk's
+/// hand-off cut at `r` — `S_r = Γ_r S₀ + Δ[..r]ᵀ (K[..r] Γ_r/Γ)`, `Γ_r` the chunk's cumulative
+/// gate after its `r`-th token. The recurrence itself is unchanged.
+fn chunked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Option<&Tensor>,
+    capture: Option<usize>,
+) -> Result<(Tensor, Tensor, Option<Tensor>)> {
     let f = DType::F32;
     let c = GDN_CHUNK;
     let (b, t, hk, dk) = q.dims4()?;
@@ -374,6 +448,10 @@ pub fn gated_delta_chunked(
         None => Tensor::zeros((n, dv, dk), f, dev)?,
     };
     let mut ys: Vec<Tensor> = Vec::with_capacity(n_chunks);
+    // The chunk holding the capture and the tokens of it before the capture (`0`: the capture is
+    // the hand-off state entering that chunk).
+    let capture = capture.map(|p| (p / c, p % c));
+    let mut captured = None;
     let mut seg_start = 0;
     while seg_start < n_chunks {
         let m = GDN_SEGMENT_CHUNKS.min(n_chunks - seg_start);
@@ -424,8 +502,31 @@ pub fn gated_delta_chunked(
         );
         for i in 0..m {
             let pick = |x: &Tensor| -> Result<Tensor> { Ok(x.narrow(1, i, 1)?.squeeze(1)?) };
+            let here = capture.filter(|&(chunk, _)| chunk == seg_start + i);
+            if let Some((_, 0)) = here {
+                captured = Some(state.clone());
+            }
             let s_t = state.transpose(1, 2)?.contiguous()?; // S₀ᵀ              [N, Dk, Dv]
             let delta = pick(&u)?.sub(&pick(&w)?.contiguous()?.matmul(&s_t)?)?; // [N, C, Dv]
+            if let Some((_, r)) = here.filter(|&(_, r)| r > 0) {
+                // The hand-off cut at `r` tokens in: Γ_r S₀ + Δ[..r]ᵀ (K[..r] Γ_r/Γ).
+                let cum_i = pick(&per_chunk(&cum)?)?; //                        [N, C]
+                let at = cum_i.narrow(1, r - 1, 1)?; // ln Γ_r                     [N, 1]
+                let k_r = pick(&per_chunk(&kc)?)?.narrow(1, 0, r)?.broadcast_mul(
+                    &at.broadcast_sub(&cum_i.narrow(1, 0, r)?)?
+                        .exp()?
+                        .unsqueeze(2)?,
+                )?; //                                                         [N, r, Dk]
+                captured = Some(
+                    state.broadcast_mul(&at.exp()?.unsqueeze(2)?)?.add(
+                        &delta
+                            .narrow(1, 0, r)?
+                            .transpose(1, 2)?
+                            .contiguous()?
+                            .matmul(&k_r.contiguous()?)?,
+                    )?,
+                );
+            }
             let y = pick(&q_gamma)?
                 .contiguous()?
                 .matmul(&s_t)?
@@ -450,7 +551,8 @@ pub fn gated_delta_chunked(
         .narrow(2, 0, t)?
         .transpose(1, 2)?
         .contiguous()?; // [B, T, Hv, Dv]
-    Ok((y, state.reshape((b, hv, dv, dk))?))
+    let captured = captured.map(|s| s.reshape((b, hv, dv, dk))).transpose()?;
+    Ok((y, state.reshape((b, hv, dv, dk))?, captured))
 }
 
 /// Constant `[C, C]` masks of the chunkwise form, plus the block-doubling bands.
@@ -1126,8 +1228,9 @@ impl DeltaNetCache {
     /// ring's depth (a speculative request's or a plain one's). Afterwards the restorable window
     /// holds only the new position (a one-token prefill keeps the earlier ones, exactly as
     /// [`advance`](Self::advance) would). A pending [`capture_at`](Self::capture_at) inside the
-    /// prefill splits the recurrence there — the head's final state is the captured one and the
-    /// tail continues from it, the arithmetic of two prefill forwards split at that position.
+    /// prefill keeps the state at that position too, read off the unchanged recurrence
+    /// ([`gated_delta_recurrence_capturing`]): the outputs and final state are the uncaptured
+    /// prefill's, bit for bit.
     ///
     /// A failure part-way leaves the position unadvanced; when the slot written is the live one
     /// (`T` a multiple of the ring's slots) it also drops the live state, as
@@ -1171,30 +1274,17 @@ impl DeltaNetCache {
                 (y, last, None)
             }
             Some(b) => {
-                let head = |x: &Tensor| x.narrow(1, 0, b);
-                let tail = |x: &Tensor| x.narrow(1, b, t - b);
-                let (y_head, at) = gated_delta_recurrence(
-                    &head(q)?,
-                    &head(k)?,
-                    &head(v)?,
-                    &head(g)?,
-                    &head(beta)?,
-                    state,
-                )?;
-                let (y_tail, last) = gated_delta_recurrence(
-                    &tail(q)?,
-                    &tail(k)?,
-                    &tail(v)?,
-                    &tail(g)?,
-                    &tail(beta)?,
-                    Some(&at),
-                )?;
+                // The recurrence of the uncaptured prefill, with the state at `b` read off on the
+                // way — never split there (see `gated_delta_recurrence_capturing`).
+                let (y, last, at) = gated_delta_recurrence_capturing(q, k, v, g, beta, state, b)?;
+                // The conv tail is a view of this forward's trace: copied compact. The state is
+                // the recurrence's own tensor, never a view of the ring.
                 let captured = (
                     offset + b as i32,
                     conv.tail_after(b - 1)?.force_contiguous()?,
-                    at.force_contiguous()?,
+                    at,
                 );
-                (Tensor::cat(&[&y_head, &y_tail], 1)?, last, Some(captured))
+                (y, last, Some(captured))
             }
         };
         let conv_tail = conv.tail_after(t - 1)?;
@@ -2792,36 +2882,83 @@ mod tests {
         assert_eq!(live(&cache), at_prefill);
     }
 
-    /// sc-24446 (defect B): a capture inside a prefill keeps the state at that position — equal,
-    /// bit for bit, to the state a prefill split there into two forwards leaves after its first —
-    /// and the prefill's outputs and final state are those of the split prefill too. A capture
-    /// outside the prefill captures nothing.
+    /// sc-24446 (cuda-campaign-a4f1, a Qwen3.8 prefix-cache miss +20..+32 % TTFT): a boundary
+    /// capture adds no recurrence work to the prefill. A chunkwise prefill whose boundary leaves a
+    /// short tail (the generation prompt) runs no per-token step, as the uncaptured prefill runs
+    /// none — the split it replaced stepped the tail per token, `tail × linear layers` sequential
+    /// steps of small kernels on the time to first token — and a per-token prefill steps exactly
+    /// its tokens either way.
+    #[test]
+    fn a_boundary_capture_adds_no_per_token_steps_to_a_prefill() {
+        for (b, t) in [(100usize, 105usize), (64, 70), (70, 150), (3, 8)] {
+            let fixture = ring_inputs(t, 7);
+            let steps = |capture: Option<usize>| {
+                let mut cache = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+                if let Some(b) = capture {
+                    cache.capture_at(b as i32);
+                }
+                let (_, steps, _) = counters::counting(|| feed_prefill(&mut cache, &fixture, 0, t));
+                assert_eq!(cache.captured(b as i32).is_some(), capture.is_some());
+                steps
+            };
+            let plain = steps(None);
+            let expected = if t < CHUNKED_PREFILL_MIN_TOKENS { t } else { 0 };
+            assert_eq!(plain, expected, "b={b} t={t}: the uncaptured prefill");
+            assert_eq!(steps(Some(b)), plain, "b={b} t={t}: the captured prefill");
+        }
+    }
+
+    /// sc-24446 (defect B): a capture inside a prefill keeps the state at that position — equal
+    /// to the state a prefill split there into two forwards leaves after its first (bit for bit
+    /// on the per-token form, to rounding on the chunkwise one, which reads it off the chunk
+    /// holding it) — and leaves the prefill itself alone: its outputs and final state are the
+    /// **uncaptured** prefill's, bit for bit, at a chunk boundary, inside a chunk and inside the
+    /// last (padded) chunk. A capture outside the prefill captures nothing.
     #[test]
     fn a_captured_boundary_equals_a_prefill_split_there() {
-        for (b, t) in [(3usize, 8usize), (100, 105), (70, 150)] {
+        let close = |got: &[f32], want: &[f32], what: &str| {
+            assert_eq!(got.len(), want.len(), "{what}");
+            let scale = want.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+            let diff = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(diff <= 1e-5 * scale, "{what}: differs by {diff}");
+        };
+        for (b, t) in [
+            (3usize, 8usize),
+            (100, 105),
+            (70, 150),
+            (64, 150),
+            (128, 133),
+        ] {
             let fixture = ring_inputs(t, 5);
             let mut one = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
             one.capture_at(b as i32);
             let y_one = feed_prefill(&mut one, &fixture, 0, t);
 
+            let mut plain = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+            let y_plain = feed_prefill(&mut plain, &fixture, 0, t);
+            assert_eq!(host(&y_one), host(&y_plain), "b={b} t={t}: outputs");
+            assert_eq!(live(&one), live(&plain), "b={b} t={t}: final state");
+
             let mut split = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
-            let y_head = feed_prefill(&mut split, &fixture, 0, b);
-            let at_b = live(&split).unwrap();
-            let y_tail = feed_prefill(&mut split, &fixture, b, t - b);
+            feed_prefill(&mut split, &fixture, 0, b);
+            let (conv_b, ssm_b) = live(&split).unwrap();
 
             let (conv, ssm) = one.captured(b as i32).expect("captured");
-            assert_eq!(
-                (host(conv), host(ssm)),
-                at_b,
-                "b={b} t={t}: the boundary state"
-            );
+            assert_eq!(host(conv), conv_b, "b={b} t={t}: the boundary conv tail");
+            if t < CHUNKED_PREFILL_MIN_TOKENS {
+                assert_eq!(host(ssm), ssm_b, "b={b} t={t}: the boundary state");
+            } else {
+                close(
+                    &host(ssm),
+                    &ssm_b,
+                    &format!("b={b} t={t}: the boundary state"),
+                );
+            }
             assert!(one.captured(b as i32 + 1).is_none());
-            assert_eq!(
-                host(&y_one),
-                host(&Tensor::cat(&[&y_head, &y_tail], 1).unwrap()),
-                "b={b} t={t}: outputs"
-            );
-            assert_eq!(live(&one), live(&split), "b={b} t={t}: final state");
         }
         let fixture = ring_inputs(6, 6);
         let mut cache = DeltaNetCache::new();
