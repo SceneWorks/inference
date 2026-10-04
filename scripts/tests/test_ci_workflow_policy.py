@@ -275,6 +275,42 @@ def evaluate_policy(
     return bool(eval(rendered, {"__builtins__": {}}, {}))
 
 
+def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
+    """Exercise the real group expression across both hosts and dispatch boundaries."""
+    concurrency = workflow["concurrency"]
+    errors = []
+    if set(concurrency) != {"group", "cancel-in-progress"}:
+        errors.append("concurrency must retain only group and cancel-in-progress")
+    if concurrency.get("cancel-in-progress") is not False:
+        errors.append("running primary dispatches must never cancel one another")
+    expression = concurrency["group"].removeprefix("${{").removesuffix("}}").strip()
+    profiles = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+    for event in ("workflow_dispatch", "schedule", "push", "pull_request", "workflow_call", "merge_group"):
+        for profile in [*profiles, "", "qwen-image-2-1-lora-mlx-extra"]:
+            for runner in ("rw-starvector", "rw-mage", "nax", "real-weights", "", "rw-starvector-extra"):
+                primary = event == "workflow_dispatch" and profile == "qwen-image-2-1-lora-mlx" and runner == "rw-starvector"
+                expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
+                # Separate runs, revisions and phases on the primary must all share one group.
+                variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
+                            ("3", "c" * 40, "imports"), ("4", "d" * 40, "full")) if primary else (("1", "a" * 40, "probe"),)
+                for run_id, sha, phase in variants:
+                    values = {"github.event_name": event, "inputs.profile": profile,
+                              "inputs.qwen_image_2_1_lora_runner": runner,
+                              "inputs.qwen_image_2_1_lora_phase": phase,
+                              "github.run_id": run_id, "github.sha": sha}
+                    rendered = expression
+                    for name in sorted(values, key=len, reverse=True):
+                        rendered = rendered.replace(name, repr(values[name]))
+                    rendered = rendered.replace("&&", " and ").replace("||", " or ")
+                    try:
+                        actual = eval(f"({rendered})", {"__builtins__": {}}, {})
+                    except (NameError, SyntaxError, AttributeError) as error:
+                        return [*errors, f"unsupported group expression: {error}"]
+                    if actual != expected:
+                        return [*errors, f"wrong group for {event}/{profile}/{runner}/{phase}/{run_id}: {actual!r}"]
+    return errors
+
+
 def workflow_job_bodies(workflow: str) -> dict[str, list[str]]:
     """Return top-level job bodies without treating nested step keys as jobs."""
     lines = workflow.splitlines()
@@ -711,6 +747,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
+        # 36 since sc-24163 added the `mlx-qwen-image-2-1` job;
         # 35 since SC-23942 added the Qwen/Bonsai MLX materialization lane;
         # 34 since sc-18932's `mlx-minimax-h3` merged alongside main's 33
         # (33 since sc-18325 added the three correctness-only decode-quality jobs;
@@ -720,7 +757,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 35,
+        MACOS_HUB_LOCK: 36,
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
@@ -1009,12 +1046,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = real_weights_inline_text()
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         # 35 / 12 after SC-23942 added one pinned materialization lane per native backend; 13 Windows
-        # after sc-24114 added `candle-qwen-image-2-1`.
+        # after sc-24114 added `candle-qwen-image-2-1`; 36 macOS after sc-24163 added
+        # `mlx-qwen-image-2-1`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 35)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 36)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 13)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
@@ -1579,9 +1617,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("test_sa3_ci_target_coverage.py", workflow[start:run])
         self.assertIn("SC_16605_REAL_WEIGHT_WORKFLOW_CLEANUP.md", workflow[start:run])
 
-    def test_real_weight_workflows_share_one_physical_host_lock(self) -> None:
+    def test_real_weight_workflows_share_lock_except_explicit_qwen_primary_dispatch(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(qwen21_primary_concurrency_errors(workflow), [])
         for path in (
-            REAL_WEIGHTS_WORKFLOW,
             LTX25_QUANT_CAMPAIGN_WORKFLOW,
             LTX25_QUANT_PROMOTION_WORKFLOW,
             YUE_WORKFLOW,
@@ -1593,6 +1632,33 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     1,
                 )
                 self.assertIn("cancel-in-progress: false", workflow)
+
+    def test_qwen_primary_group_rejects_broader_or_nonserializing_mutations(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(qwen21_primary_concurrency_errors(workflow), [])
+        expression = workflow["concurrency"]["group"]
+        mutations = {
+            "event guard omitted": expression.replace("github.event_name == 'workflow_dispatch' &&", ""),
+            "profile guard omitted": expression.replace("inputs.profile == 'qwen-image-2-1-lora-mlx' &&", ""),
+            "runner guard omitted": expression.replace("inputs.qwen_image_2_1_lora_runner == 'rw-starvector' &&", ""),
+            "secondary runner admitted": expression.replace("== 'rw-starvector'", "!= 'nax'"),
+            "all runs share global group": repr("inference-real-weights-physical-host"),
+            "group split per run": expression.replace("'inference-real-weights-qwen21-primary-mac'", "github.run_id"),
+            "group split per revision": expression.replace("'inference-real-weights-qwen21-primary-mac'", "github.sha"),
+            "group split per phase": expression.replace("'inference-real-weights-qwen21-primary-mac'", "inputs.qwen_image_2_1_lora_phase"),
+        }
+        for name, group in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertNotEqual(group, expression)
+                mutated = copy.deepcopy(workflow)
+                mutated["concurrency"]["group"] = group
+                self.assertTrue(qwen21_primary_concurrency_errors(mutated))
+        for name, changed in {"cancel active": {"cancel-in-progress": True},
+                              "change queue policy": {"queue": "max"}}.items():
+            with self.subTest(mutation=name):
+                mutated = copy.deepcopy(workflow)
+                mutated["concurrency"].update(changed)
+                self.assertTrue(qwen21_primary_concurrency_errors(mutated))
 
     def test_yue_workflow_python_installs_are_binary_hash_locked(self) -> None:
         installs = [
@@ -4120,6 +4186,142 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             mutate(mutated["jobs"]["candle-qwen-image-2-1"])
             with self.subTest(mutation=mutate):
                 self.assertTrue(self.qwen_image_2_1_lane_errors(mutated, source))
+
+
+    def mlx_qwen_image_2_1_lane_errors(self, workflow: dict, source: str) -> list[str]:
+        """Everything `test_qwen_image_2_1_mlx_lane_…` below binds, as a list of findings."""
+        errors: list[str] = []
+        inputs = workflow[True]["workflow_dispatch"]["inputs"]
+        if "qwen-image-2-1-lora-mlx" not in inputs["profile"]["options"]:
+            errors.append("`qwen-image-2-1-lora-mlx` is not a dispatchable profile")
+        hook = inputs.get("qwen_image_2_1_third_party_lora")
+        if hook is None or hook.get("default") != "" or hook.get("type") != "string":
+            errors.append(
+                "the third-party adapter hook must be an optional string input defaulting to empty"
+            )
+        job = workflow["jobs"].get("mlx-qwen-image-2-1")
+        if job is None:
+            return errors + ["no `mlx-qwen-image-2-1` job"]
+        # Its OWN profile: dispatching it must not also schedule the CUDA lane.
+        if job["if"] != (
+            "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'"
+        ):
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        # The Qwen-Image weight-set label (nax-macos-2), never the privileged `real-weights` one.
+        runner = inputs.get("qwen_image_2_1_lora_runner", {})
+        if runner.get("type") != "choice" or runner.get("default") != "rw-mage" or runner.get("options") != ["rw-mage", "rw-starvector"]:
+            errors.append("MLX LoRA runner must be bounded to rw-mage/rw-starvector, default rw-mage")
+        if job["runs-on"] != ["self-hosted", "macOS", "ARM64", "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+        if job["env"].get("QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC") != (
+            "${{ inputs.qwen_image_2_1_third_party_lora }}"
+        ):
+            errors.append("the third-party hook must reach the job through env, not interpolation")
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        steps = {step.get("name"): step for step in job["steps"]}
+        resolve = steps.get("Resolve runner-local snapshot paths", {}).get("run", "")
+        materialize = steps.get("Materialize and verify immutable snapshots", {}).get("run", "")
+        for key, variable in (
+            ("qwen-image-2-1", "MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"),
+            ("qwen-image-2-1-mlx-tiers", "MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"),
+        ):
+            model = models[key]
+            expected = (
+                "${{ vars.MLX_GEN_MODELS_ROOT }}/models--"
+                + model["repository"].replace("/", "--")
+                + "/snapshots/"
+                + model["revision"]
+            )
+            if job["env"].get(variable) != expected:
+                errors.append(f"{variable} is not the pinned cache path {expected!r}")
+            if model["environment"] != [variable]:
+                errors.append(f"{key} does not declare exactly {variable}")
+            if "unwired_reason" in model:
+                errors.append(f"{key} is wired but still carries an unwired_reason")
+            if variable not in resolve.split():
+                errors.append(f"{variable} is not resolved against the runner's home")
+            if (
+                f'scripts/release/ensure_model_snapshot.py --model {key} --snapshot "${variable}"'
+                not in materialize
+            ):
+                errors.append(f"{key} is never materialized")
+
+        run = steps.get("Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates", {}).get("run", "")
+        selected = re.findall(r"run_one (\w+) \|\| failed=1", run)
+        ignored = re.findall(r"#\[test\]\s*#\[ignore\]\s*fn (\w+)\(", source)
+        if sorted(selected) != sorted(ignored) or len(selected) != len(set(selected)):
+            errors.append(
+                f"the lane selects {sorted(selected)} but the file's ignored tests are {sorted(ignored)}"
+            )
+        for fragment in (
+            "cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration",
+            'lora_real_weights::"$name" -- --ignored --exact --nocapture --test-threads 1',
+            'grep -qE "test result: ok\\. 1 passed" "$log"',
+            'if [[ "$failed" != 0 ]]; then',
+        ):
+            if run.count(fragment) != 1:
+                errors.append(f"the gate step must carry exactly one {fragment!r}")
+        # The stacking test reads the two adapters the training tests write: order is load-bearing.
+        if selected[:3] != [
+            "t2i_lora_trains_reloads_and_moves_every_tier",
+            "edit_lokr_trains_and_moves_two_reference_edits_every_tier",
+            "stacked_adapters_apply_with_independent_weights",
+        ]:
+            errors.append(f"the training tests must run before the stacking test: {selected!r}")
+
+        upload = steps.get("Keep the Qwen-Image 2.1 MLX evidence", {})
+        if upload.get("with", {}).get("name") != "qwen-image-2-1-mlx-evidence":
+            errors.append("the evidence artifact is not `qwen-image-2-1-mlx-evidence`")
+        if upload.get("if") != "${{ !cancelled() }}":
+            errors.append("the evidence upload must survive a failed gate")
+        if upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("an empty evidence upload must red")
+        return errors
+
+    def test_qwen_image_2_1_mlx_lane_runs_every_lora_real_weight_test_on_pinned_snapshots(
+        self,
+    ) -> None:
+        """sc-24163: the dispatch-only Qwen-Image 2.1 MLX lane runs EVERY `#[ignore]`d test in
+        `mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs` -- no more, no fewer, training before
+        stacking -- against the two pinned hub-cache paths it materializes on the `rw-mage` Mac, and
+        keeps its evidence even when a gate reds.
+        """
+        workflow = yaml.safe_load(real_weights_inline_text())
+        source = (
+            REAL_WEIGHTS_WORKFLOW.parents[2]
+            / "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(self.mlx_qwen_image_2_1_lane_errors(workflow, source), [])
+
+        # The detector has to detect.
+        renamed = source.replace(
+            "fn stacked_adapters_apply_with_independent_weights(", "fn stacked_adapters("
+        )
+        self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(workflow, renamed))
+        added = source + "\n#[test]\n#[ignore]\nfn an_unwired_gate() {}\n"
+        self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(workflow, added))
+        for field, value in [("options", ["rw-mage", "nax"]), ("default", "nax"), ("type", "string")]:
+            mutated = copy.deepcopy(workflow)
+            mutated[True]["workflow_dispatch"]["inputs"]["qwen_image_2_1_lora_runner"][field] = value
+            self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
+        for mutate in (
+            lambda job: job.update(
+                {"if": "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'"}
+            ),
+            lambda job: job.update({"runs-on": ["self-hosted", "macOS", "ARM64", "real-weights"]}),
+            lambda job: job["env"].update(
+                {"MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT": "/somewhere/else"}
+            ),
+            lambda job: job["steps"][-1].pop("if"),
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["mlx-qwen-image-2-1"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
 
 
 class WorkflowFileSizeTests(unittest.TestCase):

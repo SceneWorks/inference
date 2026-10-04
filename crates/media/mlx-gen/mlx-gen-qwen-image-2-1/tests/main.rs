@@ -28,6 +28,9 @@ mod edit_parity;
 #[path = "generator_contract.rs"]
 mod generator_contract;
 
+#[path = "lora_real_weights.rs"]
+mod lora_real_weights;
+
 #[path = "pipeline_parity.rs"]
 mod pipeline_parity;
 

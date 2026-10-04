@@ -302,6 +302,18 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
 
     for name, job in macos.items():
         runs_on = job.get("runs-on") or []
+        if name == "mlx-qwen-image-2-1":
+            # Expand only this exact dispatch choice. Other expressions still fail below.
+            expected = ["self-hosted", "macOS", "ARM64",
+                        "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]
+            inputs = workflow.get(True, {}).get("workflow_dispatch", {}).get("inputs", {})
+            choice = inputs.get("qwen_image_2_1_lora_runner", {})
+            if (runs_on != expected or choice.get("type") != "choice"
+                    or choice.get("default") != "rw-mage"
+                    or choice.get("options") != ["rw-mage", "rw-starvector"]
+                    or job.get("if") != "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'"):
+                errors.append(f"{name} changed its bounded weight-set dispatch route")
+            continue
         if name == PRESERVED_LOCAL_JOB:
             if runs_on != PRESERVED_LOCAL_RUNS_ON:
                 errors.append(f"{name} changed its exact local runner selector")
@@ -412,6 +424,22 @@ class WeightSetLabelTests(unittest.TestCase):
         for label in used:
             with self.subTest(label=label):
                 self.assertIn(label, header, f"{label} is used but absent from the header table")
+
+    def test_bounded_qwen_runner_choice_discriminates_mutations(self) -> None:
+        import copy
+        for field, value in [("type", "string"), ("default", "nax"),
+                             ("options", ["rw-mage", "nax"])]:
+            workflow = copy.deepcopy(self.workflow)
+            workflow[True]["workflow_dispatch"]["inputs"]["qwen_image_2_1_lora_runner"][field] = value
+            self.assertTrue(weight_set_label_errors(workflow), field)
+        for field, value in [("if", "github.event_name == 'workflow_dispatch'"),
+                             ("runs-on", ["self-hosted", "macOS", "ARM64", "nax"])]:
+            workflow = copy.deepcopy(self.workflow)
+            workflow["jobs"]["mlx-qwen-image-2-1"][field] = value
+            self.assertTrue(weight_set_label_errors(workflow), field)
+        workflow = copy.deepcopy(self.workflow)
+        workflow["jobs"]["unbounded-copy"] = copy.deepcopy(workflow["jobs"]["mlx-qwen-image-2-1"])
+        self.assertTrue(weight_set_label_errors(workflow), "copied expression")
 
     def test_the_cuda_pool_keeps_its_shared_label(self) -> None:
         """Both Windows boxes share `real-weights` and already load-balance; do not split them."""
