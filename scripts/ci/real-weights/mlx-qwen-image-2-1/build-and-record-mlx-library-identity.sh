@@ -1,0 +1,3 @@
+set -o pipefail
+cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration --no-run --message-format=json 2>&1 | tee "$QWEN_IMAGE_2_1_RENDER_OUT/build-messages.jsonl"
+python3.12 scripts/ci/qwen21_mlx_build_identity.py --messages "$QWEN_IMAGE_2_1_RENDER_OUT/build-messages.jsonl" --out "$QWEN_IMAGE_2_1_RENDER_OUT/mlx-build-identity.json"

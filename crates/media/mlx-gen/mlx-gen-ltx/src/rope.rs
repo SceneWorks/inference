@@ -122,6 +122,9 @@ pub fn precompute_split_freqs_cis(
         )));
     }
 
+    // Row-major copy first: `as_slice` ignores strides, so a transposed/sliced positions view would
+    // be read in physical order (sc-20676).
+    let positions = mlx_gen::array::contiguous(positions)?;
     let pos = positions.as_slice::<f32>();
     // C-order index into (B, 3, T, 2): ((b*3 + d)*T + t)*2 + e.
     let idx = |b: usize, d: usize, t: usize, e: usize| ((b * n_pos_dims + d) * seq + t) * 2 + e;

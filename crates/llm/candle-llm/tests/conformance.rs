@@ -62,21 +62,32 @@ fn tokenizer_json() -> String {
 }
 
 fn write_snapshot() -> Fixture {
+    write_snapshot_with("", false)
+}
+
+/// The tiny synthetic snapshot with `identity` (extra leading `config.json` fields, each followed
+/// by a comma) and, for a Qwen3 decoder, unit per-head q/k RMSNorm weights.
+fn write_snapshot_with(identity: &str, qk_norm: bool) -> Fixture {
+    write_snapshot_with_heads(identity, qk_norm, 4)
+}
+
+/// [`write_snapshot_with`] with two query heads and one KV head of `head_dim` channels.
+fn write_snapshot_with_heads(identity: &str, qk_norm: bool, head_dim: usize) -> Fixture {
     let fixture = Fixture::new("candle-llm-conformance-", None);
     let dir = &*fixture;
     // eos_token_id outside the vocab so generation always runs to the token budget.
     let config = format!(
-        r#"{{
+        r#"{{ {identity}
             "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
-            "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": {VOCAB},
-            "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "tie_word_embeddings": false,
-            "eos_token_id": 999
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": {head_dim},
+            "vocab_size": {VOCAB}, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "tie_word_embeddings": false, "eos_token_id": 999
         }}"#
     );
     std::fs::write(dir.join("config.json"), config).unwrap();
     std::fs::write(dir.join("tokenizer.json"), tokenizer_json()).unwrap();
 
-    let (h, v, inter, qd, kvd) = (8usize, VOCAB, 16usize, 8usize, 4usize);
+    let (h, v, inter, qd, kvd) = (8usize, VOCAB, 16usize, 2 * head_dim, head_dim);
     let mut rng = SplitMix64::new(0xBEEF);
     let mut arrays: HashMap<String, Tensor> = HashMap::new();
     arrays.insert("model.embed_tokens.weight".into(), randn((v, h), &mut rng));
@@ -93,6 +104,10 @@ fn write_snapshot() -> Fixture {
         arrays.insert(p("mlp.gate_proj.weight"), randn((inter, h), &mut rng));
         arrays.insert(p("mlp.up_proj.weight"), randn((inter, h), &mut rng));
         arrays.insert(p("mlp.down_proj.weight"), randn((h, inter), &mut rng));
+        if qk_norm {
+            arrays.insert(p("self_attn.q_norm.weight"), ones(qd / 2));
+            arrays.insert(p("self_attn.k_norm.weight"), ones(qd / 2));
+        }
     }
     candle_core::safetensors::save(&arrays, dir.join("model.safetensors")).unwrap();
     fixture
@@ -414,5 +429,286 @@ fn gguf_resolves_through_load_for_model_and_probe_is_weightless() {
     assert!(
         candle_llm::provider::can_load(&tspec),
         "header-only (tensor-data-truncated) GGUF must still resolve — the probe is weightless"
+    );
+}
+
+// ---- sc-20683: compressed-KV policy parity (Candle runs dense, with the shared reason) ----
+
+const LLAMA_IDENTITY: &str = r#""architectures": ["LlamaForCausalLM"], "model_type": "llama","#;
+const QWEN3_IDENTITY: &str = r#""architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3","#;
+const MISTRAL_IDENTITY: &str =
+    r#""architectures": ["MistralForCausalLM"], "model_type": "mistral","#;
+
+/// The provider of a tiny snapshot with `identity` and `head_dim`-channel heads exactly as
+/// production loads it: no tiny fixture is a measured architecture, so it has no table family.
+fn load_kv_provider_unarmed(
+    identity: &str,
+    qk_norm: bool,
+    head_dim: usize,
+) -> (Fixture, LlamaProvider) {
+    let dir = write_snapshot_with_heads(identity, qk_norm, head_dim);
+    let provider = LlamaProvider::load(&LoadSpec::dense(dir.to_str().unwrap().to_string()))
+        .expect("load synthetic provider");
+    assert_eq!(provider.kv_model_family(), None, "not a measured model");
+    (dir, provider)
+}
+
+/// [`load_kv_provider_unarmed`] with head dimension 64 (one the fused reader reads), test-armed as
+/// its decoder's dispatch family (`core_llm::kv_model_family` of its identity), as if it were that
+/// family's measured architecture.
+fn load_kv_provider(identity: &str, qk_norm: bool) -> (Fixture, LlamaProvider) {
+    let (dir, mut provider) = load_kv_provider_unarmed(identity, qk_norm, 64);
+    let config: serde_json::Value =
+        serde_json::from_str(&format!("{{ {identity} \"_\": 0 }}")).unwrap();
+    let model_type = config["model_type"].as_str().unwrap();
+    let decoder = if model_type == "qwen3" {
+        "qwen3"
+    } else {
+        "llama"
+    };
+    provider.arm_kv_model_family_for_tests(core_llm::kv_model_family(
+        decoder,
+        config["architectures"][0].as_str().unwrap(),
+        model_type,
+    ));
+    (dir, provider)
+}
+
+/// A tiny hybrid (Qwen3.5-style: three GatedDeltaNet layers and one full-attention layer)
+/// snapshot the provider loads as its hybrid decoder.
+fn write_hybrid_snapshot() -> Fixture {
+    let fixture = Fixture::new("candle-llm-conformance-hybrid-", None);
+    let dir = &*fixture;
+    let config = format!(
+        r#"{{ "model_type": "qwen3_5", "text_config": {{
+            "model_type": "qwen3_5_text", "hidden_size": 32, "num_hidden_layers": 4,
+            "intermediate_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "head_dim": 8, "vocab_size": {VOCAB}, "rms_norm_eps": 1e-6,
+            "rope_theta": 10000000.0, "partial_rotary_factor": 0.5,
+            "max_position_embeddings": 256, "tie_word_embeddings": false,
+            "full_attention_interval": 4, "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2, "linear_key_head_dim": 4, "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 4, "eos_token_id": 999 }} }}"#
+    );
+    std::fs::write(dir.join("config.json"), config).unwrap();
+    std::fs::write(dir.join("tokenizer.json"), tokenizer_json()).unwrap();
+    let (h, inter, conv, value, hv, hd) = (32usize, 64usize, 32usize, 16usize, 4usize, 8usize);
+    let mut rng = SplitMix64::new(0x3527B);
+    let mut arrays: HashMap<String, Tensor> = HashMap::new();
+    let p = "model.language_model";
+    let mut put = |key: String, dims: &[usize]| {
+        let n: usize = dims.iter().product();
+        let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+        arrays.insert(key, Tensor::from_vec(data, dims, &Device::Cpu).unwrap());
+    };
+    put(format!("{p}.embed_tokens.weight"), &[VOCAB, h]);
+    put(format!("{p}.norm.weight"), &[h]);
+    put("lm_head.weight".into(), &[VOCAB, h]);
+    for i in 0..4 {
+        let lp = |s: &str| format!("{p}.layers.{i}.{s}");
+        put(lp("input_layernorm.weight"), &[h]);
+        put(lp("post_attention_layernorm.weight"), &[h]);
+        put(lp("mlp.gate_proj.weight"), &[inter, h]);
+        put(lp("mlp.up_proj.weight"), &[inter, h]);
+        put(lp("mlp.down_proj.weight"), &[h, inter]);
+        if i < 3 {
+            put(lp("linear_attn.in_proj_qkv.weight"), &[conv, h]);
+            put(lp("linear_attn.in_proj_z.weight"), &[value, h]);
+            put(lp("linear_attn.in_proj_a.weight"), &[hv, h]);
+            put(lp("linear_attn.in_proj_b.weight"), &[hv, h]);
+            put(lp("linear_attn.conv1d.weight"), &[conv, 1, 4]);
+            put(lp("linear_attn.A_log"), &[hv]);
+            put(lp("linear_attn.dt_bias"), &[hv]);
+            put(lp("linear_attn.norm.weight"), &[4]);
+            put(lp("linear_attn.out_proj.weight"), &[h, value]);
+        } else {
+            put(lp("self_attn.q_proj.weight"), &[4 * hd * 2, h]);
+            put(lp("self_attn.k_proj.weight"), &[2 * hd, h]);
+            put(lp("self_attn.v_proj.weight"), &[2 * hd, h]);
+            put(lp("self_attn.o_proj.weight"), &[h, 4 * hd]);
+            put(lp("self_attn.q_norm.weight"), &[hd]);
+            put(lp("self_attn.k_norm.weight"), &[hd]);
+        }
+    }
+    candle_core::safetensors::save(&arrays, dir.join("model.safetensors")).unwrap();
+    fixture
+}
+
+/// AC2: the cross-backend compressed-KV conformance table (`core_llm_testkit::kv_policy_cases`) run
+/// through Candle's production plan — the same table MLX's plan passes with its fused reader. Every
+/// request reaches MLX's policy decision and reason, except that a request MLX runs compressed
+/// reports `ReaderUnavailable` here; no report claims a compressed format or counter. Each case
+/// plans on a decoder this backend actually loaded — a plain one, one outside the fused reader's
+/// geometry (head dimension 96: `UnsupportedGeometry` on both backends) and a hybrid recurrent
+/// one — test-armed as the case's table family.
+#[test]
+fn candle_kv_plan_conforms_to_the_cross_backend_policy_table() {
+    use core_llm::KvModelFamily;
+    use core_llm_testkit::{kv_policy_conformance, KvBackendDecision, KvCaseDecoder, KvReader};
+    let (_llama_dir, llama) = load_kv_provider(LLAMA_IDENTITY, false);
+    let (_qwen_dir, mut plain) = load_kv_provider(QWEN3_IDENTITY, true);
+    // Mistral loads through the Llama decoder but is not a table family.
+    let (_mistral_dir, mistral) = load_kv_provider(MISTRAL_IDENTITY, false);
+    assert_eq!(llama.kv_model_family(), Some(KvModelFamily::Llama));
+    assert_eq!(plain.kv_model_family(), Some(KvModelFamily::Qwen3));
+    assert_eq!(mistral.kv_model_family(), None);
+    let (_geometry_dir, mut outside_geometry) = load_kv_provider_unarmed(LLAMA_IDENTITY, false, 96);
+    let hybrid_dir = write_hybrid_snapshot();
+    let mut hybrid =
+        LlamaProvider::load(&LoadSpec::dense(hybrid_dir.to_str().unwrap().to_string()))
+            .expect("load the synthetic hybrid provider");
+    assert_eq!(hybrid.kv_model_family(), None);
+    kv_policy_conformance(KvReader::Unavailable, |case| {
+        let provider = match case.decoder {
+            KvCaseDecoder::Plain => &mut plain,
+            KvCaseDecoder::UnsupportedGeometry => &mut outside_geometry,
+            KvCaseDecoder::Hybrid => &mut hybrid,
+        };
+        provider.arm_kv_model_family_for_tests(case.family);
+        KvBackendDecision::Dense(provider.kv_cache_plan(
+            case.policy,
+            case.context_tokens,
+            case.max_new_tokens,
+            case.batch,
+            case.multimodal,
+        ))
+    });
+}
+
+/// AC1 through the production entry point: every generation reports a dense cache with the shared
+/// reason — `PolicyDisabled` un-opted, the table's refusal for a short context or an unnamed
+/// family — and opting in changes nothing about what Candle generates.
+#[test]
+fn candle_generations_report_the_dense_cache_and_generate_unchanged() {
+    use core_llm::{KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy};
+    let generate = |provider: &LlamaProvider, policy| {
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t5 t6 t7 t8")],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 8,
+            seed: Some(0),
+            kv_compression: policy,
+            ..Default::default()
+        };
+        core_llm::TextLlm::generate(provider, &request, &mut |_| {}).unwrap()
+    };
+    let (_qwen_dir, qwen) = load_kv_provider(QWEN3_IDENTITY, true);
+    let off = generate(&qwen, Policy::Off);
+    let opted_in = generate(&qwen, Policy::Qualified);
+    assert_eq!(
+        off.kv_cache,
+        Some(KvCacheReport::dense(Reason::PolicyDisabled, None))
+    );
+    assert_eq!(
+        opted_in.kv_cache,
+        Some(KvCacheReport::dense(Reason::BelowMinimumContext, None))
+    );
+    assert_eq!(
+        (opted_in.text.as_str(), opted_in.usage),
+        (off.text.as_str(), off.usage)
+    );
+    let (_mistral_dir, mistral) = load_kv_provider(MISTRAL_IDENTITY, false);
+    assert_eq!(
+        generate(&mistral, Policy::Qualified).kv_cache,
+        Some(KvCacheReport::dense(Reason::UnqualifiedModel, None))
+    );
+}
+
+/// AC1: a generation at Qwen3's qualified minimum context — one MLX runs on the fused compressed
+/// reader — runs dense on Candle as `ReaderUnavailable`, claims no compressed format or counter,
+/// and generates exactly what the un-opted request does.
+#[test]
+fn a_qualified_candle_generation_runs_dense_as_reader_unavailable() {
+    use core_llm::{
+        KvCacheCounters, KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy,
+        KvModelFamily, KV_COMPRESSION_QUALIFICATIONS,
+    };
+    let min = KV_COMPRESSION_QUALIFICATIONS
+        .iter()
+        .find(|row| row.family == KvModelFamily::Qwen3)
+        .unwrap()
+        .min_context_tokens;
+    let identity = format!(
+        "{QWEN3_IDENTITY} \"max_position_embeddings\": {},",
+        min + 1024
+    );
+    let (_dir, qwen) = load_kv_provider(&identity, true);
+    let words = (0..min)
+        .map(|i| format!("t{}", i % 26 + 6))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let generate = |policy| {
+        let request = TextLlmRequest {
+            messages: vec![Message::user(words.clone())],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            kv_compression: policy,
+            ..Default::default()
+        };
+        core_llm::TextLlm::generate(&qwen, &request, &mut |_| {}).unwrap()
+    };
+    let off = generate(Policy::Off);
+    let opted_in = generate(Policy::Qualified);
+    assert!(u64::from(opted_in.usage.prompt_tokens) >= min);
+    let report = opted_in
+        .kv_cache
+        .clone()
+        .expect("Candle reports its KV cache");
+    assert_eq!(report.fallback, Some(Reason::ReaderUnavailable));
+    assert!(report
+        .detail
+        .as_deref()
+        .is_some_and(|d| d.contains("Candle")));
+    assert_eq!(report.format, None);
+    assert_eq!(report.counters, KvCacheCounters::default());
+    assert!(!report.ran_compressed());
+    assert_eq!(
+        (opted_in.text.as_str(), opted_in.usage),
+        (off.text.as_str(), off.usage)
+    );
+}
+
+/// AC1: Candle bounds the final context like MLX — a qualified-length prompt whose token budget
+/// reaches past the evidenced window reports the table's `AboveQualifiedContext`, not
+/// `ReaderUnavailable`.
+#[test]
+fn a_candle_token_budget_past_the_qualified_window_reports_the_table_refusal() {
+    use core_llm::{
+        KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        KvModelFamily, KV_COMPRESSION_QUALIFICATIONS,
+    };
+    let row = KV_COMPRESSION_QUALIFICATIONS
+        .iter()
+        .find(|row| row.family == KvModelFamily::Qwen3)
+        .unwrap();
+    let max = row
+        .max_context_tokens
+        .expect("the Qwen3 row bounds its window");
+    let identity = format!(
+        "{QWEN3_IDENTITY} \"max_position_embeddings\": {},",
+        max + 1024
+    );
+    let (_dir, qwen) = load_kv_provider(&identity, true);
+    let words = (0..row.min_context_tokens)
+        .map(|i| format!("t{}", i % 26 + 6))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let request = TextLlmRequest {
+        messages: vec![Message::user(words)],
+        sampling: core_llm::Sampling::greedy(),
+        // The budget alone carries the final context past the window; every generated piece is
+        // `t<N>`, so the stop string ends the decode at its first token.
+        max_new_tokens: u32::try_from(max - row.min_context_tokens).unwrap(),
+        stop: vec!["t".into()],
+        seed: Some(0),
+        kv_compression: Policy::Qualified,
+        ..Default::default()
+    };
+    let output = core_llm::TextLlm::generate(&qwen, &request, &mut |_| {}).unwrap();
+    assert!(u64::from(output.usage.prompt_tokens) >= row.min_context_tokens);
+    assert_eq!(
+        output.kv_cache,
+        Some(KvCacheReport::dense(Reason::AboveQualifiedContext, None))
     );
 }

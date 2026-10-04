@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "story": "SC-20684",
+  "validation": "checked-out-current-source",
+  "decision": "experimental-krea-owned-packed-affine-online-softmax-poc",
+  "upstream": {
+    "repository": "https://github.com/rajveer43/VeloxQuant-MLX",
+    "tag": "v0.65.0",
+    "commit": "54989ee223611627592f7f9bd925e924658f1f22",
+    "mechanisms": ["scalar_fused_decode_attend", "rabitq_prefill_attend"]
+  },
+  "currentProduct": {
+    "modelIds": ["krea_realtime_14b"],
+    "requestModes": ["text-to-video", "image-to-video", "video-to-video"],
+    "cacheRepresentation": "Q8/Q4 affine along head dimension for both K and V; packed payload plus bf16 scale/bias",
+    "cacheRead": "gather packed window then dequantize full dense K/V per layer before MLX SDPA",
+    "attention": "dense MLX scaled_dot_product_attention with optional additive block-causal mask",
+    "commit": "one post-RoPE K/raw-V cache append per chunk; readonly denoise and clean-context recompute are distinct",
+    "qualityEvidence": "Q8 existing-route drift measured; Q4 existing-route quality unvalidated"
+  },
+  "poc": {
+    "candidate": "Krea-owned D-axis affine Q8 packed K/V with tiled online softmax; Q4 is a separately acknowledged quality arm",
+    "status": "implemented-device-kernel-full-generation-evidence-required",
+    "nativeGeometry": "B=1, H=40, D=128, group=64, Q8 by default; query tiles of 8 and analytic block-causal masking from O(S) positions",
+    "rejectedCurrentFormat": "Krea Q8/Q4 is not RaBitQ and is not VeloxQuant token-axis K grouping; the POC reads Krea's own uint32 plus bf16 scale/bias rows",
+    "nonGoal": "full-cache dequantize-then-SDPA is not compressed-domain execution"
+  },
+  "rejectionFallbacks": [
+    {"id": "disabled", "reason": "the feature is off by default and returns the unchanged dense route before packed-state mutation"},
+    {"id": "q4-quality", "reason": "Q4 has no product-quality receipt and requires a separate explicit quality-arm acknowledgement"},
+    {"id": "handle", "reason": "a retained identity-safe compiled Metal handle is required before compressed dispatch"},
+    {"id": "geometry", "reason": "only B=1, D=128, group=64, matching packed K/V and exact query/key shapes may dispatch"},
+    {"id": "mask", "reason": "only none or analytic nonzero block-causal metadata is supported; all other masks fall back before mutation"},
+    {"id": "cancellation", "reason": "a cancelled read or trim returns without partial packed-state mutation and releases bounded scratch"},
+    {"id": "receipt", "reason": "no device-produced parity, quality, resident-byte, transient-byte, or dispatch receipt exists"}
+  ],
+  "receipt": {
+    "status": "producer-implemented-terminal-receipt-required",
+    "requiredFields": ["modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability", "representationIdentity", "compiledHandleIdentity", "persistentBytes", "retainedHandleBytes", "boundedScratchBytes", "denseWindowBytes", "scoreMatrixBytes", "fallbackReason", "parity", "quality", "cancellation", "timingLabel", "inputIdentity", "denoisingSchedule", "processMemory", "allocatorMemory", "phaseTimings", "temporalQuality", "reviewArtifacts", "releaseOutcome", "rawTranscripts", "checksumManifest", "freshDenseBaseline", "pairedCandidateComparison", "decisionPolicy", "decisionPolicySha256", "geometryCoverage", "dispatchGeometryCoverage", "processExitCodes", "perArmDecision", "tierDecision", "overallDecision", "eligibleGeometry", "modelArtifactInventory", "frozenAccuracyThresholds", "inFlightCancellationAllocation", "loadedModelReleaseBaseline", "buildIdentity", "tileAndDtypeIdentity"],
+    "forbiddenClaims": ["local performance", "local memory reduction", "local quality parity", "compressed-domain execution"]
+  },
+  "sourceMappings": [
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/config.rs", "needle": "pub struct KvCacheQuant"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/config.rs", "needle": "pub fn row_bytes"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "struct PackedKv"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn dense(&self, quant: Option<KvCacheQuant>)"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn window_prev"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn append"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn denoise_chunk_inner"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/t2v.rs", "needle": "fn resolve_request_config"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/generate.rs", "needle": "fn run_ar_loop_conditioned"},
+    {"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "fn forward_causal("},
+    {"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub fn forward_causal_chunk"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub struct ExperimentalCompressedKvConfig"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub trait RetainedKernelHandle"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub fn tiled_online_attention"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub fn append_after_decision"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub fn trim_prefix"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub struct KreaPackedMetalKernel"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn enable_experimental_packed_metal"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn prepare_packed_window"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub trait CausalPackedAttention"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub fn forward_causal_chunk_with_packed_attention"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn packed_metal_route_receipt"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn record_packed_forward_duration"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub struct PackedMetalDispatchGeometry"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs", "needle": "fn sc20684_packed_campaign_observer()"}
+    ,{"path": "scripts/sc20684_krea_realtime_campaign.py", "needle": "def decision_policy()"}
+    ,{"path": "scripts/sc20684_krea_realtime_campaign.py", "needle": "def campaign_decision("}
+  ]
+}

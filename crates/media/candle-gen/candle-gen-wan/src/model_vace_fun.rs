@@ -264,6 +264,30 @@ impl Pipeline {
         let mask_latents = prepare_masks(&mask, self.vace_cfg.base.patch.1, num_ref)?;
         let control = build_vace_control(&video_latents, &mask_latents)?;
         let (_, _, t, h, w) = control.dims5()?;
+        if let Some((persistent, transient, shape, dtype)) =
+            crate::sc20686_observer::campaign_evidence(|| {
+                (
+                    (control.elem_count() as u64)
+                        .saturating_mul(control.dtype().size_in_bytes() as u64),
+                    (mask_latents.elem_count() as u64)
+                        .saturating_mul(mask_latents.dtype().size_in_bytes() as u64),
+                    format!("{:?};{:?}", control.dims(), mask_latents.dims()),
+                    format!("{:?}", control.dtype()),
+                )
+            })
+        {
+            crate::sc20686_observer::observe_tensor(
+                "prefill-peak",
+                "vace-control-prepared",
+                persistent,
+                transient,
+                0,
+                shape,
+                dtype,
+                "control-mask",
+                "applied",
+            );
+        }
         let (pt, ph, pw) = self.vace_cfg.base.patch;
         let (cos, sin) =
             WanRope::new(&self.vace_cfg.base).cos_sin(t / pt, h / ph, w / pw, &self.device)?;
@@ -531,10 +555,40 @@ impl Generator for WanVaceFunGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
         self.validate_request(req)?;
         if let Some(prepared) = &self.i2v_memory {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
+        let frames = req
+            .control_clip()
+            .map(|clip| clip.frames.len() as u32)
+            .ok_or_else(|| gen_core::Error::Msg("missing control clip".into()))?;
+        let (latent_frames, latent_height, latent_width) =
+            crate::wan14b::latent_dims(frames, req.width, req.height);
+        let reference_count = u32::try_from(
+            req.conditioning
+                .iter()
+                .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+                .count(),
+        )
+        .map_err(|_| gen_core::Error::Msg("too many reference images".into()))?;
+        let _campaign = crate::sc20686_observer::activate_requested(
+            &self.root,
+            &req.cancel,
+            MODEL_ID_VACE_FUN,
+            1,
+            frames,
+            req.width,
+            req.height,
+            latent_frames as u32,
+            latent_height as u32,
+            latent_width as u32,
+            &req.prompt,
+            req.guidance,
+            reference_count,
+        )
+        .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let effective_offload = crate::i2v_memory_strategy::selected_offload_policy(
             self.offload,
             self.i2v_memory.is_some(),
@@ -655,7 +709,14 @@ impl Generator for WanVaceFunGenerator {
             }
         };
         on_progress(Progress::Decoding);
-        let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel, decode_cap)?;
+        let (frames, fps) = match pipeline.finish(prepared, &vae, &req.cancel, decode_cap) {
+            Ok(result) => result,
+            Err(error) => {
+                crate::sc20686_observer::observe_cancelled();
+                return Err(error.into());
+            }
+        };
+        crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
             fps,

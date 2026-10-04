@@ -60,7 +60,7 @@ fn progress_logger(label: String) -> impl FnMut(Progress) {
 /// `phys_footprint` of this process — the counter the SceneWorks memory campaign's ceiling reads
 /// (`physical_footprint_at_or_above_…`) — and its lifetime maximum, in bytes, via
 /// `proc_pid_rusage(RUSAGE_INFO_V4)`. RSS is meaningless for Metal buffers; this is not.
-fn phys_footprint() -> (u64, u64) {
+pub(crate) fn phys_footprint() -> (u64, u64) {
     extern "C" {
         fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u8) -> i32;
     }

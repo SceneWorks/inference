@@ -33,7 +33,7 @@ use candle_gen::gen_core::{
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
     OffloadPolicy, Progress, Quant, WeightsSource,
 };
-use candle_gen::{check_cancel, CandleError, Result as CResult};
+use candle_gen::{check_cancel as product_check_cancel, CandleError, Result as CResult};
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FPS_14B, DEFAULT_FRAMES_14B,
@@ -47,6 +47,13 @@ use crate::rope::WanRope;
 use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::transformer::WanTransformer;
+
+fn check_cancel(cancel: &CancelFlag) -> CResult<()> {
+    product_check_cancel(cancel).inspect_err(|_| {
+        crate::sc20686_observer::observe_cancelled();
+    })
+}
+
 /// Concrete z16 VAE assigned to both A14B routes.
 pub type ProviderVae = crate::vae16::WanVae16;
 
@@ -546,13 +553,42 @@ impl Pipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<()> {
+        crate::sc20686_observer::observe("generation-start", 0, 0, 0);
         // One cache per projected conditioning payload for this expert's request-scoped denoise range.
         // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
         check_cancel(cancel)?;
+        crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, cos.dim(0)? as u64, 0, "");
         let pos_kv = expert.prepare_cross_kv(ctx_pos)?;
+        if let Some((pos_bytes, pos_shape, pos_dtype)) = pos_kv.evidence() {
+            crate::sc20686_observer::observe_tensor(
+                "cross-kv-prepared",
+                "prepare",
+                pos_bytes,
+                0,
+                0,
+                pos_shape,
+                pos_dtype,
+                "none",
+                "applied",
+            );
+            crate::sc20686_observer::observe("cross-kv-reuse", pos_bytes, 0, 1);
+        }
         let neg_kv = ctx_neg
             .map(|context| expert.prepare_cross_kv(context))
             .transpose()?;
+        if let Some((bytes, shape, dtype)) = neg_kv.as_ref().and_then(|kv| kv.evidence()) {
+            crate::sc20686_observer::observe_tensor(
+                "cross-kv-prepared",
+                "prepare-negative",
+                bytes,
+                0,
+                0,
+                shape,
+                dtype,
+                "none",
+                "applied",
+            );
+        }
         for i in range {
             check_cancel(cancel)?;
             let t = sched.timestep(i);
@@ -571,6 +607,7 @@ impl Pipeline {
                 }
                 _ => v_pos,
             };
+            check_cancel(cancel)?;
             *latents = sched.step(&v, latents)?; // 16-channel latent (out_dim 16)
             on_progress(Progress::Step {
                 current: i as u32 + 1,
@@ -1121,6 +1158,32 @@ impl Generator for Wan14bGenerator {
         if let Some(prepared) = &self.i2v_memory {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
+        let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B);
+        let (latent_frames, latent_height, latent_width) =
+            latent_dims(frames, req.width, req.height);
+        let reference_count = u32::try_from(
+            req.conditioning
+                .iter()
+                .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+                .count(),
+        )
+        .map_err(|_| gen_core::Error::Msg("too many reference images".into()))?;
+        let _campaign = crate::sc20686_observer::activate_requested(
+            &self.root,
+            &req.cancel,
+            self.variant.id(),
+            1,
+            frames,
+            req.width,
+            req.height,
+            latent_frames as u32,
+            latent_height as u32,
+            latent_width as u32,
+            &req.prompt,
+            req.guidance,
+            reference_count,
+        )
+        .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let pipe = match &self.comfyui {
             Some(experts) => {
                 Pipeline::load_comfyui(&self.root, &self.device, self.variant, experts.clone())
@@ -1152,6 +1215,7 @@ impl Generator for Wan14bGenerator {
             let components = self.components(&pipe)?;
             pipe.render(req, &components, on_progress)?
         };
+        crate::sc20686_observer::observe("generation-end", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
             fps,

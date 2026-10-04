@@ -8,7 +8,7 @@
 //! re-injected each step into the target [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear)s
 //! through the shared [`mlx_gen::train::lora`] seam, and are stepped with `keyed_value_and_grad` +
 //! the core [`TrainOptimizer`] + `clip_grad_norm`. The install mirrors the inference reload
-//! op-for-op, so the trained adapter loads back through the sc-24156 adapter host
+//! op-for-op on the dense training tier, so the trained adapter loads back through the sc-24156 adapter host
 //! ([`crate::apply_qwen_image_2_1_adapters`]) with no key conversion.
 //!
 //! ## What is Qwen-Image-2.1-specific
@@ -95,9 +95,7 @@ use crate::config::{
     IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES, VAE_SCALE_FACTOR,
 };
 use crate::loader;
-use crate::memory_strategy::derived::{
-    MLX_EVAL_SLACK_BYTES, MLX_MAX_ACTIVE_TASKS, VAE_PIPELINED_DECODE_MAPS,
-};
+use crate::memory_strategy::derived::{MLX_EVAL_SLACK_BYTES, VAE_PIPELINED_DECODE_MAPS};
 use crate::model::{FAMILY, MODEL_ID};
 use crate::pipeline::{
     create_noise, decode_rgb, denoise, encode_references, joint_branch, joint_images,
@@ -221,17 +219,16 @@ pub fn optimizer_state_per_param(optimizer: &str) -> u64 {
 /// the q/k/v projections, q/k after the per-head RMS norm and after RoPE (whose f32 rotation
 /// planes count double at bf16 width), and the SDPA output. A **structural count, not a
 /// measurement** — like every number in [`crate::memory_strategy::derived`].
-pub const ATTENTION_SAVED_HIDDEN: u64 = 14;
+pub const ATTENTION_SAVED_HIDDEN: u64 = crate::training_memory::ATTENTION_SAVED_HIDDEN;
 /// `[S, inner]` tensors the **feed-forward** half retains regardless of its width: the residual
 /// after attention, the modulated `h`, and the FFN output.
-pub const FFN_SAVED_HIDDEN_FIXED: u64 = 3;
+pub const FFN_SAVED_HIDDEN_FIXED: u64 = crate::training_memory::FFN_SAVED_HIDDEN_FIXED;
 /// `[S, inner·mlp_ratio]` tensors the SwiGLU retains: `gate(h)`, `silu(gate(h))`, `proj(h)` and
 /// their product — each `mlp_ratio` hidden-widths wide.
-pub const FFN_SAVED_PER_MLP_RATIO: u64 = 4;
-/// `[heads, S, S]` matrices one block's attention backward holds at once (the softmax output, its
-/// cotangent and the score cotangent of the SDPA fallback VJP), at the compute width. One block
-/// at a time: the backward walks the blocks in reverse.
-pub const ATTENTION_BACKWARD_SCORE_MATRICES: u64 = 3;
+pub const FFN_SAVED_PER_MLP_RATIO: u64 = crate::training_memory::FFN_SAVED_PER_MLP_RATIO;
+/// Score buffers in the unfused Metal softmax VJP (see `training_memory`).
+pub const ATTENTION_BACKWARD_SCORE_MATRICES: u64 =
+    crate::training_memory::SOFTMAX_VJP_SCORE_BUFFERS;
 /// `[L, text_hidden]` f32 tensors live in one Qwen3 decoder layer while a caption encodes (the
 /// residual, the normed input, q/k/v, the attention output and the SwiGLU's three wide halves,
 /// rounded up). Captions are short; this term never decides a refusal on its own.
@@ -352,6 +349,8 @@ pub struct TrainingShape {
     /// `0` falls back to the whole prefix squared (`(caption_tokens + reference_tokens)²`), which
     /// is exact for a text-only prefix and an upper bound otherwise.
     pub prefix_scores: u64,
+    /// Largest single prefix SDPA call, per head. Zero uses the whole prefix as an upper bound.
+    pub largest_prefix_call: u64,
     /// Dataset items (each caches one caption feature and one latent).
     pub items: u64,
     /// Bytes per element of the DiT compute dtype (2 for bf16, 4 for f32).
@@ -395,12 +394,13 @@ impl TrainingFootprint {
 /// The DiT working set follows this crate's own block structure: a dense step retains every
 /// block's [`ATTENTION_SAVED_HIDDEN`] + [`FFN_SAVED_HIDDEN_FIXED`] + `mlp_ratio ·`
 /// [`FFN_SAVED_PER_MLP_RATIO`] `[S, inner]` tensors for the backward; a gradient-checkpointed step
-/// retains only each block's input plus ONE block's recompute set. Both add one block's attention
+/// retains each block's input plus its forward and backward recompute working sets. Both add the unfused attention
 /// backward ([`ATTENTION_BACKWARD_SCORE_MATRICES`] score matrices of the block-causal calls:
 /// `heads·(T·S + Σ (end − start)·end)` elements — the target rows attend to every key, each prefix
 /// segment's rows to the keys up to its end, [`TrainingShape::prefix_scores`]) and MLX's pipelined
-/// evaluation ([`MLX_MAX_ACTIVE_TASKS`] + 1 in-flight `[S, inner]` outputs, the same term the
-/// render path's derived model carries), plus [`MLX_EVAL_SLACK_BYTES`].
+/// evaluation: input/output buffers, wide f32 SwiGLU intermediates and score matrices held by
+/// the ten in-flight Metal command buffers plus the buffer being scheduled. See `training_memory`
+/// for the pinned upstream source and buffer threshold. Adds [`MLX_EVAL_SLACK_BYTES`].
 ///
 /// LoKr adds its materialised deltas (`lokr_delta_elements` at bf16): a dense step keeps every
 /// target's delta live for the backward, a checkpointed step only one block's (rebuilt once in the
@@ -461,32 +461,31 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
         + MLX_EVAL_SLACK_BYTES;
 
     // 3. train: dense DiT at the compute width + trainable state + caches + the step.
-    let hidden = seq * facts.inner * w;
-    let block_saved = (ATTENTION_SAVED_HIDDEN
-        + FFN_SAVED_HIDDEN_FIXED
-        + FFN_SAVED_PER_MLP_RATIO * facts.mlp_ratio)
-        * hidden;
-    let retained = if shape.checkpointed {
-        facts.num_layers * hidden + block_saved
-    } else {
-        facts.num_layers * block_saved
-    };
     let prefix = shape.caption_tokens + shape.reference_tokens;
     let prefix_scores = if shape.prefix_scores > 0 {
         shape.prefix_scores
     } else {
         prefix * prefix
     };
-    let attention_backward =
-        ATTENTION_BACKWARD_SCORE_MATRICES * facts.heads * (image_tokens * seq + prefix_scores) * w;
-    let pipelined = (MLX_MAX_ACTIVE_TASKS + 1) * hidden;
-    let lokr_deltas = shape.lokr_delta_elements * LOKR_DELTA_WIDTH;
-    let step_deltas = if shape.checkpointed {
-        2 * lokr_deltas / facts.num_layers.max(1)
+    let largest_prefix = if shape.largest_prefix_call > 0 {
+        shape.largest_prefix_call
     } else {
-        lokr_deltas
+        prefix * prefix
     };
-    let step = retained + attention_backward + pipelined + step_deltas;
+    let lokr_deltas = shape.lokr_delta_elements * LOKR_DELTA_WIDTH;
+    let step = crate::training_memory::step_bytes(crate::training_memory::StepShape {
+        sequence: seq,
+        inner: facts.inner,
+        layers: facts.num_layers,
+        heads: facts.heads,
+        mlp_ratio: facts.mlp_ratio,
+        width: w,
+        target_scores: image_tokens * seq,
+        prefix_scores,
+        largest_prefix_call: largest_prefix,
+        lokr_delta_elements: shape.lokr_delta_elements,
+        checkpointed: shape.checkpointed,
+    });
     // A preview render runs between steps (the step's activations are released by then), so its
     // decode transient competes with the step rather than adding to it.
     let (decoder_resident, preview) = if shape.sampling {
@@ -588,6 +587,85 @@ pub fn check_training_footprint(
 /// backpressure).
 fn device_budget_bytes() -> u64 {
     (mlx_rs::memory::get_memory_limit() as f64 * mlx_gen::memory::SAFE_FRAC) as u64
+}
+
+/// Caps MLX's freed-buffer pool (`set_cache_limit`) for one training run and restores the
+/// previous cap on drop. Installed as `min(previous, requested)`, like
+/// [`crate::memory_strategy::AllocatorBounds`]: a run only ever tightens what a harness set.
+struct TrainingPoolBound {
+    previous: usize,
+    effective: usize,
+}
+
+impl TrainingPoolBound {
+    fn enter(limit_bytes: u64) -> Self {
+        let limit = usize::try_from(limit_bytes).unwrap_or(usize::MAX);
+        let previous = mlx_rs::memory::set_cache_limit(limit);
+        if previous < limit {
+            mlx_rs::memory::set_cache_limit(previous);
+        }
+        Self {
+            previous,
+            effective: previous.min(limit),
+        }
+    }
+}
+
+/// Explicit operator-owned diagnostic output; unset for normal training. These
+/// Foreground snapshots at existing serialized phase boundaries. MLX's scalar
+/// counters are not an atomic snapshot; no extra array evaluation or Metal sync
+/// is introduced for sampling. Background physical samples can only be aligned
+/// approximately by timestamp. No allocator limit or peak accounting is changed.
+fn training_memory_trace(
+    stage: &str,
+    preflight: Option<TrainingFootprint>,
+    cache_limit: Option<usize>,
+) {
+    use std::io::Write;
+    let Some(directory) = std::env::var_os("QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let event = serde_json::json!({
+        "unixMillis": time, "stage": stage,
+        "counterScope": "foreground_non_atomic_snapshot_no_added_eval_or_sync",
+        "activeBytes": mlx_rs::memory::get_active_memory(),
+        "cacheBytes": mlx_rs::memory::get_cache_memory(),
+        "peakActiveBytes": mlx_rs::memory::get_peak_memory(),
+        "mlxMemoryLimitBytes": mlx_rs::memory::get_memory_limit(),
+        "configuredCacheLimitBytes": if preflight.is_none() { cache_limit } else { None },
+    });
+    let write = || -> std::io::Result<()> {
+        if let Some(fp) = preflight {
+            std::fs::write(
+                directory.join("training-preflight.json"),
+                serde_json::json!({
+                    "peakBytes": fp.peak(), "captionBytes": fp.caption_phase,
+                    "latentBytes": fp.latent_phase, "trainBytes": fp.train_phase,
+                    "requestedCacheLimitBytes": cache_limit,
+                })
+                .to_string(),
+            )?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("training-stages.jsonl"))?;
+        writeln!(file, "{event}")
+    };
+    if let Err(error) = write() {
+        eprintln!("training memory diagnostic write failed: {error}");
+    }
+}
+
+impl Drop for TrainingPoolBound {
+    fn drop(&mut self) {
+        mlx_rs::memory::set_cache_limit(self.previous);
+    }
 }
 
 /// `(trainable elements, LoKr delta elements)` the targets get under `cfg` — exact, from the
@@ -1107,9 +1185,18 @@ fn edit_prompt_layout(
 /// whether its reference latents are cached for the whole run)`.
 type PreflightPrompt<'a> = (&'a str, &'a [PathBuf], (u32, u32), bool);
 
-/// Per-head score elements of a layout's block-causal **prefix** attention calls:
-/// `Σ (end − start)·end` over [`JointLayout::prefix_segments`] — each segment's rows attend to every
-/// key before its end. `L²` for the text-to-image layout.
+/// Largest per-head block-causal prefix call: `max((end − start)·end)`. The target call
+/// is priced separately from its target-row count and total key count.
+pub fn largest_prefix_score_call(layout: &JointLayout) -> u64 {
+    layout
+        .prefix_segments()
+        .iter()
+        .map(|&(start, end, _)| ((end - start) * end) as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Sum of all prefix calls, per head.
 pub fn prefix_score_elements(layout: &JointLayout) -> u64 {
     layout
         .prefix_segments()
@@ -1579,6 +1666,7 @@ impl QwenImage21Trainer {
                 largest_target_tokens.max(target_tokens(edit_target_size(item, edge)?));
         }
         let mut prefix_scores = 0u64;
+        let mut largest_prefix_call = 0u64;
         let mut prompts: Vec<PreflightPrompt<'_>> = Vec::new();
         for item in &req.items {
             prompts.push((
@@ -1621,11 +1709,14 @@ impl QwenImage21Trainer {
                         size,
                     )?;
                     prefix_scores = prefix_scores.max(prefix_score_elements(&layout));
+                    largest_prefix_call =
+                        largest_prefix_call.max(largest_prefix_score_call(&layout));
                     text_tokens
                 }
                 None => {
                     let tokens = caption_tokens(&self.tokenizer, self.drop_count, text)?;
                     prefix_scores = prefix_scores.max(tokens * tokens);
+                    largest_prefix_call = largest_prefix_call.max(tokens * tokens);
                     tokens
                 }
             };
@@ -1641,6 +1732,7 @@ impl QwenImage21Trainer {
             largest_reference_tokens,
             reference_cache_tokens,
             prefix_scores,
+            largest_prefix_call,
             items: req.items.len() as u64,
             compute_width: if compute_dtype == Dtype::Float32 {
                 4
@@ -1656,7 +1748,42 @@ impl QwenImage21Trainer {
         let budget = self
             .memory_budget_override
             .unwrap_or_else(device_budget_bytes);
+        if std::env::var("QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS").as_deref() == Ok("1") {
+            eprintln!(
+                "training-shape {shape:?} facts {:#?} footprint {:?}",
+                self.facts,
+                training_footprint(&self.facts, &shape)
+            );
+        }
+        let derived = training_footprint(&self.facts, &shape);
+        training_memory_trace(
+            "preflight",
+            Some(derived),
+            Some(
+                usize::try_from(
+                    derived
+                        .train_phase
+                        .saturating_sub(self.facts.dit_elements * shape.compute_width)
+                        .max(1 << 30),
+                )
+                .unwrap_or(usize::MAX),
+            ),
+        );
         check_training_footprint(&self.facts, &shape, budget)?;
+        // Bound MLX's freed-buffer pool for the rest of the run to the derived working set above
+        // the DiT. Unbounded, the allocator pools every freed buffer up to ~0.95 x the device's
+        // recommended working set, so the process footprint the OS sees climbs to that pool line
+        // whatever the run needs (the first real-weight edit run crossed the evidence lane's
+        // 100 GB phys_footprint ceiling). The render path bounds the pool per request the same way
+        // (`memory_strategy::AllocatorBounds`, sc-24114); training bounds ONLY the cache, never
+        // MLX's memory limit, so a figure the derived model rounds can never throttle a step.
+        let _pool = TrainingPoolBound::enter(
+            derived
+                .train_phase
+                .saturating_sub(self.facts.dit_elements * shape.compute_width)
+                .max(1 << 30),
+        );
+        training_memory_trace("pool_bound", None, Some(_pool.effective));
 
         // --- resume admission, before any model loads ---
         // The run's identity (sc-24163): its training config and its dataset fingerprint (item
@@ -1743,7 +1870,13 @@ impl QwenImage21Trainer {
             (branches, sample_caps, sample_neg)
             // `encoder` drops here: every caption is cached, the tower is idle from now on.
         };
+        training_memory_trace(
+            "caption_tower_dropped_before_clear",
+            None,
+            Some(_pool.effective),
+        );
         mlx_rs::memory::clear_cache();
+        training_memory_trace("caption_cache_cleared", None, Some(_pool.effective));
 
         // --- 2. latents: the VAE encodes each image ONCE; the encoder half is then dropped ---
         let mut vae = loader::load_vae(&self.root)?;
@@ -1775,7 +1908,13 @@ impl QwenImage21Trainer {
         }
         vae.drop_encoder();
         let vae: Option<QwenImage21Vae> = (!sample_caps.is_empty()).then_some(vae);
+        training_memory_trace(
+            "vae_encoder_dropped_before_clear",
+            None,
+            Some(_pool.effective),
+        );
         mlx_rs::memory::clear_cache();
+        training_memory_trace("latent_cache_cleared", None, Some(_pool.effective));
         // Cancelled during caching: nothing has trained, so write nothing (and skip the DiT load).
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1789,6 +1928,7 @@ impl QwenImage21Trainer {
         if transformer.compute_dtype() != compute_dtype {
             transformer.cast_weights(compute_dtype)?;
         }
+        training_memory_trace("dit_loaded", None, Some(_pool.effective));
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let rank = cfg.rank as f32;
@@ -1870,6 +2010,7 @@ impl QwenImage21Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            training_memory_trace(&format!("step_{step}_begin"), None, Some(_pool.effective));
             let item = &cache[((step - 1) as usize) % cache.len()];
             let t = sample_sigma(
                 &cfg.timestep_type,
@@ -1898,6 +2039,11 @@ impl QwenImage21Trainer {
                 },
             )?;
             last_loss = loss;
+            training_memory_trace(
+                &format!("step_{step}_gradients_returned"),
+                None,
+                Some(_pool.effective),
+            );
             steps_run = step;
             accumulate_grads(&mut accumulated, grads)?;
 
@@ -1928,6 +2074,11 @@ impl QwenImage21Trainer {
                 update_idx += 1;
             }
 
+            training_memory_trace(
+                &format!("step_{step}_before_progress"),
+                None,
+                Some(_pool.effective),
+            );
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,
@@ -2049,6 +2200,10 @@ impl QwenImage21Trainer {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/lokr_rounding.rs"]
+mod lokr_rounding;
 
 #[cfg(test)]
 mod tests {
@@ -2284,6 +2439,7 @@ mod tests {
             largest_reference_tokens: 0,
             reference_cache_tokens: 0,
             prefix_scores: 0,
+            largest_prefix_call: 0,
             items: 20,
             compute_width: 2,
             trainable_params: 40_000_000,
@@ -3289,6 +3445,328 @@ mod tests {
         assert!(rel < 1e-3, "max rel grad diff {rel:.2e}");
     }
 
+    /// A changed render alone cannot identify a save/reload defect. Compare the *trained*
+    /// in-memory velocity with the saved file installed on a fresh base, for both adapter kinds,
+    /// both modalities and the actual bf16 production compute path, before any sampling metric.
+    #[test]
+    fn trained_factors_preserve_velocity_through_save_and_reload() {
+        let mut failures = Vec::new();
+        for network in [NetworkType::Lora, NetworkType::Lokr] {
+            for edit in [false, true] {
+                let mut dit = tiny_dit();
+                dit.cast_weights(Dtype::Bfloat16).unwrap();
+                let Built {
+                    adapter,
+                    mut params,
+                    mut cfg,
+                    paths,
+                } = build(&mut dit, network);
+                cfg.alpha = 2.5; // Exercise a non-unit alpha/rank fold.
+                let blocks = block_trainables(&mut dit, &paths, &params, &cfg).unwrap();
+                let mut batch = fixed_edit_batch(&dit);
+                if !edit {
+                    let (x0, text, noise) = fixed_batch(&dit);
+                    batch = EditBatch {
+                        x0,
+                        text,
+                        noise,
+                        references: vec![],
+                        layout: t2i_layout(),
+                    };
+                }
+                let spec = LossSpec {
+                    adapter: &adapter,
+                    alpha: cfg.alpha,
+                    rank: cfg.rank as f32,
+                    mae: false,
+                    dtype: Dtype::Bfloat16,
+                    lora_dtype: Some(Dtype::Bfloat16),
+                    checkpoint: Some(&blocks),
+                };
+                let mut opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+                for _ in 0..3 {
+                    let (_, grads) = compute_loss_grads(
+                        &mut dit,
+                        &params,
+                        &spec,
+                        &StepInputs {
+                            x0: &batch.x0,
+                            text: &batch.text,
+                            noise: &batch.noise,
+                            t: 0.5,
+                            references: &batch.references,
+                            layout: &batch.layout,
+                        },
+                    )
+                    .unwrap();
+                    opt.step(&mut params, &grads).unwrap();
+                    eval(params.values()).unwrap();
+                }
+                adapter
+                    .install_as(
+                        &mut dit,
+                        &params,
+                        cfg.alpha,
+                        cfg.rank as f32,
+                        Some(Dtype::Bfloat16),
+                        LOKR_DTYPE,
+                    )
+                    .unwrap();
+                let (x_t, _) = build_batch(&batch.x0, &batch.noise, 0.5).unwrap();
+                let x_t = x_t.as_dtype(Dtype::Bfloat16).unwrap();
+                let images = joint_images(&batch.references, &x_t);
+                let before = dit
+                    .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                    .unwrap();
+                eval([&before]).unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let file = dir.path().join("adapter.safetensors");
+                let provenance: Vec<_> = ADAPTER_PROVENANCE
+                    .into_iter()
+                    .chain(edit.then_some(EDIT_ADAPTER_MARKER))
+                    .collect();
+                adapter
+                    .save_with_meta(
+                        &params,
+                        cfg.alpha,
+                        cfg.rank as f32,
+                        cfg.decompose_factor,
+                        "",
+                        &provenance,
+                        &file,
+                    )
+                    .unwrap();
+                let mut fresh = tiny_dit();
+                fresh.cast_weights(Dtype::Bfloat16).unwrap();
+                let kind = if network == NetworkType::Lora {
+                    mlx_gen::runtime::AdapterKind::Lora
+                } else {
+                    mlx_gen::runtime::AdapterKind::Lokr
+                };
+                let report = crate::apply_qwen_image_2_1_adapters(
+                    &mut fresh,
+                    &[mlx_gen::runtime::AdapterSpec::new(file.clone(), 1.0, kind)],
+                )
+                .unwrap();
+                assert!(report.unmatched_paths.is_empty());
+                assert_eq!(report.applied, paths.len());
+                let after = fresh
+                    .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                    .unwrap();
+                eval([&after]).unwrap();
+                let error = subtract(&after, &before)
+                    .unwrap()
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(None)
+                    .unwrap()
+                    .item::<f32>();
+                let peak = before
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(None)
+                    .unwrap()
+                    .item::<f32>();
+                println!("FIDELITY {network:?} edit={edit} dense error={error} peak={peak}");
+                if !error.is_finite() || !peak.is_finite() || error > 1e-6 * peak.max(1.0) {
+                    failures.push(format!("{network:?} edit={edit} dense: {error} vs {peak}"));
+                }
+                // Compare reload with the same trained factors over an identical packed base.
+                // The direct in-memory reference MUST use the packed representation too:
+                // materialized bf16 kron and two bf16 contractions round at different places.
+                // Test that representation error separately per linear against an f64 oracle;
+                // serialization still has the strict dense velocity bound on every tier.
+                for bits in [4, 8] {
+                    let mut memory = tiny_dit();
+                    memory.cast_weights(Dtype::Bfloat16).unwrap();
+                    memory.quantize(bits).unwrap();
+                    adapter
+                        .install_as(
+                            &mut memory,
+                            &params,
+                            cfg.alpha,
+                            cfg.rank as f32,
+                            Some(Dtype::Bfloat16),
+                            LOKR_DTYPE,
+                        )
+                        .unwrap();
+                    if network == NetworkType::Lokr {
+                        let materialized = memory
+                            .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                            .unwrap();
+                        eval([&materialized]).unwrap();
+                        install_packed_lokr_reference(
+                            &mut memory,
+                            &params,
+                            &paths,
+                            cfg.alpha / cfg.rank as f32,
+                            &mut failures,
+                            &format!("edit={edit} q{bits}"),
+                        );
+                        let structured = memory
+                            .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                            .unwrap();
+                        let representation_error = subtract(&materialized, &structured)
+                            .unwrap()
+                            .as_dtype(Dtype::Float32)
+                            .unwrap()
+                            .abs()
+                            .unwrap()
+                            .max(None)
+                            .unwrap()
+                            .item::<f32>();
+                        // Diagnostic only: a nonlinear model does not inherit a single
+                        // residual's componentwise rounding budget as a global peak ratio.
+                        println!("REPRESENTATION Lokr edit={edit} q{bits} velocity_error={representation_error}");
+                    }
+                    let want = memory
+                        .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                        .unwrap();
+                    eval([&want]).unwrap();
+                    let mut reload = tiny_dit();
+                    reload.cast_weights(Dtype::Bfloat16).unwrap();
+                    reload.quantize(bits).unwrap();
+                    crate::apply_qwen_image_2_1_adapters(
+                        &mut reload,
+                        &[mlx_gen::runtime::AdapterSpec::new(file.clone(), 1.0, kind)],
+                    )
+                    .unwrap();
+                    let got = reload
+                        .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                        .unwrap();
+                    eval([&got]).unwrap();
+                    let error = subtract(&want, &got)
+                        .unwrap()
+                        .as_dtype(Dtype::Float32)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max(None)
+                        .unwrap()
+                        .item::<f32>();
+                    let peak = want
+                        .as_dtype(Dtype::Float32)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max(None)
+                        .unwrap()
+                        .item::<f32>();
+                    println!("FIDELITY {network:?} edit={edit} q{bits} error={error} peak={peak}");
+                    if !error.is_finite() || !peak.is_finite() || error > 1e-6 * peak.max(1.0) {
+                        failures.push(format!(
+                            "{network:?} edit={edit} q{bits}: {error} vs {peak}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // This test reference neither reads the serialized file nor calls the loader/builder.
+    // Construct the small factors directly from the trained parameter keys and metadata.
+    fn install_packed_lokr_reference(
+        host: &mut QwenImage21Transformer,
+        params: &LoraParams,
+        paths: &[String],
+        scale: f32,
+        failures: &mut Vec<String>,
+        cell: &str,
+    ) {
+        use mlx_gen::adapters::{Adapter, LokrFactors};
+        use mlx_rs::ops::matmul;
+
+        let mut drop_detected = false;
+        let mut scale_detected = false;
+        for path in paths {
+            let get = |suffix: &str| params.get(format!("{path}.{suffix}").as_str());
+            let w1 = get("lokr_w1").unwrap();
+            let w2 = match get("lokr_w2") {
+                Some(w2) => w2.clone(),
+                None => matmul(get("lokr_w2_a").unwrap(), get("lokr_w2_b").unwrap()).unwrap(),
+            };
+            let (a, c) = (w1.shape()[0], w1.shape()[1]);
+            let (b, d) = (w2.shape()[0], w2.shape()[1]);
+            let factors = LokrFactors {
+                w1: w1.as_dtype(Dtype::Bfloat16).unwrap(),
+                w2: multiply(&w2, Array::from_f32(scale))
+                    .unwrap()
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap(),
+                a,
+                b,
+                c,
+                d,
+                scale,
+            };
+            let x: Vec<_> = (0..3 * c * d)
+                .map(|i| ((i * 7 % 31) as f32 - 15.0) / 16.0)
+                .collect();
+            let x = Array::from_slice(&x, &[3, c * d])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let f32_values = |value: &Array| {
+                let value = value.as_dtype(Dtype::Float32).unwrap();
+                eval([&value]).unwrap();
+                value.as_slice::<f32>().to_vec()
+            };
+            let (want, products) = lokr_rounding::oracle(
+                &f32_values(w1),
+                &f32_values(&w2),
+                &f32_values(&x),
+                [a as usize, b as usize, c as usize, d as usize],
+                scale,
+            );
+            let lin = host
+                .adaptable_mut(&path.split('.').collect::<Vec<_>>())
+                .unwrap();
+            let dense = f32_values(&lin.adapters()[0].residual(&x).unwrap());
+            let structured = f32_values(&factors.residual(&x).unwrap());
+            for (representation, got, fraction) in [
+                (
+                    "dense",
+                    &dense,
+                    lokr_rounding::rounding_fraction(c as usize, d as usize, false),
+                ),
+                (
+                    "structured",
+                    &structured,
+                    lokr_rounding::rounding_fraction(c as usize, d as usize, true),
+                ),
+            ] {
+                if !lokr_rounding::within_bound(got, &want, &products, fraction) {
+                    failures.push(format!(
+                        "{cell} {path} {representation}: outside componentwise bf16 bound"
+                    ));
+                }
+            }
+            let fraction = lokr_rounding::rounding_fraction(c as usize, d as usize, true);
+            // A zero residual or forgotten alpha/rank must fail the SAME oracle assertion.
+            let mut wrong_scale = factors.clone();
+            wrong_scale.w2 = multiply(&wrong_scale.w2, Array::from_f32(scale.recip())).unwrap();
+            drop_detected |=
+                !lokr_rounding::within_bound(&vec![0.0; want.len()], &want, &products, fraction);
+            scale_detected |= !lokr_rounding::within_bound(
+                &f32_values(&wrong_scale.residual(&x).unwrap()),
+                &want,
+                &products,
+                fraction,
+            );
+            lin.set_adapters(vec![Adapter::LokrStructured { factors }]);
+        }
+        println!("ORACLE {cell} paths={} drop_mutant_detected={drop_detected} scale_mutant_detected={scale_detected}", paths.len());
+        if !drop_detected || !scale_detected {
+            failures.push(format!(
+                "{cell}: LoKr residual oracle failed to discriminate drop/scale mutants"
+            ));
+        }
+    }
+
     /// AC: the preflight prices an edit run's references — their cached latents (latent and train
     /// stages), the longer joint sequence (train stage), and the vision tower plus the vision
     /// slots of the image-conditioned prompt (caption stage).
@@ -3388,6 +3866,7 @@ mod tests {
             ],
         };
         assert_eq!(prefix_score_elements(&edit), 253);
+        assert_eq!(largest_prefix_score_call(&edit), 128);
         assert_eq!(
             prefix_score_elements(&JointLayout::text_to_image(5, 4, 4)),
             25
@@ -3418,6 +3897,7 @@ mod tests {
         let seq = target + 20;
         let squared = TrainingShape {
             prefix_scores: seq * seq - target * seq,
+            largest_prefix_call: 0,
             ..base
         };
         assert_eq!(

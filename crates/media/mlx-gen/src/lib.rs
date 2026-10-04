@@ -56,6 +56,7 @@ pub mod qkv;
 pub mod request_scope;
 pub mod residency;
 pub mod sampler;
+pub mod sc20686;
 pub mod scheduler;
 pub mod text_sample;
 pub mod weights;

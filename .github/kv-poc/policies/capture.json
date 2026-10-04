@@ -1,0 +1,1 @@
+{"schemaVersion":1,"rowDeadlineSeconds":1800,"pollMillis":250,"termGraceMillis":5000,"hostFreeReserveBytes":17179869184,"childFootprintCapBytes":17179869184,"maxContextTokens":8192,"maxRequestTokens":8192,"stdoutCapBytes":16777216,"stderrCapBytes":16777216}
