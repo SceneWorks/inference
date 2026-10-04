@@ -125,6 +125,8 @@ const EDIT_ADAPTER: &str = "qwen21_edit_lokr.safetensors";
 
 #[path = "support/edit_protocol.rs"]
 pub(crate) mod edit_protocol;
+#[path = "support/edit_training_balanced64.rs"]
+mod edit_training_balanced64;
 use edit_protocol::{EDIT_INSTRUCTION, T2I_EVAL_PROMPT, TRAIN_EDIT_INSTRUCTION};
 
 /// The T2I training style: concentric rings in exactly these three colours.
@@ -1311,13 +1313,21 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
     let key_path = data.join("key.png");
     let key = edit_key(TRAIN_EDGE);
     key.save(&key_path).unwrap();
-    let items: Vec<TrainingItem> = (0..6u64)
+    let mut raw_rgb_audits = Vec::new();
+    let items: Vec<TrainingItem> = (0..edit_training_balanced64::ITEMS)
         .map(|i| {
-            let src = edit_source(1000 + i, TRAIN_EDGE);
+            let src = image::RgbImage::from_fn(TRAIN_EDGE, TRAIN_EDGE, |x, y| {
+                image::Rgb(edit_training_balanced64::training_pixel(i, x, y, TRAIN_EDGE))
+            });
+            let target = edit_transform(&src);
+            let audit = edit_training_balanced64::audit(i, src.as_raw(), target.as_raw());
+            raw_rgb_audits.push(json!({"index":i,"sourceRawRgbSha256":audit.source_sha256,
+                "targetRawRgbSha256":audit.target_sha256,"targetColours":64,"pixelsPerTargetColour":4096,
+                "distinctSourceBytesPerChannel":256,"pixelsPerSourceBytePerChannel":1024}));
             let src_path = data.join(format!("src_{i}.png"));
             let tgt_path = data.join(format!("tgt_{i}.png"));
             src.save(&src_path).unwrap();
-            edit_transform(&src).save(&tgt_path).unwrap();
+            target.save(&tgt_path).unwrap();
             TrainingItem::edit_pair(tgt_path, TRAIN_EDIT_INSTRUCTION.into(), vec![src_path])
         })
         .collect();
@@ -1342,6 +1352,28 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
+    assert!(req.items.iter().all(
+        |item| item.caption == TRAIN_EDIT_INSTRUCTION && item.reference_image_paths.len() == 1
+    ));
+    assert!(
+        edit_training_balanced64::recipe_is_fixed(
+            edit_training_balanced64::Recipe {
+                items: req.items.len(),
+                rank: req.config.rank,
+                alpha: req.config.alpha,
+                learning_rate: req.config.learning_rate,
+                seed: req.config.seed,
+                checkpointing: req.config.gradient_checkpointing,
+                edge: req.config.resolution,
+                references: req.items[0].reference_image_paths.len(),
+                steps: req.config.steps,
+                lokr: req.config.network_type == NetworkType::Lokr,
+                adamw: req.config.optimizer == "adamw",
+            },
+            std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1")
+        ),
+        "balanced64 training recipe drift refused before admission"
+    );
     let protocol = json!({
         "kind": "representative_one_reference_training_two_reference_evaluation",
         "trainingReferenceCount": 1, "evaluationReferenceCount": 2,
@@ -1349,6 +1381,10 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
         "trainingTargetEdge": TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
         "evaluationTargetEdge": RENDER_EDGE, "stepsRequested": steps,
         "dataset": dataset_receipt(&req.items), "evaluationKeySha256": sha256_file(&key_path),
+        "trainingDataRecipe": {"version":edit_training_balanced64::VERSION,"frozenPlanSha256":edit_training_balanced64::PLAN_SHA256,
+            "rawRgbAudits":raw_rgb_audits,"heldoutSource99UsedForTraining":false,
+            "itemExposuresAt120RoundRobinSteps":20,"targetAuthority":"unchanged edit_transform(source)",
+            "scopeLimit":"colour coverage does not remove512/768, one/two reference or denseBF16/packedQ4 gaps"},
         "historicalTwoReferenceTrainingEvidence": "retained only at its original source SHA",
     });
     // Persist the disclosed protocol before admission, so even an explicit refusal is attributable.
