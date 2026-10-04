@@ -15,8 +15,8 @@
 //! 1. [`t2i_lora_trains_reloads_and_moves_every_tier`] — a short text-to-image **LoRA** run on a
 //!    synthetic single-palette style, saved, reloaded through `LoadSpec::adapters`, and rendered
 //!    with and without it at bf16, q8 and q4 on the same seed.
-//! 2. [`edit_lokr_trains_on_two_references_and_moves_every_tier`] — a short instruction-edit
-//!    **LoKr** run on two-reference edit pairs, then the same with/without comparison on a held-out
+//! 2. [`edit_lokr_trains_and_moves_two_reference_edits_every_tier`] — a representative short instruction-edit
+//!    **LoKr** run on one-reference edit pairs, then the same with/without comparison on a held-out
 //!    two-reference edit at every tier.
 //! 3. [`stacked_adapters_apply_with_independent_weights`] — both trained files stacked on one
 //!    load, each at its own strength.
@@ -54,6 +54,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -125,6 +126,8 @@ const EDIT_ADAPTER: &str = "qwen21_edit_lokr.safetensors";
 const T2I_EVAL_PROMPT: &str = "zxq style, a lighthouse on a rocky coast at dusk";
 const EDIT_INSTRUCTION: &str =
     "zxq edit: invert each RGB colour channel of image 1 independently, then quantize each channel to the four numeric levels 0, 85, 170, 255 shown in image 2; preserve the shapes and keep the result in colour";
+const TRAIN_EDIT_INSTRUCTION: &str =
+    "zxq edit: invert each RGB colour channel of image 1 independently, then quantize each channel to the four numeric levels 0, 85, 170, 255; preserve the shapes and keep the result in colour";
 
 /// The T2I training style: concentric rings in exactly these three colours.
 const PALETTE: [[u8; 3]; 3] = [[0, 150, 150], [240, 120, 20], [250, 220, 60]];
@@ -189,6 +192,10 @@ fn edit_instruction_and_target_use_independent_rgb_levels() {
     assert_eq!(edit_transform(&source).get_pixel(0, 0).0, [255, 170, 85]);
     assert!(EDIT_INSTRUCTION.contains("independently"));
     assert!(EDIT_INSTRUCTION.contains("keep the result in colour"));
+    assert_eq!(
+        TRAIN_EDIT_INSTRUCTION,
+        EDIT_INSTRUCTION.replace(" shown in image 2", "")
+    );
 }
 
 /// The three render tiers: the dense bf16 base, and the published packed q8 / q4 snapshots.
@@ -555,6 +562,65 @@ fn write_json(out: &Path, name: &str, value: &Value) {
     eprintln!("wrote {}", path.display());
 }
 
+fn sha256_file(path: &Path) -> String {
+    let mut file = std::fs::File::open(path).unwrap();
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn dataset_receipt(items: &[TrainingItem]) -> Value {
+    let file = |path: &Path| {
+        json!({
+            "file": path.file_name().unwrap().to_string_lossy(),
+            "bytes": std::fs::metadata(path).unwrap().len(), "sha256": sha256_file(path),
+        })
+    };
+    let rows: Vec<Value> = items.iter().enumerate().map(|(index, item)| json!({
+        "index": index, "target": file(&item.image_path), "caption": item.caption,
+        "referenceCount": item.reference_image_paths.len(),
+        "orderedReferences": item.reference_image_paths.iter().map(|path| file(path)).collect::<Vec<_>>(),
+    })).collect();
+    // Hash binds item/reference order, captions and exact source bytes, independent of host paths.
+    let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&rows).unwrap()));
+    json!({"sha256": hash, "hashSchema": "sha256(serde_json ordered rows with file byte hashes)", "items": rows})
+}
+
+#[test]
+fn dataset_hash_binds_caption_bytes_and_reference_order() {
+    let guard = tempfile::tempdir().unwrap();
+    let dir = guard.path();
+    let paths: Vec<_> = ["target.png", "source.png", "key.png"]
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+    for (index, path) in paths.iter().enumerate() {
+        std::fs::write(path, [index as u8]).unwrap();
+    }
+    let mut items = vec![TrainingItem::edit_pair(
+        paths[0].clone(),
+        EDIT_INSTRUCTION.into(),
+        paths[1..].to_vec(),
+    )];
+    let original = dataset_receipt(&items);
+    assert_eq!(original, dataset_receipt(&items));
+    items[0].reference_image_paths.reverse();
+    assert_ne!(original["sha256"], dataset_receipt(&items)["sha256"]);
+    items[0].reference_image_paths.reverse();
+    items[0].caption = TRAIN_EDIT_INSTRUCTION.into();
+    assert_ne!(original["sha256"], dataset_receipt(&items)["sha256"]);
+    items[0].caption = EDIT_INSTRUCTION.into();
+    std::fs::write(&paths[1], [99]).unwrap();
+    assert_ne!(original["sha256"], dataset_receipt(&items)["sha256"]);
+}
+
 // ── synthetic datasets (deterministic; no fetched or checked-in photographs) ─────────────────────
 
 /// A tiny LCG so every synthetic image is reproducible bit for bit.
@@ -918,6 +984,8 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let facts = json!({
         "adapter": canonical.file_name().unwrap().to_string_lossy(),
         "adapterBytes": std::fs::metadata(canonical).unwrap().len(),
+        "adapterSha256": sha256_file(canonical),
+        "dataset": dataset_receipt(&req.items),
         "networkType": format!("{:?}", cfg.network_type),
         "rank": cfg.rank,
         "learningRate": cfg.learning_rate,
@@ -1199,8 +1267,8 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
 
 // ── 2. instruction-edit LoKr on two references ───────────────────────────────────────────────────
 
-/// A short instruction-edit **LoKr** run on six two-reference edit pairs (image 1 = a source, image
-/// 2 = the four-level key; target = the source inverted and posterized), then a held-out
+/// A representative short instruction-edit **LoKr** run on six one-reference edit pairs (image 1
+/// is the source; target is the source inverted and posterized), then a held-out
 /// two-reference edit with and without the adapter at bf16, q8 and q4. Asserts, per tier: both
 /// renders are pictures; the adapter moves the edit by at least [`ADAPTER_MOVES_FLOOR`]; its
 /// output is CLOSER to the trained transform of the held-out source than the bare base's by at
@@ -1209,11 +1277,12 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
 /// preflight.
 ///
 /// `QWEN_IMAGE_2_1_LORA_EDIT_STEPS` (default 120 at [`TRAIN_LR`], ~30 s a step on an M5 Max, ~60
-/// min; 40 steps did not yet move the held-out edit toward the transform) scales the run: every step attends over two
-/// 1024-px-fitted references (~8k latent tokens), so it is the expensive one.
+/// min; 40 historical two-reference steps did not yet move the held-out edit toward the transform)
+/// scales this representative run: each step attends over one 1024-px-fitted reference.
+/// Evaluation, imports and stacking retain their ordered two-reference protocol and thresholds.
 #[test]
 #[ignore]
-fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
+fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
     let out = out_dir().join("edit");
     std::fs::create_dir_all(&out).unwrap();
     let guard = Footprint::start(&out);
@@ -1232,11 +1301,7 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
             let tgt_path = data.join(format!("tgt_{i}.png"));
             src.save(&src_path).unwrap();
             edit_transform(&src).save(&tgt_path).unwrap();
-            TrainingItem::edit_pair(
-                tgt_path,
-                EDIT_INSTRUCTION.into(),
-                vec![src_path, key_path.clone()],
-            )
+            TrainingItem::edit_pair(tgt_path, TRAIN_EDIT_INSTRUCTION.into(), vec![src_path])
         })
         .collect();
     let steps = training_steps("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", 120);
@@ -1260,7 +1325,19 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
-    let trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
+    let protocol = json!({
+        "kind": "representative_one_reference_training_two_reference_evaluation",
+        "trainingReferenceCount": 1, "evaluationReferenceCount": 2,
+        "trainingCaption": TRAIN_EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
+        "trainingTargetEdge": TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
+        "evaluationTargetEdge": RENDER_EDGE, "stepsRequested": steps,
+        "dataset": dataset_receipt(&req.items), "evaluationKeySha256": sha256_file(&key_path),
+        "historicalTwoReferenceTrainingEvidence": "retained only at its original source SHA",
+    });
+    // Persist the disclosed protocol before admission, so even an explicit refusal is attributable.
+    write_json(&out, "edit-training-protocol", &protocol);
+    let mut trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
+    trained.facts["editProtocol"] = protocol;
 
     if std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1") {
         assert!(
@@ -1273,7 +1350,7 @@ fn edit_lokr_trains_on_two_references_and_moves_every_tier() {
         return;
     }
 
-    // The held-out edit: a source the run never saw, the same key, the same instruction.
+    // The held-out two-reference edit: unseen source plus the levels key named by evaluation.
     let eval_src = edit_source(99, RENDER_EDGE);
     eval_src.save(out.join("eval_source.png")).unwrap();
     let expected = to_image(edit_transform(&eval_src));

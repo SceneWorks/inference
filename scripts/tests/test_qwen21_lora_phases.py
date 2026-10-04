@@ -44,7 +44,7 @@ class PhaseTests(unittest.TestCase):
 
     def test_each_phase_has_exact_cells_and_probe_is_bounded(self):
         t2i = "t2i_lora_trains_reloads_and_moves_every_tier"
-        edit = "edit_lokr_trains_on_two_references_and_moves_every_tier"
+        edit = "edit_lokr_trains_and_moves_two_reference_edits_every_tier"
         stack = "stacked_adapters_apply_with_independent_weights"
         imports = "imported_adapters_move_t2i_and_two_reference_edit_every_tier"
         public = "third_party_lora_applies_strictly_and_moves_every_tier"

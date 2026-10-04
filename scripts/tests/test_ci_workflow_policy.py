@@ -4268,7 +4268,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # The stacking test reads the two adapters the training tests write: order is load-bearing.
         if selected[:3] != [
             "t2i_lora_trains_reloads_and_moves_every_tier",
-            "edit_lokr_trains_on_two_references_and_moves_every_tier",
+            "edit_lokr_trains_and_moves_two_reference_edits_every_tier",
             "stacked_adapters_apply_with_independent_weights",
         ]:
             errors.append(f"the training tests must run before the stacking test: {selected!r}")

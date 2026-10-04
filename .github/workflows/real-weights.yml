@@ -4979,7 +4979,9 @@ jobs:
       # Report-only: which Mac, and how much unified memory it has, belongs in the evidence.
       - name: Record the macOS device inventory
         continue-on-error: true
-        run: sysctl -n hw.model hw.memsize machdep.cpu.brand_string | tee "$QWEN_IMAGE_2_1_RENDER_OUT/device-inventory.txt"
+        run: |
+          sysctl -n hw.model hw.memsize machdep.cpu.brand_string | tee "$QWEN_IMAGE_2_1_RENDER_OUT/device-inventory.txt"
+          python3.12 scripts/ci/qwen21_host_census.py --out "$QWEN_IMAGE_2_1_RENDER_OUT/host-census"
       # BEFORE the ~66 GB materialization, and its own step: a compile error reds in minutes instead
       # of after the fetch (these tests have never been compiled on a Mac), and the cold MLX build
       # reads as build time in the step timings.

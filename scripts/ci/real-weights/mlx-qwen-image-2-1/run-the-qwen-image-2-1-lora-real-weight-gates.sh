@@ -25,7 +25,7 @@ if [[ "$phase" == full || "$phase" == probe ]]; then
   run_one t2i_lora_trains_reloads_and_moves_every_tier || failed=1
 fi
 if [[ "$phase" != imports ]]; then
-  run_one edit_lokr_trains_on_two_references_and_moves_every_tier || failed=1
+  run_one edit_lokr_trains_and_moves_two_reference_edits_every_tier || failed=1
 fi
 if [[ "$phase" == full || "$phase" == edit ]]; then
   run_one stacked_adapters_apply_with_independent_weights || failed=1
