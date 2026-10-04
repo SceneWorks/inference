@@ -4,7 +4,7 @@ phase="${QWEN_IMAGE_2_1_LORA_PHASE:-full}"
 case "$phase" in
   probe) export QWEN_IMAGE_2_1_PROBE_ONLY=1 QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS=1
          export QWEN_IMAGE_2_1_LORA_T2I_STEPS=2 QWEN_IMAGE_2_1_LORA_EDIT_STEPS=2 ;;
-  edit|imports|full) ;;
+  diagnostic|edit|imports|full) ;;
   *) echo "unknown Qwen-Image 2.1 LoRA phase: $phase" >&2; exit 1 ;;
 esac
 echo "$phase" > "$QWEN_IMAGE_2_1_RENDER_OUT/selected-phase.txt"
@@ -20,6 +20,12 @@ run_one() {
     return 1
   fi
 }
+# No training, full transfer campaign, stacks or public captures in this diagnostic.
+# Its receipt is always DIAGNOSTIC_ONLY, even if every unchanged effect floor passes.
+if [[ "$phase" == diagnostic ]]; then
+  run_one diagnostic_reused_edit_adapter_semantics
+  exit $?
+fi
 # IN ORDER: the stacking test consumes the adapters the two training tests write.
 if [[ "$phase" == full || "$phase" == probe ]]; then
   run_one t2i_lora_trains_reloads_and_moves_every_tier || failed=1

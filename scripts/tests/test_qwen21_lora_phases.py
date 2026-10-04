@@ -48,7 +48,7 @@ class PhaseTests(unittest.TestCase):
         stack = "stacked_adapters_apply_with_independent_weights"
         imports = "imported_adapters_move_t2i_and_two_reference_edit_every_tier"
         public = "third_party_lora_applies_strictly_and_moves_every_tier"
-        expected = {"probe": [t2i, edit], "edit": [edit, stack, imports, public],
+        expected = {"diagnostic": ["diagnostic_reused_edit_adapter_semantics"], "probe": [t2i, edit], "edit": [edit, stack, imports, public],
                     "imports": [imports, public], "full": [t2i, edit, stack, imports, public]}
         for phase, cells in expected.items():
             with self.subTest(phase=phase):
@@ -65,3 +65,6 @@ class PhaseTests(unittest.TestCase):
         result, names, _ = self.run_phase("edit", "stacked_adapters")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(names), 4, "retain evidence from independent cells after failure")
+        result, names, _ = self.run_phase("diagnostic", "diagnostic_reused")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(names, ["diagnostic_reused_edit_adapter_semantics"])

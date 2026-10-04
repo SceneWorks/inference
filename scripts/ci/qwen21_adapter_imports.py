@@ -26,9 +26,13 @@ def validate_manifest(manifest):
             raise ValueError("duplicate adapter name or file")
         names.add(entry["name"])
         files.add(entry.get("file"))
-        if not re.fullmatch(r"[A-Za-z0-9_-]+\.safetensors", entry.get("file", "")):
+        receipt = (manifest.get("purpose") == "DIAGNOSTIC_ONLY"
+                   and entry.get("name") == "training_receipt"
+                   and entry.get("kind") == "diagnostic_training_receipt")
+        suffix = "json" if receipt else "safetensors"
+        if not re.fullmatch(rf"[A-Za-z0-9_-]+\.{suffix}", entry.get("file", "")):
             raise ValueError("adapter file must be one safe safetensors basename")
-        if entry.get("kind") not in ("lora", "lokr"):
+        if entry.get("kind") not in ("lora", "lokr") and not receipt:
             raise ValueError("adapter kind must be lora or lokr")
         if not re.fullmatch(r"[0-9a-f]{64}", entry.get("sha256", "")):
             raise ValueError("adapter SHA-256 is required")
@@ -36,7 +40,7 @@ def validate_manifest(manifest):
             raise ValueError("a positive assetId is required")
         if not isinstance(entry.get("size"), int) or entry["size"] <= 0:
             raise ValueError("expected byte length is required")
-        if not re.fullmatch(r"[A-Za-z0-9_-]+\.safetensors", entry.get("assetName", "")):
+        if not re.fullmatch(rf"[A-Za-z0-9_-]+\.{suffix}", entry.get("assetName", "")):
             raise ValueError("expected release asset name is required")
     return entries
 
