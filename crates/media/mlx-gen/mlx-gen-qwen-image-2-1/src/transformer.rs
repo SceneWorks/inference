@@ -407,12 +407,25 @@ impl Block {
         trace: &mut Trace<'_>,
     ) -> Result<Array> {
         let h = scale_residual(&layer_norm(x, None, None, self.eps)?, &m.scale1)?;
+        #[cfg(test)]
+        if index == 0 && crate::q4_diagnostic::capture_enabled() {
+            crate::q4_diagnostic::capture_linear("attn.to_k", &self.attn.to_k, &h)?;
+        }
         let a = self
             .attn
             .forward(&h, cos, sin, prefix_segments, prefix_len)?;
         trace.push(format!("block_{index}_attn"), &a)?;
         let x = add(x, &multiply(&tanh(&m.gate1)?, &a)?)?;
         let h = scale_residual(&layer_norm(&x, None, None, self.eps)?, &m.scale2)?;
+        #[cfg(test)]
+        if index == 0 && crate::q4_diagnostic::capture_enabled() {
+            crate::q4_diagnostic::capture_linear("img_mlp.gate_layer", &self.mlp.gate_layer, &h)?;
+            let gated = multiply(
+                &silu(&self.mlp.gate_layer.forward(&h)?)?,
+                &self.mlp.proj.forward(&h)?,
+            )?;
+            crate::q4_diagnostic::capture_linear("img_mlp.out", &self.mlp.out, &gated)?;
+        }
         let f = self.mlp.forward(&h)?;
         trace.push(format!("block_{index}_mlp"), &f)?;
         let out = add(&x, &multiply(&tanh(&m.gate2)?, &f)?)?;
@@ -769,6 +782,8 @@ impl QwenImage21Transformer {
         timestep: f32,
         layout: &JointLayout,
     ) -> Result<Array> {
+        #[cfg(test)]
+        crate::q4_diagnostic::assert_owner();
         self.run_joint(text, images, timestep, layout, Trace(None))
     }
 

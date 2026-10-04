@@ -372,6 +372,10 @@ pub struct CandleStarVectorProvider {
     tokenizer: core_llm::Tokenizer,
     prompt: Vec<i32>,
     model: Mutex<StarVectorModel>,
+    /// The speculative option a request that leaves it unset runs with — this backend's row of
+    /// the defaults table ([`core_llm::defaults`], E5). The captioner runs no proposer, so a
+    /// non-`off` default is reported as the named no-proposer fallback, as an explicit one is.
+    speculative_default: core_llm::Speculative,
 }
 /// The load's NVFP4 refusal (sc-24139): NVFP4 is not served for StarVector-1B (the Llama
 /// provider serves it for the qwen3_5 hybrid and the llama family, sc-24135 / sc-24140), and
@@ -391,7 +395,7 @@ impl CandleStarVectorProvider {
     pub fn load(spec: &core_llm::LoadSpec) -> core_llm::Result<Self> {
         nvfp4_gate(spec)?;
         read_config(&spec.source).map_err(to_core)?;
-        let device = crate::device::select_device().map_err(to_core)?;
+        let device = crate::device::select_eager_device().map_err(to_core)?;
         let weights = Weights::from_dir(&spec.source, &device).map_err(to_core)?;
         for key in REQUIRED_WEIGHT_KEYS {
             if !weights.contains(key) {
@@ -417,6 +421,7 @@ impl CandleStarVectorProvider {
             tokenizer,
             prompt,
             model: Mutex::new(StarVectorModel::from_weights(&weights).map_err(to_core)?),
+            speculative_default: crate::device::decode_defaults(&device).speculative,
             device,
         })
     }
@@ -440,6 +445,7 @@ pub fn descriptor() -> core_llm::TextLlmDescriptor {
             supports_preserve_thinking: false,
             supports_tools: false,
             mtp: None,
+            speculative: Vec::new(),
             supported_constraints: vec![],
         },
     }
@@ -510,60 +516,83 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
         if req.cancel.is_cancelled() {
             return Err(core_llm::Error::Canceled);
         };
-        let svg = core_llm::StarVectorRequest::new(
-            req.clone(),
-            1_000_000,
-            std::time::Duration::from_secs(120),
-        );
-        let (out, record) = self.generate_svg_recorded(&svg, &mut |_| {})?;
-        let finish = match out.finish_reason {
-            core_llm::StarVectorFinishReason::Cancelled => core_llm::FinishReason::Cancelled,
-            core_llm::StarVectorFinishReason::TokenLimit => core_llm::FinishReason::Length,
-            _ => core_llm::FinishReason::Stop,
-        };
-        let usage = core_llm::Usage {
-            prompt_tokens: (IMAGE_TOKEN_COUNT + self.prompt.len()) as u32,
-            generated_tokens: out.generated_tokens,
-        };
-        events(core_llm::StreamEvent::Done {
-            finish_reason: finish,
-            usage,
-        });
-        // The continuation decodes through the shared engine (sc-24138), so it reports its path.
-        // No graph runner wraps this decoder, so the CUDA-graph switch was off here. `None` only
-        // when the bounded stream stopped on the seeded prompt, before a decode.
-        Ok(svg_text_output(
-            out.svg,
-            usage,
-            record,
-            finish,
-            req.kv_compression,
-        ))
+        svg_text_output(
+            req,
+            (IMAGE_TOKEN_COUNT + self.prompt.len()) as u32,
+            self.speculative_default,
+            events,
+            |svg| self.generate_svg_recorded(svg, &mut |_| {}),
+        )
     }
 }
-
-/// The text output of one SVG generation: the SVG source (empty when none closed), and — the
-/// StarVector wrapper having no compressed-KV table family — the dense KV-cache report for the
-/// request's `policy` (sc-20683).
+/// The text contract's answer for one SVG generation: `decode` runs the bounded SVG request built
+/// from `req`, and its output becomes the text, usage and finish reason (`Done` emitted on
+/// `events`) — and its measured record (sc-24139) the report, carrying the captioner reasons with
+/// the request's option resolved against the provider's `speculative_default` (E2, E5, E8).
 fn svg_text_output(
-    svg: Option<String>,
-    usage: core_llm::Usage,
-    record: Option<DecodeRecord>,
-    finish: core_llm::FinishReason,
-    policy: core_llm::KvCompressionPolicy,
-) -> core_llm::TextLlmOutput {
-    core_llm::TextLlmOutput {
+    req: &core_llm::TextLlmRequest,
+    prompt_tokens: u32,
+    speculative_default: core_llm::Speculative,
+    events: &mut dyn FnMut(core_llm::StreamEvent),
+    decode: impl FnOnce(
+        &core_llm::StarVectorRequest,
+    ) -> core_llm::Result<(core_llm::StarVectorOutput, Option<DecodeRecord>)>,
+) -> core_llm::Result<core_llm::TextLlmOutput> {
+    let svg = core_llm::StarVectorRequest::new(
+        req.clone(),
+        1_000_000,
+        std::time::Duration::from_secs(120),
+    );
+    let (out, record) = decode(&svg)?;
+    let finish = match out.finish_reason {
+        core_llm::StarVectorFinishReason::Cancelled => core_llm::FinishReason::Cancelled,
+        core_llm::StarVectorFinishReason::TokenLimit => core_llm::FinishReason::Length,
+        _ => core_llm::FinishReason::Stop,
+    };
+    let usage = core_llm::Usage {
+        prompt_tokens,
+        generated_tokens: out.generated_tokens,
+    };
+    events(core_llm::StreamEvent::Done {
+        finish_reason: finish,
+        usage,
+    });
+    Ok(core_llm::TextLlmOutput {
         timings: None,
-        text: svg.unwrap_or_default(),
+        text: out.svg.unwrap_or_default(),
         thinking: None,
         tool_calls: vec![],
         usage,
         mtp: None,
-        decode: record.map(|record| record.report(false)),
+        // The continuation decodes through the shared engine (sc-24138), so it reports its
+        // path. No graph runner wraps this decoder, so the CUDA-graph switch was off here.
+        // `None` only when the bounded stream stopped on the seeded prompt, before a decode.
+        // StarVector advertises no proposer and has no prefix cache: both are named, in the
+        // words MLX's StarVector uses (E2, E8).
+        decode: record.map(|record| svg_report(&record, req, speculative_default)),
         finish_reason: Some(finish),
-        kv_cache: Some(core_llm::KvCacheReport::without_table_family(policy)),
-    }
+        // The StarVector wrapper has no compressed-KV table family: the dense KV-cache report for
+        // the request's policy (sc-20683).
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(
+            req.kv_compression,
+        )),
+    })
 }
+/// An SVG continuation's measured report (sc-24139): the engine record with the CUDA-graph
+/// switch off (no graph runner wraps this decoder), and — StarVector advertising no proposer and
+/// having no prefix cache — the request's speculative fallback and the prefix-cache reason named
+/// in the words MLX's StarVector uses (E2, E8). The request's option is resolved against the
+/// provider's per-backend `default` (E5), so a table default of `auto` is named too.
+fn svg_report(
+    record: &DecodeRecord,
+    req: &core_llm::TextLlmRequest,
+    default: core_llm::Speculative,
+) -> core_llm::DecodeReport {
+    record
+        .report(false)
+        .with_captioner_reasons(req.speculative_or(default))
+}
+
 impl core_llm::StarVectorProvider for CandleStarVectorProvider {
     fn starvector_descriptor(&self) -> &core_llm::StarVectorDescriptor {
         &self.svg
@@ -771,6 +800,67 @@ fn to_core(error: Error) -> core_llm::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E2/E8 (sc-24432 feature-end review): the captioner advertises no proposer, so an `auto` or
+    /// explicit speculative request decodes plainly with the reason named — the same words MLX's
+    /// StarVector reports — and its prefix cache's `none` is named too; `off` names no fallback.
+    #[test]
+    fn the_report_names_the_speculative_fallback_and_the_prefix_cache() {
+        use core_llm::{Message, Speculative, SpeculativeProposer};
+        let record = crate::decode::DecodeRecord::plain(
+            crate::decode::DecodePath::StepModel,
+            3,
+            2,
+            Default::default(),
+        );
+        let request = |speculative| core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            speculative: Some(speculative),
+            ..Default::default()
+        };
+        for mode in [
+            Speculative::Auto,
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 2),
+        ] {
+            let report = svg_report(&record, &request(mode), Speculative::Off);
+            assert_eq!(
+                report.fallbacks,
+                core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{mode:?}"
+            );
+            assert_eq!(report.fallbacks.len(), 1, "{mode:?}");
+            assert_eq!(report.proposer, core_llm::ProposerKind::None);
+        }
+        // E5: an unset option takes the provider's per-backend default — a table `auto` is named
+        // as the same no-proposer fallback — and an explicit `off` still overrides the default.
+        let unset = core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            ..Default::default()
+        };
+        assert_eq!(
+            svg_report(&record, &unset, Speculative::Auto).fallbacks,
+            core_llm::no_proposer_fallback(Speculative::Auto, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(svg_report(&record, &unset, Speculative::Off)
+            .fallbacks
+            .is_empty());
+        assert!(
+            svg_report(&record, &request(Speculative::Off), Speculative::Auto)
+                .fallbacks
+                .is_empty()
+        );
+        let off = svg_report(&record, &request(Speculative::Off), Speculative::Off);
+        assert!(off.fallbacks.is_empty());
+        assert_eq!(off.prefix_cache.path, "none");
+        assert_eq!(
+            off.prefix_cache.reason.as_deref(),
+            Some(core_llm::CAPTIONER_NO_PREFIX_CACHE)
+        );
+    }
     use crate::primitives::SplitMix64;
     use candle_core::DType;
     use core_llm::{StarVectorBoundedStream, StarVectorProvider, StarVectorStreamEvent, TextLlm};
@@ -804,13 +894,20 @@ mod tests {
             (Policy::Off, Reason::PolicyDisabled),
             (Policy::Qualified, Reason::UnqualifiedModel),
         ] {
-            let output = svg_text_output(
-                None,
-                core_llm::Usage::default(),
-                None,
-                core_llm::FinishReason::Stop,
-                policy,
-            );
+            let req = core_llm::TextLlmRequest {
+                messages: vec![core_llm::Message::user("x")],
+                kv_compression: policy,
+                max_new_tokens: 64,
+                ..Default::default()
+            };
+            let output = svg_text_output(&req, 0, core_llm::Speculative::Off, &mut |_| {}, |svg| {
+                let mut stream = StarVectorBoundedStream::new(svg);
+                for fragment in core_llm_testkit::deterministic_svg_fixture().fragments {
+                    stream.push(fragment, std::time::Duration::ZERO)?;
+                }
+                Ok((stream.output()?, None))
+            })
+            .unwrap();
             assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
         }
     }
@@ -1337,16 +1434,84 @@ mod tests {
         assert!(!can_load_path(file.path()));
     }
 
-    /// sc-24139: the continuation decodes through the shared engine, so the provider reports the
-    /// engine's record on `TextLlmOutput::decode` rather than `None`. (A real generation needs
-    /// the exact published 1B geometry; this pins the wiring.)
+    /// sc-24139 / E2, E5, E8 (sc-24432), through the seam the provider's `generate` answers with
+    /// ([`svg_text_output`] — a real generation needs the exact published 1B geometry, so the
+    /// bounded SVG decode is the fixture stream here): the measured record becomes
+    /// `TextLlmOutput::decode`, carrying the captioner reasons — the speculative fallback for
+    /// `auto` and an explicit proposer, none for `off`, the prefix cache's `none` named — with an
+    /// unset option resolved against the provider's default; a stream that stopped before any
+    /// decode step reports no record. `Done` and the usage carry the decode's counts.
     #[test]
-    fn the_provider_reports_its_decode_record() {
-        let source = include_str!("starvector.rs");
-        let production = &source[..source.find("mod tests {").expect("the test module")];
-        assert!(!production.contains("decode: None"));
-        assert!(production.contains("decode: record.map(|record| record.report(false))"));
-        assert!(production.contains("Some(record.with_request_span(&span))"));
+    fn generate_reports_the_decode_record_with_the_captioner_reasons() {
+        use core_llm::{Message, Speculative, SpeculativeProposer};
+        let request = |speculative| core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            speculative,
+            max_new_tokens: 64,
+            ..Default::default()
+        };
+        let run = |req: &core_llm::TextLlmRequest, default, decoded: bool| {
+            let mut done = Vec::new();
+            let out = svg_text_output(
+                req,
+                IMAGE_TOKEN_COUNT as u32 + 2,
+                default,
+                &mut |event| {
+                    if let core_llm::StreamEvent::Done { usage, .. } = event {
+                        done.push(usage);
+                    }
+                },
+                |svg| {
+                    let mut stream = StarVectorBoundedStream::new(svg);
+                    for fragment in core_llm_testkit::deterministic_svg_fixture().fragments {
+                        stream.push(fragment, std::time::Duration::ZERO)?;
+                    }
+                    let record = crate::decode::DecodeRecord::plain(
+                        crate::decode::DecodePath::StepModel,
+                        3,
+                        2,
+                        Default::default(),
+                    );
+                    Ok((stream.output()?, decoded.then_some(record)))
+                },
+            )
+            .unwrap();
+            assert_eq!(done, vec![out.usage]);
+            assert_eq!(out.usage.prompt_tokens, IMAGE_TOKEN_COUNT as u32 + 2);
+            assert!(out.usage.generated_tokens > 0);
+            assert!(out.text.starts_with("<svg"), "{}", out.text);
+            out.decode
+        };
+        let named = |mode| {
+            core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let lookup = Speculative::proposer(SpeculativeProposer::PromptLookup, 2);
+        for (speculative, default, fallbacks) in [
+            (
+                Some(Speculative::Auto),
+                Speculative::Off,
+                named(Speculative::Auto),
+            ),
+            (Some(lookup), Speculative::Off, named(lookup)),
+            (Some(Speculative::Off), Speculative::Off, Vec::new()),
+            (None, Speculative::Auto, named(Speculative::Auto)),
+            (Some(Speculative::Off), Speculative::Auto, Vec::new()),
+            (None, Speculative::Off, Vec::new()),
+        ] {
+            let case = format!("{speculative:?} over default {default:?}");
+            let report = run(&request(speculative), default, true).expect(&case);
+            assert_eq!(report.path, "step_model", "{case}");
+            assert_eq!(report.fallbacks, fallbacks, "{case}");
+            assert_eq!(report.prefix_cache.path, "none", "{case}");
+            assert_eq!(
+                report.prefix_cache.reason.as_deref(),
+                Some(core_llm::CAPTIONER_NO_PREFIX_CACHE),
+                "{case}"
+            );
+        }
+        assert!(run(&request(Some(Speculative::Auto)), Speculative::Off, false).is_none());
     }
 
     /// sc-24139: NVFP4 is refused at load by name (never a silent dense load), before the
@@ -1368,8 +1533,9 @@ mod tests {
         assert!(nvfp4_gate(&core_llm::LoadSpec::dense("/no/such/starvector-1b")).is_ok());
     }
 
-    /// sc-24134: the provider selects its device once, at load, and a request's pixels go to
-    /// that device. A `select_device()` per request would build a second device — on the own
+    /// sc-24134: the provider selects its device once, at load — on the legacy stream, since it
+    /// never captures (sc-24446, `select_eager_device`) — and a request's pixels go to that
+    /// device. A `select_device()` per request would build a second device — on the own
     /// stream a second CUDA stream (and cuBLAS / cuRAND handles) that candle's per-op check,
     /// which compares the GPU ordinal only, cannot tell from the model's (see the CUDA test).
     #[test]
@@ -1384,7 +1550,7 @@ mod tests {
             .find("pub fn descriptor()")
             .expect("descriptor()");
         let calls: Vec<usize> = production
-            .match_indices("select_device(")
+            .match_indices("select_eager_device(")
             .map(|(at, _)| at)
             .collect();
         assert_eq!(calls.len(), 1, "one device selection: {calls:?}");

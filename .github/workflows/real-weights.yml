@@ -144,11 +144,11 @@ on:
         default: rw-mage
         options: [rw-mage, rw-starvector]
       qwen_image_2_1_lora_phase:
-        description: "MLX 2.1 LoRA: bounded two-step probe, corrected edit, imports, or full campaign"
+        description: "MLX 2.1 LoRA: probe, diagnostic, q4-numeric (diagnostic only), edit, imports, or full"
         type: choice
         required: false
         default: full
-        options: [probe, edit, imports, full]
+        options: [probe, diagnostic, q4-numeric, edit, imports, full]
       profile:
         description: Real-weight profile to run
         type: choice
@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-lora-mlx]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -278,6 +278,16 @@ on:
         type: string
         required: false
         default: 832x480
+      # sc-24446 — the decode-speedups campaign matrix (`decode-speedups-bench` only): one JSON
+      # document of rows, each a snapshot (`qwen38` / `bonsai-mlx` name the repository-variable
+      # snapshots; any other model is an absolute path) and its `SPECULATIVE_BENCH_*` knobs. The
+      # field list is in `scripts/release/speculative_bench_campaign.py`, which validates every
+      # field before anything builds. Untrusted: it reaches the job only as an environment variable.
+      decode_bench_matrix:
+        description: "Decode-speedups matrix (decode-speedups-bench only): JSON {\"rows\": [...]}; fields in scripts/release/speculative_bench_campaign.py"
+        type: string
+        required: false
+        default: '{"rows": [{"id": "qwen38-bf16", "snapshot": "qwen38"}]}'
       # sc-24163 -- the hook for a public third-party Qwen-Image 2.1 adapter on the MLX lane
       # (`mlx-qwen-image-2-1`). Empty skips that one test; the lane never invents an adapter.
       qwen_image_2_1_third_party_lora:
@@ -4910,6 +4920,114 @@ jobs:
         with:
           name: qwen-image-2-1-cuda-evidence
           path: ${{ runner.temp }}/qwen-image-2-1-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-24446 (epic sc-24432 terminal campaign): the decode-speedups benchmark on the CUDA box — per
+  # matrix row, the epic's `speculative_bench` entry point and the pre-epic baseline driver as
+  # alternating processes (epic, baseline, epic, … — the row's `process_repeats`), one at a time,
+  # every document into one run-scoped directory uploaded as one artifact. `compare` in the same
+  # script turns the artifact into the E6 verdicts and E5 defaults decisions.
+  # Dispatch-only on its own profile (never `all`, never a PR or push): one matrix is hours of one
+  # card.
+  #
+  # TWO SHALLOW CHECKOUTS side by side under the workspace: the dispatched ref (`inference`) and the
+  # pre-epic revision c1e8f8e02 (`inference-pre-epic`), into which the epic's baseline driver is
+  # copied as its header says. Neither nests in the other, so each document's recorded `git status`
+  # describes only its own tree — the runner refuses a head document from a dirty tree and a
+  # baseline document whose tree differs by more than the copied driver. The runner script builds
+  # both (the pre-epic one in its own persistent target directory beside the shared one) with the
+  # commit and dirty flag stamped at compile time, so a stale binary is refused, not measured.
+  #
+  # `CUDA_VISIBLE_DEVICES=1`: the box has two RTX PRO 6000s and CI's CUDA lanes use cuda:0, so the
+  # campaign takes the second card (candle-llm opens device 0 of the devices it can see).
+  # `CUDA_DEVICE_ORDER=PCI_BUS_ID` makes CUDA number the cards as nvidia-smi does (the default
+  # FASTEST_FIRST order need not), so ordinal 1 is the inventory's GPU 1.
+  #
+  # `timeout-minutes: 600` is a runaway guard, not a budget: two cold `--release --features cuda`
+  # builds, then every row's runs back to back. Re-size it from the first campaign that completes.
+  candle-decode-speedups-bench:
+    name: Decode-speedups benchmark campaign (Candle/CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 600
+    defaults:
+      run:
+        working-directory: inference
+    env:
+      DECODE_BENCH_MATRIX: ${{ inputs.decode_bench_matrix }}
+      DECODE_BENCH_SNAPSHOT_QWEN38: ${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}
+      DECODE_BENCH_SNAPSHOT_BONSAI_MLX: ${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}
+      DECODE_BENCH_PRE_EPIC_TARGET: ${{ github.workspace }}/../cargo-target-pre-epic
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: "1"
+      # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - name: Check out the dispatched ref
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: inference
+      - name: Check out the pre-epic revision
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: c1e8f8e023bf4e1fe94a61c4c39e08f881fdd8e6
+          path: inference-pre-epic
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\install-reviewed-cpython-3-12.cmd
+      - name: Validate the matrix and initialize the run-scoped evidence directory
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\validate-the-matrix-and-initialize-the-run-scoped-evidence.cmd
+      # `dtolnay/rust-toolchain` runs its steps with `shell: bash`; on this runner a bare `bash` is
+      # WSL's `C:\Windows\System32\bash.exe`, which has no distribution (sc-24446).
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # The runner service exports RUSTC_WRAPPER=sccache, whose daemon resets mid-build on heavy
+      # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Copy the baseline driver into the pre-epic checkout
+        shell: cmd
+        run: copy /Y crates\contracts\core-llm\core-llm-testkit\baseline\speculative_bench_baseline.rs ..\inference-pre-epic\crates\llm\candle-llm\tests\speculative_bench_baseline.rs || exit /b 1
+      # Report-only, like the same step on `candle-qwen-image-2-1`.
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%DECODE_BENCH_OUT%\cuda-device-inventory.csv"
+          type "%DECODE_BENCH_OUT%\cuda-device-inventory.csv"
+      # The runner builds both checkouts first (stamped: `SPECULATIVE_BENCH_BUILD_GIT_SHA`), then
+      # alternates the epic and baseline processes per row.
+      - name: Build both checkouts and run every matrix row (epic and baseline alternating)
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\run-every-matrix-row.cmd
+      # `always()`, not `!cancelled()`: a job that hits `timeout-minutes` counts as cancelled, and
+      # run 36891326535 lost all 32 finished rows that way. The runner rewrites summary.json after
+      # every process, so a timed-out campaign's documents still compare (sc-24446).
+      - name: Keep the decode-speedups benchmark documents
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: decode-speedups-bench-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/decode-speedups-bench-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 30
 

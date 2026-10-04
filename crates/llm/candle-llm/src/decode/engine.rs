@@ -49,7 +49,9 @@
 
 use candle_core::Tensor;
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
-use core_llm::{ProposerKind, SamplerPath};
+use core_llm::{
+    AcceptanceMonitor, PlainDecode, ProposerKind, SamplerPath, Speculative, StepObservation,
+};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::record::{DecodePath, DecodeRecord, RequestSpan};
@@ -233,6 +235,23 @@ pub trait Proposer {
         kept_hidden: Option<&Tensor>,
         position: i32,
     ) -> Result<()>;
+
+    /// Bring the proposer up to date with steps the target ran **without** a proposal — the
+    /// plain probe `auto`'s timed acceptance monitor runs before the first proposal (sc-24446,
+    /// [`AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
+    /// paired with its predecessor's target hidden row in `preceding_hidden`
+    /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
+    /// before the next [`propose`](Self::propose). The default does nothing — right for a
+    /// proposer whose state is the history alone (n-gram); `draft_model` is never probed (`auto`
+    /// never resolves to it).
+    fn catch_up(
+        &mut self,
+        _tokens: &[i32],
+        _preceding_hidden: Option<&Tensor>,
+        _position: i32,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// No proposal source: the engine degenerates to the token-at-a-time loop and the record says
@@ -325,9 +344,161 @@ pub fn generate_speculative<M: StepModel + ?Sized, P: Proposer + ?Sized>(
 /// [`generate_speculative`] with the provider seams: a cooperative caller stop (checked before
 /// each step and after each emitted token) and a prefill boundary callback invoked once the prompt
 /// is in the cache and the proposer is warmed, before the first token is sampled (it may
-/// synchronize the device).
+/// synchronize the device). No acceptance monitor: the proposer runs to the end
+/// ([`generate_speculative_monitored`] is the `auto` entry).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
+    model: &M,
+    proposer: &mut P,
+    prompt: SpeculativePrompt<'_, M::Cache>,
+    config: &GenerationConfig,
+    drafts: usize,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
+) -> Result<SpeculativeRun> {
+    generate_speculative_monitored(
+        model,
+        proposer,
+        prompt,
+        config,
+        drafts,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        on_prefill_complete,
+        Speculative::Off,
+    )
+}
+
+/// [`generate_speculative_with`] for a request that asked for `speculative_mode` (sc-24446): under
+/// [`Speculative::Auto`] the run is watched by `auto`'s acceptance monitor
+/// ([`AcceptanceMonitor::for_request`] against [`PlainDecode::Candle`]); any other option — an
+/// explicit proposer, `off` — is [`generate_speculative_with`].
+///
+/// ## Demotion (sc-24446)
+/// Timed by this thread's [`decode_clock`](core_llm::decode_clock) (the wall clock), the run
+/// first takes a short plain probe — [`PLAIN_PROBE_MAX_STEPS`](core_llm::PLAIN_PROBE_MAX_STEPS)
+/// steps without a proposal, the proposer caught up on them ([`Proposer::catch_up`]) — then every
+/// window of [`ACCEPTANCE_PROBE_VERIFIES`](core_llm::ACCEPTANCE_PROBE_VERIFIES) verify steps
+/// decides whether the proposer is paying for itself: on the window's measured gain against the
+/// request's own plain-step cost, or — where timing cannot decide — on the static break-even
+/// ([`core_llm::demotion_threshold`] against [`PlainDecode::Candle`]). The first losing window
+/// demotes the run to this engine's ordinary token-at-a-time steps for the rest of the request —
+/// exactly the steps a [`NoProposer`] run takes (`K = 0`, through the same stepper, so a
+/// CUDA-graph runner replays them as it would a plain run's): no further step proposes, asks for
+/// hidden rows or commits to the proposer (an MTP head or a draft model then runs no forward of
+/// its own). The output is unchanged — a step without drafts is the plain draw — and the record
+/// names where and on what ([`DecodeRecord::speculative_demoted_at`],
+/// [`DecodeRecord::speculative_monitor`]).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Sized>(
+    model: &M,
+    proposer: &mut P,
+    prompt: SpeculativePrompt<'_, M::Cache>,
+    config: &GenerationConfig,
+    drafts: usize,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
+    speculative_mode: Speculative,
+) -> Result<SpeculativeRun> {
+    run_engine(
+        model,
+        proposer,
+        prompt,
+        config,
+        drafts,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        on_prefill_complete,
+        None,
+        speculative_mode,
+    )
+}
+
+/// A caller's own token draw on the engine's sampler seam (epic sc-24432 E8, sc-24446): the
+/// draw a pipeline pinned to an upstream reference makes — its own argmax, its own shaped
+/// distribution and seeded stream — so moving that pipeline onto the one engine loop
+/// ([`generate_with_sampler`]) leaves its tokens unchanged.
+pub trait TokenSampler {
+    /// Draw one token from the logits row of the current position (`[1, vocab]` from a prefill,
+    /// `[1, 1, vocab]` from a decode step) given the running `history` (prompt + generated ids)
+    /// and an optional constraint mask, and say where the draw ran. The engine records the path
+    /// on the run's sampler telemetry, so the record names the draw that actually happened — the
+    /// draw itself must therefore not record (the shared [`sample`] records its own path; a
+    /// sampler built on the shared primitives draws through the unrecorded ones, such as
+    /// [`sample_host`](crate::primitives::sampler::sample_host)).
+    fn sample(
+        &mut self,
+        logits: &Tensor,
+        history: &[i32],
+        allowed: Option<&[bool]>,
+    ) -> Result<(i32, SamplerPath)>;
+}
+
+/// The engine's token-at-a-time loop ([`NoProposer`], `K = 0`) drawing every token through
+/// `sampler` instead of the shared [`sample`] — the same prefill (or adopted cache), stop,
+/// caller-stop, cancel and budget contract as [`generate_speculative_with`], and the same record.
+/// Only the draw is the caller's; a speculative run keeps the shared sampler, whose distribution
+/// the acceptance test is defined over.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_with_sampler<M: StepModel + ?Sized>(
+    model: &M,
+    prompt: SpeculativePrompt<'_, M::Cache>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    sampler: &mut dyn TokenSampler,
+) -> Result<SpeculativeRun> {
+    run_engine(
+        model,
+        &mut NoProposer,
+        prompt,
+        config,
+        0,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        None,
+        Some(sampler),
+        Speculative::Off,
+    )
+}
+
+/// One draw: the caller's sampler (its path recorded here), else the shared [`sample`].
+fn draw(
+    sampler: Option<&mut (dyn TokenSampler + '_)>,
+    logits: &Tensor,
+    history: &[i32],
+    config: &GenerationConfig,
+    rng: &mut SplitMix64,
+    mask: Option<&[bool]>,
+) -> Result<i32> {
+    match sampler {
+        Some(sampler) => {
+            let (token, path) = sampler.sample(logits, history, mask)?;
+            note_sampler_path(path);
+            Ok(token)
+        }
+        None => sample(logits, history, &config.sampling, rng, mask),
+    }
+}
+
+/// The engine body. `sampler` is `Some` only for the token-at-a-time loop
+/// ([`generate_with_sampler`] passes [`NoProposer`] and `K = 0`).
+#[allow(clippy::too_many_arguments)]
+fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     model: &M,
     proposer: &mut P,
     prompt: SpeculativePrompt<'_, M::Cache>,
@@ -338,9 +509,16 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     mut constraint: Option<&mut dyn RewindableConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
     mut on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
+    mut sampler: Option<&mut dyn TokenSampler>,
+    speculative_mode: Speculative,
 ) -> Result<SpeculativeRun> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
+    }
+    if sampler.is_some() && (drafts != 0 || proposer.kind() != ProposerKind::None) {
+        return Err(Error::Msg(
+            "a caller sampler serves the token-at-a-time loop only".into(),
+        ));
     }
     let span = RequestSpan::begin();
     let mut stats = SpeculativeStats::default();
@@ -372,9 +550,12 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             }
             let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
             let cache = owned.insert(model.new_cache_for(capacity, drafts)?);
+            // A prompt prefill: no position inside it is ever rolled back to (sc-24446).
             let out = model.forward_step(
                 cache,
-                StepRequest::last(prompt_ids).with_hidden(wants_hidden),
+                StepRequest::last(prompt_ids)
+                    .with_hidden(wants_hidden)
+                    .as_prefill(),
             )?;
             stats.forwards += 1;
             stats.prefill_forwards += 1;
@@ -433,13 +614,18 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             ProposerKind::Mtp => DecodePath::Mtp {
                 drafts: u32::try_from(drafts).unwrap_or(u32::MAX),
             },
-            ProposerKind::Ngram => DecodePath::PromptLookup,
-            ProposerKind::Draft => DecodePath::DraftModel,
+            ProposerKind::PromptLookup => DecodePath::PromptLookup,
+            ProposerKind::DraftModel => DecodePath::DraftModel,
         };
         let record = DecodeRecord::speculative(path, stats, generated.len(), span.counters())
             .with_kv_cache(cache.kv_kind())
             .with_attn_formulation(model.attn_formulation(cache))
             .with_proposer(kind)
+            .with_drafts(if kind == ProposerKind::None {
+                0
+            } else {
+                u32::try_from(drafts).unwrap_or(u32::MAX)
+            })
             .with_verify_syncs(verify_host_syncs)
             .with_span_tallies(&span);
         SpeculativeRun {
@@ -466,7 +652,14 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     // ---- First token: ordinary sampling from the prefill logits (one sync, as every loop). ----
     let first = {
         let mask = constraint.as_mut().map(|c| c.allowed());
-        sample(&logits, &history, &config.sampling, &mut rng, mask)?
+        draw(
+            sampler.as_deref_mut(),
+            &logits,
+            &history,
+            config,
+            &mut rng,
+            mask,
+        )?
     };
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
@@ -491,6 +684,23 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     }
 
     // ---- Speculative steps. ----
+    // `auto`'s acceptance monitor (sc-24446): a timed one first runs a plain probe (no proposal;
+    // the steps' hidden rows kept so the proposer catches up before its first proposal), then
+    // judges each window on the request's own measured costs. Once demoted, no step proposes,
+    // asks for hidden rows or commits to the proposer — the rest of the run is the ordinary
+    // token-at-a-time step. A step is timed from the top of the loop to the end of the proposer
+    // commit (its host readback is inside); emitting its tokens is outside.
+    let clock = core_llm::decode_clock();
+    let mut monitor = AcceptanceMonitor::for_request(
+        speculative_mode,
+        kind,
+        u32::try_from(drafts).unwrap_or(u32::MAX),
+        PlainDecode::Candle,
+        clock.is_some(),
+    );
+    let mut probed: Vec<(i32, Option<Tensor>)> = Vec::new();
+    let mut probe_position = 0i32;
+    let mut demoted = false;
     'outer: while generated.len() < config.max_new_tokens && finish != FinishReason::Stopped {
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
@@ -500,11 +710,30 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             finish = FinishReason::Stopped;
             break;
         }
+        let probing = monitor.as_ref().is_some_and(AcceptanceMonitor::probing);
+        if !probing && !probed.is_empty() {
+            catch_up(&mut *proposer, &mut probed, probe_position)?;
+        }
+        let started = monitor
+            .as_ref()
+            .and(clock.as_ref())
+            .map(|clock| clock.now());
         let step_syncs = host_sync_count();
         let remaining = config.max_new_tokens - generated.len();
-        let k = drafts.min(remaining.saturating_sub(1));
+        let k = if demoted || probing {
+            0
+        } else {
+            drafts.min(remaining.saturating_sub(1))
+        };
+        let wants_hidden = wants_hidden && !demoted;
         let base = cache.len();
         let position = base + position_delta;
+        if probing {
+            if probed.is_empty() {
+                probe_position = position;
+            }
+            probed.push((cur, previous_hidden.clone()));
+        }
         let cur_ids = input_ids(&[cur], device)?;
         let constraint_checkpoint = constraint.as_ref().map(|c| c.checkpoint());
 
@@ -557,6 +786,8 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 tokens: StepTokens::Device(&verify_ids),
                 scope: LogitsScope::All,
                 want_hidden: wants_hidden,
+                prefill: false,
+                snapshot_at: None,
             },
         )?;
         stats.forwards += 1;
@@ -569,18 +800,32 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             break;
         }
 
-        // 3. Decide, on host, from one transfer.
-        let (draft_ids, committed, accepted) = decide(
-            &out.logits,
-            &drafted,
-            &proposal.dists,
-            &history,
-            config,
-            &mut rng,
-            greedy,
-            plain_greedy,
-            constraint.as_deref_mut(),
-        )?;
+        // 3. Decide, on host, from one transfer. A caller sampler only ever runs without drafts:
+        //    its one row is the caller's draw.
+        let (draft_ids, committed, accepted) = match sampler.as_deref_mut() {
+            Some(sampler) => {
+                let n = out.logits.dim(1)?;
+                if n != 1 {
+                    return Err(Error::Msg(format!(
+                        "verify returned {n} positions for 0 drafts"
+                    )));
+                }
+                let mask = constraint.as_mut().map(|c| c.allowed());
+                let token = draw(Some(sampler), &out.logits, &history, config, &mut rng, mask)?;
+                (Vec::new(), vec![token], 0)
+            }
+            None => decide(
+                &out.logits,
+                &drafted,
+                &proposal.dists,
+                &history,
+                config,
+                &mut rng,
+                greedy,
+                plain_greedy,
+                constraint.as_deref_mut(),
+            )?,
+        };
         if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
             c.rewind(checkpoint);
         }
@@ -622,14 +867,26 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 Err(e) => return Err(e),
             }
         };
-        proposer.commit(
-            cur,
-            &draft_ids[..accepted],
-            kept_hidden.as_ref(),
-            position + 1,
-        )?;
-        previous_hidden = last_row(kept_hidden.as_ref())?;
+        if !demoted {
+            proposer.commit(
+                cur,
+                &draft_ids[..accepted],
+                kept_hidden.as_ref(),
+                position + 1,
+            )?;
+            previous_hidden = last_row(kept_hidden.as_ref())?;
+        }
         verify_host_syncs += host_sync_count().wrapping_sub(step_syncs);
+        let elapsed = started
+            .zip(clock.as_ref())
+            .map(|(start, clock)| clock.now().saturating_sub(start));
+        let demote_now = monitor.as_mut().is_some_and(|m| {
+            m.observe_step(StepObservation {
+                accepted,
+                drafts: num_drafts,
+                elapsed,
+            })
+        });
 
         // 5. Commit through the shared event path.
         let mut emitted = 0usize;
@@ -668,6 +925,19 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 break 'outer;
             }
         }
+        if demote_now {
+            demoted = true;
+            stats.demoted_at = Some(generated.len());
+            previous_hidden = None;
+        }
+    }
+    stats.monitor = monitor.as_ref().and_then(AcceptanceMonitor::last_decision);
+    // A window that demotes on the step that also ends the run (its budget, a stop token, the
+    // caller's stop, a cancel) leaves the loop before the demotion is recorded above: the run was
+    // still demoted there, so the report's `speculative_demoted_at` and its monitor decision
+    // agree (sc-24446).
+    if stats.demoted_at.is_none() && stats.monitor.is_some_and(|d| d.demoted) {
+        stats.demoted_at = Some(generated.len());
     }
 
     Ok(done(
@@ -678,6 +948,24 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         cache,
         on_event,
     ))
+}
+
+/// Hand the plain probe's steps to the proposer ([`Proposer::catch_up`]): each probed token with
+/// its predecessor's hidden row (when the proposer asked for rows), fed from `position`.
+fn catch_up<P: Proposer + ?Sized>(
+    proposer: &mut P,
+    probed: &mut Vec<(i32, Option<Tensor>)>,
+    position: i32,
+) -> Result<()> {
+    let tokens: Vec<i32> = probed.iter().map(|(token, _)| *token).collect();
+    let rows: Option<Vec<&Tensor>> = probed.iter().map(|(_, row)| row.as_ref()).collect();
+    let preceding = match rows {
+        Some(rows) if !rows.is_empty() => Some(Tensor::cat(&rows, 1)?),
+        _ => None,
+    };
+    proposer.catch_up(&tokens, preceding.as_ref(), position)?;
+    probed.clear();
+    Ok(())
 }
 
 /// After an early exit inside the commit loop the cache may hold accepted positions whose tokens
@@ -1273,7 +1561,7 @@ mod tests {
             let run = run(&model, &mut proposer, &PROMPT, &config, k);
             assert_eq!(run.output.tokens, expected, "n-gram K={k} diverged");
             assert_eq!(run.record.path, DecodePath::PromptLookup);
-            assert_eq!(run.record.proposer, ProposerKind::Ngram);
+            assert_eq!(run.record.proposer, ProposerKind::PromptLookup);
             assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
             assert!(run.stats.proposed > 0, "the repetitive prompt must draft");
         }
@@ -1298,7 +1586,7 @@ mod tests {
                 let run = run(&model, &mut proposer, &PROMPT, &config, k);
                 assert_eq!(run.output.tokens, expected, "draft={name} K={k} diverged");
                 assert_eq!(run.record.path, DecodePath::DraftModel);
-                assert_eq!(run.record.proposer, ProposerKind::Draft);
+                assert_eq!(run.record.proposer, ProposerKind::DraftModel);
                 assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
                 assert!(proposer.draft_forwards > run.stats.verify_steps as u64);
                 if name == "same" {
@@ -1360,6 +1648,98 @@ mod tests {
         );
         assert_eq!(record.host_syncs, 12, "one sync per token");
         assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
+    }
+
+    // ---- A caller sampler draws every token of the one loop (E8, sc-24446) ----
+
+    /// Draws the shared host reference (the unrecorded `sample_host`, which is what `sample` runs on
+    /// a CPU device) from its own seeded stream — or, with `fixed`, always that id — and records
+    /// each draw's history length.
+    struct Recording {
+        params: SamplingParams,
+        rng: SplitMix64,
+        fixed: Option<i32>,
+        histories: Vec<usize>,
+    }
+
+    impl TokenSampler for Recording {
+        fn sample(
+            &mut self,
+            logits: &Tensor,
+            history: &[i32],
+            allowed: Option<&[bool]>,
+        ) -> Result<(i32, SamplerPath)> {
+            self.histories.push(history.len());
+            let token = match self.fixed {
+                Some(id) => id,
+                None => crate::primitives::sampler::sample_host(
+                    logits,
+                    history,
+                    &self.params,
+                    &mut self.rng,
+                    allowed,
+                )?,
+            };
+            Ok((
+                token,
+                SamplerPath::Host(core_llm::HostSampleReason::Reference),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_caller_sampler_draws_every_token_of_the_token_at_a_time_loop() {
+        let (_cfg, model) = text_model();
+        let with = |config: &GenerationConfig, sampler: &mut Recording| {
+            generate_with_sampler(
+                &model,
+                SpeculativePrompt::Tokens(&PROMPT),
+                config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                sampler,
+            )
+            .unwrap()
+        };
+        for config in [greedy(10), stochastic(10)] {
+            let expected = run(&model, &mut NoProposer, &PROMPT, &config, 0);
+            let mut sampler = Recording {
+                params: config.sampling,
+                rng: SplitMix64::new(config.seed.unwrap()),
+                fixed: None,
+                histories: Vec::new(),
+            };
+            let got = with(&config, &mut sampler);
+            // The same draw on the same stream is the same run; every draw saw the running
+            // prompt + generated history, and the record names the caller's path.
+            assert_eq!(got.output.tokens, expected.output.tokens);
+            let want: Vec<usize> = (0..10).map(|i| PROMPT.len() + i).collect();
+            assert_eq!(sampler.histories, want);
+            assert_eq!(
+                got.record.sampler.path,
+                Some(SamplerPath::Host(core_llm::HostSampleReason::Reference))
+            );
+            assert_eq!(got.record.sampler.host_draws, 10);
+            assert_eq!(got.record.sampler.device_draws, 0);
+            assert_eq!(got.record.proposer, ProposerKind::None);
+        }
+        // The caller's draw, not the shared sampler's, decides each token and the stop.
+        let mut config = greedy(10);
+        let mut fixed = Recording {
+            params: config.sampling,
+            rng: SplitMix64::new(0),
+            fixed: Some(5),
+            histories: Vec::new(),
+        };
+        assert_eq!(with(&config, &mut fixed).output.tokens, vec![5; 10]);
+        config.stop_tokens = vec![5];
+        fixed.histories.clear();
+        let stopped = with(&config, &mut fixed);
+        assert_eq!(stopped.output.tokens, Vec::<i32>::new());
+        assert_eq!(stopped.output.finish_reason, FinishReason::StopToken);
+        assert_eq!(fixed.histories, vec![PROMPT.len()]);
     }
 
     // ---- Every host decision is recorded; a degenerate row commits its argmax (sc-24140) ----
@@ -1651,7 +2031,7 @@ mod tests {
     struct Wrong(Vec<i32>);
     impl Proposer for Wrong {
         fn kind(&self) -> ProposerKind {
-            ProposerKind::Draft
+            ProposerKind::DraftModel
         }
         fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
             Ok(())
@@ -1778,6 +2158,40 @@ mod tests {
         }
     }
 
+    /// sc-24446 (defect A): the engine's own prompt prefill is a prefill — on the hybrid it takes
+    /// no per-token Gated DeltaNet step and writes one ring slot per linear layer whatever the
+    /// draft depth — so a long prompt's greedy run is the same with and without drafts.
+    #[test]
+    fn the_engine_prefill_rings_only_the_final_state_at_every_draft_depth() {
+        use crate::primitives::gated_delta::counters;
+        let (cfg, qwen) = text_model();
+        let linear = (0..cfg.num_layers).filter(|&i| cfg.is_linear(i)).count();
+        let prompt: Vec<i32> = (0..100).map(|i| (i * 7 % 49) + 1).collect();
+        let mut first = Vec::new();
+        for k in [0usize, 3, 7] {
+            let (run_k, steps, writes) = counters::counting(|| {
+                run(&qwen, &mut NgramProposer::default(), &prompt, &greedy(1), k)
+            });
+            assert_eq!(run_k.stats.forwards, 1, "K={k}: the prefill alone");
+            assert_eq!((steps, writes), (0, linear), "K={k}");
+            first.push(run_k.output.tokens);
+        }
+        assert!(first.windows(2).all(|w| w[0] == w[1]));
+        let plain = run(&qwen, &mut NoProposer, &prompt, &greedy(12), 0)
+            .output
+            .tokens;
+        let lookup = run(
+            &qwen,
+            &mut NgramProposer::default(),
+            &prompt,
+            &greedy(12),
+            4,
+        )
+        .output
+        .tokens;
+        assert_eq!(lookup, plain);
+    }
+
     /// Proposes the ramp continuation after `cur`, `len` drafts wide **regardless of
     /// `max_drafts`** — a misbehaving proposer whose accepted run can outlive the budget.
     struct Over {
@@ -1786,7 +2200,7 @@ mod tests {
     }
     impl Proposer for Over {
         fn kind(&self) -> ProposerKind {
-            ProposerKind::Draft
+            ProposerKind::DraftModel
         }
         fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
             Ok(())
@@ -1878,7 +2292,7 @@ mod tests {
         let run = run(&model, &mut proposer, &prompt, &config, 3);
         assert_eq!(run.output.tokens, vec![2, 3]);
         assert_eq!(run.output.finish_reason, FinishReason::StopToken);
-        assert_eq!(run.record.proposer, ProposerKind::Draft);
+        assert_eq!(run.record.proposer, ProposerKind::DraftModel);
         // Drafts up to and including the stop token: 3 and 4.
         assert_eq!(
             run.stats.proposed, 2,
@@ -1889,6 +2303,155 @@ mod tests {
             "accepted must not exceed the drafts up to the stop token"
         );
         assert_eq!(run.stats.verify_steps, 1);
+    }
+
+    #[test]
+    fn a_stochastic_draft_model_hands_over_its_own_q_per_draft() {
+        // sc-24436 E1: each stochastic draft's `q` is the draft model's own shaped distribution
+        // at its position — the sampler's candidates over a fresh draft prefill of everything
+        // before it — so the exact rejection rule compares the target's `p` with the draft's `q`.
+        let (_cfg, draft) = text_model_with_layers(6);
+        let config = stochastic(20);
+        let mut proposer = DraftModelProposer::new(&draft, PROMPT.len() + 24, 4);
+        proposer.warm(&PROMPT, None).unwrap();
+        let mut history = PROMPT.to_vec();
+        history.push(5);
+        let cur_ids = input_ids(&[5], &Device::Cpu).unwrap();
+        let ctx = ProposeContext {
+            cur: 5,
+            cur_ids: &cur_ids,
+            history: &history,
+            previous_hidden: None,
+            position: PROMPT.len() as i32,
+            max_drafts: 4,
+        };
+        let mut rng = SplitMix64::new(11);
+        let mut sampler = DraftSampler {
+            config: &config,
+            rng: &mut rng,
+            constraint: None,
+            device_greedy: false,
+        };
+        let proposal = proposer.propose(&ctx, &mut sampler).unwrap();
+        let Some(Drafts::Host(drafts)) = proposal.drafts else {
+            panic!("a stochastic draft samples on the host");
+        };
+        assert_eq!(drafts.len(), 4);
+        assert_eq!(proposal.dists.len(), 4, "one q per draft");
+        let norm = |d: &[(i32, f32)]| {
+            let total: f32 = d.iter().map(|&(_, w)| w).sum();
+            let mut d: Vec<(i32, f32)> = d.iter().map(|&(t, w)| (t, w / total)).collect();
+            d.sort_by_key(|&(t, _)| t);
+            d
+        };
+        for (i, q) in proposal.dists.iter().enumerate() {
+            let mut before = history.clone();
+            before.extend_from_slice(&drafts[..i]);
+            let mut cache = draft.new_cache_for(before.len() + 1, 1).unwrap();
+            let logits = draft
+                .forward_step(&mut cache, StepRequest::last(&before))
+                .unwrap()
+                .logits;
+            let want = norm(&shaped_candidates(&logits, &before, &config.sampling, None).unwrap());
+            let got = norm(q);
+            assert_eq!(
+                got.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+                want.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+                "draft {i}: q names {got:?}, the draft's distribution {want:?}"
+            );
+            for (&(t, a), &(_, b)) in got.iter().zip(&want) {
+                assert!((a - b).abs() < 1e-4, "draft {i}: token {t}: {a} vs {b}");
+            }
+        }
+        assert!(
+            proposal.dists.iter().any(|q| q.len() > 1),
+            "a stochastic draft is not a point mass: {:?}",
+            proposal.dists
+        );
+    }
+
+    #[test]
+    fn host_sampled_drafts_end_at_an_accepted_stop_token() {
+        // sc-24436: on the host path (a penalty, a temperature) the draft model stops drafting at
+        // a stop token without feeding it, so its cache holds one position fewer than the
+        // accepted run; when the target accepts the drafts through that stop the commit keeps
+        // what was fed rather than rolling past the cache — the request ends at its stop, whether
+        // the draft cache truncates or only restores its step start.
+        let mut penalized = greedy(10);
+        penalized.sampling.presence_penalty = 0.01;
+        let mut cold = greedy(10);
+        cold.sampling.temperature = 0.01;
+        for (name, mut config) in [("penalized", penalized), ("stochastic", cold)] {
+            config.stop_tokens = vec![4];
+            for step_start_only in [false, true] {
+                let model = Ramp {
+                    vocab: 7,
+                    forwards: Cell::new(0),
+                    step_start_only,
+                };
+                let prompt = [0, 1];
+                let mut proposer =
+                    DraftModelProposer::new(&model, prompt.len() + config.max_new_tokens, 3);
+                let run = run(&model, &mut proposer, &prompt, &config, 3);
+                let label = format!("{name} step_start_only={step_start_only}");
+                assert_eq!(run.output.tokens, vec![2, 3], "{label}");
+                assert_eq!(run.output.finish_reason, FinishReason::StopToken, "{label}");
+                assert_eq!(
+                    (run.stats.proposed, run.stats.accepted),
+                    (2, 2),
+                    "{label}: the drafts through the stop token, all accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_draft_padded_differently_proposes_only_tokenizer_ids_over_the_target_width() {
+        // sc-24436: a draft with its own padding rows (8 logits over a 7-token tokenizer) drafts
+        // for a target 9 logits wide: its logits are shaped to the target's width with the
+        // padding at -inf, so the engine accepts it and a padding id is never proposed.
+        let target = Ramp {
+            vocab: 9,
+            forwards: Cell::new(0),
+            step_start_only: false,
+        };
+        let draft = Ramp {
+            vocab: 8,
+            forwards: Cell::new(0),
+            step_start_only: false,
+        };
+        let proposer = DraftModelProposer::new(&draft, 16, 3).with_vocab(7, 9);
+        assert_eq!(Proposer::vocab_size(&proposer), Some(9));
+        // A draft row peaking on its padding id 7.
+        let mut row = vec![0f32; 8];
+        row[7] = 10.0;
+        row[5] = 1.0;
+        let shaped = proposer
+            .shaped(Tensor::from_vec(row, (1, 8), &Device::Cpu).unwrap())
+            .unwrap();
+        let shaped = shaped.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(shaped.len(), 9);
+        assert_eq!(&shaped[..7], &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        assert!(shaped[7..].iter().all(|x| *x == f32::NEG_INFINITY));
+        // Every draft the engine sees is a tokenizer id, on both draft paths; greedy output is
+        // the target's own.
+        let mut penalized = greedy(12);
+        penalized.sampling.presence_penalty = 0.01;
+        for config in [greedy(12), penalized] {
+            let (expected, _) = generate_step(
+                &target,
+                &[0, 1],
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            let mut proposer = DraftModelProposer::new(&draft, 14, 3).with_vocab(7, 9);
+            let run = run(&target, &mut proposer, &[0, 1], &config, 3);
+            assert_eq!(run.output.tokens, expected.tokens);
+            assert!(run.stats.proposed > 0);
+        }
     }
 
     // ---- Stochastic: seed-deterministic, and the decision preserves the target distribution ----
@@ -1913,7 +2476,7 @@ mod tests {
         );
         let mut n = NgramProposer::default();
         let via_ngram = run(&model, &mut n, &PROMPT, &config, 3);
-        assert_eq!(via_ngram.record.proposer, ProposerKind::Ngram);
+        assert_eq!(via_ngram.record.proposer, ProposerKind::PromptLookup);
         assert_eq!(via_ngram.record.host_syncs_per_verify_step(), Some(1.0));
     }
 
@@ -2288,5 +2851,879 @@ mod tests {
         assert_eq!(via_prefilled.output.tokens, via_tokens.output.tokens);
         assert_eq!(via_prefilled.stats, via_tokens.stats);
         assert_eq!(via_prefilled.record.kv_cache, via_tokens.record.kv_cache);
+    }
+
+    // ---- `auto`'s acceptance monitor (sc-24446) ----
+
+    /// What a [`Scripted`] proposer drafts every step.
+    #[derive(Clone, Copy, Debug)]
+    enum Script {
+        /// The plain loop's own continuation: always accepted.
+        Right,
+        /// A token the greedy target never picks: always rejected.
+        Wrong,
+        /// Nothing: every step is an ordinary single-token draw.
+        Empty,
+        /// [`Script::Right`] for the first `n` proposals, [`Script::Wrong`] after: a late loser.
+        RightFor(usize),
+        /// On every `every`-th proposal (the first included) the first `right` drafts are the
+        /// plain continuation and the rest wrong — `right` accepted; every other proposal wrong.
+        Partial { every: usize, right: usize },
+        /// The `n`-th proposal's (1-based) first `f(n)` drafts are right, the rest wrong.
+        Pattern(fn(usize) -> usize),
+    }
+
+    impl Script {
+        /// Whether draft `index` of the `proposal`-th proposal (1-based) is the plain token.
+        fn right(self, proposal: usize, index: usize) -> bool {
+            match self {
+                Script::Right => true,
+                Script::Wrong | Script::Empty => false,
+                Script::RightFor(n) => proposal <= n,
+                Script::Partial { every, right } => {
+                    (proposal - 1).is_multiple_of(every) && index < right
+                }
+                Script::Pattern(f) => index < f(proposal),
+            }
+        }
+    }
+
+    /// A test proposer of a chosen kind drafting up to `max_drafts` tokens every step by its
+    /// [`Script`] against `expected` (the plain tokens after `prompt_len` prompt ids). Counts its
+    /// proposals and commits.
+    struct Scripted {
+        expected: Vec<i32>,
+        prompt_len: usize,
+        script: Script,
+        kind: ProposerKind,
+        vocab: i32,
+        wants_hidden: bool,
+        proposals: usize,
+        commits: usize,
+        /// Every [`Proposer::catch_up`]: the tokens, the preceding rows' count and the position.
+        caught_up: Vec<(Vec<i32>, Option<usize>, i32)>,
+    }
+
+    impl Scripted {
+        fn new(expected: &[i32], script: Script, kind: ProposerKind, vocab: usize) -> Self {
+            Self {
+                expected: expected.to_vec(),
+                prompt_len: PROMPT.len(),
+                script,
+                kind,
+                vocab: vocab as i32,
+                wants_hidden: false,
+                proposals: 0,
+                commits: 0,
+                caught_up: Vec::new(),
+            }
+        }
+    }
+
+    impl Proposer for Scripted {
+        fn kind(&self) -> ProposerKind {
+            self.kind
+        }
+        fn wants_hidden(&self) -> bool {
+            self.wants_hidden
+        }
+        fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
+            Ok(())
+        }
+        fn propose(
+            &mut self,
+            ctx: &ProposeContext<'_>,
+            _: &mut DraftSampler<'_, '_>,
+        ) -> Result<Proposal> {
+            self.proposals += 1;
+            let at = ctx.history.len() - self.prompt_len;
+            let drafts = match self.script {
+                Script::Empty => Vec::new(),
+                script => self.expected[at.min(self.expected.len())..]
+                    .iter()
+                    .take(ctx.max_drafts)
+                    .enumerate()
+                    .map(|(i, &t)| {
+                        if script.right(self.proposals, i) {
+                            t
+                        } else {
+                            (t + 1) % self.vocab
+                        }
+                    })
+                    .collect(),
+            };
+            Ok(Proposal {
+                drafts: Some(Drafts::Host(drafts)),
+                dists: Vec::new(),
+            })
+        }
+        fn commit(&mut self, _: i32, _: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+            self.commits += 1;
+            Ok(())
+        }
+        fn catch_up(
+            &mut self,
+            tokens: &[i32],
+            preceding_hidden: Option<&Tensor>,
+            position: i32,
+        ) -> Result<()> {
+            let rows = preceding_hidden.map(|h| h.dim(1)).transpose()?;
+            self.caught_up.push((tokens.to_vec(), rows, position));
+            Ok(())
+        }
+    }
+
+    /// A deterministic decode clock (sc-24446): time moves only when [`Timed`] runs a step.
+    #[derive(Default)]
+    struct StepClock(std::cell::Cell<std::time::Duration>);
+
+    impl core_llm::DecodeClock for StepClock {
+        fn now(&self) -> std::time::Duration {
+            self.0.get()
+        }
+    }
+
+    /// A step model whose every decode forward advances `clock`: a single-token step by `plain`,
+    /// a wider (verify) step by `ratio × plain` — a verify cost `r = ratio`.
+    struct Timed<'a, M> {
+        inner: &'a M,
+        clock: std::rc::Rc<StepClock>,
+        plain: std::time::Duration,
+        ratio: f64,
+    }
+
+    impl<M: StepModel> StepModel for Timed<'_, M> {
+        type Cache = M::Cache;
+        fn new_cache(&self) -> M::Cache {
+            self.inner.new_cache()
+        }
+        fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<M::Cache> {
+            self.inner.new_cache_for(capacity, overshoot)
+        }
+        fn attn_formulation(&self, cache: &M::Cache) -> crate::primitives::AttnFormulation {
+            self.inner.attn_formulation(cache)
+        }
+        fn graph_support(&self) -> std::result::Result<(), &'static str> {
+            self.inner.graph_support()
+        }
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+        fn forward_step(
+            &self,
+            cache: &mut M::Cache,
+            request: StepRequest<'_>,
+        ) -> Result<StepOutput> {
+            let cost = if request.tokens.len()? == 1 {
+                self.plain
+            } else {
+                self.plain.mul_f64(self.ratio)
+            };
+            self.clock.0.set(self.clock.0.get() + cost);
+            self.inner.forward_step(cache, request)
+        }
+    }
+
+    /// One engine run of `model` timed by a [`StepClock`] at verify cost `ratio`.
+    fn timed_run<M: StepModel, P: Proposer + ?Sized>(
+        model: &M,
+        proposer: &mut P,
+        config: &GenerationConfig,
+        drafts: usize,
+        ratio: f64,
+    ) -> SpeculativeRun {
+        let clock = std::rc::Rc::new(StepClock::default());
+        let timed = Timed {
+            inner: model,
+            clock: clock.clone(),
+            plain: std::time::Duration::from_millis(10),
+            ratio,
+        };
+        core_llm::with_decode_clock(Some(clock), || {
+            generate_speculative_monitored(
+                &timed,
+                proposer,
+                SpeculativePrompt::Tokens(&PROMPT),
+                config,
+                drafts,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                None,
+                AUTO,
+            )
+        })
+        .inspect(assert_demotion_agrees)
+        .unwrap()
+    }
+
+    /// A step model that records whether each step asked for hidden rows.
+    struct HiddenLog<'a, M> {
+        inner: &'a M,
+        hidden: std::cell::RefCell<Vec<bool>>,
+    }
+
+    impl<M: StepModel> StepModel for HiddenLog<'_, M> {
+        type Cache = M::Cache;
+        fn new_cache(&self) -> M::Cache {
+            self.inner.new_cache()
+        }
+        fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<M::Cache> {
+            self.inner.new_cache_for(capacity, overshoot)
+        }
+        fn attn_formulation(&self, cache: &M::Cache) -> crate::primitives::AttnFormulation {
+            self.inner.attn_formulation(cache)
+        }
+        fn graph_support(&self) -> std::result::Result<(), &'static str> {
+            self.inner.graph_support()
+        }
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+        fn forward_step(
+            &self,
+            cache: &mut M::Cache,
+            request: StepRequest<'_>,
+        ) -> Result<StepOutput> {
+            self.hidden.borrow_mut().push(request.want_hidden);
+            self.inner.forward_step(cache, request)
+        }
+    }
+
+    /// One engine run from `prompt` requesting `mode`.
+    fn monitored_from<M: StepModel, P: Proposer + ?Sized>(
+        model: &M,
+        proposer: &mut P,
+        prompt: &[i32],
+        config: &GenerationConfig,
+        drafts: usize,
+        mode: core_llm::Speculative,
+    ) -> SpeculativeRun {
+        // Untimed: the static thresholds decide, no plain probe (the timed monitor has its own
+        // tests below, on a deterministic clock).
+        core_llm::with_decode_clock(None, || {
+            generate_speculative_monitored(
+                model,
+                proposer,
+                SpeculativePrompt::Tokens(prompt),
+                config,
+                drafts,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                None,
+                mode,
+            )
+        })
+        .inspect(assert_demotion_agrees)
+        .unwrap()
+    }
+
+    /// The record's two demotion fields agree: `speculative_demoted_at` is set exactly when the
+    /// monitor's last decision demoted (sc-24446).
+    fn assert_demotion_agrees(run: &SpeculativeRun) {
+        let r = run.record.report(false);
+        assert_eq!(
+            r.speculative_demoted_at.is_some(),
+            r.speculative_monitor.is_some_and(|d| d.demoted),
+            "demoted_at vs monitor: {r:?}"
+        );
+    }
+
+    fn monitored<M: StepModel, P: Proposer + ?Sized>(
+        model: &M,
+        proposer: &mut P,
+        config: &GenerationConfig,
+        drafts: usize,
+        mode: core_llm::Speculative,
+    ) -> SpeculativeRun {
+        monitored_from(model, proposer, &PROMPT, config, drafts, mode)
+    }
+
+    /// The parity reference: the reference `Decode` loop ([`generate_with`]) — a separate
+    /// implementation from the engine under test.
+    fn reference(
+        model: &Qwen35Model,
+        prompt: &[i32],
+        config: &GenerationConfig,
+    ) -> GenerationOutput {
+        generate_with(model, prompt, config, &CancelFlag::new(), &mut |_| {}, None).unwrap()
+    }
+
+    const AUTO: core_llm::Speculative = core_llm::Speculative::Auto;
+    const WINDOW: usize = core_llm::ACCEPTANCE_PROBE_VERIFIES as usize;
+
+    /// The token count at which a never-accepting proposer is demoted: the first token plus one
+    /// committed token per probe-window verify step.
+    const DEMOTED_AT: usize = 1 + WINDOW;
+
+    /// sc-24446: a run whose budget ends it on the very step that closes the demoting window
+    /// still records where it was demoted — `speculative_demoted_at` agrees with the monitor's
+    /// demoting decision.
+    #[test]
+    fn a_demotion_on_the_runs_last_step_is_recorded() {
+        let (_cfg, model) = text_model();
+        let config = greedy(DEMOTED_AT);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut wrong = Scripted::new(
+            &expected,
+            Script::Wrong,
+            ProposerKind::Mtp,
+            model.vocab_size(),
+        );
+        let run = monitored(&model, &mut wrong, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.output.finish_reason, FinishReason::MaxTokens);
+        let report = run.record.report(false);
+        assert!(
+            report.speculative_monitor.is_some_and(|d| d.demoted),
+            "the last window demoted: {report:?}"
+        );
+        assert_eq!(run.stats.demoted_at, Some(DEMOTED_AT));
+        assert_eq!(report.speculative_demoted_at, Some(DEMOTED_AT as u64));
+    }
+
+    fn assert_forward_accounting(label: &str, run: &SpeculativeRun) {
+        assert_eq!(
+            run.stats.forwards,
+            run.stats.prefill_forwards + run.stats.verify_steps + run.stats.replays,
+            "{label}: {:?}",
+            run.stats
+        );
+    }
+
+    /// sc-24446: under `auto` an MTP-kind proposer below its break-even is demoted at the end of
+    /// its first window — never proposed to, committed to or asked for hidden rows again — and the
+    /// rest of the run is the engine's ordinary token-at-a-time steps: the reference loop's greedy
+    /// tokens, the demotion on the record and its report, the forward accounting intact.
+    #[test]
+    fn auto_demotes_a_losing_proposer_to_the_plain_steps() {
+        let (_cfg, model) = text_model();
+        let config = greedy(40);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let logged = HiddenLog {
+            inner: &model,
+            hidden: Default::default(),
+        };
+        let mut wrong = Scripted::new(
+            &expected,
+            Script::Wrong,
+            ProposerKind::Mtp,
+            model.vocab_size(),
+        );
+        wrong.wants_hidden = true;
+        let run = monitored(&logged, &mut wrong, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected, "demotion changed the output");
+        assert_eq!(run.stats.demoted_at, Some(DEMOTED_AT));
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_eq!(
+            run.record.report(false).speculative_demoted_at,
+            Some(DEMOTED_AT as u64)
+        );
+        assert_eq!(
+            (wrong.proposals, wrong.commits),
+            (WINDOW, WINDOW),
+            "the proposer is not driven after the demotion"
+        );
+        assert_eq!(run.stats.proposed, 2 * WINDOW);
+        assert_eq!(run.stats.accepted, 0);
+        // Every token after the first is one verify step; every forward is the prefill or one.
+        assert_eq!(run.stats.verify_steps, 39);
+        assert_forward_accounting("mtp kind", &run);
+        // The prefill and the first window ask for hidden rows; no step after the demotion does.
+        let hidden = logged.hidden.into_inner();
+        assert_eq!(hidden.len(), run.stats.forwards);
+        assert!(hidden[..1 + WINDOW].iter().all(|&h| h), "{hidden:?}");
+        assert!(hidden[1 + WINDOW..].iter().all(|&h| !h), "{hidden:?}");
+    }
+
+    /// E5 (sc-24446): prompt lookup under `auto` is demoted on Candle below its measured
+    /// break-even (cuda-campaign-a; 0.21 accepted drafts per verify at depth 4): a never-accepting
+    /// lookup at the end of its first window, with the reference loop's tokens; a lookup accepting
+    /// 3 drafts per 16-verify window (0.1875) is demoted at its first window too, one accepting 4
+    /// (0.25) is kept to the end.
+    #[test]
+    fn auto_demotes_prompt_lookup_on_candle_below_its_threshold() {
+        let (_cfg, model) = text_model();
+        let vocab = model.vocab_size();
+        let config = greedy(40);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, vocab);
+        let run = monitored(&model, &mut wrong, &config, 4, AUTO);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_eq!((wrong.proposals, wrong.commits), (WINDOW, WINDOW));
+        assert_eq!(run.stats.accepted, 0);
+        assert_forward_accounting("lookup", &run);
+
+        let config = greedy(96);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        for (right, demoted) in [(3, true), (4, false)] {
+            let script = Script::Partial {
+                every: WINDOW,
+                right,
+            };
+            let mut partial = Scripted::new(&expected, script, ProposerKind::PromptLookup, vocab);
+            let run = monitored(&model, &mut partial, &config, 4, AUTO);
+            assert_eq!(run.output.tokens, expected, "{right} right");
+            // The first window: the right proposal's drafts plus one token per verify step.
+            let first_window = (1 + right + WINDOW) as u64;
+            assert_eq!(
+                run.record.speculative_demoted_at,
+                demoted.then_some(first_window),
+                "{right} right"
+            );
+            if !demoted {
+                assert!(run.stats.verify_steps > 3 * WINDOW, "{:?}", run.stats);
+                assert!(partial.proposals + 1 >= run.stats.verify_steps);
+            }
+            assert_forward_accounting("partial", &run);
+        }
+    }
+
+    /// sc-24446 (rolling windows): a proposer that pays for its first window and then stops
+    /// accepting is demoted at the end of its first failing window — not at the first window (it
+    /// passed), and not never (the one-shot decision kept it) — and the run's tokens are still the
+    /// reference loop's, the steps after the demotion plain.
+    #[test]
+    fn a_late_loser_is_demoted_at_its_first_failing_window() {
+        let (_cfg, model) = text_model();
+        let config = greedy(96);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let logged = HiddenLog {
+            inner: &model,
+            hidden: Default::default(),
+        };
+        let script = Script::RightFor(WINDOW);
+        let mut late = Scripted::new(&expected, script, ProposerKind::Mtp, model.vocab_size());
+        late.wants_hidden = true;
+        let run = monitored(&logged, &mut late, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected, "demotion changed the output");
+        // The first window commits 3 tokens per step (2 accepted + the bonus), the failing one 1.
+        let demoted_at = 1 + 3 * WINDOW + WINDOW;
+        assert_eq!(run.record.speculative_demoted_at, Some(demoted_at as u64));
+        assert_eq!((late.proposals, late.commits), (2 * WINDOW, 2 * WINDOW));
+        assert_eq!(run.stats.accepted, 2 * WINDOW);
+        assert_forward_accounting("late loser", &run);
+        let hidden = logged.hidden.into_inner();
+        assert!(hidden[..1 + 2 * WINDOW].iter().all(|&h| h), "{hidden:?}");
+        assert!(hidden[1 + 2 * WINDOW..].iter().all(|&h| !h), "{hidden:?}");
+    }
+
+    /// The edges of the demotion: a budget one token past the demotion point (the first plain
+    /// step draws the last token), and a stop token drawn by the first step after the demotion —
+    /// each the reference loop's output, the demotion recorded.
+    #[test]
+    fn the_first_plain_step_honours_the_budget_and_a_stop_token_it_draws() {
+        let (_cfg, model) = text_model();
+        let vocab = model.vocab_size();
+        let config = greedy(DEMOTED_AT + 1);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::Mtp, vocab);
+        let run = monitored(&model, &mut wrong, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.output.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_forward_accounting("budget", &run);
+
+        // A prompt whose reference continuation first draws a fresh token at index `DEMOTED_AT`
+        // (the fixture loops, so search a fixed pseudo-random prompt sequence for one).
+        let mut state = 0x1234_5678_u64;
+        let (prompt, stop) = (0..400usize)
+            .find_map(|n| {
+                let prompt: Vec<i32> = (0..4 + n % 8)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        ((state >> 33) % vocab as u64) as i32
+                    })
+                    .collect();
+                let tokens = reference(&model, &prompt, &greedy(DEMOTED_AT + 1)).tokens;
+                (!tokens[..DEMOTED_AT].contains(&tokens[DEMOTED_AT]))
+                    .then(|| (prompt, tokens[DEMOTED_AT]))
+            })
+            .expect("a fixture prompt drawing a fresh token at the first plain step");
+        let mut stopping = greedy(40);
+        stopping.stop_tokens = vec![stop];
+        let expected = reference(&model, &prompt, &stopping);
+        assert_eq!(expected.tokens.len(), DEMOTED_AT, "fixture premise");
+        let mut wrong = Scripted::new(&expected.tokens, Script::Wrong, ProposerKind::Mtp, vocab);
+        wrong.prompt_len = prompt.len();
+        let run = monitored_from(&model, &mut wrong, &prompt, &stopping, 2, AUTO);
+        assert_eq!(run.output.tokens, expected.tokens);
+        assert_eq!(run.output.finish_reason, FinishReason::StopToken);
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_forward_accounting("stop", &run);
+    }
+
+    /// A seeded stochastic run across a demotion draws exactly the plain seeded run's tokens: a
+    /// proposer that never drafts makes every verify step the ordinary draw from the same seeded
+    /// stream, before the demotion and after it.
+    #[test]
+    fn a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run() {
+        let (_cfg, model) = text_model();
+        let config = stochastic(40);
+        let plain = run(&model, &mut NoProposer, &PROMPT, &config, 0)
+            .output
+            .tokens;
+        let mut empty = Scripted::new(&[], Script::Empty, ProposerKind::Mtp, model.vocab_size());
+        let demoted = monitored(&model, &mut empty, &config, 2, AUTO);
+        assert_eq!(demoted.output.tokens, plain);
+        assert_eq!(
+            demoted.record.speculative_demoted_at,
+            Some(DEMOTED_AT as u64)
+        );
+        assert_eq!(empty.proposals, WINDOW);
+    }
+
+    /// A proposer at or above its break-even is never demoted under `auto`.
+    #[test]
+    fn auto_keeps_a_proposer_that_pays_for_itself() {
+        let (_cfg, model) = text_model();
+        let config = greedy(112);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut right = Scripted::new(
+            &expected,
+            Script::Right,
+            ProposerKind::Mtp,
+            model.vocab_size(),
+        );
+        let run = monitored(&model, &mut right, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.record.speculative_demoted_at, None);
+        assert!(
+            run.stats.verify_steps > 2 * WINDOW,
+            "the run outlasts several windows: {:?}",
+            run.stats
+        );
+        // Every step proposes but one the budget clamped to no drafts.
+        assert!(right.proposals + 1 >= run.stats.verify_steps);
+    }
+
+    /// An explicit `{proposer, depth}` is the caller's choice: no monitor, so a losing proposer
+    /// runs to the end — every step but the budget-clamped last proposes — and nothing demotes.
+    #[test]
+    fn an_explicit_proposer_request_is_never_demoted() {
+        use core_llm::{Speculative, SpeculativeProposer};
+        let (_cfg, model) = text_model();
+        let config = greedy(40);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut wrong = Scripted::new(
+            &expected,
+            Script::Wrong,
+            ProposerKind::Mtp,
+            model.vocab_size(),
+        );
+        let explicit = Speculative::proposer(SpeculativeProposer::Mtp, 2);
+        let run = monitored(&model, &mut wrong, &config, 2, explicit);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.record.speculative_demoted_at, None);
+        assert_eq!(wrong.proposals, run.stats.verify_steps - 1);
+    }
+
+    /// The plain probe's length: its steps run without a proposal before the first window.
+    const PROBE: usize = core_llm::PLAIN_PROBE_MAX_STEPS as usize;
+
+    /// sc-24446 (cost-aware): at the same scale of acceptance, a request whose verify steps are
+    /// dear (r = 2.0, mal 0.75 — above Candle's static 0.5 at depth 3; gain 0.875, a loser but
+    /// not a clear one) is demoted on its measured gain at the end of its first window, and one whose verify steps are cheap
+    /// (Qwen3.8-like: r = 1.5, mal 1.25) keeps its proposer to the end. Both first run the plain
+    /// probe — no proposal, the proposer caught up on the probed tokens before its first proposal
+    /// — and both decode the reference loop's tokens; the report carries the decision's inputs.
+    #[test]
+    fn a_timed_auto_weighs_the_requests_own_verify_cost() {
+        let (_cfg, model) = text_model();
+        let vocab = model.vocab_size();
+        let config = greedy(96);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+
+        let bonsai = Script::Pattern(|n| if n % 4 == 1 { 3 } else { 0 });
+        let mut dear = Scripted::new(&expected, bonsai, ProposerKind::Mtp, vocab);
+        dear.wants_hidden = true;
+        let run = timed_run(&model, &mut dear, &config, 3, 2.0);
+        assert_eq!(
+            run.output.tokens, expected,
+            "the probe and the demotion are output-neutral"
+        );
+        // The first token, the probe's plain tokens, then one window: 16 steps + 4 × 3 accepted.
+        let demoted_at = 1 + PROBE + WINDOW + 12;
+        assert_eq!(run.record.speculative_demoted_at, Some(demoted_at as u64));
+        assert_eq!((dear.proposals, dear.commits), (WINDOW, PROBE + WINDOW));
+        let d = run
+            .record
+            .report(false)
+            .speculative_monitor
+            .expect("a judged window");
+        assert_eq!(
+            (d.basis, d.demoted, d.window),
+            (core_llm::DemotionBasis::Measured, true, 1)
+        );
+        assert!((d.mean_accepted_length() - 0.75).abs() < 1e-12);
+        assert_eq!(d.plain_step_ns, Some(10_000_000));
+        assert!((d.verify_cost_ratio().unwrap() - 2.0).abs() < 1e-9, "{d:?}");
+        assert!(d.gain().unwrap() < 1.0 - core_llm::MEASURED_GAIN_MARGIN);
+        assert!(d.gain().unwrap() >= core_llm::CLEAR_LOSS_GAIN);
+        // The head was caught up once, on the probed tokens at their positions, with one
+        // preceding hidden row each.
+        assert_eq!(
+            dear.caught_up,
+            vec![(expected[..PROBE].to_vec(), Some(PROBE), PROMPT.len() as i32)]
+        );
+        assert_forward_accounting("dear", &run);
+
+        let qwen = Script::Pattern(|n| if n % 4 == 1 { 2 } else { 1 });
+        let mut cheap = Scripted::new(&expected, qwen, ProposerKind::Mtp, vocab);
+        cheap.wants_hidden = true;
+        let run = timed_run(&model, &mut cheap, &config, 3, 1.5);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.record.speculative_demoted_at, None);
+        let d = run.record.speculative_monitor.expect("a judged window");
+        assert_eq!(
+            (d.basis, d.demoted),
+            (core_llm::DemotionBasis::Measured, false)
+        );
+        assert!(d.gain().unwrap() > 1.4, "{d:?}");
+        assert_eq!(cheap.caught_up.len(), 1);
+        assert!(cheap.proposals + 1 >= run.stats.verify_steps - PROBE);
+    }
+
+    /// The timed monitor on Candle prompt lookup: a lookup accepting nothing is demoted on its
+    /// measured gain at its window's end when its verify step costs 1.15 plain steps (gain 0.87)
+    /// and kept when it costs one (the
+    /// static 0.21 would have demoted both) — and, being history-only, needs no hidden rows to
+    /// catch up.
+    #[test]
+    fn a_timed_lookup_is_judged_on_its_measured_cost() {
+        let (_cfg, model) = text_model();
+        let vocab = model.vocab_size();
+        let config = greedy(64);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        for (ratio, demoted) in [(1.15, true), (1.0, false)] {
+            let mut wrong =
+                Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, vocab);
+            let run = timed_run(&model, &mut wrong, &config, 4, ratio);
+            assert_eq!(run.output.tokens, expected, "{ratio}");
+            assert_eq!(
+                run.record.speculative_demoted_at,
+                demoted.then_some((1 + PROBE + WINDOW) as u64),
+                "{ratio}"
+            );
+            let d = run.record.speculative_monitor.unwrap();
+            assert_eq!(
+                (d.basis, d.demoted),
+                (core_llm::DemotionBasis::Measured, demoted)
+            );
+            assert_eq!(
+                wrong.caught_up,
+                vec![(expected[..PROBE].to_vec(), None, PROMPT.len() as i32)]
+            );
+        }
+    }
+
+    /// sc-24446 (cuda-campaign-b4): on the deterministic decode clock a clear loser — measured
+    /// gain below [`core_llm::CLEAR_LOSS_GAIN`] (Bonsai-like lookup under CUDA graphs: accepting
+    /// nothing at r = 2.4, gain 0.42; a companion MTP head at mal 0.75, r = 2.6, gain 0.67) — is
+    /// demoted by the end of the probe and its first window: at the first step its measurement
+    /// holds [`core_llm::CLEAR_LOSS_MIN_TIMED_STEPS`] timed steps past its shape's warm-up, or — the
+    /// MTP-kind one, too lumpy (3 drafts every fourth step) for the optimistic gain to call
+    /// early — at its first window's end. A winner
+    /// (Qwen3.8-like: mal 1.0 at r = 1.71, gain 1.17) is never demoted. The reference loop's tokens throughout.
+    #[test]
+    fn a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never() {
+        let (_cfg, model) = text_model();
+        let vocab = model.vocab_size();
+        let first =
+            core_llm::SHAPE_WARMUP_STEPS as usize + core_llm::CLEAR_LOSS_MIN_TIMED_STEPS as usize;
+        let config = greedy(64);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+
+        let mut wrong = Scripted::new(&expected, Script::Wrong, ProposerKind::PromptLookup, vocab);
+        let run = timed_run(&model, &mut wrong, &config, 4, 2.4);
+        assert_eq!(run.output.tokens, expected);
+        let at = run.record.speculative_demoted_at.expect("demoted") as usize;
+        assert_eq!(at, 1 + PROBE + first);
+        assert!(at <= 1 + PROBE + WINDOW, "within the first window");
+        let d = run.record.speculative_monitor.unwrap();
+        assert_eq!(
+            (d.basis, d.demoted, d.window),
+            (core_llm::DemotionBasis::Measured, true, 1)
+        );
+        assert!(d.gain().unwrap() < core_llm::CLEAR_LOSS_GAIN, "{d:?}");
+        assert_eq!(wrong.proposals, first);
+        assert_forward_accounting("clear lookup loser", &run);
+
+        let config = greedy(96);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let bonsai = Script::Pattern(|n| if n % 4 == 1 { 3 } else { 0 });
+        let mut head = Scripted::new(&expected, bonsai, ProposerKind::Mtp, vocab);
+        head.wants_hidden = true;
+        let run = timed_run(&model, &mut head, &config, 3, 2.6);
+        assert_eq!(run.output.tokens, expected);
+        let at = run.record.speculative_demoted_at.expect("demoted") as usize;
+        assert!(
+            at <= 1 + PROBE + WINDOW + 12,
+            "within the first window: {at}"
+        );
+        assert_eq!(head.proposals, WINDOW);
+
+        // Qwen3.8-like: mal 1.0 at r = 1.71 (the dearest measured depth-3 MTP verify), gain 1.17.
+        let mut right = Scripted::new(
+            &expected,
+            Script::Pattern(|n| if n % 2 == 1 { 2 } else { 0 }),
+            ProposerKind::Mtp,
+            vocab,
+        );
+        right.wants_hidden = true;
+        let run = timed_run(&model, &mut right, &config, 3, 1.71);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(run.record.speculative_demoted_at, None);
+        let d = run.record.speculative_monitor.expect("a judged window");
+        assert_eq!(
+            (d.basis, d.demoted),
+            (core_llm::DemotionBasis::Measured, false)
+        );
+    }
+
+    /// The real MTP head through a timed run: the plain probe, the head's catch-up on the probed
+    /// tokens, then its proposals — the reference loop's tokens throughout, and (the random
+    /// head never pays, its verify dear) a measured demotion.
+    #[test]
+    fn a_timed_mtp_head_catches_up_after_the_probe() {
+        let (_cfg, model, mtp) = text_model_with_mtp();
+        let config = greedy(48);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut head = MtpProposer::new(&mtp);
+        // r = 1.15: gain 0.87, judged at its window's end.
+        let run = timed_run(&model, &mut head, &config, 2, 1.15);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(
+            run.stats.accepted, 0,
+            "fixture premise: the random head never pays"
+        );
+        assert_eq!(
+            run.record.speculative_demoted_at,
+            Some((1 + PROBE + WINDOW) as u64)
+        );
+        assert_eq!(
+            run.record.speculative_monitor.unwrap().basis,
+            core_llm::DemotionBasis::Measured
+        );
+        assert_forward_accounting("mtp timed", &run);
+    }
+
+    /// `MtpProposer::catch_up` leaves the head where proposing on each probed token would have
+    /// (its draft step for `cur`, then a commit without accepted drafts): the next draft step's
+    /// logits match.
+    #[test]
+    fn the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them() {
+        let (_cfg, model, mtp) = text_model_with_mtp();
+        let device = model.device().clone();
+        let config = greedy(8);
+        let mut rng = SplitMix64::new(0);
+        let mut cache = model.new_cache_for(PROMPT.len() + 8, 2).unwrap();
+        let out = model
+            .forward_step(&mut cache, StepRequest::last(&PROMPT).with_hidden(true))
+            .unwrap();
+        let mut caught = MtpProposer::new(&mtp);
+        let mut stepped = MtpProposer::new(&mtp);
+        caught.warm(&PROMPT, out.hidden.as_ref()).unwrap();
+        stepped.warm(&PROMPT, out.hidden.as_ref()).unwrap();
+        let mut previous = last_row(out.hidden.as_ref()).unwrap().unwrap();
+        let start = PROMPT.len() as i32;
+        let (mut tokens, mut rows) = (Vec::new(), Vec::new());
+        let mut history = PROMPT.to_vec();
+        for (i, token) in [5, 9, 2, 7].into_iter().enumerate() {
+            let position = start + i as i32;
+            let ids = input_ids(&[token], &device).unwrap();
+            let ctx = ProposeContext {
+                cur: token,
+                cur_ids: &ids,
+                history: &history,
+                previous_hidden: Some(&previous),
+                position,
+                max_drafts: 1,
+            };
+            let mut sampler = DraftSampler {
+                config: &config,
+                rng: &mut rng,
+                constraint: None,
+                device_greedy: true,
+            };
+            stepped.propose(&ctx, &mut sampler).unwrap();
+            let step = model
+                .forward_step(&mut cache, StepRequest::last(&[token]).with_hidden(true))
+                .unwrap();
+            stepped
+                .commit(token, &[], step.hidden.as_ref(), position + 1)
+                .unwrap();
+            tokens.push(token);
+            rows.push(previous.clone());
+            previous = last_row(step.hidden.as_ref()).unwrap().unwrap();
+            history.push(token);
+        }
+        let rows: Vec<&Tensor> = rows.iter().collect();
+        caught
+            .catch_up(&tokens, Some(&Tensor::cat(&rows, 1).unwrap()), start)
+            .unwrap();
+        let next = input_ids(&[4], &device).unwrap();
+        let position = start + tokens.len() as i32;
+        let logits = |head: &MtpProposer<'_>| {
+            let mut cache = head.cache().clone();
+            let (logits, _) = mtp
+                .step_ids(&next, &previous, 0, position, &mut cache)
+                .unwrap();
+            logits.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        let (a, b) = (logits(&caught), logits(&stepped));
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "caught-up head drifts from the stepped one by {worst}"
+        );
+        // Without the catch-up the head misses the probed tokens: the logits differ.
+        let mut skipped = MtpProposer::new(&mtp);
+        skipped.warm(&PROMPT, out.hidden.as_ref()).unwrap();
+        let c = logits(&skipped);
+        let gap = c
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            gap > 1e-3,
+            "fixture premise: the probed tokens change the head's state"
+        );
+    }
+
+    /// The MTP head (a proposer that wants the target's hidden rows) demotes the same way: the
+    /// rest of the run is plain steps with the reference loop's greedy tokens.
+    #[test]
+    fn a_demoted_mtp_head_decodes_the_rest_plainly() {
+        let (_cfg, model, mtp) = text_model_with_mtp();
+        let config = greedy(40);
+        let expected = reference(&model, &PROMPT, &config).tokens;
+        let mut head = MtpProposer::new(&mtp);
+        let run = monitored(&model, &mut head, &config, 2, AUTO);
+        assert_eq!(run.output.tokens, expected);
+        assert_eq!(
+            run.stats.accepted, 0,
+            "fixture premise: the random head never pays"
+        );
+        assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
+        assert_eq!(run.record.proposer, ProposerKind::Mtp);
+        assert_forward_accounting("mtp", &run);
     }
 }

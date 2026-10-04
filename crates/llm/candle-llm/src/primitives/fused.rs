@@ -34,9 +34,14 @@ fn env_value_enables(v: &str) -> bool {
     !matches!(v, "0" | "off" | "false" | "no" | "reference")
 }
 
-/// The fused-primitive switch (on unless the environment turns it off), on the crate's one
-/// switch implementation, [`ProcessSwitch`].
-static SWITCH: ProcessSwitch = ProcessSwitch::new(FUSED_KERNELS_ENV, true, env_value_enables);
+/// The fused-primitive switch, on the crate's one switch implementation, [`ProcessSwitch`]:
+/// unset, the Candle CUDA row of the defaults table ([`core_llm::defaults::CANDLE_CUDA`]) — the
+/// only device the fused path exists on.
+static SWITCH: ProcessSwitch = ProcessSwitch::new(
+    FUSED_KERNELS_ENV,
+    core_llm::defaults::CANDLE_CUDA.fused_kernels,
+    env_value_enables,
+);
 
 /// Whether the fused path may be tried at all (the switch; a `cuda` build is still required for
 /// it to exist).
@@ -65,42 +70,8 @@ pub fn fused_policy_guard(enabled: Option<bool>) -> FusedPolicyGuard {
 }
 
 /// Per-thread counts of fused-vs-reference leaf runs (monotone; take deltas with
-/// [`FusedTally::since`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FusedTally {
-    /// Leaves served by a fused kernel launch.
-    pub fused: u64,
-    /// Leaves served by the reference op chain.
-    pub reference: u64,
-    /// Why the most recent reference run happened (`None` if none happened).
-    pub reference_reason: Option<&'static str>,
-}
-
-impl FusedTally {
-    /// The counts accumulated since `start` (the reason is the latest one).
-    pub fn since(&self, start: &FusedTally) -> FusedTally {
-        FusedTally {
-            fused: self.fused.wrapping_sub(start.fused),
-            reference: self.reference.wrapping_sub(start.reference),
-            reference_reason: if self.reference != start.reference {
-                self.reference_reason
-            } else {
-                None
-            },
-        }
-    }
-
-    /// Which path served the leaves: `fused` (only fused launches), `reference` (no fused
-    /// launch), `mixed` (both), or `none` (no leaf ran).
-    pub fn label(&self) -> &'static str {
-        match (self.fused, self.reference) {
-            (0, 0) => "none",
-            (_, 0) => "fused",
-            (0, _) => "reference",
-            _ => "mixed",
-        }
-    }
-}
+/// [`FusedTally::since`]) — the shared tally type both backends report through (E8).
+pub use core_llm::FusedTally;
 
 thread_local! {
     static TALLY: Cell<FusedTally> = const { Cell::new(FusedTally { fused: 0, reference: 0, reference_reason: None }) };

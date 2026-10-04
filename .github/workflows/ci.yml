@@ -1026,6 +1026,10 @@ jobs:
           cargo build --locked -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
       - name: Test Candle CUDA packages
         shell: cmd
+        # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run
+        # here, so `skip_without_sm120` fails instead of skipping silently (sc-24440 review).
+        env:
+          REQUIRE_SM120: "1"
         run: |
           call "%VCVARS%"
           cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast

@@ -1,0 +1,32 @@
+{
+  "purpose": "DIAGNOSTIC_ONLY",
+  "acceptanceEvidence": false,
+  "repository": "SceneWorks/inference",
+  "releaseId": 402708057,
+  "protocolSha256": "1e42ed9cd80f45712cdb75f6ee63d93ae4afe7b310f6bfbc9f645f8b2c634fab",
+  "replayRun": 37223595546,
+  "replaySource": "83bd4c53ce9abb3f2c755415c0a92d39ed2096c7",
+  "trainingSourceMain": "b3ec3f0b8ee6880dc55e6433a35dc60116709752",
+  "trainingRun": 37214050997,
+  "adapterSha256": "c233129e9a64e384850331c9804b5b496d5208c08fe34aca4c680920fddb03d7",
+  "adapters": [
+    {
+      "name": "q4_edit_base",
+      "kind": "q4_replay_png",
+      "assetId": 610462396,
+      "assetName": "qwen21_q4_replay_37223595546_base.png",
+      "size": 232879,
+      "sha256": "ba8baf8aa439a0c00e952b9615669dbde38844ec92bb3a7aa48fe79d89708235",
+      "file": "q4_edit_base.png"
+    },
+    {
+      "name": "q4_edit_mlx_lokr",
+      "kind": "q4_replay_png",
+      "assetId": 610462398,
+      "assetName": "qwen21_q4_replay_37223595546_structured.png",
+      "size": 306523,
+      "sha256": "b8ffa6b98d4f2ddbf855060630c15d258544628fb2a1b5f0244ad880f4e7ee55",
+      "file": "q4_edit_mlx_lokr.png"
+    }
+  ]
+}

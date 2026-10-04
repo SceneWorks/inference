@@ -2,11 +2,12 @@
 //!
 //! The same packed-Q4 [`Qwen3TextEncoder`](super::Qwen3TextEncoder) that extracts the T2I
 //! `prompt_embeds` (a single bidirectional forward) also drives the caption-upsampling
-//! `generate()` loop (a KV-cached causal decode). The decode loop itself lives on
-//! `Qwen3TextEncoder` in `encoder.rs`; the on-device pieces it needs — the per-layer growable K/V
-//! cache and the temperature/top-p token sampler — are the shared `mlx-llm` decode primitives
-//! ([`mlx_llm::primitives::ContiguousKvCache`] + [`mlx_llm::primitives::sample`]), not a hand-rolled
-//! copy (sc-7160). This module is left with only the caller-facing sampling knobs.
+//! `generate()` loop (a KV-cached causal decode). The decode runs on the shared `mlx-llm` engine
+//! (`generate_speculative`'s token-at-a-time loop, epic sc-24432 E8) from
+//! `Qwen3TextEncoder::generate_from_embeds` in `encoder.rs`, over the shared per-layer growable
+//! K/V cache ([`mlx_llm::primitives::ContiguousKvCache`]) and drawing through the shared
+//! temperature/top-p token sampler ([`mlx_llm::primitives::sample`]), not a hand-rolled copy
+//! (sc-7160). This module is left with only the caller-facing sampling knobs.
 
 /// Sampling knobs for the caption-upsampling decode (the reference `generate(do_sample=True,
 /// temperature, max_new_tokens)`). `temperature <= 0` is greedy argmax; `top_p < 1` nucleus-filters.

@@ -226,7 +226,11 @@ pub fn sampler_path(
     if degenerate_temperature(params.temperature) {
         return SamplerPath::Host(HostSampleReason::DegenerateTemperature);
     }
-    if REFERENCE_SAMPLER.with(Cell::get) {
+    // The defaults table's row for a CUDA device (E5) can turn the device sampler off; the other
+    // rows have no device sampler, which the availability check below reports.
+    if REFERENCE_SAMPLER.with(Cell::get)
+        || (device.is_cuda() && !crate::device::decode_defaults(device).device_sampler)
+    {
         return SamplerPath::Host(HostSampleReason::Reference);
     }
     if device_sampler_available(device, vocab) {
@@ -497,9 +501,10 @@ pub fn logits_rows_host(logits: &Tensor) -> Result<Vec<Vec<f32>>> {
 }
 
 /// On-device argmax of every row of `[1, n, vocab]` (or `[n, vocab]`) logits, brought to host as
-/// **one** `n`-element transfer — the greedy verify decision's whole device->host traffic. Row `i`
-/// ties break to the lowest index like [`argmax_device`], so a row's result equals the
-/// single-row fast path's.
+/// **one** `n`-element transfer — the greedy verify decision's whole device->host traffic. Each row
+/// is reduced by the same candle `argmax` as [`argmax_device`], so an exact tie resolves the way
+/// that path's does on the same device: to the lowest index on the CPU, to an index the parallel
+/// reduction does not specify on CUDA (see [`argmax_device`]).
 pub fn argmax_rows_device(logits: &Tensor) -> Result<Vec<i32>> {
     let rows = argmax_rows_tensor(logits)?;
     Ok(read_token_ids(&rows)? // one n-element transfer
@@ -675,8 +680,15 @@ fn nucleus_weights(v: &[f32], params: &SamplingParams) -> Vec<(usize, f32)> {
 }
 
 /// On-device argmax of a `[vocab]` / `[1, vocab]` logits row. Greedy fast path — avoids pulling the
-/// full vocabulary to the host. Ties break to the lowest index (matching the host scan), so greedy
-/// decoding is bit-identical whichever path is taken.
+/// full vocabulary to the host.
+///
+/// **Exact ties are device-dependent.** On the CPU, candle's `argmax` keeps the first maximum, so a
+/// tie breaks to the lowest index exactly as the host scan ([`argmax_host`]) does. On CUDA (and
+/// Metal) it is a parallel tree reduction that does **not** guarantee which of several equal
+/// maxima it returns, so a row whose top logits are exactly equal can resolve to a different index
+/// than the host scan. Greedy decoding is therefore path-independent only up to exact ties; a
+/// parity check over device argmaxes must excuse an exact (or within-one-ULP) tie rather than
+/// assume the lowest index.
 pub fn argmax_device(logits: &Tensor) -> Result<i32> {
     let flat = logits.flatten_all()?;
     let idx = flat.argmax(0)?;
@@ -1273,7 +1285,8 @@ mod tests {
         assert_eq!(host.len(), 2);
         assert_eq!(host[0], vec![0.1, 5.0, 0.2, 9.9, 3.0]);
         let before = crate::primitives::host_sync_count();
-        assert_eq!(argmax_rows_device(&rows).unwrap(), vec![3, 2]); // ties -> lowest index
+        // The CPU's argmax keeps the first maximum: ties -> lowest index (not guaranteed on CUDA).
+        assert_eq!(argmax_rows_device(&rows).unwrap(), vec![3, 2]);
         assert_eq!(crate::primitives::host_sync_count() - before, 1);
         let before = crate::primitives::host_sync_count();
         let kept = argmax_rows_tensor(&rows).unwrap();

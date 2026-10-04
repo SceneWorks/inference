@@ -499,7 +499,7 @@ impl ConstraintMask for EvenOnly {
 const PROMPT: [i32; 5] = [1, 7, 42, 300, 9];
 const TOKENS: usize = 24;
 
-fn run_step(model: &Qwen35Model, config: &GenerationConfig) -> (Vec<i32>, DecodeRecord) {
+fn run_step<M: StepModel>(model: &M, config: &GenerationConfig) -> (Vec<i32>, DecodeRecord) {
     let (out, record) = generate_step(
         model,
         &PROMPT,
@@ -550,14 +550,46 @@ fn assert_host_routes_are_reported(model: &Qwen35Model) {
     assert_eq!(record.sampler.logits_to_host, TOKENS as u64);
 }
 
+/// Teacher-force `tokens` through the plain token-at-a-time seam loop and check that each one is a
+/// maximum of the step's logits, read on the host by the test itself — independent of the device
+/// argmax under test. Tie-aware on purpose: the tiny fixtures' periodic weights give exact logit
+/// ties (rows `r` and `r + 29` of the llama head are identical), and the CUDA argmax does not
+/// promise the lowest tied index, so the oracle checks "an argmax", never "the lowest one".
+fn assert_host_argmax_stream<M: StepModel>(model: &M, prompt: &[i32], tokens: &[i32]) {
+    let mut cache = model.new_cache_for(prompt.len() + tokens.len(), 0).unwrap();
+    let mut step = prompt.to_vec();
+    for (i, &token) in tokens.iter().enumerate() {
+        let logits = model
+            .forward_step(&mut cache, StepRequest::last(&step))
+            .unwrap()
+            .logits;
+        let row: Vec<f32> = logits
+            .flatten_all()
+            .unwrap()
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let chosen = row[usize::try_from(token).unwrap()];
+        assert!(
+            max.is_finite() && chosen == max,
+            "step {i}: token {token} scores {chosen}, the row maximum is {max}"
+        );
+        step = vec![token];
+    }
+}
+
 /// E1: greedy is the device argmax on every device, one sync per token, no logits copy, and
-/// token-identical with the reference sampler forced.
-fn assert_greedy_unchanged(model: &Qwen35Model) {
+/// token-identical with the reference sampler forced and with the host argmax of the plain seam
+/// loop — on either decoder family (epic AT1).
+fn assert_greedy_unchanged<M: StepModel>(model: &M) {
     let mut greedy = stochastic(TOKENS);
     greedy.sampling.temperature = 0.0;
     let (tokens, record) = run_step(model, &greedy);
     let (reference, _) = with_reference_sampler(|| run_step(model, &greedy));
     assert_eq!(tokens, reference);
+    assert_host_argmax_stream(model, &PROMPT, &tokens);
     assert_eq!(record.sampler.path, Some(SamplerPath::Device));
     assert_eq!(record.sampler.logits_to_host, 0);
     assert_eq!(record.host_syncs, TOKENS as u64);
@@ -576,6 +608,7 @@ fn cpu_routes_are_reported_and_never_silent() {
     let (_, record) = with_reference_sampler(|| run_step(&model, &stochastic(TOKENS)));
     assert_eq!(record.sampler.label(), "host:reference");
     assert_host_routes_are_reported(&model);
+    assert_greedy_unchanged(&tiny_llama(&Device::Cpu));
     assert_greedy_unchanged(&model);
 }
 
@@ -1134,6 +1167,7 @@ mod cuda {
     fn ac3_cuda_penalties_and_constraints_take_the_host_path() {
         let model = tiny_qwen35(&gpu());
         assert_host_routes_are_reported(&model);
+        assert_greedy_unchanged(&tiny_llama(&gpu()));
         assert_greedy_unchanged(&model);
     }
 

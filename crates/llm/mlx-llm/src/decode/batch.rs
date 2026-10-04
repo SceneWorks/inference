@@ -27,7 +27,7 @@
 //! 7169); the [`core_llm::Scheduler`] already carries per-sequence offsets so that lands without
 //! reworking the policy.
 
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use core_llm::schedule::{Scheduler, SeqId, SeqSpec};
 use core_llm::FinishReason as CoreFinish;
@@ -38,7 +38,7 @@ use crate::decode::{record_lane_token, BufferRelease, LaneStep};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::kv_cache::ContiguousKvCache;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::{draw_token, SamplingParams, SplitMix64};
 
 /// The pad token id stuffed into the left-pad region. Any in-vocabulary id works — the attention
 /// mask blocks these positions and their outputs are never read — so `0` is a safe choice.
@@ -146,6 +146,10 @@ pub(crate) fn generate_batch_with_observer(
         .collect();
 
     let mut cache = model.make_cache();
+    // Ownership events are recorded only for an attached campaign observer.
+    if observer.is_some() {
+        cache.record_events();
+    }
     let mut observed_cache_events = 0;
 
     // ---- Prefill: left-pad every prompt to `max_prompt` and run one batched forward. ----
@@ -157,8 +161,7 @@ pub(crate) fn generate_batch_with_observer(
     // table per layer type, and only the model knows how many it has.
     let logits = model.decode_logits_masked_at(&ids, cache.as_mut(), &positions, &mask)?;
     if let Some(observer) = observer.as_deref_mut() {
-        let logits_f32 = logits.as_dtype(Dtype::Float32)?;
-        let values = logits_f32.as_slice::<f32>().to_vec();
+        let values = crate::primitives::sampler::counted_host_f32(&logits)?;
         observer.logits("prefill", &values);
         observer.phase("prefill-peak");
         observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer)?;
@@ -383,7 +386,7 @@ fn decode_mask(active: &[Lane], k_total: i32, dtype: mlx_rs::Dtype) -> Result<Ar
 fn sample_row(logits: &Array, row: usize, lane: &mut Lane) -> Result<i32> {
     let idx = Array::from_slice(&[row as i32], &[1]);
     let lg = logits.take_axis(&idx, 0)?; // [1, vocab]
-    sample(&lg, &lane.history, &lane.params, &mut lane.rng, None)
+    draw_token(&lg, &lane.history, &lane.params, &mut lane.rng, None)
 }
 
 /// Record `tok` for `lane` through the scheduler and emit its stream events, mirroring the
@@ -430,8 +433,7 @@ fn selected_token_probability(logits: &Array, row: usize, token: i32) -> Result<
     if token < 0 {
         return Err(Error::Msg("negative sampled token id".into()));
     }
-    let logits_f32 = logits.as_dtype(Dtype::Float32)?;
-    let values = logits_f32.as_slice::<f32>().to_vec();
+    let values = crate::primitives::sampler::counted_host_f32(logits)?;
     let shape = logits.shape();
     let width = shape
         .get(1)

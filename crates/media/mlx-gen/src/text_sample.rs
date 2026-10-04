@@ -1,20 +1,35 @@
-//! Shared host-side text/LLM token sampler — temperature / top-k / top-p / repetition-penalty over a
-//! `[vocab]` logit slice, with a seeded PRNG.
+//! The media pipelines' text/LLM token draw — the knobs ([`SampleParams`], with the LTX enhancer
+//! and Lens reasoner presets) over **mlx-llm's shared sampler**. There is no sampler math here: the
+//! draw is [`mlx_llm::primitives::sample`] and the PRNG is [`mlx_llm::primitives::SplitMix64`]
+//! (re-exported), one implementation for every MLX decode (epic sc-24432 E8).
 //!
-//! Hoisted from `mlx-gen-ltx`'s Gemma prompt-enhancer (sc-2845) so the lens PromptReasoner
-//! (sc-9561 / F-105) and any future LLM-decode path share ONE implementation rather than cloning it
-//! (the 2026-07-01 review's T6 duplication theme). It is **pure host math** over a `&[f32]` logit
-//! slice — no MLX / tensor dependency, and no numeric-parity requirement: generation is stochastic;
-//! the [`SplitMix64`] PRNG only makes a run reproducible given a seed.
+//! **The one named policy** ([`sample_token`]): a media pipeline draws on mlx-llm's *heap-order
+//! host reference* ([`sample`](mlx_llm::primitives::sample) — candidates in index order, a
+//! heap-selected nucleus, the categorical inverse-CDF walked in that order, a degenerate row taking
+//! the argmax without consuming a draw), **not** the decode loops' index-order device-matched draw
+//! ([`draw_token`](mlx_llm::primitives::sampler::draw_token)). The LTX-2.3 enhancer and the Lens
+//! PromptReasoner reproduce their upstream `make_sampler` / `make_logits_processors` decode with a
+//! seeded stream of their own, and mlx-llm keeps that reference draw for exactly these pipelines;
+//! routing them through the device sampler would change every seeded rewrite with no upstream
+//! reason.
 //!
-//! A caller pulls its `[vocab]` logits to the host once per step
-//! (`logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec()`) and calls [`sample_token`]. Greedy
-//! decode stays each crate's concern (e.g. the lens reasoner keeps its on-device `argmax` as the
-//! KV-cache parity oracle); this module supplies the *sampled* path.
+//! sc-24446 consolidation (behaviour, vs the crate-local copy this module used to carry): the
+//! repetition penalty now applies **once per distinct id** in the window — the upstream
+//! `make_repetition_penalty` gathers and scatters, so a repeated id was never meant to compound
+//! (the local copy divided once per occurrence); and a custom top-k / top-p now selects with the
+//! shared tie order (descending weight, ties to the lower index) and an f64 nucleus mass. Greedy
+//! and pure-temperature draws (the Lens preset, the LTX uncensored preset) are unchanged.
+
+use mlx_rs::Array;
+
+pub use mlx_llm::primitives::SplitMix64;
+
+use crate::{Error, Result};
 
 /// Sampling parameters. `top_k <= 0` and `top_p >= 1.0` disable those filters. `repetition_penalty`
-/// (`None` ⇒ off) divides the logit of a token seen in the last `repetition_context` positions
-/// (multiplies when the logit is negative), matching the reference `make_logits_processors`.
+/// (`None` ⇒ off) divides the logit of each distinct token seen in the last `repetition_context`
+/// positions once (multiplies when the logit is negative), matching the reference
+/// `make_logits_processors`.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleParams {
     pub temperature: f32,
@@ -57,128 +72,50 @@ impl SampleParams {
     }
 }
 
-/// Sample a token id from host `logits` `[vocab]`, applying the repetition penalty over the tail of
-/// `history`, then temperature + optional top-k / top-p. Host-side (CPU) for a faithful repetition
-/// penalty + nucleus filter; deterministic given `rng`. Greedy (argmax) when `temperature <= 0` or the
-/// filtered candidate mass is not a positive finite number (all-filtered / NaN / inf).
+impl SampleParams {
+    /// These knobs in the shared sampler's vocabulary: `top_k <= 0` disables top-k, and a missing
+    /// or non-positive repetition penalty disables the penalty (`1.0`).
+    pub fn to_sampling(&self) -> mlx_llm::primitives::SamplingParams {
+        mlx_llm::primitives::SamplingParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: usize::try_from(self.top_k).unwrap_or(0),
+            presence_penalty: 0.0,
+            repetition_penalty: self
+                .repetition_penalty
+                .filter(|&penalty| penalty > 0.0)
+                .unwrap_or(1.0),
+            repetition_context: self.repetition_context,
+        }
+    }
+}
+
+/// Draw a token id from `logits` (`[vocab]` or `[1, vocab]`) on mlx-llm's heap-order host reference
+/// ([`mlx_llm::primitives::sample`], the module's one policy): the repetition penalty over the tail
+/// of `history`, then temperature + optional top-k / top-p, from `rng`. Greedy (the argmax, ties to
+/// the lowest index) when `temperature <= 0` or the shaped mass is not a positive finite number.
 pub fn sample_token(
-    logits: &[f32],
+    logits: &Array,
     history: &[i32],
     p: &SampleParams,
     rng: &mut SplitMix64,
-) -> i32 {
-    let mut v: Vec<f32> = logits.to_vec();
-    let vocab = v.len();
-
-    // Repetition penalty over the last `repetition_context` tokens (incl. the prompt tail).
-    if let Some(pen) = p.repetition_penalty {
-        if pen > 0.0 && p.repetition_context > 0 {
-            let start = history.len().saturating_sub(p.repetition_context);
-            for &t in &history[start..] {
-                let idx = t as usize;
-                if idx < vocab {
-                    v[idx] = if v[idx] < 0.0 {
-                        v[idx] * pen
-                    } else {
-                        v[idx] / pen
-                    };
-                }
-            }
-        }
-    }
-
-    // Greedy when temperature collapses to 0 (reference `make_sampler` argmaxes at temp == 0).
-    if p.temperature <= 0.0 {
-        return argmax_f32(&v);
-    }
-
-    // Candidate set: all tokens, optionally narrowed by top-k then top-p. Disabled at the reference
-    // defaults (`top_k <= 0`, `top_p >= 1.0`), in which case every token is a candidate.
-    let mut idx: Vec<usize> = (0..vocab).collect();
-    if p.top_k > 0 && (p.top_k as usize) < vocab {
-        let k = p.top_k as usize;
-        idx.select_nth_unstable_by(k - 1, |&a, &b| v[b].total_cmp(&v[a]));
-        idx.truncate(k);
-    }
-    // Temperature-scaled softmax over the candidates (numerically stable).
-    let max = idx.iter().map(|&i| v[i]).fold(f32::NEG_INFINITY, f32::max);
-    let inv_t = 1.0 / p.temperature;
-    let mut probs: Vec<(usize, f32)> = idx
-        .iter()
-        .map(|&i| (i, ((v[i] - max) * inv_t).exp()))
-        .collect();
-    // Nucleus (top-p): sort by prob desc, keep the smallest prefix whose cumulative mass ≥ top_p.
-    if p.top_p < 1.0 {
-        probs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        let total: f32 = probs.iter().map(|x| x.1).sum();
-        let threshold = p.top_p * total;
-        let mut cum = 0.0;
-        let mut keep = probs.len();
-        for (n, x) in probs.iter().enumerate() {
-            cum += x.1;
-            if cum >= threshold {
-                keep = n + 1;
-                break;
-            }
-        }
-        probs.truncate(keep.max(1));
-    }
-
-    // Sample from the (unnormalized) categorical via inverse-CDF. Fall back to greedy if the mass is
-    // not a positive finite number (all-filtered / NaN / inf).
-    let total: f32 = probs.iter().map(|x| x.1).sum();
-    if total <= 0.0 || !total.is_finite() {
-        return argmax_f32(&v);
-    }
-    let mut target = rng.next_f32() * total;
-    for (i, prob) in &probs {
-        target -= prob;
-        if target <= 0.0 {
-            return *i as i32;
-        }
-    }
-    probs.last().map(|x| x.0).unwrap_or(0) as i32
-}
-
-/// Argmax over a logit vector (greedy fallback). Ties break to the lowest index.
-fn argmax_f32(v: &[f32]) -> i32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > best_v {
-            best_v = x;
-            best = i;
-        }
-    }
-    best as i32
-}
-
-/// SplitMix64 — a tiny deterministic PRNG for host-side categorical sampling. (Generation is
-/// stochastic and not parity-gated; this just makes a run reproducible given a seed.)
-pub struct SplitMix64(u64);
-
-impl SplitMix64 {
-    pub fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform f32 in `[0, 1)` (24-bit mantissa).
-    pub fn next_f32(&mut self) -> f32 {
-        ((self.next_u64() >> 40) as f32) / ((1u64 << 24) as f32)
-    }
+) -> Result<i32> {
+    mlx_llm::primitives::sample(logits, history, &p.to_sampling(), rng, None)
+        .map_err(|e| Error::Msg(format!("text sample: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_llm::primitives::TokenRng as _;
+
+    fn row(v: &[f32]) -> Array {
+        Array::from_slice(v, &[v.len() as i32])
+    }
+
+    fn draw(logits: &[f32], history: &[i32], p: &SampleParams, rng: &mut SplitMix64) -> i32 {
+        sample_token(&row(logits), history, p, rng).unwrap()
+    }
 
     #[test]
     fn splitmix64_is_deterministic_and_in_range() {
@@ -214,7 +151,7 @@ mod tests {
         let mut rng = SplitMix64::new(1);
         let params = SampleParams::temperature(0.0);
         for _ in 0..8 {
-            assert_eq!(sample_token(&logits, &[], &params, &mut rng), 1);
+            assert_eq!(draw(&logits, &[], &params, &mut rng), 1);
         }
     }
 
@@ -225,7 +162,7 @@ mod tests {
         let seq = |seed: u64| {
             let mut rng = SplitMix64::new(seed);
             (0..64)
-                .map(|_| sample_token(&logits, &[], &params, &mut rng))
+                .map(|_| draw(&logits, &[], &params, &mut rng))
                 .collect::<Vec<_>>()
         };
         assert_eq!(seq(7), seq(7), "same seed must reproduce the same draws");
@@ -241,7 +178,7 @@ mod tests {
         params.top_k = 1;
         let mut rng = SplitMix64::new(3);
         for _ in 0..8 {
-            assert_eq!(sample_token(&logits, &[], &params, &mut rng), 2);
+            assert_eq!(draw(&logits, &[], &params, &mut rng), 2);
         }
     }
 
@@ -254,8 +191,58 @@ mod tests {
         params.repetition_context = 4;
         let mut rng = SplitMix64::new(0);
         // 2.0 / 2.0 = 1.0 < 1.5 → token 1 wins once token 0 is in the recent history.
-        assert_eq!(sample_token(&logits, &[0], &params, &mut rng), 1);
+        assert_eq!(draw(&logits, &[0], &params, &mut rng), 1);
         // Without the history the penalty does not apply → token 0 wins.
-        assert_eq!(sample_token(&logits, &[], &params, &mut rng), 0);
+        assert_eq!(draw(&logits, &[], &params, &mut rng), 0);
+    }
+
+    /// The upstream penalty gathers and scatters: an id repeated in the window is penalized once,
+    /// never compounded by its count (sc-24446; the local copy this module used to carry divided once
+    /// per occurrence).
+    #[test]
+    fn a_repeated_id_is_penalized_once() {
+        // 3.0 / 2 = 1.5 > 1.4 keeps token 0 on top; 3.0 / 4 (compounded) = 0.75 would not.
+        let logits = [3.0, 1.4, 0.0];
+        let mut params = SampleParams::temperature(0.0);
+        params.repetition_penalty = Some(2.0);
+        params.repetition_context = 8;
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(draw(&logits, &[0, 0, 0], &params, &mut rng), 0);
+    }
+
+    /// One implementation (E8): every preset's draw is mlx-llm's heap-order host reference from the
+    /// same stream, token for token — this module adds the knobs, not a sampler.
+    #[test]
+    fn the_draw_is_the_shared_host_reference() {
+        let logits: Vec<f32> = (0..97)
+            .map(|i| ((i * 37) % 23) as f32 * 0.21 - 1.7)
+            .collect();
+        let history: Vec<i32> = (0..40).map(|i| (i * 13) % 97).collect();
+        let mut custom = SampleParams::censored(0.9);
+        custom.top_k = 30;
+        custom.top_p = 0.8;
+        for params in [
+            SampleParams::temperature(0.7),
+            SampleParams::censored(0.7),
+            SampleParams::uncensored(1.0),
+            custom,
+        ] {
+            let (mut ours, mut shared) = (SplitMix64::new(5), SplitMix64::new(5));
+            for step in 0..32 {
+                let history = &history[..8 + step];
+                assert_eq!(
+                    draw(&logits, history, &params, &mut ours),
+                    mlx_llm::primitives::sample(
+                        &row(&logits),
+                        history,
+                        &params.to_sampling(),
+                        &mut shared,
+                        None
+                    )
+                    .unwrap(),
+                    "{params:?} step {step}"
+                );
+            }
+        }
     }
 }

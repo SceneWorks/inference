@@ -5,10 +5,27 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.ci.qwen21_mlx_build_identity import collect_identity
+from scripts.ci.qwen21_mlx_build_identity import collect_identity, collect_lib_test_identity
 
 
 class BuildIdentityTests(unittest.TestCase):
+    def test_lib_test_identity_rejects_integration_release_library_missing_and_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "lib-test"
+            binary.write_bytes(b"actual cfg(test) executable")
+            record = {"reason": "compiler-artifact", "target": {
+                "name": "mlx_gen_qwen_image_2_1", "kind": ["lib"]},
+                "profile": {"test": True}, "executable": str(binary)}
+            identity = collect_lib_test_identity([record])
+            self.assertEqual(identity["bytes"], 27)
+            self.assertEqual(identity["path"], str(binary.resolve()))
+            for records in ([], [record, record],
+                            [{**record, "target": {"name": "integration", "kind": ["test"]}}],
+                            [{**record, "profile": {"test": False}}],
+                            [{**record, "executable": None}]):
+                with self.subTest(records=records), self.assertRaises(ValueError):
+                    collect_lib_test_identity(records)
+
     def fixture(self, root):
         libraries = root / "build" / "lib"
         libraries.mkdir(parents=True)

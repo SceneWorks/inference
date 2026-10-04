@@ -13,8 +13,9 @@ use crate::primitives::kv_cache::KV_BLOCK_TOKENS;
 pub mod batch;
 pub mod cancel;
 pub mod continuous;
+pub mod engine;
 pub mod prefix;
-pub mod qwen35_mtp;
+pub mod proposers;
 pub mod speculative;
 pub mod stream;
 
@@ -24,13 +25,21 @@ pub use continuous::{
     generate_continuous, generate_continuous_kv, BatchExactness, ContinuousConfig, ContinuousKv,
     ContinuousOutput,
 };
-pub use prefix::{
-    generate_cached, generate_cached_with, PagedPrefixCache, PagedPrefixLookup, PagedPrefixStats,
-    PrefixCache, PrefixStats,
+pub use engine::{
+    generate_speculative, CacheRollback, CheckpointRingRollback, DraftSampler, DynCacheTarget,
+    EngineOptions, LogitsScope, MlxSampler, NoDraftRollback, NoProposer, Pipelining, Proposal,
+    ProposeContext, Proposer, RewindableConstraintMask, Rollback, SampledToken, SnapshotRollback,
+    SpeculativePrompt, SpeculativeRun, SpeculativeTarget, StepTarget, TargetOutput, TokenSampler,
+    TruncateRollback,
 };
-pub use qwen35_mtp::{generate_qwen35_mtp, Qwen35MtpMultimodalPrompt, RewindableConstraintMask};
-pub(crate) use qwen35_mtp::{
-    generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
+pub use prefix::{
+    generate_cached, generate_cached_with, prefill_restored, prefill_with_prefix, Boundary,
+    PagedPrefixCache, PagedPrefixLookup, PagedPrefixStats, PrefixCache, PrefixEntry, PrefixPrefill,
+    PrefixSnapshot, PrefixStats, Restored,
+};
+pub use proposers::{
+    generate_qwen35_mtp, DraftModelProposer, MtpBoundary, MtpProposer, NgramProposer,
+    Qwen35MtpMultimodalPrompt,
 };
 pub use speculative::{
     generate_draft_speculative, generate_draft_speculative_on, generate_prompt_lookup,
@@ -44,10 +53,7 @@ pub use stream::{
 // observers on a production decode.
 pub(crate) use stream::generate_with_observer;
 pub(crate) use stream::{forced_greedy_decode, forced_greedy_decode_from, ForcedDecode};
-pub(crate) use stream::{
-    generate_from_prefill_observed, generate_from_prefill_with_timings,
-    generate_with_cache_observed, generate_with_timings, generate_with_timings_on,
-};
+pub(crate) use stream::{generate_from_prefill_observed, generate_with_cache_observed};
 
 /// Generated tokens between releases of MLX's freed-buffer cache during decode. The KV block size
 /// ([`KV_BLOCK_TOKENS`]) so each release lands right after a block growth has retired the

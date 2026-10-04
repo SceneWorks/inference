@@ -575,6 +575,15 @@ pub struct GemmaKvCache {
 }
 
 impl GemmaKvCache {
+    /// Positions the cache holds — the next decode step's start position (`0` when empty). Every
+    /// layer keeps the full K/V (`(1, kv_heads, seq, head_dim)`), so layer 0's length is it.
+    pub fn offset(&self) -> i32 {
+        self.layers
+            .first()
+            .and_then(Option::as_ref)
+            .map_or(0, |(k, _)| k.shape()[2])
+    }
+
     /// Append this step's `(k, v)` to layer `i`'s cache and return the full cached `(k, v)`. (mlx
     /// `Array` is a cheap handle, so the clone retained in the cache is a refcount bump, not a copy.)
     ///
@@ -681,11 +690,11 @@ mod tests {
 /// every downstream number by a small amount that a smoke render would not catch, exactly the
 /// hazard the story called out. Synthetic tiny weights only — no real Gemma checkpoint needed.
 #[cfg(test)]
-mod hidden_state_pinning_tests {
+pub(crate) mod hidden_state_pinning_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn tiny_cfg(num_layers: usize) -> GemmaConfig {
+    pub(crate) fn tiny_cfg(num_layers: usize) -> GemmaConfig {
         GemmaConfig {
             hidden_size: 8,
             num_layers,
@@ -722,7 +731,7 @@ mod hidden_state_pinning_tests {
 
     /// A tiny, fully-synthetic Gemma weight set (unprefixed keys — `from_weights_with_prefix(..,
     /// "")`) covering every tensor `from_weights_with_prefix` requires.
-    fn tiny_weights(cfg: &GemmaConfig, vocab: i32, seed: f32) -> Weights {
+    pub(crate) fn tiny_weights(cfg: &GemmaConfig, vocab: i32, seed: f32) -> Weights {
         let mut m: HashMap<String, Array> = HashMap::new();
         put(
             &mut m,
