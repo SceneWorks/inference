@@ -670,28 +670,37 @@ class OwnerGuardTests(unittest.TestCase):
                         quant_smoke_binary=binary, vae_smoke_binary=binary,
                         work_dir=root / "listening", engine_sha=guard.ENGINE, control_sha="a" * 40,
                         app_sha="", backend="cuda", cuda_scheduling_mode="owner-gpu0")
-            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            # The retired owner route cannot pass production GPU1 dispatch. Isolate its
+            # downstream pre-Popen ordering while direct guard tests cover real guard behavior.
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
                                          "YUE2_IDLE_CONTEXT_RUN_ID": guard.RECEIPT, "RUNNER_NAME": "cuda-windows",
                                          "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
                  patch.object(control, "sha256", return_value=control.REFERENCE_SHA256), \
                  patch.object(control, "verify_revisions"), patch.object(control.subprocess, "run", return_value=Mock(stdout="")), \
+                 patch.object(existing.IDLE, "check_shared_gpu1_dispatch") as dispatch, \
                  patch.object(existing.IDLE, "require_remaining_window", return_value=({}, root)) as receipt, \
                  patch.object(control, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(control, "retain_cuda_physical_evidence", return_value=[]), \
                  patch.object(control, "verify_binary_identity", return_value={}), \
                  patch.object(control, "cuda_physical_census", return_value=("raw", [])), \
-                 patch.object(guard.OwnerGuard, "preflight", side_effect=RuntimeError("exact holder lost")) as owner, \
+                 patch.object(guard, "OwnerGuard") as owner, \
                  patch.object(control.subprocess, "Popen") as launch:
+                owner.return_value.preflight.side_effect = RuntimeError("exact holder lost")
+                owner.return_value.summary.return_value = {"mode": "owner-gpu0"}
                 with self.assertRaisesRegex(RuntimeError, "exact holder lost"):
                     control.execute(args)
-                self.assertGreaterEqual(receipt.call_count, 2)
+                dispatch.assert_called_once()
+                self.assertGreaterEqual(receipt.call_count, 1)
                 owner.assert_called_once()
+                owner.return_value.preflight.assert_called_once()
                 launch.assert_not_called()
+                dispatch.reset_mock()
                 receipt.reset_mock()
                 owner.reset_mock()
                 receipt.side_effect = RuntimeError("reviewed receipt mismatch")
                 with self.assertRaisesRegex(RuntimeError, "reviewed receipt mismatch"):
                     control.execute(args)
+                dispatch.assert_called_once()
                 receipt.assert_called_once()
                 owner.assert_not_called()
                 launch.assert_not_called()
