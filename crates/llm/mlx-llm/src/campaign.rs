@@ -802,6 +802,19 @@ fn scheduled_family(family: &str) -> Option<&'static str> {
         .find(|candidate| *candidate == family)
 }
 
+/// The architecture family a session loaded from scheduled `family`'s pinned candidate reports
+/// ([`crate::provider::LlamaProvider::campaign_family`]), derived from that spec's `model_type`:
+/// `llama` and `llama8b` load as `"llama"`, `qwen` and `qwen8b` as `"qwen"`.
+fn coordinate_architecture_family(family: &str) -> Result<&'static str, String> {
+    match benchmark_model(family, false)?.model_type {
+        "llama" => Ok("llama"),
+        "qwen3" => Ok("qwen"),
+        other => Err(format!(
+            "SC-20671 family {family:?} pins unsupported model_type {other:?}"
+        )),
+    }
+}
+
 pub fn benchmark_model(
     family: &str,
     reference: bool,
@@ -2021,8 +2034,13 @@ impl CampaignSession {
     fn model_weights_bytes(&self) -> u64 {
         self.model_weights_bytes
     }
+    /// The loaded architecture family (`"llama"` / `"qwen"`) must be the one the coordinate's
+    /// scheduled family's pinned models load as ([`coordinate_architecture_family`]): the 8B
+    /// families are a separate schedule, not a separate architecture.
     fn validate_coordinate_family(&self, coordinate: &Coordinate) -> core_llm::Result<()> {
-        if self.family != coordinate.family {
+        let expected = coordinate_architecture_family(coordinate.family)
+            .map_err(core_llm::Error::InvalidRequest)?;
+        if self.family != expected {
             return Err(core_llm::Error::InvalidRequest(format!(
                 "loaded {family} architecture cannot produce {coordinate_family} coordinate",
                 family = self.family,
@@ -13426,6 +13444,76 @@ pub(crate) mod tests {
                 operation_evidence_sha256: format!("{index:064x}"),
             })
             .collect()
+    }
+
+    /// A2 run 37195735179: the first 8B row (`llama8b-short-single-chunked-cold`) loaded its
+    /// candidate, then timing repeat 0 refused "loaded llama architecture cannot produce llama8b
+    /// coordinate" — the session reports its loaded architecture family, the coordinate its
+    /// schedule family. Tiny fixtures with each pinned 8B config's shape (Llama-3.1-8B: no
+    /// `head_dim`, llama3 `rope_scaling`, a 131,072-token window; Qwen3-8B: explicit `head_dim`,
+    /// q/k norms, a 40,960-token window) run the 8B short coordinate's timing repeat on the
+    /// compressed arm, and still refuse the other architecture's coordinates.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eight_b_sessions_run_their_own_coordinates_and_refuse_the_other_architecture() {
+        let llama8b = crate::provider::tests::tiny_snapshot(
+            serde_json::json!({
+                "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "rope_theta": 500000.0, "eos_token_id": [99, 100, 101],
+                "rope_scaling": {
+                    "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                    "original_max_position_embeddings": 8192, "rope_type": "llama3",
+                },
+            }),
+            131_072,
+            false,
+        );
+        let config_path = llama8b.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config.as_object_mut().unwrap().remove("head_dim");
+        fs::write(&config_path, config.to_string()).unwrap();
+        let qwen8b = crate::provider::tests::tiny_snapshot(
+            serde_json::json!({
+                "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+                "rope_theta": 1000000, "rope_scaling": null,
+            }),
+            40_960,
+            true,
+        );
+        // Each family's short-band coordinate: the 8B rows' first, and the one A2 stopped on.
+        let short = |family: &str| {
+            required_coordinates()
+                .into_iter()
+                .find(|coordinate| {
+                    coordinate.family == family && coordinate.context_band == "short"
+                })
+                .unwrap_or_else(|| panic!("{family} has a scheduled short row"))
+        };
+        assert_eq!(
+            coordinate_slug(&short("llama8b")),
+            "llama8b-short-single-chunked-cold"
+        );
+        for (snapshot, own, others) in [
+            (&llama8b, "llama8b", ["qwen", "qwen8b"]),
+            (&qwen8b, "qwen8b", ["llama", "llama8b"]),
+        ] {
+            let session =
+                CampaignSession::load_compressed(snapshot.path(), CompressedKvMethod::GroupAffine8)
+                    .unwrap();
+            run_timing_on_session(&session, "baseline", &short(own), 4_096)
+                .unwrap_or_else(|e| panic!("{own} timing repeat: {e}"));
+            for other in others {
+                let refused = session
+                    .validate_coordinate_family(&short(other))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    refused.contains("cannot produce"),
+                    "{own} vs {other}: {refused}"
+                );
+            }
+        }
     }
 
     #[test]
