@@ -68,6 +68,18 @@ pub fn admit_full(host: Host, envelope: u64, explicit_cap: Option<u64>) -> Resul
     Ok(ceiling)
 }
 
+/// Reservation is independent of the allocator's actual cache cap. This is an
+/// estimator only; it neither raises that cap nor changes ordinary admission.
+pub fn admit_numeric_full(
+    mut host: Host,
+    envelope: u64,
+    frozen_free_cache: u64,
+    explicit_cap: Option<u64>,
+) -> Result<u64, String> {
+    host.cache_limit = frozen_free_cache;
+    admit_full(host, envelope, explicit_cap)
+}
+
 /// Parse the printed `vm_stat` snapshot, whose "Pages free" excludes speculative
 /// pages. Its printed free, speculative and inactive buckets are disjoint.
 /// Raw Mach `free_count` already contains speculative pages and is a different
@@ -151,6 +163,26 @@ mod tests {
             None
         )
         .is_err());
+    }
+    #[test]
+    fn frozen_numeric_reserve_survives_zero_actual_allocator_cache() {
+        let measured = Host {
+            cache_limit: 0,
+            ..host()
+        };
+        let active = 69_080_366_523;
+        let reserve = 11_142_168_576;
+        // The previous min(actual_cache, reserve) estimator wrongly admitted.
+        assert!(admit_full(measured, active, Some(75_000_000_000)).is_ok());
+        assert!(admit_numeric_full(measured, active, reserve, Some(75_000_000_000)).is_err());
+        assert_eq!(
+            admit_numeric_full(measured, active, reserve, Some(100_000_000_000)).unwrap(),
+            80_222_535_099 + GIB / 2
+        );
+        assert_eq!(
+            measured.cache_limit, 0,
+            "reservation must not alter allocator policy"
+        );
     }
     #[test]
     fn every_headroom_boundary_caps_cache_allowance_independently() {

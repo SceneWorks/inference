@@ -407,12 +407,15 @@ impl Footprint {
 
     #[allow(dead_code)] // Used only by the cfg(test) library diagnostic, not this integration binary.
     pub(crate) fn admit_numeric(&self, active_envelope: u64, free_cache: u64) {
-        let (mut host, census) = host_census();
-        host.cache_limit = host.cache_limit.min(free_cache);
+        let (host, census) = host_census();
+        // Reserve the entire frozen allowance even if the allocator was already
+        // capped lower. This estimate never modifies the actual allocator policy.
         let cap = self.explicit_cap.unwrap_or(100_000_000_000);
-        let result = physical_watchdog::admit_full(host, active_envelope, Some(cap));
+        let result =
+            physical_watchdog::admit_numeric_full(host, active_envelope, free_cache, Some(cap));
         let receipt = json!({"kind": "DIAGNOSTIC_ONLY", "host": census,
-            "activeEnvelopeBytes": active_envelope, "freeCacheAllowanceBytes": host.cache_limit,
+            "activeEnvelopeBytes": active_envelope, "freeCacheAllowanceBytes": free_cache,
+            "actualAllocatorCacheLimitBytes": host.cache_limit,
             "explicitOrDefaultCapBytes": cap, "physicalCeilingBytes": result.as_ref().ok(),
             "refusal": result.as_ref().err(), "reservesUnchanged": true});
         write_json(&self.out, "numeric-physical-admission", &receipt);

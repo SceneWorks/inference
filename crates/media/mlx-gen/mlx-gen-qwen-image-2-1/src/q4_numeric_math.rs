@@ -61,6 +61,29 @@ pub fn dot_bound(terms: usize, absolute_products: f64) -> f64 {
     gamma(terms + 1) * absolute_products + (terms + 1) as f64 * f32::MIN_POSITIVE as f64
 }
 
+/// Apple MPP relaxed_precision permits input truncation without specifying its
+/// width/rounding. Finite discrepancies are observations, never a bound verdict.
+pub const ARITHMETIC_VERDICT: &str = "UNPROVEN_RELAXED_NAX_PRECISION";
+#[derive(Clone, Copy, Debug)]
+pub struct ArithmeticObservation {
+    pub actual: f64,
+    pub reference: f64,
+    pub absolute_difference: f64,
+    pub verdict: &'static str,
+}
+pub fn observe(actual: f64, reference: f64) -> Result<ArithmeticObservation, String> {
+    let absolute_difference = (actual - reference).abs();
+    if !actual.is_finite() || !reference.is_finite() || !absolute_difference.is_finite() {
+        return Err("nonfinite numerical observation".into());
+    }
+    Ok(ArithmeticObservation {
+        actual,
+        reference,
+        absolute_difference,
+        verdict: ARITHMETIC_VERDICT,
+    })
+}
+
 pub fn within(got: f64, expected: f64, bound: f64) -> bool {
     got.is_finite() && expected.is_finite() && bound.is_finite() && (got - expected).abs() <= bound
 }
@@ -93,6 +116,24 @@ mod tests {
         let mut altered = shapes();
         altered[0] = (4096, 4095);
         assert!(price(&altered).is_err());
+    }
+    #[test]
+    fn relaxed_gemm_discrepancies_never_claim_a_proven_bound() {
+        for (actual, reference, difference) in
+            [(1.0, 1.0, 0.0), (1.125, 1.0, 0.125), (-2.0, 3.0, 5.0)]
+        {
+            let observation = observe(actual, reference).unwrap();
+            assert_eq!(observation.actual, actual);
+            assert_eq!(observation.reference, reference);
+            assert_eq!(observation.absolute_difference, difference);
+            assert_eq!(observation.verdict, "UNPROVEN_RELAXED_NAX_PRECISION");
+            assert_ne!(observation.verdict, "PASS");
+        }
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(observe(invalid, 1.0).is_err());
+            assert!(observe(1.0, invalid).is_err());
+        }
+        assert!(observe(f64::MAX, -f64::MAX).is_err());
     }
     #[test]
     fn f32_component_bound_rejects_drop_scale_and_axis_mutants() {

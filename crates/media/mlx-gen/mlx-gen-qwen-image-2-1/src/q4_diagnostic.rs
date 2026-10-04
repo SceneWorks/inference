@@ -21,6 +21,7 @@ pub(crate) mod math;
 
 const DONOR_HASH: &str = "c233129e9a64e384850331c9804b5b496d5208c08fe34aca4c680920fddb03d7";
 const PROTOCOL_HASH: &str = "1e42ed9cd80f45712cdb75f6ee63d93ae4afe7b310f6bfbc9f645f8b2c634fab";
+const ADDENDUM_HASH: &str = "510071193701e506ca42dd7d46687457f414c70c4ed589eb0edc04a80380fd76";
 const RECEIPT_HASH: &str = "fa5b6234870f6ac0784f893067524407178ee9ee1678c50bc6bd6713d008e333";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -223,10 +224,71 @@ fn retirement_boundary() {
     mlx_rs::memory::clear_cache();
 }
 
-fn f32_values(array: &Array) -> Result<Vec<f32>> {
-    let a = array.as_dtype(Dtype::Float32)?;
+pub(crate) fn f32_values(array: &Array) -> Result<Vec<f32>> {
+    // Same-dtype cast and reshape can both preserve strides. Request a logical
+    // row-contiguous copy explicitly through the pinned mlx-c API before export.
+    let source = array.as_dtype(Dtype::Float32)?;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Handle {
+        ctx: *mut std::ffi::c_void,
+    }
+    extern "C" {
+        fn mlx_array_new() -> Handle;
+        fn mlx_array_free(array: Handle) -> i32;
+        fn mlx_contiguous(
+            out: *mut Handle,
+            array: Handle,
+            allow_col_major: bool,
+            stream: Handle,
+        ) -> i32;
+    }
+    let stream = mlx_rs::Stream::task_local_or_default();
+    // SAFETY: these are the exact single-pointer mlx-c handles; from_ptr below
+    // transfers the independently created output handle to Array's normal Drop.
+    let mut output = unsafe { mlx_array_new() };
+    let rc = unsafe {
+        mlx_contiguous(
+            &mut output,
+            Handle {
+                ctx: source.as_ptr().ctx,
+            },
+            false,
+            Handle {
+                ctx: stream.as_ptr().ctx,
+            },
+        )
+    };
+    if rc != 0 {
+        assert_eq!(unsafe { mlx_array_free(output) }, 0);
+        return Err("logical contiguous CPU export failed".into());
+    }
+    let mut typed_output = source.as_ptr();
+    typed_output.ctx = output.ctx;
+    let a = unsafe { Array::from_ptr(typed_output) };
     eval([&a])?;
     Ok(a.as_slice::<f32>().to_vec())
+}
+#[test]
+pub(crate) fn cpu_export_preserves_three_strided_rows_and_output_components() {
+    let values: Vec<f32> = (0..3 * 4096).map(|i| i as f32).collect();
+    let parent = Array::from_slice(&values, &[1, 3, 4096]);
+    let view = parent.index((.., .., 0..16));
+    let expected: Vec<f32> = (0..3)
+        .flat_map(|row| (0..16).map(move |col| (row * 4096 + col) as f32))
+        .collect();
+    assert_eq!(f32_values(&view).unwrap(), expected);
+    assert_ne!(
+        &values[..48],
+        expected.as_slice(),
+        "raw contiguous read mutant must differ"
+    );
+    let column = parent.index((.., .., 0..1));
+    assert_eq!(
+        f32_values(&column).unwrap(),
+        [0.0, 4096.0, 8192.0],
+        "reshape-only stride mutant"
+    );
 }
 struct Capture {
     params: LoraParams,
@@ -273,29 +335,32 @@ pub(crate) fn capture_linear(path: &str, linear: &AdaptableLinear, x: &Array) ->
         let stored_w2=f32_values(&w2.as_dtype(Dtype::Bfloat16)?)?;
         let coefficients=f32_values(&delta.index((0..components,..)))?;
         let mut checks=Vec::new();
-        let mut inner_checks=true;
+        let mut raw_inner_reference=Vec::new();
+        let mut raw_inner_max_difference=0.0f64;
         let raw_a=f32_values(w2a)?; let raw_b=f32_values(w2b)?;
         for bi in 0..b as usize {
             for di in 0..d as usize {
-                let mut want=0.0; let mut products=0.0;
+                let mut want=0.0;
                 for rank in 0..16usize {
                     let product=raw_a[bi*16+rank] as f64*raw_b[rank*d as usize+di] as f64;
-                    want+=product; products+=product.abs();
+                    want+=product;
                 }
-                inner_checks &= math::within(raw_w2[bi*d as usize+di] as f64,want,math::dot_bound(16,products));
+                let observation=math::observe(raw_w2[bi*d as usize+di] as f64,want)?;
+                raw_inner_max_difference=raw_inner_max_difference.max(observation.absolute_difference);
+                raw_inner_reference.push(want);
             }
         }
         for row in 0..3usize {
             for out in 0..components as usize {
                 let (oi,oj)=(out/b as usize,out%b as usize);
-                let mut structured=0.0; let mut structured_abs=0.0;
-                let mut materialized=0.0; let mut materialized_abs=0.0;
+                let mut structured=0.0;
+                let mut materialized=0.0;
                 let mut reconstruction_pass=true;
                 for ci in 0..c as usize {
                     for dj in 0..d as usize {
                         let input=inputs[row*(c*d) as usize+ci*d as usize+dj] as f64;
                         let product=input*stored_w1[oi*c as usize+ci] as f64*stored_w2[oj*d as usize+dj] as f64;
-                        structured+=product; structured_abs+=product.abs();
+                        structured+=product;
                         let coefficient=coefficients[out*(c*d) as usize+ci*d as usize+dj] as f64;
                         let raw_product=raw_w1[oi*c as usize+ci] as f64*raw_w2[oj*d as usize+dj] as f64;
                         // Complete-delta BF16 round versus exact product of the
@@ -304,20 +369,18 @@ pub(crate) fn capture_linear(path: &str, linear: &AdaptableLinear, x: &Array) ->
                             +math::dot_bound(1,raw_product.abs());
                         reconstruction_pass &= math::within(coefficient,raw_product,coefficient_bound);
                         materialized+=input*coefficient;
-                        materialized_abs+=(input*coefficient).abs();
                     }
                 }
-                let structured_bound=(math::gamma(c as usize+1)+math::gamma(d as usize+1)
-                    +math::gamma(c as usize+1)*math::gamma(d as usize+1))*structured_abs
-                    +(c*d) as f64*f32::MIN_POSITIVE as f64;
-                let direct_bound=math::dot_bound((c*d) as usize,materialized_abs);
                 let index=row*components as usize+out;
-                let structured_pass=math::within(current_values[index] as f64,structured,structured_bound);
-                let direct_pass=math::within(direct_values[index] as f64,materialized,direct_bound);
-                checks.push(json!({"row":row,"component":out,"structured":current_values[index],
-                    "structuredOracleF64":structured,"structuredBound":structured_bound,"structuredPass":structured_pass,
-                    "directDelta":direct_values[index],"directOracleF64":materialized,"directBound":direct_bound,"directPass":direct_pass,
-                    "rawInnerProductPass":inner_checks,"completeDeltaBF16RoundPass":reconstruction_pass}));
+                let structured_observation=math::observe(current_values[index] as f64,structured)?;
+                let direct_observation=math::observe(direct_values[index] as f64,materialized)?;
+                checks.push(json!({"row":row,"component":out,"structured":structured_observation.actual,
+                    "structuredOracleF64":structured_observation.reference,
+                    "structuredAbsoluteDifference":structured_observation.absolute_difference,
+                    "directDelta":direct_observation.actual,"directOracleF64":direct_observation.reference,
+                    "directAbsoluteDifference":direct_observation.absolute_difference,
+                    "arithmeticBoundVerdict":structured_observation.verdict,
+                    "completeDeltaBF16RoundPass":reconstruction_pass}));
             }
         }
         use sha2::Digest;
@@ -325,7 +388,14 @@ pub(crate) fn capture_linear(path: &str, linear: &AdaptableLinear, x: &Array) ->
         capture.rows.insert(path.clone(),json!({"path":path,"inputDtype":format!("{:?}",x.dtype()),
             "residualDtype":format!("{:?}",current.dtype()),"jointRows":s,"rowIndices":row_indices,
             "factorShape":[a,b,c,d],"inputRowsSha256":input_sha256,"inputRowsF32":inputs,"rawW1F32":raw_w1,"rawW2F32":raw_w2,
-            "rawW2AF32":raw_a,"rawW2BF32":raw_b,
+            "rawW2AF32":raw_a,"rawW2BF32":raw_b,"rawW2OracleF64":raw_inner_reference,
+            "rawW2MaxAbsoluteDifference":raw_inner_max_difference,
+            "arithmeticBoundVerdict":math::ARITHMETIC_VERDICT,
+            "referenceSemantics":"f64 sums over actual operands, without modeling unspecified NAX input truncation or chained intermediate re-rounding; observations only",
+            "precision":{"dtype":"Float32","configuredMLX_ENABLE_TF32":std::env::var("MLX_ENABLE_TF32").unwrap_or_else(|_|"unset: pinned default1".into()),
+                "pinnedCore":"0.32.0","dispatchPolicy":"NAX on available M5 hardware for M,N>1 with default flag",
+                "contract":"MPP relaxed_precision=true permits mantissa truncation; bitwidth and rounding unspecified",
+                "limits":"independent f64 references are observations; no proven packed GEMM error bound"},
             "storedW1BF16AsF32":stored_w1,"storedW2BF16AsF32":stored_w2,
             "selectedDirectDeltaBF16AsF32":coefficients,"componentChecks":checks}));
         Ok(())
@@ -422,7 +492,10 @@ fn fixed_q4_numeric_diagnostic() {
         &out,
         "DIAGNOSTIC_ONLY",
         &json!({"kind":"DIAGNOSTIC_ONLY","acceptanceEvidence":false,
-        "source":source,"sourceBase":"83bd4c53ce9abb3f2c755415c0a92d39ed2096c7","protocolSha256":PROTOCOL_HASH,"renderCount":4,"originalDonorSha256":DONOR_HASH,
+        "source":source,"sourceBase":"83bd4c53ce9abb3f2c755415c0a92d39ed2096c7","protocolSha256":PROTOCOL_HASH,
+        "protocolV2AddendumSha256":ADDENDUM_HASH,"arithmeticBoundVerdict":math::ARITHMETIC_VERDICT,"numericPassClaim":false,
+        "comparisonScope":"complete representation paths; no factor-rounding-only or whole-training-forward equivalence claim",
+        "renderCount":4,"originalDonorSha256":DONOR_HASH,
         "provenance":manifest["trainingProvenance"],"pricing":{"deltaElements":pricing.elements,"bf16DeltaBytes":pricing.bf16_delta,
         "f32WideningBytes":pricing.f32_widening,"scratchBytes":pricing.construction_scratch,
         "residentBytes":pricing.resident,"activeEnvelopeBytes":pricing.active,"physicalEnvelopeBeforeOverheadBytes":pricing.physical}}),
@@ -577,22 +650,19 @@ fn fixed_q4_numeric_diagnostic() {
         "numeric-first-forward",
         &json!({"kind":"DIAGNOSTIC_ONLY","acceptanceEvidence":false,
         "scope":"separate production firststep forward, no render instrumentation","source":source,
+        "arithmeticBoundVerdict":math::ARITHMETIC_VERDICT,"numericPassClaim":false,
         "forwardResult":capture_result.as_ref().map(|_|"ok").map_err(ToString::to_string),
         "mlxActivePeakBytes":numeric_active,"physFootprintMaxBytes":numeric_physical,"captures":captures}),
     );
     capture_result.unwrap();
     assert_eq!(captures.len(), 3);
     assert!(
-        captures.values().all(
-            |v| v["componentChecks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|c| c["structuredPass"] == true
-                    && c["directPass"] == true
-                    && c["rawInnerProductPass"] == true
-                    && c["completeDeltaBF16RoundPass"] == true)
-        ),
-        "componentwise oracle failure retained"
+        captures.values().all(|v| v["componentChecks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["arithmeticBoundVerdict"] == math::ARITHMETIC_VERDICT
+                && c["completeDeltaBF16RoundPass"] == true)),
+        "scalar complete-delta BF16 reconstruction or honest-report contract failure retained"
     );
 }
