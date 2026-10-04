@@ -74,7 +74,7 @@ for d in "$HOME" /Volumes/Models; do
   if [ -d "$d" ]; then row "disk free $d" "$(df -h "$d" | awk 'NR==2 {print $4 " free of " $2 " (" $5 " used)"}')"; fi
 done
 
-for snap in "$LQ" "$LB" "$QQ" "$QB"; do
+for snap in "$LQ" "$LB" "$QQ" "$QB" "$L8Q" "$L8B" "$Q8Q" "$Q8B"; do
   name="$(printf '%s' "$snap" | sed -n 's|.*/models--\([^/]*\)/snapshots/\(.......\).*|\1@\2|p')"
   if [ -d "$snap" ]; then
     size="$(du -shL "$snap" 2>/dev/null | awk '{print $1}')"

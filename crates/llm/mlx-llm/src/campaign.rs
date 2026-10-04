@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use crate::campaign_supervisor::{self, RunRequest, SafetyPolicy, SystemProbe};
 
-pub const SC20671_SCHEDULE_VERSION: u64 = 2;
+/// v3 (epic 20669, sc-20688): the 8B families `llama8b` and `qwen8b` run the same four rows as the
+/// 3B `llama` and 1.7B `qwen` families, so the covering set is sixteen rows.
+pub const SC20671_SCHEDULE_VERSION: u64 = 3;
 pub const SC20671_CAMPAIGN_KIND: &str = "sc-20671-complete-covering-set";
 /// Manifest kind of an `--only-coordinate` run: one scheduled row, never a campaign. Every
 /// complete-campaign loader (here and in SceneWorks) refuses it by kind.
@@ -286,8 +288,9 @@ pub const NEEDLE_FIXTURE_QUESTION: &str =
 /// Every campaign row is admitted by its runtime guards (supervised worker, footprint watchdog cap,
 /// host reserve, deadline, sampling), never by a static whole-process peak proof.
 pub const RUNTIME_GUARDED_ADMISSION: &str = "runtime-guarded";
-/// Admission estimate source of an SC-20671 row: `static_row_footprint_budget`, the larger of
-/// the candidate and reference roles' model-load (2x payload) plus KV, fused prefill tile and
+/// Admission estimate source of an SC-20671 row: `static_row_footprint_budget`, the loaded roles'
+/// (dense: the larger of candidate and bf16 reference; compressed: the candidate, whose dense-KV
+/// arm is its quality reference) model-load (2x payload) plus KV, fused prefill tile and
 /// tiled-prefill activation budget.
 pub const SC20671_ESTIMATE_SOURCE: &str = "sc20671-static-row-footprint-budget";
 /// Estimate source of a noise-floor row: one dense candidate session (`static_role_footprint_budget`).
@@ -456,6 +459,10 @@ pub struct BenchmarkModelSpec {
     pub architecture: &'static str,
     pub model_type: &'static str,
     pub native_context_tokens: u64,
+    /// The fit-boundary row's window when it is not the native window: the largest window whose
+    /// fit row the 68 GiB child footprint cap of `.github/kv-poc/policies/llm.json` admits with
+    /// margin (see [`spec_band_target`]). `None` = native.
+    pub fit_window_tokens: Option<u64>,
     pub quantized: bool,
     pub required_files: &'static [PinnedSnapshotFile],
 }
@@ -562,6 +569,7 @@ pub const LLAMA_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
     architecture: "LlamaForCausalLM",
     model_type: "llama",
     native_context_tokens: 131_072,
+    fit_window_tokens: None,
     quantized: true,
     required_files: LLAMA_4BIT_FILES,
 };
@@ -573,6 +581,7 @@ pub const LLAMA_REFERENCE: BenchmarkModelSpec = BenchmarkModelSpec {
     architecture: "LlamaForCausalLM",
     model_type: "llama",
     native_context_tokens: 131_072,
+    fit_window_tokens: None,
     quantized: false,
     required_files: LLAMA_BF16_FILES,
 };
@@ -584,6 +593,7 @@ pub const QWEN_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
     architecture: "Qwen3ForCausalLM",
     model_type: "qwen3",
     native_context_tokens: 40_960,
+    fit_window_tokens: None,
     quantized: true,
     required_files: QWEN_4BIT_FILES,
 };
@@ -595,9 +605,202 @@ pub const QWEN_REFERENCE: BenchmarkModelSpec = BenchmarkModelSpec {
     architecture: "Qwen3ForCausalLM",
     model_type: "qwen3",
     native_context_tokens: 40_960,
+    fit_window_tokens: None,
     quantized: false,
     required_files: QWEN_BF16_FILES,
 };
+
+// Epic 20669 (sc-20688): the 8B pair of each family, measured on the same row structure so
+// compressed K8V8 can be qualified for them. Each candidate is the mlx-community 4-bit group-64
+// conversion; each bf16 reference is that family's mlx-community bf16 conversion.
+const LLAMA8B_4BIT_FILES: &[PinnedSnapshotFile] = &[
+    PinnedSnapshotFile {
+        path: "config.json",
+        bytes: 1097,
+        sha256: "88804b1a541a86ce1b5b21dd0b38d95ee99006ef656a0b59ab267ecb0bce8b22",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors",
+        bytes: 4_517_489_037,
+        sha256: "192065799d1621df78b68274137974d3258c5dadce9ca71305ed014d997d67c4",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors.index.json",
+        bytes: 52_381,
+        sha256: "9a76e05055778bb04cacb7aff616b378da0e57c87a181c932037a943efba5997",
+    },
+    PinnedSnapshotFile {
+        path: "tokenizer_config.json",
+        bytes: 55_381,
+        sha256: "f0f2d5fa9caf736f4184e3fe3316378290696f9ebd9f11ac431d48fbda92a11c",
+    },
+];
+const LLAMA8B_BF16_FILES: &[PinnedSnapshotFile] = &[
+    PinnedSnapshotFile {
+        path: "config.json",
+        bytes: 944,
+        sha256: "cc4b961ba4da639c74e00e59956dadbca2471bee85bccabecf9373bfcb5a47b3",
+    },
+    PinnedSnapshotFile {
+        path: "model-00001-of-00004.safetensors",
+        bytes: 5_295_466_428,
+        sha256: "e8f8bd79686b2bf28b7f47826c14f038488c1e23311ffa64c5a6c84b9bd80a03",
+    },
+    PinnedSnapshotFile {
+        path: "model-00002-of-00004.safetensors",
+        bytes: 5_352_157_832,
+        sha256: "0ba199f8cba7b46e09dad10ee239a2877d6467f9448c08db87f7a74e43ead599",
+    },
+    PinnedSnapshotFile {
+        path: "model-00003-of-00004.safetensors",
+        bytes: 4_362_258_775,
+        sha256: "c37b5389bcd3d822c9a712b8fec3327585f760cc9b10081c81f9dfa9194d2794",
+    },
+    PinnedSnapshotFile {
+        path: "model-00004-of-00004.safetensors",
+        bytes: 1_050_673_279,
+        sha256: "bfca38e630589bdba9d83040a771d63b36ea18ce5bce8f7c70493119a1f77fd5",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors.index.json",
+        bytes: 25_125,
+        sha256: "e60a22a6cec3b5ac425ffa46d368d64999c1f411d63f967f72861670a0745ba5",
+    },
+    PinnedSnapshotFile {
+        path: "tokenizer_config.json",
+        bytes: 55_351,
+        sha256: "177c7b61e616fecb84c17ce0591acb92c6c4d60e9ac5ababfb940ff23bbcd424",
+    },
+];
+const QWEN8B_4BIT_FILES: &[PinnedSnapshotFile] = &[
+    PinnedSnapshotFile {
+        path: "config.json",
+        bytes: 939,
+        sha256: "e5485285fd7e289e76e9cffa112f6dc2e3426519082f7db9b69041589f81a218",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors",
+        bytes: 4_607_835_174,
+        sha256: "f2d29621aab300336ad645567ff38c42aac755513006ef4e8a579cf7ef5256d8",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors.index.json",
+        bytes: 64_065,
+        sha256: "3fb25463b4078b1fc27159daa605190029c2e965f533bf0b1b594f96cbfceb8a",
+    },
+    PinnedSnapshotFile {
+        path: "tokenizer_config.json",
+        bytes: 9_706,
+        sha256: "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0",
+    },
+];
+const QWEN8B_BF16_FILES: &[PinnedSnapshotFile] = &[
+    PinnedSnapshotFile {
+        path: "config.json",
+        bytes: 786,
+        sha256: "5d758e724677ed4cefc9fe625717e29ee051df5511f89c803fe418c4d34f84f8",
+    },
+    PinnedSnapshotFile {
+        path: "model-00001-of-00004.safetensors",
+        bytes: 5_288_151_758,
+        sha256: "511de1a92abea7eb36e57935cbdb9351ba0c1eb0941981127de92058d1cde22c",
+    },
+    PinnedSnapshotFile {
+        path: "model-00002-of-00004.safetensors",
+        bytes: 5_301_854_484,
+        sha256: "59f362e0f24dac3fbc08c0aacc56bc50747fe819322387b134a9cba2d0fc3cfd",
+    },
+    PinnedSnapshotFile {
+        path: "model-00003-of-00004.safetensors",
+        bytes: 4_546_850_621,
+        sha256: "d9eee2e91d2fcc18bf435d4464346a603d0a0727350767c9d5cec13b203f1df7",
+    },
+    PinnedSnapshotFile {
+        path: "model-00004-of-00004.safetensors",
+        bytes: 1_244_659_839,
+        sha256: "3b37554fa92ed7cb0282698b5f490aaa537dafd528511bbb3e77cdf004862e00",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors.index.json",
+        bytes: 34_485,
+        sha256: "ea95c14009d02d9eedf3e96d83a51f3ea81802243e3de0ae3560b2b89230aae1",
+    },
+    PinnedSnapshotFile {
+        path: "tokenizer_config.json",
+        bytes: 9_706,
+        sha256: "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0",
+    },
+];
+
+/// Llama-3.1-8B's fit-boundary window. The compressed fit row's admission estimate is the
+/// candidate estimate scaled by [`COMPRESSED_MEASURED_PEAK_SCALE_BPS`] (the measured A2 v5 peak
+/// ratio). At the native 130,560-token row that is 59.2 GiB x 1.27 = 75.2 GiB, over the 68 GiB
+/// child footprint cap of `.github/kv-poc/policies/llm.json`, so the row would be refused before
+/// spawn. A 107,008-token window puts the fit row at 106,496 tokens: 50.0 GiB x 1.27 = 63.5 GiB,
+/// 4.5 GiB under the cap; the next 2,048-token step (108,544) leaves 3.5 GiB. The other bands keep
+/// the native window (memory-material 32,768). A dense (A1) row also loads the bf16 reference
+/// (71.5 GiB here), which no fit row of at least 90% of this window keeps under the cap.
+pub const LLAMA8B_FIT_WINDOW_TOKENS: u64 = 107_008;
+
+pub const LLAMA8B_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
+    family: "llama8b",
+    role: "candidate",
+    repository: "mlx-community/Llama-3.1-8B-Instruct-4bit",
+    revision: "90215b22ec18e72f623dde2ea7af4097025160e2",
+    architecture: "LlamaForCausalLM",
+    model_type: "llama",
+    native_context_tokens: 131_072,
+    fit_window_tokens: Some(LLAMA8B_FIT_WINDOW_TOKENS),
+    quantized: true,
+    required_files: LLAMA8B_4BIT_FILES,
+};
+pub const LLAMA8B_REFERENCE: BenchmarkModelSpec = BenchmarkModelSpec {
+    family: "llama8b",
+    role: "bf16-reference",
+    repository: "mlx-community/Meta-Llama-3.1-8B-Instruct-bf16",
+    revision: "f8311090f9ee47782b6f094984a20c856eb841d6",
+    architecture: "LlamaForCausalLM",
+    model_type: "llama",
+    native_context_tokens: 131_072,
+    fit_window_tokens: Some(LLAMA8B_FIT_WINDOW_TOKENS),
+    quantized: false,
+    required_files: LLAMA8B_BF16_FILES,
+};
+pub const QWEN8B_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
+    family: "qwen8b",
+    role: "candidate",
+    repository: "mlx-community/Qwen3-8B-4bit",
+    revision: "545dc4251c05440727734bcd94334791f6ab0192",
+    architecture: "Qwen3ForCausalLM",
+    model_type: "qwen3",
+    native_context_tokens: 40_960,
+    fit_window_tokens: None,
+    quantized: true,
+    required_files: QWEN8B_4BIT_FILES,
+};
+pub const QWEN8B_REFERENCE: BenchmarkModelSpec = BenchmarkModelSpec {
+    family: "qwen8b",
+    role: "bf16-reference",
+    repository: "mlx-community/Qwen3-8B-bf16",
+    revision: "85dd0f16bfe491befbc9cf0b4e966664236e5050",
+    architecture: "Qwen3ForCausalLM",
+    model_type: "qwen3",
+    native_context_tokens: 40_960,
+    fit_window_tokens: None,
+    quantized: false,
+    required_files: QWEN8B_BF16_FILES,
+};
+
+/// The scheduled model families, in schedule order: each runs every context band on its own pinned
+/// candidate/reference pair ([`benchmark_model`]).
+pub const SC20671_FAMILIES: [&str; 4] = ["llama", "qwen", "llama8b", "qwen8b"];
+
+/// The `'static` scheduled family named `family`, or `None` for an unscheduled name.
+fn scheduled_family(family: &str) -> Option<&'static str> {
+    SC20671_FAMILIES
+        .into_iter()
+        .find(|candidate| *candidate == family)
+}
 
 pub fn benchmark_model(
     family: &str,
@@ -608,6 +811,10 @@ pub fn benchmark_model(
         ("llama", true) => Ok(&LLAMA_REFERENCE),
         ("qwen", false) => Ok(&QWEN_CANDIDATE),
         ("qwen", true) => Ok(&QWEN_REFERENCE),
+        ("llama8b", false) => Ok(&LLAMA8B_CANDIDATE),
+        ("llama8b", true) => Ok(&LLAMA8B_REFERENCE),
+        ("qwen8b", false) => Ok(&QWEN8B_CANDIDATE),
+        ("qwen8b", true) => Ok(&QWEN8B_REFERENCE),
         _ => Err(format!(
             "SC-20671 has no immutable benchmark model for family {family:?}"
         )),
@@ -640,6 +847,47 @@ pub fn context_band_target(context_window: u64, context_band: &str) -> Result<u6
     }
 }
 
+/// A spec's target for `context_band`: [`context_band_target`] of the native window, except the
+/// fit-boundary band of a spec with a [`BenchmarkModelSpec::fit_window_tokens`] cap, which is that
+/// window's fit target.
+pub fn spec_band_target(spec: &BenchmarkModelSpec, context_band: &str) -> Result<u64, String> {
+    match (context_band, spec.fit_window_tokens) {
+        ("fit-boundary", Some(window)) if window <= spec.native_context_tokens => {
+            context_band_target(window, context_band)
+        }
+        ("fit-boundary", Some(_)) => Err(format!(
+            "{} fit window exceeds its native window",
+            spec.repository
+        )),
+        _ => context_band_target(spec.native_context_tokens, context_band),
+    }
+}
+
+/// The fit window of a `family` row measured at `context_window`: the family's
+/// [`BenchmarkModelSpec::fit_window_tokens`] cap when that is its native window, else the window.
+fn row_fit_window(family: &str, context_window: u64) -> u64 {
+    benchmark_model(family, false)
+        .ok()
+        .filter(|spec| spec.native_context_tokens == context_window)
+        .and_then(|spec| spec.fit_window_tokens)
+        .unwrap_or(context_window)
+}
+
+/// A recorded row's band target: [`context_band_target`] of its window, with the family's fit cap
+/// ([`row_fit_window`]) on the fit-boundary band.
+fn row_band_target(family: &str, context_window: u64, context_band: &str) -> Result<u64, String> {
+    if context_band == "fit-boundary" {
+        context_band_target(row_fit_window(family, context_window), context_band)
+    } else {
+        context_band_target(context_window, context_band)
+    }
+}
+
+/// [`spec_band_target`] of a scheduled family's candidate.
+pub fn family_band_target(family: &str, context_band: &str) -> Result<u64, String> {
+    spec_band_target(benchmark_model(family, false)?, context_band)
+}
+
 /// Live tokens of a compressed row's forced continuation: the kernel prompt plus its continuation,
 /// which a fit-boundary row shortens to the native window.
 fn forced_continuation_live_tokens(kernel_prompt_tokens: u64, native_context_tokens: u64) -> u64 {
@@ -661,7 +909,7 @@ fn preflight_total_live_tokens(
 ) -> Result<(u64, u64), String> {
     let tokenizer = Tokenizer::from_file(snapshot.join("tokenizer.json"))
         .map_err(|e| format!("load pinned tokenizer for safety preflight: {e}"))?;
-    let target = context_band_target(spec.native_context_tokens, coordinate.context_band)?;
+    let target = spec_band_target(spec, coordinate.context_band)?;
     let header = format!("SC20671-CONTEXT-BAND-{}", coordinate.context_band);
     let token_count = |text: &str| -> Result<u64, String> {
         u64::try_from(
@@ -1010,9 +1258,15 @@ pub(crate) fn static_role_footprint_budget(
     }
     let layers = positive("num_hidden_layers")?;
     let kv_heads = positive("num_key_value_heads")?;
-    let head_dim = positive("head_dim")?;
     let query_heads = positive("num_attention_heads")?;
     let hidden_size = positive("hidden_size")?;
+    // The product loader's default when the config omits `head_dim` (Llama 3.1 does).
+    let head_dim = match config.get("head_dim") {
+        None => (hidden_size % query_heads == 0)
+            .then(|| hidden_size / query_heads)
+            .ok_or("pinned model hidden_size is not a multiple of num_attention_heads")?,
+        Some(_) => positive("head_dim")?,
+    };
     let intermediate_size = positive("intermediate_size")?;
     let vocab_size = positive("vocab_size")?;
     let element_bytes = pinned_dense_kv_element_bytes(spec, snapshot, layers)?;
@@ -1052,6 +1306,20 @@ pub(crate) fn static_role_footprint_budget(
         .ok_or("static model-load plus KV/working budget overflows".into())
 }
 
+/// Measured whole-process peak over the static candidate estimate of a compressed row, in basis
+/// points: the largest ratio of the A2 v5 receipts (run 37004025116, group-affine-8, inference
+/// 0030a60b8; receipt `memory.phaseSamples[*].physFootprintPeakBytes` over the candidate-only
+/// estimate this source computes for the same row): qwen-fit-boundary 17,960,978,184 B over
+/// 14,149,222,820 B is 1.2694; llama-fit-boundary 56,136,371,440 B over 46,768,365,740 B is
+/// 1.2003; llama/qwen memory-material 1.0715 / 1.0400; the short and medium rows sit below 1 (the
+/// group-affine-4 run's peaks are lower still). Rounded up to 1.27.
+pub const COMPRESSED_MEASURED_PEAK_SCALE_BPS: u64 = 12_700;
+
+/// The row's static floor over the roles its worker loads: a dense row loads the candidate then
+/// the bf16 reference (the larger prices the row); a compressed row's quality reference is the
+/// dense-KV arm on the SAME candidate weights, so only the candidate is ever loaded and the bf16
+/// reference is never priced. The candidate-only source estimate sat below the measured peak of
+/// the long compressed rows, so it is scaled by [`COMPRESSED_MEASURED_PEAK_SCALE_BPS`].
 fn static_row_footprint_budget(
     coordinate: &Coordinate,
     candidate_snapshot: &Path,
@@ -1059,6 +1327,7 @@ fn static_row_footprint_budget(
     total_live_tokens: u64,
     request_tokens: u64,
     policy: &CampaignSafetyPolicy,
+    compressed: bool,
 ) -> Result<u64, String> {
     let candidate = static_role_footprint_budget(
         benchmark_model(coordinate.family, false)?,
@@ -1066,13 +1335,19 @@ fn static_row_footprint_budget(
         total_live_tokens,
         request_tokens,
     )?;
-    let reference = static_role_footprint_budget(
-        benchmark_model(coordinate.family, true)?,
-        reference_snapshot,
-        total_live_tokens,
-        request_tokens,
-    )?;
-    let required = candidate.max(reference);
+    let required = if compressed {
+        candidate
+            .checked_mul(COMPRESSED_MEASURED_PEAK_SCALE_BPS)
+            .map(|bytes| bytes.div_ceil(10_000))
+            .ok_or("scaled compressed footprint budget overflows")?
+    } else {
+        candidate.max(static_role_footprint_budget(
+            benchmark_model(coordinate.family, true)?,
+            reference_snapshot,
+            total_live_tokens,
+            request_tokens,
+        )?)
+    };
     if required > policy.child_footprint_cap_bytes {
         return Err(format!(
             "{} needs at least {required} bytes of source-based model-load plus KV/working budget; child footprint cap {} refuses before spawn",
@@ -1127,6 +1402,7 @@ fn static_row_requirements(
         total,
         max_request,
         policy,
+        compressed,
     )?;
     Ok((total, max_request, known_footprint_budget))
 }
@@ -2721,7 +2997,7 @@ impl ReceiptBuilder {
         {
             return Err("invalid command or thermal provenance".into());
         }
-        if !["llama", "qwen"].contains(&self.template.matrix.family.as_str())
+        if !SC20671_FAMILIES.contains(&self.template.matrix.family.as_str())
             || !CONTEXT_BANDS.contains(&self.template.matrix.context_band.as_str())
             || !["single", "supported-batch"].contains(&self.template.matrix.request_mode.as_str())
             || !["chunked", "single-shot"].contains(&self.template.matrix.prefill_mode.as_str())
@@ -2744,7 +3020,8 @@ impl ReceiptBuilder {
             return Err("invalid geometry".into());
         }
         if self.template.geometry.context_target_tokens
-            != context_band_target(
+            != row_band_target(
+                &self.template.matrix.family,
                 self.template.geometry.context_window_tokens,
                 &self.template.matrix.context_band,
             )?
@@ -3492,7 +3769,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if g.element_bytes != DENSE_KV_COMPUTE_ELEMENT_BYTES {
         return Err(dense_kv_width_refusal(g.element_bytes));
     }
-    if !["llama", "qwen"].contains(&receipt.matrix.family.as_str())
+    if !SC20671_FAMILIES.contains(&receipt.matrix.family.as_str())
         || !CONTEXT_BANDS.contains(&receipt.matrix.context_band.as_str())
         || !["single", "supported-batch"].contains(&receipt.matrix.request_mode.as_str())
         || !["chunked", "single-shot"].contains(&receipt.matrix.prefill_mode.as_str())
@@ -3505,7 +3782,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("matrix coordinate or geometry relationship is invalid".into());
     }
     if receipt.geometry.context_target_tokens
-        != context_band_target(
+        != row_band_target(
+            &receipt.matrix.family,
             receipt.geometry.context_window_tokens,
             &receipt.matrix.context_band,
         )?
@@ -3685,8 +3963,11 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if receipt.matrix.context_band == "fit-boundary"
         && (receipt.geometry.kv_length > receipt.geometry.context_window_tokens
             || u128::from(receipt.geometry.kv_length).saturating_mul(10_000)
-                < u128::from(receipt.geometry.context_window_tokens)
-                    .saturating_mul(u128::from(FIT_BOUNDARY_MIN_CONTEXT_BPS)))
+                < u128::from(row_fit_window(
+                    &receipt.matrix.family,
+                    receipt.geometry.context_window_tokens,
+                ))
+                .saturating_mul(u128::from(FIT_BOUNDARY_MIN_CONTEXT_BPS)))
     {
         return Err("fit-boundary cache occupancy is below the frozen admission ratio".into());
     }
@@ -4872,11 +5153,7 @@ fn validate_fixture_binding(
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| format!("fixture {name} lacks producer binding"))?;
     let expected_coordinate = coordinate_slug(&Coordinate {
-        family: match receipt.matrix.family.as_str() {
-            "llama" => "llama",
-            "qwen" => "qwen",
-            _ => return Err("fixture receipt family".into()),
-        },
+        family: scheduled_family(&receipt.matrix.family).ok_or("fixture receipt family")?,
         context_band: match receipt.matrix.context_band.as_str() {
             "short" => "short",
             "medium" => "medium",
@@ -5270,7 +5547,8 @@ pub fn estimate_row_seconds(
         .iter()
         .filter(|row| row.family == family)
         .max_by_key(|row| row.context_target_tokens)?;
-    let target_tokens = context_band_target(row.context_window_tokens, context_band).ok()? as f64;
+    let target_tokens =
+        row_band_target(family, row.context_window_tokens, context_band).ok()? as f64;
     let basis_prefill = row.work.prefills as f64 * row.prefill_seconds;
     let basis_fixed = (row.wall_seconds - basis_prefill).max(0.0);
     let fixed_seconds = basis_fixed * target.units as f64 / row.work.units as f64;
@@ -5294,7 +5572,7 @@ pub fn duration_estimate_refuses(estimate: &RowDurationEstimate, deadline_second
     estimate.seconds > deadline_seconds as f64 * DURATION_REFUSAL_MARGIN
 }
 
-/// Atomically publish the whole eight-coordinate receipt collection. Individual worker output is
+/// Atomically publish the whole scheduled receipt collection. Individual worker output is
 /// intentionally not a campaign result; only this function creates `destination`, and it does so
 /// after every receipt, sidecar, coordinate, and product-owned worker PID has been validated.
 pub fn publish_complete_campaign(
@@ -5335,7 +5613,10 @@ fn publish_campaign(
         .collect::<Vec<_>>();
     if prepared.len() != schedule.len() {
         return Err(match only_coordinate {
-            None => "complete campaign requires exactly eight prepared receipts".into(),
+            None => format!(
+                "complete campaign requires exactly {} prepared receipts",
+                schedule.len()
+            ),
             Some(slug) => {
                 format!("partial run of {slug} requires exactly its one prepared receipt")
             }
@@ -5380,11 +5661,8 @@ fn publish_campaign(
             .entry(receipt.matrix.family.clone())
             .or_insert(family_identity);
         let coordinate = Coordinate {
-            family: match receipt.matrix.family.as_str() {
-                "llama" => "llama",
-                "qwen" => "qwen",
-                _ => return Err("prepared receipt has unsupported family".into()),
-            },
+            family: scheduled_family(&receipt.matrix.family)
+                .ok_or("prepared receipt has unsupported family")?,
             context_band: match receipt.matrix.context_band.as_str() {
                 "short" => "short",
                 "medium" => "medium",
@@ -5638,8 +5916,15 @@ pub fn load_validated_complete_campaign(
             if value
                 .get("scheduleVersion")
                 .and_then(serde_json::Value::as_u64)
-                == Some(SC20671_SCHEDULE_VERSION) =>
+                .and_then(covering_schedule)
+                .is_some() =>
         {
+            let schedule_version = value
+                .get("scheduleVersion")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("SC-20671 v2 manifest lacks its schedule version")?;
+            let schedule =
+                covering_schedule(schedule_version).ok_or("unsupported covering schedule")?;
             for key in ["policySha256", "resumeIdentitySha256"] {
                 let digest = value
                     .get(key)
@@ -5668,7 +5953,7 @@ pub fn load_validated_complete_campaign(
                 || identity
                     .get("scheduleVersion")
                     .and_then(serde_json::Value::as_u64)
-                    != Some(SC20671_SCHEDULE_VERSION)
+                    != Some(schedule_version)
                 || identity
                     .get("schemaVersion")
                     .and_then(serde_json::Value::as_u64)
@@ -5676,9 +5961,9 @@ pub fn load_validated_complete_campaign(
                 || identity.get("kind").and_then(serde_json::Value::as_str)
                     != Some("sc-20671-resume-identity")
                 || identity.get("coordinates")
-                    != Some(&serde_json::json!(required_coordinates()
+                    != Some(&serde_json::json!(schedule
                         .iter()
-                        .map(coordinate_slug)
+                        .map(|row| coordinate_slug(&row.coordinate))
                         .collect::<Vec<_>>()))
                 || seal_json(&identity)?.0 != identity_bytes
             {
@@ -5699,7 +5984,7 @@ pub fn load_validated_complete_campaign(
             {
                 return Err("SC-20671 published safety policy bytes drifted".into());
             }
-            (required_schedule(), Some(identity), Some(policy))
+            (schedule, Some(identity), Some(policy))
         }
         _ => return Err("SC-20671 campaign manifest identity is invalid".into()),
     };
@@ -6162,10 +6447,8 @@ pub(crate) struct DriveOutcome {
 #[derive(Clone, Debug)]
 pub struct CampaignLaunch {
     pub executable: PathBuf,
-    pub llama_snapshot: PathBuf,
-    pub qwen_snapshot: PathBuf,
-    pub llama_fp32_reference_snapshot: PathBuf,
-    pub qwen_fp32_reference_snapshot: PathBuf,
+    /// One candidate/reference snapshot pair per [`SC20671_FAMILIES`] entry, in that order.
+    pub snapshots: [FamilySnapshots; SC20671_FAMILIES.len()],
     pub prompt_file: PathBuf,
     pub destination: PathBuf,
     pub resume_dir: PathBuf,
@@ -6178,6 +6461,75 @@ pub struct CampaignLaunch {
     /// `--only-coordinate <slug>`: run just this scheduled row. The run publishes a partial,
     /// non-publishable manifest ([`SC20671_PARTIAL_RUN_KIND`]), never a campaign.
     pub only_coordinate: Option<String>,
+}
+
+/// One family's snapshot directories: `--<family>-snapshot` (the measured 4-bit candidate) and
+/// `--<family>-fp32-reference-snapshot` (its pinned bf16 reference).
+#[derive(Clone, Debug)]
+pub struct FamilySnapshots {
+    pub candidate: PathBuf,
+    pub reference: PathBuf,
+}
+
+impl CampaignLaunch {
+    /// The snapshot pair of a scheduled `family`.
+    fn family_snapshots(&self, family: &str) -> Result<&FamilySnapshots, String> {
+        SC20671_FAMILIES
+            .iter()
+            .position(|candidate| *candidate == family)
+            .map(|index| &self.snapshots[index])
+            .ok_or_else(|| format!("SC-20671 has no snapshots for family {family:?}"))
+    }
+
+    /// Every pinned snapshot's inventory, candidates then references, each in
+    /// [`SC20671_FAMILIES`] order (the [`resume_identity`] key order).
+    fn validated_inventories(&self) -> Result<Vec<SnapshotInventory>, String> {
+        [false, true]
+            .into_iter()
+            .flat_map(|reference| {
+                SC20671_FAMILIES
+                    .iter()
+                    .zip(&self.snapshots)
+                    .map(move |(family, pair)| {
+                        let path = if reference {
+                            &pair.reference
+                        } else {
+                            &pair.candidate
+                        };
+                        validate_benchmark_snapshot(path, benchmark_model(family, reference)?)
+                    })
+            })
+            .collect()
+    }
+}
+
+/// The resume-identity key of a family's candidate or reference inventory (`llamaCandidate`,
+/// `qwen8bReference`, ...).
+fn inventory_identity_key(family: &str, reference: bool) -> String {
+    format!(
+        "{family}{}",
+        if reference { "Reference" } else { "Candidate" }
+    )
+}
+
+/// Parse `--<family>-snapshot` and `--<family>-fp32-reference-snapshot` for every scheduled family.
+fn family_snapshot_flags(
+    args: &[String],
+) -> Result<[FamilySnapshots; SC20671_FAMILIES.len()], String> {
+    SC20671_FAMILIES
+        .iter()
+        .map(|family| {
+            Ok(FamilySnapshots {
+                candidate: PathBuf::from(required_flag(args, &format!("--{family}-snapshot"))?),
+                reference: PathBuf::from(required_flag(
+                    args,
+                    &format!("--{family}-fp32-reference-snapshot"),
+                )?),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .try_into()
+        .map_err(|_| "one snapshot pair per scheduled family".to_string())
 }
 
 /// Indices into [`required_schedule`] a launch runs: all of them, or the one `--only-coordinate`
@@ -6216,8 +6568,13 @@ pub(crate) fn file_seal(path: &Path) -> Result<String, String> {
 fn resume_identity(
     launch: &CampaignLaunch,
     policy_sha256: &str,
-    inventories: &[SnapshotInventory; 4],
+    inventories: &[SnapshotInventory],
 ) -> Result<serde_json::Value, String> {
+    if inventories.len() != 2 * SC20671_FAMILIES.len() {
+        return Err(
+            "resume identity needs every family's candidate and reference inventory".into(),
+        );
+    }
     let inference_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(3)
@@ -6241,11 +6598,13 @@ fn resume_identity(
         "executableSha256": file_seal(&launch.executable)?,
         "promptSha256": file_seal(&launch.prompt_file)?,
         "policySha256": policy_sha256,
-        "llamaCandidate": inventory_value(0),
-        "qwenCandidate": inventory_value(1),
-        "llamaReference": inventory_value(2),
-        "qwenReference": inventory_value(3),
     });
+    for (index, reference) in [false, true].into_iter().enumerate() {
+        for (offset, family) in SC20671_FAMILIES.iter().enumerate() {
+            identity[inventory_identity_key(family, reference)] =
+                inventory_value(index * SC20671_FAMILIES.len() + offset);
+        }
+    }
     bind_resume_mode(&mut identity, launch.compressed);
     if let Some(slug) = &launch.only_coordinate {
         // A single-row run never shares a resume directory with a full campaign.
@@ -6329,12 +6688,7 @@ fn prepare_resume_root(root: &Path, identity: &mut serde_json::Value) -> Result<
 /// an independent consumer before any model child is started.
 pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json::Value, String> {
     let policy = load_campaign_safety_policy(&launch.safety_policy)?;
-    let inventories = [
-        validate_benchmark_snapshot(&launch.llama_snapshot, &LLAMA_CANDIDATE)?,
-        validate_benchmark_snapshot(&launch.qwen_snapshot, &QWEN_CANDIDATE)?,
-        validate_benchmark_snapshot(&launch.llama_fp32_reference_snapshot, &LLAMA_REFERENCE)?,
-        validate_benchmark_snapshot(&launch.qwen_fp32_reference_snapshot, &QWEN_REFERENCE)?,
-    ];
+    let inventories = launch.validated_inventories()?;
     let prompt = fs::read_to_string(&launch.prompt_file).map_err(|e| e.to_string())?;
     if prompt.trim().is_empty() {
         return Err("campaign prompt must not be empty".into());
@@ -6345,14 +6699,8 @@ pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json
         .into_iter()
         .map(|index| schedule[index].clone())
     {
-        let (candidate, reference) = if row.coordinate.family == "llama" {
-            (
-                &launch.llama_snapshot,
-                &launch.llama_fp32_reference_snapshot,
-            )
-        } else {
-            (&launch.qwen_snapshot, &launch.qwen_fp32_reference_snapshot)
-        };
+        let pair = launch.family_snapshots(row.coordinate.family)?;
+        let (candidate, reference) = (&pair.candidate, &pair.reference);
         let coordinate = coordinate_slug(&row.coordinate);
         match static_row_requirements(
             &row.coordinate,
@@ -6444,11 +6792,11 @@ fn validate_receipt_launch_identity(
             .and_then(|v| v.get("bytes"))
             .and_then(serde_json::Value::as_u64)
     };
-    let (candidate, reference) = if coordinate.family == "llama" {
-        ("llamaCandidate", "llamaReference")
-    } else {
-        ("qwenCandidate", "qwenReference")
-    };
+    let (candidate, reference) = (
+        inventory_identity_key(coordinate.family, false),
+        inventory_identity_key(coordinate.family, true),
+    );
+    let (candidate, reference) = (candidate.as_str(), reference.as_str());
     let method = resume_identity_mode(identity)?;
     if receipt.mode
         != if method.is_some() {
@@ -6524,13 +6872,16 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
     }
     for path in [
         &launch.executable,
-        &launch.llama_snapshot,
-        &launch.qwen_snapshot,
-        &launch.llama_fp32_reference_snapshot,
-        &launch.qwen_fp32_reference_snapshot,
         &launch.prompt_file,
         &launch.safety_policy,
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        launch
+            .snapshots
+            .iter()
+            .flat_map(|pair| [&pair.candidate, &pair.reference]),
+    ) {
         if !path.exists() {
             return Err(format!(
                 "required campaign input is absent: {}",
@@ -6540,12 +6891,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
     }
     let policy = load_campaign_safety_policy(&launch.safety_policy)?;
     let policy_sha256 = policy.seal()?;
-    let inventories = [
-        validate_benchmark_snapshot(&launch.llama_snapshot, &LLAMA_CANDIDATE)?,
-        validate_benchmark_snapshot(&launch.qwen_snapshot, &QWEN_CANDIDATE)?,
-        validate_benchmark_snapshot(&launch.llama_fp32_reference_snapshot, &LLAMA_REFERENCE)?,
-        validate_benchmark_snapshot(&launch.qwen_fp32_reference_snapshot, &QWEN_REFERENCE)?,
-    ];
+    let inventories = launch.validated_inventories()?;
     let schedule = required_schedule();
     let selected = selected_schedule_indices(launch.only_coordinate.as_deref())?;
     let prompt = fs::read_to_string(&launch.prompt_file).map_err(|e| e.to_string())?;
@@ -6588,16 +6934,8 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                 )?);
                 return Ok(true);
             }
-            let snapshot = if row.coordinate.family == "llama" {
-                &launch.llama_snapshot
-            } else {
-                &launch.qwen_snapshot
-            };
-            let reference_snapshot = if row.coordinate.family == "llama" {
-                &launch.llama_fp32_reference_snapshot
-            } else {
-                &launch.qwen_fp32_reference_snapshot
-            };
+            let pair = launch.family_snapshots(row.coordinate.family)?;
+            let (snapshot, reference_snapshot) = (&pair.candidate, &pair.reference);
             let (total_tokens, request_tokens, static_footprint_floor) = static_row_requirements(
                 &row.coordinate,
                 snapshot,
@@ -6900,6 +7238,8 @@ fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, 
 ///   parent --mode compressed --kv-method group-affine \
 ///   --llama-snapshot <llama-4bit> --qwen-snapshot <qwen-4bit> \
 ///   --llama-fp32-reference-snapshot <llama-bf16> --qwen-fp32-reference-snapshot <qwen-bf16> \
+///   --llama8b-snapshot <llama8b-4bit> --qwen8b-snapshot <qwen8b-4bit> \
+///   --llama8b-fp32-reference-snapshot <llama8b-bf16> --qwen8b-fp32-reference-snapshot <qwen8b-bf16> \
 ///   --prompt-file <prompt.txt> --safety-policy <policy.json> \
 ///   --resume-dir /abs/sc20676-compressed-resume --out /abs/sc20676-compressed-campaign
 /// ```
@@ -6919,16 +7259,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let resume_dir = PathBuf::from(required_flag(args, "--resume-dir")?);
             let launch = CampaignLaunch {
                 executable: std::env::current_exe().map_err(|e| e.to_string())?,
-                llama_snapshot: PathBuf::from(required_flag(args, "--llama-snapshot")?),
-                qwen_snapshot: PathBuf::from(required_flag(args, "--qwen-snapshot")?),
-                llama_fp32_reference_snapshot: PathBuf::from(required_flag(
-                    args,
-                    "--llama-fp32-reference-snapshot",
-                )?),
-                qwen_fp32_reference_snapshot: PathBuf::from(required_flag(
-                    args,
-                    "--qwen-fp32-reference-snapshot",
-                )?),
+                snapshots: family_snapshot_flags(args)?,
                 prompt_file: PathBuf::from(required_flag(args, "--prompt-file")?),
                 destination: PathBuf::from(required_flag(args, "--out")?),
                 stop_files: operator_stop_files(args, &resume_dir)?,
@@ -7000,7 +7331,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let row = required_schedule()
                 .get(index)
                 .cloned()
-                .ok_or("--coordinate-index is outside the frozen eight-coordinate schedule")?;
+                .ok_or("--coordinate-index is outside the frozen covering schedule")?;
             if let Some(only) = identity.get("onlyCoordinate") {
                 if only.as_str() != Some(coordinate_slug(&row.coordinate).as_str()) {
                     return Err(
@@ -7028,14 +7359,13 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 &snapshot,
                 &reference_snapshot,
             )?;
-            let (candidate_key, reference_key) = if row.coordinate.family == "llama" {
-                ("llamaCandidate", "llamaReference")
-            } else {
-                ("qwenCandidate", "qwenReference")
-            };
+            let (candidate_key, reference_key) = (
+                inventory_identity_key(row.coordinate.family, false),
+                inventory_identity_key(row.coordinate.family, true),
+            );
             for (key, inventory) in [
-                (candidate_key, &candidate_inventory),
-                (reference_key, &reference_inventory),
+                (candidate_key.as_str(), &candidate_inventory),
+                (reference_key.as_str(), &reference_inventory),
             ] {
                 if identity
                     .get(key)
@@ -7538,7 +7868,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             println!("{}", String::from_utf8(bytes).map_err(|e| e.to_string())?);
             Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --safety-policy <json> --out <json> [--prefill-chunk <tokens>] | noise-floor-parent --llama-snapshot <dir> --qwen-snapshot <dir> --llama-fp32-reference-snapshot <dir> --qwen-fp32-reference-snapshot <dir> --prompt-file <file> --safety-policy <json> --resume-dir <dir> --out <dir> [--prefill-chunk <tokens>] [--stop-file <path>]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options] | noise-floor --snapshot <dir> --prompt-file <file> --coordinate <coordinate> --safety-policy <json> --out <json> [--prefill-chunk <tokens>] | noise-floor-parent --llama-snapshot <dir> --qwen-snapshot <dir> --llama8b-snapshot <dir> --qwen8b-snapshot <dir> [--<family>-fp32-reference-snapshot <dir> ...] --prompt-file <file> --safety-policy <json> --resume-dir <dir> --out <dir> [--prefill-chunk <tokens>] [--stop-file <path>]".into()),
     }
 }
 
@@ -7911,22 +8241,21 @@ fn noise_floor_parent(args: &[String]) -> Result<CampaignOutcome, String> {
     // SC-20671 dense row (candidate plus reference), an upper bound for one dense session.
     // The measured 4-bit candidate of each family: the worker's only session (the bf16 reference
     // flags phase.sh shares with A1/A2 are accepted and unused).
-    let snapshots = [
-        (
-            "llama",
-            PathBuf::from(required_flag(args, "--llama-snapshot")?),
-        ),
-        (
-            "qwen",
-            PathBuf::from(required_flag(args, "--qwen-snapshot")?),
-        ),
-    ];
+    let snapshots = SC20671_FAMILIES
+        .into_iter()
+        .map(|family| {
+            Ok((
+                family,
+                PathBuf::from(required_flag(args, &format!("--{family}-snapshot"))?),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let prefill_chunk = optional_flag(args, "--prefill-chunk")?;
     let stop_files = operator_stop_files(args, &resume_dir)?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let logs = resume_dir.join("logs");
     fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
-    // `--only-coordinate`: one scheduled row (kv-poc `nf_only_coordinate`); else all eight.
+    // `--only-coordinate`: one scheduled row (kv-poc `nf_only_coordinate`); else every row.
     let only_coordinate = optional_flag(args, "--only-coordinate")?;
     let coordinates = required_coordinates()
         .into_iter()
@@ -8077,6 +8406,26 @@ pub fn required_coordinates() -> Vec<Coordinate> {
         ("qwen", "medium", "supported-batch", "chunked", "warm"),
         ("qwen", "memory-material", "single", "single-shot", "warm"),
         ("qwen", "fit-boundary", "single", "chunked", "cold"),
+        ("llama8b", "short", "single", "chunked", "cold"),
+        (
+            "llama8b",
+            "medium",
+            "supported-batch",
+            "single-shot",
+            "warm",
+        ),
+        (
+            "llama8b",
+            "memory-material",
+            "single",
+            "single-shot",
+            "warm",
+        ),
+        ("llama8b", "fit-boundary", "single", "chunked", "cold"),
+        ("qwen8b", "short", "single", "single-shot", "cold"),
+        ("qwen8b", "medium", "supported-batch", "chunked", "warm"),
+        ("qwen8b", "memory-material", "single", "single-shot", "warm"),
+        ("qwen8b", "fit-boundary", "single", "chunked", "cold"),
     ]
     .into_iter()
     .map(
@@ -8157,6 +8506,22 @@ pub fn required_schedule() -> Vec<ScheduledCoordinate> {
         .collect()
 }
 
+/// The covering schedule a published campaign of `version` ran: v3 (the current sixteen rows) or
+/// v2 (the eight `llama`/`qwen` rows, published before the 8B families; still read so SC-20676 can
+/// bind an earlier dense baseline). `None` for any other version.
+fn covering_schedule(version: u64) -> Option<Vec<ScheduledCoordinate>> {
+    match version {
+        SC20671_SCHEDULE_VERSION => Some(required_schedule()),
+        2 => Some(
+            required_schedule()
+                .into_iter()
+                .filter(|row| ["llama", "qwen"].contains(&row.coordinate.family))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn legacy_required_schedule() -> Vec<ScheduledCoordinate> {
     legacy_required_coordinates()
         .into_iter()
@@ -8178,8 +8543,15 @@ pub fn validate_schedule_outcomes(
     scheduled: &[ScheduledCoordinate],
     outcomes: &[(Coordinate, ProcessDiscipline, u32)],
 ) -> Result<(), String> {
-    if ![8, 64].contains(&scheduled.len()) || outcomes.len() != scheduled.len() {
-        return Err("campaign schedule must contain exactly 8 or 64 outcomes".into());
+    let lengths = [
+        covering_schedule(2).map_or(0, |rows| rows.len()),
+        required_coordinates().len(),
+        legacy_required_coordinates().len(),
+    ];
+    if !lengths.contains(&scheduled.len()) || outcomes.len() != scheduled.len() {
+        return Err(format!(
+            "campaign schedule must contain exactly {lengths:?} outcomes"
+        ));
     }
     let key = |coordinate: &Coordinate| {
         format!(
@@ -11086,15 +11458,21 @@ fn run_product_fixture_half_on_session(
     run_product_fixture_half_on_session_bounded(session, prompt, coordinate, u64::MAX, None)
 }
 
+/// `coordinate`'s band target ([`family_band_target`]) for the provider's payload builders.
+fn coordinate_band_target(coordinate: &Coordinate) -> core_llm::Result<u64> {
+    family_band_target(coordinate.family, coordinate.context_band).map_err(core_llm::Error::Load)
+}
+
 /// The kernel fixture prompt of `coordinate`'s context band, exactly as the fixture half builds it.
 fn kernel_fixture_prompt(
     session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
 ) -> core_llm::Result<String> {
-    let (band_payload, ..) = session
-        .provider
-        .campaign_context_band_measurement(coordinate.context_band)?;
+    let (band_payload, ..) = session.provider.campaign_context_band_measurement(
+        coordinate.context_band,
+        coordinate_band_target(coordinate)?,
+    )?;
     Ok(format!(
         "{prompt}\n{band_payload}\nReturn a concise deterministic answer."
     ))
@@ -11107,9 +11485,10 @@ fn cache_fixture_prompt(
     prompt: &str,
     coordinate: &Coordinate,
 ) -> core_llm::Result<String> {
-    let (band_payload, ..) = session
-        .provider
-        .campaign_context_band_measurement(coordinate.context_band)?;
+    let (band_payload, ..) = session.provider.campaign_context_band_measurement(
+        coordinate.context_band,
+        coordinate_band_target(coordinate)?,
+    )?;
     Ok(format!(
         "{prompt}\n{band_payload}\nRepeat the stable baseline fact."
     ))
@@ -11122,9 +11501,10 @@ fn multi_turn_fixture_prompt(
     prompt: &str,
     coordinate: &Coordinate,
 ) -> core_llm::Result<String> {
-    let (payload, ..) = session
-        .provider
-        .campaign_multi_turn_payload(coordinate.context_band)?;
+    let (payload, ..) = session.provider.campaign_multi_turn_payload(
+        coordinate.context_band,
+        coordinate_band_target(coordinate)?,
+    )?;
     Ok(format!(
         "{prompt}\n{payload}\nRepeat the stable baseline fact."
     ))
@@ -11297,9 +11677,11 @@ fn run_product_fixture_half_on_session_bounded(
 ) -> core_llm::Result<ProductFixtureHalf> {
     session.validate_coordinate_family(coordinate)?;
     let context_window_tokens = session.provider.campaign_context_window()?;
-    let (band_payload, context_target_tokens, context_payload_tokens) = session
-        .provider
-        .campaign_context_band_measurement(coordinate.context_band)?;
+    let (band_payload, context_target_tokens, context_payload_tokens) =
+        session.provider.campaign_context_band_measurement(
+            coordinate.context_band,
+            coordinate_band_target(coordinate)?,
+        )?;
     let needle = "SC20671-NUMERIC-NEEDLE-9b7a2e".to_string();
     let kernel_prompt = kernel_fixture_prompt(session, prompt, coordinate)?;
     let tool_prompt = format!(
@@ -13841,6 +14223,10 @@ pub(crate) mod tests {
                 "/nonexistent/llama-bf16",
                 "--qwen-fp32-reference-snapshot",
                 "/nonexistent/qwen-bf16",
+                "--llama8b-snapshot",
+                "/nonexistent/llama8b",
+                "--qwen8b-snapshot",
+                "/nonexistent/qwen8b",
                 "--prompt-file",
                 prompt.to_str().unwrap(),
                 "--safety-policy",
@@ -14162,6 +14548,96 @@ pub(crate) mod tests {
         );
     }
 
+    /// sc-20688: the 8B families pin their own candidate/reference pair, and every family runs the
+    /// same four rows. Bands follow the native window (Llama-3.1-8B material 32,768, Qwen3-8B
+    /// 10,240) except Llama-3.1-8B's fit row, capped at the largest the 68 GiB child cap admits.
+    #[test]
+    fn eight_b_families_pin_their_pairs_and_mirror_the_row_structure() {
+        for (family, candidate, reference, window, material, fit) in [
+            (
+                "llama8b",
+                "mlx-community/Llama-3.1-8B-Instruct-4bit@90215b22ec18e72f623dde2ea7af4097025160e2",
+                "mlx-community/Meta-Llama-3.1-8B-Instruct-bf16@f8311090f9ee47782b6f094984a20c856eb841d6",
+                131_072,
+                32_768,
+                106_496,
+            ),
+            (
+                "qwen8b",
+                "mlx-community/Qwen3-8B-4bit@545dc4251c05440727734bcd94334791f6ab0192",
+                "mlx-community/Qwen3-8B-bf16@85dd0f16bfe491befbc9cf0b4e966664236e5050",
+                40_960,
+                10_240,
+                40_448,
+            ),
+        ] {
+            let pin = |spec: &BenchmarkModelSpec| format!("{}@{}", spec.repository, spec.revision);
+            let (c, r) = (
+                benchmark_model(family, false).unwrap(),
+                benchmark_model(family, true).unwrap(),
+            );
+            assert_eq!((pin(c).as_str(), pin(r).as_str()), (candidate, reference));
+            assert!(c.quantized && !r.quantized);
+            assert_eq!((c.family, r.family), (family, family));
+            assert_eq!(c.native_context_tokens, window);
+            assert_eq!(family_band_target(family, "short").unwrap(), 32);
+            assert_eq!(family_band_target(family, "medium").unwrap(), 1_024);
+            assert_eq!(family_band_target(family, "memory-material").unwrap(), material);
+            assert_eq!(family_band_target(family, "fit-boundary").unwrap(), fit);
+        }
+        // A recorded row is validated against the same capped target and occupancy window when it
+        // ran at the family's native window; a synthetic window keeps the plain band formula.
+        assert_eq!(
+            row_band_target("llama8b", 131_072, "fit-boundary").unwrap(),
+            106_496
+        );
+        assert_eq!(
+            row_fit_window("llama8b", 131_072),
+            LLAMA8B_FIT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            row_band_target("llama8b", 131_072, "memory-material").unwrap(),
+            32_768
+        );
+        assert_eq!(
+            row_band_target("llama8b", 4_096, "fit-boundary").unwrap(),
+            context_band_target(4_096, "fit-boundary").unwrap()
+        );
+        assert_eq!(row_fit_window("qwen8b", 40_960), 40_960);
+        // The measured 3B/1.7B families keep their native-window fit rows.
+        assert_eq!(
+            family_band_target("llama", "fit-boundary").unwrap(),
+            130_560
+        );
+        assert_eq!(family_band_target("qwen", "fit-boundary").unwrap(), 40_448);
+        // A fit window wider than the native window is refused, never silently used.
+        let mut wide = LLAMA8B_CANDIDATE;
+        wide.fit_window_tokens = Some(wide.native_context_tokens + 1);
+        assert!(spec_band_target(&wide, "fit-boundary").is_err());
+        // Every family runs exactly the measured families' row structure, in schedule order.
+        let shape = |family: &str| {
+            required_coordinates()
+                .into_iter()
+                .filter(|row| row.family == family)
+                .map(|row| {
+                    (
+                        row.context_band,
+                        row.request_mode,
+                        row.prefill_mode,
+                        row.process_temperature,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(required_coordinates().len(), 4 * SC20671_FAMILIES.len());
+        assert_eq!(shape("llama8b"), shape("llama"));
+        assert_eq!(shape("qwen8b"), shape("qwen"));
+        assert_eq!(
+            inventory_identity_key("qwen8b", true),
+            "qwen8bReference".to_string()
+        );
+    }
+
     #[test]
     fn benchmark_snapshot_rejects_substitution_family_and_reference_mismatch() {
         const FILES: &[PinnedSnapshotFile] = &[
@@ -14184,6 +14660,7 @@ pub(crate) mod tests {
             architecture: "LlamaForCausalLM",
             model_type: "llama",
             native_context_tokens: 32_768,
+            fit_window_tokens: None,
             quantized: true,
             required_files: FILES,
         };
@@ -14484,9 +14961,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn required_covering_set_is_exactly_eight_coordinates() {
+    fn required_covering_set_is_exactly_sixteen_coordinates() {
         let coordinates = required_coordinates();
-        assert_eq!(coordinates.len(), 8);
+        assert_eq!(coordinates.len(), 16);
         assert_eq!(
             coordinates.iter().map(coordinate_slug).collect::<Vec<_>>(),
             [
@@ -14498,6 +14975,14 @@ pub(crate) mod tests {
                 "qwen-medium-supported-batch-chunked-warm",
                 "qwen-memory-material-single-single-shot-warm",
                 "qwen-fit-boundary-single-chunked-cold",
+                "llama8b-short-single-chunked-cold",
+                "llama8b-medium-supported-batch-single-shot-warm",
+                "llama8b-memory-material-single-single-shot-warm",
+                "llama8b-fit-boundary-single-chunked-cold",
+                "qwen8b-short-single-single-shot-cold",
+                "qwen8b-medium-supported-batch-chunked-warm",
+                "qwen8b-memory-material-single-single-shot-warm",
+                "qwen8b-fit-boundary-single-chunked-cold",
             ]
         );
         assert_eq!(legacy_required_schedule().len(), 64);
@@ -14514,7 +14999,7 @@ pub(crate) mod tests {
         const SLUG: &str = "llama-memory-material-single-single-shot-warm";
         assert_eq!(
             selected_schedule_indices(None).unwrap(),
-            (0..8).collect::<Vec<_>>()
+            (0..16).collect::<Vec<_>>()
         );
         let selected = selected_schedule_indices(Some(SLUG)).unwrap();
         assert_eq!(selected, vec![2]);
@@ -14593,6 +15078,99 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             load_validated_complete_campaign(&destination).unwrap_err(),
+            "SC-20671 campaign manifest identity is invalid"
+        );
+    }
+
+    /// sc-20688: the complete-campaign loader still reads a published schedule-v2 campaign (the
+    /// eight `llama`/`qwen` rows, SC-20676's dense baseline) as well as v3, routes each to its own
+    /// schedule and resume-identity coordinates, and refuses any other schedule version or a v2
+    /// manifest bound to the v3 coordinate list.
+    #[test]
+    fn complete_campaign_loader_reads_schedule_v2_and_v3_by_their_own_schedule() {
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1024,
+            child_footprint_cap_bytes: 2048,
+            max_context_tokens: 4096,
+            max_request_tokens: 4096,
+            stdout_cap_bytes: 4096,
+            stderr_cap_bytes: 4096,
+        };
+        let slugs = |version: u64| {
+            covering_schedule(version)
+                .unwrap()
+                .iter()
+                .map(|row| coordinate_slug(&row.coordinate))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            slugs(2),
+            required_coordinates()[..8]
+                .iter()
+                .map(coordinate_slug)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(slugs(3).len(), 16);
+        assert!(covering_schedule(1).is_none() && covering_schedule(4).is_none());
+        let publish_as =
+            |schedule_version: u64, identity_version: u64, coordinates: Vec<String>| {
+                let root = tempfile::tempdir().unwrap();
+                let dir = root.path();
+                let identity = serde_json::json!({
+                    "schemaVersion": 1, "kind": "sc-20671-resume-identity",
+                    "scheduleVersion": identity_version, "coordinates": coordinates,
+                    "policySha256": policy.seal().unwrap(),
+                });
+                let (identity_bytes, identity_sha) = seal_json(&identity).unwrap();
+                fs::write(dir.join("resume-identity.json"), &identity_bytes).unwrap();
+                fs::write(
+                    dir.join("resume-identity.json.sha256"),
+                    format!("{identity_sha}  resume-identity.json\n"),
+                )
+                .unwrap();
+                let (policy_bytes, _) = seal_json(&serde_json::to_value(&policy).unwrap()).unwrap();
+                fs::write(dir.join("safety-policy.json"), &policy_bytes).unwrap();
+                let manifest = canonical_json_bytes(&serde_json::json!({
+                    "schemaVersion": 2, "kind": SC20671_CAMPAIGN_KIND,
+                    "scheduleVersion": schedule_version,
+                    "policySha256": policy.seal().unwrap(),
+                    "resumeIdentitySha256": identity_sha,
+                    "coordinates": [],
+                }))
+                .unwrap();
+                fs::write(dir.join("campaign.json"), &manifest).unwrap();
+                fs::write(
+                    dir.join("campaign.json.sha256"),
+                    format!("{}  campaign.json\n", seal_bytes(&manifest)),
+                )
+                .unwrap();
+                load_validated_complete_campaign(dir).unwrap_err()
+            };
+        let publish =
+            |version: u64, coordinates: Vec<String>| publish_as(version, version, coordinates);
+        // Both versions pass the identity gate and reach their own (here empty) row set.
+        for version in [2, 3] {
+            assert_eq!(
+                publish(version, slugs(version)),
+                "SC-20671 campaign manifest is not a complete scheduled set",
+                "schedule v{version}"
+            );
+        }
+        assert_eq!(
+            publish(2, slugs(3)),
+            "SC-20671 published resume identity semantics drifted"
+        );
+        // A v2 manifest whose resume identity claims another schedule version is refused.
+        assert_eq!(
+            publish_as(2, 3, slugs(2)),
+            "SC-20671 published resume identity semantics drifted"
+        );
+        assert_eq!(
+            publish(4, slugs(3)),
             "SC-20671 campaign manifest identity is invalid"
         );
     }
@@ -14734,7 +15312,7 @@ pub(crate) mod tests {
             .remove("onlyCoordinate");
         assert_eq!(
             publish_campaign(&full, &prepared, &full_identity, &policy, None).unwrap_err(),
-            "complete campaign requires exactly eight prepared receipts"
+            "complete campaign requires exactly 16 prepared receipts"
         );
         let destination = root.path().join("partial");
         publish_campaign(&destination, &prepared, &identity, &policy, Some(&slug)).unwrap();
@@ -14784,7 +15362,7 @@ pub(crate) mod tests {
             "03b18fb4b6e8e729189ad1243fecc31934ff1b4aa011cdf00fb6489029a17d2a"
         );
         let identity = serde_json::json!({
-            "schemaVersion": 1, "kind": "sc-20671-resume-identity", "scheduleVersion": 2,
+            "schemaVersion": 1, "kind": "sc-20671-resume-identity", "scheduleVersion": 3,
             "coordinates": required_coordinates().iter().map(coordinate_slug).collect::<Vec<_>>(),
             "inferenceRevision": "a".repeat(40), "sceneWorksRevision": "b".repeat(40),
             "executableSha256": "c".repeat(64), "promptSha256": "d".repeat(64),
@@ -14793,10 +15371,14 @@ pub(crate) mod tests {
             "qwenCandidate": {"sha256": "f".repeat(64), "bytes": 102},
             "llamaReference": {"sha256": "1".repeat(64), "bytes": 103},
             "qwenReference": {"sha256": "2".repeat(64), "bytes": 104},
+            "llama8bCandidate": {"sha256": "3".repeat(64), "bytes": 105},
+            "qwen8bCandidate": {"sha256": "4".repeat(64), "bytes": 106},
+            "llama8bReference": {"sha256": "5".repeat(64), "bytes": 107},
+            "qwen8bReference": {"sha256": "6".repeat(64), "bytes": 108},
         });
         assert_eq!(
             seal_json(&identity).unwrap().1,
-            "a9bcc30bc11a2c86a4057489e1e0c9bc1519f0802b6f576200562406a8d02112"
+            "501113212265652a9652fd27c48962708d15d8f705cd46f6e9a5458b182518d1"
         );
     }
 
@@ -15128,13 +15710,145 @@ pub(crate) mod tests {
             stderr_cap_bytes: 4_096,
         };
         let row = &required_coordinates()[0];
-        let refusal = static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy)
-            .unwrap_err();
+        let refusal =
+            static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy, false)
+                .unwrap_err();
         assert!(refusal.contains("child footprint cap 2048 refuses before spawn"));
         policy.child_footprint_cap_bytes = u64::MAX - policy.host_free_reserve_bytes;
         let budget =
-            static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy).unwrap();
+            static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy, false)
+                .unwrap();
         assert!(budget > 12_000_000_000); // BF16 reference dominates the sequential roles.
+    }
+
+    /// sc-20688: a config without `head_dim` (Llama 3.1) is priced at the product loader's
+    /// default, hidden_size / num_attention_heads, instead of refusing the row; an indivisible
+    /// pair is refused.
+    #[test]
+    fn static_floor_defaults_a_missing_head_dim_like_the_loader() {
+        let temporary = tempfile::tempdir().unwrap();
+        let snapshot = temporary.path().join("candidate");
+        write_stub_dtype_snapshot(&snapshot, &LLAMA_CANDIDATE, "F16");
+        let explicit = static_role_footprint_budget(&LLAMA_CANDIDATE, &snapshot, 425, 318).unwrap();
+        let config = |text: &str| fs::write(snapshot.join("config.json"), text).unwrap();
+        config(
+            r#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"num_attention_heads":24,"hidden_size":3072,"intermediate_size":8192,"vocab_size":128256}"#,
+        );
+        assert_eq!(
+            static_role_footprint_budget(&LLAMA_CANDIDATE, &snapshot, 425, 318).unwrap(),
+            explicit
+        );
+        config(
+            r#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"num_attention_heads":25,"hidden_size":3072,"intermediate_size":8192,"vocab_size":128256}"#,
+        );
+        assert!(static_role_footprint_budget(&LLAMA_CANDIDATE, &snapshot, 425, 318).is_err());
+    }
+
+    /// sc-20688: the scaled compressed estimate covers the measured A2 v5 peaks of the 3B and 1.7B
+    /// fit rows (run 37004025116: 56,136,371,440 B and 17,960,978,184 B) at their recorded live and
+    /// request tokens, so admission never prices a compressed row below what it was seen to hold.
+    #[test]
+    fn compressed_estimate_covers_the_measured_fit_row_peaks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1,
+            child_footprint_cap_bytes: u64::MAX - 1,
+            max_context_tokens: 1 << 20,
+            max_request_tokens: 1 << 20,
+            stdout_cap_bytes: 4_096,
+            stderr_cap_bytes: 4_096,
+        };
+        let qwen_config = br#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"head_dim":128,"num_attention_heads":16,"hidden_size":2048,"intermediate_size":6144,"vocab_size":151936}"#;
+        for (family, candidate_spec, reference_spec, scale, config, live, request, peak) in [
+            (
+                "llama",
+                &LLAMA_CANDIDATE,
+                &LLAMA_REFERENCE,
+                "F16",
+                None,
+                261_483,
+                130_846,
+                56_136_371_440_u64,
+            ),
+            (
+                "qwen",
+                &QWEN_CANDIDATE,
+                &QWEN_REFERENCE,
+                "BF16",
+                Some(&qwen_config[..]),
+                81_231,
+                40_700,
+                17_960_978_184,
+            ),
+        ] {
+            let candidate = temporary.path().join(format!("{family}-candidate"));
+            let reference = temporary.path().join(format!("{family}-reference"));
+            write_stub_dtype_snapshot(&candidate, candidate_spec, scale);
+            write_stub_dtype_snapshot(&reference, reference_spec, "BF16");
+            if let Some(config) = config {
+                fs::write(candidate.join("config.json"), config).unwrap();
+                fs::write(reference.join("config.json"), config).unwrap();
+            }
+            let row = required_coordinates()
+                .into_iter()
+                .find(|row| row.family == family && row.context_band == "fit-boundary")
+                .unwrap();
+            let unscaled =
+                static_role_footprint_budget(candidate_spec, &candidate, live, request).unwrap();
+            assert!(
+                unscaled < peak,
+                "{family}: the unscaled estimate is the under-price"
+            );
+            let priced = static_row_footprint_budget(
+                &row, &candidate, &reference, live, request, &policy, true,
+            )
+            .unwrap();
+            assert!(priced >= peak, "{family}: {priced} < measured {peak}");
+        }
+    }
+
+    /// sc-20688: a compressed row loads only the candidate (its quality reference is the dense-KV
+    /// arm on the same weights), so its floor is the candidate's alone; a dense row still prices
+    /// the larger bf16 reference it loads.
+    #[test]
+    fn compressed_rows_price_only_the_candidate_they_load() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = temporary.path().join("candidate");
+        let reference = temporary.path().join("reference");
+        write_stub_dtype_snapshot(&candidate, &LLAMA_CANDIDATE, "F16");
+        write_stub_dtype_snapshot(&reference, &LLAMA_REFERENCE, "BF16");
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1,
+            child_footprint_cap_bytes: u64::MAX - 1,
+            max_context_tokens: 4_096,
+            max_request_tokens: 4_096,
+            stdout_cap_bytes: 4_096,
+            stderr_cap_bytes: 4_096,
+        };
+        let row = &required_coordinates()[0];
+        let candidate_only =
+            static_role_footprint_budget(&LLAMA_CANDIDATE, &candidate, 425, 318).unwrap();
+        let reference_only =
+            static_role_footprint_budget(&LLAMA_REFERENCE, &reference, 425, 318).unwrap();
+        assert!(reference_only > candidate_only);
+        assert_eq!(
+            static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy, true)
+                .unwrap(),
+            (candidate_only * COMPRESSED_MEASURED_PEAK_SCALE_BPS).div_ceil(10_000)
+        );
+        assert_eq!(
+            static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy, false)
+                .unwrap(),
+            reference_only
+        );
     }
 
     /// sc-20671: the static floor prices the request's prefill activations beside the load
@@ -15199,6 +15913,7 @@ pub(crate) mod tests {
             architecture: "LlamaForCausalLM",
             model_type: "llama",
             native_context_tokens: 4096,
+            fit_window_tokens: None,
             quantized: true,
             required_files: &[],
         };
@@ -15296,13 +16011,13 @@ pub(crate) mod tests {
     #[test]
     fn schedule_is_exact_and_rejects_duplicate_or_reused_cold_workers() {
         let schedule = required_schedule();
-        assert_eq!(schedule.len(), 8);
+        assert_eq!(schedule.len(), 16);
         assert_eq!(
             schedule
                 .iter()
                 .filter(|row| row.discipline == ProcessDiscipline::FreshChild)
                 .count(),
-            4
+            8
         );
         let outcomes = schedule
             .iter()
@@ -15336,13 +16051,13 @@ pub(crate) mod tests {
             Ok((seen.len() + 100) as u32)
         })
         .unwrap();
-        assert_eq!(seen.len(), 8);
-        assert_eq!(outcomes.len(), 8);
+        assert_eq!(seen.len(), 16);
+        assert_eq!(outcomes.len(), 16);
         assert_eq!(
             seen.iter()
                 .filter(|(_, discipline)| *discipline == ProcessDiscipline::ReusedWarmWorker)
                 .count(),
-            4
+            8
         );
     }
 
@@ -16540,6 +17255,7 @@ pub(crate) mod tests {
             architecture: "LlamaForCausalLM",
             model_type: "llama",
             native_context_tokens: 4096,
+            fit_window_tokens: None,
             quantized: true,
             required_files: &[],
         };

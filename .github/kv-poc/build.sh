@@ -68,8 +68,9 @@ stage_models() {
   tools="$(hub_tools)"
   [ -d "$KV_HF_HUB" ] || { echo "::error title=no hub cache::$KV_HF_HUB does not exist on $(hostname)"; return 1; }
   HF_HUB_CACHE="$KV_HF_HUB" HF_HUB_DISABLE_TELEMETRY=1 PYTHONPATH="$tools" \
-    python3.12 "$KV_DIR/models.py" --hub "$KV_HF_HUB" --pins "$KV_DIR/models.tsv"
-  summary "- four pinned snapshots present in \`$KV_HF_HUB\` at their pinned byte sizes"
+    python3.12 "$KV_DIR/models.py" --hub "$KV_HF_HUB" --pins "$KV_DIR/models.tsv" \
+      --reserve-gib "${KV_W1_DISK_RESERVE_GIB:-20}"
+  summary "- eight pinned snapshots present in \`$KV_HF_HUB\` at their pinned byte sizes"
 }
 
 # W2: every file in models-w2.tsv. Totals the missing bytes against the hub volume's free space

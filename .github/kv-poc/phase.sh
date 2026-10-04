@@ -3,7 +3,7 @@
 #   W1 (LLM KV):  a1 | a3 | a2 | b | nf
 #                 nf = SC-20669 dense noise floor: `sc20671_kv_baseline noise-floor-parent`, the dense
 #                 arm against two exact recomputations of itself (one-shot repeat, chunked prefill)
-#                 on all eight SC-20671 rows, per-row JSON + sealed summary.json
+#                 on all sixteen SC-20671 rows (four per family), per-row JSON + sealed summary.json
 #   W2 (media):   c  = SC-20684 Krea Realtime six-cell (T2V/I2V/V2V x Q8/Q4 KV), sc20684_krea_realtime_campaign.py
 #                 d  = SC-20686 Metal matrix (18 coordinates x normal/cancel), sc20686_campaign_adapter.py
 #                 d-control = the same matrix's --schedule-control arm (one product-schedule arm each)
@@ -278,7 +278,7 @@ D_ARGS=(--campaign --matrix --inference-revision "$INFERENCE_SHA" --safety-polic
   --flux-entrypoint "$F2/sc20686_flux2_edit" --flux-snapshot "$W2_FLUX" --flux-kv-snapshot "$W2_FLUX_KV"
   --flux-reference "$F2/inputs/dog.jpg" --flux-reference2 "$F2/inputs/pulid-reference.png")
 
-LLM_ARGS_TEXT="--llama-snapshot $LQ --qwen-snapshot $QQ --llama-fp32-reference-snapshot $LB --qwen-fp32-reference-snapshot $QB --prompt-file $F/inputs/prompt.txt --safety-policy $F/policies/llm.json"
+LLM_ARGS_TEXT="--llama-snapshot $LQ --qwen-snapshot $QQ --llama-fp32-reference-snapshot $LB --qwen-fp32-reference-snapshot $QB --llama8b-snapshot $L8Q --qwen8b-snapshot $Q8Q --llama8b-fp32-reference-snapshot $L8B --qwen8b-fp32-reference-snapshot $Q8B --prompt-file $F/inputs/prompt.txt --safety-policy $F/policies/llm.json"
 # shellcheck disable=SC2206  # every element is a space-free absolute path or flag
 LLM_ARGS=($LLM_ARGS_TEXT)
 
