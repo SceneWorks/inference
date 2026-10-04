@@ -71,6 +71,9 @@ use sha2::{Digest, Sha256};
 
 use crate::e2e_real_weights::phys_footprint;
 
+#[path = "support/training_peaks.rs"]
+mod training_peaks;
+
 const ID: &str = "qwen_image_2_1";
 
 // ── thresholds (first-run floors; see the module docs) ──────────────────────────────────────────
@@ -570,13 +573,22 @@ struct Trained {
     /// Observed MLX active peak of the step phase, and the preflight's predicted train phase.
     train_peak: u64,
     predicted_train_gib: Option<f64>,
+    predicted_peak_gib: Option<f64>,
+    remaining_steps_peak: u64,
 }
 
 /// Run `req` on a fresh trainer through the registry, recording the caching-phase and the
-/// step-phase MLX peaks separately (the phases never overlap), the losses and the wall time; copy
+/// subsequent step peaks. The first observation overlaps caching and step 1 because the trainer
+/// reports progress after each completed step. Retain and price that conservative overlap against
+/// the full preflight envelope, and subsequent steps against its train phase. Copy
 /// the adapter to `canonical` if the trainer wrote it elsewhere.
 fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: u32) -> Trained {
     let (predicted_message, predicted_train_gib) = predicted_training_footprint(req);
+    let predicted_peak_gib = predicted_message
+        .split("derived peak memory is ~")
+        .nth(1)
+        .and_then(|rest| rest.split(" GiB").next())
+        .and_then(|v| v.parse::<f64>().ok());
     eprintln!("preflight (forced 1 KiB budget): {predicted_message}");
 
     let mut trainer = provider_registry()
@@ -607,16 +619,16 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
             };
             match p {
                 TrainingProgress::Training { step, loss, .. } => {
-                    if caching_peaks.is_none() {
+                    let first_observation = caching_peaks.is_none();
+                    if first_observation {
                         // First step reported: everything before it was the staged caching (and
                         // step 1 itself).
                         caching_peaks = Some(guard.end());
                         resident_after_first_step =
                             Some(mlx_rs::memory::get_active_memory() as u64);
-                        guard.begin();
                     }
                     losses.push(loss);
-                    if step == 1 || step % log_every == 0 {
+                    if first_observation || step % log_every == 0 {
                         let (active, cache, peak, footprint) = memory();
                         eprintln!(
                             "step {step}: loss {loss:.4} ({:.0}s) active={:.2} cache={:.2} \
@@ -637,6 +649,10 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
                             "physFootprintBytes": footprint,
                         }));
                     }
+                    if first_observation {
+                        // Reset only AFTER sampling the completed first step's high-water mark.
+                        guard.begin();
+                    }
                 }
                 TrainingProgress::Preparing
                 | TrainingProgress::LoadingModel
@@ -656,14 +672,18 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
         })
         .unwrap_or_else(|e| panic!("training failed: {e}"));
     let seconds = started.elapsed().as_secs_f64();
-    let (train_peak, train_footprint) = guard.end();
+    let remaining_steps = guard.end();
     drop(trainer);
     mlx_rs::memory::clear_cache();
     let (caching_peak, caching_footprint) = caching_peaks.unwrap_or((0, 0));
+    let (train_peak, train_footprint) = training_peaks::aggregate_training_peaks(
+        (caching_peak, caching_footprint),
+        remaining_steps,
+    );
     let resident = resident_after_first_step.unwrap_or(0);
     eprintln!(
-        "trained in {seconds:.0}s: step-phase peak {:.2} GiB (resident after step 1 {:.2} + \
-         transient {:.2}) vs preflight train ~{} GiB",
+        "trained in {seconds:.0}s: conservative cache/step peak {:.2} GiB (resident after step 1 {:.2} + \
+         high-water excess {:.2}) vs preflight train ~{} GiB",
         gib(train_peak),
         gib(resident),
         gib(train_peak.saturating_sub(resident)),
@@ -699,11 +719,15 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
         "cachingPhysFootprintMaxBytes": caching_footprint,
         "trainMlxActivePeakBytes": train_peak,
         "trainPhysFootprintMaxBytes": train_footprint,
+        "trainMeasurementScope": "caching_and_first_step_overlap_then_remaining_steps",
+        "remainingStepsMlxActivePeakBytes": remaining_steps.0,
+        "remainingStepsPhysFootprintMaxBytes": remaining_steps.1,
         "residentAfterFirstStepBytes": resident,
         "stepTransientPeakBytes": train_peak.saturating_sub(resident),
         "stepSamples": samples,
         "predictedPreflight": predicted_message,
         "predictedTrainPhaseGiB": predicted_train_gib,
+        "predictedFullEnvelopeGiB": predicted_peak_gib,
         "metadata": metadata,
     });
     Trained {
@@ -711,6 +735,8 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
         facts,
         train_peak,
         predicted_train_gib,
+        predicted_peak_gib,
+        remaining_steps_peak: remaining_steps.0,
     }
 }
 
@@ -746,8 +772,8 @@ fn assert_trained(label: &str, trained: &Trained, steps: u32, edit: bool) {
     }
 }
 
-/// The preflight is what stops the OS killing a worker mid-run, so its train-phase figure must not
-/// under-predict the step phase it guards. Checked LAST in each training test, after every
+/// The preflight must cover all observations: the cache/first-step overlap uses the full envelope,
+/// and later steps use its training phase. Checked LAST in each training test, after every
 /// render-side assertion, so a red run still exercises (and reports) the adapter's own checks.
 fn assert_preflight_covers_step(label: &str, trained: &Trained) {
     let predicted = trained
@@ -755,8 +781,16 @@ fn assert_preflight_covers_step(label: &str, trained: &Trained) {
         .unwrap_or_else(|| panic!("{label}: could not read the preflight's train figure"));
     let predicted_bytes = (predicted * (1u64 << 30) as f64) as u64;
     assert!(
+        trained.remaining_steps_peak <= predicted_bytes + PREDICTION_SLACK_BYTES,
+        "{label}: remaining training steps exceed their derived train phase"
+    );
+    let full_envelope = trained
+        .predicted_peak_gib
+        .expect("full preflight envelope must parse");
+    let predicted_bytes = (full_envelope * (1u64 << 30) as f64) as u64;
+    assert!(
         trained.train_peak <= predicted_bytes + PREDICTION_SLACK_BYTES,
-        "{label}: the step phase peaked at {:.2} GiB, over the preflight's derived {predicted:.1} \
+        "{label}: caching/first-step plus remaining steps peaked at {:.2} GiB, over the preflight's full {full_envelope:.1} \
          GiB (+{:.0} GiB slack) — the training footprint under-predicts",
         gib(trained.train_peak),
         gib(PREDICTION_SLACK_BYTES)

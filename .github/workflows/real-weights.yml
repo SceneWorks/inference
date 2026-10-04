@@ -137,6 +137,12 @@ on:
     - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
+      qwen_image_2_1_lora_runner:
+        description: "MLX 2.1 LoRA host: rw-mage (second Mac) or rw-starvector (primary Mac)"
+        type: choice
+        required: false
+        default: rw-mage
+        options: [rw-mage, rw-starvector]
       qwen_image_2_1_lora_phase:
         description: "MLX 2.1 LoRA: bounded two-step probe, corrected edit, imports, or full campaign"
         type: choice
@@ -4930,7 +4936,9 @@ jobs:
   mlx-qwen-image-2-1:
     name: MLX Qwen-Image 2.1 LoRA/LoKr real weights
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'
-    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    # Terminal recovery may select the primary Mac's unique rw-starvector label. Both Macs
+    # carry nax, so nax alone cannot reserve the idle primary. Keep this bounded to this profile.
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]
     timeout-minutes: 300
     permissions:
       contents: write # authenticated GET of hash-pinned unpublished transfer assets
@@ -4967,7 +4975,7 @@ jobs:
       # of after the fetch (these tests have never been compiled on a Mac), and the cold MLX build
       # reads as build time in the step timings.
       - name: Build the Qwen-Image 2.1 MLX test binary
-        run: cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration --no-run
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/build-and-record-mlx-library-identity.sh
       - name: Prove trained velocity survives adapter save and reload
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
       - name: Materialize and verify immutable snapshots

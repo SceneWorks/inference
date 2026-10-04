@@ -1,10 +1,12 @@
-//! Metal training allocation envelope (MLX v0.31.1, sc-24163).
+//! Metal training allocation envelope (MLX v0.32.0, sc-24163).
+//! mlx-rs 48ff5e78 build.rs upgrades the vendored mlx-c FetchContent tag to v0.32.0.
+//! The probe captures the actual linked archives, build manifest and staged source tag.
 //!
 //! This is deliberately tensor-free, so its structural allocation tests also run on Windows:
 //! `rustc --edition 2021 --test src/training_memory.rs -o <temp>/training-memory-tests`.
 //! Metal SDPA uses its unfused fallback during grad tracing, and its VJP is also unfused:
-//! https://github.com/ml-explore/mlx/blob/v0.31.1/mlx/fast.cpp (SDPA fallback / VJP)
-//! https://github.com/ml-explore/mlx/blob/v0.31.1/mlx/primitives.cpp (Softmax::vjp)
+//! https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/fast.cpp (SDPA fallback / VJP)
+//! https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/primitives.cpp (Softmax::vjp)
 //! `Softmax::vjp` holds s, cotangent, s*cotangent, s*sum(s*cotangent), and their difference.
 //! The synchronous count alone is insufficient: metal/eval.cpp retains op inputs in completion
 //! handlers. transforms.cpp permits ten outstanding command buffers; device.cpp commits after

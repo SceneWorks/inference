@@ -4144,7 +4144,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ):
             errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
         # The Qwen-Image weight-set label (nax-macos-2), never the privileged `real-weights` one.
-        if job["runs-on"] != ["self-hosted", "macOS", "ARM64", "rw-mage"]:
+        runner = inputs.get("qwen_image_2_1_lora_runner", {})
+        if runner.get("type") != "choice" or runner.get("default") != "rw-mage" or runner.get("options") != ["rw-mage", "rw-starvector"]:
+            errors.append("MLX LoRA runner must be bounded to rw-mage/rw-starvector, default rw-mage")
+        if job["runs-on"] != ["self-hosted", "macOS", "ARM64", "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]:
             errors.append(f"wrong runner: {job['runs-on']!r}")
         if job["env"].get("QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC") != (
             "${{ inputs.qwen_image_2_1_third_party_lora }}"
@@ -4237,6 +4240,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(workflow, renamed))
         added = source + "\n#[test]\n#[ignore]\nfn an_unwired_gate() {}\n"
         self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(workflow, added))
+        for field, value in [("options", ["rw-mage", "nax"]), ("default", "nax"), ("type", "string")]:
+            mutated = copy.deepcopy(workflow)
+            mutated[True]["workflow_dispatch"]["inputs"]["qwen_image_2_1_lora_runner"][field] = value
+            self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
         for mutate in (
             lambda job: job.update(
                 {"if": "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'"}
