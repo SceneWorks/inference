@@ -417,7 +417,8 @@ mod tests {
             llama.min_context_tokens,
             band(&LLAMA_CANDIDATE, "memory-material")
         );
-        // Llama's fit-boundary coordinate is pending its noise-floor run: the row stops there.
+        // Llama failed its fit-boundary coordinate on multi-turn (run 37201786765): the row
+        // stops there.
         assert_eq!(
             llama.max_context_tokens,
             Some(band(&LLAMA_CANDIDATE, "fit-boundary"))

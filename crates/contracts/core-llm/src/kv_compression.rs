@@ -368,9 +368,16 @@ impl KvQualification {
 /// Qwen3-1.7B (40 960-token window) qualified at both coordinates, so it runs compressed from its
 /// memory-material coordinate (10 240) to its evidenced window (final context ≤ 40 960): a Qwen3
 /// checkpoint with a longer window (Qwen3-2507, YaRN) stays dense beyond it. Llama-3.2-3B
-/// (131 072-token window) qualified at memory-material (32 768); its fit-boundary coordinate
-/// (130 560) awaits a dense multi-turn noise-floor run, so final contexts from there up stay
-/// dense until that row's maximum is raised.
+/// (131 072-token window) qualified at memory-material (32 768) but failed fit-boundary (130 560)
+/// on multi-turn (2/1024 against a dense floor of 0/1024), so its final context stays capped below
+/// 130 560 and runs dense from there up.
+///
+/// Evidence: terminal campaign run 37201786765 (inference `32dea7a3c`, SceneWorks `1f4bb8282`),
+/// with the group-affine-8 (A2) and dense noise-floor (NF) arms on the same UTC day and matching
+/// prompt hashes. The same run measured Llama-3.1-8B and Qwen3-8B, which both failed at K8V8 with
+/// real compression error rather than dense noise; neither has a row, so both stay dense
+/// ([`KvCacheFallbackReason::UnqualifiedModel`]). History: A2 v5 run 37004025116 and noise-floor
+/// runs 37035827730 and 37076039109.
 pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
     KvQualification {
         family: KvModelFamily::Llama,
@@ -379,9 +386,12 @@ pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
         format: KvCompressionFormat::GroupAffineK8V8,
         min_context_tokens: 32_768,
         max_context_tokens: Some(130_560),
-        evidence: "sc-20669 A2 run 37004025116 + dense noise floor 37035827730: \
+        evidence: "sc-20669 terminal campaign run 37201786765 (inference 32dea7a3c, SceneWorks \
+                   1f4bb8282; A2 and NF same UTC day, prompt hashes match): \
                    Llama-3.2-3B-Instruct-4bit memory-material (32768) passes at group-affine-8; \
-                   fit-boundary (130560) pending a dense multi-turn noise-floor run",
+                   fit-boundary (130560) fails multi-turn (2/1024 vs dense floor 0/1024), so \
+                   final context stays < 130560; history: A2 v5 37004025116, noise floors \
+                   37035827730 and 37076039109",
     },
     KvQualification {
         family: KvModelFamily::Qwen3,
@@ -390,9 +400,11 @@ pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
         format: KvCompressionFormat::GroupAffineK8V8,
         min_context_tokens: 10_240,
         max_context_tokens: Some(40_961),
-        evidence: "sc-20669 A2 run 37004025116 + dense noise floor 37035827730: \
+        evidence: "sc-20669 terminal campaign run 37201786765 (inference 32dea7a3c, SceneWorks \
+                   1f4bb8282; A2 and NF same UTC day, prompt hashes match): \
                    Qwen3-1.7B-4bit memory-material (10240) and fit-boundary (40448) pass at \
-                   group-affine-8 within its 40960-token window",
+                   group-affine-8 within its 40960-token window; history: A2 v5 37004025116, \
+                   noise floors 37035827730 and 37076039109",
     },
 ];
 
