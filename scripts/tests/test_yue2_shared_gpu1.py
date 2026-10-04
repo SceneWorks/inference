@@ -1,5 +1,6 @@
 """CPU-only selected-card tests for the owner's physical GPU1 shared window."""
 import json
+import copy
 from pathlib import Path
 import sys
 import tempfile
@@ -113,6 +114,49 @@ class SharedGpu1Tests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         self.verify(root)
                     path.write_bytes(original)
+            self.verify(root)
+
+    def test_pdh_full_paths_distinguish_duplicate_short_instances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_shared_probe(root)
+            for index in range(3):
+                path = root / f"windows-counters-{index}.json"
+                value = json.loads(path.read_text(encoding="utf-8"))
+                for family, metric, amount in (("gpu engine", "utilization percentage", 0),
+                                               ("gpu process memory", "dedicated usage", 270336)):
+                    row = next(row for row in value["counters"]
+                               if row["counter"].lower() ==
+                               f"\\{family}(*)\\{metric}")
+                    short = row["samples"][0]["instance"]
+                    row["samples"][0]["path"] = f"\\\\host\\{family}({short})\\{metric}"
+                    duplicate = copy.deepcopy(row["samples"][0])
+                    duplicate["path"] = f"\\\\host\\{family}({short}#1)\\{metric}"
+                    duplicate["cookedValue"] = amount
+                    row["samples"].append(duplicate)
+                path.write_text(json.dumps(value), encoding="utf-8")
+            self.verify(root)
+            path = root / "windows-counters-1.json"
+            original = path.read_bytes()
+            for mutate in (
+                lambda row: row["samples"][-1].__setitem__("path", row["samples"][0]["path"]),
+                lambda row: row["samples"][-1].__setitem__(
+                    "path", row["samples"][-1]["path"].replace("gpu engine", "gpu process memory")),
+                lambda row: row["samples"][-1].__setitem__(
+                    "path", row["samples"][-1]["path"].replace("#1", "_other#1")),
+                lambda row: row["samples"][-1].pop("path"),
+                lambda row: row["samples"][-1].__setitem__("status", "unavailable"),
+                lambda row: row["samples"][-1].__setitem__("cookedValue", 51),
+            ):
+                with self.subTest(mutate=mutate):
+                    value = json.loads(original)
+                    row = next(row for row in value["counters"]
+                               if row["counter"] == r"\GPU Engine(*)\Utilization Percentage")
+                    mutate(row)
+                    path.write_text(json.dumps(value), encoding="utf-8")
+                    with self.assertRaises(RuntimeError):
+                        self.verify(root)
+            path.write_bytes(original)
             self.verify(root)
 
     def test_dispatch_and_sampler_bind_physical1_without_old_receipt(self):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import csv
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -670,14 +671,43 @@ def _shared_gpu1_summary(directory: Path, *, admission: bool) -> dict:
             row = counter_rows[path]
             require(isinstance(row, dict) and "error" not in row and
                     isinstance(row.get("samples"), list), f"selected GPU1 {key} unavailable")
-            samples = [sample for sample in row["samples"]
-                       if luid in sample.get("instance", "").lower()]
-            require(all(str(sample.get("status")) == "0" and
+            require(all(isinstance(sample, dict) and str(sample.get("status")) == "0" and
                         type(sample.get("cookedValue")) in (int, float) and
                         math.isfinite(sample["cookedValue"]) and sample["cookedValue"] >= 0
-                        for sample in samples), f"selected GPU1 {key} invalid")
-            names = [sample["instance"].lower() for sample in samples]
-            require(len(names) == len(set(names)), f"selected GPU1 {key} duplicate instance")
+                        for sample in row["samples"]), f"selected GPU1 {key} invalid")
+            samples = [sample for sample in row["samples"]
+                       if (luid in str(sample.get("instance", "")).lower() or
+                        luid in str(sample.get("path", "")).lower())]
+            category, metric = path[1:].split("(*)\\", 1)
+            counter_pattern = re.compile(
+                rf"^\\\\[^\\]+\\{re.escape(category)}\(([^()]+)\)\\{re.escape(metric)}$",
+                re.IGNORECASE)
+            names = []
+            identities = []
+            for sample in samples:
+                name = sample.get("instance")
+                require(isinstance(name, str) and luid in name.lower(),
+                        f"selected GPU1 {key} instance/LUID invalid")
+                names.append(name.lower())
+                full_path = sample.get("path")
+                if full_path is None:
+                    identities.append(None)
+                    continue
+                require(isinstance(full_path, str) and
+                        (match := counter_pattern.fullmatch(full_path)) is not None,
+                        f"selected GPU1 {key} counter path invalid")
+                path_name = match.group(1).lower()
+                require(path_name == name.lower() or
+                        re.fullmatch(re.escape(name.lower()) + r"#[1-9][0-9]*", path_name) is not None,
+                        f"selected GPU1 {key} counter path/instance mismatch")
+                identities.append(full_path.lower())
+            counts = Counter(names)
+            require(all(identity is not None for name, identity in zip(names, identities)
+                        if counts[name] > 1),
+                    f"selected GPU1 {key} duplicate instance without full path")
+            require(len([identity for identity in identities if identity is not None]) ==
+                    len(set(identity for identity in identities if identity is not None)),
+                    f"selected GPU1 {key} duplicate counter path")
             if key.startswith("adapter"):
                 require(len(samples) == 1, f"selected GPU1 {key} adapter missing")
             if key == "engine" and admission:
