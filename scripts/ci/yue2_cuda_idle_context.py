@@ -24,6 +24,9 @@ BASELINE_CONTROL_SHA = "e538120368ac279cc42176c44f9d88fa5af9c9b4"
 BASELINE_DIGEST = "d67f8d2c7cd79040bbe48ada71e6e27722237a3316bf622e69808ca341f77a2c"
 BASELINE_RUNNER = "cuda-windows"
 WINDOW = timedelta(hours=12)
+# The owner approved these limits for the process-free GPU0 route. NVML memory
+# utilization measures traffic; memory.used is separately bounded by capacity.
+EMPTY_GPU0_PERCENT_LIMIT = 5
 
 
 def require(ok: bool, why: str) -> None:
@@ -50,7 +53,8 @@ def artifact_digest(directory: Path) -> str:
     return digest.hexdigest()
 
 
-def _gpu_row(directory: Path, name: str, *, has_free: bool) -> dict:
+def _gpu_row(directory: Path, name: str, *, has_free: bool,
+             utilization_percent_limit: int = 0) -> dict:
     sample = read_json(directory, name)
     require(sample.get("exitCode") == 0, f"{name} unavailable")
     rows = [next(csv.reader([line], skipinitialspace=True)) for line in sample.get("output", [])]
@@ -66,7 +70,8 @@ def _gpu_row(directory: Path, name: str, *, has_free: bool) -> dict:
     util = [int(value) for value in row[8 if has_free else 7:]]
     require(total > 0 and 0 <= used <= total and (free is None or 0 < free <= total),
             f"{name} invalid memory")
-    require(util == [0, 0], f"{name} selected GPU activity is nonzero")
+    require(all(value <= utilization_percent_limit for value in util),
+            f"{name} selected GPU activity exceeds approved limit")
     return {"uuid": row[1], "pci": row[2].lower().lstrip("0"), "totalMiB": total,
             "usedMiB": used, "freeMiB": free}
 
@@ -291,7 +296,8 @@ def check_empty_dispatch() -> None:
             os.environ.get("GITHUB_REPOSITORY") == "SceneWorks/inference" and
             os.environ.get("GITHUB_JOB") == "cuda" and
             os.environ.get("GITHUB_RUN_ATTEMPT") == "1" and
-            os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "shared-host" and
+            os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") in
+            ("shared-host", "gpu0-with-reviewed-gpu1") and
             os.environ.get("RUNNER_NAME") in ("cuda-windows", "cuda-windows-2"),
             "empty GPU0 source/control/runner identity unavailable")
 
@@ -409,15 +415,18 @@ def _empty_gpu0_summary(directory: Path) -> dict:
     raw_luid = bytes.fromhex(devices[0]["luidBytes"].replace("-", ""))
     require(len(raw_luid) == 8, "empty-device LUID invalid")
     luid = f"luid_0x{int.from_bytes(raw_luid[4:], 'little'):08x}_0x{int.from_bytes(raw_luid[:4], 'little'):08x}"
-    gpu = [_gpu_row(directory, f"gpu-sample-{index}", has_free=True) for index in range(3)]
+    gpu = [_gpu_row(directory, f"gpu-sample-{index}", has_free=True,
+                    utilization_percent_limit=EMPTY_GPU0_PERCENT_LIMIT)
+           for index in range(3)]
     # The owner's GPU0 allocation is bound to the authenticated physical card,
     # even when a reboot changes its Windows adapter LUID.
     require(gpu[0]["uuid"] == "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0" and
             gpu[0]["pci"] == "00000000:21:00.0".lstrip("0"),
             "empty-device probe selected a different physical GPU0")
-    require(gpu[0]["usedMiB"] == 0 and all(row == gpu[0] for row in gpu) and
+    require(gpu[0]["usedMiB"] * 100 <= gpu[0]["totalMiB"] * EMPTY_GPU0_PERCENT_LIMIT and
+            all(row == gpu[0] for row in gpu) and
             devices[0]["pciBusId"].lower().lstrip("0") == gpu[0]["pci"],
-            "empty-device GPU0 identity/residency changed or nonzero")
+            "empty-device GPU0 identity/residency changed or exceeded approved capacity")
     for index in range(3):
         mode = _empty_smi(directory, f"driver-mode-{index}")
         rows = [next(csv.reader([line], skipinitialspace=True)) for line in mode["output"]]
@@ -435,7 +444,9 @@ def _empty_gpu0_summary(directory: Path) -> dict:
         require(len(rows) == 1 and len(rows[0]) == 5 and rows[0][1].strip() == gpu[0]["uuid"] and
                 rows[0][2].strip().lower().lstrip("0") == gpu[0]["pci"] and
                 rows[0][3].strip().isdigit() and int(rows[0][3]) == gpu[0]["usedMiB"] and
-                rows[0][4].strip() == "0", f"{name} changed or active")
+                rows[0][4].strip().isdigit() and
+                int(rows[0][4]) <= EMPTY_GPU0_PERCENT_LIMIT,
+                f"{name} changed or exceeded approved utilization")
     counters = []
     expected = {
         "engine": r"\GPU Engine(*)\Utilization Percentage",
@@ -472,11 +483,12 @@ def _empty_gpu0_summary(directory: Path) -> dict:
                 require(len(set(instances)) == len(instances),
                         f"empty-device {path} process instances ambiguous")
                 if key == "engine":
-                    require(all(sample["cookedValue"] == 0 for sample in samples),
+                    require(all(sample["cookedValue"] <= EMPTY_GPU0_PERCENT_LIMIT
+                                for sample in samples),
                             f"empty-device {path} process active")
-                    # Zero-activity WDDM engine rows may also be enumerated
-                    # under different process instances between samples.
-                    result[key] = "all-zero"
+                    # WDDM may enumerate low-activity rows under different
+                    # process instances between samples; retain all raw rows.
+                    result[key] = "within-owner-approved-utilization-limit"
                 else:
                     # Keep full raw rows and validate all of them above. WDDM
                     # may enumerate zero-byte processes between epochs; only
@@ -486,7 +498,10 @@ def _empty_gpu0_summary(directory: Path) -> dict:
         counters.append(result)
     require(all(row == counters[0] for row in counters),
             "empty-device Windows adapter/process counters changed")
-    return {"physicalMode": "empty-gpu0", "uuid": gpu[0]["uuid"],
+    return {"physicalMode": "empty-gpu0",
+            "ownerApprovedNvmlAndEngineUtilizationPercentLimit": EMPTY_GPU0_PERCENT_LIMIT,
+            "ownerApprovedResidentCapacityPercentLimit": EMPTY_GPU0_PERCENT_LIMIT,
+            "uuid": gpu[0]["uuid"],
             "pci": gpu[0]["pci"], "luid": luid, "gpu": gpu[0], "counters": counters[0]}
 
 

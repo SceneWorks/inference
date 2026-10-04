@@ -82,6 +82,75 @@ def make_probe(root: Path) -> None:
 
 
 class EmptyDeviceTests(unittest.TestCase):
+    def test_owner_approved_utilization_boundary_is_empty_route_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_probe(root)
+            gpu_path = root / "gpu-sample-1.json"
+            engine_path = root / "windows-counters-1.json"
+            original_gpu, original_engine = gpu_path.read_bytes(), engine_path.read_bytes()
+            with patch.dict("os.environ", {"EXPECTED_ENGINE_SHA": SHA, "GITHUB_SHA": SHA,
+                                        "RUNNER_NAME": "cuda-windows"}):
+                for gpu_percent, memory_percent, engine_percent, allowed in (
+                    (5, 5, 5, True),
+                    (6, 0, 0, False),
+                    (0, 6, 0, False),
+                    (0, 0, 6, False),
+                ):
+                    with self.subTest(gpu=gpu_percent, memory=memory_percent,
+                                      engine=engine_percent):
+                        gpu = json.loads(original_gpu)
+                        gpu["output"][0] = gpu["output"][0].replace(
+                            ", 0, 0", f", {gpu_percent}, {memory_percent}")
+                        gpu_path.write_text(json.dumps(gpu), encoding="utf-8")
+                        counters = json.loads(original_engine)
+                        counters["counters"][0]["samples"][0]["cookedValue"] = engine_percent
+                        engine_path.write_text(json.dumps(counters), encoding="utf-8")
+                        if allowed:
+                            self.assertEqual(idle._empty_gpu0_summary(root)["physicalMode"],
+                                             "empty-gpu0")
+                            with self.assertRaises(RuntimeError):
+                                idle._gpu_row(root, "gpu-sample-1", has_free=True)
+                        else:
+                            with self.assertRaises(RuntimeError):
+                                idle._empty_gpu0_summary(root)
+            gpu_path.write_bytes(original_gpu)
+            engine_path.write_bytes(original_engine)
+
+    def test_resident_vram_and_final_gpu_utilization_are_separately_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_probe(root)
+            originals = {path: path.read_bytes() for path in root.glob("*.json")}
+
+            def set_residency(used_mib: int, final_gpu_percent: int) -> None:
+                for index in range(3):
+                    path = root / f"gpu-sample-{index}.json"
+                    row = json.loads(originals[path])
+                    row["output"][0] = row["output"][0].replace(
+                        ", 0, 97438, 0, 0",
+                        f", {used_mib}, {97438 - used_mib}, 0, 0")
+                    path.write_text(json.dumps(row), encoding="utf-8")
+                for name in ("gpu-before-cuda-properties", "gpu-after-cuda-properties"):
+                    path = root / f"{name}.json"
+                    row = json.loads(originals[path])
+                    row["output"][0] = row["output"][0].replace(
+                        ", 0, 0", f", {used_mib}, {final_gpu_percent}")
+                    path.write_text(json.dumps(row), encoding="utf-8")
+
+            with patch.dict("os.environ", {"EXPECTED_ENGINE_SHA": SHA, "GITHUB_SHA": SHA,
+                                        "RUNNER_NAME": "cuda-windows"}):
+                # 4,894 MiB is within 5% of the reported 97,887 MiB; the next
+                # integer MiB exceeds it. NVML and pre/post values stay coherent.
+                set_residency(4894, 5)
+                self.assertEqual(idle._empty_gpu0_summary(root)["gpu"]["usedMiB"], 4894)
+                set_residency(4895, 5)
+                with self.assertRaisesRegex(RuntimeError, "approved capacity"):
+                    idle._empty_gpu0_summary(root)
+                set_residency(4894, 6)
+                with self.assertRaisesRegex(RuntimeError, "approved utilization"):
+                    idle._empty_gpu0_summary(root)
+
     def test_process_free_census_retains_all_29_bytes_and_rejects_new_actor(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -125,6 +194,8 @@ class EmptyDeviceTests(unittest.TestCase):
                 result = idle._empty_gpu0_summary(root)
                 self.assertEqual((result["physicalMode"], result["gpu"]["usedMiB"]),
                                  ("empty-gpu0", 0))
+                self.assertEqual(result["ownerApprovedNvmlAndEngineUtilizationPercentLimit"], 5)
+                self.assertEqual(result["ownerApprovedResidentCapacityPercentLimit"], 5)
                 self.assertEqual(result["counters"]["adapterDedicated"],
                                  (f"{LUID}_phys_0", 4_493_312))
                 self.assertEqual(result["counters"]["processDedicated"],
@@ -132,7 +203,8 @@ class EmptyDeviceTests(unittest.TestCase):
                 self.assertEqual(result["counters"]["processCommitted"], [
                     (f"pid_4_{LUID}_phys_0", 4_755_456),
                     (f"pid_7976_{LUID}_phys_0", 262_144)])
-                self.assertEqual(result["counters"]["engine"], "all-zero")
+                self.assertEqual(result["counters"]["engine"],
+                                 "within-owner-approved-utilization-limit")
                 self.assertIn("pid_23028", (root / "windows-counters-0.json").read_text(encoding="utf-8"))
                 self.assertIn("pid_40804", (root / "windows-counters-2.json").read_text(encoding="utf-8"))
                 # GPU1 may hold foreign work; selected physical GPU0 is the
@@ -160,7 +232,7 @@ class EmptyDeviceTests(unittest.TestCase):
                     gpu1_counters.write_bytes(saved_gpu1[2])
                 mutations = (
                     ("gpu-sample-1", lambda row: row["output"].__setitem__(
-                        0, row["output"][0].replace(", 0, 0", ", 1, 0"))),
+                        0, row["output"][0].replace(", 0, 0", ", 6, 0"))),
                     ("pmon-0-0", lambda row: row["output"].__setitem__(
                         1, "0 123 C 12 0 0 0 0 0 0")),
                     ("pmon-0-final", lambda row: row["output"].__setitem__(
@@ -182,7 +254,7 @@ class EmptyDeviceTests(unittest.TestCase):
                     ("windows-counters-1", lambda row: row["counters"][1]["samples"][-1].__setitem__(
                         "status", "unavailable")),
                     ("windows-counters-1", lambda row: row["counters"][0]["samples"][0].__setitem__(
-                        "cookedValue", 1)),
+                        "cookedValue", 6)),
                     ("windows-counters-1", lambda row: row["counters"][0]["samples"][0].__setitem__(
                         "status", "unavailable")),
                     ("windows-counters-1", lambda row: row["counters"][0]["samples"].append(
@@ -224,22 +296,17 @@ class EmptyDeviceTests(unittest.TestCase):
                         finally:
                             for path, original in saved_counters.items():
                                 path.write_bytes(original)
-                # A stable Windows counter reservation is allowed; actual
-                # selected-card NVML residency still must remain zero.
-                names = [*(f"gpu-sample-{index}" for index in range(3)),
-                         "gpu-before-cuda-properties", "gpu-after-cuda-properties"]
+                # NVML residency must stay stable across all three epochs.
+                names = ["gpu-sample-1"]
                 saved = {name: (root / f"{name}.json").read_bytes() for name in names}
                 try:
                     for name in names:
                         path = root / f"{name}.json"
                         row = json.loads(saved[name])
-                        if name.startswith("gpu-sample"):
-                            row["output"][0] = row["output"][0].replace(
-                                ", 0, 97438, 0, 0", ", 1, 97437, 0, 0")
-                        else:
-                            row["output"][0] = row["output"][0].replace(", 0, 0", ", 1, 0")
+                        row["output"][0] = row["output"][0].replace(
+                            ", 0, 97438, 0, 0", ", 1, 97437, 0, 0")
                         path.write_text(json.dumps(row), encoding="utf-8")
-                    with self.assertRaisesRegex(RuntimeError, "residency changed or nonzero"):
+                    with self.assertRaisesRegex(RuntimeError, "residency changed"):
                         idle._empty_gpu0_summary(root)
                 finally:
                     for name, raw in saved.items():
@@ -269,6 +336,12 @@ class EmptyDeviceTests(unittest.TestCase):
             "GITHUB_JOB": "cuda", "GITHUB_RUN_ATTEMPT": "1",
             "YUE2_CUDA_SCHEDULING_MODE": "shared-host"}):
             idle.check_empty_dispatch()
+            with patch.dict("os.environ", {"YUE2_CUDA_SCHEDULING_MODE":
+                                        "gpu0-with-reviewed-gpu1"}):
+                idle.check_empty_dispatch()
+            with patch.dict("os.environ", {"YUE2_CUDA_SCHEDULING_MODE": "owner-gpu0"}):
+                with self.assertRaisesRegex(RuntimeError, "source/control"):
+                    idle.check_empty_dispatch()
             with patch.dict("os.environ", {"YUE2_IDLE_CONTEXT_RUN_ID": "old"}):
                 with self.assertRaisesRegex(RuntimeError, "cannot select"):
                     idle.check_empty_dispatch()
@@ -281,7 +354,8 @@ class EmptyDeviceTests(unittest.TestCase):
 
     def test_empty_pmon_rejects_graphics_and_unknown_rows(self):
         idle._pmon_empty(PMON_EMPTY, "test")
-        for row in ("0 3 C - - - - - - 4 - worker", "0 3 G - - - - - - 4 - desktop",
+        for row in ("0 3 C 0 0 0 0 0 0 4 - worker", "0 3 C - - - - - - 4 - worker",
+                    "0 3 G - - - - - - 4 - desktop",
                     "0 3 X - - - - - - 4 - unknown", "0 - - 0 - - - - - - - -",
                     "0 - - -", "1 - - - - - - - - - - -"):
             with self.subTest(row=row), self.assertRaises(RuntimeError):
