@@ -13,8 +13,8 @@ on:
         type: choice
         required: false
         default: shared-host
-        options: [shared-host, owner-gpu0, owner-gpu0-mac-anchor]
-        description: Shared-host CUDA uses physical GPU1; retired GPU0 owner routes refuse before capture
+        options: [shared-host, shared-gpu1, owner-gpu0, owner-gpu0-mac-anchor]
+        description: shared-gpu1 serializes YuE2 on physical GPU1 while observing external workloads; legacy shared-host remains strict
       expected_engine_sha:
         type: string
         required: true
@@ -43,7 +43,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: ${{ inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
+  group: ${{ inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'shared-gpu1' && 'inference-yue2-owner-gpu1' || inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
   queue: max
   cancel-in-progress: false
 

@@ -791,7 +791,8 @@ def main() -> None:
     if env.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") in {"owner-gpu0", "owner-gpu0-mac-anchor"}:
         code = guarded_command(args.argv[1:], Path.cwd(), env, None, args.evidence, args.label)
     else:
-        require(env.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "shared-host", "unknown scheduling mode")
+        require(env.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") in ("shared-host", "shared-gpu1"),
+                "unknown scheduling mode")
         code = shared_host_install_command(args.argv[1:], Path.cwd(),
                                            {k: v for k, v in env.items()
                                             if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}, None)

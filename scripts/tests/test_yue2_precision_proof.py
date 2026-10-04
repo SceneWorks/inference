@@ -97,6 +97,13 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertEqual(app["cancel-in-progress"], "false")
         self.assertEqual(self.concurrency_group(group, "metal", "101"),
                          self.concurrency_group(app["group"], "metal", "102"))
+        for stage in ("cuda", "cuda-diagnostic"):
+            self.assertEqual(self.concurrency_group(group, stage, "101", scheduling="shared-gpu1"),
+                             "inference-yue2-owner-gpu1")
+        self.assertEqual(self.concurrency_group(app["group"], "cuda", "102", scheduling="shared-gpu1"),
+                         "inference-yue2-owner-gpu1")
+        self.assertEqual(self.concurrency_group(app["group"], "metal", "102", scheduling="shared-gpu1"),
+                         "yue2-app-precision-nax-macos-2")
 
     def test_precision_queue_preserves_existing_pending_and_running_work(self):
         settings = self.concurrency_settings(WORKFLOW.read_text(encoding="utf-8"))

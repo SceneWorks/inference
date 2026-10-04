@@ -544,7 +544,7 @@ def check_shared_gpu1_dispatch() -> None:
     require(os.name == "nt" and os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" and
             os.environ.get("CUDA_VISIBLE_DEVICES") == "1" and
             not os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID") and
-            os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "shared-host" and
+            os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") in ("shared-host", "shared-gpu1") and
             os.environ.get("GITHUB_REPOSITORY") == "SceneWorks/inference" and
             os.environ.get("GITHUB_JOB") in ("cuda", "cuda_diagnostic") and
             os.environ.get("GITHUB_RUN_ATTEMPT") == "1" and

@@ -49,6 +49,9 @@ def write_record(record: Path, body: dict) -> None:
     if body.get("backend") == "cuda":
         owned = body.get("measured", {}).get("owned")
         if isinstance(owned, dict):
+            (record.parent / "stages.jsonl").write_text("".join(
+                json.dumps({"stage": stage, "at": index + 1}) + "\n"
+                for index, stage in enumerate((*control.STAGES, "done"))), encoding="utf-8")
             (record.parent / "profile-process.json").write_text(
                 json.dumps({"processId": owned["process"]["pid"]}) + "\n", encoding="utf-8")
             journal = record.parent / "cuda-owned-samples.jsonl"
@@ -140,6 +143,17 @@ class PrecisionControlTests(unittest.TestCase):
             body["measured"]["owned"]["journalSha256"] = control.sha256(journal)
             record.write_text(json.dumps(body), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "counter journal lacks bound"):
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+            write_record(record, body)
+            lines = (record.parent / "cuda-owned-samples.jsonl").read_text(encoding="utf-8").splitlines()
+            altered = json.loads(lines[0])
+            altered["bytes"] = 2048
+            altered["counter"]["rows"][0]["cookedValue"] = 2048.0
+            lines[0] = json.dumps(altered)
+            journal.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            body["measured"]["owned"]["journalSha256"] = control.sha256(journal)
+            record.write_text(json.dumps(body), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "peaks differ from retained counter timeline"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
             write_record(record, body)
             (record.parent / "profile-process.json").write_text('{"processId":999}\n', encoding="utf-8")

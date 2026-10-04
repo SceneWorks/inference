@@ -2,8 +2,8 @@
 """External, fail-closed all-listener watch for one shared-host YuE2 CUDA run.
 
 This does not grant a physical lease. The in-job selected GPU1 census and owned process
-cleanup remain mandatory; this watcher cancels only its exact run when an
-unreviewed GitHub actor appears on either repository's CUDA runners.
+cleanup remain mandatory. The shared-gpu1 route observes concurrent foreign work and
+revokes only on owned identity or inventory failure; strict shared-host retains exclusivity.
 """
 from __future__ import annotations
 
@@ -107,11 +107,11 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
     require(re.fullmatch(r"[0-9a-f]{40}", head) is not None and workflow in
             ("yue2-precision-proof.yml", "yue2-app-precision-profile.yml"),
             "invalid exact owned source")
-    require(mode in {"shared-host", "gpu0-with-reviewed-gpu1"} and
+    require(mode in {"shared-host", "shared-gpu1", "gpu0-with-reviewed-gpu1"} and
             (mode != "gpu0-with-reviewed-gpu1" or workflow == "yue2-precision-proof.yml"),
             "unreviewed GPU1 scheduling mode/workflow")
     require(own_job_name == "cuda" or
-            (mode == "gpu0-with-reviewed-gpu1" and own_job_name == "cuda_diagnostic"),
+            (mode in {"shared-gpu1", "gpu0-with-reviewed-gpu1"} and own_job_name == "cuda_diagnostic"),
             "unreviewed owned GPU job name")
     companion_state = None
     if mode == "gpu0-with-reviewed-gpu1":
@@ -174,10 +174,14 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
     owned = selected[0]
     require(observed[owned["runner_name"]][0].get("status") == "online",
             "owned CUDA runner is offline")
+    require(observed[owned["runner_name"]][0].get("busy") is True,
+            "owned CUDA runner is not assigned")
     if mode == "gpu0-with-reviewed-gpu1":
         require(owned["runner_name"] == "cuda-windows-2" and owned["runner_id"] == 2619,
                 "reviewed GPU1 route must own the other Windows listener")
     for name, (row, _) in observed.items():
+        if mode == "shared-gpu1":
+            continue  # Foreign runner occupancy is observed, never mistaken for owned exclusivity.
         expected_busy = name == owned["runner_name"] or (
             mode == "gpu0-with-reviewed-gpu1" and companion_state == "active" and
             name == gpu1.RUNNER)
@@ -186,11 +190,16 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
         require(row.get("status") == "online" or row.get("busy") is False,
                 f"offline CUDA listener has an active job: {name}")
     historical = []
+    foreign_runs = []
     for key, run in data["runs"].items():
         if key == own_key:
             require(all(job is owned or job.get("status") == "completed" for job in own_jobs),
                     "another owned job is active")
             continue
+        if mode == "shared-gpu1":
+            foreign_runs.append({"repository": key[0], "run_id": key[1],
+                                 "status": run.get("status"), "job_count": len(data["jobs"].get(key, []))})
+            continue  # Keep the complete inventory in each watch receipt without blocking foreign work.
         if mode == "gpu0-with-reviewed-gpu1" and key == ("SceneWorks/inference", gpu1.RUN):
             listed_jobs = data["jobs"].get(key, [])
             gpu1.inventory({"total_count": len(listed_jobs), "jobs": listed_jobs},
@@ -248,6 +257,7 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
                 "reviewed GPU1 active run absent from complete inventory")
     return {"own_run": own_id, "own_job": owned["id"],
             "own_runner": owned["runner_name"], "historical_zero_job_runs": historical,
+            "foreign_runs_observed": foreign_runs,
             "reviewed_gpu1": companion_state,
             "physical_lease": False}
 
@@ -316,12 +326,12 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
             "watch interval/duration/output invalid")
     require((runner_name, runner_id) in (("cuda-windows", 2313), ("cuda-windows-2", 2619)),
             "owned runner binding invalid")
-    require(mode in {"shared-host", "gpu0-with-reviewed-gpu1"} and
+    require(mode in {"shared-host", "shared-gpu1", "gpu0-with-reviewed-gpu1"} and
             (mode != "gpu0-with-reviewed-gpu1" or
              (workflow == "yue2-precision-proof.yml" and runner_name == "cuda-windows-2" and runner_id == 2619)),
             "unreviewed GPU1 watcher placement")
     require(own_job_name == "cuda" or
-            (mode == "gpu0-with-reviewed-gpu1" and own_job_name == "cuda_diagnostic"),
+            (mode in {"shared-gpu1", "gpu0-with-reviewed-gpu1"} and own_job_name == "cuda_diagnostic"),
             "unreviewed owned GPU job name")
     # No cancellation if the initial direct run/job/runner authentication fails.
     binding = bind_owned_job(own_id, head, workflow, job_id, runner_name, runner_id,
@@ -411,7 +421,7 @@ def main() -> None:
     parser.add_argument("--expected-job-id", type=int, required=True)
     parser.add_argument("--expected-runner-name", choices=("cuda-windows", "cuda-windows-2"), required=True)
     parser.add_argument("--expected-runner-id", type=int, choices=(2313, 2619), required=True)
-    parser.add_argument("--mode", choices=("shared-host", "gpu0-with-reviewed-gpu1"),
+    parser.add_argument("--mode", choices=("shared-host", "shared-gpu1", "gpu0-with-reviewed-gpu1"),
                         default="shared-host")
     parser.add_argument("--expected-job-name", choices=("cuda", "cuda_diagnostic"),
                         default="cuda")

@@ -15,8 +15,8 @@ on:
         type: choice
         required: false
         default: shared-host
-        options: [shared-host, owner-gpu0, owner-gpu0-mac-anchor, gpu0-with-reviewed-gpu1]
-        description: Shared-host mode selects physical GPU1; retired GPU0 owner routes refuse before model launch
+        options: [shared-host, shared-gpu1, owner-gpu0, owner-gpu0-mac-anchor, gpu0-with-reviewed-gpu1]
+        description: shared-gpu1 serializes YuE2 on physical GPU1 while observing external workloads; legacy shared-host remains strict
       expected_engine_sha:
         type: string
         required: true
@@ -58,11 +58,13 @@ permissions:
 
 # Hosted CPU fixture transfers do not hold the shared accelerator lock. Every accelerator
 # Metal shares the app's exact nax-macos-2 group; other accelerators default to the existing
-# Windows physical group. Only the explicitly approved receipt-bound
+# Windows physical group. Shared GPU1 YuE2 jobs have their own serialized group;
+# in-job selected-device admission and the external inventory watch remain mandatory.
+# Only the explicitly approved receipt-bound
 # CUDA route uses the fixed provisional GPU0 group; the controller authenticates
 # the selected Windows holder or the exact Mac-active/pending scheduler barrier.
 concurrency:
-  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || inputs.stage == 'metal' && 'yue2-app-precision-nax-macos-2' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'gpu0-with-reviewed-gpu1' && inputs.idle_cuda_context_run_id == '' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda-diagnostic' && inputs.cuda_scheduling_mode == 'gpu0-with-reviewed-gpu1' && inputs.idle_cuda_context_run_id == '' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
+  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || inputs.stage == 'metal' && 'yue2-app-precision-nax-macos-2' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'shared-gpu1' && 'inference-yue2-owner-gpu1' || inputs.stage == 'cuda-diagnostic' && inputs.cuda_scheduling_mode == 'shared-gpu1' && 'inference-yue2-owner-gpu1' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'gpu0-with-reviewed-gpu1' && inputs.idle_cuda_context_run_id == '' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda-diagnostic' && inputs.cuda_scheduling_mode == 'gpu0-with-reviewed-gpu1' && inputs.idle_cuda_context_run_id == '' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
   queue: max
   cancel-in-progress: false
 

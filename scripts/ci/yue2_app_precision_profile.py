@@ -350,11 +350,12 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
                 owned["peakBytes"] >= max(own_stages[stage]["peakBytes"] for stage in STAGES),
                 "shared CUDA owned overall peak is inconsistent with stage peaks")
         source_dir = record_path.parent
+        marks_file = source_dir / "stages.jsonl"
         process_file = source_dir / "profile-process.json"
         owned_journal = source_dir / "cuda-owned-samples.jsonl"
         fault_journal = source_dir / "cuda-owned-faults.jsonl"
         require(all(path.is_file() and not path.is_symlink() for path in
-                    (process_file, owned_journal, fault_journal)) and
+                    (marks_file, process_file, owned_journal, fault_journal)) and
                 json.loads(process_file.read_text(encoding="utf-8")) == {"processId": process["pid"]},
                 "shared CUDA native test process receipt missing or changed")
         require(sha256(owned_journal) == owned["journalSha256"] and
@@ -386,6 +387,28 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
         require(len(raw_samples) >= sum(own_stages[stage]["samples"] for stage in STAGES) and
                 all(valid_owned_sample(sample) for sample in raw_samples),
                 "shared CUDA owned counter journal lacks bound stage samples")
+        marks = [json.loads(line) for line in marks_file.read_text(encoding="utf-8").splitlines()
+                 if line.strip()]
+        require([mark.get("stage") for mark in marks] == [*STAGES, "done"] and
+                all(type(mark.get("at")) in (int, float) and math.isfinite(mark["at"])
+                    for mark in marks) and
+                all(first["at"] <= second["at"] for first, second in zip(marks, marks[1:])),
+                "shared CUDA stage marks are incomplete or unordered")
+        derived = {}
+        for sample in raw_samples:
+            stage = None
+            for mark in marks:
+                if mark["at"] <= sample["at"]:
+                    stage = mark["stage"]
+                else:
+                    break
+            if stage in STAGES:
+                peak_row = derived.setdefault(stage, {"peakBytes": 0, "samples": 0})
+                peak_row["peakBytes"] = max(peak_row["peakBytes"], sample["bytes"])
+                peak_row["samples"] += 1
+        require(all(own_stages[stage] == derived.get(stage) for stage in STAGES) and
+                owned["peakBytes"] == max(derived[stage]["peakBytes"] for stage in STAGES),
+                "shared CUDA owned-stage peaks differ from retained counter timeline")
     result = {"case_id": row["caseId"], "backend": backend, "admission": "admitted",
               "effective_compute_policy": policy, "effective_model_dtype": model_dtype,
               "effective_vae_dtype": vae_dtype, "effective_vae_cuda_bf16_math_policy": math_policy,
@@ -394,6 +417,8 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
               "owned_peak_bytes": owned["peakBytes"] if backend == "cuda" else None,
               "owned_process_pid": process["pid"] if backend == "cuda" else None,
               "owned_proof_sha256": device["sha256"] if backend == "cuda" else None,
+              "owned_journal_sha256": owned["journalSha256"] if backend == "cuda" else None,
+              "stage_marks_sha256": sha256(marks_file) if backend == "cuda" else None,
               "stage_samples": {stage: stages[stage]["samples"] for stage in STAGES},
               "record_sha256": sha256(record_path)}
     if name in CUDA_ONLY_CASES:
@@ -484,8 +509,9 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
     evidence.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     scheduling = environment.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host")
-    require(scheduling in {"shared-host", "owner-gpu0", "owner-gpu0-mac-anchor"} and
-            (scheduling == "shared-host" or backend == "cuda"), "invalid CUDA owner route")
+    require(scheduling in {"shared-host", "shared-gpu1", "owner-gpu0", "owner-gpu0-mac-anchor"} and
+            (scheduling in {"shared-host", "shared-gpu1"} or backend == "cuda") and
+            (scheduling != "shared-gpu1" or backend == "cuda"), "invalid CUDA owner route")
     environment.pop("HF_HUB_CACHE", None)
     environment.pop("HUGGINGFACE_HUB_CACHE", None)
     environment.pop("GH_TOKEN", None)

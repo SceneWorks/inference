@@ -61,6 +61,63 @@ def reviewed_gpu1_snapshot():
 
 
 class SharedHostWatchTests(unittest.TestCase):
+    def test_shared_gpu1_observes_foreign_jobs_without_revoking_owned_run(self):
+        data = own_snapshot()
+        data["runners"]["org"][1]["busy"] = True
+        data["runners"]["app"][0]["busy"] = True
+        data["runners"]["app"][1]["status"] = "offline"
+        key = ("SceneWorks/SceneWorks", 99)
+        data["runs"][key] = {"id": 99, "status": "queued", "head_sha": "b" * 40}
+        data["jobs"][key] = []
+        proof = watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode="shared-gpu1")
+        self.assertEqual(proof["own_job"], 70)
+        self.assertEqual(proof["foreign_runs_observed"],
+                         [{"repository": key[0], "run_id": 99, "status": "queued", "job_count": 0}])
+        with self.assertRaisesRegex(RuntimeError, "unaccounted busy"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode="shared-host")
+        data["runs"][("SceneWorks/inference", 7)]["head_sha"] = "c" * 40
+        with self.assertRaisesRegex(RuntimeError, "owned run/source"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode="shared-gpu1")
+
+    def test_shared_gpu1_requires_exact_owned_runner_and_all_four_listener_identities(self):
+        data = own_snapshot()
+        data["jobs"][("SceneWorks/inference", 7)][0]["name"] = "cuda_diagnostic"
+        self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                                        mode="shared-gpu1", own_job_name="cuda_diagnostic")["own_job"], 70)
+        data["runners"]["org"][0]["busy"] = False
+        with self.assertRaisesRegex(RuntimeError, "owned CUDA runner is not assigned"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                           mode="shared-gpu1", own_job_name="cuda_diagnostic")
+        data["runners"]["org"][0]["busy"] = True
+        data["runners"]["app"][0]["id"] = 999
+        with self.assertRaisesRegex(RuntimeError, "physical CUDA runner identity"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml",
+                           mode="shared-gpu1", own_job_name="cuda_diagnostic")
+
+    def test_shared_gpu1_watch_keeps_owned_run_when_foreign_cuda_job_is_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = own_snapshot()
+            data["runners"]["org"][1]["busy"] = True
+            key = ("SceneWorks/inference", 99)
+            data["runs"][key] = {"id": 99, "status": "in_progress", "head_sha": "b" * 40}
+            data["jobs"][key] = [{"id": 990, "name": "foreign CUDA", "status": "in_progress",
+                                  "runner_name": "cuda-windows-2", "runner_id": 2619}]
+            direct = {**data["runs"][("SceneWorks/inference", 7)],
+                      "repository": {"full_name": "SceneWorks/inference"},
+                      "created_at": "2026-10-04T20:00:00Z"}
+            job = data["jobs"][("SceneWorks/inference", 7)][0]
+            job["started_at"] = "2026-10-04T20:01:00Z"
+            binding = {"run": direct, "job": job, "job_id": 70, "start": job["started_at"]}
+            terminal = {**direct, "status": "completed", "conclusion": "success"}
+            with patch.object(watch, "bind_owned_job", return_value=binding), \
+                 patch.object(watch, "owned_run", side_effect=[direct, terminal]), \
+                 patch.object(watch, "snapshot", return_value=data), \
+                 patch.object(watch.time, "sleep"), \
+                 patch.object(watch, "cancel_bound_run") as cancel:
+                watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
+                            60, 30, 70, "cuda-windows", 2313, mode="shared-gpu1")
+            cancel.assert_not_called()
+
     def test_unused_app_listeners_may_be_offline_but_owned_runner_must_be_online(self):
         data = own_snapshot()
         for row in data["runners"]["app"]:

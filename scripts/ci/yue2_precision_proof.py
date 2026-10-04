@@ -715,7 +715,8 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
               "owned_descendants_released": descendants_released,
               "exact_one_test_passed": exact_one_test_executed(output, name),
               "sample_count": len(samples), "sampler_faults": faults,
-              "scheduling": owner_guard.summary() if owner_guard is not None else {"mode": "shared-host"}}
+              "scheduling": owner_guard.summary() if owner_guard is not None else
+              {"mode": env.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host")}}
     return result, samples, faults
 
 
@@ -988,7 +989,7 @@ def execute(args: argparse.Namespace) -> None:
               "post_census_busy": after_busy, "post_census_error": post_census_error,
               "receipt_sha256": sha256(receipt) if receipt.is_file() else None,
               "receipt_schema_error": receipt_schema_error,
-              "scheduling": owner_guard.summary() if owner_guard is not None else {"mode": "shared-host"}}
+              "scheduling": owner_guard.summary() if owner_guard is not None else {"mode": scheduling}}
     write_json(evidence / "control.json", report)
     print(json.dumps(report, indent=2), flush=True)
     require(len(child_results) == len(stages) and all(child_stage_succeeded(row) for row in child_results),

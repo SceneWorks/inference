@@ -123,6 +123,8 @@ class SharedGpu1Tests(unittest.TestCase):
                "EXPECTED_ENGINE_SHA": SHA, "EXPECTED_CONTROL_SHA": SHA, "GITHUB_SHA": SHA}
         with patch("os.name", "nt"), patch.dict("os.environ", env):
             idle.check_shared_gpu1_dispatch()
+            with patch.dict("os.environ", {"YUE2_CUDA_SCHEDULING_MODE": "shared-gpu1"}):
+                idle.check_shared_gpu1_dispatch()
             with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0"}):
                 with self.assertRaises(RuntimeError):
                     idle.check_shared_gpu1_dispatch()
