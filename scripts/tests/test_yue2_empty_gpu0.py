@@ -15,7 +15,11 @@ SHA = "a" * 40
 LUID = "luid_0x00000000_0x00020d46"
 PCI = "0000:21:00.0"
 UUID = "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
-PMON_EMPTY = ["# gpu pid type fb sm mem enc dec jpg ofa", "0 - - - - - - - - -"]
+PMON_EMPTY = [
+    "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command",
+    "# Idx           #    C/G      %      %      %      %      %      %     MB     MB    name",
+    "    0          -     -      -      -      -      -      -      -      -      -    -",
+]
 
 
 def make_probe(root: Path) -> None:
@@ -211,7 +215,12 @@ class EmptyDeviceTests(unittest.TestCase):
 
     def test_empty_pmon_rejects_graphics_and_unknown_rows(self):
         idle._pmon_empty(PMON_EMPTY, "test")
-        for row in ("0 3 G 0 0 0 0 0 0 0", "0 3 X 0 0 0 0 0 0 0",
-                    "0 - - 0 - - - - - -"):
+        for row in ("0 3 C - - - - - - 4 - worker", "0 3 G - - - - - - 4 - desktop",
+                    "0 3 X - - - - - - 4 - unknown", "0 - - 0 - - - - - - - -",
+                    "0 - - -", "1 - - - - - - - - - - -"):
             with self.subTest(row=row), self.assertRaises(RuntimeError):
-                idle._pmon_empty([PMON_EMPTY[0], row], "test")
+                idle._pmon_empty(PMON_EMPTY[:2] + [row], "test")
+        for rows in (PMON_EMPTY[1:], [PMON_EMPTY[1], PMON_EMPTY[0]],
+                     [PMON_EMPTY[0], PMON_EMPTY[0], PMON_EMPTY[2]]):
+            with self.subTest(rows=rows), self.assertRaises(RuntimeError):
+                idle._pmon_empty(rows, "test")

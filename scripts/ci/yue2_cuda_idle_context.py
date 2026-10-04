@@ -348,9 +348,14 @@ def _pmon_empty(output: list[str], name: str) -> None:
     columns = None
     for line in output:
         fields = line.split()
-        if line.startswith("#") and "pid" in fields and "type" in fields:
-            columns = {field: index - 1 for index, field in enumerate(fields) if index > 0}
-        elif fields:
+        if fields and fields[0] == "#":
+            if "pid" in fields and "type" in fields:
+                require(columns is None, f"{name} has duplicate typed pmon columns")
+                columns = {field: index - 1 for index, field in enumerate(fields) if index > 0}
+            else:
+                require(columns is not None, f"{name} lacks typed pmon columns")
+            continue
+        if fields:
             require(columns is not None and all(key in columns for key in ("gpu", "pid", "type")) and
                     len(fields) > max(columns.values()) and fields[columns["gpu"]] == "0" and
                     fields[columns["pid"]] == fields[columns["type"]] == "-" and
