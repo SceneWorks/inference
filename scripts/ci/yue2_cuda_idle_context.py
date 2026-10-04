@@ -279,6 +279,23 @@ def check_device_selection(platform: str, visible: str | None, order: str | None
             "reviewed context requires Windows and PCI-ordered CUDA GPU0")
 
 
+def check_empty_dispatch() -> None:
+    """The no-process route has no desktop receipt or borrowed 12-hour clock."""
+    check_device_selection(os.name, os.environ.get("CUDA_VISIBLE_DEVICES"),
+                           os.environ.get("CUDA_DEVICE_ORDER"))
+    require(not os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID"),
+            "empty GPU0 route cannot select a desktop-context receipt")
+    require(re.fullmatch(r"[0-9a-f]{40}", os.environ.get("EXPECTED_ENGINE_SHA", "")) is not None and
+            re.fullmatch(r"[0-9a-f]{40}", os.environ.get("EXPECTED_CONTROL_SHA", "")) is not None and
+            os.environ.get("EXPECTED_CONTROL_SHA") == os.environ.get("GITHUB_SHA") and
+            os.environ.get("GITHUB_REPOSITORY") == "SceneWorks/inference" and
+            os.environ.get("GITHUB_JOB") == "cuda" and
+            os.environ.get("GITHUB_RUN_ATTEMPT") == "1" and
+            os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "shared-host" and
+            os.environ.get("RUNNER_NAME") in ("cuda-windows", "cuda-windows-2"),
+            "empty GPU0 source/control/runner identity unavailable")
+
+
 def reviewed_baseline() -> tuple[dict, Path]:
     check_device_selection(os.name, os.environ.get("CUDA_VISIBLE_DEVICES"),
                            os.environ.get("CUDA_DEVICE_ORDER"))
@@ -311,6 +328,167 @@ def diagnostic_file_pairs(directory: Path) -> tuple[dict[str, str], dict[str, st
     files = {item.name: item.read_bytes() for item in sorted(directory.iterdir()) if item.is_file()}
     return ({name: data.decode("utf-8-sig") for name, data in files.items()},
             {name: base64.b64encode(data).decode("ascii") for name, data in files.items()})
+
+
+def empty_probe_names() -> set[str]:
+    names = {"manifest.json", "process-before.json", "process-after.json",
+             "windows-counter-catalog.json", "cuda-adapter-map.json",
+             "gpu-before-cuda-properties.json", "gpu-after-cuda-properties.json",
+             "pmon-0-final.json"}
+    for index in range(3):
+        names.update({f"gpu-sample-{index}.json", f"driver-mode-{index}.json",
+                      f"windows-counters-{index}.json"})
+        for gpu in (0, 1):
+            names.update({f"pmon-{gpu}-{index}.json", f"compute-apps-{gpu}-{index}.json"})
+    require(len(names) == 29, "empty-device probe inventory definition changed")
+    return names
+
+
+def _pmon_empty(output: list[str], name: str) -> None:
+    columns = None
+    for line in output:
+        fields = line.split()
+        if line.startswith("#") and "pid" in fields and "type" in fields:
+            columns = {field: index - 1 for index, field in enumerate(fields) if index > 0}
+        elif fields:
+            require(columns is not None and all(key in columns for key in ("gpu", "pid", "type")) and
+                    len(fields) > max(columns.values()) and fields[columns["gpu"]] == "0" and
+                    fields[columns["pid"]] == fields[columns["type"]] == "-" and
+                    all(value == "-" or index == columns["gpu"] for index, value in enumerate(fields)),
+                    f"{name} has a process or ambiguous GPU0 row")
+    require(columns is not None, f"{name} lacks typed pmon columns")
+
+
+def _empty_smi(directory: Path, name: str) -> dict:
+    value = read_json(directory, name)
+    require(value.get("exitCode") == 0 and isinstance(value.get("output"), list),
+            f"{name} unavailable")
+    return value
+
+
+def _empty_gpu0_summary(directory: Path) -> dict:
+    """Validate every device/process family from a fresh, process-free probe."""
+    manifest = read_json(directory, "manifest")
+    require(manifest.get("completed") is True and manifest.get("targetPid") == 0 and
+            manifest.get("engineSha") == os.environ.get("EXPECTED_ENGINE_SHA") and
+            manifest.get("controlSha") == os.environ.get("GITHUB_SHA") and
+            manifest.get("runner") == os.environ.get("RUNNER_NAME"),
+            "empty-device probe source/runner/target changed")
+    for name in ("process-before", "process-after"):
+        process = read_json(directory, name)
+        require(process.get("pid") == 0 and process.get("status") == "no-target-process",
+                f"{name} is not process-free")
+    catalog = read_json(directory, "windows-counter-catalog")
+    listed = {row.get("name"): row for row in catalog.get("sets", [])}
+    required_catalog = {
+        "GPU Engine": {r"\GPU Engine(*)\Utilization Percentage"},
+        "GPU Process Memory": {r"\GPU Process Memory(*)\Dedicated Usage",
+                               r"\GPU Process Memory(*)\Shared Usage",
+                               r"\GPU Process Memory(*)\Total Committed"},
+        "GPU Adapter Memory": {r"\GPU Adapter Memory(*)\Dedicated Usage",
+                               r"\GPU Adapter Memory(*)\Shared Usage",
+                               r"\GPU Adapter Memory(*)\Total Committed"},
+    }
+    require(catalog.get("targetPid") == 0 and len(listed) == len(catalog.get("sets", [])) == 3 and
+            all(isinstance(listed.get(name), dict) and "error" not in listed[name] and
+                paths.issubset(set(listed[name].get("paths", [])))
+                for name, paths in required_catalog.items()),
+            "empty-device Windows counter catalog unavailable")
+    adapter = read_json(directory, "cuda-adapter-map")
+    devices = adapter.get("devices", [])
+    require(adapter.get("cuInit") == adapter.get("cuDeviceGetCount") == 0 and
+            len(devices) == 1 and devices[0].get("ordinal") == 0 and
+            devices[0].get("cuDeviceGet") == devices[0].get("cuDeviceGetPCIBusId") ==
+            devices[0].get("cuDeviceGetLuid") == 0 and devices[0].get("nodeMask") == 1,
+            "empty-device CUDA ordinal/PCI/LUID mapping unavailable")
+    raw_luid = bytes.fromhex(devices[0]["luidBytes"].replace("-", ""))
+    require(len(raw_luid) == 8, "empty-device LUID invalid")
+    luid = f"luid_0x{int.from_bytes(raw_luid[4:], 'little'):08x}_0x{int.from_bytes(raw_luid[:4], 'little'):08x}"
+    gpu = [_gpu_row(directory, f"gpu-sample-{index}", has_free=True) for index in range(3)]
+    require(gpu[0]["usedMiB"] == 0 and all(row == gpu[0] for row in gpu) and
+            devices[0]["pciBusId"].lower().lstrip("0") == gpu[0]["pci"],
+            "empty-device GPU0 identity/residency changed or nonzero")
+    for index in range(3):
+        mode = _empty_smi(directory, f"driver-mode-{index}")
+        rows = [next(csv.reader([line], skipinitialspace=True)) for line in mode["output"]]
+        rows = [row for row in rows if row and row[0].strip() == "0"]
+        require(len(rows) == 1 and rows[0][1].strip() == gpu[0]["uuid"] and
+                rows[0][2].strip() == "WDDM", "empty-device driver mode changed")
+        _pmon_empty(_empty_smi(directory, f"pmon-0-{index}")["output"], f"pmon-0-{index}")
+        require(not any(line.strip() for line in _empty_smi(directory, f"compute-apps-0-{index}")["output"]),
+                "empty-device compute application appeared")
+    _pmon_empty(_empty_smi(directory, "pmon-0-final")["output"], "pmon-0-final")
+    for name in ("gpu-before-cuda-properties", "gpu-after-cuda-properties"):
+        sample = _empty_smi(directory, name)
+        rows = [next(csv.reader([line], skipinitialspace=True)) for line in sample["output"]]
+        rows = [row for row in rows if row and row[0].strip() == "0"]
+        require(len(rows) == 1 and len(rows[0]) == 5 and rows[0][1].strip() == gpu[0]["uuid"] and
+                rows[0][2].strip().lower().lstrip("0") == gpu[0]["pci"] and
+                rows[0][3].strip().isdigit() and int(rows[0][3]) == gpu[0]["usedMiB"] and
+                rows[0][4].strip() == "0", f"{name} changed or active")
+    counters = []
+    expected = {
+        "engine": r"\GPU Engine(*)\Utilization Percentage",
+        "processDedicated": r"\GPU Process Memory(*)\Dedicated Usage",
+        "processShared": r"\GPU Process Memory(*)\Shared Usage",
+        "processCommitted": r"\GPU Process Memory(*)\Total Committed",
+        "adapterDedicated": r"\GPU Adapter Memory(*)\Dedicated Usage",
+        "adapterShared": r"\GPU Adapter Memory(*)\Shared Usage",
+        "adapterCommitted": r"\GPU Adapter Memory(*)\Total Committed",
+    }
+    for index in range(3):
+        value = read_json(directory, f"windows-counters-{index}")
+        rows = {row.get("counter"): row for row in value.get("counters", [])}
+        require(value.get("targetPid") == 0 and len(rows) == len(value.get("counters", [])),
+                "empty-device counter rows ambiguous")
+        result = {}
+        for key, path in expected.items():
+            row = rows.get(path)
+            require(isinstance(row, dict) and "error" not in row,
+                    f"empty-device {path} unavailable")
+            samples = [sample for sample in row.get("samples", [])
+                       if luid in sample.get("instance", "").lower()]
+            require(all(str(sample.get("status")) == "0" and
+                        type(sample.get("cookedValue")) in (int, float) and
+                        math.isfinite(sample["cookedValue"]) and sample["cookedValue"] >= 0
+                        for sample in samples), f"empty-device {path} invalid")
+            if key.startswith("adapter"):
+                require(len(samples) == 1, f"empty-device {path} adapter ambiguous")
+                result[key] = samples[0]["cookedValue"]
+            else:
+                require(all(sample["cookedValue"] == 0 for sample in samples),
+                        f"empty-device {path} process active/resident")
+                result[key] = sorted(sample["instance"].lower() for sample in samples)
+        counters.append(result)
+    require(all(row == counters[0] for row in counters),
+            "empty-device Windows adapter/process counters changed")
+    return {"physicalMode": "empty-gpu0", "uuid": gpu[0]["uuid"],
+            "pci": gpu[0]["pci"], "luid": luid, "gpu": gpu[0], "counters": counters[0]}
+
+
+def census_empty_device(initial_pmon: str) -> tuple[str, bool]:
+    check_empty_dispatch()
+    _pmon_empty(initial_pmon.splitlines(), "initial pmon")
+    with tempfile.TemporaryDirectory(prefix="yue2-empty-gpu0-") as root:
+        output = Path(root)
+        script = Path(__file__).with_name("yue2_cuda_context_diagnostic.ps1")
+        command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                   "-File", str(script), "-TargetPid", "0", "-OutputDirectory", str(output),
+                   "-EngineSha", os.environ["EXPECTED_ENGINE_SHA"], "-ControlSha", os.environ["GITHUB_SHA"]]
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=180)
+        files, raw_files = diagnostic_file_pairs(output)
+        raw = {"physicalMode": "empty-gpu0", "initialPmon": initial_pmon,
+               "commandExit": result.returncode, "diagnosticFiles": files,
+               "diagnosticFileBytesB64": raw_files}
+        try:
+            require(result.returncode == 0, f"empty-device read-only probe failed: {result.stderr.strip()}")
+            require(set(files) == set(raw_files) == empty_probe_names(),
+                    "empty-device raw file inventory incomplete")
+            raw["validatedDevice"] = _empty_gpu0_summary(output)
+            return json.dumps(raw, sort_keys=True), True
+        except Exception as error:
+            raw["refusal"] = str(error)
+            return json.dumps(raw, sort_keys=True), False
 
 
 def census_mixed_context(pid: int, initial_pmon: str) -> tuple[str, bool]:

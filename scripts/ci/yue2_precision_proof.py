@@ -212,6 +212,14 @@ def cuda_census() -> tuple[str, list[str]]:
     if result.returncode == 0:
         typed = typed_compute_rows(result.stdout)
         busy = [line for line, _, _ in typed]
+        if not typed:
+            try:
+                from yue2_cuda_idle_context import census_empty_device  # type: ignore[import-not-found]
+                raw, verified = census_empty_device(result.stdout)
+                return raw, [] if verified else ["empty GPU0 physical probe refused"]
+            except Exception as error:
+                return (f"{result.stdout}\nempty GPU0 guard refused: {error}",
+                        ["empty GPU0 physical probe refused"])
         # The normal typed guard still refuses every compute context. The only
         # exception is a currently reverified, receipt-bound WDDM C+G context;
         # pure C, multiple mixed rows, missing evidence, and faults stay busy.
@@ -252,11 +260,11 @@ def physical_busy_message(raw: str, busy: list[str], context: str) -> str:
 
 
 def cuda_physical_census() -> tuple[str, list[str]]:
-    """Require the complete reviewed-owner fresh probe for production acceptance.
+    """Require complete selected-GPU seven-family evidence before model work.
 
-    The current collector's seven families include one target process. An empty
-    or graphics-only GPU has no process to sample, so this route refuses it
-    rather than interpreting unsupported process telemetry as zero.
+    A reviewed C+G receipt selects one signed process; an actually process-free
+    GPU0 instead requires a fresh unfiltered, zero-residency 29-file probe.
+    Graphics-only or ambiguous telemetry is never interpreted as empty.
     """
     raw, busy = cuda_census()
     if busy:
@@ -268,6 +276,9 @@ def cuda_physical_census() -> tuple[str, list[str]]:
                 len(probe["diagnosticFiles"]) == len(probe["diagnosticFileBytesB64"]) == 29 and
                 set(probe["diagnosticFiles"]) == set(probe["diagnosticFileBytesB64"]) and
                 probe.get("commandExit") == 0 and
+                probe.get("physicalMode") in (None, "empty-gpu0") and
+                (probe.get("physicalMode") != "empty-gpu0" or
+                 probe.get("validatedDevice", {}).get("physicalMode") == "empty-gpu0") and
                 "refusal" not in probe, "complete selected-device physical probe absent")
     except (ValueError, TypeError, RuntimeError):
         return raw, ["complete selected-device seven-family physical proof absent"]
@@ -415,8 +426,9 @@ def exact_one_test_executed(output: str, name: str) -> bool:
 def remaining_cuda_budget(total_deadline: float, job_start_ns: int) -> float:
     remaining = total_deadline - time.monotonic()
     require(remaining > 0, "combined CUDA child deadline expired before next exact test")
-    from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
-    require_remaining_window(remaining + CUDA_POSTFLIGHT_SECONDS)
+    if os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID"):
+        from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
+        require_remaining_window(remaining + CUDA_POSTFLIGHT_SECONDS)
     require(time.time_ns() + (remaining + CUDA_POSTFLIGHT_SECONDS) * 1_000_000_000 <=
             job_start_ns + CUDA_JOB_TIMEOUT_SECONDS * 1_000_000_000,
             "combined CUDA child cannot finish before workflow upload tail")
@@ -646,15 +658,19 @@ def execute(args: argparse.Namespace) -> None:
     else:
         require(os.environ.get("CUDA_VISIBLE_DEVICES") == "0",
                 "CUDA proof must bind the same physical GPU 0 used by its process census")
-        from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
+        from yue2_cuda_idle_context import check_empty_dispatch, require_remaining_window  # type: ignore[import-not-found]
         job_start = os.environ.get("YUE2_PRECISION_JOB_STARTED_UTC_NS", "")
         require(job_start.isdigit() and int(job_start) <= time.time_ns() and
                 time.time_ns() + (CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS) * 1_000_000_000 <=
                 int(job_start) + CUDA_JOB_TIMEOUT_SECONDS * 1_000_000_000,
                 "bounded CUDA child cannot finish before workflow upload tail")
-        baseline, baseline_dir = require_remaining_window(
-            CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS)
-        baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
+        baseline = None
+        if os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID"):
+            baseline, baseline_dir = require_remaining_window(
+                CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS)
+            baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
+        else:
+            check_empty_dispatch()
     total_deadline = time.monotonic() + CUDA_CHILD_TIMEOUT_SECONDS if args.backend == "cuda" else None
     before_raw, before_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
     (evidence / "census-before.txt").write_text(before_raw, encoding="utf-8")

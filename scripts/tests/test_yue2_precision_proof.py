@@ -297,9 +297,11 @@ class PrecisionControlTests(unittest.TestCase):
         header = "# gpu pid type fb sm\n"
         with patch.dict("os.environ", {"YUE2_IDLE_CONTEXT_RUN_ID": IDLE.RUN_ID}):
             with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 - - - -\n")), \
-                 patch.object(IDLE, "census_mixed_context") as attestation:
-                self.assertEqual(CONTROL.cuda_census()[1], [])
+                 patch.object(IDLE, "census_mixed_context") as attestation, \
+                 patch.object(IDLE, "census_empty_device", return_value=("fresh empty proof", True)) as empty:
+                self.assertEqual(CONTROL.cuda_census(), ("fresh empty proof", []))
                 attestation.assert_not_called()
+                empty.assert_called_once()
             with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 38212 C+G 0 -\n")), \
                  patch.object(IDLE, "census_mixed_context", return_value=("reviewed raw receipt", True)):
                 self.assertEqual(CONTROL.cuda_census(), ("reviewed raw receipt", []))
@@ -507,6 +509,7 @@ class PrecisionControlTests(unittest.TestCase):
                  patch.object(CONTROL, "verify_revisions"), \
                  patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
                  patch.object(IDLE, "require_remaining_window", return_value=(baseline, root)), \
+                 patch.object(IDLE, "check_empty_dispatch"), \
                  patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(CONTROL, "cuda_physical_census", return_value=(census, [])) as physical, \
                  patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
@@ -571,6 +574,7 @@ class PrecisionControlTests(unittest.TestCase):
                  patch.object(CONTROL, "verify_revisions"), \
                  patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
                  patch.object(IDLE, "require_remaining_window", return_value=(baseline, root)), \
+                 patch.object(IDLE, "check_empty_dispatch"), \
                  patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(CONTROL, "cuda_physical_census", side_effect=physical_census) as physical, \
                  patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
@@ -765,7 +769,8 @@ class PrecisionControlTests(unittest.TestCase):
 
     def test_three_children_share_one_cuda_deadline_and_tail(self):
         job_start = time.time_ns()
-        with patch.object(IDLE, "require_remaining_window", return_value=({}, Path("baseline"))) as check, \
+        with patch.dict("os.environ", {"YUE2_IDLE_CONTEXT_RUN_ID": IDLE.RUN_ID}), \
+             patch.object(IDLE, "require_remaining_window", return_value=({}, Path("baseline"))) as check, \
              patch.object(CONTROL.time, "monotonic", side_effect=[100.0, 110.0, 179.0]):
             self.assertEqual(CONTROL.remaining_cuda_budget(200.0, job_start), 100.0)
             self.assertEqual(CONTROL.remaining_cuda_budget(200.0, job_start), 90.0)
@@ -967,7 +972,7 @@ class PrecisionControlTests(unittest.TestCase):
                                                "cuda-diagnostic", "101"), "inference-real-weights-physical-host")
         self.assertIn("$env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA", job)
         self.assertIn("(git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA", job)
-        self.assertIn("diagnostic_pid must be a positive decimal PID", job)
+        self.assertIn("diagnostic_pid must be 0 or a positive decimal PID", job)
         self.assertIn("if: always()", job)
         self.assertNotIn("cargo ", job)
         self.assertNotIn("download-artifact", job)

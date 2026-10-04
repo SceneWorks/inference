@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import types
 import unittest
@@ -409,6 +410,7 @@ class PrecisionControlTests(unittest.TestCase):
                                            retain_cuda_physical_evidence=lambda *_: [],
                                            retain_reviewed_baseline=lambda *_: [])
             with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
+                 patch.object(control, "remaining_app_budget", return_value=3600), \
                  patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)):
                 with self.assertRaisesRegex(ValueError, "competing physical-device"):
                     control.preflight("cuda", evidence, "before-test")
@@ -429,6 +431,7 @@ class PrecisionControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence"
             with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
+                 patch.object(control, "remaining_app_budget", return_value=3600), \
                  patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)):
                 with self.assertRaisesRegex(ValueError, "adapterDedicated rose over reviewed baseline"):
                     control.preflight("cuda", evidence, "before-test")
@@ -448,11 +451,45 @@ class PrecisionControlTests(unittest.TestCase):
             guard = types.SimpleNamespace(require_remaining_window=Mock(
                 side_effect=RuntimeError("reviewed owner window cannot cover bounded run and postflight")))
             with patch.dict("sys.modules", {"yue2_precision_proof": census,
-                                            "yue2_cuda_idle_context": guard}):
+                                            "yue2_cuda_idle_context": guard}), \
+                 patch.dict("os.environ", {"YUE2_IDLE_CONTEXT_RUN_ID": "reviewed"}), \
+                 patch.object(control, "remaining_app_budget", return_value=3600):
                 with self.assertRaisesRegex(RuntimeError, "cannot cover"):
                     control.preflight("cuda", Path(directory) / "evidence", "initial")
             guard.require_remaining_window.assert_called_once_with(480 * 60 + 600)
             census.cuda_physical_census.assert_not_called()
+
+    def test_shared_host_cuda_keeps_absolute_app_job_tail(self):
+        now = 900_000_000_000_000
+        with patch.object(control.time, "time_ns", return_value=now), \
+             patch.dict("os.environ", {"YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": str(
+                 now - (480 * 60 - 601) * 1_000_000_000)}):
+            self.assertEqual(control.remaining_app_budget(), 1)
+        with patch.object(control.time, "time_ns", return_value=now), \
+             patch.dict("os.environ", {"YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": str(
+                 now - (480 * 60 - 599) * 1_000_000_000)}), \
+             self.assertRaisesRegex(ValueError, "cleanup/upload tail"):
+            control.remaining_app_budget()
+
+    def test_shared_host_timeout_reaps_only_its_child_tree(self):
+        class Owned:
+            def __init__(self):
+                self.pid = 8123
+                self.released = False
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("node", timeout)
+            def poll(self):
+                return -9 if self.released else None
+        owned = Owned()
+        owner = types.SimpleNamespace(reap_tree=lambda child: (
+            setattr(child, "released", True) or -9, None))
+        with patch.object(control, "remaining_app_budget", return_value=77), \
+             patch.object(control.subprocess, "Popen", return_value=owned) as launch, \
+             patch.dict("sys.modules", {"yue2_gpu0_owner_guard": owner}), \
+             self.assertRaises(subprocess.TimeoutExpired):
+            control.run_shared_command(["node", "capture"], Path("app"), {}, None)
+        self.assertEqual(launch.call_args.args[0], ["node", "capture"])
+        self.assertTrue(owned.released)
 
     def test_eight_cuda_case_verdict_requires_final_physical_release_census(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -466,6 +503,7 @@ class PrecisionControlTests(unittest.TestCase):
                     raise ValueError("post-case physical owner changed")
             with patch.object(control, "preflight", side_effect=preflight), \
                  patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)), \
+                 patch.object(control, "run_shared_command", return_value=0), \
                  patch.object(control.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)), \
                  patch.object(control, "verify_record"), \
                  patch.object(control, "verify_audio", return_value={"sha256": "a" * 64}), \

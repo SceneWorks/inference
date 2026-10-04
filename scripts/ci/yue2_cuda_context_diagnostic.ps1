@@ -3,7 +3,9 @@
 # as the ownership gate. cuInit below initializes the CUDA driver only; no
 # context acquisition, allocation, kernel, model, or test is performed.
 param(
-    [Parameter(Mandatory = $true)][ValidateRange(1, 2147483647)][int]$TargetPid,
+    # Zero is the process-free GPU0 route. It still collects the same 29 raw
+    # files, including unfiltered Windows counters for the mapped adapter.
+    [Parameter(Mandatory = $true)][ValidateRange(0, 2147483647)][int]$TargetPid,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][string]$EngineSha,
     [Parameter(Mandatory = $true)][string]$ControlSha
@@ -29,6 +31,7 @@ function Invoke-Smi($Name, [string[]]$Arguments) {
 function Save-ProcessIdentity($Name) {
     $at = (Get-Date).ToUniversalTime().ToString('o')
     try {
+        if ($TargetPid -eq 0) { Save-Json "$Name.json" @{ utc = $at; pid = 0; status = 'no-target-process' }; return }
         $item = Get-CimInstance Win32_Process -Filter "ProcessId = $TargetPid" -ErrorAction Stop
         if ($null -eq $item) { Save-Json "$Name.json" @{ utc = $at; pid = $TargetPid; status = 'not_found' }; return }
         $signature = $null
@@ -53,7 +56,7 @@ function Save-Counters($Name) {
         try {
             $set = Get-Counter -Counter $pattern -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
             $samples = @($set.CounterSamples | Where-Object {
-                $pattern -like '*GPU Adapter Memory*' -or $_.InstanceName -match "(^|_)pid_$TargetPid(_|$)"
+                $TargetPid -eq 0 -or $pattern -like '*GPU Adapter Memory*' -or $_.InstanceName -match "(^|_)pid_$TargetPid(_|$)"
             } | ForEach-Object { @{ path = $_.Path; instance = $_.InstanceName; cookedValue = $_.CookedValue; status = [string]$_.Status } })
             $results += @{ counter = $pattern; timestamp = [string]$set.Timestamp; samples = $samples }
         } catch { $results += @{ counter = $pattern; error = $_.Exception.Message } }
@@ -67,7 +70,7 @@ function Save-CounterCatalog {
         try {
             $set = Get-Counter -ListSet $name -ErrorAction Stop
             $instances = @($set.PathsWithInstances | Where-Object {
-                $name -eq 'GPU Adapter Memory' -or $_ -match "(^|_)pid_$TargetPid(_|$)"
+                $TargetPid -eq 0 -or $name -eq 'GPU Adapter Memory' -or $_ -match "(^|_)pid_$TargetPid(_|$)"
             })
             $sets += @{ name = $name; paths = @($set.Paths); targetOrAdapterInstances = $instances }
         } catch { $sets += @{ name = $name; error = $_.Exception.Message } }

@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 CASES = {
     "strict-bf16-standard": ("bf16", "strict-bf16-standard", "standard", "bf16", "bfloat16", "bfloat16"),
@@ -176,10 +177,16 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
         require(os.environ.get("RUNNER_NAME") == "nax-macos-2", "Metal must run on nax-macos-2")
     evidence.mkdir(parents=True, exist_ok=True)
     baseline_files = None
-    if backend == "cuda" and label == "initial":
-        from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
-        _, baseline_dir = require_remaining_window(480 * 60 + 600)
-        baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
+    if backend == "cuda":
+        remaining_app_budget()
+        if label == "initial":
+            if os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID"):
+                from yue2_cuda_idle_context import require_remaining_window  # type: ignore[import-not-found]
+                _, baseline_dir = require_remaining_window(480 * 60 + 600)
+                baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
+            else:
+                from yue2_cuda_idle_context import check_empty_dispatch  # type: ignore[import-not-found]
+                check_empty_dispatch()
     census, busy = (cuda_physical_census if backend == "cuda" else metal_census)()
     physical_files = (retain_cuda_physical_evidence(evidence, label, census)
                       if backend == "cuda" and not busy else None)
@@ -211,6 +218,30 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
     (evidence / f"preflight-{label}.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     require(not errors, "; ".join(errors))
     return record
+
+
+def remaining_app_budget() -> float:
+    """Keep the original 480-minute job bound and 600-second cleanup/upload tail."""
+    stamp = os.environ.get("YUE2_APP_PRECISION_JOB_STARTED_UTC_NS", "")
+    require(stamp.isdigit() and int(stamp) <= time.time_ns(),
+            "app owned job start is unavailable")
+    remaining = (int(stamp) + 480 * 60 * 1_000_000_000 - time.time_ns()) / 1_000_000_000 - 600
+    require(remaining > 0, "app job no longer has its original 600-second cleanup/upload tail")
+    return remaining
+
+
+def run_shared_command(argv: list[str], app: Path, environment: dict, log) -> int:
+    """Bound only our Node process tree when using the serialized shared-host lane."""
+    remaining_app_budget()
+    child = subprocess.Popen(argv, cwd=app, env=environment, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        return child.wait(timeout=remaining_app_budget())
+    except BaseException:
+        from yue2_gpu0_owner_guard import reap_tree  # type: ignore[import-not-found]
+        _, error = reap_tree(child)
+        require(error is None and child.poll() is not None,
+                f"owned shared-host app process did not release: {error}")
+        raise
 
 
 def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_policy: str) -> dict:
@@ -376,6 +407,8 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                     if scheduling in {"owner-gpu0", "owner-gpu0-mac-anchor"}:
                         from yue2_gpu0_owner_guard import guarded_command
                         status = guarded_command(argv, app, environment, log, evidence, f"{name}-{label}")
+                    elif backend == "cuda":
+                        status = run_shared_command(argv, app, environment, log)
                     else:
                         status = subprocess.run(argv, cwd=app, env=environment,
                                                 stdout=log, stderr=subprocess.STDOUT, check=False).returncode

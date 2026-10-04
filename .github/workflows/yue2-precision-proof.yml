@@ -45,7 +45,7 @@ on:
         type: string
         required: false
         default: ""
-        description: "Exact Windows PID to inspect on cuda-diagnostic only; no other process metadata is queried"
+        description: "Exact Windows PID, or 0 for a process-free GPU0 probe, on cuda-diagnostic only"
       idle_cuda_context_run_id:
         type: string
         required: false
@@ -99,7 +99,7 @@ jobs:
         run: |
           if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_engine_sha must be 40 lowercase hex' }
           if ($env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_control_sha must be 40 lowercase hex' }
-          if ($env:DIAGNOSTIC_PID -notmatch '^[1-9][0-9]*$') { throw 'diagnostic_pid must be a positive decimal PID' }
+          if ($env:DIAGNOSTIC_PID -notmatch '^(0|[1-9][0-9]*)$') { throw 'diagnostic_pid must be 0 or a positive decimal PID' }
           if ($env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA -or (git rev-parse HEAD).Trim() -cne $env:EXPECTED_CONTROL_SHA) { throw 'workflow control SHA mismatch' }
           if ((git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA) { throw 'engine SHA mismatch' }
           if (git status --porcelain --untracked-files=normal) { throw 'workflow control checkout is dirty' }
