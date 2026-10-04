@@ -124,7 +124,7 @@ const T2I_ADAPTER: &str = "qwen21_t2i_lora.safetensors";
 const EDIT_ADAPTER: &str = "qwen21_edit_lokr.safetensors";
 
 #[path = "support/edit_protocol.rs"]
-mod edit_protocol;
+pub(crate) mod edit_protocol;
 use edit_protocol::{EDIT_INSTRUCTION, T2I_EVAL_PROMPT, TRAIN_EDIT_INSTRUCTION};
 
 /// The T2I training style: concentric rings in exactly these three colours.
@@ -156,7 +156,7 @@ fn tier_snapshot() -> PathBuf {
     )
 }
 
-fn out_dir() -> PathBuf {
+pub(crate) fn out_dir() -> PathBuf {
     let dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
@@ -207,7 +207,7 @@ fn tiers() -> [(&'static str, Option<Quant>); 3] {
     ]
 }
 
-fn tier_spec(label: &str, quant: Option<Quant>) -> LoadSpec {
+pub(crate) fn tier_spec(label: &str, quant: Option<Quant>) -> LoadSpec {
     match quant {
         None => LoadSpec::new(WeightsSource::Dir(snapshot())),
         Some(quant) => {
@@ -221,9 +221,9 @@ fn tier_spec(label: &str, quant: Option<Quant>) -> LoadSpec {
 /// A 50 ms `phys_footprint` sampler that keeps a resettable phase high-water mark and aborts the
 /// process above the ceiling (writing a marker into the evidence dir first).
 #[path = "support/physical_watchdog.rs"]
-mod physical_watchdog;
+pub(crate) mod physical_watchdog;
 
-fn host_census() -> (physical_watchdog::Host, Value) {
+pub(crate) fn host_census() -> (physical_watchdog::Host, Value) {
     use std::process::Command;
     let command = |program: &str, args: &[&str]| {
         let result = Command::new(program)
@@ -272,7 +272,7 @@ fn host_census() -> (physical_watchdog::Host, Value) {
     (host, receipt)
 }
 
-struct Footprint {
+pub(crate) struct Footprint {
     phase_max: Arc<AtomicU64>,
     ceiling: Arc<AtomicU64>,
     explicit_cap: Option<u64>,
@@ -282,7 +282,7 @@ struct Footprint {
 }
 
 impl Footprint {
-    fn start(out: &Path) -> Self {
+    pub(crate) fn start(out: &Path) -> Self {
         use std::io::Write;
         let explicit_cap = std::env::var("QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB")
             .ok()
@@ -405,12 +405,27 @@ impl Footprint {
         eprintln!("admitted training: preflight={envelope} physicalCeiling={ceiling} bytes");
     }
 
-    fn begin(&self) {
+    #[allow(dead_code)] // Used only by the cfg(test) library diagnostic, not this integration binary.
+    pub(crate) fn admit_numeric(&self, active_envelope: u64, free_cache: u64) {
+        let (mut host, census) = host_census();
+        host.cache_limit = host.cache_limit.min(free_cache);
+        let cap = self.explicit_cap.unwrap_or(100_000_000_000);
+        let result = physical_watchdog::admit_full(host, active_envelope, Some(cap));
+        let receipt = json!({"kind": "DIAGNOSTIC_ONLY", "host": census,
+            "activeEnvelopeBytes": active_envelope, "freeCacheAllowanceBytes": host.cache_limit,
+            "explicitOrDefaultCapBytes": cap, "physicalCeilingBytes": result.as_ref().ok(),
+            "refusal": result.as_ref().err(), "reservesUnchanged": true});
+        write_json(&self.out, "numeric-physical-admission", &receipt);
+        let ceiling = result.expect("numeric diagnostic cannot safely fit; receipt retained");
+        self.ceiling.store(ceiling, Ordering::Relaxed);
+    }
+
+    pub(crate) fn begin(&self) {
         mlx_rs::memory::reset_peak_memory();
         self.phase_max.store(0, Ordering::Relaxed);
     }
 
-    fn end(&self) -> (u64, u64) {
+    pub(crate) fn end(&self) -> (u64, u64) {
         let (fp, _) = phys_footprint();
         (
             mlx_rs::memory::get_peak_memory() as u64,
@@ -434,7 +449,7 @@ fn gib(bytes: u64) -> f64 {
 
 // ── image metrics ────────────────────────────────────────────────────────────────────────────────
 
-fn mean_abs_diff(a: &Image, b: &Image) -> f64 {
+pub(crate) fn mean_abs_diff(a: &Image, b: &Image) -> f64 {
     assert_eq!((a.width, a.height), (b.width, b.height), "geometry differs");
     assert_eq!(a.pixels.len(), b.pixels.len(), "byte length differs");
     let sum: u64 = a
@@ -556,13 +571,13 @@ fn save_png(path: &Path, img: &Image) {
     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-fn write_json(out: &Path, name: &str, value: &Value) {
+pub(crate) fn write_json(out: &Path, name: &str, value: &Value) {
     let path = out.join(format!("{name}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(value).unwrap()).unwrap();
     eprintln!("wrote {}", path.display());
 }
 
-fn sha256_file(path: &Path) -> String {
+pub(crate) fn sha256_file(path: &Path) -> String {
     let mut file = std::fs::File::open(path).unwrap();
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 65536];
@@ -635,7 +650,7 @@ impl Lcg {
     }
 }
 
-fn to_image(img: image::RgbImage) -> Image {
+pub(crate) fn to_image(img: image::RgbImage) -> Image {
     Image {
         width: img.width(),
         height: img.height(),
@@ -657,7 +672,7 @@ fn ring_image(index: u32, edge: u32) -> image::RgbImage {
 }
 
 /// One edit source: a vertical gradient with five seeded discs of seeded colours.
-fn edit_source(seed: u64, edge: u32) -> image::RgbImage {
+pub(crate) fn edit_source(seed: u64, edge: u32) -> image::RgbImage {
     let mut rng = Lcg(seed);
     let discs: Vec<(f32, f32, f32, [u8; 3])> = (0..5)
         .map(|_| {
@@ -690,14 +705,14 @@ fn edit_source(seed: u64, edge: u32) -> image::RgbImage {
 }
 
 /// Reference 2 is a color palette, not a competing monochrome layout.
-fn edit_key(edge: u32) -> image::RgbImage {
+pub(crate) fn edit_key(edge: u32) -> image::RgbImage {
     image::RgbImage::from_fn(edge, edge, |x, y| {
         image::Rgb(edit_protocol::palette_pixel(x, y, edge))
     })
 }
 
 /// The trained edit: invert, then posterize every channel to the key's four levels.
-fn edit_transform(src: &image::RgbImage) -> image::RgbImage {
+pub(crate) fn edit_transform(src: &image::RgbImage) -> image::RgbImage {
     let mut out = src.clone();
     for px in out.pixels_mut() {
         for v in px.0.iter_mut() {
@@ -711,7 +726,7 @@ fn edit_transform(src: &image::RgbImage) -> image::RgbImage {
 
 /// Load `spec` through the explicit catalog, render `req` once, write `<out>/<label>.png`, and
 /// return the image plus its timing / memory / predicted-overlay facts.
-fn render(
+pub(crate) fn render(
     label: &str,
     spec: &LoadSpec,
     req: &GenerationRequest,
@@ -767,7 +782,7 @@ fn render(
     (image, facts)
 }
 
-fn adapter(path: &Path, scale: f32, kind: AdapterKind) -> AdapterSpec {
+pub(crate) fn adapter(path: &Path, scale: f32, kind: AdapterKind) -> AdapterSpec {
     AdapterSpec::new(path.to_path_buf(), scale, kind)
 }
 
@@ -1096,7 +1111,7 @@ fn assert_overlay_not_underpredicted(label: &str, base: &Value, adapted: &Value)
     );
 }
 
-fn t2i_request() -> GenerationRequest {
+pub(crate) fn t2i_request() -> GenerationRequest {
     GenerationRequest {
         prompt: T2I_EVAL_PROMPT.to_owned(),
         width: RENDER_EDGE,

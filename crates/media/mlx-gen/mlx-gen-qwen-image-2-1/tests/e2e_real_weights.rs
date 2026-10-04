@@ -60,19 +60,9 @@ fn progress_logger(label: String) -> impl FnMut(Progress) {
 /// `phys_footprint` of this process — the counter the SceneWorks memory campaign's ceiling reads
 /// (`physical_footprint_at_or_above_…`) — and its lifetime maximum, in bytes, via
 /// `proc_pid_rusage(RUSAGE_INFO_V4)`. RSS is meaningless for Metal buffers; this is not.
-pub(crate) fn phys_footprint() -> (u64, u64) {
-    extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u8) -> i32;
-    }
-    // `rusage_info_v4` is 296 bytes: `ri_phys_footprint` at byte 72 and
-    // `ri_lifetime_max_phys_footprint` at byte 240 (see `<sys/resource.h>`).
-    let mut buffer = [0u8; 512];
-    // SAFETY: the buffer is larger than `rusage_info_v4` and the pid is our own.
-    let rc = unsafe { proc_pid_rusage(std::process::id() as i32, 4, buffer.as_mut_ptr()) };
-    assert_eq!(rc, 0, "proc_pid_rusage failed");
-    let read = |offset: usize| u64::from_ne_bytes(buffer[offset..offset + 8].try_into().unwrap());
-    (read(72), read(240))
-}
+#[path = "support/physical_footprint.rs"]
+mod physical_footprint;
+pub(crate) use physical_footprint::phys_footprint;
 
 /// One `[mem]` line per phase boundary: MLX's active / cache / peak-active counters, the process
 /// footprint, and the footprint high-water mark the sampler thread saw since the previous line.
