@@ -1723,6 +1723,7 @@ mod tests {
             head_dim: 8,
             layers: 4,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: 32,
             intermediate_size: 64,
             vocab_size: 50,

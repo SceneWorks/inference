@@ -53,15 +53,22 @@ use mlx_rs::{Array, Dtype};
 use crate::config::{Architecture, BidirectionalAttention, LayerAttentionType, ModelConfig};
 use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
-use crate::primitives::attention::{sdpa_capped, sliding_causal_mask, AttnMask};
-use crate::primitives::kv_cache::KvCache;
+use crate::primitives::attention::{
+    sdpa_capped, sliding_causal_mask, AttnMask, SDPA_EVAL_GROUP_QLEN,
+};
+use crate::primitives::kv_cache::{KvCache, PackedAttentionMask, PackedCacheEvidence};
 use crate::primitives::nn::{
     embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap, to_f32_host,
 };
+use crate::primitives::paged_packed_kv::paged_attention_batch;
 use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
-use crate::primitives::quant::QuantizedLinear;
+use crate::primitives::quant::{QuantizedEmbedding, QuantizedLinear};
 use crate::primitives::rope::{apply_rope, Rope};
-use crate::primitives::{ContiguousKvCache, PagedKvCache, Weights};
+use crate::primitives::{
+    select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
+    ContiguousKvCache, DecoderCacheSelection, PackedCacheRequest, PagedCacheRequest,
+    PagedCacheSelection, PagedKvCache, PagedPackedKvCache, Weights, PACKED_METAL_QUANT_GROUP_SIZE,
+};
 
 /// Cached decode runs in bf16 (matching the reference engines).
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
@@ -83,13 +90,41 @@ enum Stack {
     Sequential(Box<crate::residency::SequentialStack>),
 }
 
+/// Token embeddings may arrive dense (the engine-native snapshot invariant) or already packed by
+/// an MLX community checkpoint. Packed rows stay packed at rest and are dequantized only after the
+/// requested token ids have been gathered.
+#[derive(Debug)]
+enum TokenEmbedding {
+    Dense(Array),
+    Quantized(QuantizedEmbedding),
+}
+
+impl TokenEmbedding {
+    fn forward(&self, input_ids: &Array) -> Result<Array> {
+        match self {
+            Self::Dense(weight) => embed(weight, input_ids),
+            Self::Quantized(weight) => weight.forward(input_ids),
+        }
+    }
+
+    fn tied_projection(&self) -> Projection {
+        match self {
+            Self::Dense(weight) => Projection::Dense {
+                weight: weight.clone(),
+                bias: None,
+            },
+            Self::Quantized(weight) => Projection::Quantized(weight.tied_linear()),
+        }
+    }
+}
+
 /// A loaded causal decoder.
 #[derive(Debug)]
 pub struct CausalLm {
-    embed_tokens: Array,
+    embed_tokens: TokenEmbedding,
     stack: Stack,
     norm: Array,
-    lm_head: Array,
+    lm_head: Projection,
     /// The model-level RoPE for a uniform architecture; Gemma 4's `sliding_attention` schedule.
     rope: Rope,
     /// Gemma 4's `full_attention` schedule — a different head dim *and* a different frequency
@@ -98,6 +133,12 @@ pub struct CausalLm {
     full_rope: Option<Rope>,
     cfg: ModelConfig,
     quantized: bool,
+    /// The load-time quantization the projections were built with (`None` for none): its bits
+    /// and group size shape the K/V as much as the config does.
+    load_quant: Option<QuantSpec>,
+    /// The identity of the weight files this decoder was loaded from ([`Self::with_weights_identity`];
+    /// empty when the caller named none).
+    weights_identity: String,
     /// Gemma scales token embeddings by √hidden; `None` ⇒ no scaling.
     embed_scale: Option<f32>,
     /// Gemma-2 final-logit soft-cap; `None` ⇒ no cap.
@@ -279,12 +320,55 @@ impl CausalLm {
             }
         };
 
-        let embed_tokens = req_bf16(p("embed_tokens.weight"))?;
+        let embed_key = p("embed_tokens.weight");
+        let embed_base = embed_key
+            .strip_suffix(".weight")
+            .expect("embedding weight key has the required suffix");
+        let embed_scales_key = format!("{embed_base}.scales");
+        let embed_tokens = if w.contains(&embed_scales_key) {
+            let spec = cfg.quantization.ok_or_else(|| {
+                Error::Config(format!(
+                    "snapshot stores quantized tensor `{embed_scales_key}` but config.json has no `quantization` block"
+                ))
+            })?;
+            TokenEmbedding::Quantized(QuantizedEmbedding::from_quantized(
+                w.require(&embed_key)?.clone(),
+                w.require(&embed_scales_key)?.clone(),
+                w.require(&format!("{embed_base}.biases"))?.clone(),
+                spec.group_size,
+                spec.bits,
+                COMPUTE_DTYPE,
+            )?)
+        } else {
+            TokenEmbedding::Dense(req_bf16(embed_key)?)
+        };
         let norm = norm_w(p("norm.weight"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            embed_tokens.clone()
+            embed_tokens.tied_projection()
         } else {
-            req_bf16(head_key)?
+            let head_base = head_key
+                .strip_suffix(".weight")
+                .expect("LM head key has the required suffix");
+            let head_scales_key = format!("{head_base}.scales");
+            if w.contains(&head_scales_key) {
+                let spec = cfg.quantization.ok_or_else(|| {
+                    Error::Config(format!(
+                        "snapshot stores quantized tensor `{head_scales_key}` but config.json has no `quantization` block"
+                    ))
+                })?;
+                Projection::from_quantized(
+                    w.require(&head_key)?.clone(),
+                    w.require(&head_scales_key)?.clone(),
+                    w.require(&format!("{head_base}.biases"))?.clone(),
+                    spec,
+                    COMPUTE_DTYPE,
+                )?
+            } else {
+                Projection::Dense {
+                    weight: req_bf16(head_key)?,
+                    bias: None,
+                }
+            }
         };
 
         let plan = LayerPlan::new(&cfg, decoder_root.clone());
@@ -328,6 +412,8 @@ impl CausalLm {
             rope,
             full_rope,
             quantized,
+            load_quant: quant,
+            weights_identity: String::new(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f32).sqrt()),
             final_softcap: cfg.final_logit_softcap,
             cfg,
@@ -413,9 +499,50 @@ impl CausalLm {
         PagedKvCache::new(self.cfg.num_layers, block_size)
     }
 
+    /// A single-sequence paged cache under the compressed-KV policy (sc-20680; crate-internal since
+    /// the sc-20688 review, so no external caller can arm per-sequence paged compression): with the
+    /// qualified opt-in, a request the qualification table admits runs on K8V8 pages of
+    /// `request.packed_pool` read in place by the fused paged reader; every other request runs the
+    /// established dense [`PagedKvCache`] on `request.dense_pool`, with its reason in
+    /// [`PagedCacheSelection::report`].
+    pub(crate) fn select_paged_cache(&self, request: PagedCacheRequest<'_>) -> PagedCacheSelection {
+        crate::kv_policy::select_paged_cache(self, request)
+    }
+
+    /// The engine's cached-decode compute dtype (bf16): activations, logits and the K/V cache.
+    pub const COMPUTE_DTYPE: Dtype = COMPUTE_DTYPE;
+
     /// The engine's cached-decode compute dtype (bf16).
     pub const fn compute_dtype(&self) -> Dtype {
-        COMPUTE_DTYPE
+        Self::COMPUTE_DTYPE
+    }
+
+    /// Name the weight files this decoder was loaded from (for example each file's name, size
+    /// and modification time), so its [`Self::cache_fingerprint`] changes when they are replaced.
+    pub fn with_weights_identity(mut self, identity: impl Into<String>) -> Self {
+        self.weights_identity = identity.into();
+        self
+    }
+
+    /// SHA-256 (hex) of everything in the loaded decoder that shapes its K/V (sc-20681): the whole
+    /// parsed config (geometry, vocabulary, RoPE theta and scaling, attention variants, a
+    /// pre-quantized checkpoint's quantization spec), the cached K/V dtype, the load-time
+    /// quantization (its bits and group size, so Q4 and Q8 loads of the same weights differ) and
+    /// the weights' identity ([`Self::with_weights_identity`], so replaced weights at the same
+    /// path differ; sc-20688 review). Paged prefix stores and snapshots key on it next to the
+    /// caller's model name, so decoders named alike but configured or weighted differently never
+    /// share pages.
+    pub fn cache_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let described = format!(
+            "{:?}|kv={:?}|quantized={}|load_quant={:?}|weights={}",
+            self.cfg,
+            Self::COMPUTE_DTYPE,
+            self.quantized,
+            self.load_quant,
+            self.weights_identity
+        );
+        format!("{:x}", Sha256::digest(described.as_bytes()))
     }
 
     /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions
@@ -471,7 +598,10 @@ impl CausalLm {
 
     /// Embed token ids `[batch, seq]` → `[batch, seq, hidden]` (bf16). Gemma scales by √hidden.
     pub fn embed(&self, input_ids: &Array) -> Result<Array> {
-        let e = embed(&self.embed_tokens, input_ids)?;
+        let e = self
+            .embed_tokens
+            .forward(input_ids)?
+            .as_dtype(COMPUTE_DTYPE)?;
         match self.embed_scale {
             Some(s) => Ok(multiply(&e, &Array::from_f32(s).as_dtype(e.dtype())?)?),
             None => Ok(e),
@@ -709,6 +839,23 @@ impl CausalLm {
         caches: &mut [&mut PagedKvCache],
         positions: &[i32],
     ) -> Result<Array> {
+        let mut caches = caches
+            .iter_mut()
+            .map(|cache| &mut **cache as &mut dyn KvCache)
+            .collect::<Vec<_>>();
+        self.decode_logits_per_seq_dyn(input_ids, &mut caches, positions)
+    }
+
+    /// [`CausalLm::decode_logits_per_seq`] over any per-sequence caches (sc-20681): a batch may mix
+    /// dense paged sequences with paged compressed ones. The compressed sequences of one page pool
+    /// attend through one fused paged dispatch per layer (a page table and per-sequence lengths,
+    /// no padding mask); every other sequence attends on its own as before.
+    pub fn decode_logits_per_seq_dyn(
+        &self,
+        input_ids: &Array,
+        caches: &mut [&mut dyn KvCache],
+        positions: &[i32],
+    ) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
         if caches.len() != b as usize {
@@ -881,8 +1028,17 @@ impl CausalLm {
         let mut shared = SharedKv::default();
         match &self.stack {
             Stack::Resident(layers) => {
+                let checkpoint_prefill = input_embeds.shape()[1] > SDPA_EVAL_GROUP_QLEN;
                 for (i, layer) in layers.iter().enumerate() {
                     h = layer.forward(&h, ropes, mask, cache, i, &mut shared)?;
+                    if checkpoint_prefill {
+                        // The sequential stack already evaluates its carry per layer. Do the
+                        // same for a long resident prefill: evaluating h also materializes this
+                        // layer's K/V ancestors (residency.rs), then the previous layer's graph
+                        // can be released before the next one is constructed. Decode and short
+                        // prefills keep the existing lazy execution path.
+                        h.eval()?;
+                    }
                     if let Some(sink) = collect.as_deref_mut() {
                         sink.push(h.clone());
                     }
@@ -918,7 +1074,7 @@ impl CausalLm {
     /// Final RMSNorm + `lm_head` (+ Gemma-2 logit soft-cap) over hidden states `[batch, n, hidden]`.
     fn project_logits(&self, h: &Array) -> Result<Array> {
         let normed = rms_norm(h, &self.norm, self.cfg.rms_norm_eps)?;
-        let logits = linear(&normed, &self.lm_head, None)?;
+        let logits = self.lm_head.forward(&normed)?;
         match self.final_softcap {
             // Soft-cap in f32 for precision (the cap denominator matters near the extremes).
             Some(c) => soft_cap(&logits.as_dtype(Dtype::Float32)?, c),
@@ -929,11 +1085,63 @@ impl CausalLm {
 
 impl crate::decode::Decode for CausalLm {
     fn make_cache(&self) -> Box<dyn KvCache> {
-        Box::new(self.new_cache())
+        // Every decoder now crosses the experimental cache factory before its first mutation.
+        // The explicit override remains off by default, so this returns the identical established
+        // contiguous cache while preserving a single, testable future selection seam.
+        select_decoder_cache(PackedCacheRequest::disabled(self.cfg.num_layers)).into_cache()
     }
 
     fn step(&self, input_ids: &Array, cache: &mut dyn KvCache, offset: i32) -> Result<Array> {
         self.decode_logits(input_ids, cache, offset)
+    }
+}
+
+impl CausalLm {
+    /// Explicit opt-in construction for the retained packed reader.  Normal `Decode::make_cache`
+    /// remains unchanged; callers must provide a reader that was compiled for this model's
+    /// identity and pass the real batch/query geometry discovered at the model boundary.
+    pub fn make_cache_with_packed_reader(
+        &self,
+        handle: CompiledKernelHandle,
+        batch: usize,
+        query_length: usize,
+        has_mask: bool,
+    ) -> Box<dyn KvCache> {
+        self.select_cache_with_packed_reader(handle, batch, query_length, has_mask)
+            .into_cache()
+    }
+
+    /// Preflight-preserving variant for sealed harnesses. The caller can record the exact route or
+    /// fallback reason before taking ownership of the decoder cache.
+    pub fn select_cache_with_packed_reader(
+        &self,
+        handle: CompiledKernelHandle,
+        batch: usize,
+        query_length: usize,
+        has_mask: bool,
+    ) -> DecoderCacheSelection {
+        select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: handle.cache_identity().to_owned(),
+                layers: self.cfg.num_layers,
+                batch,
+                kv_heads: self.cfg.num_kv_heads as usize,
+                head_dimension: self.cfg.head_dim as usize,
+                group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                bits: handle.code_bits(),
+                query_length,
+                has_mask,
+            },
+            handle,
+        )
+    }
+
+    /// Immutable compressed-domain evidence at the public model/cache boundary. A sealed model
+    /// receipt can call this without downcasting to the experimental storage implementation.
+    pub fn packed_cache_evidence(&self, cache: &dyn KvCache) -> Option<PackedCacheEvidence> {
+        cache.packed_evidence()
     }
 }
 
@@ -1048,7 +1256,7 @@ impl LlamaLayer {
         &self,
         x: &Array,
         ropes: &RopeTables,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         let (cos, sin) = ropes.get(self.rope_slot);
@@ -1120,7 +1328,7 @@ impl Attention {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         match self {
@@ -1286,6 +1494,37 @@ impl LlamaAttention {
         let (k_all, v_all) = match &self.kv {
             Some(kv) => {
                 let (k, v) = self.project_kv(kv, x, cos, sin)?;
+                // The packed route is an explicit opt-in on the cache. It is attempted before
+                // `update`, so an accepted result cannot accidentally materialize full K/V and
+                // then fall through to dense SDPA. Shared-K/V and score-softcap layers stay on
+                // the established path because the retained reader cannot preserve those extra
+                // semantics without a dense shared tensor.
+                if self.softcap.is_none() {
+                    let packed_mask = match mask {
+                        AttnMask::Causal => PackedAttentionMask::Causal,
+                        AttnMask::SlidingCausal { window } => {
+                            PackedAttentionMask::SlidingWindow(window as usize)
+                        }
+                        AttnMask::None => PackedAttentionMask::None,
+                        AttnMask::Additive(_) => PackedAttentionMask::Additive,
+                    };
+                    if let Some(out) = cache.try_packed_attention(
+                        layer_idx,
+                        &q,
+                        &k,
+                        &v,
+                        packed_mask,
+                        self.scale,
+                        self.stores_kv,
+                    )? {
+                        return self.output(&out);
+                    }
+                } else if let Some(softcap) = self.softcap {
+                    let reason = format!(
+                        "attention score softcap c={softcap} requires tanh before softmax; the packed reader implements uncapped scaled dot-product attention"
+                    );
+                    cache.prepare_dense_fallback("score-softcap", &reason)?;
+                }
                 let both = cache.update(layer_idx, &k, &v)?;
                 if self.stores_kv {
                     shared.set(self.kind, both.clone());
@@ -1313,7 +1552,7 @@ impl LlamaAttention {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         let q = self.project_q(x, cos, sin)?;
@@ -1325,15 +1564,88 @@ impl LlamaAttention {
             )
         })?;
         let (k, v) = self.project_kv(kv, x, cos, sin)?;
-        let mut outs = Vec::with_capacity(caches.len());
+        let mut outs: Vec<Option<Array>> = (0..caches.len()).map(|_| None).collect();
+        let packed_mask = match self.sliding_window {
+            Some(window) => PackedAttentionMask::SlidingWindow(window.max(0) as usize),
+            None => PackedAttentionMask::Causal,
+        };
+        // The paged compressed sequences of one pool attend in one fused dispatch (sc-20681).
+        if self.softcap.is_none() && !self.stores_kv {
+            let mut group = caches
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, cache)| {
+                    cache
+                        .as_any_mut()
+                        .downcast_mut::<PagedPackedKvCache>()
+                        .map(|cache| (i, cache))
+                })
+                .collect::<Vec<_>>();
+            if group.len() > 1 {
+                let rows = group.iter().map(|(i, _)| *i as i32).collect::<Vec<_>>();
+                let rows = Array::from_slice(&rows, &[rows.len() as i32]);
+                let (qg, kg, vg) = (
+                    q.take_axis(&rows, 0)?,
+                    k.take_axis(&rows, 0)?,
+                    v.take_axis(&rows, 0)?,
+                );
+                let batched = {
+                    let mut members = group
+                        .iter_mut()
+                        .map(|(_, cache)| &mut **cache)
+                        .collect::<Vec<_>>();
+                    paged_attention_batch(
+                        &mut members,
+                        layer_idx,
+                        &qg,
+                        &kg,
+                        &vg,
+                        packed_mask,
+                        self.scale,
+                    )?
+                };
+                if let Some(out) = batched {
+                    for (j, (i, _)) in group.iter().enumerate() {
+                        outs[*i] = Some(row_axis0(&out, j as i32)?);
+                    }
+                }
+            }
+        }
         for (i, cache) in caches.iter_mut().enumerate() {
-            let i = i as i32;
-            let (qi, ki, vi) = (row_axis0(&q, i)?, row_axis0(&k, i)?, row_axis0(&v, i)?);
+            if outs[i].is_some() {
+                continue;
+            }
+            let row = i as i32;
+            let (qi, ki, vi) = (
+                row_axis0(&q, row)?,
+                row_axis0(&k, row)?,
+                row_axis0(&v, row)?,
+            );
+            if self.softcap.is_none() {
+                if let Some(out) = cache.try_packed_attention(
+                    layer_idx,
+                    &qi,
+                    &ki,
+                    &vi,
+                    packed_mask,
+                    self.scale,
+                    self.stores_kv,
+                )? {
+                    outs[i] = Some(out);
+                    continue;
+                }
+            } else if let Some(softcap) = self.softcap {
+                let reason = format!(
+                    "attention score softcap c={softcap} requires tanh before softmax; the packed \
+                     reader implements uncapped scaled dot-product attention"
+                );
+                cache.prepare_dense_fallback("score-softcap", &reason)?;
+            }
             let (k_all, v_all) = cache.update(layer_idx, &ki, &vi)?;
             let mut buf = None;
             let mask =
                 self.windowed(AttnMask::Causal, qi.shape()[2], k_all.shape()[2], &mut buf)?;
-            outs.push(sdpa_capped(
+            outs[i] = Some(sdpa_capped(
                 &qi,
                 &k_all,
                 &v_all,
@@ -1342,6 +1654,10 @@ impl LlamaAttention {
                 mask,
             )?);
         }
+        let outs = outs
+            .into_iter()
+            .map(|out| out.ok_or_else(|| Error::Msg("a sequence produced no attention".into())))
+            .collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Array> = outs.iter().collect();
         let out = concatenate_axis(&refs, 0)?; // [b, heads, s, head_dim]
         self.output(&out)
@@ -1742,14 +2058,15 @@ impl LayerPlan {
                          `quantization` block"
                     ))
                 })?;
-                Ok(Projection::Quantized(QuantizedLinear {
-                    weight: w.require(key)?.clone(),
-                    scales: w.require(&scales_key)?.clone(),
-                    biases: w.require(&format!("{base}.biases"))?.clone(),
-                    group_size: spec.group_size,
-                    bits: spec.bits,
+                Ok(Projection::Quantized(QuantizedLinear::from_stored(
+                    w.require(key)?.clone(),
+                    w.require(&scales_key)?.clone(),
+                    w.require(&format!("{base}.biases"))?.clone(),
+                    spec.group_size,
+                    spec.bits,
                     bias,
-                }))
+                    COMPUTE_DTYPE,
+                )?))
             } else {
                 Projection::load_with_bias(w.require(key)?.as_dtype(COMPUTE_DTYPE)?, bias, quant)
             }

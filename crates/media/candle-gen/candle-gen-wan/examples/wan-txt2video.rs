@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -27,11 +27,40 @@ fn arg(args: &[String], key: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+fn campaign_contract(args: &[String]) -> Result<Option<(String, String, OffloadPolicy)>> {
+    if !args.iter().any(|arg| arg == "--sc20686-campaign") {
+        return Ok(None);
+    }
+    let source_ref = arg(args, "--sc20686-source-ref")
+        .ok_or("SC-20686 campaign requires --sc20686-source-ref <inference-commit>")?;
+    let residency = arg(args, "--sc20686-residency")
+        .ok_or("SC-20686 campaign requires --sc20686-residency sequential")?;
+    if residency != "sequential" {
+        return Err("wan2_2_ti2v_5b campaign residency must be sequential".into());
+    }
+    Ok(Some((source_ref, residency, OffloadPolicy::Sequential)))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("WAN_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set WAN_SNAPSHOT)")?;
+    let campaign_contract = campaign_contract(&args)?;
+    let _campaign_request = if let Some((source_ref, residency, _)) = &campaign_contract {
+        let event_path = arg(&args, "--sc20686-events")
+            .filter(|path| path != "-")
+            .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
+        let request =
+            candle_gen_wan::sc20686_observer::request_output(event_path, source_ref, residency)?;
+        Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
+            request.arm_cancellation()
+        } else {
+            request.arm()
+        })
+    } else {
+        None
+    };
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| {
         "a fluffy cat walking across a sunny garden, gentle camera pan, cinematic, highly detailed"
             .into()
@@ -59,7 +88,12 @@ fn main() -> Result<()> {
          guidance={guidance:?} sampler={sampler:?} seed={seed}\n[smoke] prompt={prompt:?}"
     );
 
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let offload = campaign_contract
+        .as_ref()
+        .map(|(_, _, policy)| *policy)
+        .unwrap_or_default();
+    let spec =
+        LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_offload_policy(offload);
     let gen = candle_gen_wan::provider_registry()?.load("wan2_2_ti2v_5b", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",
@@ -94,7 +128,17 @@ fn main() -> Result<()> {
         Progress::Loading(phase) => println!("\n[smoke] loading {phase:?}"),
     };
     let t0 = std::time::Instant::now();
-    let output = gen.generate(&req, &mut on_progress)?;
+    let output = match gen.generate(&req, &mut on_progress) {
+        Ok(output) => output,
+        Err(_error)
+            if args.iter().any(|arg| arg == "--sc20686-cancel")
+                && candle_gen_wan::sc20686_observer::campaign_cancelled() =>
+        {
+            println!("[smoke] expected SC-20686 campaign cancellation");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let secs = t0.elapsed().as_secs_f32();
     let (frames, fps) = match output {
         GenerationOutput::Video { frames, fps, .. } => (frames, fps),

@@ -525,6 +525,7 @@ mod tests {
                 generated_tokens: 1,
                 generated_bytes: "<svg/>".len(),
                 finish_reason: StarVectorFinishReason::CompleteRoot,
+                kv_cache: None,
             };
             on_event(StarVectorStreamEvent::Done {
                 finish_reason: output.finish_reason,

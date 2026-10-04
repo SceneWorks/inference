@@ -39,6 +39,10 @@ pub struct RenderOptions<'a> {
     /// (matching `transformers` `tools=`); empty ⇒ the context is omitted, so a template's `if tools`
     /// test is false and the render is byte-identical to a no-tools render.
     pub tools: &'a [ToolSpec],
+    /// The `date_string` chat-template kwarg. `None` omits it, so a template that dates its prompt
+    /// (Llama 3.2's `Today Date:` header) falls back to `strftime_now` — the current date, as in
+    /// `transformers`. `Some` fixes the date, making the render independent of the wall clock.
+    pub date_string: Option<&'a str>,
 }
 
 impl<'a> RenderOptions<'a> {
@@ -50,6 +54,7 @@ impl<'a> RenderOptions<'a> {
             reasoning_effort: None,
             preserve_thinking: None,
             tools: &[],
+            date_string: None,
         }
     }
 
@@ -74,6 +79,12 @@ impl<'a> RenderOptions<'a> {
     /// Set the offered `tools` (builder style).
     pub fn with_tools(mut self, tools: &'a [ToolSpec]) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Set the `date_string` kwarg (builder style).
+    pub fn with_date_string(mut self, date_string: Option<&'a str>) -> Self {
+        self.date_string = date_string;
         self
     }
 }
@@ -222,6 +233,7 @@ impl ChatTemplate for JinjaChatTemplate {
                 reasoning_effort: None,
                 preserve_thinking: None,
                 tools: &[],
+                date_string: None,
             },
         )
     }
@@ -280,6 +292,9 @@ impl ChatTemplate for JinjaChatTemplate {
         }
         if let Some(preserve_thinking) = opts.preserve_thinking {
             ctx.insert("preserve_thinking", Value::from(preserve_thinking));
+        }
+        if let Some(date_string) = opts.date_string {
+            ctx.insert("date_string", Value::from(date_string));
         }
         // Offered tools in the OpenAI function shape the template renders (`tool | tojson`). Inserted
         // only when non-empty, so a template's `if tools` test is false on a no-tools render (the
@@ -345,9 +360,35 @@ fn extract_token(value: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+#[cfg(any(test, feature = "test-clock"))]
+thread_local! {
+    static CLOCK_OVERRIDE: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `strftime_now` reading `unix_seconds` as "now" on this thread, so a
+/// test can prove a render does (or does not) depend on the wall clock. Behind the `test-clock`
+/// feature; production builds have no clock override.
+#[cfg(any(test, feature = "test-clock"))]
+#[doc(hidden)]
+pub fn with_template_clock<R>(unix_seconds: i64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLOCK_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(CLOCK_OVERRIDE.with(|c| c.replace(Some(unix_seconds))));
+    f()
+}
+
 /// `strftime_now(fmt)`: format the current UTC date. Supports the specifiers HF templates use
 /// (`%Y %y %m %d %e %b %B %%`).
 fn strftime_now(fmt: String) -> std::result::Result<Value, minijinja::Error> {
+    #[cfg(any(test, feature = "test-clock"))]
+    if let Some(secs) = CLOCK_OVERRIDE.with(|c| c.get()) {
+        let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+        return Ok(Value::from(format_date(&fmt, y, m, d)));
+    }
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1199,6 +1240,28 @@ mod tests {
             .as_secs() as i64;
         let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
         assert_eq!(out, format!("Today: {}", format_date("%d %b %Y", y, m, d)));
+    }
+
+    /// A `date_string` kwarg fixes a dated template's header; omitting it falls back to the
+    /// (here mocked) wall clock, exactly as `transformers` does.
+    #[test]
+    fn date_string_kwarg_pins_a_dated_template_against_the_clock() {
+        let t = JinjaChatTemplate::new(
+            "{%- if not date_string is defined %}{%- set date_string = strftime_now('%d %b %Y') %}\
+             {%- endif %}Today Date: {{ date_string }}",
+        );
+        let msgs = [Message::user("x")];
+        let render = |opts: &RenderOptions<'_>, secs| {
+            with_template_clock(secs, || t.render_with(&msgs, opts).unwrap())
+        };
+        // 2026-10-03 and 2026-10-04 (UTC midnight).
+        let (day_one, day_two) = (20_729 * 86_400, 20_730 * 86_400);
+        let clock = RenderOptions::generation();
+        assert_eq!(render(&clock, day_one), "Today Date: 03 Oct 2026");
+        assert_eq!(render(&clock, day_two), "Today Date: 04 Oct 2026");
+        let pinned = RenderOptions::generation().with_date_string(Some("26 Jul 2024"));
+        assert_eq!(render(&pinned, day_one), "Today Date: 26 Jul 2024");
+        assert_eq!(render(&pinned, day_two), "Today Date: 26 Jul 2024");
     }
 
     #[test]

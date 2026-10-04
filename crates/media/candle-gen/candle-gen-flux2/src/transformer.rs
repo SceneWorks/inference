@@ -364,6 +364,7 @@ impl DoubleAttention {
         let iq = to_heads(&self.to_q.forward(norm_img)?, h, hd, Some(&self.norm_q))?;
         let ik = to_heads(&self.to_k.forward(norm_img)?, h, hd, Some(&self.norm_k))?;
         let iv = to_heads(&self.to_v.forward(norm_img)?, h, hd, None)?;
+        let campaign_reference = crate::sc20686_observer::record_flux_kv_created(&ik, &iv);
         // txt stream q/k/v
         let tq = to_heads(
             &self.add_q.forward(norm_txt)?,
@@ -378,7 +379,6 @@ impl DoubleAttention {
             Some(&self.norm_added_k),
         )?;
         let tv = to_heads(&self.add_v.forward(norm_txt)?, h, hd, None)?;
-
         // Concat [txt, img] along the sequence axis, apply RoPE to the full q/k.
         let q = Tensor::cat(&[&tq, &iq], 2)?;
         let k = Tensor::cat(&[&tk, &ik], 2)?;
@@ -386,7 +386,12 @@ impl DoubleAttention {
         let q = Flux2PosEmbed::apply(&q, cos, sin)?;
         let k = Flux2PosEmbed::apply(&k, cos, sin)?;
 
+        let campaign_read = crate::sc20686_observer::begin_flux_kv_read(campaign_reference);
+        // This is a fused joint attention over text, target-image, and reference-image tokens.
+        // The observer retains its duration only as non-attributable execution context; it must
+        // never be presented as isolated reference-K/V runtime.
         let o = attention(&q, &k, &v, hd, attention_plan)?; // [B, txt_seq+img_seq, inner]
+        crate::sc20686_observer::record_flux_kv_read(campaign_read);
         let txt_out = o.narrow(1, 0, txt_seq)?;
         let img_out = o.narrow(1, txt_seq, o.dim(1)? - txt_seq)?;
         let txt_out = self.to_add_out.forward(&txt_out.contiguous()?)?;
