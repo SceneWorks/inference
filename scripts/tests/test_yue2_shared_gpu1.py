@@ -1,9 +1,10 @@
 """CPU-only selected-card tests for the owner's physical GPU1 shared window."""
-import json
 import copy
+import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -181,6 +182,47 @@ class SharedGpu1Tests(unittest.TestCase):
                 sample = proof.sample_cuda()
             self.assertEqual(sample["physical_gpu_index"], 1)
             self.assertEqual(smi.call_args.args[0][2], "1")
+
+    def test_workflow_cuda_mode_argument_reaches_selected_device_preflight(self):
+        workflow = (ROOT / ".github/workflows/yue2-precision-proof.yml").read_text(encoding="utf-8")
+        self.assertIn("'--cuda-scheduling-mode', $env:YUE2_CUDA_SCHEDULING_MODE", workflow)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference = root / "reference"
+            reference.mkdir()
+            (reference / "vae_real_reference.safetensors").write_bytes(b"fixture")
+            binary = root / "test-binary"
+            binary.write_bytes(b"test")
+            argv = ["yue2_precision_proof.py", "run", "--backend", "cuda",
+                    "--binary", str(binary), "--quant-smoke-binary", str(binary),
+                    "--vae-smoke-binary", str(binary), "--reference", str(reference),
+                    "--evidence", str(root / "evidence"), "--work-dir", str(root / "listening"),
+                    "--engine-sha", SHA, "--control-sha", SHA,
+                    "--cuda-scheduling-mode", "shared-gpu1"]
+            env = {"RUNNER_NAME": "cuda-windows", "CUDA_VISIBLE_DEVICES": "1",
+                   "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "YUE2_IDLE_CONTEXT_RUN_ID": "",
+                   "YUE2_CUDA_SCHEDULING_MODE": "shared-gpu1",
+                   "GITHUB_REPOSITORY": "SceneWorks/inference", "GITHUB_JOB": "cuda",
+                   "GITHUB_RUN_ATTEMPT": "1", "EXPECTED_ENGINE_SHA": SHA,
+                   "EXPECTED_CONTROL_SHA": SHA, "GITHUB_SHA": SHA,
+                   "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}
+            real_preflight = idle.check_shared_gpu1_dispatch
+            def selected_preflight():
+                with patch.object(idle.os, "name", "nt"):
+                    real_preflight()
+            with patch.object(proof.sys, "argv", argv), patch.dict("os.environ", env), \
+                 patch.object(proof, "sha256", return_value=proof.REFERENCE_SHA256), \
+                 patch.object(proof, "verify_revisions"), \
+                 patch.object(proof.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
+                 patch.object(idle, "check_shared_gpu1_dispatch", side_effect=selected_preflight) as selected, \
+                 patch.object(proof, "cuda_physical_census",
+                              side_effect=RuntimeError("selected GPU1 census reached")) as census, \
+                 patch.object(proof.subprocess, "Popen") as launched:
+                with self.assertRaisesRegex(RuntimeError, "selected GPU1 census reached"):
+                    proof.main()
+            selected.assert_called_once_with()
+            census.assert_called_once_with()
+            launched.assert_not_called()
 
     def test_workflow_and_app_capture_use_physical1(self):
         engine = (ROOT / ".github/workflows/yue2-precision-proof.yml").read_text(encoding="utf-8")

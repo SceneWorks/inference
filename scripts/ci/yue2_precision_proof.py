@@ -1032,7 +1032,7 @@ def main() -> None:
     p.add_argument("--engine-sha", required=True)
     p.add_argument("--control-sha", required=True)
     p.add_argument("--app-sha", default="")
-    p.add_argument("--cuda-scheduling-mode", choices=("shared-host", "owner-gpu0", "owner-gpu0-mac-anchor",
+    p.add_argument("--cuda-scheduling-mode", choices=("shared-host", "shared-gpu1", "owner-gpu0", "owner-gpu0-mac-anchor",
                                                       "gpu0-with-reviewed-gpu1"), default="shared-host")
     args = parser.parse_args()
     {"resolve-binary": resolve_binary, "verify-reference": verify_reference, "run": execute}[args.mode](args)
