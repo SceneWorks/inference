@@ -5985,7 +5985,11 @@ pub(crate) mod tests {
 
     /// [`tiny_packed_capable_snapshot`] with the config's architecture `identity` keys, a
     /// `window`-token context, and (for Qwen3) unit per-head q/k RMSNorm weights.
-    fn tiny_snapshot(identity: serde_json::Value, window: u64, qk_norm: bool) -> tempfile::TempDir {
+    pub(crate) fn tiny_snapshot(
+        identity: serde_json::Value,
+        window: u64,
+        qk_norm: bool,
+    ) -> tempfile::TempDir {
         tiny_snapshot_with(identity, window, qk_norm, SnapshotGains::DEFAULT)
     }
 
