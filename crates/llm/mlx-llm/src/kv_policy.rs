@@ -95,7 +95,8 @@ pub(crate) fn family_for(campaign_family: Option<&str>) -> Option<KvModelFamily>
     }
 }
 
-/// The campaign identity of a table family: the inverse of [`family_for`].
+/// The campaign identity of a table family: the inverse of the test-only `family_for` (no link:
+/// it exists only under `cfg(test)`, so documentation builds cannot resolve it).
 pub(crate) const fn campaign_family(family: KvModelFamily) -> &'static str {
     match family {
         KvModelFamily::Llama => "llama",

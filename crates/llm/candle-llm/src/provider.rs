@@ -3349,6 +3349,7 @@ impl TextLlm for LlamaProvider {
                 reasoning_effort: req.reasoning_effort,
                 preserve_thinking: req.preserve_thinking,
                 tools: &req.tools,
+                date_string: None,
             },
         )?;
         let prompt_ids: Vec<i32> = self
