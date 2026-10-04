@@ -16,6 +16,37 @@ use crate::protocol::{
     CotMode, GenerationConfig, Sampling, SamplingOverrides, SongRequest, SongRequestSpec,
 };
 
+#[test]
+fn cached_decode_records_the_current_vae_math_policy() {
+    let historical = json!({
+        "vae_dtype": "float32", "decoder_release": "standard",
+        "source_only": "retained",
+    });
+    let cuda_bf16 = json!({
+        "compute_policy": "bf16", "vae_dtype": "bfloat16", "decoder_release": "legacy",
+        "vae_cuda_bf16_math_policy": "fixed_order_bf16_convolution_v1",
+    });
+    let decoded = Value::Object(cached_decode_current_config(&historical, &cuda_bf16));
+    assert_eq!(
+        decoded["vae_cuda_bf16_math_policy"],
+        cuda_bf16["vae_cuda_bf16_math_policy"]
+    );
+    assert_eq!(decoded["compute_policy"], "bf16");
+    assert_eq!(decoded["vae_dtype"], "bfloat16");
+    assert_eq!(decoded["decoder_release"], "legacy");
+    assert_eq!(decoded["source_only"], "retained");
+    assert!(historical.get("vae_cuda_bf16_math_policy").is_none());
+
+    // A new FP32 or Metal BF16 decode must not inherit the CUDA source's math mode.
+    for (policy, dtype) in [("fp32", "float32"), ("bf16", "bfloat16")] {
+        let current = json!({"compute_policy": policy, "vae_dtype": dtype});
+        let next = Value::Object(cached_decode_current_config(&decoded, &current));
+        assert!(next.get("vae_cuda_bf16_math_policy").is_none());
+        assert_eq!(next["compute_policy"], policy);
+        assert_eq!(next["vae_dtype"], dtype);
+    }
+}
+
 /// Small token budgets and two midpoint steps keep a whole song to seconds on the CPU.
 pub(crate) fn settings(decoder: VaeVariant) -> SongSettings {
     let o = |min: i64, max: i64| SamplingOverrides {

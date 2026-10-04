@@ -1,0 +1,17 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -39,12 +39,12 @@
+ candle-datasets = { path = "./candle-datasets", version = "0.10.2" }
+ candle-flash-attn = { path = "./candle-flash-attn", version = "0.10.2" }
+ candle-flash-attn-v3 = { path = "./candle-flash-attn-v3", version = "0.10.2" }
+-candle-kernels = { path = "./candle-kernels", version = "0.10.2" }
++candle-kernels = { path = "../engine-overlay/crates/media/candle-gen/vendor/candle-kernels", version = "0.10.2" }
+ candle-metal-kernels = { path = "./candle-metal-kernels", version = "0.10.2" }
+ candle-nn = { path = "./candle-nn", version = "0.10.2" }
+ candle-onnx = { path = "./candle-onnx", version = "0.10.2" }
+ candle-transformers = { path = "./candle-transformers", version = "0.10.2" }
+-candle-ug = { path = "./candle-ug", version = "0.10.2" }
++candle-ug = { git = "https://github.com/huggingface/candle", rev = "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", version = "0.10.2" }
+ clap = { version = "4.2.4", features = ["derive"] }
+ criterion = { version = "0.8", default-features = false }
+ cudarc = { version = "0.19.4", features = [

@@ -107,9 +107,9 @@ use candle_gen::gen_core::ProviderComponents;
 /// Sorted so a reader can find an id and a future diff stays local; the emitted manifest sorts
 /// independently, so this ordering carries no meaning beyond readability.
 ///
-/// One row per **distinct** id: five Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
-/// `wan2_2_t2v_14b`, `z_image_turbo`) are also generator ids and load the same checkpoints, so they
-/// appear once — a duplicate `provider_id` is rejected by the conformance gate. `krea_2_control`
+/// One row per **distinct** id: fourteen Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
+/// `qwen_image_2_1`, `z_image_turbo`, …) are also generator ids and load the same checkpoints, so
+/// they appear once — a duplicate `provider_id` is rejected by the conformance gate. `krea_2_control`
 /// and `ltx_2_3` are trainer-**only** ids with no Candle generator, which is why they appear here
 /// and in no generator list.
 pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -593,8 +593,8 @@ mod tests {
         assert_eq!(
             registered.len(),
             61,
-            "61 distinct Candle provider ids: 56 generators + 7 trainers (5 of them also generator \
-             ids) + 1 captioner + 2 embedders"
+            "61 distinct Candle provider ids: 56 generators + 16 trainers (14 of them also \
+             generator ids) + 1 captioner + 2 embedders"
         );
 
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();

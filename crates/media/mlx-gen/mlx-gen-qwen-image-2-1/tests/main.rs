@@ -13,6 +13,9 @@
 
 mod common;
 
+#[path = "adapters.rs"]
+mod adapters;
+
 #[path = "descriptor_conformance.rs"]
 mod descriptor_conformance;
 
@@ -24,6 +27,9 @@ mod edit_parity;
 
 #[path = "generator_contract.rs"]
 mod generator_contract;
+
+#[path = "lora_real_weights.rs"]
+mod lora_real_weights;
 
 #[path = "pipeline_parity.rs"]
 mod pipeline_parity;
@@ -42,6 +48,9 @@ mod text_encoder_parity;
 
 #[path = "tiers.rs"]
 mod tiers;
+
+#[path = "training.rs"]
+mod training;
 
 #[path = "transformer_parity.rs"]
 mod transformer_parity;

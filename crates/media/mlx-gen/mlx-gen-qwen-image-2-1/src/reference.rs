@@ -169,6 +169,38 @@ pub fn reference_derived_size(
     reference_target_size(last, output_resolution)
 }
 
+/// The fitted `(w', h')` of a `size = (width, height)` reference, **refused** when the Qwen3-VL
+/// processor's `smart_resize` would rebind that fit (its vision slots would then no longer cover
+/// its VAE latents 4:1). Pure geometry — no pixel is read — so a caller holding only an image
+/// header (the trainer's preflight, sc-24161) refuses exactly what [`prepare_reference`] refuses,
+/// before any weight loads. `index` only names the offender.
+pub fn reference_fit(size: (u32, u32), index: usize, vision: &VisionConfig) -> Result<(u32, u32)> {
+    let output_resolution = vision.output_resolution();
+    let (rw, rh) = reference_target_size(size, output_resolution)?;
+    let (sh, sw) = vision
+        .processor
+        .smart_resize(rh as usize, rw as usize)
+        .map_err(from_llm)?;
+    if (sh, sw) != (rh as usize, rw as usize) {
+        let patch = vision.processor.patch_size.max(1);
+        return Err(Error::Unsupported(format!(
+            "qwen_image_2_1: reference image {index} ({}x{}) fits to {rw}x{rh}, but the Qwen3-VL \
+             processor's smart_resize rebinds it to a {}x{} patch grid instead of {}x{}, so its \
+             vision slots would no longer cover its VAE latents 4:1. Supply a reference whose \
+             {output_resolution}-px fit stays inside the processor's [{}, {}] pixel budget.",
+            size.0,
+            size.1,
+            sw / patch,
+            sh / patch,
+            rw as usize / patch,
+            rh as usize / patch,
+            vision.processor.min_pixels,
+            vision.processor.max_pixels,
+        )));
+    }
+    Ok((rw, rh))
+}
+
 /// Preprocess one reference: resize once (LANCZOS), then fan out to the vision processor and the
 /// VAE. `index` only names the offender in error messages.
 pub fn prepare_reference(
@@ -178,7 +210,7 @@ pub fn prepare_reference(
 ) -> Result<PreparedReference> {
     validate_image(image, index)?;
     let output_resolution = vision.output_resolution();
-    let (rw, rh) = reference_target_size((image.width, image.height), output_resolution)?;
+    let (rw, rh) = reference_fit((image.width, image.height), index, vision)?;
     let (src_h, src_w) = (image.height as usize, image.width as usize);
     let (dst_h, dst_w) = (rh as usize, rw as usize);
 

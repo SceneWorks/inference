@@ -117,20 +117,24 @@ LoRA/LoKr fine-tuning is available for a subset of generator families. Load with
 
 | Trainer id | MLX | Candle |
 | --- | :---: | :---: |
-| `anima_base` | ✓ | — |
+| `anima_base` | ✓ | ✓ |
 | `anima_aesthetic` | ✓ | — |
 | `anima_turbo` | ✓ | — |
-| `kolors` | ✓ | — |
+| `kolors` | ✓ | ✓ |
 | `krea_2_raw` | ✓ | ✓ |
 | `krea_2_control` | — | ✓ |
 | `lens` | ✓ | ✓ |
 | `ltx_2_3` | ✓ | ✓ |
-| `sd3_5_large` | ✓ | — |
-| `sd3_5_medium` | ✓ | — |
+| `ltx_2_5` | ✓ | — |
+| `ltx_2_5_distilled` | — | ✓ |
+| `mage_flow_base` | ✓ | ✓ |
+| `qwen_image_2_1` | ✓ | ✓ |
+| `sd3_5_large` | ✓ | ✓ |
+| `sd3_5_medium` | ✓ | ✓ |
 | `sdxl` | ✓ | ✓ |
 | `wan2_2_t2v_14b` | ✓ | ✓ |
-| `wan2_2_i2v_14b` | ✓ | — |
-| `wan2_2_ti2v_5b` | ✓ | — |
+| `wan2_2_i2v_14b` | ✓ | ✓ |
+| `wan2_2_ti2v_5b` | ✓ | ✓ |
 | `z_image_turbo` | ✓ | ✓ |
 
 ## Captioners, embedders

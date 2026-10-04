@@ -20,6 +20,8 @@ name: Real-weight validation
 #   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos-2
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
+#   rw-mage     Qwen-Image-2.1 bf16 + the q8/q4 re-host            ~66 GB    nax-macos-2
+#               (dispatch-only `mlx-qwen-image-2-1`; estimated, unmeasured)  (sc-24163)
 #   rw-mage     MiniMax-H3 upstream slice: vae/ + audio_vae/ +        ~10.8 GiB BOTH boxes
 #               FL2VA/audio_vae/ + tokenizer/ + the TE shard index,
 #               PLUS the ~840 KB operator diffusers VAE reference
@@ -135,6 +137,18 @@ on:
     - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
+      qwen_image_2_1_lora_runner:
+        description: "MLX 2.1 LoRA host: rw-mage (second Mac) or rw-starvector (primary Mac)"
+        type: choice
+        required: false
+        default: rw-mage
+        options: [rw-mage, rw-starvector]
+      qwen_image_2_1_lora_phase:
+        description: "MLX 2.1 LoRA: bounded two-step probe, corrected edit, imports, or full campaign"
+        type: choice
+        required: false
+        default: full
+        options: [probe, edit, imports, full]
       profile:
         description: Real-weight profile to run
         type: choice
@@ -142,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -274,12 +288,28 @@ on:
         type: string
         required: false
         default: '{"rows": [{"id": "qwen38-bf16", "snapshot": "qwen38"}]}'
+      # sc-24163 -- the hook for a public third-party Qwen-Image 2.1 adapter on the MLX lane
+      # (`mlx-qwen-image-2-1`). Empty skips that one test; the lane never invents an adapter.
+      qwen_image_2_1_third_party_lora:
+        description: "qwen-image-2-1-lora-mlx only: pinned third-party 2.1 adapter, owner/repo@<40-hex sha>:<path>.safetensors[:lokr]"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
+# SC-24163: the explicit Qwen 2.1 primary-Mac dispatch selects only its MLX job.
+# rw-starvector is runner 2310 / Michaels-MacBook-Pro, physically distinct from
+# secondary Mac runner 5281 and Windows CUDA runner 2313. Its constant group
+# serializes primary Qwen dispatches without holding the other hosts' shared lock.
+# Every other event, profile and runner retains the shared physical-host group.
 concurrency:
-  group: inference-real-weights-physical-host
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch' &&
+        inputs.profile == 'qwen-image-2-1-lora-mlx' &&
+        inputs.qwen_image_2_1_lora_runner == 'rw-starvector' &&
+        'inference-real-weights-qwen21-primary-mac' || 'inference-real-weights-physical-host' }}
   cancel-in-progress: false
 
 # BUILD ARTIFACTS OUTSIDE THE DIRECTORY `actions/checkout` CLEANS.
@@ -4998,5 +5028,99 @@ jobs:
         with:
           name: decode-speedups-bench-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/decode-speedups-bench-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-24163 -- Qwen-Image 2.1 LoRA/LoKr real-weight evidence on MLX (epic sc-24107 Phase 2), the
+  # Metal counterpart of the CUDA lane above. DISPATCH-ONLY on its OWN `qwen-image-2-1-lora-mlx`
+  # profile (never `all`, never the schedule): it trains two adapters and renders ~25 times over
+  # ~33 GB of weights, and dispatching it must not also schedule the CUDA lane on the Windows box.
+  #
+  # WHAT IT PROVISIONS. The same two pinned snapshots the CUDA lane reads, through
+  # `ensure_model_snapshot.py`, INTO the runner's persistent hub cache (`vars.MLX_GEN_MODELS_ROOT`,
+  # a `~/`-relative value resolved per box), so the ~66 GB is fetched once per Mac and every later
+  # dispatch only verifies it. Two manifest keys of their own (`qwen-image-2-1` for the dense
+  # snapshot, `qwen-image-2-1-mlx-tiers` for the q8/q4 re-host) because wiring is per variable and
+  # the CUDA rows each declare exactly one.
+  #
+  # WHAT IT RUNS. Every `#[ignore]`d test in `mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs`,
+  # one `cargo test` per name with `--exact` AFTER the `--` and a run-count assertion, IN ORDER: the
+  # stacking test consumes the two adapters the training tests write. The third-party test runs only
+  # when `qwen_image_2_1_third_party_lora` names a pinned `owner/repo@<sha>:<file>.safetensors`
+  # (optionally `:lokr`); it is never fabricated. A failing test does not stop the rest -- every
+  # verdict and all evidence is collected, then the lane reds at the end.
+  #
+  # THE BOX. `rw-mage` is the Qwen-Image weight-set label and is registered only on `nax-macos-2`
+  # (Mac17,6, M5 Max, 128 GiB, Metal working set 107.52 GiB; ~1 TiB free when last measured), NOT
+  # on the 98%-full `nax-macos`. Phase 1 measured the 2048^2 bf16 render at a 43.8 GB allocator
+  # envelope; this lane renders at 768^2 and trains at 512^2, and the dense-bf16 LoKr overlay adds
+  # ~14 GB. The tests abort themselves above a 100 GB `phys_footprint` rather than risk the host.
+  #
+  # `timeout-minutes: 300` is a runaway guard for a lane that has never executed, not a budget: a
+  # first dispatch pays a cold `--release` MLX build plus the one-time ~66 GB fetch; the tests
+  # themselves are estimated at ~60-90 min (the two-reference edit training step attends over
+  # ~9k tokens). Re-size it DOWN from the first run that completes.
+  mlx-qwen-image-2-1:
+    name: MLX Qwen-Image 2.1 LoRA/LoKr real weights
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'
+    # Terminal recovery may select the primary Mac's unique rw-starvector label. Both Macs
+    # carry nax, so nax alone cannot reserve the idle primary. Keep this bounded to this profile.
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]
+    timeout-minutes: 300
+    permissions:
+      contents: write # authenticated GET of hash-pinned unpublished transfer assets
+    env:
+      # Composed from the ONE `~/`-relative hub-root variable every macOS lane already shares; the
+      # resolve step below expands the `~/` against whichever Mac claimed the job. The names on the
+      # LEFT are what the crate reads and what the manifest wiring gate counts.
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--Qwen--Qwen-Image-2.1/snapshots/790c92633540aa0cb11d9abf19eb46d861714758
+      MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--SceneWorks--qwen-image-2-1-mlx/snapshots/1691de01c24a070131e0a28bf4c065fd027f4fe9
+      # Through env, never interpolated into a script: the materialize step validates its shape.
+      QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC: ${{ inputs.qwen_image_2_1_third_party_lora }}
+      QWEN_IMAGE_2_1_LORA_PHASE: ${{ inputs.qwen_image_2_1_lora_phase }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          MLX_GEN_MODELS_ROOT MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Require the resolved snapshot paths and initialize evidence
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/require-the-resolved-snapshot-paths-and-initialize-evidence.sh
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MLX_GEN_MODELS_ROOT MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT
+      # Report-only: which Mac, and how much unified memory it has, belongs in the evidence.
+      - name: Record the macOS device inventory
+        continue-on-error: true
+        run: |
+          sysctl -n hw.model hw.memsize machdep.cpu.brand_string | tee "$QWEN_IMAGE_2_1_RENDER_OUT/device-inventory.txt"
+          python3.12 scripts/ci/qwen21_host_census.py --out "$QWEN_IMAGE_2_1_RENDER_OUT/host-census"
+      # BEFORE the ~66 GB materialization, and its own step: a compile error reds in minutes instead
+      # of after the fetch (these tests have never been compiled on a Mac), and the cold MLX build
+      # reads as build time in the step timings.
+      - name: Build the Qwen-Image 2.1 MLX test binary
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/build-and-record-mlx-library-identity.sh
+      - name: Prove trained velocity survives adapter save and reload
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
+      - name: Materialize and verify immutable snapshots
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
+      - name: Materialize hash-pinned transferred adapters
+        if: inputs.qwen_image_2_1_lora_phase != 'probe'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-hash-pinned-transferred-adapters.sh
+      - name: Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh
+      - name: Keep the Qwen-Image 2.1 MLX evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen-image-2-1-mlx-evidence
+          path: ${{ runner.temp }}/qwen-image-2-1-mlx-evidence
           if-no-files-found: error
           retention-days: 30

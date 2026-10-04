@@ -38,7 +38,8 @@ fn advertised_surface_matches_the_story_contract() {
     assert!(caps.supports_negative_prompt && caps.supports_guidance && caps.supports_true_cfg);
     assert!(caps.requires_sigma_shift);
     assert!(caps.supports_sequential_offload);
-    assert!(!caps.supports_lora && !caps.supports_lokr);
+    // sc-24157: LoRA/LoKr (additive, every tier) and LoHa (dense fold, bf16 tier) are wired.
+    assert!(caps.supports_lora && caps.supports_lokr);
     assert_eq!(caps.max_count, 8);
     // Reference conditioning (sc-24110): one upstream call takes one ordered list of one to ten
     // condition images, reached through either kind. No `Mask` — upstream has no mask input.

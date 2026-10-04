@@ -46,6 +46,17 @@
 //! `Conditioning::Mask` is deliberately unadvertised and refused with the workaround named — see
 //! `UPSTREAM.md`.
 //!
+//! Adapters (sc-24157): LoRA and PEFT-stamped LoKr stack as forward-time additive residuals over
+//! the DiT's projections on every tier (dense bf16 and packed q8/q4), each at its own strength;
+//! LyCORIS LoHa folds into the dense weights on the bf16 tier and is a typed refusal on a packed
+//! one. See [`mod@adapters`].
+//!
+//! Training (sc-24160): the text-to-image LoRA/LoKr trainer [`QwenImage21Trainer`], registered as
+//! trainer id [`TRAINER_ID`] (`qwen_image_2_1`) — staged caption/latent caching, a snapshot-derived
+//! memory preflight, optional per-block gradient checkpointing, checkpoints + resume, previews, and
+//! adapters that load back strictly through [`mod@adapters`] with the MLX trainer's key layout. See
+//! [`mod@training`].
+//!
 //! ## Deliberate differences from the MLX twin
 //!
 //! * `backend = "candle"`, `mac_only = false`.
@@ -78,6 +89,7 @@ use candle_gen::gen_core::{
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
 
+pub mod adapters;
 pub mod config;
 pub mod loader;
 pub mod memory_strategy;
@@ -86,6 +98,7 @@ pub mod quant;
 pub mod reference;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -121,19 +134,25 @@ pub use loader::{
 pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use pipeline::{
     create_noise, decode_rgb, decode_rgba, decode_tiling, denoise, encode_prompt,
-    encode_references, joint_layout, pack_latents, rgba_to_rgb_over_white, text_rows,
-    unpack_latents, DenoiseInputs, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
+    encode_references, joint_branch, joint_images, joint_layout, missing_vision_tower,
+    pack_latents, prepare_conditioning_references, rgba_to_rgb_over_white, text_rows,
+    unpack_latents, DenoiseInputs, JointBranch, ReferenceConditioning, DECODE_OVERLAP,
+    DECODE_TILE_EDGE,
 };
 pub use quant::{Tier, GROUP_SIZE};
 pub use reference::{
     calculate_dimensions, collect_references, prepare_reference, prepare_references,
-    reference_derived_size, reference_target_size, validate_reference_count, PreparedReference,
+    reference_derived_size, reference_fit, reference_target_size, validate_reference_count,
+    PreparedReference,
 };
 pub use text_encoder::{
     image_pad_token_id, prompt_template, prompt_template_ti2i, system_prefix,
     system_prompt_drop_count, QwenImage21TextEncoder, TextConditioning, IMAGE_PAD_TOKEN,
 };
-pub use transformer::{JointLayout, QwenImage21Transformer, Segment};
+pub use training::{QwenImage21Trainer, ADAPTER_PROVENANCE, TRAINER_ID};
+pub use transformer::{
+    JointLayout, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS, GLOBAL_ADAPTER_TARGETS,
+};
 pub use vae::QwenImage21Vae;
 
 /// Registry id for Qwen-Image 2.1 (the SceneWorks worker's `payload.model`).
@@ -188,8 +207,11 @@ pub fn descriptor() -> ModelDescriptor {
             // that would have to fabricate an alpha to honour the flag. Whether a given render is
             // actually transparent is decided by the prompt, not by this bit; see UPSTREAM.md.
             supports_alpha_output: true,
-            supports_lora: false,
-            supports_lokr: false,
+            // sc-24157: LoRA and PEFT LoKr ride as stacked additive residuals over every tier
+            // (dense bf16 and packed q8/q4); LyCORIS LoHa folds into the dense weights on the bf16
+            // tier and is a typed refusal on a packed one — see `crate::adapters`.
+            supports_lora: true,
+            supports_lokr: true,
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
             min_size: MIN_SIZE,
@@ -270,11 +292,6 @@ pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
             )));
         }
     }
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "qwen_image_2_1: LoRA/LoKr adapters are not wired for Qwen-Image 2.1 yet".into(),
-        ));
-    }
     if spec.text_encoder.is_some() {
         return Err(gen_core::Error::Unsupported(
             "qwen_image_2_1: the Qwen3-VL text encoder is loaded from the snapshot's own \
@@ -324,6 +341,12 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // The loaded contract is priced from the snapshot on disk BEFORE any weight is read, so a
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
     // through the memory registration.
+    //
+    // It is also the adapter admission: pricing the stack runs `adapters::plan` (the weight-free
+    // preflight, safetensors headers only), so a LoHa on a packed tier, a key that reaches no DiT
+    // projection and a mis-oriented factor are refused here on EVERY offload policy — under
+    // `Sequential` the DiT (and so `adapters::install`) is deferred to the first render, so without
+    // this a bad adapter would pass `load` and fail mid-generate.
     let memory_strategy = memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     let residency = build_residency(spec, &device)?;
     Ok(Box::new(QwenImage21 {
@@ -356,7 +379,12 @@ fn build_residency(
 
 fn load_heavy(spec: &LoadSpec, device: &Device) -> Result<Heavy> {
     let root: &Path = loader::snapshot_root(&spec.weights)?;
-    let transformer = loader::load_transformer(root, device)?;
+    let mut transformer = loader::load_transformer(root, device)?;
+    // One install for every route: T2I, and the 1-10 reference edit, all denoise through this DiT.
+    if !spec.adapters.is_empty() {
+        let tier = quant::resolve_requested_tier(root, spec.quantize)?;
+        adapters::install(&mut transformer, &spec.adapters, tier, device)?;
+    }
     let vae = loader::load_vae(root, device)?;
     Ok(Heavy { transformer, vae })
 }
@@ -469,64 +497,22 @@ impl QwenImage21 {
             on_progress,
             |te: &QwenImage21TextEncoder| {
                 // The ordered reference list, host-preprocessed against the snapshot's own
-                // Qwen3-VL processor geometry. Empty ⇒ the text-to-image route, unchanged.
-                let sources = crate::reference::collect_references(req)?;
-                let references = if sources.is_empty() {
-                    Vec::new()
-                } else {
-                    let vision = te.vision_config().ok_or_else(|| {
-                        Error::Unsupported(
-                            "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL \
-                             vision tower (`text_encoder/config.json` `vision_config` + \
-                             `model.visual.*`), which this snapshot does not carry"
-                                .to_string(),
-                        )
-                    })?;
-                    crate::reference::prepare_references(&sources, vision, te.device())?
-                };
-                let pos =
-                    te.encode_conditioning(&self.tokenizer, &req.prompt, drop, &references)?;
-                let neg = if params.use_negative {
-                    Some(te.encode_conditioning(
-                        &self.tokenizer,
-                        req.negative_prompt.as_deref().unwrap_or(""),
-                        drop,
-                        &references,
-                    )?)
-                } else {
-                    None
-                };
-                Ok((pos, neg, references))
+                // Qwen3-VL processor geometry, encoded into one joint branch per CFG side.
+                // Empty ⇒ the text-to-image route, unchanged.
+                assemble_reference_branches(te, &self.tokenizer, req, drop, params.use_negative)
             },
             |_| Ok(()),
-            |heavy, (pos, neg, references), on_progress| {
+            |heavy, branches, on_progress| {
+                let ReferenceBranches {
+                    pos,
+                    neg,
+                    references,
+                } = branches;
                 let channels = heavy.transformer.config().in_channels;
-                // The joint layout + the condition latents: both branches share one reference
-                // encode, but a different prompt is a different text length, hence two layouts.
+                // The condition latents: both branches share one reference encode, but a
+                // different prompt is a different text length, hence two layouts.
                 let reference_latents =
                     crate::pipeline::encode_references(&heavy.vae, &references)?;
-                let pos_layout = crate::pipeline::joint_layout(
-                    &pos.image_pad_mask,
-                    &references,
-                    req.width,
-                    req.height,
-                )?;
-                let neg_layout = neg
-                    .as_ref()
-                    .map(|neg| {
-                        crate::pipeline::joint_layout(
-                            &neg.image_pad_mask,
-                            &references,
-                            req.width,
-                            req.height,
-                        )
-                    })
-                    .transpose()?;
-                let pos_text = crate::pipeline::text_rows(&pos.hidden, &pos.image_pad_mask)?;
-                let neg_text = neg
-                    .as_ref()
-                    .map(|neg| crate::pipeline::text_rows(&neg.hidden, &neg.image_pad_mask))
-                    .transpose()?;
                 let conditioned = !references.is_empty();
                 // ONE decode per image either way — upstream always decodes four channels and
                 // has no transparency flag — so this branch chooses only whether the alpha is
@@ -544,8 +530,8 @@ impl QwenImage21 {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
                             latents,
-                            prompt_embeds: &pos_text,
-                            negative_embeds: neg_text.as_ref(),
+                            prompt_embeds: &pos.text,
+                            negative_embeds: neg.as_ref().map(|neg| &neg.text),
                             true_cfg_scale: params.true_cfg,
                             width: req.width,
                             height: req.height,
@@ -554,8 +540,8 @@ impl QwenImage21 {
                             cancel: &req.cancel,
                             references: conditioned.then(|| ReferenceConditioning {
                                 latents: &reference_latents,
-                                layout: &pos_layout,
-                                negative_layout: neg_layout.as_ref(),
+                                layout: &pos.layout,
+                                negative_layout: neg.as_ref().map(|neg| &neg.layout),
                             }),
                         },
                         on_progress,
@@ -594,6 +580,49 @@ impl QwenImage21 {
     }
 }
 
+/// The text side of one render request, assembled while the text encoder is resident: the
+/// prepared ordered references and one [`JointBranch`] per CFG side (`neg` only when the run uses
+/// a negative branch).
+pub(crate) struct ReferenceBranches {
+    pub(crate) pos: JointBranch,
+    pub(crate) neg: Option<JointBranch>,
+    pub(crate) references: Vec<PreparedReference>,
+}
+
+/// The render path's text-side assembly (sc-24110, factored out by sc-24162): the request's ordered
+/// references ([`collect_references`]) host-preprocessed against the tower's own Qwen3-VL geometry
+/// ([`pipeline::prepare_conditioning_references`]), each prompt encoded by
+/// [`QwenImage21TextEncoder::encode_conditioning`] (the image-conditioned template with vision
+/// tokens when references are present), then [`pipeline::joint_branch`] at the request's size.
+///
+/// Factored out of `generate` so the edit trainer's equivalence test compares against the code
+/// the render path actually runs, not a re-implementation of it.
+pub(crate) fn assemble_reference_branches(
+    te: &QwenImage21TextEncoder,
+    tokenizer: &TextTokenizer,
+    req: &GenerationRequest,
+    drop: usize,
+    use_negative: bool,
+) -> Result<ReferenceBranches> {
+    let images = collect_references(req)?;
+    let references = pipeline::prepare_conditioning_references(te, &images)?;
+    let branch = |prompt: &str| -> Result<JointBranch> {
+        let conditioning = te.encode_conditioning(tokenizer, prompt, drop, &references)?;
+        pipeline::joint_branch(&conditioning, &references, req.width, req.height)
+    };
+    let pos = branch(&req.prompt)?;
+    let neg = if use_negative {
+        Some(branch(req.negative_prompt.as_deref().unwrap_or(""))?)
+    } else {
+        None
+    };
+    Ok(ReferenceBranches {
+        pos,
+        neg,
+        references,
+    })
+}
+
 /// Capability-driven request validation: the shared floor (count, size range + 32-px grid,
 /// negative/guidance support, sampler/scheduler membership, finiteness) plus the family's own
 /// `steps >= 2` (the terminal-sigma stretch is undefined at one step).
@@ -625,11 +654,16 @@ candle_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
 
-/// Add the Candle Qwen-Image 2.1 generator to an explicit media registry builder.
+/// Add the Candle Qwen-Image 2.1 generator and its LoRA/LoKr trainer (sc-24160) to an explicit
+/// media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(registry.register_generator(REGISTRATION))
+    register_memory_contract_surfaces(
+        registry
+            .register_generator(REGISTRATION)
+            .register_trainer(training::TRAINER_REGISTRATION),
+    )
 }
 
 /// The shared-ladder registrations (sc-24112). Split out the way the sibling Candle providers do so
