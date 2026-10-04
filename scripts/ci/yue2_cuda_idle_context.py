@@ -474,13 +474,15 @@ def _empty_gpu0_summary(directory: Path) -> dict:
                 if key == "engine":
                     require(all(sample["cookedValue"] == 0 for sample in samples),
                             f"empty-device {path} process active")
-                    result[key] = sorted(instances)
+                    # Zero-activity WDDM engine rows may also be enumerated
+                    # under different process instances between samples.
+                    result[key] = "all-zero"
                 else:
-                    # WDDM may retain a small allocation even while NVML reports
-                    # 0 MiB and no CUDA actor. Preserve every selected-LUID byte
-                    # and instance; any change across epochs still refuses.
+                    # Keep full raw rows and validate all of them above. WDDM
+                    # may enumerate zero-byte processes between epochs; only
+                    # actual selected-LUID allocations must remain identical.
                     result[key] = sorted((sample["instance"].lower(), sample["cookedValue"])
-                                         for sample in samples)
+                                         for sample in samples if sample["cookedValue"] != 0)
         counters.append(result)
     require(all(row == counters[0] for row in counters),
             "empty-device Windows adapter/process counters changed")

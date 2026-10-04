@@ -54,14 +54,18 @@ def make_probe(root: Path) -> None:
               "adapterDedicated": 4_493_312,
               "adapterShared": 262_144,
               "adapterCommitted": 5_017_600}
-    def counter_samples(key):
+    def counter_samples(key, index):
         if key == "engine":
-            return [{"instance": f"pid_4_{LUID}_phys_0_eng_{number}_engtype_3d",
+            return [{"instance": f"pid_{40804 if index == 2 and number == 0 else 4}_{LUID}_phys_0_eng_{number}_engtype_3d",
                      "status": "0", "cookedValue": 0} for number in range(22)]
         if key.startswith("adapter"):
             return [{"instance": f"{LUID}_phys_0", "status": "0", "cookedValue": values[key]}]
-        return [{"instance": f"pid_{pid}_{LUID}_phys_0", "status": "0", "cookedValue": amount}
-                for pid, amount in zip((4, 7976), values[key])]
+        samples = [{"instance": f"pid_{pid}_{LUID}_phys_0", "status": "0", "cookedValue": amount}
+                   for pid, amount in zip((4, 7976), values[key])]
+        if index < 2 or key == "processCommitted":
+            pid = 23028 if index < 2 else 40804
+            samples.append({"instance": f"pid_{pid}_{LUID}_phys_0", "status": "0", "cookedValue": 0})
+        return samples
     for index in range(3):
         put(f"gpu-sample-{index}", {"exitCode": 0, "output": [
             f"0, {UUID}, {PCI}, RTX, 596, 97887, 0, 97438, 0, 0"]})
@@ -70,7 +74,7 @@ def make_probe(root: Path) -> None:
             put(f"pmon-{gpu}-{index}", {"exitCode": 0, "output": PMON_EMPTY})
             put(f"compute-apps-{gpu}-{index}", {"exitCode": 0, "output": []})
         put(f"windows-counters-{index}", {"targetPid": 0, "counters": [
-            {"counter": path, "samples": counter_samples(key)}
+            {"counter": path, "samples": counter_samples(key, index)}
             for key, path in paths.items()]})
     for name in ("gpu-before-cuda-properties", "gpu-after-cuda-properties"):
         put(name, {"exitCode": 0, "output": [f"0, {UUID}, {PCI}, 0, 0"]})
@@ -123,9 +127,14 @@ class EmptyDeviceTests(unittest.TestCase):
                                  ("empty-gpu0", 0))
                 self.assertEqual(result["counters"]["adapterDedicated"],
                                  (f"{LUID}_phys_0", 4_493_312))
+                self.assertEqual(result["counters"]["processDedicated"],
+                                 [(f"pid_4_{LUID}_phys_0", 4_493_312)])
                 self.assertEqual(result["counters"]["processCommitted"], [
                     (f"pid_4_{LUID}_phys_0", 4_755_456),
                     (f"pid_7976_{LUID}_phys_0", 262_144)])
+                self.assertEqual(result["counters"]["engine"], "all-zero")
+                self.assertIn("pid_23028", (root / "windows-counters-0.json").read_text(encoding="utf-8"))
+                self.assertIn("pid_40804", (root / "windows-counters-2.json").read_text(encoding="utf-8"))
                 # GPU1 may hold foreign work; selected physical GPU0 is the
                 # admission target. The separate all-runner watch owns job scope.
                 gpu1_pmon = root / "pmon-1-0.json"
@@ -165,11 +174,19 @@ class EmptyDeviceTests(unittest.TestCase):
                         "cookedValue", 5_017_601)),
                     ("windows-counters-1", lambda row: row["counters"][1]["samples"][0].__setitem__(
                         "cookedValue", 4_493_313)),
-                    ("windows-counters-1", lambda row: row["counters"][1]["samples"].pop()),
+                    ("windows-counters-1", lambda row: row["counters"][1]["samples"].pop(0)),
                     ("windows-counters-1", lambda row: row["counters"][1]["samples"].append(
-                        {"instance": f"pid_999_{LUID}_phys_0", "status": "0", "cookedValue": 0})),
+                        {"instance": f"pid_999_{LUID}_phys_0", "status": "0", "cookedValue": 1})),
+                    ("windows-counters-1", lambda row: row["counters"][1]["samples"].append(
+                        dict(row["counters"][1]["samples"][-1]))),
+                    ("windows-counters-1", lambda row: row["counters"][1]["samples"][-1].__setitem__(
+                        "status", "unavailable")),
                     ("windows-counters-1", lambda row: row["counters"][0]["samples"][0].__setitem__(
                         "cookedValue", 1)),
+                    ("windows-counters-1", lambda row: row["counters"][0]["samples"][0].__setitem__(
+                        "status", "unavailable")),
+                    ("windows-counters-1", lambda row: row["counters"][0]["samples"].append(
+                        dict(row["counters"][0]["samples"][0]))),
                     ("windows-counters-1", lambda row: row["counters"][0].__setitem__("samples", None)),
                     ("windows-counters-1", lambda row: row["counters"][2].__setitem__("error", "unavailable")),
                     ("windows-counters-1", lambda row: row["counters"][3]["samples"][0].__setitem__(
