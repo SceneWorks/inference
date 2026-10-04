@@ -52,9 +52,12 @@ pub fn admit(host: Host, envelope: u64, explicit_cap: Option<u64>) -> Result<u64
     Ok(required.saturating_add(host.cache_limit).min(safe_cap))
 }
 
-/// vm_stat's free and inactive pages are reclaimable; purgeable pages may also
-/// be inactive and must not be added a second time. Speculative/compressed and
-/// wired pages are recorded by the harness but excluded from admission.
+/// Parse the printed `vm_stat` snapshot, whose "Pages free" excludes speculative
+/// pages. Its printed free, speculative and inactive buckets are disjoint.
+/// Raw Mach `free_count` already contains speculative pages and is a different
+/// format: never add speculative again to that raw counter. Purgeable and
+/// file-backed counters can overlap and are excluded from this sum.
+/// <https://github.com/apple-oss-distributions/system_cmds/blob/main/vm_stat/vm_stat.c>
 pub fn reclaimable_bytes(text: &str) -> Result<u64, String> {
     let page = text
         .split("page size of ")
@@ -73,6 +76,7 @@ pub fn reclaimable_bytes(text: &str) -> Result<u64, String> {
             .ok_or_else(|| format!("missing vm_stat {label}"))
     };
     Ok(pages("Pages free:")?
+        .saturating_add(pages("Pages speculative:")?)
         .saturating_add(pages("Pages inactive:")?)
         .saturating_mul(page))
 }
@@ -198,9 +202,62 @@ mod tests {
         }
     }
     #[test]
-    fn reclaimable_pages_do_not_double_count_purgeable_or_speculative() {
+    fn actual_native_census_preserves_reserves_and_admits_original_edit() {
+        // Run 37202513081, job 111436911459: normal pressure on a 128 GiB Mac.
+        // vm_stat reports disjoint printed buckets at the actual 16384-byte page size.
+        let raw = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 3449230.\nPages inactive: 2797979.\nPages speculative: 274298.\nPages purgeable: 25655.\nFile-backed pages: 2902110.\nPages occupied by compressor: 83848.\n";
+        let available = reclaimable_bytes(raw).unwrap();
+        assert_eq!(available, 106_848_370_688);
+        let measured = Host {
+            total: 137_438_953_472,
+            available,
+            recommended: 115_448_725_504,
+            mlx_limit: 130_567_005_798,
+            pressure: 1,
+            baseline_physical: 108_855_944,
+            baseline_active: 0,
+            baseline_cache: 0,
+            cache_limit: 86_753_458_944,
+        };
+        let envelope = 100_983_708_416;
+        assert_eq!(admit(measured, envelope, None).unwrap(), 101_614_808_014);
+        assert!(admit(
+            Host {
+                available: 102_354_272_256,
+                ..measured
+            },
+            envelope,
+            None
+        )
+        .is_err());
+        assert!(admit(measured, envelope, Some(100_000_000_000)).is_err());
+        assert!(admit(
+            Host {
+                pressure: 2,
+                ..measured
+            },
+            envelope,
+            None
+        )
+        .is_err());
+        assert!(reclaimable_bytes(
+            "free_count: 3723528\ninactive_count: 2797979\nspeculative_count: 274298\n"
+        )
+        .is_err());
+    }
+    #[test]
+    fn printed_reclaimable_includes_speculative_once_without_overlapping_buckets() {
         let raw="Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 10.\nPages inactive: 20.\nPages purgeable: 7.\nPages speculative: 3.\nPages occupied by compressor: 8.\n";
-        assert_eq!(reclaimable_bytes(raw).unwrap(), 30 * 16384);
+        assert_eq!(reclaimable_bytes(raw).unwrap(), 33 * 16384);
+        assert_eq!(
+            reclaimable_bytes(&raw.replace("16384", "4096")).unwrap(),
+            33 * 4096
+        );
+        assert!(reclaimable_bytes(&raw.replace("Pages speculative: 3.", "")).is_err());
+        assert!(
+            reclaimable_bytes(&raw.replace("Pages speculative: 3.", "Pages speculative: -3."))
+                .is_err()
+        );
         assert!(reclaimable_bytes("Pages free: 100.").is_err());
     }
 }
