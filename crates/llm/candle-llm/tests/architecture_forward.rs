@@ -30,8 +30,11 @@ use candle_core::{DType, Device, Tensor};
 use serde_json::{json, Map, Value};
 
 use candle_llm::config::ModelConfig;
+use candle_llm::decode::{StepModel, StepRequest};
 use candle_llm::models::CausalLm;
-use candle_llm::primitives::{input_ids, AttnFormulation, SplitMix64, TokenRng, Weights};
+use candle_llm::primitives::{
+    input_ids, AttnFormulation, DecodeCache, SplitMix64, TokenRng, Weights,
+};
 
 const HIDDEN: usize = 32;
 const VOCAB: usize = 48;
@@ -843,4 +846,61 @@ fn forward_goldens_cover_every_generic_architecture() {
         covered, expected,
         "the forward suite must cover exactly the generic-decoder architectures"
     );
+}
+
+/// sc-24441: every generic-decoder architecture decodes on the device-positions step path — RoPE
+/// tables from device positions, K/V written at a device-held index, the length-aware decode
+/// attention with each architecture's own soft-cap, rotary layout (partial, interleaved) and
+/// key/value widths (MLA) — to f32 rounding of the host path it replaces, through a prefill,
+/// decodes, a 4-token verify and a rollback into it. Mixture-of-Experts stacks run the same path
+/// eagerly (their graph refusal is the router, not the positions).
+#[test]
+fn every_architecture_steps_identically_on_device_positions() {
+    for case in cases() {
+        let build = |on: bool| {
+            let cfg = ModelConfig::from_json(&case.config).unwrap();
+            let weights = Weights::from_map(case.weights.clone(), Device::Cpu);
+            let mut model = CausalLm::from_weights(&weights, "", cfg).unwrap();
+            model.set_device_positions(on);
+            model
+        };
+        let (host_model, dev_model) = (build(false), build(true));
+        assert_eq!(
+            dev_model.device_positions_support(),
+            Ok(()),
+            "{}",
+            case.name
+        );
+        let mut hc = host_model.new_cache_for(24, 3).unwrap();
+        let mut dc = dev_model.new_cache_for(24, 3).unwrap();
+        assert!(dc.device_positions().is_some(), "{}", case.name);
+        let steps: [(&[i32], bool); 4] = [
+            (&PROMPT, false),
+            (&[6], false),
+            (&[7, 8, 9, 10], true),
+            (&[11], false),
+        ];
+        for (n, (tokens, all)) in steps.iter().enumerate() {
+            let req = if *all {
+                StepRequest::all(tokens)
+            } else {
+                StepRequest::last(tokens)
+            };
+            let h = host(&host_model.forward_step(&mut hc, req).unwrap().logits);
+            let d = host(&dev_model.forward_step(&mut dc, req).unwrap().logits);
+            let scale = h.iter().fold(1f32, |m, x| m.max(x.abs()));
+            for (i, (x, y)) in d.iter().zip(&h).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-4 * scale,
+                    "{} step {n} [{i}]: device positions {x} vs host {y}",
+                    case.name
+                );
+            }
+            if *all {
+                let back = DecodeCache::len(&hc) - 1;
+                hc.rollback_to(back).unwrap();
+                dc.rollback_to(back).unwrap();
+            }
+        }
+    }
 }

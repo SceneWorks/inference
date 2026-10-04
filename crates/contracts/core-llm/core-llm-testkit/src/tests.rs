@@ -51,6 +51,7 @@ fn stub_caps() -> TextLlmCapabilities {
         supports_preserve_thinking: false,
         supports_tools: false,
         mtp: None,
+        speculative: Vec::new(),
         supported_constraints: Vec::new(),
     }
 }

@@ -37,7 +37,9 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
 use crate::primitives::attention::{sdpa, sdpa_gqa, sdpa_gqa_causal, AttnFormulation, AttnMask};
 use crate::primitives::decode_cache::DecodeCache;
+use crate::primitives::device_positions::{DevicePositions, DeviceRope, MAX_DEVICE_STEP_TOKENS};
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu};
 use crate::primitives::nn::{
     embed, gelu, rms_norm, rms_norm_residual, rms_norm_unscaled, soft_cap, swiglu,
 };
@@ -280,6 +282,17 @@ pub struct CausalLm {
     /// Which KV cache [`StepModel::new_cache_for`] builds: [`KvCacheKind::Static`] (the default) or
     /// [`KvCacheKind::Growing`] (the reference concat, through the same seam).
     step_kv_cache: KvCacheKind,
+    /// [`CausalLm::rope`] / [`CausalLm::rope_full`] with their inverse frequencies on the device:
+    /// the device-positions path builds a step's RoPE tables from the staged positions with them
+    /// (sc-24441).
+    device_rope: DeviceRope,
+    device_rope_full: Option<DeviceRope>,
+    /// Whether a static step cache stages its positions on the device (sc-24441; see
+    /// [`CausalLm::set_device_positions`]). Built from the process default
+    /// ([`device_positions_default`](crate::primitives::device_positions_default)): on CUDA, where
+    /// it is what makes the step capturable as a CUDA graph; off on the CPU, where the host path
+    /// serves.
+    device_positions: bool,
 }
 
 /// The LM head and the device its weight lives on (the last shard's, or the embedding's when
@@ -581,11 +594,10 @@ impl CausalLm {
                 let mut experts = Vec::with_capacity(moe.num_experts);
                 for e in 0..moe.num_experts {
                     let ep = |s: &str| lp(&format!("mlp.experts.{e}.{s}"));
-                    experts.push(LlamaMlp {
+                    experts.push(SwiGlu {
                         gate: proj(ep("gate_proj.weight"))?,
                         up: proj(ep("up_proj.weight"))?,
                         down: proj(ep("down_proj.weight"))?,
-                        gelu: false,
                     });
                 }
                 // Shared expert key stem: DeepSeek packs `n_shared_experts` into `mlp.shared_experts`
@@ -596,24 +608,25 @@ impl CausalLm {
                     "mlp.shared_expert"
                 };
                 let shared_gate_key = lp("mlp.shared_expert_gate.weight");
-                Ffn::Moe(MoeMlp {
-                    router: req(lp("mlp.gate.weight"))?, // [num_experts, hidden]
+                Ffn::Moe(SparseMoe::new(
+                    req(lp("mlp.gate.weight"))?, // [num_experts, hidden]
                     experts,
-                    shared: LlamaMlp {
+                    SwiGlu {
                         gate: proj(lp(&format!("{shared_stem}.gate_proj.weight")))?,
                         up: proj(lp(&format!("{shared_stem}.up_proj.weight")))?,
                         down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
-                        gelu: false,
                     },
-                    shared_gate: if w.contains(&shared_gate_key) {
+                    if w.contains(&shared_gate_key) {
                         Some(req(shared_gate_key)?) // [1, hidden]
                     } else {
                         None
                     },
-                    experts_per_tok: moe.num_experts_per_tok,
-                    norm_topk_prob: moe.norm_topk_prob,
-                    routed_scaling_factor: moe.routed_scaling_factor,
-                })
+                    MoeRouting {
+                        experts_per_tok: moe.num_experts_per_tok,
+                        norm_topk_prob: moe.norm_topk_prob,
+                        routed_scaling_factor: moe.routed_scaling_factor,
+                    },
+                )?)
             } else {
                 // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
                 // `use_double_wide_mlp` doubles this layer's inner width on Gemma 4's KV-sharing
@@ -728,6 +741,12 @@ impl CausalLm {
         // normal load, distinct blocks when the `Weights` were placed by a sharded loader.
         let layer_devices: Vec<Device> =
             layers.iter().map(|l| l.input_ln.device().clone()).collect();
+        let device_rope = DeviceRope::new(&rope, &device)?;
+        let device_rope_full = rope_full
+            .as_ref()
+            .map(|r| DeviceRope::new(r, &device))
+            .transpose()?;
+        let device_positions = crate::primitives::device_positions_default(&device);
         Ok(Self {
             embed_tokens,
             layers,
@@ -748,6 +767,9 @@ impl CausalLm {
             cfg,
             attn_formulation: AttnFormulation::Gqa,
             step_kv_cache: KvCacheKind::Static,
+            device_rope,
+            device_rope_full,
+            device_positions,
         })
     }
 
@@ -868,6 +890,21 @@ impl CausalLm {
         }
     }
 
+    /// The widest per-token working set of this model's Mixture-of-Experts dispatch in bytes
+    /// ([`SparseMoe::step_bytes_per_token`](crate::primitives::moe::SparseMoe::step_bytes_per_token)
+    /// over every MoE layer; sc-24440) — `0` for a dense model. Admission prices it per token row
+    /// on top of the dense step working set.
+    pub fn moe_step_bytes_per_token(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe(m) => Some(m.step_bytes_per_token()),
+                Ffn::Dense(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions —
     /// the term admission charges for the static KV cache (E6). Saturating.
     pub fn static_kv_bytes(&self, capacity: usize) -> usize {
@@ -886,7 +923,85 @@ impl CausalLm {
                 capacity: max_positions,
             });
         }
-        StepKvCache::preallocated(&self.kv_layout(), capacity)
+        let cache = StepKvCache::preallocated(&self.kv_layout(), capacity)?;
+        if self.device_positions_active() {
+            cache.with_device_positions()
+        } else {
+            Ok(cache)
+        }
+    }
+
+    /// Select whether a static step cache stages its positions on the device (sc-24441): the
+    /// RoPE tables built from device positions, the K/V written at a device-held index and
+    /// attention through the length-aware [`candle_quant_kernels::decode_attention()`] — the path
+    /// a CUDA graph can replay, and the one the eager static path runs too, so graphs on and off
+    /// are the same arithmetic. The process default ([`crate::primitives::DEVICE_POSITIONS_DEFAULT`])
+    /// turns it on on CUDA; on the CPU it is off by default (the host
+    /// path serves) and can be switched on to exercise the same logic. Applies to caches built
+    /// afterwards, and only when the model supports it ([`CausalLm::device_positions_support`]).
+    pub fn set_device_positions(&mut self, on: bool) {
+        self.device_positions = on;
+    }
+
+    /// Whether static step caches are asked to stage device positions (the setting).
+    pub fn device_positions(&self) -> bool {
+        self.device_positions
+    }
+
+    /// Why this decoder's step cannot run on device positions, as a stable label (`Ok` when it
+    /// can): a Gemma 4 KV-sharing tail cannot continue a cached generation at all
+    /// (`kv_shared_layers`), a pipeline-sharded stack spans devices one position buffer cannot
+    /// serve (`pipeline_sharded`), and the length-aware attention takes F32/BF16 operands no wider
+    /// than [`candle_quant_kernels::DECODE_ATTN_MAX_HEAD_DIM`] and must compile on the device
+    /// (`decode_attention_dtype`, `decode_attention_head_dim`, `decode_attention_unavailable`).
+    pub fn device_positions_support(&self) -> std::result::Result<(), &'static str> {
+        if self.kv_sharing {
+            return Err("kv_shared_layers");
+        }
+        if self
+            .layer_devices
+            .iter()
+            .any(|d| !d.same_device(&self.device))
+        {
+            return Err("pipeline_sharded");
+        }
+        if !candle_quant_kernels::decode_attention::served_dtype(self.dtype) {
+            return Err("decode_attention_dtype");
+        }
+        let widest = self
+            .kv_layout()
+            .layers
+            .iter()
+            .flatten()
+            .map(|l| l.key_dim.max(l.value_dim))
+            .max()
+            .unwrap_or(0);
+        if widest > candle_quant_kernels::DECODE_ATTN_MAX_HEAD_DIM {
+            return Err("decode_attention_head_dim");
+        }
+        if candle_quant_kernels::decode_attention::available(&self.device).is_err() {
+            return Err("decode_attention_unavailable");
+        }
+        Ok(())
+    }
+
+    /// Whether a static step cache built now stages device positions (the setting, and the
+    /// model supports it).
+    pub fn device_positions_active(&self) -> bool {
+        self.device_positions && self.device_positions_support().is_ok()
+    }
+
+    /// The step's RoPE tables from the staged device positions (one pair per layer type).
+    fn device_rope_tables(&self, positions: &DevicePositions, s: usize) -> Result<RopeTables> {
+        let pos = positions.rope_positions(s)?;
+        Ok(RopeTables {
+            primary: self.device_rope.cos_sin(&pos, self.dtype)?,
+            full: self
+                .device_rope_full
+                .as_ref()
+                .map(|r| r.cos_sin(&pos, self.dtype))
+                .transpose()?,
+        })
     }
 
     /// A step-seam cache on the growing backing — the reference concat, through the seam.
@@ -905,7 +1020,7 @@ impl CausalLm {
     /// pre-migration arithmetic for a labelled comparison. The static cache attends un-expanded
     /// regardless.
     pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
-        self.attn_formulation = formulation;
+        self.attn_formulation = formulation.selector();
     }
 
     /// The selected formulation (what the reference paths request).
@@ -928,11 +1043,26 @@ impl CausalLm {
     /// no sliding window (Gemma 4) and not MLA; a layer that cannot keeps the `repeat_kv` + `sdpa`
     /// arithmetic, and one such layer makes the request's label [`AttnFormulation::Expanded`].
     pub fn effective_attn_formulation(&self, requested: AttnFormulation) -> AttnFormulation {
-        match requested {
+        match requested.selector() {
             AttnFormulation::Gqa if self.layers.iter().all(|l| l.attn.gqa_expressible()) => {
                 AttnFormulation::Gqa
             }
             _ => AttnFormulation::Expanded,
+        }
+    }
+
+    /// What a request asking for `requested` reports (sc-24441):
+    /// [`AttnFormulation::DecodeAttention`] when its cached decode / verify steps attend with the
+    /// length-aware decode attention — the model's device positions are active and the request
+    /// attends un-expanded, the condition `run_decoder_stack_collecting` takes that attention on
+    /// (its prompt prefill still attends [`AttnFormulation::Gqa`]); else
+    /// [`effective_attn_formulation`](Self::effective_attn_formulation). The reference loop's
+    /// report reads this with the model's selector.
+    pub fn decode_attention_formulation(&self, requested: AttnFormulation) -> AttnFormulation {
+        if requested.selector() == AttnFormulation::Gqa && self.device_positions_active() {
+            AttnFormulation::DecodeAttention
+        } else {
+            self.effective_attn_formulation(requested)
         }
     }
 
@@ -955,6 +1085,7 @@ impl CausalLm {
         cache: &mut StepKvCache,
     ) -> Result<Tensor> {
         let (b, s, _) = embeds.dims3()?;
+        let _prefill = crate::primitives::prefill_scope(true);
         let h = self.step_hidden(embeds, cache)?;
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
         Ok(self
@@ -966,6 +1097,34 @@ impl CausalLm {
     /// cache's formulation: final hidden states `[b, s, hidden]` (pre-norm).
     fn step_hidden(&self, embeds: &Tensor, cache: &mut StepKvCache) -> Result<Tensor> {
         let s = embeds.dim(1)?;
+        // The device-positions path (sc-24441): a cached decode / verify step on a static cache
+        // that stages its positions reads every position from the device — RoPE, KV write,
+        // attention length and mask — so the step is replayable as a CUDA graph. The prompt
+        // prefill (from an empty cache, whatever its length) and any longer step take the host
+        // path below, as does a prefill segment from a non-empty cache (a prefix-cache hit's
+        // suffix: `StepRequest::prefill`), so a restored prompt attends as a cold prefill does;
+        // both keep the cache's host length in step.
+        if s <= MAX_DEVICE_STEP_TOKENS
+            && DecodeCache::len(cache) > 0
+            && cache.device_positions().is_some()
+            && !crate::primitives::in_prefill()
+        {
+            cache.stage_positions()?;
+            let tables = match cache.device_positions() {
+                Some(positions) => self.device_rope_tables(positions, s)?,
+                None => unreachable!("checked above"),
+            };
+            return self.run_decoder_stack_collecting(
+                embeds,
+                cache,
+                &tables,
+                AttnMask::Causal,
+                None,
+                AttnFormulation::Gqa,
+                false,
+                true,
+            );
+        }
         let offset = DecodeCache::len(cache) + cache.rope_delta();
         let tables = self.rope_tables_seq(s as i32, offset)?;
         let formulation = self.cache_formulation(cache);
@@ -976,6 +1135,7 @@ impl CausalLm {
             AttnMask::Causal,
             None,
             formulation,
+            false,
             false,
         )
     }
@@ -1143,6 +1303,7 @@ impl CausalLm {
             Some(&mut out),
             self.attn_formulation,
             false,
+            false,
         )?;
         if let Some(last) = out.last_mut() {
             *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
@@ -1225,6 +1386,64 @@ impl CausalLm {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<Tensor> {
+        let h = self.mrope_deepstack_hidden(
+            embeds,
+            positions,
+            cache,
+            visual_pos_mask,
+            deepstack,
+            self.attn_formulation,
+        )?;
+        self.last_position_logits(&h)
+    }
+
+    /// [`decode_logits_from_embeds_mrope_deepstack`](Self::decode_logits_from_embeds_mrope_deepstack)
+    /// into a step-seam cache — the Qwen3-VL multimodal prefill of a request that then decodes
+    /// through the engine (sc-24446): the same interleaved-M-RoPE / DeepStack stack, attending in
+    /// the cache's formulation exactly as [`StepModel::forward_step`] would. The caller sets the
+    /// cache's RoPE delta (`mrope_delta`) afterwards, so the continuation's text positions follow
+    /// the compressed visual positions.
+    pub fn step_prefill_mrope_deepstack(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut StepKvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+    ) -> Result<Tensor> {
+        let formulation = self.cache_formulation(cache);
+        let h = self.mrope_deepstack_hidden(
+            embeds,
+            positions,
+            cache,
+            visual_pos_mask,
+            deepstack,
+            formulation,
+        )?;
+        self.last_position_logits(&h)
+    }
+
+    /// Logits `[b, vocab]` of the last position of final hidden states `h` `[b, s, hidden]`
+    /// (pre-norm).
+    fn last_position_logits(&self, h: &Tensor) -> Result<Tensor> {
+        let (b, s, _) = h.dims3()?;
+        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
+        let logits = self.project_logits(&last_h)?;
+        Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
+    }
+
+    /// The interleaved-M-RoPE / DeepStack decoder stack over `embeds` into `cache`, attending in
+    /// `formulation`: final hidden states `[b, s, hidden]` (pre-norm). The one body behind both
+    /// the reference and the step-seam Qwen3-VL prefill.
+    fn mrope_deepstack_hidden(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut dyn KvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+        formulation: AttnFormulation,
+    ) -> Result<Tensor> {
         // Interleaved M-RoPE is Qwen3-VL's whole-model schedule; a per-layer-type table (Gemma 4)
         // has no M-RoPE form, and running the sliding schedule on every layer would be silently
         // wrong rather than an error.
@@ -1242,7 +1461,6 @@ impl CausalLm {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
-        let (b, s, _) = h0.dims3()?;
         // The hidden state + RoPE tables follow each layer onto its device (a no-op clone for a
         // single-device model); DeepStack features are moved onto the running device by the fusion.
         let mut cur = h0.device().clone();
@@ -1250,7 +1468,7 @@ impl CausalLm {
         let mut sin_d = sin.clone();
         // Qwen3-VL only (Gemma 4 is refused above), so no layer ever reads or writes this.
         let mut shared_kv = SharedKv::default();
-        let h = deepstack_fused_decoder_layers(
+        deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
             deepstack,
@@ -1269,15 +1487,13 @@ impl CausalLm {
                     cache: &mut *cache,
                     layer_idx: i,
                     shared_kv: &mut shared_kv,
-                    formulation: self.attn_formulation,
+                    formulation,
                     additive_gqa: false,
+                    step: StepAttention::Reference,
                 };
                 self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, &mut state)
             },
-        )?;
-        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
-        let logits = self.project_logits(&last_h)?;
-        Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
+        )
     }
 
     /// Batched forward over a **left-padded** `[batch, seq]` step with **per-sequence** RoPE positions
@@ -1459,6 +1675,7 @@ impl CausalLm {
             None,
             self.attn_formulation,
             additive_gqa,
+            false,
         )
     }
 
@@ -1475,7 +1692,31 @@ impl CausalLm {
         mut collect: Option<&mut Vec<Tensor>>,
         formulation: AttnFormulation,
         additive_gqa: bool,
+        indexed: bool,
     ) -> Result<Tensor> {
+        // A short cached causal step on a model whose static caches stage device positions
+        // attends with the length-aware decode attention on every cache (see
+        // `StepAttention::Decode`), from the cache's length before the step. A forward from an
+        // empty cache (a prompt prefill, a text encoder) keeps the reference attention.
+        let decode_start = (!indexed
+            && cache.offset() > 0
+            && formulation.selector() == AttnFormulation::Gqa
+            && !additive_gqa
+            && matches!(mask, AttnMask::Causal)
+            && input_embeds.dim(1)? <= MAX_DEVICE_STEP_TOKENS
+            && !crate::primitives::in_prefill()
+            && self.device_positions_active())
+        .then(|| {
+            let start = u32::try_from(cache.offset())
+                .map_err(|_| Error::Msg(format!("negative cache length {}", cache.offset())))?;
+            Ok::<_, Error>(Tensor::new(&[start], &self.device)?)
+        })
+        .transpose()?;
+        let step = match (indexed, &decode_start) {
+            (true, _) => StepAttention::Indexed,
+            (false, Some(start)) => StepAttention::Decode(start),
+            (false, None) => StepAttention::Reference,
+        };
         // Gemma 4's KV-sharing tail reads keys/values published **within one forward**. Upstream
         // keeps `shared_kv_states` alive across decode steps (they are the prefill's full-length
         // keys); this decoder does not carry them in the cache, so a continued generation would
@@ -1539,6 +1780,7 @@ impl CausalLm {
                 shared_kv: &mut shared_kv,
                 formulation,
                 additive_gqa,
+                step,
             };
             h = layer.forward(&h, cos_d, sin_d, layer_mask, &mut state)?;
             if let Some(sink) = collect.as_deref_mut() {
@@ -1676,23 +1918,41 @@ impl StepModel for CausalLm {
         }
     }
 
-    /// Un-expanded on a static cache where every layer can express it; otherwise the selector's
-    /// effective formulation (see [`CausalLm::effective_attn_formulation`]).
+    /// [`AttnFormulation::DecodeAttention`] when the request's cached steps attend with the
+    /// length-aware decode attention (sc-24441) — a cache that stages device positions, or an
+    /// un-expanded cache of a model whose device positions are active
+    /// ([`CausalLm::decode_attention_formulation`]); otherwise un-expanded on a static cache where
+    /// every layer can express it, else the selector's effective formulation (see
+    /// [`CausalLm::effective_attn_formulation`]).
     fn attn_formulation(&self, cache: &StepKvCache) -> AttnFormulation {
-        self.effective_attn_formulation(self.cache_formulation(cache))
+        if cache.device_positions().is_some() {
+            return AttnFormulation::DecodeAttention;
+        }
+        self.decode_attention_formulation(self.cache_formulation(cache))
     }
 
-    /// Not replayable as a CUDA graph (story sc-24134), declared so the runner refuses before any
-    /// capture: a Mixture-of-Experts layer pulls its router probabilities to the host every step
-    /// for the top-k (`moe_router_host_read`), and every step's positions are Rust-side scalars —
-    /// the RoPE offset taken from the cache's length, the KV written at that offset, attention
-    /// bounded by the host-side length — which a graph would replay at the captured position
-    /// (`positions_host_scalar`).
+    /// Replayable as a CUDA graph (stories sc-24134, sc-24441) when every per-step position is
+    /// device data: with device positions on (the CUDA default) a step reads its RoPE positions,
+    /// KV write index and attention length from the cache's staged buffers. Still declared
+    /// uncapturable, so the runner refuses before any capture: a Mixture-of-Experts layer whose
+    /// experts no indexed kernel serves — Prism-packed, a mixed or biased bank, NVFP4 with the
+    /// decode GEMV off, a kernel that does not compile, any bank off CUDA — dispatches them from
+    /// host-read routes (`moe_expert_host_dispatch:<cause>`, sc-24440; dense, GGML, MLX-affine Q8
+    /// and NVFP4 banks are dispatched on the device and capture);
+    /// with device positions off the positions are Rust-side scalars (`positions_host_scalar`);
+    /// and a stack the device path does not serve says why
+    /// ([`CausalLm::device_positions_support`]).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
-        if self.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_))) {
-            return Err("moe_router_host_read");
+        if let Some(reason) = self.layers.iter().find_map(|l| match &l.ffn {
+            Ffn::Moe(m) => m.graph_refusal(),
+            Ffn::Dense(_) => None,
+        }) {
+            return Err(reason);
         }
-        Err("positions_host_scalar")
+        if !self.device_positions {
+            return Err("positions_host_scalar");
+        }
+        self.device_positions_support()
     }
 
     fn device(&self) -> &Device {
@@ -1716,6 +1976,7 @@ impl StepModel for CausalLm {
         let ids = request.tokens.ids(&self.device)?;
         let embeds = self.embed(&ids)?;
         let (b, s, _) = embeds.dims3()?;
+        let _prefill = crate::primitives::prefill_scope(request.prefill);
         let h = self.step_hidden(&embeds, cache)?;
         let logits = match request.scope {
             LogitsScope::Last => {
@@ -1931,6 +2192,26 @@ struct LayerState<'a> {
     /// [`CausalLm::decode_logits_masked_gqa`]); `false` keeps every other masked caller on the
     /// `repeat_kv` + [`sdpa`] arithmetic it has always run.
     additive_gqa: bool,
+    /// How a short causal step attends (sc-24441; see [`StepAttention`]).
+    step: StepAttention<'a>,
+}
+
+/// How a layer attends on one forward (sc-24441).
+#[derive(Clone, Copy)]
+enum StepAttention<'a> {
+    /// The formulation's `sdpa_gqa` / `repeat_kv` + `sdpa` over the cache's K/V — every prefill,
+    /// every masked batch, and every step where the device-positions path is off.
+    Reference,
+    /// The device-positions step: K/V written through [`KvCache::update_indexed`] at the start the
+    /// cache staged on the device, attention by the length-aware
+    /// [`candle_quant_kernels::decode_attention()`] over the layer's whole static buffers. Set by
+    /// [`CausalLm::step_hidden`] on a cache that stages positions; the mask is causal.
+    Indexed,
+    /// The same length-aware attention over the K/V an ordinary cache returns (a growing cache,
+    /// the reference loop), from the step start `start` (`[1]` `u32`): short causal steps of a
+    /// model whose static caches stage device positions attend with one arithmetic on every
+    /// cache, so the reference loop and the static path stay token-identical by construction.
+    Decode(&'a Tensor),
 }
 
 impl LlamaLayer {
@@ -1969,15 +2250,7 @@ impl LlamaLayer {
         }
         match &self.ffn {
             Ffn::Dense(m) => m.record(census),
-            Ffn::Moe(m) => {
-                census.record_tensor(&m.router);
-                if let Some(gate) = &m.shared_gate {
-                    census.record_tensor(gate);
-                }
-                for expert in m.experts.iter().chain([&m.shared]) {
-                    expert.record(census);
-                }
-            }
+            Ffn::Moe(m) => m.record(census),
         }
     }
 
@@ -2051,10 +2324,11 @@ impl LlamaLayer {
     }
 }
 
-/// A layer's feed-forward network: a dense SwiGLU MLP, or a sparse Mixture-of-Experts bank.
+/// A layer's feed-forward network: a dense SwiGLU MLP, or a sparse Mixture-of-Experts bank (the
+/// shared [`SparseMoe`] block — Qwen2-MoE, DeepSeek-V2).
 enum Ffn {
     Dense(LlamaMlp),
-    Moe(MoeMlp),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -2094,7 +2368,7 @@ impl Attention {
     ) -> Result<Tensor> {
         match self {
             Attention::Gqa(a) => a.forward(x, cos, sin, mask, state),
-            Attention::Mla(a) => a.forward(x, cos, sin, mask, &mut *state.cache, state.layer_idx),
+            Attention::Mla(a) => a.forward(x, cos, sin, mask, state),
         }
     }
 
@@ -2304,6 +2578,33 @@ impl LlamaAttention {
                     })?;
                 (q, k, v)
             }
+            None if matches!(state.step, StepAttention::Indexed) => {
+                // The device-positions step (sc-24441): K/V written at the staged device start,
+                // attention over the layer's whole static buffers bounded on the device — causal,
+                // this layer's sliding window and soft-cap included. (A KV-sharing stack never
+                // takes this path: `device_positions_support` refuses it.)
+                let (q, k, v) = self.project(x, cos, sin)?;
+                let kv = state
+                    .cache
+                    .update_indexed(state.layer_idx, &k, &v)?
+                    .ok_or_else(|| {
+                        Error::Msg(
+                            "device-positions step on a cache without device positions".into(),
+                        )
+                    })?;
+                let out = candle_quant_kernels::decode_attention(
+                    &q,
+                    &kv.keys,
+                    &kv.values,
+                    &kv.start,
+                    candle_quant_kernels::DecodeAttnSpec {
+                        scale: self.scale,
+                        softcap: self.softcap,
+                        window: self.sliding_window.map(|w| w.max(1) as usize),
+                    },
+                )?;
+                return self.output(&out);
+            }
             None => {
                 let (q, k, v) = self.project(x, cos, sin)?;
                 if self.stores_shared_kv {
@@ -2315,13 +2616,27 @@ impl LlamaAttention {
                 (q, k_all, v_all)
             }
         };
+        if let StepAttention::Decode(start) = state.step {
+            let out = candle_quant_kernels::decode_attention(
+                &q,
+                &k_all.contiguous()?,
+                &v_all.contiguous()?,
+                start,
+                candle_quant_kernels::DecodeAttnSpec {
+                    scale: self.scale,
+                    softcap: self.softcap,
+                    window: self.sliding_window.map(|w| w.max(1) as usize),
+                },
+            )?;
+            return self.output(&out);
+        }
         let mask = self.layer_mask(mask);
         // [b, heads, s, head_dim]. Un-expanded where the formulation asks for it and the layer can
         // express it (plain causal, no soft-cap — a sliding layer's mask is `SlidingCausal` here);
         // otherwise the `repeat_kv` expansion through `sdpa`, the pre-migration arithmetic. An
         // additive mask joins the un-expanded path only on the opt-in `decode_logits_masked_gqa`
         // (a sliding layer's additive mask is `AdditiveSliding` here, so it never matches).
-        let out = match (state.formulation, mask) {
+        let out = match (state.formulation.selector(), mask) {
             (AttnFormulation::Gqa, AttnMask::Causal) if self.softcap.is_none() => {
                 sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)?
             }
@@ -2531,9 +2846,9 @@ impl MlaAttention {
         cos: &Tensor,
         sin: &Tensor,
         mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
+        state: &mut LayerState<'_>,
     ) -> Result<Tensor> {
+        let (cache, layer_idx, step) = (&mut *state.cache, state.layer_idx, state.step);
         let (b, s, _) = x.dims3()?;
         let nh = self.num_heads;
         let (nope, rope, vhd) = (
@@ -2587,8 +2902,35 @@ impl MlaAttention {
             .contiguous()?;
         let v = value.transpose(1, 2)?.contiguous()?;
 
-        let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
-        let out = sdpa(&q, &k_all, &v_all, self.scale, None, mask)?; // [b, nh, s, v_head_dim]
+        // The device-positions step (sc-24441): the same write and length-aware attention as the
+        // grouped-query layers, with keys (`qk_nope + qk_rope`) wider than values.
+        let spec = candle_quant_kernels::DecodeAttnSpec {
+            scale: self.scale,
+            softcap: None,
+            window: None,
+        };
+        let out = match step {
+            StepAttention::Indexed => {
+                let kv = cache.update_indexed(layer_idx, &k, &v)?.ok_or_else(|| {
+                    Error::Msg("device-positions step on a cache without device positions".into())
+                })?;
+                candle_quant_kernels::decode_attention(&q, &kv.keys, &kv.values, &kv.start, spec)?
+            }
+            StepAttention::Decode(start) => {
+                let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
+                candle_quant_kernels::decode_attention(
+                    &q,
+                    &k_all.contiguous()?,
+                    &v_all.contiguous()?,
+                    start,
+                    spec,
+                )?
+            }
+            StepAttention::Reference => {
+                let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
+                sdpa(&q, &k_all, &v_all, self.scale, None, mask)? // [b, nh, s, v_head_dim]
+            }
+        };
         let out = out
             .transpose(1, 2)?
             .contiguous()?
@@ -2626,102 +2968,6 @@ impl LlamaMlp {
     }
 }
 
-/// A sparse Mixture-of-Experts feed-forward (Qwen2-MoE, DeepSeek-V2): a softmax router over `experts`
-/// (top-k per token) plus an always-on `shared` expert. Correctness-first — each expert runs **only
-/// on its routed tokens** (gathered, then scatter-added back), so the active compute scales with
-/// `experts_per_tok`, not the full bank. Top-k selection is done on the host (Candle has no fused
-/// top-k); `n_group`/`topk_group` group-limited routing (DeepSeek-V2-236B / V3) is not modelled —
-/// the verification model (V2-Lite) uses plain greedy top-k.
-struct MoeMlp {
-    /// Router weight `[num_experts, hidden]`.
-    router: Tensor,
-    experts: Vec<LlamaMlp>,
-    shared: LlamaMlp,
-    /// Shared-expert sigmoid gate `[1, hidden]` (Qwen2-MoE); `None` ⇒ the shared expert is added
-    /// ungated (DeepSeek-V2).
-    shared_gate: Option<Tensor>,
-    experts_per_tok: usize,
-    norm_topk_prob: bool,
-    /// Multiplier on the (un-normalized) routed weights — DeepSeek's `routed_scaling_factor`; `1.0`
-    /// for Qwen2-MoE. Ignored when `norm_topk_prob` (the weights are renormalized instead).
-    routed_scaling_factor: f32,
-}
-
-impl MoeMlp {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, s, h) = x.dims3()?;
-        let t = b * s;
-        let dtype = x.dtype();
-        let device = x.device();
-        let xf = x.reshape((t, h))?;
-
-        // Router probabilities (computed in f32 for a stable top-k), pulled to host.
-        let logits = xf.matmul(&self.router.t()?)?; // [t, E]
-        let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
-        let probs = probs.to_vec2::<f32>()?; // [t][E]
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Invert the per-token top-k into per-expert (token, weight) lists.
-        let mut routed: Vec<Vec<(u32, f32)>> = vec![Vec::new(); num_experts];
-        for (ti, row) in probs.iter().enumerate() {
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
-            let top = &idx[..k];
-            // Renormalize the top-k weights to sum to 1, or (when not normalizing) apply the routed
-            // scaling factor — matching the reference gate's two branches.
-            let (denom, post_scale) = if self.norm_topk_prob {
-                let sum = top
-                    .iter()
-                    .map(|&e| row[e])
-                    .sum::<f32>()
-                    .max(f32::MIN_POSITIVE);
-                (sum, 1.0)
-            } else {
-                (1.0, self.routed_scaling_factor)
-            };
-            for &e in top {
-                routed[e].push((ti as u32, row[e] / denom * post_scale));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = Tensor::zeros((t, h), dtype, device)?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len();
-            let idx = Tensor::from_vec(
-                toks.iter().map(|&(ti, _)| ti).collect::<Vec<u32>>(),
-                (n,),
-                device,
-            )?;
-            let wts = Tensor::from_vec(
-                toks.iter().map(|&(_, w)| w).collect::<Vec<f32>>(),
-                (n, 1),
-                device,
-            )?
-            .to_dtype(dtype)?;
-            let xe = xf.index_select(&idx, 0)?; // [n, h]
-            let ye = self.experts[e].forward(&xe)?.broadcast_mul(&wts)?; // [n, h]
-            out = out.index_add(&idx, &ye, 0)?;
-        }
-
-        // Always-on shared expert: Qwen2 gates it by sigmoid(x · shared_gateᵀ); DeepSeek packs several
-        // shared experts into one MLP and adds them ungated.
-        let shared = self.shared.forward(&xf)?;
-        let shared = match &self.shared_gate {
-            Some(g) => {
-                let sg = candle_nn::ops::sigmoid(&xf.matmul(&g.t()?)?)?; // [t, 1]
-                shared.broadcast_mul(&sg)?
-            }
-            None => shared,
-        };
-        Ok((out + shared)?.reshape((b, s, h))?)
-    }
-}
-
 /// Join a key prefix and suffix (`""` prefix ⇒ the suffix verbatim).
 fn join(prefix: &str, suffix: &str) -> String {
     if prefix.is_empty() {
@@ -2732,12 +2978,51 @@ fn join(prefix: &str, suffix: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// sc-24441: a request's record names the attention its cached steps ran — the length-aware
+    /// decode attention whenever the model's device positions are active (the static cache that
+    /// stages them, and an un-expanded growing cache alike), `gqa` / `expanded` otherwise.
+    #[test]
+    fn records_report_the_decode_attention_when_device_positions_run_it() {
+        use crate::decode::{generate_step, CancelFlag, GenerationConfig};
+        let (weights, cfg) = tiny_qwen3(64, true, &Device::Cpu);
+        let mut model = CausalLm::from_weights(&weights, "", cfg).unwrap();
+        let config = GenerationConfig {
+            max_new_tokens: 6,
+            seed: Some(5),
+            ..Default::default()
+        };
+        let attention = |model: &CausalLm| {
+            let (_, record) = generate_step(
+                model,
+                &[1, 7, 3, 42, 9],
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            record.report(false).attention
+        };
+        assert!(!model.device_positions(), "off on the CPU by default");
+        assert_eq!(attention(&model), "gqa");
+        model.set_device_positions(true);
+        assert_eq!(attention(&model), "decode_attention");
+        model.set_step_kv_cache(KvCacheKind::Growing);
+        assert_eq!(attention(&model), "decode_attention");
+        model.set_attn_formulation(AttnFormulation::Expanded);
+        assert_eq!(
+            attention(&model),
+            "expanded",
+            "the expanded selector keeps sdpa"
+        );
+    }
 
     /// A tiny `Qwen3ForCausalLM` (the Qwen3-8B block shape: explicit head_dim, per-head q/k
     /// RMSNorm, GQA) with `vocab` rows, deterministic weights on `device` (sc-24140).
-    fn tiny_qwen3(vocab: usize, tie: bool, device: &Device) -> (Weights, ModelConfig) {
+    pub(crate) fn tiny_qwen3(vocab: usize, tie: bool, device: &Device) -> (Weights, ModelConfig) {
         const HIDDEN: usize = 64;
         const INTER: usize = 96;
         const HEADS: usize = 4;

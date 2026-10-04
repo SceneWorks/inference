@@ -166,7 +166,8 @@ fn write_snapshot(tokenizer_path: &std::path::Path, stop_first: bool) -> tempfil
 }
 
 /// [`write_snapshot`] with or without the MTP head (`with_mtp`): a checkpoint without one
-/// advertises no MTP capability, so `MtpMode::Auto` must decode normally and say `proposer=none`.
+/// advertises no MTP capability, so `MtpMode::Auto` (the legacy alias of `Speculative::Auto`)
+/// resolves to prompt lookup and says `proposer=prompt_lookup` (sc-24433).
 fn write_snapshot_with(
     tokenizer_path: &std::path::Path,
     stop_first: bool,
@@ -363,8 +364,12 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert_eq!(
         capabilities.mtp,
         Some(core_llm::MtpCapabilities {
-            max_draft_tokens: u32::MAX,
-            recommended_draft_tokens: 3,
+            max_draft_tokens: candle_llm::provider::MTP_MAX_DEPTH,
+            recommended_draft_tokens: candle_llm::device::decode_defaults(
+                &candle_llm::device::select_device().unwrap()
+            )
+            .recommended_depths
+            .mtp,
         })
     );
 
@@ -384,7 +389,7 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert_eq!(ar_record.proposer, ProposerKind::None);
 
     let mut mtp_request = request("What is 2+2?", 4);
-    mtp_request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    mtp_request.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
     let (mut thinking, mut content) = (String::new(), String::new());
     let mtp = provider
         .generate(&mtp_request, &mut |event| {
@@ -422,7 +427,7 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     tool_request.thinking = ThinkingMode::Auto;
     tool_request.reasoning_effort = Some(ReasoningEffort::Low);
     tool_request.tools = vec![weather_tool()];
-    tool_request.mtp = MtpMode::Auto;
+    tool_request.mtp = Some(MtpMode::Auto);
     let tool_output = provider.generate(&tool_request, &mut |_| {}).unwrap();
     assert!(tool_output.mtp.is_some());
     assert!(tool_output.tool_calls.is_empty());
@@ -433,7 +438,7 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     let stop_provider =
         LlamaProvider::load(&LoadSpec::dense(stop_snapshot.path().display().to_string())).unwrap();
     let mut stop_request = request("stop on the frozen EOS", 4);
-    stop_request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    stop_request.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
     let mut token_events = 0usize;
     let stopped = stop_provider
         .generate(&stop_request, &mut |event| {
@@ -461,18 +466,18 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     .unwrap();
     assert!(plain_provider.descriptor().capabilities.mtp.is_none());
     let mut auto_request = request("auto without a head", 3);
-    auto_request.mtp = MtpMode::Auto;
+    auto_request.mtp = Some(MtpMode::Auto);
     let auto_output = plain_provider.generate(&auto_request, &mut |_| {}).unwrap();
     assert!(auto_output.mtp.is_none());
     assert_eq!(auto_output.usage.generated_tokens, 3);
     let auto_record = plain_provider.last_decode_record().unwrap();
-    assert_eq!(auto_record.path, DecodePath::StepModel);
+    assert_eq!(auto_record.path, DecodePath::PromptLookup);
     assert_eq!(auto_record.kv_cache, KvCacheKind::Static);
-    assert_eq!(auto_record.proposer, ProposerKind::None);
-    assert_eq!(auto_record.proposer.label(), "none");
-    assert_eq!(auto_record.proposed_tokens, 0);
+    assert_eq!(auto_record.proposer, ProposerKind::PromptLookup);
+    assert_eq!(auto_record.proposer.label(), "prompt_lookup");
+    assert!(auto_output.decode.unwrap().fallbacks.is_empty());
     let mut enabled_request = request("enabled without a head", 3);
-    enabled_request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    enabled_request.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
     assert!(matches!(
         plain_provider.generate(&enabled_request, &mut |_| {}),
         Err(core_llm::Error::Unsupported(_))

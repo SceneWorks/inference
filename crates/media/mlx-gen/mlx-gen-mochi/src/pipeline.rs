@@ -137,7 +137,10 @@ pub fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
         )));
     }
     let (fr, h, w) = (sh[0] as usize, sh[1] as u32, sh[2] as u32);
-    let owned = frames.as_dtype(Dtype::Uint8)?;
+    // `as_slice` reads the physical buffer: force logical row-major order so a strided view (a
+    // caller's transpose, or a future `decode_to_frames` that drops its trailing `contiguous`) is
+    // read correctly rather than scrambled.
+    let owned = contiguous(&frames.as_dtype(Dtype::Uint8)?)?;
     let data = owned.as_slice::<u8>();
     let per = (h as usize) * (w as usize) * 3;
     Ok((0..fr)
@@ -177,5 +180,21 @@ mod tests {
         assert_eq!(imgs[0].height, 1);
         assert_eq!(imgs[0].pixels, vec![10, 20, 30]);
         assert_eq!(imgs[1].pixels, vec![40, 50, 60]);
+    }
+
+    /// A permuted (non-row-contiguous) `(F, H, W, 3)` view is split in LOGICAL order, not the
+    /// physical buffer order a raw `as_slice` would return.
+    #[test]
+    fn frames_to_images_reads_a_strided_view_logically() {
+        // Physical (3, F=2, H=1, W=2) planes → logical (F, H, W, 3) through a transpose view.
+        let planes: Vec<u8> = (0..12).collect();
+        let f = Array::from_slice(&planes, &[3, 2, 1, 2])
+            .transpose_axes(&[1, 2, 3, 0])
+            .unwrap();
+        f.eval().unwrap();
+        let imgs = frames_to_images(&f).unwrap();
+        // Frame 0 pixel (0,0) = channels (0, 4, 8), pixel (0,1) = (1, 5, 9); frame 1 offsets by 2.
+        assert_eq!(imgs[0].pixels, vec![0, 4, 8, 1, 5, 9]);
+        assert_eq!(imgs[1].pixels, vec![2, 6, 10, 3, 7, 11]);
     }
 }

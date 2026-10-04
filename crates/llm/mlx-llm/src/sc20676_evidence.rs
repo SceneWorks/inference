@@ -5508,6 +5508,7 @@ mod tests {
             yarn: None,
             mrope_section: None,
             gemma4: None,
+            activation_role: Default::default(),
         };
         let mut rng = SplitMix64::new(0x5c20676);
         let mut randn = |shape: &[i32]| {
