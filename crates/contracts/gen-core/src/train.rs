@@ -171,6 +171,27 @@ pub struct TrainingConfig {
     /// [`weight_noise`](TrainingTechniques::weight_noise), and by every trainer for a
     /// [`full_finetune`](Self::full_finetune) run — see [`validate_training_techniques`].
     pub weight_noise_sigma: f32,
+    /// **Gradient noise** (epic 2123, sc-24827) — annealed Gaussian noise on the trainable adapter
+    /// gradients, the `neelakantan` mode of ai-toolkit-perceptual (Neelakantan et al. 2015). On
+    /// every **real optimizer update** `t` (0-based update index, not the micro-step), after the
+    /// window's gradients are averaged and globally norm-clipped and **before** the optimizer step
+    /// (upstream's placement: "after clip so the clip doesn't eat the noise"), every adapter gradient
+    /// `g` gets `g += N(0, 1) · σ_t` with `σ_t = gradient_noise_eta / (1 + t)^gradient_noise_gamma`
+    /// (see [`gradient_noise_std`]). The noise is drawn from an RNG derived from
+    /// [`seed`](Self::seed) and the update index on a stream independent of weight noising (E4).
+    /// Upstream's suggested strength when enabled is `0.01`.
+    ///
+    /// `0.0` (the default) is **off**: no extra RNG draws, the adapter is exactly the pre-sc-24827
+    /// one. A non-zero eta is refused (typed [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`gradient_noise`](TrainingTechniques::gradient_noise), and for a
+    /// [`full_finetune`](Self::full_finetune) run (it perturbs adapter gradients only) — see
+    /// [`validate_training_techniques`].
+    pub gradient_noise_eta: f32,
+    /// Annealing exponent `γ` of [`gradient_noise_eta`](Self::gradient_noise_eta)'s schedule
+    /// `σ_t = η / (1 + t)^γ`. Default `0.55` (the paper's / upstream's default). Must be finite and
+    /// `>= 0` (a negative exponent would grow the noise without bound); ignored while eta is `0`.
+    pub gradient_noise_gamma: f32,
 }
 
 impl Default for TrainingConfig {
@@ -216,6 +237,10 @@ impl Default for TrainingConfig {
             // Weight noising is OFF by default (epic 2123 E1): a caller that does not opt in trains
             // exactly as before.
             weight_noise_sigma: 0.0,
+            // Gradient noise is OFF by default (epic 2123 E1); gamma carries the upstream default
+            // so turning eta on alone gives the paper's schedule.
+            gradient_noise_eta: 0.0,
+            gradient_noise_gamma: DEFAULT_GRADIENT_NOISE_GAMMA,
         }
     }
 }
@@ -419,9 +444,9 @@ pub struct TrainerDescriptor {
 }
 
 /// Per-technique support flags for the optional training techniques of epic 2123 (weight noising
-/// today; gradient noise, aspect buckets, masked loss, depth anchoring and the perceptual
-/// identity/body/latent losses join here as their stories land). Each flag gates exactly one
-/// [`TrainingConfig`] knob through [`validate_training_techniques`].
+/// and gradient noise today; aspect buckets, masked loss, depth anchoring and the perceptual
+/// identity/body/latent losses join here as their stories land). Each flag gates one technique's
+/// [`TrainingConfig`] knob(s) through [`validate_training_techniques`].
 ///
 /// Non-supporting descriptors spell [`TrainingTechniques::NONE`], so a new flag defaults to
 /// *unsupported* everywhere without touching them; a supporting descriptor names the flags it
@@ -430,39 +455,97 @@ pub struct TrainerDescriptor {
 pub struct TrainingTechniques {
     /// Honors [`TrainingConfig::weight_noise_sigma`] (relative-mode adapter weight noising).
     pub weight_noise: bool,
+    /// Honors [`TrainingConfig::gradient_noise_eta`] / [`TrainingConfig::gradient_noise_gamma`]
+    /// (annealed adapter gradient noise, sc-24827).
+    pub gradient_noise: bool,
 }
 
 impl TrainingTechniques {
     /// No optional technique supported — every technique knob must stay at its off value.
     pub const NONE: Self = Self {
         weight_noise: false,
+        gradient_noise: false,
     };
+
+    /// The adapter-noise pair every LoRA/LoKr trainer implements at its optimizer step (epic 2123
+    /// S2, sc-24827): weight noising after the update and gradient noise between clip and step.
+    pub const ADAPTER_NOISE: Self = Self {
+        weight_noise: true,
+        gradient_noise: true,
+    };
+}
+
+/// Upstream / Neelakantan et al. (2015) default annealing exponent for gradient noise.
+pub const DEFAULT_GRADIENT_NOISE_GAMMA: f32 = 0.55;
+
+/// The gradient-noise standard deviation at optimizer update `update_idx` (0-based):
+/// `σ_t = eta / (1 + t)^gamma` — upstream ai-toolkit-perceptual's `neelakantan` mode, the one
+/// formula both backends' gradient-noise kernels share. `eta == 0` ⇒ `0` (off).
+pub fn gradient_noise_std(eta: f32, gamma: f32, update_idx: u32) -> f32 {
+    if eta == 0.0 {
+        return 0.0;
+    }
+    (eta as f64 / (1.0 + update_idx as f64).powf(gamma as f64)) as f32
+}
+
+/// Domain-separation salt for the **weight-noise** RNG stream (epic 2123, sc-24826).
+pub const WEIGHT_NOISE_SALT: u64 = 0x5745_4947_4854_4E5A; // "WEIGHTNZ"
+/// Domain-separation salt for the **gradient-noise** RNG stream (sc-24827) — independent of the
+/// weight-noise stream so turning one technique on never shifts the other's draws.
+pub const GRADIENT_NOISE_SALT: u64 = 0x4752_4144_4E4F_4953; // "GRADNOIS"
+
+/// SplitMix64 finalizer — a bijective 64-bit mix, so distinct inputs map to well-separated keys.
+pub fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The RNG seed for one adapter tensor's technique-noise draw (epic 2123 E4): derived only from
+/// the job `seed`, the technique's stream `salt` ([`WEIGHT_NOISE_SALT`] / [`GRADIENT_NOISE_SALT`]),
+/// the 0-based optimizer `update_idx`, and the tensor's index in **sorted key order** — so a
+/// seeded run (or a resumed one) reproduces the same noise on either backend's kernel, and
+/// `HashMap` iteration order can never leak in.
+pub fn technique_noise_key(seed: u64, salt: u64, update_idx: u32, tensor_idx: usize) -> u64 {
+    let stream = splitmix64(seed ^ salt).wrapping_add(update_idx as u64);
+    splitmix64(splitmix64(stream) ^ tensor_idx as u64)
 }
 
 /// The shared **training-technique floor** (epic 2123 E3/E5) — every trainer's `validate` *and*
 /// `train` entry point calls it before any expensive work, so a requested technique the trainer
 /// does not implement is refused instead of silently ignored.
 ///
-/// - `weight_noise_sigma` not finite or negative ⇒ [`crate::Error::Msg`] (malformed request).
+/// - `weight_noise_sigma` / `gradient_noise_eta` / `gradient_noise_gamma` not finite or negative
+///   ⇒ [`crate::Error::Msg`] (malformed request).
 /// - `weight_noise_sigma > 0` on a trainer whose [`TrainerDescriptor::techniques`] lacks
-///   [`weight_noise`](TrainingTechniques::weight_noise) ⇒ typed [`crate::Error::Unsupported`].
-/// - `weight_noise_sigma > 0` with [`TrainingConfig::full_finetune`] ⇒ typed
-///   [`crate::Error::Unsupported`]: weight noise perturbs adapter factors only and must never touch
-///   base weights (E5).
+///   [`weight_noise`](TrainingTechniques::weight_noise) ⇒ typed [`crate::Error::Unsupported`];
+///   likewise `gradient_noise_eta > 0` without
+///   [`gradient_noise`](TrainingTechniques::gradient_noise).
+/// - either noise technique with [`TrainingConfig::full_finetune`] ⇒ typed
+///   [`crate::Error::Unsupported`]: both perturb adapter factors / adapter gradients only and must
+///   never touch base weights (E5).
 /// - every technique off ⇒ no-op.
 pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
     req: &TrainingRequest,
 ) -> crate::Result<()> {
-    let sigma = req.config.weight_noise_sigma;
-    if !sigma.is_finite() || sigma < 0.0 {
-        return Err(crate::Error::Msg(format!(
-            "{}: weight_noise_sigma must be a finite value >= 0, got {sigma}",
-            desc.id
-        )));
+    let cfg = &req.config;
+    for (name, value) in [
+        ("weight_noise_sigma", cfg.weight_noise_sigma),
+        ("gradient_noise_eta", cfg.gradient_noise_eta),
+        ("gradient_noise_gamma", cfg.gradient_noise_gamma),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: {name} must be a finite value >= 0, got {value}",
+                desc.id
+            )));
+        }
     }
+    let sigma = cfg.weight_noise_sigma;
     if sigma > 0.0 {
-        if req.config.full_finetune {
+        if cfg.full_finetune {
             return Err(crate::Error::Unsupported(format!(
                 "{}: weight noising (weight_noise_sigma {sigma}) perturbs adapter factors only and \
                  cannot be combined with a full base fine-tune",
@@ -472,6 +555,22 @@ pub fn validate_training_techniques(
         if !desc.techniques.weight_noise {
             return Err(crate::Error::Unsupported(format!(
                 "{}: weight noising (weight_noise_sigma {sigma}) is not supported by this trainer",
+                desc.id
+            )));
+        }
+    }
+    let eta = cfg.gradient_noise_eta;
+    if eta > 0.0 {
+        if cfg.full_finetune {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: gradient noise (gradient_noise_eta {eta}) perturbs adapter gradients only and \
+                 cannot be combined with a full base fine-tune",
+                desc.id
+            )));
+        }
+        if !desc.techniques.gradient_noise {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: gradient noise (gradient_noise_eta {eta}) is not supported by this trainer",
                 desc.id
             )));
         }
@@ -852,6 +951,90 @@ mod tests {
             let err = validate_training_techniques(&noisy_desc, &r).unwrap_err();
             assert!(matches!(err, crate::Error::Msg(_)), "{bad}: {err:?}");
         }
+    }
+
+    #[test]
+    fn validate_training_techniques_gates_gradient_noise() {
+        // sc-24827 (epic 2123 E3/E5): gradient noise is refused unless declared, refused with a
+        // full fine-tune, and malformed eta/gamma are refused outright. Independent of weight noise.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut wn_only = trainer_desc_with(false, true);
+        wn_only.techniques.weight_noise = true;
+        let mut both = trainer_desc_with(false, true);
+        both.techniques = TrainingTechniques::ADAPTER_NOISE;
+
+        let off = train_req(None, items);
+        assert_eq!(off.config.gradient_noise_eta, 0.0, "off by default (E1)");
+        assert_eq!(
+            off.config.gradient_noise_gamma,
+            DEFAULT_GRADIENT_NOISE_GAMMA
+        );
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.gradient_noise_eta = 0.01;
+        for desc in [&plain, &wn_only] {
+            let err = validate_training_techniques(desc, &on).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m) if m.contains("gradient noise")),
+                "{err:?}"
+            );
+        }
+        assert!(validate_training_techniques(&both, &on).is_ok());
+
+        let mut full = on.clone();
+        full.config.full_finetune = true;
+        let err = validate_training_techniques(&both, &full).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("full base fine-tune")),
+            "{err:?}"
+        );
+
+        for bad in [-0.01f32, f32::NAN, f32::INFINITY] {
+            let mut r = off.clone();
+            r.config.gradient_noise_eta = bad;
+            let err = validate_training_techniques(&both, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("gradient_noise_eta")));
+            let mut r = off.clone();
+            r.config.gradient_noise_gamma = bad;
+            let err = validate_training_techniques(&both, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("gradient_noise_gamma")));
+        }
+    }
+
+    #[test]
+    fn gradient_noise_std_anneals_per_the_neelakantan_formula() {
+        // sc-24827: σ_t = η / (1 + t)^γ, t the 0-based optimizer update.
+        assert_eq!(gradient_noise_std(0.0, 0.55, 0), 0.0, "eta 0 is off");
+        assert_eq!(gradient_noise_std(0.01, 0.55, 0), 0.01, "σ_0 = η");
+        for t in [1u32, 9, 99, 999] {
+            let want = 0.01 / (1.0 + t as f64).powf(0.55);
+            let got = gradient_noise_std(0.01, 0.55, t) as f64;
+            assert!((got - want).abs() <= want * 1e-6, "t={t}: {got} vs {want}");
+            assert!(
+                got < gradient_noise_std(0.01, 0.55, t - 1) as f64,
+                "shrinks with t"
+            );
+        }
+        // γ = 0 is constant noise.
+        assert_eq!(gradient_noise_std(0.02, 0.0, 500), 0.02);
+    }
+
+    #[test]
+    fn technique_noise_keys_separate_streams_updates_and_tensors() {
+        let k = |salt, u, i| technique_noise_key(7, salt, u, i);
+        assert_eq!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 3, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(GRADIENT_NOISE_SALT, 3, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 4, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 3, 1));
+        assert_ne!(
+            technique_noise_key(7, WEIGHT_NOISE_SALT, 0, 0),
+            technique_noise_key(8, WEIGHT_NOISE_SALT, 0, 0)
+        );
     }
 
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {

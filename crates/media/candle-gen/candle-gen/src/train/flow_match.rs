@@ -54,10 +54,10 @@ use crate::train::checkpoint::{
     checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
 };
 use crate::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
-    LoraSet,
+    adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
+    AdapterKind, LoraHost, LoraSet,
 };
-use crate::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use crate::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
 use crate::train::schedule::{lr_multiplier, schedule_updates};
 use crate::{CandleError, Result};
 
@@ -333,8 +333,9 @@ pub fn install_adapters(
     }
 }
 
-/// Fire one optimizer update: LR-schedule, average the accumulated grads by `1/micro_count`, grad-norm
-/// clip, step. `micro_count` is the ACTUAL number of micro-grads accumulated into this window — for a
+/// Fire one optimizer update: LR-schedule, average the accumulated grads by `1/micro_count`, then the
+/// shared [`adapter_optimizer_step`] — grad-norm clip, epic 2123 gradient noise, step, weight noise
+/// (sc-24827), seeded by `noise_seed` (the job seed; Wan passes its per-expert seed). `micro_count` is the ACTUAL number of micro-grads accumulated into this window — for a
 /// full window that equals `gradient_accumulation`, but for the final partial flush (when
 /// `steps % accum != 0`, or a mid-window cancel) it is the sub-`accum` remainder, so the tail update is
 /// a true mean of the `k` grads it holds rather than a `k/accum`-scaled underweighted step (F-034,
@@ -350,6 +351,7 @@ pub fn apply_update(
     update_idx: u32,
     total_updates: u32,
     warmup_updates: u32,
+    noise_seed: u64,
 ) -> Result<()> {
     assert!(
         micro_count > 0,
@@ -361,9 +363,7 @@ pub fn apply_update(
         .take()
         .expect("apply_update called with a pending accumulation");
     scale_grads(&mut avg, &set.vars, 1.0 / micro_count as f64)?;
-    clip_grad_norm(&mut avg, &set.vars, 1.0)?;
-    opt.step(&avg)?;
-    Ok(())
+    adapter_optimizer_step(opt, &mut avg, set, cfg, update_idx, noise_seed)
 }
 
 /// The preview-sample plan a [`FlowMatchTrainer::cache`] builds while the text encoder (and any VAE
@@ -617,6 +617,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                 update_idx,
                 total_updates,
                 warmup_updates,
+                cfg.seed,
             )?;
             pending = 0;
             update_idx += 1;
@@ -723,6 +724,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             update_idx,
             total_updates,
             warmup_updates,
+            cfg.seed,
         )?;
         if resume_due {
             save_resume(
@@ -1557,5 +1559,171 @@ mod tests {
             !frozen_after.get(),
             "the thaw pass must still run after a freeze failure so no adapter is left frozen"
         );
+    }
+
+    /// Epic 2123 (sc-24827): a `MockTrainer` that snapshots the adapter factors at the final save,
+    /// so a test can compare what the driver actually trained.
+    struct CaptureTrainer {
+        inner: MockTrainer,
+        saved: std::cell::RefCell<Vec<(String, Vec<f32>)>>,
+    }
+
+    impl FlowMatchTrainer for CaptureTrainer {
+        type Dit = MockDit;
+        type Cached = ();
+        type Aux = ();
+        type SampleState = ();
+        const LABEL: &'static str = "capture trainer";
+
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn default_targets(&self) -> &'static [&'static str] {
+            self.inner.default_targets()
+        }
+        fn cache(
+            &self,
+            req: &TrainingRequest,
+            device: &Device,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<()>, (), SamplePlan<()>)> {
+            self.inner.cache(req, device, on_progress)
+        }
+        fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<MockDit> {
+            // A non-zero base so both LoRA factors receive gradients.
+            let w = Tensor::from_vec(
+                (0..16)
+                    .map(|i| 0.1 * (i as f32 - 7.5))
+                    .collect::<Vec<f32>>(),
+                (4, 4),
+                device,
+            )?;
+            let _ = req;
+            Ok(MockDit(LoraLinear::from_linear(
+                Linear::new(w, None),
+                4,
+                4,
+                "to_q".into(),
+            )))
+        }
+        fn micro_step(
+            &self,
+            dit: &MockDit,
+            vars: &[Var],
+            cached: &(),
+            aux: &(),
+            cfg: &TrainingConfig,
+            step: u32,
+            device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            // Loss through the adapted forward so B (zero-init) gets a gradient too.
+            let x = Tensor::from_vec(vec![1.0f32, -2.0, 0.5, 3.0], (1, 4), device)?;
+            let y = candle_core::Module::forward(&dit.0, &x)?;
+            let target = Tensor::from_vec(vec![0.3f32, 0.1, -0.2, 0.4], (1, 4), device)?;
+            let loss = (y - target)?.sqr()?.sum_all()?;
+            let _ = (vars, cached, aux, cfg, step);
+            self.inner.steps_seen.set(step);
+            Ok((loss.to_scalar::<f32>()?, loss.backward()?))
+        }
+        fn save(&self, set: &LoraSet, _path: &Path) -> Result<()> {
+            let mut named = set.named_vars();
+            named.sort_by(|a, b| a.0.cmp(&b.0));
+            *self.saved.borrow_mut() = named
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        v.as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            Ok(())
+        }
+    }
+
+    fn capture_run(
+        weight_sigma: f32,
+        grad_eta: f32,
+        steps: u32,
+        accum: u32,
+    ) -> Vec<(String, Vec<f32>)> {
+        let model = CaptureTrainer {
+            inner: MockTrainer {
+                device: Device::Cpu,
+                steps_seen: Cell::new(0),
+                saves: Cell::new(0),
+                cache_len: 1,
+            },
+            saved: Default::default(),
+        };
+        let (_fixture, mut req) = mock_request(1, steps, accum, 0, CancelFlag::new());
+        req.config.seed = 11;
+        req.config.rank = 2;
+        req.config.alpha = 2.0;
+        req.config.weight_noise_sigma = weight_sigma;
+        req.config.gradient_noise_eta = grad_eta;
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let saved = model.saved.borrow().clone();
+        assert!(!saved.is_empty());
+        saved
+    }
+
+    /// Call site (epic 2123, sc-24827): the shared driver invokes weight noise exactly once per
+    /// REAL optimizer update, after the step, with that update's index — never on the
+    /// gradient-accumulation micro-steps. One update (steps = accum = 2): the noisy run's adapter is
+    /// bit-identical to the clean run's adapter plus `apply_weight_noise(.., update 0)`. Noise on
+    /// micro-step 1 would perturb micro-step 2's gradient (and add a second draw); a wrong index
+    /// draws different noise — either breaks the equality.
+    ///
+    /// *Mutation that reds this:* calling the update (or the weight-noise kernel) on every
+    /// micro-step, or `apply_update` dropping the noise call.
+    #[test]
+    fn driver_applies_weight_noise_once_per_real_update() {
+        let sigma = 0.05f32;
+        let clean = capture_run(0.0, 0.0, 2, 2);
+        let noisy = capture_run(sigma, 0.0, 2, 2);
+        assert_ne!(clean, noisy, "weight noise must reach the trained adapter");
+        // Rebuild a set holding the clean factors and noise it as update 0 would.
+        let mut host = MockDit(LoraLinear::from_linear(
+            Linear::new(
+                Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap(),
+                None,
+            ),
+            4,
+            4,
+            "to_q".into(),
+        ));
+        let set =
+            build_lora_targets(&mut host, &["to_q".to_string()], 2, 2.0, 0, &Device::Cpu).unwrap();
+        let mut named = set.named_vars();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((name, var), (cname, values)) in named.iter().zip(&clean) {
+            assert_eq!(name, cname);
+            var.set(&Tensor::from_vec(values.clone(), var.dims(), &Device::Cpu).unwrap())
+                .unwrap();
+        }
+        crate::train::lora::apply_weight_noise(&set, sigma, 11, 0).unwrap();
+        let mut named = set.named_vars();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected: Vec<(String, Vec<f32>)> = named
+            .into_iter()
+            .map(|(k, v)| (k, v.as_tensor().flatten_all().unwrap().to_vec1().unwrap()))
+            .collect();
+        assert_eq!(noisy, expected);
+    }
+
+    /// Call site: gradient noise reaches the driver's optimizer step (the adapter differs from the
+    /// clean run) and is seeded (two runs agree), including the final partial-window flush.
+    #[test]
+    fn driver_applies_gradient_noise_reproducibly() {
+        let clean = capture_run(0.0, 0.0, 3, 2);
+        let a = capture_run(0.0, 0.05, 3, 2);
+        let b = capture_run(0.0, 0.05, 3, 2);
+        assert_ne!(clean, a, "gradient noise must reach the trained adapter");
+        assert_eq!(a, b, "seeded gradient noise must reproduce");
     }
 }

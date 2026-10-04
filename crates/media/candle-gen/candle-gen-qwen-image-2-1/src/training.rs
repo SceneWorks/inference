@@ -837,7 +837,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Instruction-edit datasets (sc-24162), capped at the render path's own reference limit —
         // the one constant `collect_references`/`validate_reference_count` enforce.
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
     }
 }
 
@@ -2074,6 +2076,7 @@ impl QwenImage21Trainer {
                     update_idx,
                     total_updates,
                     warmup_updates,
+                    cfg.seed,
                 )?;
                 pending = 0;
                 update_idx += 1;
@@ -2167,6 +2170,7 @@ impl QwenImage21Trainer {
                 update_idx,
                 total_updates,
                 warmup_updates,
+                cfg.seed,
             )?;
             if resume_due {
                 save_resume(

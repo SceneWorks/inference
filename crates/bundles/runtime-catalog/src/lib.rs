@@ -690,6 +690,9 @@ pub struct TrainerCapabilitySnapshot {
     pub max_reference_images: u32,
     /// Honors `TrainingConfig::weight_noise_sigma` (epic 2123 weight noising, sc-24826).
     pub supports_weight_noise: bool,
+    /// Honors `TrainingConfig::gradient_noise_eta` / `gradient_noise_gamma` (epic 2123 annealed
+    /// gradient noise, sc-24827).
+    pub supports_gradient_noise: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -705,6 +708,7 @@ impl TrainerCapabilitySnapshot {
             supports_full_finetune: descriptor.supports_full_finetune,
             max_reference_images: descriptor.max_reference_images,
             supports_weight_noise: descriptor.techniques.weight_noise,
+            supports_gradient_noise: descriptor.techniques.gradient_noise,
         }
     }
 
@@ -720,6 +724,7 @@ impl TrainerCapabilitySnapshot {
             "supports_full_finetune": self.supports_full_finetune,
             "max_reference_images": self.max_reference_images,
             "supports_weight_noise": self.supports_weight_noise,
+            "supports_gradient_noise": self.supports_gradient_noise,
         })
     }
 }
@@ -1004,6 +1009,13 @@ mod tests {
         noisy.techniques.weight_noise = true;
         let noisy_json = TrainerCapabilitySnapshot::from_descriptor(&noisy).to_json();
         assert_eq!(noisy_json["supports_weight_noise"], true);
+        // sc-24827: gradient noise is advertised independently of weight noise.
+        assert_eq!(json["supports_gradient_noise"], false);
+        assert_eq!(noisy_json["supports_gradient_noise"], false);
+        let mut grad = noisy;
+        grad.techniques.gradient_noise = true;
+        let grad_json = TrainerCapabilitySnapshot::from_descriptor(&grad).to_json();
+        assert_eq!(grad_json["supports_gradient_noise"], true);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {
