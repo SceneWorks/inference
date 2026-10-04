@@ -688,6 +688,8 @@ pub struct TrainerCapabilitySnapshot {
     /// Most ordered reference images one instruction-edit training item may carry (sc-24161);
     /// `0` = the trainer refuses edit-pair datasets.
     pub max_reference_images: u32,
+    /// Honors `TrainingConfig::weight_noise_sigma` (epic 2123 weight noising, sc-24826).
+    pub supports_weight_noise: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -702,6 +704,7 @@ impl TrainerCapabilitySnapshot {
             supports_control: descriptor.supports_control,
             supports_full_finetune: descriptor.supports_full_finetune,
             max_reference_images: descriptor.max_reference_images,
+            supports_weight_noise: descriptor.techniques.weight_noise,
         }
     }
 
@@ -716,6 +719,7 @@ impl TrainerCapabilitySnapshot {
             "supports_control": self.supports_control,
             "supports_full_finetune": self.supports_full_finetune,
             "max_reference_images": self.max_reference_images,
+            "supports_weight_noise": self.supports_weight_noise,
         })
     }
 }
@@ -965,6 +969,7 @@ mod tests {
             supports_control: false,
             supports_full_finetune: true,
             max_reference_images: 0,
+            techniques: gen_core::TrainingTechniques::NONE,
         };
         let snapshot = TrainerCapabilitySnapshot::from_descriptor(&descriptor);
         let json = snapshot.to_json();
@@ -992,6 +997,13 @@ mod tests {
             edit_json,
             "the reference cap must be anti-restamp protected"
         );
+
+        // sc-24826: per-technique support is part of the advertised training surface.
+        assert_eq!(json["supports_weight_noise"], false);
+        let mut noisy = descriptor;
+        noisy.techniques.weight_noise = true;
+        let noisy_json = TrainerCapabilitySnapshot::from_descriptor(&noisy).to_json();
+        assert_eq!(noisy_json["supports_weight_noise"], true);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {

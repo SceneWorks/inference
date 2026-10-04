@@ -837,6 +837,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Instruction-edit datasets (sc-24162), capped at the render path's own reference limit —
         // the one constant `collect_references`/`validate_reference_count` enforce.
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
+        techniques: gen_core::train::TrainingTechniques::NONE,
     }
 }
 
@@ -1707,6 +1708,9 @@ impl Trainer for QwenImage21Trainer {
         // trainer is a typed `Unsupported`, never a silently trained plain adapter.
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         // Instruction-edit datasets: the shared floor caps references at this descriptor's
         // `max_reference_images` (the render path's own cap) and refuses mixed or hybrid
         // datasets; the snapshot must also carry the vision tower the references go through.
@@ -1732,6 +1736,9 @@ impl Trainer for QwenImage21Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
+        // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }

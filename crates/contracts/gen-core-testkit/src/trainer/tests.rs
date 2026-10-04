@@ -33,6 +33,9 @@ struct Behavior {
     /// `Some(text)` replaces the shared edit floor's refusal with `Error::Msg(text)` — the
     /// flattened-variant / wrong-message class the edit honesty check must catch (sc-24161).
     edit_refusal_override: Option<&'static str>,
+    /// Routes `validate` (and so `train`) through the shared technique floor
+    /// (`validate_training_techniques`, epic 2123) vs. silently ignoring technique knobs.
+    honor_techniques: bool,
 }
 
 impl Behavior {
@@ -43,6 +46,7 @@ impl Behavior {
             honor_cancel: true,
             typed_cancel: true,
             edit_refusal_override: None,
+            honor_techniques: true,
         }
     }
 }
@@ -65,6 +69,7 @@ fn stub_desc(id: &'static str) -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        techniques: gen_core::TrainingTechniques::NONE,
     }
 }
 
@@ -103,6 +108,9 @@ impl Trainer for StubTrainer {
         // Route through the shared capability floors (F-006), like a real family trainer.
         gen_core::train::validate_control_request(&self.desc, req)?;
         gen_core::train::validate_full_finetune_request(&self.desc, req)?;
+        if self.behavior.honor_techniques {
+            gen_core::train::validate_training_techniques(&self.desc, req)?;
+        }
         gen_core::train::validate_edit_request(&self.desc, req).map_err(|e| {
             match self.behavior.edit_refusal_override {
                 Some(text) => Error::Msg(text.to_owned()),
@@ -241,6 +249,7 @@ fn good_stub_passes_every_check_individually() {
     check_trainer_validate(&g, &profile(&tmp)).unwrap();
     check_trainer_progress(&mut g, &profile(&tmp)).unwrap();
     check_trainer_cancellation(&make_good, &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make_good, &profile(&tmp)).unwrap();
     check_trainer_registry(&registry(), &g).unwrap();
 }
 
@@ -380,4 +389,79 @@ fn an_over_cap_refusal_that_does_not_name_the_cap_fails_the_validate_check() {
     );
     let err = check_trainer_validate(&stub, &profile(&tmp)).unwrap_err();
     assert!(err.contains("at most 3"), "got: {err}");
+}
+
+fn ignores_techniques() -> Behavior {
+    Behavior {
+        honor_techniques: false,
+        ..Behavior::good()
+    }
+}
+
+/// sc-24826: a trainer that does not declare weight noise but silently accepts it fails the
+/// validate check AND the train-entry refusal check.
+#[test]
+fn silently_ignored_weight_noise_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let err = check_trainer_validate(
+        &StubTrainer::new(STUB_ID, ignores_techniques()),
+        &profile(&tmp),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("techniques.weight_noise == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(
+        &|| StubTrainer::boxed(STUB_ID, ignores_techniques()),
+        &profile(&tmp),
+    )
+    .unwrap_err();
+    assert!(err.contains("silently ignored"), "got: {err}");
+}
+
+/// sc-24826: a trainer that declares weight noise passes both checks (accepts the knob, still
+/// refuses it with a full fine-tune).
+#[test]
+fn declared_weight_noise_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.weight_noise = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+    trainer_conformance(make, &profile(&tmp));
+}
+
+/// sc-24826: a declared-weight-noise trainer that rejects the knob anyway fails the validate check.
+#[test]
+fn declared_but_rejected_weight_noise_fails_the_validate_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Declares weight noise but routes through a descriptor copy that does not — the floor refuses.
+    struct Liar(StubTrainer, TrainerDescriptor);
+    impl Trainer for Liar {
+        fn descriptor(&self) -> &TrainerDescriptor {
+            &self.1
+        }
+        fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+            self.0.validate(req)
+        }
+        fn train(
+            &mut self,
+            req: &TrainingRequest,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> gen_core::Result<TrainingOutput> {
+            self.0.train(req, on_progress)
+        }
+    }
+    let inner = StubTrainer::new(STUB_ID, Behavior::good());
+    let mut claimed = stub_desc(STUB_ID);
+    claimed.techniques.weight_noise = true;
+    let err = check_trainer_validate(&Liar(inner, claimed), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.weight_noise == true"),
+        "got: {err}"
+    );
 }

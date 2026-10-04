@@ -59,6 +59,7 @@ fn descriptor_for(variant: Variant) -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
+        techniques: gen_core::train::TrainingTechniques::NONE,
     }
 }
 
@@ -148,6 +149,9 @@ impl Trainer for Sd3Trainer {
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         let want_bf16 = {
@@ -170,6 +174,9 @@ impl Trainer for Sd3Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
+        // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }

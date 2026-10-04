@@ -156,6 +156,21 @@ pub struct TrainingConfig {
     /// optimizer-update boundary (always for `gradient_accumulation = 1`; for `> 1`, use a `save_every`
     /// that is a multiple of it) — the in-flight accumulation buffer is not snapshotted.
     pub resume: bool,
+    /// **Weight noising** (epic 2123, sc-24826) — relative-mode perturbation of the trainable
+    /// adapter factors, ported from ai-toolkit-perceptual. After every **real optimizer update**
+    /// (not every gradient-accumulation micro-step) each adapter tensor `w` (LoRA A/B, LoKr
+    /// factors — never a base weight) is permanently perturbed by
+    /// `w += N(0, 1) · weight_noise_sigma · rms(w)`, with the noise drawn from an RNG derived from
+    /// [`seed`](Self::seed) and the update index, so a seeded run is reproducible (and resume is
+    /// bit-exact). The upstream suggested strength when enabled is `0.0125`.
+    ///
+    /// `0.0` (the default) is **off**: the trainer takes no extra RNG draws and produces exactly the
+    /// adapter it did before this field existed. A non-zero sigma is refused (typed
+    /// [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`weight_noise`](TrainingTechniques::weight_noise), and by every trainer for a
+    /// [`full_finetune`](Self::full_finetune) run — see [`validate_training_techniques`].
+    pub weight_noise_sigma: f32,
 }
 
 impl Default for TrainingConfig {
@@ -198,6 +213,9 @@ impl Default for TrainingConfig {
             // Resume is OFF by default (F-125): a caller that does not opt in trains from scratch,
             // exactly as before. The worker sets it from the plan when re-running an interrupted job.
             resume: false,
+            // Weight noising is OFF by default (epic 2123 E1): a caller that does not opt in trains
+            // exactly as before.
+            weight_noise_sigma: 0.0,
         }
     }
 }
@@ -393,6 +411,72 @@ pub struct TrainerDescriptor {
     /// [`crate::Error::Unsupported`] instead of silently training a text-to-image adapter on the
     /// targets (the F-055 class). `0` for every trainer shipped before sc-24161.
     pub max_reference_images: u32,
+    /// Which optional **training techniques** (epic 2123) this trainer actually implements. The
+    /// shared [`validate_training_techniques`] floor refuses a request that turns on a technique
+    /// the trainer does not declare — a typed [`crate::Error::Unsupported`] before any work, never a
+    /// silently ignored knob. [`TrainingTechniques::NONE`] for a trainer that implements none.
+    pub techniques: TrainingTechniques,
+}
+
+/// Per-technique support flags for the optional training techniques of epic 2123 (weight noising
+/// today; gradient noise, aspect buckets, masked loss, depth anchoring and the perceptual
+/// identity/body/latent losses join here as their stories land). Each flag gates exactly one
+/// [`TrainingConfig`] knob through [`validate_training_techniques`].
+///
+/// Non-supporting descriptors spell [`TrainingTechniques::NONE`], so a new flag defaults to
+/// *unsupported* everywhere without touching them; a supporting descriptor names the flags it
+/// implements (and, once more than one flag exists, completes the rest with `..NONE`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrainingTechniques {
+    /// Honors [`TrainingConfig::weight_noise_sigma`] (relative-mode adapter weight noising).
+    pub weight_noise: bool,
+}
+
+impl TrainingTechniques {
+    /// No optional technique supported — every technique knob must stay at its off value.
+    pub const NONE: Self = Self {
+        weight_noise: false,
+    };
+}
+
+/// The shared **training-technique floor** (epic 2123 E3/E5) — every trainer's `validate` *and*
+/// `train` entry point calls it before any expensive work, so a requested technique the trainer
+/// does not implement is refused instead of silently ignored.
+///
+/// - `weight_noise_sigma` not finite or negative ⇒ [`crate::Error::Msg`] (malformed request).
+/// - `weight_noise_sigma > 0` on a trainer whose [`TrainerDescriptor::techniques`] lacks
+///   [`weight_noise`](TrainingTechniques::weight_noise) ⇒ typed [`crate::Error::Unsupported`].
+/// - `weight_noise_sigma > 0` with [`TrainingConfig::full_finetune`] ⇒ typed
+///   [`crate::Error::Unsupported`]: weight noise perturbs adapter factors only and must never touch
+///   base weights (E5).
+/// - every technique off ⇒ no-op.
+pub fn validate_training_techniques(
+    desc: &TrainerDescriptor,
+    req: &TrainingRequest,
+) -> crate::Result<()> {
+    let sigma = req.config.weight_noise_sigma;
+    if !sigma.is_finite() || sigma < 0.0 {
+        return Err(crate::Error::Msg(format!(
+            "{}: weight_noise_sigma must be a finite value >= 0, got {sigma}",
+            desc.id
+        )));
+    }
+    if sigma > 0.0 {
+        if req.config.full_finetune {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: weight noising (weight_noise_sigma {sigma}) perturbs adapter factors only and \
+                 cannot be combined with a full base fine-tune",
+                desc.id
+            )));
+        }
+        if !desc.techniques.weight_noise {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: weight noising (weight_noise_sigma {sigma}) is not supported by this trainer",
+                desc.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The shared control-training validation floor (F-006) — the training analog of
@@ -724,6 +808,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_training_techniques_floor() {
+        // sc-24826 (epic 2123 E3/E5): weight noising is refused unless the descriptor declares it,
+        // refused with a full fine-tune, and malformed sigmas are refused outright.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut noisy_desc = trainer_desc_with(false, true);
+        noisy_desc.techniques.weight_noise = true;
+
+        // Off (the default) ⇒ no-op everywhere.
+        let off = train_req(None, items);
+        assert_eq!(off.config.weight_noise_sigma, 0.0);
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+        assert!(validate_training_techniques(&noisy_desc, &off).is_ok());
+
+        // On ⇒ typed Unsupported on a trainer that does not declare it; accepted where declared.
+        let mut on = off.clone();
+        on.config.weight_noise_sigma = 0.0125;
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("weight noising")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&noisy_desc, &on).is_ok());
+
+        // On + full fine-tune ⇒ refused even where weight noise is declared (E5).
+        let mut full = on.clone();
+        full.config.full_finetune = true;
+        let err = validate_training_techniques(&noisy_desc, &full).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("full base fine-tune")),
+            "{err:?}"
+        );
+
+        // Malformed ⇒ Msg, regardless of support.
+        for bad in [-0.01f32, f32::NAN, f32::INFINITY] {
+            let mut r = off.clone();
+            r.config.weight_noise_sigma = bad;
+            let err = validate_training_techniques(&noisy_desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad}: {err:?}");
+        }
+    }
+
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {
         trainer_desc_with(supports_control, false)
     }
@@ -742,6 +872,7 @@ mod tests {
             supports_control,
             supports_full_finetune,
             max_reference_images: 0,
+            techniques: TrainingTechniques::NONE,
         }
     }
 
