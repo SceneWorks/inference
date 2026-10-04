@@ -2926,30 +2926,45 @@ mod tests {
                 .fold(0.0f32, f32::max);
             assert!(diff <= 1e-5 * scale, "{what}: differs by {diff}");
         };
-        for (b, t) in [
-            (3usize, 8usize),
-            (100, 105),
-            (70, 150),
-            (64, 150),
-            (128, 133),
+        // (a, b, t): an earlier prefill of `a` tokens carries its state in (`a = 0`: none), then
+        // one prefill of `a..t` captures at position `b`. `b - a` past 512 lands in the
+        // recurrence's second segment of chunks; a capture inside the second prefill's first
+        // chunk reads the carried-in state.
+        for (a, b, t) in [
+            (0usize, 3usize, 8usize),
+            (0, 100, 105),
+            (0, 70, 150),
+            (0, 64, 150),
+            (0, 128, 133),
+            (20, 50, 150),
+            (37, 120, 200),
+            (10, 560, 700),
         ] {
             let fixture = ring_inputs(t, 5);
+            let prefix = |cache: &mut DeltaNetCache| {
+                if a > 0 {
+                    feed_prefill(cache, &fixture, 0, a);
+                }
+            };
             let mut one = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+            prefix(&mut one);
             one.capture_at(b as i32);
-            let y_one = feed_prefill(&mut one, &fixture, 0, t);
+            let y_one = feed_prefill(&mut one, &fixture, a, t - a);
 
             let mut plain = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
-            let y_plain = feed_prefill(&mut plain, &fixture, 0, t);
+            prefix(&mut plain);
+            let y_plain = feed_prefill(&mut plain, &fixture, a, t - a);
             assert_eq!(host(&y_one), host(&y_plain), "b={b} t={t}: outputs");
             assert_eq!(live(&one), live(&plain), "b={b} t={t}: final state");
 
             let mut split = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
-            feed_prefill(&mut split, &fixture, 0, b);
+            prefix(&mut split);
+            feed_prefill(&mut split, &fixture, a, b - a);
             let (conv_b, ssm_b) = live(&split).unwrap();
 
             let (conv, ssm) = one.captured(b as i32).expect("captured");
             assert_eq!(host(conv), conv_b, "b={b} t={t}: the boundary conv tail");
-            if t < CHUNKED_PREFILL_MIN_TOKENS {
+            if t - a < CHUNKED_PREFILL_MIN_TOKENS {
                 assert_eq!(host(ssm), ssm_b, "b={b} t={t}: the boundary state");
             } else {
                 close(
@@ -2968,5 +2983,62 @@ mod tests {
             cache.captured(6).is_none(),
             "the prefill's end is not inside it"
         );
+    }
+
+    /// sc-24446 review: the chunkwise capture at batch 2 with GQA heads (`Hk` 2 → `Hv` 4) and a
+    /// carried-in state — inside the first chunk (the carried state's own decay term), at a chunk
+    /// boundary, and past 512 tokens in a later segment — equals the state a run stopped there
+    /// leaves, and leaves the run's outputs and final state bit for bit those of the uncaptured
+    /// recurrence.
+    #[test]
+    fn a_chunkwise_capture_holds_at_batch_two_with_gqa_and_a_carried_state() {
+        let (b, hk, hv, dk, dv, t) = (2usize, 2usize, 4usize, 3usize, 2usize, 700usize);
+        let dev = Device::Cpu;
+        let tensor = |shape: &[usize], salt: usize, scale: f32| {
+            let len: usize = shape.iter().product();
+            let data: Vec<f32> = (0..len)
+                .map(|i| ((i * 37 + salt * 11) % 53) as f32 * scale - 26.0 * scale)
+                .collect();
+            Tensor::from_vec(data, shape, &dev).unwrap()
+        };
+        let q = tensor(&[b, t, hk, dk], 1, 0.04);
+        let k = tensor(&[b, t, hk, dk], 2, 0.03);
+        let v = tensor(&[b, t, hv, dv], 3, 0.05);
+        let g = candle_nn::ops::sigmoid(&tensor(&[b, t, hv], 4, 0.2))
+            .unwrap()
+            .affine(0.2, 0.8)
+            .unwrap();
+        let beta = candle_nn::ops::sigmoid(&tensor(&[b, t, hv], 5, 0.1)).unwrap();
+        let carried = tensor(&[b, hv, dv, dk], 6, 0.07);
+        let (y, last) = gated_delta_recurrence(&q, &k, &v, &g, &beta, Some(&carried)).unwrap();
+        for at in [17usize, 64, 530, 640] {
+            let (y_c, last_c, state) =
+                gated_delta_recurrence_capturing(&q, &k, &v, &g, &beta, Some(&carried), at)
+                    .unwrap();
+            assert_eq!(host(&y_c), host(&y), "at {at}: outputs");
+            assert_eq!(host(&last_c), host(&last), "at {at}: final state");
+            let head = |x: &Tensor| x.narrow(1, 0, at).unwrap();
+            let (_, want) = gated_delta_recurrence_per_token(
+                &head(&q),
+                &head(&k),
+                &head(&v),
+                &head(&g),
+                &head(&beta),
+                Some(&carried),
+                &mut |_, _| Ok(()),
+            )
+            .unwrap();
+            let (got, want) = (host(&state), host(&want));
+            let scale = want.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+            let diff = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                diff <= 1e-4 * scale,
+                "at {at}: the captured state differs by {diff}"
+            );
+        }
     }
 }

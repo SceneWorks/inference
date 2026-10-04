@@ -734,15 +734,22 @@ pub const CLEAR_LOSS_GAIN: f64 = 0.8;
 /// window.
 pub const CLEAR_LOSS_MIN_TIMED_STEPS: u32 = ACCEPTANCE_PROBE_VERIFIES * 3 / 4;
 
+/// The most timed steps the clear-loss check holds: four windows' worth, the newest. It judges
+/// only until a window measures; a request whose windows keep falling short of
+/// [`MIN_TIMED_WINDOW_STEPS`] is judged on its most recent steps, never a growing history.
+pub const CLEAR_LOSS_MAX_TIMED_STEPS: usize = 4 * ACCEPTANCE_PROBE_VERIFIES as usize;
+
 /// Standard errors (of the timed steps' tokens per step, from their sample variance) the
 /// clear-loss check adds to the mean before comparing the gain with [`CLEAR_LOSS_GAIN`]: the
 /// one-sided 95 % normal quantile.
 pub const CLEAR_LOSS_CONFIDENCE_Z: f64 = 1.645;
 
-/// A timed speculative step longer than this many times the median timed step of the stretch
-/// being judged (a window, or the clear-loss stretch) is a **stall** — a host hiccup, not the
-/// proposer's cost — and is left out of that stretch's measured gain, its tokens with its time
-/// (sc-24446).
+/// A timed speculative step whose wall time **per verified token** (`1 + drafts`) is longer than
+/// this many times the stretch's median per-token step time (a window, or the clear-loss
+/// stretch) is a **stall** — a host hiccup, not the proposer's cost — and is left out of that
+/// stretch's measured gain, its tokens with its time (sc-24446). Per verified token, so a stretch
+/// of mostly single-token steps (a lookup that mostly finds nothing) cannot read its wide verify
+/// steps as stalls: a verify costs at most about one plain step per token it verifies.
 ///
 /// Why (cuda-campaign-a4f1 `f1-qwen38-graphs-off` epic-2, `creative`): a Qwen3.8 MTP request
 /// whose windows measured `r` 1.66–1.82 and gains 1.46–2.26 had one window's mean verify step
@@ -751,10 +758,10 @@ pub const CLEAR_LOSS_CONFIDENCE_Z: f64 = 1.645;
 /// A mean step cost lets one stalled step decide a window; the median of the stretch does not
 /// move with it. The plain side is already a median ([`PLAIN_PROBE_STEPS`]).
 ///
-/// 4 sits above the spread of legitimate step costs inside one stretch: the dearest verify the
-/// campaigns measured is 3.1 plain steps (Bonsai lookup at width 5 under CUDA graphs) and the
-/// cheapest speculative step is a single-token one (a lookup that found nothing, ~1 plain step),
-/// so no real step of a stretch reaches 4× its median while the stretch's steps are mostly real.
+/// 4 sits above the spread of legitimate per-token costs inside one stretch: the campaigns'
+/// verify steps cost 1.02–3.1 plain steps over widths 1–5, between ~0.4 and ~1.0 plain step per
+/// verified token, so no real step reaches 4× the stretch's median while most of its steps are
+/// real; a stall of a second or more in a ~100 ms step does.
 pub const STALL_STEP_FACTOR: u64 = 4;
 
 /// One engine step as the monitor sees it (sc-24446).
@@ -899,15 +906,15 @@ pub struct AcceptanceMonitor {
     verifies: u32,
     /// Drafts accepted in the current window.
     accepted: u64,
-    /// The current window's timed steps: the tokens each committed and its wall time.
-    window_timed: Vec<(u64, u64)>,
+    /// The current window's timed steps.
+    window_timed: Vec<TimedStep>,
     /// Since the request's speculative phase began — a window with too few timed steps to
     /// measure carries its own forward — the verify steps and the drafts they accepted, and the
-    /// timed steps among them (tokens, wall time): what [`CLEAR_LOSS_GAIN`] is checked against
-    /// after every step until a window measures.
+    /// newest [`CLEAR_LOSS_MAX_TIMED_STEPS`] timed steps among them: what [`CLEAR_LOSS_GAIN`] is
+    /// checked against after every step until a window measures.
     clear_verifies: u32,
     clear_accepted: u64,
-    clear_timed: Vec<(u64, u64)>,
+    clear_timed: Vec<TimedStep>,
     /// Whether a window has decided on its measured gain (the clear-loss check stops there).
     measured: bool,
     demoted: bool,
@@ -1039,10 +1046,17 @@ impl AcceptanceMonitor {
         self.clear_verifies += 1;
         self.clear_accepted += step.accepted as u64;
         if let Some(ns) = elapsed_ns {
-            let tokens = 1 + step.accepted as u64;
-            self.window_timed.push((tokens, ns));
+            let timed = TimedStep {
+                tokens: 1 + step.accepted as u64,
+                width: width as u64,
+                ns,
+            };
+            self.window_timed.push(timed);
             if !self.measured {
-                self.clear_timed.push((tokens, ns));
+                if self.clear_timed.len() == CLEAR_LOSS_MAX_TIMED_STEPS {
+                    self.clear_timed.remove(0);
+                }
+                self.clear_timed.push(timed);
             }
         }
         let decision = if let Some(clear) = self.clear_loss() {
@@ -1083,14 +1097,14 @@ impl AcceptanceMonitor {
     /// their verify and acceptance counts with the timed steps among them. `None` otherwise (the
     /// window decides at its end as usual).
     fn clear_loss(&mut self) -> Option<MonitorDecision> {
-        if self.measured {
+        if self.measured || self.clear_timed.len() < CLEAR_LOSS_MIN_TIMED_STEPS as usize {
             return None;
         }
+        let plain_step_ns = self.plain_step_ns()?;
         let stretch = Stretch::of(&self.clear_timed);
         if stretch.steps < CLEAR_LOSS_MIN_TIMED_STEPS {
             return None;
         }
-        let plain_step_ns = self.plain_step_ns()?;
         let decision = MonitorDecision {
             window: self.windows + 1,
             verifies: self.clear_verifies,
@@ -1148,6 +1162,15 @@ impl AcceptanceMonitor {
     }
 }
 
+/// One timed speculative step: the tokens it committed, its verify width (`1 + drafts`) and its
+/// wall time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimedStep {
+    tokens: u64,
+    width: u64,
+    ns: u64,
+}
+
 /// A stretch's timed steps less its stalls ([`STALL_STEP_FACTOR`]): their count, the tokens they
 /// committed (and the squares, for their variance) and their summed wall time.
 struct Stretch {
@@ -1158,11 +1181,13 @@ struct Stretch {
 }
 
 impl Stretch {
-    fn of(timed: &[(u64, u64)]) -> Self {
-        let mut ns: Vec<u64> = timed.iter().map(|&(_, ns)| ns).collect();
-        ns.sort_unstable();
-        let stall = ns
-            .get(ns.len() / 2)
+    fn of(timed: &[TimedStep]) -> Self {
+        // Wall time per verified token, the median of which bounds a real step's.
+        let per_token = |s: &TimedStep| s.ns / s.width.max(1);
+        let mut costs: Vec<u64> = timed.iter().map(per_token).collect();
+        costs.sort_unstable();
+        let stall = costs
+            .get(costs.len() / 2)
             .map_or(u64::MAX, |median| median.saturating_mul(STALL_STEP_FACTOR));
         let mut stretch = Self {
             steps: 0,
@@ -1170,11 +1195,11 @@ impl Stretch {
             tokens_sq: 0,
             ns: 0,
         };
-        for &(tokens, ns) in timed.iter().filter(|&&(_, ns)| ns <= stall) {
+        for s in timed.iter().filter(|s| per_token(s) <= stall) {
             stretch.steps += 1;
-            stretch.tokens += tokens;
-            stretch.tokens_sq += tokens * tokens;
-            stretch.ns = stretch.ns.saturating_add(ns);
+            stretch.tokens += s.tokens;
+            stretch.tokens_sq += s.tokens * s.tokens;
+            stretch.ns = stretch.ns.saturating_add(s.ns);
         }
         stretch
     }
@@ -2530,6 +2555,38 @@ mod tests {
                 assert!(at < 2 * window, "{proposer:?} {stalls:?}: demoted at {at}");
             }
         }
+    }
+
+    /// sc-24446 review: a mixed-width loser is not excused as stalls. A lookup whose steps are
+    /// 70 % single-token (nothing found, 1 plain step) and 30 % full-width verifies at 4.5 plain
+    /// steps accepting nothing — true gain 10 / 20.5 ≈ 0.49 — still demotes by the end of its
+    /// second window: its wide steps are ~0.9 plain step per verified token, not stalls, though
+    /// each is 4.5× the median step.
+    #[test]
+    fn a_mixed_width_loser_is_not_excused_as_stalls() {
+        let window = ACCEPTANCE_PROBE_VERIFIES as usize;
+        let plain_ns = 10 * MS;
+        let mut m = timed(ProposerKind::PromptLookup, 4, PlainDecode::Candle);
+        while m.probing() {
+            m.observe_step(plain_step(Some(plain_ns)));
+        }
+        let at = (0..8 * window).find(|&i| {
+            let wide = matches!(i % 10, 2 | 5 | 8);
+            m.observe_step(StepObservation {
+                accepted: 0,
+                drafts: if wide { 4 } else { 0 },
+                elapsed: Some(Duration::from_nanos(if wide {
+                    plain_ns * 9 / 2
+                } else {
+                    plain_ns
+                })),
+            })
+        });
+        let at = at.expect("demoted");
+        assert!(at < 2 * window, "demoted at {at}");
+        let d = m.last_decision().unwrap();
+        assert_eq!((d.basis, d.demoted), (DemotionBasis::Measured, true));
+        assert!(d.gain().unwrap() < 1.0 - MEASURED_GAIN_MARGIN, "{d:?}");
     }
 
     /// One seeded timed `auto` request for the clear-loss property tests: acceptance from a
