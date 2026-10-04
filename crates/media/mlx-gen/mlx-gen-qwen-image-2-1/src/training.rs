@@ -8,7 +8,7 @@
 //! re-injected each step into the target [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear)s
 //! through the shared [`mlx_gen::train::lora`] seam, and are stepped with `keyed_value_and_grad` +
 //! the core [`TrainOptimizer`] + `clip_grad_norm`. The install mirrors the inference reload
-//! op-for-op, so the trained adapter loads back through the sc-24156 adapter host
+//! op-for-op on the dense training tier, so the trained adapter loads back through the sc-24156 adapter host
 //! ([`crate::apply_qwen_image_2_1_adapters`]) with no key conversion.
 //!
 //! ## What is Qwen-Image-2.1-specific
@@ -2109,6 +2109,10 @@ impl QwenImage21Trainer {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/lokr_rounding.rs"]
+mod lokr_rounding;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mlx_gen::WeightsSource;
@@ -3353,6 +3357,7 @@ mod tests {
     /// both modalities and the actual bf16 production compute path, before any sampling metric.
     #[test]
     fn trained_factors_preserve_velocity_through_save_and_reload() {
+        let mut failures = Vec::new();
         for network in [NetworkType::Lora, NetworkType::Lokr] {
             for edit in [false, true] {
                 let mut dit = tiny_dit();
@@ -3473,13 +3478,15 @@ mod tests {
                     .max(None)
                     .unwrap()
                     .item::<f32>();
-                assert!(
-                    error <= 1e-6 * peak.max(1.0),
-                    "{network:?} edit={edit}: {error} vs {peak}"
-                );
+                println!("FIDELITY {network:?} edit={edit} dense error={error} peak={peak}");
+                if !error.is_finite() || !peak.is_finite() || error > 1e-6 * peak.max(1.0) {
+                    failures.push(format!("{network:?} edit={edit} dense: {error} vs {peak}"));
+                }
                 // Compare reload with the same trained factors over an identical packed base.
-                // This isolates factor reconstruction from ordinary dense/quantized base drift.
-                // LoKr uses a structured contraction on packed tiers, so allow bf16 rounding.
+                // The direct in-memory reference MUST use the packed representation too:
+                // materialized bf16 kron and two bf16 contractions round at different places.
+                // Test that representation error separately per linear against an f64 oracle;
+                // serialization still has the strict dense velocity bound on every tier.
                 for bits in [4, 8] {
                     let mut memory = tiny_dit();
                     memory.cast_weights(Dtype::Bfloat16).unwrap();
@@ -3494,6 +3501,35 @@ mod tests {
                             LOKR_DTYPE,
                         )
                         .unwrap();
+                    if network == NetworkType::Lokr {
+                        let materialized = memory
+                            .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                            .unwrap();
+                        eval([&materialized]).unwrap();
+                        install_packed_lokr_reference(
+                            &mut memory,
+                            &params,
+                            &paths,
+                            cfg.alpha / cfg.rank as f32,
+                            &mut failures,
+                            &format!("edit={edit} q{bits}"),
+                        );
+                        let structured = memory
+                            .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                            .unwrap();
+                        let representation_error = subtract(&materialized, &structured)
+                            .unwrap()
+                            .as_dtype(Dtype::Float32)
+                            .unwrap()
+                            .abs()
+                            .unwrap()
+                            .max(None)
+                            .unwrap()
+                            .item::<f32>();
+                        // Diagnostic only: a nonlinear model does not inherit a single
+                        // residual's componentwise rounding budget as a global peak ratio.
+                        println!("REPRESENTATION Lokr edit={edit} q{bits} velocity_error={representation_error}");
+                    }
                     let want = memory
                         .forward_joint(&batch.text, &images, 0.5, &batch.layout)
                         .unwrap();
@@ -3527,12 +3563,114 @@ mod tests {
                         .max(None)
                         .unwrap()
                         .item::<f32>();
-                    assert!(
-                        error <= 5e-3 * peak.max(1.0),
-                        "{network:?} edit={edit} q{bits}: reload error {error} vs {peak}"
-                    );
+                    println!("FIDELITY {network:?} edit={edit} q{bits} error={error} peak={peak}");
+                    if !error.is_finite() || !peak.is_finite() || error > 1e-6 * peak.max(1.0) {
+                        failures.push(format!(
+                            "{network:?} edit={edit} q{bits}: {error} vs {peak}"
+                        ));
+                    }
                 }
             }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // This test reference neither reads the serialized file nor calls the loader/builder.
+    // Construct the small factors directly from the trained parameter keys and metadata.
+    fn install_packed_lokr_reference(
+        host: &mut QwenImage21Transformer,
+        params: &LoraParams,
+        paths: &[String],
+        scale: f32,
+        failures: &mut Vec<String>,
+        cell: &str,
+    ) {
+        use mlx_gen::adapters::{Adapter, LokrFactors};
+        use mlx_rs::ops::matmul;
+
+        let mut drop_detected = false;
+        let mut scale_detected = false;
+        for path in paths {
+            let get = |suffix: &str| params.get(format!("{path}.{suffix}").as_str());
+            let w1 = get("lokr_w1").unwrap();
+            let w2 = match get("lokr_w2") {
+                Some(w2) => w2.clone(),
+                None => matmul(get("lokr_w2_a").unwrap(), get("lokr_w2_b").unwrap()).unwrap(),
+            };
+            let (a, c) = (w1.shape()[0], w1.shape()[1]);
+            let (b, d) = (w2.shape()[0], w2.shape()[1]);
+            let factors = LokrFactors {
+                w1: w1.as_dtype(Dtype::Bfloat16).unwrap(),
+                w2: multiply(&w2, Array::from_f32(scale))
+                    .unwrap()
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap(),
+                a,
+                b,
+                c,
+                d,
+                scale,
+            };
+            let x: Vec<_> = (0..3 * c * d)
+                .map(|i| ((i * 7 % 31) as f32 - 15.0) / 16.0)
+                .collect();
+            let x = Array::from_slice(&x, &[3, c * d])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let f32_values = |value: &Array| {
+                let value = value.as_dtype(Dtype::Float32).unwrap();
+                eval([&value]).unwrap();
+                value.as_slice::<f32>().to_vec()
+            };
+            let (want, products) = lokr_rounding::oracle(
+                &f32_values(w1),
+                &f32_values(&w2),
+                &f32_values(&x),
+                [a as usize, b as usize, c as usize, d as usize],
+                scale,
+            );
+            let lin = host
+                .adaptable_mut(&path.split('.').collect::<Vec<_>>())
+                .unwrap();
+            let dense = f32_values(&lin.adapters()[0].residual(&x).unwrap());
+            let structured = f32_values(&factors.residual(&x).unwrap());
+            for (representation, got, fraction) in [
+                (
+                    "dense",
+                    &dense,
+                    lokr_rounding::rounding_fraction(c as usize, d as usize, false),
+                ),
+                (
+                    "structured",
+                    &structured,
+                    lokr_rounding::rounding_fraction(c as usize, d as usize, true),
+                ),
+            ] {
+                if !lokr_rounding::within_bound(got, &want, &products, fraction) {
+                    failures.push(format!(
+                        "{cell} {path} {representation}: outside componentwise bf16 bound"
+                    ));
+                }
+            }
+            let fraction = lokr_rounding::rounding_fraction(c as usize, d as usize, true);
+            // A zero residual or forgotten alpha/rank must fail the SAME oracle assertion.
+            let mut wrong_scale = factors.clone();
+            wrong_scale.w2 = multiply(&wrong_scale.w2, Array::from_f32(scale.recip())).unwrap();
+            drop_detected |=
+                !lokr_rounding::within_bound(&vec![0.0; want.len()], &want, &products, fraction);
+            scale_detected |= !lokr_rounding::within_bound(
+                &f32_values(&wrong_scale.residual(&x).unwrap()),
+                &want,
+                &products,
+                fraction,
+            );
+            lin.set_adapters(vec![Adapter::LokrStructured { factors }]);
+        }
+        println!("ORACLE {cell} paths={} drop_mutant_detected={drop_detected} scale_mutant_detected={scale_detected}", paths.len());
+        if !drop_detected || !scale_detected {
+            failures.push(format!(
+                "{cell}: LoKr residual oracle failed to discriminate drop/scale mutants"
+            ));
         }
     }
 

@@ -31,13 +31,13 @@ def collect_identity(messages, lock):
         raise ValueError("expected exactly one actual MLX library directory")
     directory = libraries[0]
     manifest = directory / "pmetal-mlx-prebuilt.txt"
-    build_manifest = dict(line.split("=", 1) for line in manifest.read_text().splitlines() if "=" in line)
+    build_manifest = dict(line.split("=", 1) for line in manifest.read_text(encoding="utf-8").splitlines() if "=" in line)
     if not build_manifest.get("fingerprint"):
         raise ValueError("linked MLX archives lack their source fingerprint")
     staged = Path(record["out_dir"]) / "mlx-c-staged" / "CMakeLists.txt"
     tag = None
     if staged.is_file():
-        match = re.search(r"GIT_TAG\s+(v[0-9.]+)", staged.read_text())
+        match = re.search(r"GIT_TAG\s+(v[0-9.]+)", staged.read_text(encoding="utf-8"))
         if match is None or match[1] != "v0.32.0":
             raise ValueError("actual staged MLX source must select v0.32.0")
         tag = match[1]
@@ -59,12 +59,12 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     messages = []
-    for line in args.messages.read_text().splitlines():
+    for line in args.messages.read_text(encoding="utf-8").splitlines():
         try:
             messages.append(json.loads(line))
         except json.JSONDecodeError:
             pass  # cargo stderr diagnostics are preserved in the same log
-    identity = collect_identity(messages, tomllib.loads(args.lock.read_text()))
+    identity = collect_identity(messages, tomllib.loads(args.lock.read_text(encoding="utf-8")))
     args.out.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(identity, indent=2))
 

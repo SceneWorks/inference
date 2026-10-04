@@ -14,10 +14,10 @@ class BuildIdentityTests(unittest.TestCase):
         libraries.mkdir(parents=True)
         for name in ("libmlx.a", "libmlxc.a", "mlx.metallib"):
             (libraries / name).write_bytes(name.encode())
-        (libraries / "pmetal-mlx-prebuilt.txt").write_text("fingerprint=actual-source\ntarget=aarch64-apple-darwin\n")
+        (libraries / "pmetal-mlx-prebuilt.txt").write_text("fingerprint=actual-source\ntarget=aarch64-apple-darwin\n", encoding="utf-8")
         staged = root / "mlx-c-staged"
         staged.mkdir()
-        (staged / "CMakeLists.txt").write_text("FetchContent_Declare(mlx GIT_TAG v0.32.0)")
+        (staged / "CMakeLists.txt").write_text("FetchContent_Declare(mlx GIT_TAG v0.32.0)", encoding="utf-8")
         revision = "a" * 40
         messages = [{"reason": "build-script-executed",
                      "package_id": f"git+https://example.test?rev={revision}#pmetal-mlx-sys@0.2.4",
@@ -44,7 +44,7 @@ class BuildIdentityTests(unittest.TestCase):
             wrong[0]["package_id"] = wrong[0]["package_id"].replace("a" * 40, "b" * 40)
             with self.assertRaisesRegex(ValueError, "locked mlx-sys"):
                 collect_identity(wrong, lock)
-            (staged / "CMakeLists.txt").write_text("GIT_TAG v0.31.1")
+            (staged / "CMakeLists.txt").write_text("GIT_TAG v0.31.1", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "v0.32.0"):
                 collect_identity(messages, lock)
             (libraries / "libmlx.a").unlink()

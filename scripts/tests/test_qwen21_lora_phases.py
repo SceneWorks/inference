@@ -37,8 +37,8 @@ class PhaseTests(unittest.TestCase):
                 env={**os.environ, "FAKE_BIN": shell_path(root), "CARGO_CALLS": shell_path(calls),
                      "QWEN_IMAGE_2_1_RENDER_OUT": shell_path(root), "QWEN_IMAGE_2_1_LORA_PHASE": phase,
                      "QWEN_IMAGE_2_1_THIRD_PARTY_LORA": "fake.safetensors", "FAIL_TEST": fail},
-                capture_output=True, text=True, check=False)
-            text = calls.read_text() if calls.exists() else ""
+                capture_output=True, text=True, encoding="utf-8", check=False)
+            text = calls.read_text(encoding="utf-8") if calls.exists() else ""
             names = re.findall(r"lora_real_weights::(\w+)", text)
             return result, names, text
 
