@@ -987,6 +987,27 @@ class PrecisionControlTests(unittest.TestCase):
                           "extern int cudaMalloc", "Start-Process", "Stop-Process"):
             self.assertNotIn(forbidden, probe)
 
+    def test_optional_hyperv_process_mapping_is_read_only_metadata(self):
+        probe = (ROOT / "scripts/ci/yue2_cuda_context_diagnostic.ps1").read_text(encoding="utf-8")
+        lookup = probe.split("function Get-HyperVVmMapping", 1)[1].split(
+            "function Save-ProcessIdentity", 1)[0]
+        identity = probe.split("function Save-ProcessIdentity", 1)[1].split(
+            "function Save-Counters", 1)[0]
+        self.assertIn("Get-CimInstance -Namespace 'root\\virtualization\\v2'", lookup)
+        self.assertIn("-ClassName 'Msvm_ComputerSystem'", lookup)
+        self.assertIn('-Filter "ProcessID = $ProcessId" -OperationTimeoutSec 10 -ErrorAction Stop', lookup)
+        for field in ("elementName", "name", "processId"):
+            self.assertIn(f"{field} =", lookup)
+        self.assertIn("status = 'error'", lookup)
+        self.assertIn("errorCategory =", lookup)
+        self.assertLess(identity.index("if ($TargetPid -eq 0)"),
+                        identity.index("Get-HyperVVmMapping -ProcessId $TargetPid"))
+        self.assertEqual(identity.count("hyperVVm = $vm"), 3)
+        for forbidden in ("Start-VM", "Stop-VM", "Restart-VM", "Set-VM",
+                          "Invoke-CimMethod", "Set-CimInstance", "Remove-CimInstance",
+                          "-Credential"):
+            self.assertNotIn(forbidden, lookup)
+
 
 if __name__ == "__main__":
     unittest.main()

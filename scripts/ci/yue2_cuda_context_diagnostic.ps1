@@ -28,12 +28,24 @@ function Invoke-Smi($Name, [string[]]$Arguments) {
         Save-Json "$Name.json" @{ utc = $at; argv = @('nvidia-smi') + $Arguments; error = $_.Exception.Message }
     }
 }
+function Get-HyperVVmMapping([int]$ProcessId) {
+    # Optional read-only WMI metadata. A missing provider or denied query must
+    # remain visible without changing the process identity or GPU verdict.
+    try {
+        $matches = @(Get-CimInstance -Namespace 'root\virtualization\v2' -ClassName 'Msvm_ComputerSystem' -Filter "ProcessID = $ProcessId" -OperationTimeoutSec 10 -ErrorAction Stop |
+            ForEach-Object { @{ elementName = [string]$_.ElementName; name = [string]$_.Name; processId = [uint32]$_.ProcessID } })
+        return @{ status = 'queried'; matches = $matches }
+    } catch {
+        return @{ status = 'error'; errorCategory = [string]$_.CategoryInfo.Category; error = $_.Exception.Message }
+    }
+}
 function Save-ProcessIdentity($Name) {
     $at = (Get-Date).ToUniversalTime().ToString('o')
     try {
         if ($TargetPid -eq 0) { Save-Json "$Name.json" @{ utc = $at; pid = 0; status = 'no-target-process' }; return }
+        $vm = Get-HyperVVmMapping -ProcessId $TargetPid
         $item = Get-CimInstance Win32_Process -Filter "ProcessId = $TargetPid" -ErrorAction Stop
-        if ($null -eq $item) { Save-Json "$Name.json" @{ utc = $at; pid = $TargetPid; status = 'not_found' }; return }
+        if ($null -eq $item) { Save-Json "$Name.json" @{ utc = $at; pid = $TargetPid; status = 'not_found'; hyperVVm = $vm }; return }
         $signature = $null
         if ($item.ExecutablePath) {
             try {
@@ -41,8 +53,8 @@ function Save-ProcessIdentity($Name) {
                 $signature = @{ status = [string]$sig.Status; signerSubject = $sig.SignerCertificate.Subject; signerThumbprint = $sig.SignerCertificate.Thumbprint }
             } catch { $signature = @{ error = $_.Exception.Message } }
         }
-        Save-Json "$Name.json" @{ utc = $at; pid = $TargetPid; name = $item.Name; executablePath = $item.ExecutablePath; creationDate = [string]$item.CreationDate; signature = $signature }
-    } catch { Save-Json "$Name.json" @{ utc = $at; pid = $TargetPid; error = $_.Exception.Message } }
+        Save-Json "$Name.json" @{ utc = $at; pid = $TargetPid; name = $item.Name; executablePath = $item.ExecutablePath; creationDate = [string]$item.CreationDate; signature = $signature; hyperVVm = $vm }
+    } catch { Save-Json "$Name.json" @{ utc = $at; pid = $TargetPid; error = $_.Exception.Message; hyperVVm = $vm } }
 }
 function Save-Counters($Name) {
     $at = (Get-Date).ToUniversalTime().ToString('o')
