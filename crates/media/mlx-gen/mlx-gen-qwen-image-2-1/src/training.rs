@@ -3445,6 +3445,445 @@ mod tests {
         assert!(rel < 1e-3, "max rel grad diff {rel:.2e}");
     }
 
+    /// Unlike the historical8-channel fixture, img_in and all hidden projections
+    /// actually pack at group64, so Q4/Q8 choose the production F32 compute path.
+    fn fully_packable_dit() -> QwenImage21Transformer {
+        use mlx_gen::weights::Weights;
+        use std::collections::HashMap;
+        let original = loader::load_transformer(&tiny_snapshot()).unwrap();
+        let mut cfg = original.config().clone();
+        cfg.in_channels = 64;
+        cfg.out_channels = 64;
+        cfg.context_in_dim = 64;
+        cfg.num_attention_heads = 4;
+        cfg.mlp_ratio = 3;
+        let weights = Weights::from_dir(tiny_snapshot().join("transformer")).unwrap();
+        let mut keys: Vec<_> = weights.keys().map(str::to_owned).collect();
+        keys.sort();
+        let mut tensors = HashMap::new();
+        for (index, key) in keys.into_iter().enumerate() {
+            let original = weights.require(&key).unwrap();
+            let shape = if key.ends_with(".weight") && original.shape().len() == 2 {
+                let module = key.strip_suffix(".weight").unwrap();
+                let (out, input) = match module {
+                    "img_in"
+                    | "txt_in.in_layer"
+                    | "txt_in.out_layer"
+                    | "time_text_embed.timestep_embedder.linear_2"
+                    | "proj_out"
+                    | "norm_out.linear" => (64, 64),
+                    "time_text_embed.timestep_embedder.linear_1" => (64, 256),
+                    "modulation.1" => (256, 64),
+                    _ if module.ends_with("img_mlp.gate_layer")
+                        || module.ends_with("img_mlp.proj") =>
+                    {
+                        (192, 64)
+                    }
+                    _ if module.ends_with("img_mlp.out") => (64, 192),
+                    _ => (64, 64),
+                };
+                vec![out, input]
+            } else if key.ends_with(".bias") {
+                let module = key.strip_suffix(".bias").unwrap();
+                vec![match module {
+                    "modulation.1" => 256,
+                    _ if module.ends_with("img_mlp.gate_layer")
+                        || module.ends_with("img_mlp.proj") =>
+                    {
+                        192
+                    }
+                    _ => 64,
+                }]
+            } else if key.ends_with("norm_q.weight") || key.ends_with("norm_k.weight") {
+                vec![16]
+            } else {
+                vec![64]
+            };
+            let value = if key.ends_with(".bias") {
+                Array::zeros::<f32>(&shape).unwrap()
+            } else if shape.len() == 1 {
+                Array::ones::<f32>(&shape).unwrap()
+            } else {
+                multiply(randn(&shape, 500 + index as u64), Array::from_f32(0.02)).unwrap()
+            }
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+            tensors.insert(key, value);
+        }
+        QwenImage21Transformer::from_weights(&Weights::from_map(tensors), &cfg).unwrap()
+    }
+
+    // Independent component arithmetic on the ACTUAL loaded packed factors and
+    // F32 activation rows. This never substitutes a structured forward for the
+    // direct-trained/export reference used by the full forward below.
+    fn packed_f32_lokr_oracle(
+        production: &mut QwenImage21Transformer,
+        direct: &mut QwenImage21Transformer,
+        paths: &[String],
+    ) -> serde_json::Value {
+        use crate::q4_diagnostic::math;
+        use mlx_gen::adapters::Adapter;
+        let values = |a: &Array| crate::q4_diagnostic::f32_values(a).unwrap();
+        let mut observations = Vec::new();
+        for path in paths {
+            let parts = path.split('.').collect::<Vec<_>>();
+            let lin = production.adaptable_mut(&parts).unwrap();
+            assert!(lin.quantized_params().is_some());
+            let Adapter::LokrStructured { factors } = &lin.adapters()[0] else {
+                panic!("packed fixture must exercise production structured LoKr");
+            };
+            let (a, b, c, d) = (
+                factors.a as usize,
+                factors.b as usize,
+                factors.c as usize,
+                factors.d as usize,
+            );
+            let w1 = values(&factors.w1);
+            let w2 = values(&factors.w2);
+            let x: Vec<f32> = (0..3 * c * d)
+                .map(|i| ((i * 17 % 101) as f32 - 50.0) / 51.0)
+                .collect();
+            let input = Array::from_slice(&x, &[3, (c * d) as i32]);
+            let actual = lin.adapters()[0].residual(&input).unwrap();
+            assert_eq!(input.dtype(), Dtype::Float32);
+            assert_eq!(actual.dtype(), Dtype::Float32);
+            let got = values(&actual);
+            let low = lin.adapters()[0]
+                .residual(&input.as_dtype(Dtype::Bfloat16).unwrap())
+                .unwrap();
+            assert_eq!(low.dtype(), Dtype::Bfloat16);
+            let low = values(&low);
+            let direct_lin = direct.adaptable_mut(&parts).unwrap();
+            let Adapter::Lokr { delta, .. } = &direct_lin.adapters()[0] else {
+                panic!("direct training reference must remain materialized LoKr");
+            };
+            assert_eq!(delta.dtype(), Dtype::Bfloat16);
+            let delta = values(delta);
+            let direct_got = direct_lin.adapters()[0].residual(&input).unwrap();
+            assert_eq!(direct_got.dtype(), Dtype::Float32);
+            let direct_got = values(&direct_got);
+            for row in 0..3 {
+                for out in 0..a * b {
+                    let (oi, oj) = (out / b, out % b);
+                    let (mut want, mut reverse, mut dense) = (0.0f64, 0.0f64, 0.0f64);
+                    for ci in 0..c {
+                        for dj in 0..d {
+                            let col = ci * d + dj;
+                            let coefficient = w1[oi * c + ci] as f64 * w2[oj * d + dj] as f64;
+                            let product = x[row * c * d + col] as f64 * coefficient;
+                            want += product;
+                            reverse += x[row * c * d + (c * d - 1 - col)] as f64 * coefficient;
+                            let product =
+                                x[row * c * d + col] as f64 * delta[out * c * d + col] as f64;
+                            dense += product;
+                        }
+                    }
+                    let index = row * a * b + out;
+                    let structured = math::observe(got[index] as f64, want).unwrap();
+                    let direct = math::observe(direct_got[index] as f64, dense).unwrap();
+                    observations.push(serde_json::json!({"path":path,"row":row,"component":out,
+                        "structuredF32":structured.actual,"structuredReferenceF64":structured.reference,
+                        "structuredAbsoluteDifference":structured.absolute_difference,
+                        "directF32":direct.actual,"directReferenceF64":direct.reference,
+                        "directAbsoluteDifference":direct.absolute_difference,
+                        "arithmeticBoundVerdict":structured.verdict,
+                        "mutantObservations":{"dropAbsoluteDifference":want.abs(),
+                            "halfScaleAbsoluteDifference":(got[index] as f64*0.5-want).abs(),
+                            "reversedAxisAbsoluteDifference":(reverse-want).abs(),
+                            "BF16ActivationAbsoluteDifference":(low[index] as f64-want).abs()},
+                        "BF16ActivationRejectedByDtypeContract":true}));
+                }
+            }
+        }
+        assert!(!observations.is_empty());
+        serde_json::json!({"componentChecks":observations.len(),"actualActivationDtype":"Float32","actualResidualDtype":"Float32",
+            "arithmeticBoundVerdict":math::ARITHMETIC_VERDICT,"numericPassClaim":false,
+            "precisionContract":"pinned MLX0.32 default NAX relaxed inputs have unspecified mantissa truncation/rounding",
+            "observations":observations})
+    }
+
+    #[test]
+    fn fully_packed_trained_factors_preserve_direct_delta_through_export() {
+        crate::q4_diagnostic::cpu_export_preserves_three_strided_rows_and_output_components();
+        use mlx_gen::weights::Weights;
+        let mut receipts = Vec::new();
+        for network in [NetworkType::Lora, NetworkType::Lokr] {
+            for edit in [false, true] {
+                let mut trained = fully_packable_dit();
+                assert_eq!(trained.compute_dtype(), Dtype::Bfloat16);
+                let Built {
+                    adapter,
+                    mut params,
+                    mut cfg,
+                    paths,
+                } = build(&mut trained, network);
+                cfg.alpha = 2.5;
+                let blocks = block_trainables(&mut trained, &paths, &params, &cfg).unwrap();
+                let mut batch = fixed_edit_batch(&trained);
+                if !edit {
+                    let (x0, text, noise) = fixed_batch(&trained);
+                    batch = EditBatch {
+                        x0,
+                        text,
+                        noise,
+                        references: vec![],
+                        layout: t2i_layout(),
+                    };
+                }
+                let loss = LossSpec {
+                    adapter: &adapter,
+                    alpha: cfg.alpha,
+                    rank: cfg.rank as f32,
+                    mae: false,
+                    dtype: Dtype::Bfloat16,
+                    lora_dtype: Some(Dtype::Bfloat16),
+                    checkpoint: Some(&blocks),
+                };
+                let mut opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+                for _ in 0..3 {
+                    let (_, grads) = compute_loss_grads(
+                        &mut trained,
+                        &params,
+                        &loss,
+                        &StepInputs {
+                            x0: &batch.x0,
+                            text: &batch.text,
+                            noise: &batch.noise,
+                            t: 0.5,
+                            references: &batch.references,
+                            layout: &batch.layout,
+                        },
+                    )
+                    .unwrap();
+                    opt.step(&mut params, &grads).unwrap();
+                    eval(params.values()).unwrap();
+                }
+                adapter
+                    .install_as(
+                        &mut trained,
+                        &params,
+                        cfg.alpha,
+                        cfg.rank as f32,
+                        Some(Dtype::Bfloat16),
+                        LOKR_DTYPE,
+                    )
+                    .unwrap();
+                let dense = trained
+                    .adaptable_mut(&paths[0].split('.').collect::<Vec<_>>())
+                    .unwrap();
+                let dense_x = randn(&[3, dense.base_shape()[1]], 24163)
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap();
+                assert_eq!(dense_x.dtype(), Dtype::Bfloat16);
+                assert_eq!(
+                    dense.adapters()[0].residual(&dense_x).unwrap().dtype(),
+                    Dtype::Bfloat16
+                );
+                let dir = tempfile::tempdir().unwrap();
+                let file = dir.path().join("trained.safetensors");
+                let provenance: Vec<_> = ADAPTER_PROVENANCE
+                    .into_iter()
+                    .chain(edit.then_some(EDIT_ADAPTER_MARKER))
+                    .collect();
+                adapter
+                    .save_with_meta(
+                        &params,
+                        cfg.alpha,
+                        cfg.rank as f32,
+                        cfg.decompose_factor,
+                        "",
+                        &provenance,
+                        &file,
+                    )
+                    .unwrap();
+                let saved = Weights::from_file(&file).unwrap();
+                let schema = crate::q4_diagnostic::math::export_schema(
+                    &params.keys().map(ToString::to_string).collect::<Vec<_>>(),
+                    &paths,
+                    network == NetworkType::Lora,
+                    &saved.keys().map(ToString::to_string).collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let expected_network = if network == NetworkType::Lora {
+                    "lora"
+                } else {
+                    "lokr"
+                };
+                crate::q4_diagnostic::math::validate_export_metadata(
+                    expected_network,
+                    cfg.rank,
+                    cfg.alpha,
+                    (
+                        saved.metadata("networkType"),
+                        saved.metadata("rank"),
+                        saved.metadata("alpha"),
+                    ),
+                )
+                .unwrap();
+                if network == NetworkType::Lokr {
+                    assert_eq!(
+                        saved.metadata("decomposeFactor"),
+                        Some(cfg.decompose_factor.to_string().as_str())
+                    );
+                }
+                for (key, value) in &provenance {
+                    assert_eq!(saved.metadata(key), Some(*value));
+                }
+                if !edit {
+                    assert_eq!(saved.metadata(EDIT_ADAPTER_MARKER.0), None);
+                }
+                for key in &schema.alphas {
+                    let value = saved.require(key).unwrap();
+                    crate::q4_diagnostic::math::validate_alpha(
+                        value.item::<f32>(),
+                        cfg.alpha,
+                        value.shape(),
+                        value.dtype() == Dtype::Float32,
+                    )
+                    .unwrap();
+                }
+                let alpha_tensor_count = schema.alphas.len();
+                let mut readback = LoraParams::new();
+                for (serialized, mapped) in schema.factors {
+                    let value = saved.require(&serialized).unwrap().clone();
+                    assert_eq!(
+                        value.dtype(),
+                        Dtype::Float32,
+                        "export preserves raw trained masters"
+                    );
+                    assert_eq!(
+                        value.shape(),
+                        params[mapped.as_str()].shape(),
+                        "export preserves raw trained master shape"
+                    );
+                    readback.insert(Rc::from(mapped), value);
+                }
+                assert_eq!(readback.len(), params.len());
+                for (key, value) in &params {
+                    let error = subtract(value, &readback[key])
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max(None)
+                        .unwrap()
+                        .item::<f32>();
+                    assert_eq!(error, 0.0, "trained raw master changed through export");
+                }
+                let (x_t, _) = build_batch(&batch.x0, &batch.noise, 0.5).unwrap();
+                let images = joint_images(&batch.references, &x_t);
+                for bits in [4, 8] {
+                    let mut direct = fully_packable_dit();
+                    direct.quantize(bits).unwrap();
+                    let packed = direct
+                        .adaptable_mut(&["img_in"])
+                        .unwrap()
+                        .quantized_params()
+                        .unwrap();
+                    assert_eq!(packed.4, 64);
+                    assert_eq!(packed.5, bits);
+                    assert_eq!(direct.compute_dtype(), Dtype::Float32);
+                    adapter
+                        .install_as(
+                            &mut direct,
+                            &params,
+                            cfg.alpha,
+                            cfg.rank as f32,
+                            Some(Dtype::Bfloat16),
+                            LOKR_DTYPE,
+                        )
+                        .unwrap();
+                    let want = direct
+                        .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                        .unwrap();
+                    eval([&want]).unwrap();
+                    assert_eq!(want.dtype(), Dtype::Float32);
+                    let mut direct_reload = fully_packable_dit();
+                    direct_reload.quantize(bits).unwrap();
+                    adapter
+                        .install_as(
+                            &mut direct_reload,
+                            &readback,
+                            cfg.alpha,
+                            cfg.rank as f32,
+                            Some(Dtype::Bfloat16),
+                            LOKR_DTYPE,
+                        )
+                        .unwrap();
+                    let reloaded = direct_reload
+                        .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                        .unwrap();
+                    eval([&reloaded]).unwrap();
+                    let export_error = subtract(&want, &reloaded)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max(None)
+                        .unwrap()
+                        .item::<f32>();
+                    assert_eq!(
+                        export_error, 0.0,
+                        "DIRECT raw-trained delta reference survives export"
+                    );
+                    // Preserve the direct reference. The normal production loader's
+                    // representation can differ; report it rather than replacing want.
+                    let mut production = fully_packable_dit();
+                    production.quantize(bits).unwrap();
+                    let kind = if network == NetworkType::Lora {
+                        mlx_gen::runtime::AdapterKind::Lora
+                    } else {
+                        mlx_gen::runtime::AdapterKind::Lokr
+                    };
+                    let report = crate::apply_qwen_image_2_1_adapters(
+                        &mut production,
+                        &[mlx_gen::runtime::AdapterSpec::new(file.clone(), 1.0, kind)],
+                    )
+                    .unwrap();
+                    assert_eq!(report.applied, paths.len());
+                    assert!(report.unmatched_paths.is_empty());
+                    let got = production
+                        .forward_joint(&batch.text, &images, 0.5, &batch.layout)
+                        .unwrap();
+                    eval([&got]).unwrap();
+                    let representation_error = subtract(&got, &want)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max(None)
+                        .unwrap()
+                        .item::<f32>();
+                    assert!(representation_error.is_finite());
+                    let oracle = if network == NetworkType::Lokr {
+                        packed_f32_lokr_oracle(&mut production, &mut direct, &paths)
+                    } else {
+                        let lin = production
+                            .adaptable_mut(&paths[0].split('.').collect::<Vec<_>>())
+                            .unwrap();
+                        let width = lin.base_shape()[1];
+                        let activation = randn(&[3, width], 24163);
+                        assert_eq!(activation.dtype(), Dtype::Float32);
+                        assert_eq!(
+                            lin.adapters()[0].residual(&activation).unwrap().dtype(),
+                            Dtype::Float32
+                        );
+                        serde_json::json!({"actualActivationDtype":"Float32","actualResidualDtype":"Float32"})
+                    };
+                    println!("PACKED_DIRECT {network:?} edit={edit} q{bits} img_in_packed=true group64 compute=Float32 export_error={export_error} production_representation_error={representation_error}");
+                    receipts.push(serde_json::json!({"network":format!("{network:?}"),"edit":edit,"bits":bits,
+                        "exportSchemaExact":true,"serializedTensorCount":saved.keys().count(),"rawTrainedParameterCount":params.len(),
+                        "alphaTensorCount":alpha_tensor_count,"alphaMetadataAndTensorContractValidated":true,
+                        "imgInPacked":true,"groupSize":64,"computeDtype":"Float32","denseControlActivationAndResidualDtype":"Bfloat16","directTrainedExportError":export_error,
+                        "productionRepresentationError":representation_error,"directReferenceNeverSubstituted":true,"residualOracle":oracle}));
+                }
+            }
+        }
+        if let Ok(out) = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT") {
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(Path::new(&out).join("packed-direct-export.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({"kind":"NUMERICAL_FIXTURE_ONLY","acceptanceEvidence":false,
+                    "geometry":{"inChannels":64,"inner":64,"context":64,"layers":2,"mlpRatio":3},"cells":receipts})).unwrap()).unwrap();
+        }
+    }
+
     /// A changed render alone cannot identify a save/reload defect. Compare the *trained*
     /// in-memory velocity with the saved file installed on a fresh base, for both adapter kinds,
     /// both modalities and the actual bf16 production compute path, before any sampling metric.

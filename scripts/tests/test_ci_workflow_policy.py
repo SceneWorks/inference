@@ -292,7 +292,8 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
                 # Separate runs, revisions and phases on the primary must all share one group.
                 variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
-                            ("3", "c" * 40, "imports"), ("4", "d" * 40, "full")) if primary else (("1", "a" * 40, "probe"),)
+                            ("3", "c" * 40, "imports"), ("4", "d" * 40, "full"),
+                            ("5", "e" * 40, "diagnostic"), ("6", "f" * 40, "q4-numeric")) if primary else (("1", "a" * 40, "probe"),)
                 for run_id, sha, phase in variants:
                     values = {"github.event_name": event, "inputs.profile": profile,
                               "inputs.qwen_image_2_1_lora_runner": runner,

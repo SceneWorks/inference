@@ -179,3 +179,20 @@ mod tests {
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }
+
+// Native diagnostic hooks exist only in this crate's unit-test binary. Integration
+// tests and release libraries cannot select them.
+#[cfg(test)]
+extern crate self as mlx_gen_qwen_image_2_1;
+#[cfg(test)]
+#[path = "../tests/support/physical_footprint.rs"]
+mod diagnostic_physical_footprint;
+#[cfg(test)]
+mod e2e_real_weights {
+    pub(crate) use super::diagnostic_physical_footprint::phys_footprint;
+}
+#[cfg(test)]
+mod q4_diagnostic;
+#[cfg(test)]
+#[path = "../tests/lora_real_weights.rs"]
+mod q4_real_weights_support;
