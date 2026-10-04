@@ -35,6 +35,17 @@ fi
 
 KV_ROOT="${KV_POC_ROOT:-$HOME/kv-poc}"
 KV_HF_HUB="${KV_POC_HF_HUB:-/Volumes/Models/huggingface/hub}"
+# A run's validated HF hub override (config.sh `hf_hub_override`, hub.sh) replaces the hub for every
+# job of that run, created here when missing; the `cleanup` job deletes it after the last phase.
+# shellcheck source=.github/kv-poc/hub.sh
+source "$(dirname "${BASH_SOURCE[0]}")/hub.sh"
+if [ -n "${KV_HF_HUB_OVERRIDE:-}" ]; then
+  if ! kv_hub_problem="$(hub_override_prepare "$KV_HF_HUB_OVERRIDE" "$HOME")"; then
+    echo "::error title=bad hf_hub_override::$kv_hub_problem"
+    exit 1
+  fi
+  KV_HF_HUB="$KV_HF_HUB_OVERRIDE"
+fi
 INF="$KV_ROOT/$INFERENCE_SHA/inference"
 SW="$KV_ROOT/$INFERENCE_SHA/SceneWorks"
 F="$KV_ROOT/$INFERENCE_SHA/frozen"
