@@ -503,20 +503,19 @@ class PrecisionControlTests(unittest.TestCase):
             census = '{"diagnosticFiles":{},"diagnosticFileBytesB64":{}}'
             child = Owned()
             with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows-2",
-                                        "CUDA_VISIBLE_DEVICES": "0",
+                                        "CUDA_VISIBLE_DEVICES": "1",
                                         "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
                  patch.object(CONTROL, "sha256", return_value=CONTROL.REFERENCE_SHA256), \
                  patch.object(CONTROL, "verify_revisions"), \
                  patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
-                 patch.object(IDLE, "require_remaining_window", return_value=(baseline, root)), \
-                 patch.object(IDLE, "check_empty_dispatch"), \
+                 patch.object(IDLE, "check_shared_gpu1_dispatch"), \
                  patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(CONTROL, "cuda_physical_census", return_value=(census, [])) as physical, \
                  patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
                  patch.object(CONTROL, "verify_binary_identity", return_value={}), \
                  patch.object(CONTROL.subprocess, "Popen", return_value=child), \
                  patch("builtins.print"), \
-                 patch.object(CONTROL, "sample_cuda", return_value={"raw": "0,0,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}):
+                 patch.object(CONTROL, "sample_cuda", return_value={"raw": "t,1,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}):
                 with self.assertRaisesRegex(RuntimeError, "timed out"):
                     CONTROL.execute(args)
             result = json.loads((evidence / "control.json").read_text(encoding="utf-8"))
@@ -547,7 +546,7 @@ class PrecisionControlTests(unittest.TestCase):
             def identity(path, label, out):
                 events.append(f"identity-{label}")
                 return {"binary_sha256": "verified"}
-            def physical_census():
+            def physical_census(*, admission=True):
                 events.append("physical-census")
                 return census, []
             def fake_child(path, name, label, backend, env, out, total_deadline, guard, identity):
@@ -566,15 +565,14 @@ class PrecisionControlTests(unittest.TestCase):
                        "binary_unchanged_after_child": True,
                        "sample_count": 0 if zero_quant and label == "quant" else 1,
                        "sampler_faults": [], "scheduling": {"mode": "shared-host"}}
-                sample = {"raw": "0,0,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}
+                sample = {"raw": "t,1,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}
                 return row, ([] if zero_quant and label == "quant" else [sample]), []
-            with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows-2", "CUDA_VISIBLE_DEVICES": "0",
+            with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows-2", "CUDA_VISIBLE_DEVICES": "1",
                                         "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
                  patch.object(CONTROL, "sha256", return_value=CONTROL.REFERENCE_SHA256), \
                  patch.object(CONTROL, "verify_revisions"), \
                  patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
-                 patch.object(IDLE, "require_remaining_window", return_value=(baseline, root)), \
-                 patch.object(IDLE, "check_empty_dispatch"), \
+                 patch.object(IDLE, "check_shared_gpu1_dispatch"), \
                  patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(CONTROL, "cuda_physical_census", side_effect=physical_census) as physical, \
                  patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
@@ -916,7 +914,7 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("if: inputs.stage == 'metal'", source)
         self.assertEqual(self.concurrency_group(self.concurrency_settings(source)["group"],
                                                "cuda", "101"), "inference-real-weights-physical-host")
-        self.assertIn('CUDA_VISIBLE_DEVICES: "0"', source)
+        self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "1"'), 2)
         self.assertEqual(source.count("path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav"), 2)
         self.assertEqual(source.count("if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}"), 2)
         self.assertNotIn("path: ${{ env.YUE2_PRECISION_WORK_DIR }}\n", source)
@@ -949,8 +947,8 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertIn(f"{IDLE.BASELINE_ENGINE_SHA}-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1", workflow)
             self.assertNotIn("-36956986577-1", workflow)
             self.assertIn("run-id: ${{ inputs.idle_cuda_context_run_id }}", workflow)
-            self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
-        self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
+        self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
+        self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "1"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
 
     def test_cuda_deadline_stamp_uses_existing_directory_before_checkout(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")

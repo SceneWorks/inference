@@ -27,6 +27,10 @@ WINDOW = timedelta(hours=12)
 # The owner approved these limits for the process-free GPU0 route. NVML memory
 # utilization measures traffic; memory.used is separately bounded by capacity.
 EMPTY_GPU0_PERCENT_LIMIT = 5
+SHARED_GPU1_PERCENT_LIMIT = 50
+SHARED_GPU1_MIN_FREE_MIB = 16 * 1024
+SHARED_GPU1_UUID = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+SHARED_GPU1_PCI = "00000000:C1:00.0"
 
 
 def require(ok: bool, why: str) -> None:
@@ -54,15 +58,16 @@ def artifact_digest(directory: Path) -> str:
 
 
 def _gpu_row(directory: Path, name: str, *, has_free: bool,
-             utilization_percent_limit: int = 0) -> dict:
+             utilization_percent_limit: int = 0, index: int = 0,
+             with_util: bool = False) -> dict:
     sample = read_json(directory, name)
     require(sample.get("exitCode") == 0, f"{name} unavailable")
     rows = [next(csv.reader([line], skipinitialspace=True)) for line in sample.get("output", [])]
-    rows = [row for row in rows if row and row[0].strip() == "0"]
-    require(len(rows) == 1 and len(rows[0]) == (10 if has_free else 9), f"{name} GPU0 ambiguous")
+    rows = [row for row in rows if row and row[0].strip() == str(index)]
+    require(len(rows) == 1 and len(rows[0]) == (10 if has_free else 9), f"{name} GPU{index} ambiguous")
     row = [field.strip() for field in rows[0]]
     require(row[1].startswith("GPU-") and re.fullmatch(r"[0-9A-Fa-f:.]{12,}", row[2]) is not None,
-            f"{name} GPU0 identity invalid")
+            f"{name} GPU{index} identity invalid")
     numbers = row[5:]
     require(all(re.fullmatch(r"[0-9]+", value) for value in numbers), f"{name} telemetry unavailable")
     total, used = int(row[5]), int(row[6])
@@ -72,8 +77,11 @@ def _gpu_row(directory: Path, name: str, *, has_free: bool,
             f"{name} invalid memory")
     require(all(value <= utilization_percent_limit for value in util),
             f"{name} selected GPU activity exceeds approved limit")
-    return {"uuid": row[1], "pci": row[2].lower().lstrip("0"), "totalMiB": total,
-            "usedMiB": used, "freeMiB": free}
+    value = {"uuid": row[1], "pci": row[2].lower().lstrip("0"), "totalMiB": total,
+             "usedMiB": used, "freeMiB": free}
+    if with_util:
+        value.update(gpuPercent=util[0], memoryPercent=util[1])
+    return value
 
 
 def _pmon(directory: Path, name: str, pid: int) -> None:
@@ -381,6 +389,7 @@ def _empty_gpu0_summary(directory: Path) -> dict:
     """Validate every device/process family from a fresh, process-free probe."""
     manifest = read_json(directory, "manifest")
     require(manifest.get("completed") is True and manifest.get("targetPid") == 0 and
+            manifest.get("selectedGpuIndex", 0) == 0 and
             manifest.get("engineSha") == os.environ.get("EXPECTED_ENGINE_SHA") and
             manifest.get("controlSha") == os.environ.get("GITHUB_SHA") and
             manifest.get("runner") == os.environ.get("RUNNER_NAME"),
@@ -524,6 +533,197 @@ def census_empty_device(initial_pmon: str) -> tuple[str, bool]:
             require(set(files) == set(raw_files) == empty_probe_names(),
                     "empty-device raw file inventory incomplete")
             raw["validatedDevice"] = _empty_gpu0_summary(output)
+            return json.dumps(raw, sort_keys=True), True
+        except Exception as error:
+            raw["refusal"] = str(error)
+            return json.dumps(raw, sort_keys=True), False
+
+
+def check_shared_gpu1_dispatch() -> None:
+    """Bind logical CUDA 0 to the owner's physical GPU1 allocation."""
+    require(os.name == "nt" and os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" and
+            os.environ.get("CUDA_VISIBLE_DEVICES") == "1" and
+            not os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID") and
+            os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "shared-host" and
+            os.environ.get("GITHUB_REPOSITORY") == "SceneWorks/inference" and
+            os.environ.get("GITHUB_JOB") in ("cuda", "cuda_diagnostic") and
+            os.environ.get("GITHUB_RUN_ATTEMPT") == "1" and
+            os.environ.get("RUNNER_NAME") in ("cuda-windows", "cuda-windows-2") and
+            re.fullmatch(r"[0-9a-f]{40}", os.environ.get("EXPECTED_ENGINE_SHA", "")) is not None and
+            os.environ.get("EXPECTED_CONTROL_SHA") == os.environ.get("GITHUB_SHA") and
+            re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", "")) is not None,
+            "shared GPU1 dispatch/source/physical selection unavailable")
+
+
+def _shared_gpu1_pmon(output: list[str], name: str) -> list[dict]:
+    columns = None
+    rows = []
+    seen = set()
+    for line in output:
+        fields = line.split()
+        if fields and fields[0] == "#":
+            if "pid" in fields and "type" in fields:
+                require(columns is None, f"{name} duplicate typed header")
+                columns = {field: index - 1 for index, field in enumerate(fields) if index > 0}
+            else:
+                require(columns is not None, f"{name} lacks typed header")
+            continue
+        if not fields:
+            continue
+        require(columns is not None and all(key in columns for key in
+                ("gpu", "pid", "type", "sm", "mem", "enc", "dec", "jpg", "ofa")) and
+                len(fields) > max(columns.values()) and fields[columns["gpu"]] == "1",
+                f"{name} ambiguous physical GPU1 pmon row")
+        pid, kind = fields[columns["pid"]], fields[columns["type"]]
+        require((pid == kind == "-") or (pid.isdigit() and int(pid) > 0 and
+                kind in ("C", "C+G", "G")), f"{name} unknown actor")
+        if pid == "-":
+            require(all(value == "-" for index, value in enumerate(fields)
+                        if index != columns["gpu"]), f"{name} ambiguous idle row")
+            continue
+        require(int(pid) not in seen, f"{name} duplicate actor PID")
+        seen.add(int(pid))
+        for key in ("sm", "mem", "enc", "dec", "jpg", "ofa"):
+            value = fields[columns[key]]
+            require(value == "-" or (re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value) is not None and
+                    float(value) <= 100), f"{name} invalid actor utilization")
+        rows.append({"pid": int(pid), "type": kind})
+    require(columns is not None, f"{name} lacks typed pmon header")
+    return rows
+
+
+def _shared_gpu1_summary(directory: Path, *, admission: bool) -> dict:
+    """Complete selected-card proof; foreign actor activity is evidence, not an owner PID."""
+    manifest = read_json(directory, "manifest")
+    require(manifest.get("completed") is True and manifest.get("targetPid") == 0 and
+            manifest.get("selectedGpuIndex") == 1 and
+            manifest.get("engineSha") == os.environ.get("EXPECTED_ENGINE_SHA") and
+            manifest.get("controlSha") == os.environ.get("GITHUB_SHA") and
+            manifest.get("runner") == os.environ.get("RUNNER_NAME"),
+            "shared GPU1 probe source/runner/target changed")
+    for name in ("process-before", "process-after"):
+        process = read_json(directory, name)
+        require(process.get("pid") == 0 and process.get("status") == "no-target-process",
+                f"{name} is not a TargetPid0 observation")
+    catalog = read_json(directory, "windows-counter-catalog")
+    expected = {
+        "engine": r"\GPU Engine(*)\Utilization Percentage",
+        "processDedicated": r"\GPU Process Memory(*)\Dedicated Usage",
+        "processShared": r"\GPU Process Memory(*)\Shared Usage",
+        "processCommitted": r"\GPU Process Memory(*)\Total Committed",
+        "adapterDedicated": r"\GPU Adapter Memory(*)\Dedicated Usage",
+        "adapterShared": r"\GPU Adapter Memory(*)\Shared Usage",
+        "adapterCommitted": r"\GPU Adapter Memory(*)\Total Committed",
+    }
+    listed = {row.get("name"): row for row in catalog.get("sets", [])}
+    require(catalog.get("targetPid") == 0 and len(listed) == len(catalog.get("sets", [])) == 3 and
+            all(isinstance(listed.get(name), dict) and "error" not in listed[name] and
+                set(paths).issubset(set(listed[name].get("paths", []))) for name, paths in {
+                    "GPU Engine": [expected["engine"]],
+                    "GPU Process Memory": [expected[key] for key in
+                                           ("processDedicated", "processShared", "processCommitted")],
+                    "GPU Adapter Memory": [expected[key] for key in
+                                           ("adapterDedicated", "adapterShared", "adapterCommitted")],
+                }.items()), "shared GPU1 counter catalog unavailable")
+    adapter = read_json(directory, "cuda-adapter-map")
+    devices = adapter.get("devices", [])
+    require(adapter.get("cuInit") == adapter.get("cuDeviceGetCount") == 0 and
+            len(devices) == 1 and devices[0].get("ordinal") == 0 and
+            devices[0].get("cuDeviceGet") == devices[0].get("cuDeviceGetPCIBusId") ==
+            devices[0].get("cuDeviceGetLuid") == 0 and devices[0].get("nodeMask") == 1 and
+            devices[0].get("pciBusId", "").lower().lstrip("0") == SHARED_GPU1_PCI.lower().lstrip("0"),
+            "logical CUDA0 does not map to physical GPU1 PCI")
+    raw_luid = bytes.fromhex(devices[0]["luidBytes"].replace("-", ""))
+    require(len(raw_luid) == 8, "shared GPU1 LUID invalid")
+    luid = f"luid_0x{int.from_bytes(raw_luid[4:], 'little'):08x}_0x{int.from_bytes(raw_luid[:4], 'little'):08x}"
+    selected = []
+    actors = []
+    for index in range(3):
+        gpu = _gpu_row(directory, f"gpu-sample-{index}", has_free=True,
+                       utilization_percent_limit=100, index=1, with_util=True)
+        require(gpu["uuid"] == SHARED_GPU1_UUID and
+                gpu["pci"] == SHARED_GPU1_PCI.lower().lstrip("0"),
+                "selected physical GPU1 UUID/PCI changed")
+        if admission:
+            require(gpu["usedMiB"] * 100 <= gpu["totalMiB"] * SHARED_GPU1_PERCENT_LIMIT and
+                    gpu["freeMiB"] >= SHARED_GPU1_MIN_FREE_MIB and
+                    gpu["gpuPercent"] <= SHARED_GPU1_PERCENT_LIMIT and
+                    gpu["memoryPercent"] <= SHARED_GPU1_PERCENT_LIMIT,
+                    "selected GPU1 baseline exceeds approved occupancy or 16 GiB free floor")
+        mode = _empty_smi(directory, f"driver-mode-{index}")
+        rows = [next(csv.reader([line], skipinitialspace=True)) for line in mode["output"]]
+        rows = [row for row in rows if row and row[0].strip() == "1"]
+        require(len(rows) == 1 and len(rows[0]) >= 3 and rows[0][1].strip() == SHARED_GPU1_UUID and
+                rows[0][2].strip() == "WDDM", "selected GPU1 driver identity changed")
+        actors.append(_shared_gpu1_pmon(_empty_smi(directory, f"pmon-1-{index}")["output"],
+                                        f"pmon-1-{index}"))
+        apps = _empty_smi(directory, f"compute-apps-1-{index}")["output"]
+        require(all(len(next(csv.reader([line], skipinitialspace=True))) == 3 and
+                    next(csv.reader([line], skipinitialspace=True))[0].strip().isdigit()
+                    for line in apps if line.strip()), "selected GPU1 compute-apps row ambiguous")
+        value = read_json(directory, f"windows-counters-{index}")
+        counter_rows = {row.get("counter"): row for row in value.get("counters", [])}
+        require(value.get("targetPid") == 0 and len(counter_rows) == len(value.get("counters", [])) and
+                set(expected.values()).issubset(counter_rows),
+                "selected GPU1 seven-family counter set changed")
+        for key, path in expected.items():
+            row = counter_rows[path]
+            require(isinstance(row, dict) and "error" not in row and
+                    isinstance(row.get("samples"), list), f"selected GPU1 {key} unavailable")
+            samples = [sample for sample in row["samples"]
+                       if luid in sample.get("instance", "").lower()]
+            require(all(str(sample.get("status")) == "0" and
+                        type(sample.get("cookedValue")) in (int, float) and
+                        math.isfinite(sample["cookedValue"]) and sample["cookedValue"] >= 0
+                        for sample in samples), f"selected GPU1 {key} invalid")
+            names = [sample["instance"].lower() for sample in samples]
+            require(len(names) == len(set(names)), f"selected GPU1 {key} duplicate instance")
+            if key.startswith("adapter"):
+                require(len(samples) == 1, f"selected GPU1 {key} adapter missing")
+            if key == "engine" and admission:
+                require(all(sample["cookedValue"] <= SHARED_GPU1_PERCENT_LIMIT for sample in samples),
+                        "selected GPU1 engine exceeds approved shared baseline")
+        selected.append(gpu)
+    for name in ("gpu-before-cuda-properties", "gpu-after-cuda-properties"):
+        sample = _empty_smi(directory, name)
+        rows = [next(csv.reader([line], skipinitialspace=True)) for line in sample["output"]]
+        rows = [row for row in rows if row and row[0].strip() == "1"]
+        require(len(rows) == 1 and len(rows[0]) == 5 and rows[0][1].strip() == SHARED_GPU1_UUID and
+                rows[0][2].strip().lower().lstrip("0") == SHARED_GPU1_PCI.lower().lstrip("0") and
+                rows[0][3].strip().isdigit() and rows[0][4].strip().isdigit() and
+                int(rows[0][4]) <= 100, f"{name} selected GPU1 changed")
+        if admission:
+            require(int(rows[0][3]) * 100 <= selected[0]["totalMiB"] * SHARED_GPU1_PERCENT_LIMIT and
+                    int(rows[0][3]) + SHARED_GPU1_MIN_FREE_MIB <= selected[0]["totalMiB"] and
+                    int(rows[0][4]) <= SHARED_GPU1_PERCENT_LIMIT,
+                    f"{name} selected GPU1 baseline exceeds admission")
+    actors.append(_shared_gpu1_pmon(_empty_smi(directory, "pmon-0-final")["output"],
+                                    "pmon-0-final"))
+    return {"physicalMode": "shared-gpu1", "admission": admission, "uuid": SHARED_GPU1_UUID,
+            "pci": SHARED_GPU1_PCI, "luid": luid, "cudaOrdinal": 0, "physicalIndex": 1,
+            "minFreeMiB": SHARED_GPU1_MIN_FREE_MIB, "baselineMaxPercent": SHARED_GPU1_PERCENT_LIMIT,
+            "gpu": selected, "observedActors": actors}
+
+
+def census_shared_gpu1(*, admission: bool) -> tuple[str, bool]:
+    check_shared_gpu1_dispatch()
+    with tempfile.TemporaryDirectory(prefix="yue2-shared-gpu1-") as root:
+        output = Path(root)
+        script = Path(__file__).with_name("yue2_cuda_context_diagnostic.ps1")
+        command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                   "-File", str(script), "-TargetPid", "0", "-OutputDirectory", str(output),
+                   "-EngineSha", os.environ["EXPECTED_ENGINE_SHA"], "-ControlSha", os.environ["GITHUB_SHA"],
+                   "-SelectedGpuIndex", "1"]
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=180)
+        files, raw_files = diagnostic_file_pairs(output)
+        raw = {"physicalMode": "shared-gpu1", "admission": admission,
+               "commandExit": result.returncode, "diagnosticFiles": files,
+               "diagnosticFileBytesB64": raw_files}
+        try:
+            require(result.returncode == 0, f"shared GPU1 read-only probe failed: {result.stderr.strip()}")
+            require(set(files) == set(raw_files) == empty_probe_names(),
+                    "shared GPU1 raw file inventory incomplete")
+            raw["validatedDevice"] = _shared_gpu1_summary(output, admission=admission)
             return json.dumps(raw, sort_keys=True), True
         except Exception as error:
             raw["refusal"] = str(error)

@@ -16,7 +16,7 @@ on:
         required: false
         default: shared-host
         options: [shared-host, owner-gpu0, owner-gpu0-mac-anchor, gpu0-with-reviewed-gpu1]
-        description: Owner-approved GPU0 lane; exact reviewed actor and selected-device proof remain required
+        description: Shared-host mode selects physical GPU1; retired GPU0 owner routes refuse before model launch
       expected_engine_sha:
         type: string
         required: true
@@ -45,7 +45,7 @@ on:
         type: string
         required: false
         default: ""
-        description: "Exact Windows PID, or 0 for a process-free GPU0 probe, on cuda-diagnostic only"
+        description: "Exact Windows PID, or 0 for selected-device read-only telemetry, on cuda-diagnostic only"
       idle_cuda_context_run_id:
         type: string
         required: false
@@ -75,7 +75,7 @@ jobs:
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 10
     env:
-      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_VISIBLE_DEVICES: "1"
       CUDA_DEVICE_ORDER: PCI_BUS_ID
     defaults:
       run:
@@ -143,7 +143,7 @@ jobs:
           if (Test-Path $out) { throw 'run-owned diagnostic directory already exists' }
           New-Item -ItemType Directory -Path $out | Out-Null
           Add-Content -Path $env:GITHUB_ENV -Value "YUE2_CUDA_DIAGNOSTIC_OUT=$out"
-          & .\scripts\ci\yue2_cuda_context_diagnostic.ps1 -TargetPid ([int]$env:DIAGNOSTIC_PID) -OutputDirectory $out -EngineSha $env:EXPECTED_ENGINE_SHA -ControlSha $env:EXPECTED_CONTROL_SHA
+          & .\scripts\ci\yue2_cuda_context_diagnostic.ps1 -TargetPid ([int]$env:DIAGNOSTIC_PID) -OutputDirectory $out -EngineSha $env:EXPECTED_ENGINE_SHA -ControlSha $env:EXPECTED_CONTROL_SHA -SelectedGpuIndex 1
           if (-not (Test-Path (Join-Path $out 'manifest.json'))) { throw 'diagnostic manifest was not produced' }
       - name: Upload raw read-only CUDA diagnostic
         if: always()
@@ -228,7 +228,7 @@ jobs:
       YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
       YUE2_CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}
       YUE2_HF_HUB: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
-      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_VISIBLE_DEVICES: "1"
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"

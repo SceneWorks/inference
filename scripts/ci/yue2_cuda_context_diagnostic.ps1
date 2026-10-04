@@ -8,7 +8,8 @@ param(
     [Parameter(Mandatory = $true)][ValidateRange(0, 2147483647)][int]$TargetPid,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][string]$EngineSha,
-    [Parameter(Mandatory = $true)][string]$ControlSha
+    [Parameter(Mandatory = $true)][string]$ControlSha,
+    [ValidateSet(0, 1)][int]$SelectedGpuIndex = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -124,7 +125,7 @@ public static class Yue2CudaAdapterProperties {
 }
 
 $started = (Get-Date).ToUniversalTime().ToString('o')
-Save-Json 'manifest.json' @{ schemaVersion = 1; purpose = 'diagnostic only, no idle verdict'; engineSha = $EngineSha; controlSha = $ControlSha; runner = $env:RUNNER_NAME; targetPid = $TargetPid; startedUtc = $started; completed = $false }
+Save-Json 'manifest.json' @{ schemaVersion = 1; purpose = 'diagnostic only, no idle verdict'; engineSha = $EngineSha; controlSha = $ControlSha; runner = $env:RUNNER_NAME; targetPid = $TargetPid; selectedGpuIndex = $SelectedGpuIndex; startedUtc = $started; completed = $false }
 Save-ProcessIdentity 'process-before'
 Save-CounterCatalog
 for ($i = 0; $i -lt 3; $i++) {
@@ -140,6 +141,6 @@ for ($i = 0; $i -lt 3; $i++) {
 Invoke-Smi 'gpu-before-cuda-properties' @('--query-gpu=index,uuid,pci.bus_id,memory.used,utilization.gpu', '--format=csv,noheader,nounits')
 Save-CudaAdapterMap
 Invoke-Smi 'gpu-after-cuda-properties' @('--query-gpu=index,uuid,pci.bus_id,memory.used,utilization.gpu', '--format=csv,noheader,nounits')
-Invoke-Smi 'pmon-0-final' @('pmon', '-i', '0', '-c', '1', '-s', 'um')
+Invoke-Smi 'pmon-0-final' @('pmon', '-i', [string]$SelectedGpuIndex, '-c', '1', '-s', 'um')
 Save-ProcessIdentity 'process-after'
-Save-Json 'manifest.json' @{ schemaVersion = 1; purpose = 'diagnostic only, no idle verdict'; engineSha = $EngineSha; controlSha = $ControlSha; runner = $env:RUNNER_NAME; targetPid = $TargetPid; startedUtc = $started; completedUtc = (Get-Date).ToUniversalTime().ToString('o'); completed = $true }
+Save-Json 'manifest.json' @{ schemaVersion = 1; purpose = 'diagnostic only, no idle verdict'; engineSha = $EngineSha; controlSha = $ControlSha; runner = $env:RUNNER_NAME; targetPid = $TargetPid; selectedGpuIndex = $SelectedGpuIndex; startedUtc = $started; completedUtc = (Get-Date).ToUniversalTime().ToString('o'); completed = $true }

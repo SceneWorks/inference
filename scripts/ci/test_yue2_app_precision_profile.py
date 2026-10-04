@@ -23,6 +23,27 @@ M5_SHA = "190e20e7c6b5bac006194c729baabd22c0c44a5d"
 M5_POLICY = "fixed_order_bf16_convolution_v1"
 
 
+def estimated_stages() -> dict:
+    return {stage: {"deviceBytes": 1024} for stage in control.STAGES}
+
+
+def measured_scope(backend: str) -> dict:
+    if backend != "cuda":
+        return {}
+    luid = "luid_0x00000000_0x0001f78f"
+    proof = "a" * 64
+    return {"scope": "selected-device-global", "sampler": "nvidia-smi memory.used",
+            "deviceProof": {"physicalIndex": 1, "cudaOrdinal": 0,
+                            "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+                            "pci": "00000000:C1:00.0", "luid": luid, "sha256": proof},
+            "ownedFaults": [], "owned": {"complete": True,
+                "sampler": "windows-gpu-process-memory dedicated", "selectedLuid": luid,
+                "proofSha256": proof, "journalSha256": "b" * 64, "faults": [], "peakBytes": 1,
+                "process": {"pid": 42, "parentPid": 41, "createdUtc": "2026-10-04T20:00:00Z",
+                            "executablePath": "C:\\test.exe", "executableSha256": "c" * 64},
+                "stages": {stage: {"peakBytes": 1, "samples": 1} for stage in control.STAGES}}}
+
+
 class PrecisionControlTests(unittest.TestCase):
     def test_eight_cuda_cases_and_seven_metal_cases_keep_exact_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -65,14 +86,28 @@ class PrecisionControlTests(unittest.TestCase):
                 "caseId": "yue2:bf16:cuda:strict-bf16-legacy", "backend": "cuda",
                 "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae-legacy"}},
                 "request": {"name": "strict-bf16-legacy", "computePolicy": "bf16"},
-                "admission": {"outcome": "admitted"},
+                "admission": {"outcome": "admitted", "estimate": {"stages": estimated_stages()}},
                 "outcome": {"status": "completed", "engineComputePolicy": "bf16",
                             "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16",
                             "engineVaeCudaBf16MathPolicy": M4_POLICY},
-                "measured": {"peakBytes": 1024, "stages": stages},
+                "measured": {"peakBytes": 1024, "stages": stages, **measured_scope("cuda")},
             }
             record.write_text(json.dumps(body), encoding="utf-8")
             self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)["effective_vae_dtype"], "bfloat16")
+            self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+                             ["owned_peak_bytes"], 1)
+            self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+                             ["selected_device_global_used_peak_bytes"], 1024)
+            del body["measured"]["scope"]
+            record.write_text(json.dumps(body), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "global selected-device"):
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+            body["measured"].update(measured_scope("cuda"))
+            del body["admission"]["estimate"]["stages"]["load"]
+            record.write_text(json.dumps(body), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "modeled stage"):
+                control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+            body["admission"]["estimate"]["stages"] = estimated_stages()
             body["outcome"]["engineVaeDtype"] = "float32"
             record.write_text(json.dumps(body), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "effective engineVaeDtype"):
@@ -94,10 +129,10 @@ class PrecisionControlTests(unittest.TestCase):
                     "caseId": control.case_id(backend, name), "backend": backend,
                     "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
                     "request": {"name": case_name, "computePolicy": policy},
-                    "admission": {"outcome": "admitted"},
+                    "admission": {"outcome": "admitted", "estimate": {"stages": estimated_stages()}},
                     "outcome": {"status": "completed", "engineComputePolicy": policy,
                                 "engineModelDtype": model_dtype, "engineVaeDtype": vae_dtype},
-                    "measured": {"peakBytes": 1024, "stages": {
+                    "measured": {"peakBytes": 1024, **measured_scope(backend), "stages": {
                         stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
                 }
                 wanted = M4_POLICY
@@ -134,11 +169,12 @@ class PrecisionControlTests(unittest.TestCase):
                 "caseId": control.case_id("cuda", name), "backend": "cuda",
                 "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
                 "request": {"name": name, "computePolicy": "auto", "arMode": "experimentalFp8"},
-                "admission": {"outcome": "admitted", "estimate": {"weights": {"hostBytes": 2 * 1024 ** 3}}},
+                "admission": {"outcome": "admitted", "estimate": {"stages": estimated_stages(),
+                    "weights": {"hostBytes": 2 * 1024 ** 3}}},
                 "outcome": {"status": "completed", "engineComputePolicy": "auto",
                             "engineModelDtype": "bfloat16", "engineVaeDtype": "float32",
                             "engineQuantization": "fp8"},
-                "measured": {"peakBytes": 1024, "stages": {
+                "measured": {"peakBytes": 1024, **measured_scope("cuda"), "stages": {
                     stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
             }
             def check():
@@ -272,11 +308,11 @@ class PrecisionControlTests(unittest.TestCase):
                 "caseId": control.case_id("cuda", "strict-bf16-standard"), "backend": "cuda",
                 "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
                 "request": {"name": "strict-bf16-standard", "computePolicy": "bf16"},
-                "admission": {"outcome": "admitted"},
+                "admission": {"outcome": "admitted", "estimate": {"stages": estimated_stages()}},
                 "outcome": {"status": "completed", "engineComputePolicy": "bf16",
                             "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16",
                             "engineVaeCudaBf16MathPolicy": M4_POLICY},
-                "measured": {"peakBytes": 1, "stages": stages},
+                "measured": {"peakBytes": 1, **measured_scope("cuda"), "stages": stages},
             }
             record.write_text(json.dumps(body), encoding="utf-8")
             new_policy = "fixed_order_bf16_convolution_v1"
@@ -359,11 +395,11 @@ class PrecisionControlTests(unittest.TestCase):
                     "caseId": control.case_id("cuda", name), "backend": "cuda",
                     "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae" + ("-legacy" if decoder == "legacy" else "")}},
                     "request": {"name": case_name, "computePolicy": policy},
-                    "admission": {"outcome": "admitted"},
+                    "admission": {"outcome": "admitted", "estimate": {"stages": estimated_stages()}},
                     "outcome": {"status": "completed", "engineComputePolicy": policy,
                                 "engineModelDtype": model_dtype, "engineVaeDtype": vae_dtype,
                                 "engineVaeCudaBf16MathPolicy": M5_POLICY},
-                    "measured": {"peakBytes": 1, "stages": {
+                    "measured": {"peakBytes": 1, **measured_scope("cuda"), "stages": {
                         stage: {"peakBytes": 1, "samples": 1} for stage in control.STAGES}},
                 }
 
@@ -404,9 +440,10 @@ class PrecisionControlTests(unittest.TestCase):
     def test_busy_cuda_preflight_refuses_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence"
-            census = types.SimpleNamespace(cuda_physical_census=lambda: ("typed pmon rows", ["123 C worker"]),
+            census = types.SimpleNamespace(cuda_physical_census=lambda **_: ("typed pmon rows", ["123 C worker"]),
                                            metal_census=lambda: ("", []),
                                            physical_busy_message=lambda raw, busy, context: f"{context}: {busy}",
+                                           same_selected_cuda_device=Mock(),
                                            retain_cuda_physical_evidence=lambda *_: [],
                                            retain_reviewed_baseline=lambda *_: [])
             with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
@@ -425,8 +462,9 @@ class PrecisionControlTests(unittest.TestCase):
         proof_spec.loader.exec_module(proof)
         raw = json.dumps({"commandExit": 0, "refusal": "adapterDedicated rose over reviewed baseline"})
         busy = ["0 38212 C+G - - ChatGPT.exe"]
-        census = types.SimpleNamespace(cuda_physical_census=lambda: (raw, busy),
+        census = types.SimpleNamespace(cuda_physical_census=lambda **_: (raw, busy),
                     metal_census=Mock(), physical_busy_message=proof.physical_busy_message,
+                    same_selected_cuda_device=Mock(),
                     retain_cuda_physical_evidence=Mock(), retain_reviewed_baseline=Mock())
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence"
@@ -446,6 +484,7 @@ class PrecisionControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             census = types.SimpleNamespace(cuda_physical_census=Mock(), metal_census=Mock(),
                                            physical_busy_message=Mock(),
+                                           same_selected_cuda_device=Mock(),
                                            retain_cuda_physical_evidence=Mock(),
                                            retain_reviewed_baseline=Mock())
             guard = types.SimpleNamespace(require_remaining_window=Mock(
@@ -555,10 +594,10 @@ class PrecisionControlTests(unittest.TestCase):
                     "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae" +
                                               ("-legacy" if decoder == "legacy" else "")}},
                     "request": {"name": case_name, "computePolicy": policy},
-                    "admission": {"outcome": "admitted"},
+                    "admission": {"outcome": "admitted", "estimate": {"stages": estimated_stages()}},
                     "outcome": {"status": "completed", "engineComputePolicy": policy,
                                 "engineModelDtype": model_dtype, "engineVaeDtype": vae_dtype},
-                    "measured": {"peakBytes": 1024, "stages": {
+                    "measured": {"peakBytes": 1024, **measured_scope("cuda"), "stages": {
                         stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
                 }
                 if policy == "bf16":
@@ -566,7 +605,15 @@ class PrecisionControlTests(unittest.TestCase):
                 if name == "experimental-fp8-auto":
                     body["request"]["arMode"] = "experimentalFp8"
                     body["outcome"]["engineQuantization"] = "fp8"
-                    body["admission"]["estimate"] = {"weights": {"hostBytes": 2 * 1024 ** 3}}
+                    body["admission"]["estimate"]["weights"] = {"hostBytes": 2 * 1024 ** 3}
+                evidence.mkdir(exist_ok=True)
+                selected = body["measured"]["deviceProof"]
+                proof = evidence / f"preflight-before-{name}.json"
+                proof.write_text(json.dumps({"backend": "cuda", "admitted": True,
+                                             "census": json.dumps({"validatedDevice": selected})}),
+                                 encoding="utf-8")
+                selected["sha256"] = control.sha256(proof)
+                body["measured"]["owned"]["proofSha256"] = selected["sha256"]
                 (run.parent / "record.json").write_text(json.dumps(body), encoding="utf-8")
             with patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)):
                 verdict = control.collect(profile, evidence, "cuda", root, root)

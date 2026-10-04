@@ -61,6 +61,19 @@ def reviewed_gpu1_snapshot():
 
 
 class SharedHostWatchTests(unittest.TestCase):
+    def test_unused_app_listeners_may_be_offline_but_owned_runner_must_be_online(self):
+        data = own_snapshot()
+        for row in data["runners"]["app"]:
+            row["status"] = "offline"
+        self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml")["own_job"], 70)
+        data["runners"]["app"][0]["busy"] = True
+        with self.assertRaisesRegex(RuntimeError, "unaccounted busy"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+        data["runners"]["app"][0]["busy"] = False
+        data["runners"]["org"][0]["status"] = "offline"
+        with self.assertRaisesRegex(RuntimeError, "owned CUDA runner is offline"):
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+
     def test_reviewed_gpu1_exact_job_and_clean_completion_transition(self):
         data = reviewed_gpu1_snapshot()
         self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml",

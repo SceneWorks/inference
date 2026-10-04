@@ -206,7 +206,11 @@ def query_compute_apps_rows(output: str) -> list[str]:
     return rows
 
 
-def cuda_census() -> tuple[str, list[str]]:
+def cuda_census(*, admission: bool = True) -> tuple[str, list[str]]:
+    if os.environ.get("CUDA_VISIBLE_DEVICES") == "1":
+        from yue2_cuda_idle_context import census_shared_gpu1  # type: ignore[import-not-found]
+        raw, verified = census_shared_gpu1(admission=admission)
+        return raw, [] if verified else ["physical GPU1 shared-device proof refused"]
     command = ["nvidia-smi", "pmon", "-i", "0", "-c", "1", "-s", "um"]
     result = subprocess.run(command, capture_output=True, text=True, timeout=20, encoding="utf-8")
     if result.returncode == 0:
@@ -259,14 +263,15 @@ def physical_busy_message(raw: str, busy: list[str], context: str) -> str:
     return message
 
 
-def cuda_physical_census() -> tuple[str, list[str]]:
+def cuda_physical_census(*, admission: bool = True) -> tuple[str, list[str]]:
     """Require complete selected-GPU seven-family evidence before model work.
 
     A reviewed C+G receipt selects one signed process; an actually process-free
-    GPU0 instead requires a fresh unfiltered, zero-residency 29-file probe.
-    Graphics-only or ambiguous telemetry is never interpreted as empty.
+    GPU0 requires a fresh unfiltered 29-file probe. The owner-approved shared
+    GPU1 route keeps foreign actors and allocations in raw evidence, admits
+    only the selected card before a child, and checks owned release afterward.
     """
-    raw, busy = cuda_census()
+    raw, busy = cuda_census(admission=admission)
     if busy:
         return raw, busy
     try:
@@ -276,9 +281,14 @@ def cuda_physical_census() -> tuple[str, list[str]]:
                 len(probe["diagnosticFiles"]) == len(probe["diagnosticFileBytesB64"]) == 29 and
                 set(probe["diagnosticFiles"]) == set(probe["diagnosticFileBytesB64"]) and
                 probe.get("commandExit") == 0 and
-                probe.get("physicalMode") in (None, "empty-gpu0") and
-                (probe.get("physicalMode") != "empty-gpu0" or
-                 probe.get("validatedDevice", {}).get("physicalMode") == "empty-gpu0") and
+                probe.get("physicalMode") in (None, "empty-gpu0", "shared-gpu1") and
+                (probe.get("physicalMode") not in ("empty-gpu0", "shared-gpu1") or
+                 probe.get("validatedDevice", {}).get("physicalMode") == probe["physicalMode"]) and
+                (probe.get("physicalMode") != "shared-gpu1" or
+                 (probe.get("admission") is admission and
+                  probe.get("validatedDevice", {}).get("admission") is admission and
+                  probe.get("validatedDevice", {}).get("physicalIndex") == 1 and
+                  probe.get("validatedDevice", {}).get("cudaOrdinal") == 0)) and
                 "refusal" not in probe, "complete selected-device physical probe absent")
     except (ValueError, TypeError, RuntimeError):
         return raw, ["complete selected-device seven-family physical proof absent"]
@@ -360,11 +370,18 @@ def metal_census() -> tuple[str, list[str]]:
 
 def sample_cuda() -> dict:
     started = time.time_ns()
-    command = ["nvidia-smi", "--query-gpu=timestamp,index,memory.used,memory.free", "--format=csv,noheader,nounits"]
+    index = "1" if os.environ.get("CUDA_VISIBLE_DEVICES") == "1" else "0"
+    command = ["nvidia-smi", "-i", index, "--query-gpu=timestamp,index,memory.used,memory.free",
+               "--format=csv,noheader,nounits"]
     result = subprocess.run(command, capture_output=True, text=True, timeout=10, encoding="utf-8")
     require(result.returncode == 0, result.stderr.strip() or "nvidia-smi sample failed")
+    rows = [next(csv.reader([line], skipinitialspace=True)) for line in result.stdout.splitlines() if line.strip()]
+    require(len(rows) == 1 and len(rows[0]) == 4 and rows[0][1].strip() == index and
+            all(rows[0][column].strip().isdigit() for column in (2, 3)),
+            "selected physical CUDA sample missing or ambiguous")
     return {"started_utc_ns": started, "ended_utc_ns": time.time_ns(),
-            "method": "nvidia-smi query-gpu", "raw": result.stdout.strip()}
+            "method": "nvidia-smi query-gpu", "physical_gpu_index": int(index),
+            "raw": result.stdout.strip()}
 
 
 def sample_metal(pid: int) -> dict:
@@ -384,23 +401,32 @@ def sample_metal(pid: int) -> dict:
                 "phys_footprint_bytes": value}
 
 
-def wait_owned_child(child: subprocess.Popen, backend: str, timeout: float | None = None) -> tuple[int | None, bool, str | None]:
+def wait_owned_child(child: subprocess.Popen, backend: str, timeout: float | None = None,
+                     *, owned_tree: bool = False) -> tuple[int | None, bool, str | None]:
     """Bound only the Popen-owned precision test, leaving other processes untouched."""
     try:
         return child.wait(timeout=(CUDA_CHILD_TIMEOUT_SECONDS if timeout is None else timeout)
                           if backend == "cuda" else None), False, None
     except subprocess.TimeoutExpired:
-        code, cleanup_error = reap_owned_child(child)
+        code, cleanup_error = reap_owned_child(child, owned_tree=owned_tree)
         return code, True, cleanup_error
     except Exception as error:
-        code, cleanup_error = reap_owned_child(child)
+        code, cleanup_error = reap_owned_child(child, owned_tree=owned_tree)
         return code, False, f"{error}; cleanup: {cleanup_error}" if cleanup_error else str(error)
 
 
-def reap_owned_child(child: subprocess.Popen) -> tuple[int | None, str | None]:
+def reap_owned_child(child: subprocess.Popen, *, owned_tree: bool = False) -> tuple[int | None, str | None]:
     try:
         if child.poll() is None:
-            child.kill()  # Never signal a foreign PID or enumerate process names.
+            if owned_tree:
+                # The root is still our live Popen process. Windows taskkill /T
+                # follows only this root's process tree, never a name/PID search.
+                result = subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"],
+                                        capture_output=True, text=True, encoding="utf-8", timeout=15)
+                require(result.returncode == 0 or child.poll() is not None,
+                        "owned CUDA process-tree termination failed")
+            else:
+                child.kill()
             return child.wait(timeout=30), None
         return child.poll(), None
     except Exception as error:
@@ -439,8 +465,145 @@ def child_stage_succeeded(row: dict) -> bool:
     return (row["exit_code"] == 0 and not row["timed_out"] and row["wait_error"] is None and
             row["released"] and row["exact_one_test_passed"] and row["sample_count"] > 0 and
             row["binary_unchanged_after_child"] and
-            not row["sampler_faults"] and not row.get("post_census_error") and
+            not row["sampler_faults"] and row.get("owned_gpu_pid_released", True) and
+            row.get("owned_descendants_released", True) and
+            not row.get("post_census_error") and
             not row.get("post_census_busy"))
+
+
+def descendant_generations(parents: dict[int, int], births: dict[int, int],
+                           root_pid: int, root_birth: int) -> dict[int, int]:
+    """Bind descendants to the Popen root's process generation, not reused PIDs."""
+    require(root_pid not in births or births[root_pid] == root_birth,
+            "owned CUDA root PID was reused")
+    known = {root_pid: root_birth}
+    for _ in range(len(parents)):
+        children = {pid: parent for pid, parent in parents.items()
+                    if parent in known and pid not in known}
+        if not children:
+            return {pid: birth for pid, birth in known.items() if pid != root_pid}
+        for pid, parent in children.items():
+            require(pid in births and births[pid] >= known[parent],
+                    "owned CUDA descendant creation identity unavailable or older than parent")
+            known[pid] = births[pid]
+    raise RuntimeError("owned CUDA process lineage is cyclic or ambiguous")
+
+
+def windows_process_birth(handle: int) -> int:
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    times = [wintypes.FILETIME() for _ in range(4)]
+    require(kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)) != 0,
+            "owned CUDA process creation time unavailable")
+    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+
+
+def windows_owned_descendants(root_pid: int, root_birth: int) -> dict[int, int]:
+    """Read only PID, parent PID, and creation for the root's Windows tree."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel.Process32FirstW.restype = wintypes.BOOL
+    kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel.Process32NextW.restype = wintypes.BOOL
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel.CreateToolhelp32Snapshot(0x2, 0)
+    require(snapshot not in (None, ctypes.c_void_p(-1).value),
+            "owned CUDA process snapshot unavailable")
+    parents = {}
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(ProcessEntry)
+        require(kernel.Process32FirstW(snapshot, ctypes.byref(entry)) != 0,
+                "owned CUDA process snapshot empty")
+        while True:
+            pid = int(entry.th32ProcessID)
+            require(pid not in parents, "owned CUDA process snapshot duplicated a PID")
+            parents[pid] = int(entry.th32ParentProcessID)
+            entry.dwSize = ctypes.sizeof(ProcessEntry)
+            if kernel.Process32NextW(snapshot, ctypes.byref(entry)) == 0:
+                break
+    finally:
+        kernel.CloseHandle(snapshot)
+    candidates = {root_pid}
+    for _ in range(len(parents)):
+        added = {pid for pid, parent in parents.items() if parent in candidates}
+        if added <= candidates:
+            break
+        candidates |= added
+    births = {}
+    for pid in candidates & parents.keys():
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        require(handle, "owned CUDA process creation handle unavailable")
+        try:
+            births[pid] = windows_process_birth(handle)
+        finally:
+            kernel.CloseHandle(handle)
+    return descendant_generations(parents, births, root_pid, root_birth)
+
+
+def owned_descendants_released(root_pid: int, root_birth: int,
+                               observed: dict[int, int]) -> bool:
+    current = windows_owned_descendants(root_pid, root_birth)
+    # A child spawned in the last instant before root exit must also be seen.
+    if current:
+        return False
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    for pid, birth in observed.items():
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if handle:
+            try:
+                if windows_process_birth(handle) == birth:
+                    return False
+            finally:
+                kernel.CloseHandle(handle)
+        else:
+            require(ctypes.get_last_error() == 87, "observed owned CUDA descendant is inaccessible")
+    return True
+
+
+def owned_gpu_pid_released(raw: str, pid: int) -> bool:
+    probe = json.loads(raw)
+    if probe.get("physicalMode") != "shared-gpu1":
+        return True
+    actors = probe.get("validatedDevice", {}).get("observedActors")
+    require(isinstance(actors, list) and len(actors) == 4 and
+            all(isinstance(epoch, list) for epoch in actors),
+            "selected GPU1 postflight actor inventory unavailable")
+    return all(actor.get("pid") != pid for epoch in actors for actor in epoch)
+
+
+def same_selected_cuda_device(initial: str, current: str) -> bool:
+    first, later = json.loads(initial), json.loads(current)
+    if first.get("physicalMode") != "shared-gpu1":
+        return True
+    require(later.get("physicalMode") == "shared-gpu1", "selected GPU1 proof mode changed")
+    keys = ("uuid", "pci", "luid", "physicalIndex", "cudaOrdinal")
+    before = first.get("validatedDevice", {})
+    after = later.get("validatedDevice", {})
+    return all(before.get(key) == after.get(key) for key in keys)
 
 
 def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
@@ -451,6 +614,10 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
     samples: list[dict] = []
     faults: list[str] = []
     stop = threading.Event()
+    track_tree = backend == "cuda" and env.get("CUDA_VISIBLE_DEVICES") == "1" and os.name == "nt"
+    root_birth = None
+    descendants: dict[int, int] = {}
+    descendants_released = not track_tree
     started = time.time_ns()
     log_path = evidence / ("test.log" if label == "precision" else f"{label}-smoke.log")
     with log_path.open("w", encoding="utf-8") as log:
@@ -469,9 +636,18 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
             if owner_guard is not None:
                 owner_guard.finish()
             raise
+        if track_tree:
+            try:
+                root_birth = windows_process_birth(int(child._handle))
+                descendants.update(windows_owned_descendants(child.pid, root_birth))
+            except BaseException:
+                reap_owned_child(child, owned_tree=True)
+                raise
         def loop() -> None:
             while not stop.is_set() and child.poll() is None:
                 try:
+                    if track_tree:
+                        descendants.update(windows_owned_descendants(child.pid, root_birth))
                     samples.append(sample_cuda() if backend == "cuda" else sample_metal(child.pid))
                 except Exception as error:
                     if child.poll() is None:
@@ -497,7 +673,8 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
                 from yue2_gpu0_owner_guard import wait
                 code, timed_out, wait_error = wait(child, owner_guard, wait_budget or 0)
             else:
-                code, timed_out, wait_error = wait_owned_child(child, backend, wait_budget)
+                code, timed_out, wait_error = wait_owned_child(
+                    child, backend, wait_budget, owned_tree=track_tree)
         except BaseException as error:
             if owner_guard is None and not isinstance(error, Exception):
                 raise
@@ -505,7 +682,7 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
                 from yue2_gpu0_owner_guard import reap_tree
                 code, cleanup_error = reap_tree(child)
             else:
-                code, cleanup_error = reap_owned_child(child)
+                code, cleanup_error = reap_owned_child(child, owned_tree=track_tree)
             timed_out = False
             wait_error = f"sampler startup: {error}; cleanup: {cleanup_error}"
         finally:
@@ -514,6 +691,11 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
                 thread.join(timeout=25)
                 if thread.is_alive():
                     faults.append("external sampler thread did not release")
+            if track_tree and root_birth is not None and not thread.is_alive():
+                try:
+                    descendants_released = owned_descendants_released(child.pid, root_birth, descendants)
+                except Exception as error:
+                    faults.append(f"owned CUDA descendant release proof: {error}")
     if owner_guard is not None:
         try:
             owner_guard.finish()
@@ -528,6 +710,9 @@ def run_test_child(binary: Path, name: str, label: str, backend: str, env: dict,
               "started_utc_ns": started, "ended_utc_ns": ended, "exit_code": code,
               "timed_out": timed_out, "wait_error": wait_error,
               "released": child.poll() is not None,
+              "owned_descendants": [{"pid": pid, "creation_filetime": birth}
+                                    for pid, birth in sorted(descendants.items())],
+              "owned_descendants_released": descendants_released,
               "exact_one_test_passed": exact_one_test_executed(output, name),
               "sample_count": len(samples), "sampler_faults": faults,
               "scheduling": owner_guard.summary() if owner_guard is not None else {"mode": "shared-host"}}
@@ -656,21 +841,16 @@ def execute(args: argparse.Namespace) -> None:
     if args.backend == "metal":
         require(runner == "nax-macos-2", f"Metal proof assigned to wrong runner: {runner}")
     else:
-        require(os.environ.get("CUDA_VISIBLE_DEVICES") == "0",
-                "CUDA proof must bind the same physical GPU 0 used by its process census")
-        from yue2_cuda_idle_context import check_empty_dispatch, require_remaining_window  # type: ignore[import-not-found]
+        require(os.environ.get("CUDA_VISIBLE_DEVICES") == "1",
+                "CUDA proof must bind logical CUDA0 to the owner's physical GPU1")
+        from yue2_cuda_idle_context import check_shared_gpu1_dispatch, require_remaining_window  # type: ignore[import-not-found]
         job_start = os.environ.get("YUE2_PRECISION_JOB_STARTED_UTC_NS", "")
         require(job_start.isdigit() and int(job_start) <= time.time_ns() and
                 time.time_ns() + (CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS) * 1_000_000_000 <=
                 int(job_start) + CUDA_JOB_TIMEOUT_SECONDS * 1_000_000_000,
                 "bounded CUDA child cannot finish before workflow upload tail")
         baseline = None
-        if os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID"):
-            baseline, baseline_dir = require_remaining_window(
-                CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS)
-            baseline_files = retain_reviewed_baseline(evidence, baseline_dir)
-        else:
-            check_empty_dispatch()
+        check_shared_gpu1_dispatch()
     total_deadline = time.monotonic() + CUDA_CHILD_TIMEOUT_SECONDS if args.backend == "cuda" else None
     before_raw, before_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
     (evidence / "census-before.txt").write_text(before_raw, encoding="utf-8")
@@ -702,6 +882,8 @@ def execute(args: argparse.Namespace) -> None:
                 # fresh physical census is the last action before Popen.
                 handoff_raw, handoff_busy = cuda_physical_census()
                 (evidence / f"census-pre-{label}.txt").write_text(handoff_raw, encoding="utf-8")
+                require(same_selected_cuda_device(before_raw, handoff_raw),
+                        "selected GPU1 adapter/LUID changed before owned child")
                 require(not handoff_busy, physical_busy_message(
                     handoff_raw, handoff_busy, f"foreign process at {label} handoff"))
                 handoff_files.append(retain_cuda_physical_evidence(evidence, f"pre-{label}", handoff_raw))
@@ -716,10 +898,14 @@ def execute(args: argparse.Namespace) -> None:
         faults.extend(stage_faults)
         if args.backend == "cuda":
             try:
-                release_raw, release_busy = cuda_physical_census()
+                release_raw, release_busy = cuda_physical_census(admission=False)
                 (evidence / f"census-post-{label}.txt").write_text(release_raw, encoding="utf-8")
+                require(same_selected_cuda_device(before_raw, release_raw),
+                        "selected GPU1 adapter/LUID changed after owned child")
                 result["post_census_files"] = retain_cuda_physical_evidence(
                     evidence, f"post-{label}", release_raw) if not release_busy else None
+                result["owned_gpu_pid_released"] = (owned_gpu_pid_released(release_raw, result["pid"])
+                                                    if not release_busy else False)
                 result["post_census_busy"] = release_busy
                 result["post_census_error"] = None
             except Exception as error:
@@ -735,7 +921,10 @@ def execute(args: argparse.Namespace) -> None:
     wait_error = last_child["wait_error"] if last_child else "no owned test child launched"
     post_census_error = None
     try:
-        after_raw, after_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
+        after_raw, after_busy = cuda_physical_census(admission=False) if args.backend == "cuda" else metal_census()
+        if args.backend == "cuda":
+            require(same_selected_cuda_device(before_raw, after_raw),
+                    "selected GPU1 adapter/LUID changed at final postflight")
     except Exception as error:
         after_raw, after_busy = "", []
         post_census_error = str(error)
@@ -759,7 +948,7 @@ def execute(args: argparse.Namespace) -> None:
         for sample in samples:
             for row in sample["raw"].splitlines():
                 fields = [value.strip() for value in row.split(",")]
-                if len(fields) >= 4 and fields[2].isdigit():
+                if len(fields) >= 4 and fields[1] == ("1" if os.environ.get("CUDA_VISIBLE_DEVICES") == "1" else "0") and fields[2].isdigit():
                     peak = max(peak or 0, int(fields[2]))
     else:
         peak = max((sample["phys_footprint_bytes"] for sample in samples), default=None)
@@ -783,7 +972,9 @@ def execute(args: argparse.Namespace) -> None:
               "stage_marker_count": len(markers), "external_peak": peak,
               "missing_stage_markers": missing_markers,
               "stage_sample_coverage": coverage,
-              "external_peak_unit": "MiB global device used" if args.backend == "cuda" else "bytes owned phys_footprint",
+              "external_peak_unit": "MiB selected physical device used" if args.backend == "cuda" else "bytes owned phys_footprint",
+              "external_peak_scope": "selected-device-global-capacity" if args.backend == "cuda" else "owned-process",
+              "owned_cuda_peak_unavailable": args.backend == "cuda",
               "sampler_faults": faults, "owned_test_pid": last_child["pid"] if last_child else None,
               "owned_test_released": bool(last_child and last_child["released"]),
               "owned_test_timed_out": timed_out, "owned_test_wait_error": wait_error,

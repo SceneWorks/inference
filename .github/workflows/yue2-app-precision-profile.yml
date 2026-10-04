@@ -14,7 +14,7 @@ on:
         required: false
         default: shared-host
         options: [shared-host, owner-gpu0, owner-gpu0-mac-anchor]
-        description: Owner-approved provisional GPU0 lane; exact Windows holder or Mac anchor/pending barrier must remain active
+        description: Shared-host CUDA uses physical GPU1; retired GPU0 owner routes refuse before capture
       expected_engine_sha:
         type: string
         required: true
@@ -58,7 +58,7 @@ jobs:
       EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
       YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
       YUE2_CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}
-      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_VISIBLE_DEVICES: "1"
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       CUDA_COMPUTE_CAP: "120"
       APP_RUN_ROOT: 'E:\sceneworks-terminal\sc-23002-yue2-precision\${{ github.run_id }}-${{ github.run_attempt }}'
@@ -171,7 +171,7 @@ jobs:
           set "RUSTC_WRAPPER="
           call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           set "NVCC_CCBIN=%VCToolsInstallDir%bin\Hostx64\x64"
-          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_gpu0_owner_guard.py --evidence "%APP_EVIDENCE%" --label install -- node scripts\yue2-acceptance.mjs --platform cuda --gpu-id 0 --profile-install-only --out "%APP_RUN_ROOT%\install" --data-dir "%APP_RUN_ROOT%\app-data" --hf-home "%APP_RUN_ROOT%\hf-home" --api-bin "%CARGO_TARGET_DIR%\release\sceneworks-rust-api.exe" --ffmpeg-bin "%YUE2_FFMPEG_BIN%" > "%APP_EVIDENCE%\install.log" 2>&1
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_gpu0_owner_guard.py --evidence "%APP_EVIDENCE%" --label install -- node scripts\yue2-acceptance.mjs --platform cuda --gpu-id 1 --profile-install-only --out "%APP_RUN_ROOT%\install" --data-dir "%APP_RUN_ROOT%\app-data" --hf-home "%APP_RUN_ROOT%\hf-home" --api-bin "%CARGO_TARGET_DIR%\release\sceneworks-rust-api.exe" --ffmpeg-bin "%YUE2_FFMPEG_BIN%" > "%APP_EVIDENCE%\install.log" 2>&1
           if errorlevel 1 exit /b 1
       - name: Capture exactly eight CUDA app precision profiles
         id: capture

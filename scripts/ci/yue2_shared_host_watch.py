@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """External, fail-closed all-listener watch for one shared-host YuE2 CUDA run.
 
-This does not grant a physical lease. The in-job GPU0 census and owned process
+This does not grant a physical lease. The in-job selected GPU1 census and owned process
 cleanup remain mandatory; this watcher cancels only its exact run when an
 unreviewed GitHub actor appears on either repository's CUDA runners.
 """
@@ -152,9 +152,9 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
         for row in runners["inference"]), "CUDA listener set changed")
     for name, expected in RUNNERS.items():
         row, scope = observed[name]
-        require(row.get("id") == expected and row.get("status") == "online" and
+        require(row.get("id") == expected and row.get("status") in ("online", "offline") and
                 scope == ("org" if expected in (2313, 2619) else "app"),
-                "physical CUDA runner identity/offline state changed")
+                "physical CUDA runner identity/status changed")
     own_key = ("SceneWorks/inference", own_id)
     own = data["runs"].get(own_key)
     require(isinstance(own, dict) and own.get("head_sha") == head and
@@ -172,6 +172,8 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
             selected[0].get("runner_id") == RUNNERS[selected[0]["runner_name"]],
             "exact owned CUDA job/runner missing")
     owned = selected[0]
+    require(observed[owned["runner_name"]][0].get("status") == "online",
+            "owned CUDA runner is offline")
     if mode == "gpu0-with-reviewed-gpu1":
         require(owned["runner_name"] == "cuda-windows-2" and owned["runner_id"] == 2619,
                 "reviewed GPU1 route must own the other Windows listener")
@@ -181,6 +183,8 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
             name == gpu1.RUNNER)
         require(row.get("busy") is expected_busy,
                 f"unaccounted busy/free physical listener: {name}")
+        require(row.get("status") == "online" or row.get("busy") is False,
+                f"offline CUDA listener has an active job: {name}")
     historical = []
     for key, run in data["runs"].items():
         if key == own_key:
