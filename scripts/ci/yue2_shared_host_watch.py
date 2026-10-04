@@ -27,6 +27,14 @@ LEGACY_ZERO_JOB = {
                   "2026-08-06T15:32:49Z", "2026-08-06T18:41:10Z"),
 }
 STATUSES = ("in_progress", "queued", "pending", "requested", "waiting")
+SHARED_GPU1_INVENTORY_ATTEMPTS = 3
+
+
+class InventorySnapshotError(RuntimeError):
+    def __init__(self, message: str, source: str, pages: object):
+        super().__init__(message)
+        self.source = source
+        self.pages = pages
 
 
 def require(value: bool, message: str) -> None:
@@ -43,13 +51,19 @@ def api(path: str, *, pages: bool = False) -> dict | list[dict]:
     return json.loads(output)
 
 
-def complete_pages(value: list[dict], key: str) -> list[dict]:
-    require(isinstance(value, list) and value and all(isinstance(page, dict) for page in value),
-            "missing paginated inventory")
-    counts = {page.get("total_count") for page in value}
+def complete_pages(value: list[dict], key: str, source: str = "unknown") -> list[dict]:
+    if not (isinstance(value, list) and value and
+            all(isinstance(page, dict) and isinstance(page.get(key), list) for page in value)):
+        raise InventorySnapshotError("missing paginated inventory", source, value)
+    counts = [page.get("total_count") for page in value]
     rows = [row for page in value for row in page.get(key, [])]
-    require(len(counts) == 1 and counts.pop() == len(rows),
-            "truncated paginated inventory")
+    if not (all(type(count) is int and count >= 0 for count in counts) and
+            len(set(counts)) == 1 and counts[0] == len(rows)):
+        raise InventorySnapshotError("truncated paginated inventory", source, value)
+    ids = [row.get("id") if isinstance(row, dict) else None for row in rows]
+    if not (all(type(identifier) is int and identifier > 0 for identifier in ids) and
+            len(set(ids)) == len(ids)):
+        raise InventorySnapshotError("ambiguous paginated inventory", source, value)
     return rows
 
 
@@ -66,22 +80,27 @@ def snapshot(*, reviewed_gpu1: bool = False) -> dict:
     runners = {}
     for scope in ("org", "inference", "app"):
         payload = responses[scope]
-        require(isinstance(payload, dict) and type(payload.get("total_count")) is int and
-                payload["total_count"] == len(payload.get("runners", [])),
-                "incomplete runner inventory")
+        if not (isinstance(payload, dict) and type(payload.get("total_count")) is int and
+                isinstance(payload.get("runners"), list) and
+                payload["total_count"] == len(payload["runners"])):
+            raise InventorySnapshotError("incomplete runner inventory", scope, payload)
         runners[scope] = payload["runners"]
     runs = {}
     for repo in REPOS:
         for status in STATUSES:
-            for run in complete_pages(responses[f"{repo}:{status}"], "workflow_runs"):
+            for run in complete_pages(responses[f"{repo}:{status}"], "workflow_runs",
+                                      f"{repo}:{status}"):
                 if run.get("status") != "completed":
                     key = (repo, run["id"])
-                    require(key not in runs or runs[key] == run, "run status inventory inconsistent")
+                    if key in runs and runs[key] != run:
+                        raise InventorySnapshotError("run status inventory inconsistent",
+                                                     f"{repo}:{status}",
+                                                     {"earlier": runs[key], "later": run})
                     runs[key] = run
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {key: pool.submit(api, f"repos/{key[0]}/actions/runs/{key[1]}/jobs?per_page=100",
                                     pages=True) for key in runs}
-        jobs = {key: complete_pages(future.result(timeout=50), "jobs")
+        jobs = {key: complete_pages(future.result(timeout=50), "jobs", f"{key[0]}:{key[1]}")
                 for key, future in futures.items()}
     # The two old zero-job rows are exceptions only while a direct run read
     # agrees with this cycle's status inventory and its fresh zero-job list.
@@ -360,7 +379,37 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
             if direct.get("status") == "completed":
                 (output / "terminal.json").write_text(json.dumps(direct, indent=2) + "\n", encoding="utf-8")
                 return  # Final child/postflight and physical release still require independent audit.
-            data = snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
+            for inventory_attempt in range(1, SHARED_GPU1_INVENTORY_ATTEMPTS + 1):
+                try:
+                    data = snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
+                    break
+                except (InventorySnapshotError, subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired, TimeoutError, json.JSONDecodeError) as error:
+                    if mode != "shared-gpu1":
+                        raise
+                    # A changing REST status count or transport failure never
+                    # supplies a partial inventory. Retain the rejected page,
+                    # then fetch a wholly new snapshot after direct own reauth.
+                    (output / f"inventory-attempt-{index:04d}-{inventory_attempt}.json").write_text(
+                        json.dumps({"errorType": type(error).__name__, "error": str(error),
+                                    "source": getattr(error, "source", None),
+                                    "pages": getattr(error, "pages", None)}, indent=2) + "\n",
+                        encoding="utf-8")
+                    if (inventory_attempt == SHARED_GPU1_INVENTORY_ATTEMPTS or
+                            time.monotonic() >= deadline):
+                        raise
+                    try:
+                        fresh = bind_owned_job(own_id, head, workflow, job_id, runner_name,
+                                               runner_id, own_job_name=own_job_name)
+                    except Exception as identity_error:
+                        raise RuntimeError(
+                            "owned identity drifted or unavailable during inventory retry"
+                        ) from identity_error
+                    require(fresh["run"].get("created_at") == binding["run"].get("created_at") and
+                            fresh["job"].get("id") == binding["job_id"] and
+                            fresh["job"].get("started_at") == binding["start"],
+                            "owned identity drifted during inventory retry")
+                    time.sleep(min(1, max(0, deadline - time.monotonic())))
             observed_job = next((job for job in data["jobs"].get(("SceneWorks/inference", own_id), [])
                                  if job.get("id") == job_id), None)
             if observed_job is not None and any((

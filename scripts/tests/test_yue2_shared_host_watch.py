@@ -1,5 +1,7 @@
 """Fail-closed external shared-host inventory watcher regressions."""
 from pathlib import Path
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -61,6 +63,107 @@ def reviewed_gpu1_snapshot():
 
 
 class SharedHostWatchTests(unittest.TestCase):
+    def test_moving_paginated_status_is_rejected_then_fresh_snapshot_succeeds(self):
+        moving = [{"total_count": 2, "workflow_runs": [{"id": 7}]}]
+        with self.assertRaisesRegex(watch.InventorySnapshotError,
+                                    "truncated paginated inventory") as error:
+            watch.complete_pages(moving, "workflow_runs", "SceneWorks/inference:queued")
+        self.assertEqual(error.exception.pages, moving)
+        self.assertEqual(error.exception.source, "SceneWorks/inference:queued")
+        duplicated = [{"total_count": 2, "workflow_runs": [{"id": 7}, {"id": 7}]}]
+        with self.assertRaisesRegex(watch.InventorySnapshotError, "ambiguous paginated inventory"):
+            watch.complete_pages(duplicated, "workflow_runs", "SceneWorks/inference:queued")
+        data = own_snapshot()
+        data["checked_at"] = "2026-10-04T20:02:00Z"
+        direct = {**data["runs"][("SceneWorks/inference", 7)],
+                  "repository": {"full_name": "SceneWorks/inference"},
+                  "created_at": "2026-10-04T20:00:00Z"}
+        job = data["jobs"][("SceneWorks/inference", 7)][0]
+        job["started_at"] = "2026-10-04T20:01:00Z"
+        bound = {"run": direct, "job": job, "job_id": 70, "start": job["started_at"]}
+        terminal = {**direct, "status": "completed", "conclusion": "success"}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "watch"
+            with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
+                 patch.object(watch, "owned_run", side_effect=[direct, terminal]), \
+                 patch.object(watch, "snapshot", side_effect=[error.exception, data]) as snapshots, \
+                 patch.object(watch.time, "sleep"), \
+                 patch.object(watch, "cancel_bound_run") as cancel:
+                watch.watch(7, SHA, "yue2-precision-proof.yml", output, 60, 30,
+                            70, "cuda-windows", 2313, mode="shared-gpu1")
+            self.assertEqual(snapshots.call_count, 2)
+            self.assertEqual(auth.call_count, 2)
+            cancel.assert_not_called()
+            retained = json.loads((output / "inventory-attempt-0001-1.json").read_text(encoding="utf-8"))
+            self.assertEqual(retained["pages"], moving)
+            self.assertTrue((output / "0001.json").is_file())
+
+    def test_shared_gpu1_retries_transport_but_persistent_incomplete_inventory_refuses(self):
+        data = own_snapshot()
+        data["checked_at"] = "2026-10-04T20:02:00Z"
+        direct = {**data["runs"][("SceneWorks/inference", 7)],
+                  "repository": {"full_name": "SceneWorks/inference"},
+                  "created_at": "2026-10-04T20:00:00Z"}
+        job = data["jobs"][("SceneWorks/inference", 7)][0]
+        job["started_at"] = "2026-10-04T20:01:00Z"
+        bound = {"run": direct, "job": job, "job_id": 70, "start": job["started_at"]}
+        transport = subprocess.CalledProcessError(1, ["gh", "api"])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "watch"
+            with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
+                 patch.object(watch, "owned_run", side_effect=[direct, {**direct, "status": "completed"}]), \
+                 patch.object(watch, "snapshot", side_effect=[transport, data]) as snapshots, \
+                 patch.object(watch.time, "sleep"), \
+                 patch.object(watch, "cancel_bound_run") as cancel:
+                watch.watch(7, SHA, "yue2-precision-proof.yml", output, 60, 30,
+                            70, "cuda-windows", 2313, mode="shared-gpu1")
+            self.assertEqual((auth.call_count, snapshots.call_count), (2, 2))
+            cancel.assert_not_called()
+        incomplete = watch.InventorySnapshotError("truncated paginated inventory", "queued", [])
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
+                 patch.object(watch, "owned_run", return_value=direct), \
+                 patch.object(watch, "snapshot", side_effect=incomplete) as snapshots, \
+                 patch.object(watch.time, "sleep"), \
+                 patch.object(watch, "cancel_bound_run") as cancel:
+                with self.assertRaisesRegex(RuntimeError, "truncated paginated inventory"):
+                    watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
+                                60, 30, 70, "cuda-windows", 2313, mode="shared-gpu1")
+            self.assertEqual((auth.call_count, snapshots.call_count), (3, 3))
+            cancel.assert_called_once()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
+                 patch.object(watch, "owned_run", return_value=direct), \
+                 patch.object(watch, "snapshot", side_effect=incomplete) as snapshots, \
+                 patch.object(watch, "cancel_bound_run") as cancel:
+                with self.assertRaisesRegex(RuntimeError, "truncated paginated inventory"):
+                    watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
+                                60, 30, 70, "cuda-windows", 2313, mode="shared-host")
+            auth.assert_called_once()
+            snapshots.assert_called_once()
+            cancel.assert_called_once()
+
+    def test_inventory_retry_refuses_owned_identity_drift_without_cancellation(self):
+        data = own_snapshot()
+        direct = {**data["runs"][("SceneWorks/inference", 7)],
+                  "repository": {"full_name": "SceneWorks/inference"},
+                  "created_at": "2026-10-04T20:00:00Z"}
+        job = data["jobs"][("SceneWorks/inference", 7)][0]
+        job["started_at"] = "2026-10-04T20:01:00Z"
+        bound = {"run": direct, "job": job, "job_id": 70, "start": job["started_at"]}
+        moved = {**bound, "start": "changed", "job": {**job, "started_at": "changed"}}
+        incomplete = watch.InventorySnapshotError("truncated paginated inventory", "queued", [])
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(watch, "bind_owned_job", side_effect=[bound, moved]), \
+                 patch.object(watch, "owned_run", return_value=direct), \
+                 patch.object(watch, "snapshot", side_effect=incomplete) as snapshots, \
+                 patch.object(watch, "cancel_bound_run") as cancel:
+                with self.assertRaisesRegex(RuntimeError, "owned identity drifted"):
+                    watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
+                                60, 30, 70, "cuda-windows", 2313, mode="shared-gpu1")
+            snapshots.assert_called_once()
+            self.assertTrue(cancel.call_args.kwargs["identity_drift"])
+
     def test_shared_gpu1_observes_foreign_jobs_without_revoking_owned_run(self):
         data = own_snapshot()
         data["runners"]["org"][1]["busy"] = True
