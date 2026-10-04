@@ -1629,7 +1629,12 @@ impl LlamaProvider {
         )?;
         let draft_estimate = match &draft {
             Some((draft_spec, None)) => {
-                Some(Self::load_memory_estimate(draft_spec, device.is_cuda())?)
+                // As a draft (never graph-wrapped), the price `admit_draft` admitted it at.
+                Some(Self::load_memory_estimate_as(
+                    draft_spec,
+                    device.is_cuda(),
+                    false,
+                )?)
             }
             _ => None,
         };
