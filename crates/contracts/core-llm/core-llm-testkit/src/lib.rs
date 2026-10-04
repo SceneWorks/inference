@@ -31,7 +31,12 @@ use std::path::PathBuf;
 pub mod comparison;
 pub mod defaults;
 pub mod draft_model;
+pub mod kv_compression;
 pub mod speculative;
+pub use kv_compression::{
+    check_kv_policy_conformance, kv_policy_cases, kv_policy_conformance, KvBackendDecision,
+    KvCaseDecoder, KvPolicyCase, KvPolicyDecision, KvReader,
+};
 pub mod starvector;
 pub use defaults::check_speculative_default;
 pub use draft_model::{

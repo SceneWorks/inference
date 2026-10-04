@@ -46,6 +46,9 @@ core-llm-testkit = { workspace = true }
 tempfile = { workspace = true }
 # Slice identity for the NVFP4 real-weight evidence run (sc-24135); already in the graph.
 sha2 = { workspace = true }
+# This crate's own integration tests arm the compressed-KV test seam (`test-kv-arm`); a dev
+# dependency's features reach only this package's test targets (resolver 2).
+candle-llm = { path = ".", features = ["test-kv-arm"] }
 
 [features]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).
@@ -59,3 +62,6 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-quant-kernels/metal"]
 # falling back to the eager softmax SDPA for the cases the kernel can't serve (soft-cap, mismatched
 # q/v head dims, padded-batch masks, f32/CPU). NOTE: candle-flash-attn ships sm80 kernels.
 flash-attn = ["cuda", "dep:candle-flash-attn"]
+# Test seam only (sc-20688 review): `LlamaProvider::arm_kv_model_family_for_tests`, enabled for
+# this crate's integration tests by its dev-dependency on itself. Never enable it in a product.
+test-kv-arm = []

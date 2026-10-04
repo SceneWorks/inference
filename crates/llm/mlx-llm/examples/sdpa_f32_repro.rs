@@ -1,3 +1,9 @@
+//! **Superseded (sc-20676):** this repro reads results with `as_slice`, which returns the raw
+//! buffer and ignores strides. MLX's fused full attention kernel returns a transposed view
+//! (strides `[L·H·D, D, H·D, 1]`), so every "wrong" fused-SDPA `q_len > 8` multi-head cell below
+//! is a readback artifact, not a kernel bug; read stride-aware and the kernel matches the host
+//! reference in f32/bf16/f16 (`fused_full_kernel_matches_host_across_dtypes`).
+//!
 //! Standalone repro for **sc-7430**: localize the wrong-numbers bug on the pinned pmetal mlx-rs fork.
 //!
 //! **Resolved by sc-24442:** there was no kernel bug. MLX's fused full attention kernel (`q_len > 8`,

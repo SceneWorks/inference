@@ -23,12 +23,138 @@
 use mlx_rs::ops::indexing::{TryIndexMutOp, TryIndexOp};
 use mlx_rs::ops::{concatenate_axis, multiply, zeros_dtype};
 use mlx_rs::Array;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
 /// Layout, per layer, of the cached keys/values: `[batch, n_kv_heads, seq, head_dim]`. Keys are
 /// stored already-RoPE'd; values raw. The sequence axis (2) is the one that grows each step.
 pub const SEQ_AXIS: i32 = 2;
+
+/// Experimental representation routing is decided before cache mutation.  The dense route is the
+/// compatibility default until a backend advertises every requested semantic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CacheRoute {
+    DenseFallback { reason: String },
+    ExperimentalPacked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackedAttentionMask {
+    None,
+    Causal,
+    SlidingWindow(usize),
+    Additive,
+}
+
+/// Immutable evidence exported by an experimental packed cache at the same trait-object boundary
+/// used by the decoder.  A sealed harness must not need private-field access or a storage-only test
+/// path to prove that model calls stayed compressed-domain.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct PackedCacheEvidence {
+    pub representation_identity: String,
+    pub representation_version: u32,
+    pub bits: u8,
+    pub quantization_group_size: usize,
+    pub accepted_direct_calls: usize,
+    /// Accepted calls per kernel path actually dispatched, sorted by (kernel, selection, query
+    /// dtype); on a reader that reports its selection these sum to `accepted_direct_calls`.
+    #[serde(default)]
+    pub kernel_paths: Vec<PackedKernelPathEvidence>,
+    pub full_cache_dequantizations: usize,
+    pub dispatch_attempts: u64,
+    pub failed_dispatches: u64,
+    pub compile_jit_attempts: u64,
+    pub kernel_warmed: bool,
+    pub attempted_elapsed_ms: f64,
+    pub cold_dispatches: u64,
+    pub steady_dispatches: u64,
+    pub cold_elapsed_ms: f64,
+    pub steady_elapsed_ms: f64,
+    pub uploaded_packed_bytes: u64,
+    pub accepted_uploaded_packed_bytes: u64,
+    /// Cache-resident packed code arrays, derived from the live device representation rather than
+    /// cumulative upload traffic.
+    pub retained_device_code_bytes: u64,
+    /// Cache-resident scale/zero arrays, derived from the live device representation rather than
+    /// dispatch arguments or allocator high-water.
+    pub retained_device_metadata_bytes: u64,
+    pub retained_device_packed_logical_bytes: u64,
+    pub peak_packed_argument_logical_bytes: u64,
+    pub peak_packed_transient_logical_bytes: u64,
+    pub dense_active: bool,
+    pub fallback_reasons: Vec<(String, String)>,
+    /// Attention calls a paged compressed cache served through its dense gather fallback, per
+    /// stable reason id (SC-20680). History stays compressed across these calls, so they are not
+    /// dense transitions; empty (and omitted) for every other cache.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dense_gather_calls: Vec<(String, u64)>,
+}
+/// One kernel path of the packed reader and the accepted calls that ran it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PackedKernelPathEvidence {
+    /// Kernel name (a `PACKED_*_KERNEL` constant).
+    pub kernel: String,
+    /// Selection token (a `PACKED_SELECTION_*` constant).
+    pub selection: String,
+    /// Human-readable reason for the selection.
+    pub reason: String,
+    /// Dispatched query dtype (`float32`, `float16`, `bfloat16`).
+    pub query_dtype: String,
+    pub calls: u64,
+}
+
+impl PackedKernelPathEvidence {
+    /// Evidence rows for a cache's recorded paths, sorted by (kernel, selection, query dtype).
+    pub fn sorted(
+        paths: &[(crate::primitives::packed_metal::PackedKernelSelection, u64)],
+    ) -> Vec<Self> {
+        let mut rows = paths
+            .iter()
+            .map(|(path, calls)| Self {
+                kernel: path.kernel.into(),
+                selection: path.selection.into(),
+                reason: path.reason.into(),
+                query_dtype: path.query_dtype.into(),
+                calls: *calls,
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            (&a.kernel, &a.selection, &a.query_dtype).cmp(&(
+                &b.kernel,
+                &b.selection,
+                &b.query_dtype,
+            ))
+        });
+        rows
+    }
+}
+
+/// Measured physical storage of a live compressed KV representation, exported only to campaign
+/// observers (SC-20676 compressed rows). Device bytes are the sizes of the MLX arrays the cache
+/// actually retains and host bytes its allocated staging payload, never bit accounting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompressedCacheStorage {
+    /// Retained device code arrays.
+    pub device_code_bytes: u64,
+    /// Retained device scale/zero (or codebook) arrays, plus any bounded dense residual of
+    /// not-yet-quantized recent tokens the representation keeps on the device.
+    pub device_metadata_bytes: u64,
+    /// Allocated host-side staging payload.
+    pub host_payload_bytes: u64,
+    /// Live cached tokens.
+    pub tokens: u64,
+    /// Scalar width of the K/V tensors handed to the cache (the dense-equivalent element width).
+    pub element_bytes: u64,
+}
+
+impl CompressedCacheStorage {
+    /// MLX-resident compressed bytes: the cache's contribution to MLX active memory.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_code_bytes
+            .saturating_add(self.device_metadata_bytes)
+    }
+}
 
 /// Sequence positions a [`ContiguousKvCache`] buffer grows by at a time: the buffer is
 /// reallocated once per this many tokens and written in place in between.
@@ -41,6 +167,59 @@ pub const KV_BLOCK_TOKENS: i32 = 256;
 /// reports how many positions are already cached (the RoPE offset for the next step), so the
 /// decoder reads it once before the step rather than threading an `index_pos` through every call.
 pub trait KvCache {
+    /// Preflight an experimental representation without changing the cache.  Existing dense
+    /// implementations retain their feature-off behavior through this default.
+    fn preflight_packed(&self, _query_length: usize, _mask: bool) -> CacheRoute {
+        CacheRoute::DenseFallback {
+            reason: "experimental packed representation disabled".into(),
+        }
+    }
+    /// Optional pre-update packed attention path. Returning `Some` means the cache appended the
+    /// current K/V and produced attention output directly; callers must not call `update` or
+    /// dense SDPA for that layer. The default preserves all existing cache implementations.
+    #[allow(clippy::too_many_arguments)]
+    fn try_packed_attention(
+        &mut self,
+        _layer: usize,
+        _query: &Array,
+        _keys: &Array,
+        _values: &Array,
+        _mask: PackedAttentionMask,
+        _scale: f32,
+        _retained_for_sharing: bool,
+    ) -> Result<Option<Array>> {
+        Ok(None)
+    }
+
+    /// Import a reused dense prefix — one `(keys, values)` pair per layer, each
+    /// `[batch, n_kv_heads, seq, head_dim]` — into an empty cache's own representation. Returns
+    /// `Ok(true)` when the cache now holds the prefix; the default declines (`Ok(false)`, nothing
+    /// mutated), and the caller keeps its dense seed.
+    fn import_prefix(&mut self, _layers: &[(Array, Array)]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Force an explicitly-reasoned dense transition before the caller performs its ordinary
+    /// update. Dense and paged caches are already dense, so their default is a no-op.
+    fn prepare_dense_fallback(&mut self, _operation: &str, _reason: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Model-boundary evidence for sealed packed-cache receipts.
+    fn packed_evidence(&self) -> Option<PackedCacheEvidence> {
+        None
+    }
+
+    /// Campaign-only measured storage of a live compressed representation. `None` for dense
+    /// caches, an empty compressed cache, or while an explicit dense fallback owns the history.
+    fn compressed_storage(&self) -> Result<Option<CompressedCacheStorage>> {
+        Ok(None)
+    }
+
+    /// Campaign-only: the explicit dense fallback cache owned by a compressed representation.
+    fn compressed_dense_fallback(&self) -> Option<&ContiguousKvCache> {
+        None
+    }
     /// Append `keys`/`values` for `layer` (each `[batch, n_kv_heads, step, head_dim]`) and return
     /// the full cached `(keys, values)` to attend over, same layout with the sequence axis grown.
     fn update(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<(Array, Array)>;
@@ -68,12 +247,42 @@ pub trait KvCache {
     fn truncate(&mut self, len: i32) -> Result<()>;
 
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
-    fn reset(&mut self);
+    fn reset(&mut self) -> Result<()>;
+
+    /// Arm exact speculative rollback at the current position (sc-20681): the next
+    /// [`KvCache::truncate`] to a length at or past this position must leave the cache exactly as
+    /// if only the kept positions had been appended. Speculative loops arm it before each verify
+    /// forward; the next truncate consumes it. A cache whose truncation is already exact (every
+    /// dense cache) needs nothing, which is the default; a quantizing cache keeps the unquantized
+    /// rows it appends until then.
+    fn begin_speculation(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Downcast hook so a decoder can recover its concrete cache from a `&mut dyn KvCache` — the
     /// hybrid Qwen3.6 cache (recurrent linear-attention state + KV) is driven natively rather than
     /// through the softmax-only [`KvCache::update`] path.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// Producer-only ownership evidence emitted by the contiguous cache.  This is intentionally a
+/// value type: campaign code can serialize it without exposing MLX arrays or changing the public
+/// decoder contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEvent {
+    pub layer: usize,
+    pub operation: &'static str,
+    pub role: &'static str,
+    pub lifetime: &'static str,
+    pub bytes: u64,
+    pub tokens: u64,
+}
+
+fn array_bytes(array: &Array) -> Result<u64> {
+    u64::try_from(array.size())
+        .ok()
+        .and_then(|elements| elements.checked_mul(u64::try_from(array.item_size()).ok()?))
+        .ok_or_else(|| crate::error::Error::Msg("KV shape overflows byte accounting".into()))
 }
 
 /// One layer's block-allocated K/V buffers plus how many leading positions are live.
@@ -91,6 +300,10 @@ struct LayerSlot {
     values: Array,
     /// Live positions (`<= capacity`).
     offset: i32,
+    /// Whether the buffers belong to someone else — a [`ContiguousKvCache::seeded`] slot holds the
+    /// prefix store's entry by reference. Growing such a slot retires nothing this cache owns: the
+    /// store keeps the old buffers alive, so no transient release is recorded for them.
+    borrowed: bool,
 }
 
 impl LayerSlot {
@@ -110,9 +323,12 @@ impl LayerSlot {
 /// A row-contiguous copy of `a` holding only `a`'s own elements. A `[.., ..offset]` view keeps
 /// the whole padded block buffer alive and, while it lives, forces the next in-place update to
 /// copy rather than donate; anything that outlives the step (the prefix store) takes this instead.
-/// `x * 1` is bit-exact for every float (unlike `x + 0`, which folds `-0.0`).
+/// `x * 1` is bit-exact for every float (unlike `x + 0`, which folds `-0.0`) and owns its buffer,
+/// but keeps a permuted-dense input's strides; [`contiguous`] then makes it row-major.
+///
+/// [`contiguous`]: crate::primitives::nn::contiguous
 fn materialize(a: &Array) -> Result<Array> {
-    Ok(multiply(a, Array::from_f32(1.0).as_dtype(a.dtype())?)?)
+    crate::primitives::nn::contiguous(&multiply(a, Array::from_f32(1.0).as_dtype(a.dtype())?)?)
 }
 
 /// Block-allocated KV cache: one `(K, V)` buffer pair per layer, grown by [`KV_BLOCK_TOKENS`]
@@ -127,6 +343,7 @@ pub struct ContiguousKvCache {
     layers: Vec<Option<LayerSlot>>,
     /// Growth granularity along the sequence axis.
     block: i32,
+    events: Vec<CacheEvent>,
 }
 
 impl ContiguousKvCache {
@@ -141,6 +358,7 @@ impl ContiguousKvCache {
         assert!(block >= 1, "kv cache block must be at least one position");
         Self {
             layers: (0..num_layers).map(|_| None).collect(),
+            events: Vec::new(),
             block,
         }
     }
@@ -173,6 +391,97 @@ impl ContiguousKvCache {
             .collect()
     }
 
+    /// Ownership events since construction, for the campaign producer only.
+    pub fn events(&self) -> &[CacheEvent] {
+        &self.events
+    }
+
+    /// Drop the ownership events recorded so far — a cache kept beyond its request (a prefix-cache
+    /// entry, sc-24437) carries no campaign evidence, which would otherwise grow with every update
+    /// the request made and stay resident as long as the entry.
+    pub(crate) fn clear_events(&mut self) {
+        self.events = Vec::new();
+    }
+
+    /// Actual scalar width of the retained key/value arrays.
+    pub fn element_bytes(&self) -> Result<Option<u64>> {
+        let mut observed = None;
+        for slot in self.layers.iter().flatten() {
+            for array in [&slot.keys, &slot.values] {
+                let bytes = u64::try_from(array.item_size()).map_err(|_| {
+                    crate::error::Error::Msg("KV element width overflows u64".into())
+                })?;
+                if bytes == 0 {
+                    return Err(crate::error::Error::Msg(
+                        "KV element width must be positive".into(),
+                    ));
+                }
+                match observed {
+                    Some(expected) if expected != bytes => {
+                        return Err(crate::error::Error::Msg(
+                            "dense KV cache contains mixed element widths".into(),
+                        ));
+                    }
+                    None => observed = Some(bytes),
+                    _ => {}
+                }
+            }
+        }
+        Ok(observed)
+    }
+
+    /// Count the resident K/V buffers, including the block padding allocated by this cache;
+    /// report the live token offset and allocated capacity separately for receipt geometry.
+    pub(crate) fn retained_snapshot(&self) -> Result<Option<(u64, u64, u64, u64)>> {
+        if self.layers.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if self.layers.iter().any(Option::is_none) {
+            return Err(crate::error::Error::Msg(
+                "dense KV cache has incomplete layer ownership".into(),
+            ));
+        }
+        let mut total_bytes = 0_u64;
+        let mut retained_tokens = None;
+        let mut allocated_tokens = None;
+        for slot in self.layers.iter().flatten() {
+            let key_tokens = u64::try_from(slot.offset)
+                .map_err(|_| crate::error::Error::Msg("KV sequence length overflows u64".into()))?;
+            if retained_tokens.is_some_and(|tokens| tokens != key_tokens) {
+                return Err(crate::error::Error::Msg(
+                    "dense KV cache has inconsistent retained sequence lengths".into(),
+                ));
+            }
+            retained_tokens = Some(key_tokens);
+            let capacity = u64::try_from(slot.capacity()).map_err(|_| {
+                crate::error::Error::Msg("KV allocated capacity overflows u64".into())
+            })?;
+            if allocated_tokens.is_some_and(|tokens| tokens != capacity) {
+                return Err(crate::error::Error::Msg(
+                    "dense KV cache has inconsistent allocated capacities".into(),
+                ));
+            }
+            allocated_tokens = Some(capacity);
+            let pair_bytes = array_bytes(&slot.keys)?
+                .checked_add(array_bytes(&slot.values)?)
+                .ok_or_else(|| {
+                    crate::error::Error::Msg("retained KV pair bytes overflow u64".into())
+                })?;
+            total_bytes = total_bytes.checked_add(pair_bytes).ok_or_else(|| {
+                crate::error::Error::Msg("retained KV cache bytes overflow u64".into())
+            })?;
+        }
+        let element_bytes = self.element_bytes()?.ok_or_else(|| {
+            crate::error::Error::Msg("retained KV cache has no scalar width".into())
+        })?;
+        Ok(Some((
+            total_bytes,
+            retained_tokens.unwrap_or_default(),
+            allocated_tokens.unwrap_or_default(),
+            element_bytes,
+        )))
+    }
+
     /// Construct a cache pre-populated with per-layer `(keys, values)` — the seam the prefix cache
     /// (story 7168) reuses a shared prefix's KV through. Each entry is `[batch, n_kv_heads, seq,
     /// head_dim]` (keys already-RoPE'd); the cache then reports [`KvCache::offset`] equal to that
@@ -195,6 +504,7 @@ impl ContiguousKvCache {
                         keys,
                         values,
                         offset,
+                        borrowed: true,
                     };
                     debug_assert_eq!(
                         slot.offset,
@@ -206,7 +516,33 @@ impl ContiguousKvCache {
                 })
                 .collect(),
             block: KV_BLOCK_TOKENS,
+            events: Vec::new(),
         }
+    }
+
+    /// Hand every layer's live `(keys, values)` to a caller that outlives this cache — the prefix
+    /// store taking a finished request's KV — without copying: the result is a `[.., ..offset]` view
+    /// of each block buffer, evaluated (so it is a materialized view, not a lazy graph), or `None`
+    /// if any layer is still empty.
+    ///
+    /// The views share the buffers, so the caller must be the last writer: reset (or drop) this
+    /// cache next and never update it again, or the next in-place write would copy the block
+    /// instead of donating it. Each view pins its block's padding (fewer than one block of
+    /// positions: every growth sizes the buffer to the live length plus whole blocks), a small
+    /// fraction of a long entry. The alternative, [`export`](Self::export), holds a second full
+    /// copy of the KV next to this cache until it is reset — at long context the dominant
+    /// transient of a prefix-store insert (sc-20671).
+    pub fn share_live(&self) -> Result<Option<Vec<(Array, Array)>>> {
+        let Some(layers) = self
+            .layers
+            .iter()
+            .map(|slot| slot.as_ref().map(LayerSlot::live).transpose())
+            .collect::<Result<Option<Vec<_>>>>()?
+        else {
+            return Ok(None);
+        };
+        mlx_rs::transforms::eval(layers.iter().flat_map(|(k, v)| [k, v]))?;
+        Ok(Some(layers))
     }
 
     /// Snapshot every layer's cached `(keys, values)` over the live positions, or `None` if any
@@ -254,6 +590,7 @@ impl ContiguousKvCache {
                             keys: materialize(&s.keys.try_index((.., .., ..capacity, ..))?)?,
                             values: materialize(&s.values.try_index((.., .., ..capacity, ..))?)?,
                             offset: len,
+                            borrowed: false,
                         })
                     })
                     .transpose()
@@ -265,6 +602,7 @@ impl ContiguousKvCache {
         Ok(Self {
             layers,
             block: self.block,
+            events: Vec::new(),
         })
     }
 
@@ -305,22 +643,41 @@ impl ContiguousKvCache {
         let zv = self.zero_block(&live_v, extra)?;
         slot.keys = concatenate_axis(&[&live_k, &zk], SEQ_AXIS)?;
         slot.values = concatenate_axis(&[&live_v, &zv], SEQ_AXIS)?;
+        slot.borrowed = false;
         Ok(())
+    }
+
+    /// Dense compatibility route used by the experimental packed-cache planner before mutation.
+    pub fn packed_preflight(&self, query_length: usize, mask: bool) -> CacheRoute {
+        self.preflight_packed(query_length, mask)
     }
 }
 
 impl KvCache for ContiguousKvCache {
     fn update(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<(Array, Array)> {
         let n = keys.shape()[SEQ_AXIS as usize];
+        // A borrowed (seeded) slot's buffers stay owned by the prefix store, so growing out of
+        // them retires nothing: only an owned buffer becomes a transient.
+        let prior_bytes = self.layers[layer]
+            .as_ref()
+            .filter(|slot| !slot.borrowed)
+            .map(|slot| {
+                array_bytes(&slot.keys)?
+                    .checked_add(array_bytes(&slot.values)?)
+                    .ok_or_else(|| crate::error::Error::Msg("prior KV bytes overflow u64".into()))
+            })
+            .transpose()?;
         let mut slot = match self.layers[layer].take() {
             Some(slot) => slot,
             None => LayerSlot {
                 keys: self.zero_block(keys, self.blocks_for(n))?,
                 values: self.zero_block(values, self.blocks_for(n))?,
                 offset: 0,
+                borrowed: false,
             },
         };
-        if slot.offset + n > slot.capacity() {
+        let grew = slot.offset + n > slot.capacity();
+        if grew {
             self.grow(&mut slot, n)?;
         }
         if n > 0 {
@@ -333,7 +690,39 @@ impl KvCache for ContiguousKvCache {
             slot.values
                 .try_index_mut((.., .., slot.offset..end, ..), values)?;
             slot.offset = end;
+            // The write's output is this cache's own buffer (a borrowed one is copied, never
+            // written through).
+            slot.borrowed = false;
         }
+        let retained_bytes = array_bytes(&slot.keys)?
+            .checked_add(array_bytes(&slot.values)?)
+            .ok_or_else(|| crate::error::Error::Msg("retained KV bytes overflow u64".into()))?;
+        let tokens = u64::try_from(slot.offset)
+            .map_err(|_| crate::error::Error::Msg("KV sequence length overflows u64".into()))?;
+        if grew {
+            // The grown buffer is the layer's new persistent cache (the `append` event below and
+            // the retained snapshot). What coexists with it transiently is only the retired
+            // pre-growth buffer, so that is the transient: recording old + new here would count
+            // the new buffer twice against a peak floor of persistent + transient.
+            if let Some(prior_bytes) = prior_bytes {
+                self.events.push(CacheEvent {
+                    layer,
+                    operation: "dense_block_growth_retired_buffer",
+                    role: "output",
+                    lifetime: "transient",
+                    bytes: prior_bytes,
+                    tokens,
+                });
+            }
+        }
+        self.events.push(CacheEvent {
+            layer,
+            operation: "append",
+            role: "cache",
+            lifetime: "persistent",
+            bytes: retained_bytes,
+            tokens,
+        });
         let live = slot.live()?;
         self.layers[layer] = Some(slot);
         Ok(live)
@@ -362,6 +751,7 @@ impl KvCache for ContiguousKvCache {
         for slot in self.layers.iter_mut().flatten() {
             slot.keys = slot.keys.take_axis(&idx, 0)?;
             slot.values = slot.values.take_axis(&idx, 0)?;
+            slot.borrowed = false;
         }
         Ok(())
     }
@@ -380,10 +770,35 @@ impl KvCache for ContiguousKvCache {
         Ok(())
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<()> {
+        let bytes = self
+            .layers
+            .iter()
+            .flatten()
+            .try_fold(0_u64, |total, slot| {
+                let pair = array_bytes(&slot.keys)?
+                    .checked_add(array_bytes(&slot.values)?)
+                    .ok_or_else(|| {
+                        crate::error::Error::Msg("released KV pair bytes overflow u64".into())
+                    })?;
+                total.checked_add(pair).ok_or_else(|| {
+                    crate::error::Error::Msg("released KV cache bytes overflow u64".into())
+                })
+            })?;
+        if bytes > 0 {
+            self.events.push(CacheEvent {
+                layer: usize::MAX,
+                operation: "cache_release",
+                role: "cache",
+                lifetime: "released",
+                bytes,
+                tokens: 0,
+            });
+        }
         for slot in &mut self.layers {
             *slot = None;
         }
+        Ok(())
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -490,6 +905,7 @@ mod tests {
             let mut cache = ContiguousKvCache::new(2);
             assert_eq!(cache.offset(), 0);
             assert_eq!(cache.batch_size(), 0);
+            assert_eq!(cache.element_bytes().unwrap(), None);
 
             let k = arange4(1, 2, 3, 4);
             let v = arange4(1, 2, 3, 4);
@@ -499,19 +915,89 @@ mod tests {
             assert_eq!(host(&ka), host(&k));
             assert_eq!(cache.offset(), 3);
             assert_eq!(cache.num_layers(), 2);
+            assert_eq!(cache.element_bytes().unwrap(), Some(4));
+            assert!(cache.retained_snapshot().is_err());
+            cache.update(1, &k, &v).unwrap();
+            // Two physical 256-token K/V blocks, although only three positions are live.
+            assert_eq!(
+                cache.retained_snapshot().unwrap(),
+                Some((32_768, 3, 256, 4))
+            );
         })
     }
 
     #[test]
-    fn second_update_concatenates_on_seq_axis() {
+    fn cache_events_account_for_block_growth_and_release() {
         on_cpu(|| {
-            let mut cache = ContiguousKvCache::new(1);
+            let mut cache = ContiguousKvCache::with_block_tokens(1, 4);
             let k0 = arange4(1, 2, 3, 4);
             cache.update(0, &k0, &k0).unwrap();
             let k1 = arange4(1, 2, 1, 4); // one new token
             let (ka, _) = cache.update(0, &k1, &k1).unwrap();
             assert_eq!(ka.shape(), &[1, 2, 4, 4]); // 3 + 1 along seq
             assert_eq!(cache.offset(), 4);
+            assert_eq!(cache.retained_snapshot().unwrap(), Some((256, 4, 4, 4)));
+            assert!(cache
+                .events()
+                .iter()
+                .all(|event| event.lifetime != "transient"));
+
+            cache.update(0, &k1, &k1).unwrap();
+            assert_eq!(cache.retained_snapshot().unwrap(), Some((512, 5, 8, 4)));
+            let event = cache
+                .events()
+                .iter()
+                .find(|event| event.operation == "dense_block_growth_retired_buffer")
+                .expect("block growth must publish the retired pre-growth buffer");
+            assert_eq!(event.role, "output");
+            assert_eq!(event.lifetime, "transient");
+            // Only the 256-byte retired buffer; the 512-byte grown buffer is the persistent cache.
+            assert_eq!(event.bytes, 256);
+            assert_eq!(event.tokens, 5);
+            cache.reset().unwrap();
+            assert_eq!(cache.retained_snapshot().unwrap(), None);
+            let release = cache.events().last().unwrap();
+            assert_eq!(release.operation, "cache_release");
+            assert_eq!(release.lifetime, "released");
+            assert_eq!(release.bytes, 512);
+        })
+    }
+
+    /// A chunk that lands exactly on a block boundary, then growth: persistent + the largest
+    /// transient equals the true coexistence peak (every layer's grown buffer plus one retired
+    /// buffer), never the double-counted old + new.
+    #[test]
+    fn block_growth_at_a_boundary_is_counted_once_in_the_peak_floor() {
+        on_cpu(|| {
+            const LAYERS: usize = 2;
+            let mut cache = ContiguousKvCache::with_block_tokens(LAYERS, 4);
+            let chunk = arange4(1, 2, 4, 4); // lands exactly on the 4-token block boundary
+            let one = arange4(1, 2, 1, 4);
+            for layer in 0..LAYERS {
+                cache.update(layer, &chunk, &chunk).unwrap();
+            }
+            let (before, ..) = cache.retained_snapshot().unwrap().unwrap();
+            assert!(cache
+                .events()
+                .iter()
+                .all(|event| event.lifetime != "transient"));
+            for layer in 0..LAYERS {
+                cache.update(layer, &one, &one).unwrap();
+            }
+            let (after, ..) = cache.retained_snapshot().unwrap().unwrap();
+            let per_layer_old = before / LAYERS as u64;
+            let per_layer_new = after / LAYERS as u64;
+            let transient = cache
+                .events()
+                .iter()
+                .filter(|event| event.lifetime == "transient")
+                .map(|event| event.bytes)
+                .max()
+                .unwrap();
+            // True peak: the last layer's old and new buffers coexist beside every grown layer.
+            let true_peak = per_layer_new * LAYERS as u64 + per_layer_old;
+            assert_eq!(after + transient, true_peak);
+            assert!(after + transient < after + per_layer_old + per_layer_new);
         })
     }
 
@@ -601,6 +1087,7 @@ mod tests {
             let (k, _) = cache.update(0, &b, &b).unwrap();
             assert_eq!(k.shape(), &[1, 1, 9, 2]);
             assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), 3 + 8);
+            assert_eq!(cache.retained_snapshot().unwrap(), Some((176, 9, 11, 4)));
             let expected: Vec<f32> = host(&a).into_iter().chain(host(&b)).collect();
             assert_eq!(host(&k), expected);
         })
@@ -642,6 +1129,20 @@ mod tests {
             let expected: Vec<f32> = host(&prefix).into_iter().chain(host(&suffix)).collect();
             assert_eq!(host(&k), expected);
             assert_eq!(cache.offset(), 6);
+            // The seeded buffer is the prefix store's, which keeps it: growing out of it retires
+            // nothing (a recorded transient would raise the campaign's phase-local peak floor by a
+            // whole prefix KV that is never allocated).
+            assert!(!cache
+                .events()
+                .iter()
+                .any(|event| event.operation == "dense_block_growth_retired_buffer"));
+            // Once grown, the buffer is the cache's own: the next growth retires it.
+            let more = arange4(1, 1, 300, 2);
+            cache.update(0, &more, &more).unwrap();
+            assert!(cache
+                .events()
+                .iter()
+                .any(|event| event.operation == "dense_block_growth_retired_buffer"));
         })
     }
 
@@ -765,7 +1266,7 @@ mod tests {
             let mut cache = ContiguousKvCache::new(2);
             let k = arange4(1, 2, 3, 4);
             cache.update(0, &k, &k).unwrap();
-            cache.reset();
+            cache.reset().unwrap();
             assert_eq!(cache.offset(), 0);
             assert!(cache.peek(0).unwrap().is_none());
         })
@@ -849,6 +1350,38 @@ mod tests {
                 cache_growth <= retired + block_pair + slack,
                 "freed-buffer cache grew {cache_growth} B; retired pre-growth buffers total {retired} B"
             );
+        })
+    }
+
+    #[test]
+    fn share_live_hands_over_the_buffers_without_a_copy() {
+        on_cpu(|| {
+            // The prefix store takes a finished request's KV through `share_live`: the entry must be
+            // the cache's own buffers (a copy is a second full KV at the store's high-water) and
+            // already materialized, over exactly the live positions.
+            let mut cache = ContiguousKvCache::with_block_tokens(1, MEM_BLOCK);
+            let inputs: Vec<(Array, Array)> = (0..5)
+                .map(|i| (mem_tok(i as f32), mem_tok(50.0 + i as f32)))
+                .collect();
+            let mut expected = (Vec::new(), Vec::new());
+            for (k, v) in &inputs {
+                let (ck, cv) = cache.update(0, k, v).unwrap();
+                mlx_rs::transforms::eval([&ck, &cv]).unwrap();
+                expected = (host(&ck), host(&cv));
+            }
+            let active_base = memory::get_active_memory();
+            let shared = cache.share_live().unwrap().unwrap();
+            let (sk, sv) = &shared[0];
+            let growth = memory::get_active_memory().saturating_sub(active_base);
+            let live_pair = 2 * 5 * MEM_BYTES_PER_POS;
+            assert!(
+                growth < live_pair / 2,
+                "share_live allocated {growth} B (a copy of the live K/V is {live_pair} B)"
+            );
+            assert_eq!(sk.shape(), &[1, MEM_HEADS, 5, MEM_HEAD_DIM]);
+            cache.reset().unwrap();
+            assert_eq!((host(sk), host(sv)), expected);
+            assert!(ContiguousKvCache::new(1).share_live().unwrap().is_none());
         })
     }
 

@@ -161,6 +161,16 @@ impl MemPool {
             )
     }
 
+    /// Reset only the concurrently-live byte high-water mark.
+    ///
+    /// This is the operation-window primitive: callers snapshot [`used`](Self::used), reset this
+    /// watermark, execute one serialized operation, then read [`used_high`](Self::used_high).
+    /// Unlike [`reset_high_water`](Self::reset_high_water), it deliberately preserves the
+    /// process-wide RESERVED high-water used by admission and whole-generation evidence.
+    pub fn reset_used_high_water(&self) -> bool {
+        self.set_attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH, 0)
+    }
+
     /// Return cached-free pool pages to the driver. Success is NOT the same as having freed anything:
     /// at a [`release_threshold`](Self::release_threshold) of 0 there is no retained cache to return,
     /// so on a stock candle setup this is a **no-op**.

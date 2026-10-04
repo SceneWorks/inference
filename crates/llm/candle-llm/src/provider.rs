@@ -394,6 +394,7 @@ impl Decoder {
             head_dim: head_dim.max(0) as u64,
             layers: layers as u64,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: hidden as u64,
             intermediate_size: intermediate,
             vocab_size: vocab as u64,
@@ -911,6 +912,11 @@ pub struct LlamaProvider {
     /// device's defaults-table row ([`crate::device::decode_defaults`]) unless
     /// [`set_speculative_default`](LlamaProvider::set_speculative_default) overrides it.
     speculative_default: core_llm::Speculative,
+    /// The loaded decoder's compressed-KV table family (sc-20683), named by the same
+    /// [`core_llm::qualified_kv_model_family`] rule the MLX backend uses, so a request reaches the same
+    /// policy decision on both backends. Candle has no fused compressed-domain reader, so every
+    /// generation runs dense and reports why ([`LlamaProvider::kv_cache_plan`]).
+    kv_family: Option<core_llm::KvModelFamily>,
 }
 
 /// A draft model resident beside its target (sc-24436).
@@ -1342,6 +1348,29 @@ pub(crate) fn write_test_snapshot_tensors(dir: &Path, names: &[&str], index: boo
     candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
 }
 
+/// The compressed-KV table family of a decoder dispatched as `arch` from `config` (sc-20683): the
+/// shared [`core_llm::qualified_kv_model_family`] rule — the (text) decoder config's identity, and
+/// only for a measured row's exact architecture (sc-20688 review) — exactly as the MLX backend
+/// names it.
+fn kv_family_of(arch: Architecture, config: &Value) -> Option<core_llm::KvModelFamily> {
+    core_llm::qualified_kv_model_family(arch.family(), config)
+}
+
+/// The attention geometry of a causal decoder for the shared compressed-KV plan's geometry stage
+/// ([`core_llm::KvAttentionGeometry`]; the MLX backend fills the same fields from its config), so
+/// a decoder outside the fused reader's geometry reports `UnsupportedGeometry` on both backends.
+fn kv_attention_geometry(cfg: &crate::config::ModelConfig) -> core_llm::KvAttentionGeometry {
+    core_llm::KvAttentionGeometry {
+        head_dim: u64::try_from(cfg.head_dim).unwrap_or(0),
+        attention_softcap: cfg.attn_logit_softcap.is_some(),
+        query_pre_attn_scalar: cfg
+            .query_pre_attn_scalar
+            .map(|scalar| u64::try_from(scalar).unwrap_or(0)),
+        latent_or_shared_kv: cfg.mla.is_some() || cfg.gemma4.is_some(),
+        mixture_of_experts: cfg.moe.is_some(),
+    }
+}
+
 /// Why a snapshot's family cannot hold NVFP4 projections, or `None` when it can (the family half of
 /// [`nvfp4_format_with`]). Prism/Bonsai snapshots are already packed affine-2; the qwen3_5 hybrid
 /// and every llama-family (`CausalLm`) architecture quantize their dense projections through the
@@ -1479,6 +1508,9 @@ impl LlamaProvider {
                     reasoning_effort: req.reasoning_effort,
                     preserve_thinking: req.preserve_thinking,
                     tools: &req.tools,
+                    // The same date the request's own render used (none on Candle), so the
+                    // conversation is a prefix of the prompt.
+                    date_string: None,
                 },
             )
             .ok()?;
@@ -2322,6 +2354,7 @@ impl LlamaProvider {
             speculative_default: crate::device::decode_defaults(device).speculative,
             draft: None,
             draft_report: None,
+            kv_family: kv_family_of(arch, &cfg_value),
             vision,
             gemma4,
             load_record: LoadRecord {
@@ -2469,6 +2502,8 @@ impl LlamaProvider {
                 speculative_default: crate::device::decode_defaults(device).speculative,
                 draft: None,
                 draft_report: None,
+                // The Prism/Bonsai hybrid has no table family.
+                kv_family: None,
                 constraint_table: OnceCell::new(),
                 vision,
                 gemma4: None,
@@ -2530,6 +2565,10 @@ impl LlamaProvider {
             speculative_default: crate::device::decode_defaults(device).speculative,
             draft: None,
             draft_report: None,
+            // No table family: the HF identity is reconstructed from `general.architecture`, and
+            // llama.cpp labels Mistral and other llama-shaped fine-tunes `"llama"` too, so a GGUF
+            // cannot be told to be the Llama family the evidence measured (as `from_parts`).
+            kv_family: None,
             constraint_table: OnceCell::new(),
             vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
@@ -2600,11 +2639,73 @@ impl LlamaProvider {
         self.load_record.clone()
     }
 
+    /// The loaded decoder's compressed-KV table family (sc-20683); `None` for a model the
+    /// qualification table did not measure.
+    pub fn kv_model_family(&self) -> Option<core_llm::KvModelFamily> {
+        self.kv_family
+    }
+
+    /// Test seam (sc-20688 review): plan this provider's KV cache as `family`, as if its loaded
+    /// checkpoint were that family's measured architecture, so the shared policy can be exercised
+    /// on synthetic weights. Production loads name a family only for a measured architecture.
+    /// Compiled only with the `test-kv-arm` feature, which this crate's own integration tests
+    /// enable; a product build cannot arm a family.
+    #[cfg(any(test, feature = "test-kv-arm"))]
+    #[doc(hidden)]
+    pub fn arm_kv_model_family_for_tests(&mut self, family: Option<core_llm::KvModelFamily>) {
+        self.kv_family = family;
+    }
+
+    /// The KV cache a generation of `context_tokens` prefilled tokens and up to `max_new_tokens`
+    /// more, in a `batch`-sequence decode, runs on (sc-20683) — what [`TextLlm::generate`] reports
+    /// on [`TextLlmOutput::kv_cache`]. The same shared policy decision as the MLX backend
+    /// ([`core_llm::plan_kv_cache`]: policy, batch, family, prompt minimum, final-context maximum,
+    /// request shape, the shared geometry stage), always dense: Candle has no fused
+    /// compressed-domain reader on any device, so a request MLX would run compressed reports
+    /// [`core_llm::KvCacheFallbackReason::ReaderUnavailable`], and a decoder outside the fused
+    /// reader's geometry reports [`core_llm::KvCacheFallbackReason::UnsupportedGeometry`] on both
+    /// backends.
+    pub fn kv_cache_plan(
+        &self,
+        policy: core_llm::KvCompressionPolicy,
+        context_tokens: u64,
+        max_new_tokens: u32,
+        batch: u64,
+        multimodal: bool,
+    ) -> core_llm::KvCacheReport {
+        let unsupported_request = if multimodal {
+            Some("multimodal prefill splices embeddings outside the compressed cache".to_string())
+        } else if matches!(self.model, Decoder::Qwen35(_)) {
+            Some("the hybrid recurrent decoder has no compressed cache".to_string())
+        } else {
+            None
+        };
+        core_llm::plan_kv_cache_without_reader(
+            core_llm::KvCacheRequest {
+                policy,
+                family: self.kv_family,
+                context_tokens,
+                max_new_tokens: u64::from(max_new_tokens),
+                batch,
+                unsupported_request,
+                // The hybrid decoder is refused by the request-shape stage before geometry.
+                geometry: match &self.model {
+                    Decoder::Causal(model) => kv_attention_geometry(model.config()),
+                    _ => core_llm::KvAttentionGeometry::default(),
+                },
+            },
+            "the Candle backend",
+        )
+    }
+
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
     /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         let backend = crate::device::decode_backend(model.device());
         Self {
+            // No config identity, so no table family: a Llama decoder assembled from parts cannot
+            // be told from a Mistral or dense Qwen2 one (as MLX's `from_parts`).
+            kv_family: None,
             descriptor: provider_descriptor_on(backend),
             model: Decoder::Causal(model),
             mtp: None,
@@ -4160,6 +4261,7 @@ impl TextLlm for LlamaProvider {
                 reasoning_effort: req.reasoning_effort,
                 preserve_thinking: req.preserve_thinking,
                 tools: &req.tools,
+                date_string: None,
             },
         )?;
         let prompt_ids: Vec<i32> = self
@@ -4200,6 +4302,16 @@ impl TextLlm for LlamaProvider {
             admitted_prompt,
             req.max_new_tokens,
         )?;
+        // sc-20683: the request's KV cache under the shared compressed-KV policy — always dense
+        // here, with the reason MLX's decision for the same request gives (or `ReaderUnavailable`
+        // where MLX would compress).
+        let kv_cache = self.kv_cache_plan(
+            req.kv_compression,
+            u64::try_from(admitted_prompt).unwrap_or(u64::MAX),
+            req.max_new_tokens,
+            1,
+            multimodal || gemma4_mm_request,
+        );
         // Every portable eager-attention mask variant is query-tiled; CUDA flash attention is
         // bounded more tightly. Use the runtime's exact maximum tile so admission prices the same
         // peak score/mask/weight lifetime the implementation enforces.
@@ -5291,6 +5403,7 @@ impl TextLlm for LlamaProvider {
             mtp: mtp_stats,
             decode: Some(request_report(&decode_record, cuda_graphs_on, fallbacks)),
             finish_reason: Some(finish),
+            kv_cache: Some(kv_cache),
         })
     }
 }
@@ -5825,6 +5938,7 @@ mod tests {
             head_dim: 128,
             layers: 64,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -8113,6 +8227,12 @@ mod tests {
     /// A tiny `qwen3` GGUF (2 layers, hidden 32, vocab 40): Q8_0 matrices, f32 norms, and a
     /// sibling tokenizer. Returns every tensor's element count and the layer projections'.
     fn write_tiny_gguf(path: &std::path::Path) -> (u64, Vec<u64>) {
+        write_tiny_gguf_arch(path, "qwen3")
+    }
+
+    /// [`write_tiny_gguf`] with `general.architecture = arch` (`"qwen3"` or `"llama"`; a llama
+    /// GGUF carries no per-head q/k norms).
+    fn write_tiny_gguf_arch(path: &std::path::Path, arch: &str) -> (u64, Vec<u64>) {
         use crate::primitives::{SplitMix64, TokenRng};
         use candle_core::quantized::gguf_file::{self, Value as Meta};
         use candle_core::quantized::{GgmlDType, QTensor};
@@ -8142,8 +8262,10 @@ mod tests {
             let b = |s: &str| format!("blk.{i}.{s}");
             add(b("attn_norm.weight"), &[hidden], false);
             add(b("ffn_norm.weight"), &[hidden], false);
-            add(b("attn_q_norm.weight"), &[8], false);
-            add(b("attn_k_norm.weight"), &[8], false);
+            if arch == "qwen3" {
+                add(b("attn_q_norm.weight"), &[8], false);
+                add(b("attn_k_norm.weight"), &[8], false);
+            }
             add(b("attn_q.weight"), &[hidden, hidden], true);
             add(b("attn_k.weight"), &[kv, hidden], true);
             add(b("attn_v.weight"), &[kv, hidden], true);
@@ -8152,19 +8274,23 @@ mod tests {
             add(b("ffn_up.weight"), &[inter, hidden], true);
             add(b("ffn_down.weight"), &[hidden, inter], true);
         }
+        let key = |s: &str| format!("{arch}.{s}");
         let metadata = [
-            ("general.architecture", Meta::String("qwen3".into())),
-            ("qwen3.attention.head_count", Meta::U32(4)),
-            ("qwen3.attention.head_count_kv", Meta::U32(2)),
-            ("qwen3.attention.key_length", Meta::U32(8)),
-            ("qwen3.embedding_length", Meta::U32(hidden as u32)),
-            ("qwen3.block_count", Meta::U32(layers as u32)),
-            ("qwen3.feed_forward_length", Meta::U32(inter as u32)),
-            ("qwen3.context_length", Meta::U32(256)),
-            ("qwen3.attention.layer_norm_rms_epsilon", Meta::F32(1e-6)),
-            ("qwen3.rope.freq_base", Meta::F32(1e6)),
+            (
+                "general.architecture".to_string(),
+                Meta::String(arch.into()),
+            ),
+            (key("attention.head_count"), Meta::U32(4)),
+            (key("attention.head_count_kv"), Meta::U32(2)),
+            (key("attention.key_length"), Meta::U32(8)),
+            (key("embedding_length"), Meta::U32(hidden as u32)),
+            (key("block_count"), Meta::U32(layers as u32)),
+            (key("feed_forward_length"), Meta::U32(inter as u32)),
+            (key("context_length"), Meta::U32(256)),
+            (key("attention.layer_norm_rms_epsilon"), Meta::F32(1e-6)),
+            (key("rope.freq_base"), Meta::F32(1e6)),
         ];
-        let metadata: Vec<(&str, &Meta)> = metadata.iter().map(|(k, v)| (*k, v)).collect();
+        let metadata: Vec<(&str, &Meta)> = metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let tensor_refs: Vec<(&str, &QTensor)> =
             tensors.iter().map(|(k, t)| (k.as_str(), t)).collect();
         gguf_file::write(
@@ -8179,6 +8305,31 @@ mod tests {
         )
         .unwrap();
         (total, projections)
+    }
+
+    /// sc-20683 review: a GGUF's HF identity is reconstructed from `general.architecture`, which
+    /// labels Mistral and other llama-shaped fine-tunes `"llama"` too, so no GGUF load names a
+    /// compressed-KV table family — an opted-in request is `UnqualifiedModel`.
+    #[test]
+    fn a_gguf_load_names_no_compressed_kv_family() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        for arch in ["llama", "qwen3"] {
+            let dir = tempfile::Builder::new()
+                .prefix("candle-gguf-kv-family-")
+                .tempdir()
+                .unwrap();
+            let path = dir.path().join(format!("tiny-{arch}.gguf"));
+            write_tiny_gguf_arch(&path, arch);
+            let provider = super::LlamaProvider::load(&spec_at(&path, None)).unwrap();
+            assert_eq!(provider.kv_model_family(), None, "{arch}");
+            assert_eq!(
+                provider
+                    .kv_cache_plan(Policy::Qualified, 40_000, 64, 1, false)
+                    .fallback,
+                Some(Reason::UnqualifiedModel),
+                "{arch}"
+            );
+        }
     }
 
     /// sc-24140 review: a llama-family GGUF load dequantizes every tensor into a dense f32 map on
@@ -10901,6 +11052,7 @@ mod tests {
                         reasoning_effort: req.reasoning_effort,
                         preserve_thinking: req.preserve_thinking,
                         tools: &req.tools,
+                        date_string: None,
                     },
                 )
                 .unwrap();

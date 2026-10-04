@@ -571,6 +571,11 @@ fn svg_text_output(
         // words MLX's StarVector uses (E2, E8).
         decode: record.map(|record| svg_report(&record, req, speculative_default)),
         finish_reason: Some(finish),
+        // The StarVector wrapper has no compressed-KV table family: the dense KV-cache report for
+        // the request's policy (sc-20683).
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(
+            req.kv_compression,
+        )),
     })
 }
 /// An SVG continuation's measured report (sc-24139): the engine record with the CUDA-graph
@@ -876,6 +881,35 @@ mod tests {
             "num_attention_heads": 16,
             "multi_query": true
         })
+    }
+
+    /// sc-20683: every SVG text output reports the dense KV cache with the shared reason for its
+    /// policy.
+    #[test]
+    fn svg_text_output_reports_the_dense_kv_cache_for_the_policy() {
+        use core_llm::{
+            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        };
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let req = core_llm::TextLlmRequest {
+                messages: vec![core_llm::Message::user("x")],
+                kv_compression: policy,
+                max_new_tokens: 64,
+                ..Default::default()
+            };
+            let output = svg_text_output(&req, 0, core_llm::Speculative::Off, &mut |_| {}, |svg| {
+                let mut stream = StarVectorBoundedStream::new(svg);
+                for fragment in core_llm_testkit::deterministic_svg_fixture().fragments {
+                    stream.push(fragment, std::time::Duration::ZERO)?;
+                }
+                Ok((stream.output()?, None))
+            })
+            .unwrap();
+            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
+        }
     }
 
     #[test]

@@ -33,13 +33,19 @@
 //! mask + KV read window + causal RoPE offset — the released reference applies no additive attention
 //! bias / `score_mod` in its sampling path (see the crate-root reconciliation note).
 
+use std::time::Instant;
+
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, DiffPatchPart};
 use mlx_gen::{Error, Result};
 use mlx_gen_wan::patchify::unpatchify;
-use mlx_gen_wan::{normalize_wan_key, WanTransformer};
+use mlx_gen_wan::{normalize_wan_key, CausalPackedAttention, WanTransformer};
 use mlx_rs::ops::{concatenate_axis, dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
+use crate::compressed_kv::{
+    CompressedTier, KreaPackedMetalKernel, RetainedKernelHandle,
+    PACKED_METAL_THREADGROUP_SCRATCH_BYTES,
+};
 use crate::config::{KreaRealtimeConfig, KvCacheQuant};
 
 #[cfg(test)]
@@ -59,6 +65,66 @@ fn mask_materialization_count() -> usize {
 /// This is the **dense** form the attention path produces and consumes. The cache may store it
 /// group-wise-quantized ([`KvCacheQuant`]) and dequantize on read — see [`CausalKvCache`].
 pub type LayerKv = (Array, Array);
+
+/// One forward's borrowed adapter from Wan's projected q/current-K/current-V into Krea's retained
+/// packed history. Any per-layer capability miss is promoted to the whole-forward fallback boundary
+/// because this adapter intentionally omits dense history from Wan's provisional packed attempt.
+struct PackedKreaAttentionBackend<'a> {
+    cache: &'a CausalKvCache,
+    query_positions: Array,
+    key_positions: Array,
+    block_size: usize,
+    dispatched_outputs: Vec<Array>,
+}
+
+const PACKED_DISPATCH_ERROR_PREFIX: &str = "SC-20684 packed dispatch failed: ";
+
+#[inline]
+fn packed_dispatch_complete(dispatched_layers: usize, intended_layers: usize) -> bool {
+    intended_layers != 0 && dispatched_layers == intended_layers
+}
+
+impl CausalPackedAttention for PackedKreaAttentionBackend<'_> {
+    fn attend(
+        &mut self,
+        layer: usize,
+        q: &Array,
+        current_k: &Array,
+        current_v: &Array,
+        _mask: Option<&Array>,
+        scale: f32,
+    ) -> Result<Option<Array>> {
+        // The packed kernel represents Krea's block-causal mask analytically from the O(S)
+        // position vectors and the product block size. No additive [Sq,Sk] tensor is consumed.
+        let shape = q.shape();
+        let expected_scale = (shape.get(3).copied().unwrap_or_default() as f32).powf(-0.5);
+        if shape.len() != 4
+            || shape[0] != 1
+            || shape[1] != 40
+            || shape[3] != 128
+            || scale.to_bits() != expected_scale.to_bits()
+        {
+            return Err(Error::Msg(format!(
+                "{PACKED_DISPATCH_ERROR_PREFIX}unsupported layer {layer} query geometry {:?} or scale {scale}",
+                q.shape()
+            )));
+        }
+        let output = self
+            .cache
+            .dispatch_experimental_packed_layer(
+                layer,
+                q,
+                current_k,
+                current_v,
+                &self.query_positions,
+                &self.key_positions,
+                self.block_size,
+            )
+            .map_err(|error| Error::Msg(format!("{PACKED_DISPATCH_ERROR_PREFIX}{error}")))?;
+        self.dispatched_outputs.push(output.clone());
+        Ok(Some(output))
+    }
+}
 
 /// One group-wise affine-quantized cached tensor: the packed payload plus its per-group scales and
 /// biases (sc-17807).
@@ -198,6 +264,15 @@ impl StoredKv {
         }
     }
 
+    fn packed(&self) -> Result<(&PackedKv, &PackedKv)> {
+        match self {
+            Self::Packed { k, v } => Ok((k, v)),
+            Self::Dense { .. } => Err(Error::Msg(
+                "krea packed Metal POC was selected for a dense cache".into(),
+            )),
+        }
+    }
+
     /// Bytes physically retained for this layer — the **stored** representation, so a quantized cache
     /// reports its packed cost rather than what it would cost dequantized.
     fn nbytes(&self) -> usize {
@@ -205,6 +280,18 @@ impl StoredKv {
             Self::Dense { k, v } => k.nbytes() + v.nbytes(),
             Self::Packed { k, v } => k.nbytes() + v.nbytes(),
         }
+    }
+
+    /// Materialize a staged successor before it becomes observable cache state. MLX concat and
+    /// quantize are lazy, so publication without this barrier could poison a later dense retry.
+    fn eval(&self) -> Result<()> {
+        match self {
+            Self::Dense { k, v } => mlx_rs::transforms::eval([k, v])?,
+            Self::Packed { k, v } => {
+                mlx_rs::transforms::eval([&k.w, &k.scales, &k.biases, &v.w, &v.scales, &v.biases])?
+            }
+        }
+        Ok(())
     }
 }
 
@@ -372,10 +459,67 @@ pub struct CausalKvCache {
     /// Storage tier for the retained K/V: `None` = bf16 (the shipped default), `Some(q)` = group-wise
     /// affine-quantized, dequantized on read (sc-17807).
     quant: Option<KvCacheQuant>,
+    /// Retained only after an explicit experimental caller enables the packed Metal path. The
+    /// default cache never constructs this object and therefore stays on the existing dense SDPA.
+    packed_metal_kernel: Option<KreaPackedMetalKernel>,
+    /// Product-boundary counters for the experimental route. A runtime/JIT dispatch fault is
+    /// retried through unchanged dense SDPA and remains visible here for the device receipt.
+    packed_metal_accepted_forwards: usize,
+    packed_metal_materialized_scratch_dispatches: usize,
+    packed_metal_bounded_scratch_bytes: usize,
+    packed_metal_dense_fallbacks: usize,
+    last_packed_metal_fallback: Option<String>,
+    packed_metal_dispatch_geometries: Vec<PackedMetalDispatchGeometry>,
+    /// Evaluated packed-forward timing. The first accepted forward includes lazy Metal pipeline
+    /// compilation; later accepted forwards are the steady evaluated distribution. Failed/fallback
+    /// attempts are deliberately excluded from accepted-path timing and remain visible in the
+    /// fallback counters above.
+    packed_metal_first_forward_ns: Option<u64>,
+    packed_metal_steady_forward_ns: u64,
+    packed_metal_steady_forward_count: usize,
+    /// Successful packed append transactions, including quantize/concat and forced evaluation of
+    /// every successor layer before publication.
+    packed_metal_append_ns: u64,
+    packed_metal_append_count: usize,
+    /// Largest logical old-plus-successor payload simultaneously alive at an immutable MLX append
+    /// barrier. Process receipts still measure allocator high water; this prevents retained-only
+    /// accounting from concealing full-history concat residency. Recorded only by the armed
+    /// packed-Metal POC (the only path with that barrier); stays 0 on the production cache.
+    peak_append_coexistence_bytes: usize,
     /// Test-only switch for the real-weight before/after oracle. `false` reproduces the pre-sc-17894
     /// eager max-window eviction exactly; production builds do not carry this field or branch.
     #[cfg(test)]
     evict_to_next_read: bool,
+}
+
+/// Provider-owned measurement snapshot for an opt-in packed-Metal cache.  This is deliberately
+/// populated from the cache which actually participated in a forward, rather than from a caller's
+/// requested tier.  It is the narrow runtime seam consumed by the SC-20684 real-weight observer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedMetalDispatchGeometry {
+    pub query_tokens: usize,
+    pub key_tokens: usize,
+    pub accepted_forwards: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedMetalRouteReceipt {
+    pub compiled_handle_identity: String,
+    pub retained_handle_bytes: usize,
+    pub persistent_bytes: usize,
+    pub bounded_scratch_bytes: usize,
+    pub materialized_scratch_dispatches: usize,
+    pub dense_window_bytes: usize,
+    pub score_matrix_bytes: usize,
+    pub accepted_forwards: usize,
+    pub dense_fallbacks: usize,
+    pub last_fallback_reason: Option<String>,
+    pub dispatch_geometries: Vec<PackedMetalDispatchGeometry>,
+    pub first_evaluated_forward_ns: u64,
+    pub steady_evaluated_forward_ns: u64,
+    pub steady_evaluated_forward_count: usize,
+    pub accepted_append_ns: u64,
+    pub accepted_append_count: usize,
 }
 
 impl CausalKvCache {
@@ -401,6 +545,19 @@ impl CausalKvCache {
             max_attention_size,
             sink_tokens,
             quant,
+            packed_metal_kernel: None,
+            packed_metal_accepted_forwards: 0,
+            packed_metal_materialized_scratch_dispatches: 0,
+            packed_metal_bounded_scratch_bytes: 0,
+            packed_metal_dense_fallbacks: 0,
+            last_packed_metal_fallback: None,
+            packed_metal_dispatch_geometries: Vec::new(),
+            packed_metal_first_forward_ns: None,
+            packed_metal_steady_forward_ns: 0,
+            packed_metal_steady_forward_count: 0,
+            packed_metal_append_ns: 0,
+            packed_metal_append_count: 0,
+            peak_append_coexistence_bytes: 0,
             #[cfg(test)]
             evict_to_next_read: true,
         }
@@ -422,6 +579,210 @@ impl CausalKvCache {
     /// The storage tier this cache retains K/V at — `None` for the shipped bf16 cache.
     pub fn quant(&self) -> Option<KvCacheQuant> {
         self.quant
+    }
+
+    pub fn packed_metal_route_stats(&self) -> (usize, usize, Option<&str>) {
+        (
+            self.packed_metal_accepted_forwards,
+            self.packed_metal_dense_fallbacks,
+            self.last_packed_metal_fallback.as_deref(),
+        )
+    }
+
+    /// Return a receipt only for the retained experimental kernel that this cache owns. Scratch is
+    /// reported only after a packed output has materialized successfully; before the first accepted
+    /// dispatch it remains zero. Persistent bytes and route counters come from this live cache.
+    pub fn packed_metal_route_receipt(&self) -> Option<PackedMetalRouteReceipt> {
+        let kernel = self.packed_metal_kernel.as_ref()?;
+        Some(PackedMetalRouteReceipt {
+            compiled_handle_identity: kernel.identity().to_owned(),
+            retained_handle_bytes: kernel.retained_bytes(),
+            persistent_bytes: self.retained_bytes(),
+            bounded_scratch_bytes: self.packed_metal_bounded_scratch_bytes,
+            materialized_scratch_dispatches: self.packed_metal_materialized_scratch_dispatches,
+            dense_window_bytes: 0,
+            score_matrix_bytes: 0,
+            accepted_forwards: self.packed_metal_accepted_forwards,
+            dense_fallbacks: self.packed_metal_dense_fallbacks,
+            last_fallback_reason: self.last_packed_metal_fallback.clone(),
+            dispatch_geometries: self.packed_metal_dispatch_geometries.clone(),
+            first_evaluated_forward_ns: self.packed_metal_first_forward_ns.unwrap_or(0),
+            steady_evaluated_forward_ns: self.packed_metal_steady_forward_ns,
+            steady_evaluated_forward_count: self.packed_metal_steady_forward_count,
+            accepted_append_ns: self.packed_metal_append_ns,
+            accepted_append_count: self.packed_metal_append_count,
+        })
+    }
+
+    fn record_packed_forward_duration(
+        &mut self,
+        elapsed: std::time::Duration,
+        query_tokens: usize,
+        key_tokens: usize,
+    ) {
+        self.packed_metal_materialized_scratch_dispatches = self
+            .packed_metal_materialized_scratch_dispatches
+            .saturating_add(1);
+        self.packed_metal_bounded_scratch_bytes = self
+            .packed_metal_bounded_scratch_bytes
+            .max(PACKED_METAL_THREADGROUP_SCRATCH_BYTES);
+        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        if self.packed_metal_first_forward_ns.is_none() {
+            self.packed_metal_first_forward_ns = Some(elapsed_ns);
+        } else {
+            self.packed_metal_steady_forward_ns = self
+                .packed_metal_steady_forward_ns
+                .saturating_add(elapsed_ns);
+            self.packed_metal_steady_forward_count =
+                self.packed_metal_steady_forward_count.saturating_add(1);
+        }
+        if let Some(geometry) = self
+            .packed_metal_dispatch_geometries
+            .iter_mut()
+            .find(|geometry| {
+                geometry.query_tokens == query_tokens && geometry.key_tokens == key_tokens
+            })
+        {
+            geometry.accepted_forwards = geometry.accepted_forwards.saturating_add(1);
+        } else {
+            self.packed_metal_dispatch_geometries
+                .push(PackedMetalDispatchGeometry {
+                    query_tokens,
+                    key_tokens,
+                    accepted_forwards: 1,
+                });
+        }
+    }
+
+    fn record_packed_append_duration(&mut self, elapsed: std::time::Duration) {
+        self.packed_metal_append_ns = self
+            .packed_metal_append_ns
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.packed_metal_append_count = self.packed_metal_append_count.saturating_add(1);
+    }
+
+    pub fn peak_append_coexistence_bytes(&self) -> usize {
+        self.peak_append_coexistence_bytes
+    }
+
+    /// Explicitly construct and retain the MLX custom kernel for an already-quantized Krea cache.
+    /// This is intentionally separate from [`Self::new`]: production configuration remains dense
+    /// unless an experiment opts in and handles construction failure before any cache mutation.
+    pub fn enable_experimental_packed_metal(&mut self, allow_q4_quality_arm: bool) -> Result<()> {
+        let tier = match self.quant {
+            Some(KvCacheQuant {
+                bits: 8,
+                group_size: 64,
+            }) => CompressedTier::Q8,
+            Some(KvCacheQuant {
+                bits: 4,
+                group_size: 64,
+            }) if allow_q4_quality_arm => CompressedTier::Q4,
+            Some(KvCacheQuant {
+                bits: 4,
+                group_size: 64,
+            }) => {
+                return Err(Error::Msg(
+                    "krea packed Metal Q4 requires the separate quality-arm acknowledgement".into(),
+                ))
+            }
+            _ => {
+                return Err(Error::Msg(
+                    "krea packed Metal POC requires Q8/Q4 group-64 cache storage".into(),
+                ))
+            }
+        };
+        self.packed_metal_kernel = Some(KreaPackedMetalKernel::new(tier)?);
+        Ok(())
+    }
+
+    /// Whether this cache owns the experimental retained packed-attention kernel. This reports
+    /// construction, not successful JIT compilation or device dispatch.
+    pub fn experimental_packed_metal_enabled(&self) -> bool {
+        self.packed_metal_kernel.is_some()
+    }
+
+    fn preview_window_positions(&self, s_new: usize) -> Result<Vec<i64>> {
+        let positions = self.window_positions(s_new);
+        let sink_kept = self.sink_kept();
+        if let Some(requested) = positions
+            .iter()
+            .map(|&g| g as usize)
+            .find(|&g| g >= sink_kept && g < self.tail_base)
+        {
+            return Err(Error::Msg(format!(
+                "krea causal: packed reread needs evicted token {requested}; retained tail starts at {}",
+                self.tail_base
+            )));
+        }
+        Ok(positions)
+    }
+
+    /// Accept only an already-physical packed read window.  The POC deliberately does not gather
+    /// before lazy Metal JIT: a JIT/command-buffer error must be able to fall straight back to
+    /// dense SDPA without rollback. Sliding/sink geometries therefore reject before mutation.
+    fn prepare_packed_window(&self, s_new: usize) -> Result<Vec<i64>> {
+        let positions = self.preview_window_positions(s_new)?;
+        let phys: Vec<i32> = positions
+            .iter()
+            .map(|&g| self.phys_index(g as usize) as i32)
+            .collect();
+        let whole = phys.len() == self.retained_tokens()
+            && phys.iter().enumerate().all(|(i, &p)| p as usize == i);
+        if !whole {
+            return Err(Error::Msg(
+                "krea packed Metal POC requires an already-physical cache window; sliding/sink gather falls back before mutation".into(),
+            ));
+        }
+        for stored in self.layers.iter().flatten() {
+            stored.packed()?;
+        }
+        Ok(positions)
+    }
+
+    /// Direct packed-cache dispatch seam used by the experimental Wan attention backend. The
+    /// caller supplies only this layer's projected current K/V and O(S) global positions; historical
+    /// cache storage remains Krea's uint32/bf16 packed rows for the kernel to decode itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_experimental_packed_layer(
+        &self,
+        layer: usize,
+        q: &Array,
+        current_k: &Array,
+        current_v: &Array,
+        query_positions: &Array,
+        key_positions: &Array,
+        block_size: usize,
+    ) -> Result<Array> {
+        let kernel = self.packed_metal_kernel.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "krea packed Metal dispatch requested without an enabled retained kernel".into(),
+            )
+        })?;
+        let stored = self
+            .layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "krea packed Metal dispatch missing cached layer {layer}"
+                ))
+            })?;
+        let (k, v) = stored.packed()?;
+        kernel.dispatch(
+            q,
+            &k.w,
+            &k.scales,
+            &k.biases,
+            &v.w,
+            &v.scales,
+            &v.biases,
+            current_k,
+            current_v,
+            query_positions,
+            key_positions,
+            block_size,
+        )
     }
 
     /// Bytes **physically retained** right now, summed over every layer, in the representation the
@@ -641,6 +1002,7 @@ impl CausalKvCache {
     /// grows that tail until the next read supplies its actual length and trims again. `new_kv` must
     /// carry exactly one `(k, v)` per layer.
     pub fn append(&mut self, new_kv: Vec<LayerKv>) -> Result<()> {
+        let packed_append_started = self.packed_metal_kernel.as_ref().map(|_| Instant::now());
         if new_kv.len() != self.layers.len() {
             return Err(Error::Msg(format!(
                 "krea causal: append expected {} layers, got {}",
@@ -648,34 +1010,76 @@ impl CausalKvCache {
                 new_kv.len()
             )));
         }
-        // Concatenate this chunk's K/V onto the physical tail (each layer identically). When the cache
-        // is quantized the chunk is packed **here**, at commit — once per chunk, not once per denoise
-        // step, since only the committing forward reaches `append` (sc-17807).
-        let mut s_new = 0usize;
-        for (slot, kv) in self.layers.iter_mut().zip(new_kv) {
-            s_new = kv.0.shape()[2] as usize;
+        let expected_shape = new_kv
+            .first()
+            .map(|(k, _)| k.shape().to_vec())
+            .ok_or_else(|| Error::Msg("krea causal: append requires at least one layer".into()))?;
+        if expected_shape.len() != 4 || expected_shape.contains(&0) {
+            return Err(Error::Msg(format!(
+                "krea causal: append requires nonempty [B,H,S,D] tensors, got {expected_shape:?}"
+            )));
+        }
+        for (layer, (k, v)) in new_kv.iter().enumerate() {
+            if k.shape() != expected_shape || v.shape() != expected_shape || k.dtype() != v.dtype()
+            {
+                return Err(Error::Msg(format!(
+                    "krea causal: append layer {layer} must match K/V geometry and dtype {:?}/{:?}; expected shape {expected_shape:?}",
+                    k.shape(), v.shape()
+                )));
+            }
+        }
+        let s_new = expected_shape[2] as usize;
+        let committed_after = self
+            .committed_tokens
+            .checked_add(s_new)
+            .ok_or_else(|| Error::Msg("krea causal: committed token count overflow".into()))?;
+
+        // Build every layer's packed/concatenated successor without touching observable cache state.
+        // A pack/concat construction failure therefore leaves all layers and counters at the old
+        // boundary. These are lazy MLX graphs (the same take + concat the cache always built); on the
+        // production path nothing is evaluated here and the successors become the cache as-is.
+        let mut staged_layers = Vec::with_capacity(self.layers.len());
+        for (slot, kv) in self.layers.iter().zip(new_kv) {
             let incoming = StoredKv::store(kv, self.quant)?;
-            *slot = Some(match slot.take() {
+            let staged = match slot {
                 None => incoming,
-                Some(prev) => prev.concat(&incoming)?,
-            });
+                Some(previous) => previous.concat(&incoming)?,
+            };
+            staged_layers.push(Some(staged));
+        }
+
+        // Experimental packed-Metal POC only: evaluate every successor before publishing any layer
+        // so a late device fault leaves the old cache intact for the dense retry, and record the
+        // old-plus-successor payload that coexists at that barrier. The production cache never
+        // arms the POC, so it never pays this per-append eval or the coexistence residency.
+        if self.packed_metal_kernel.is_some() {
+            let append_coexistence_bytes = self.retained_bytes().saturating_add(
+                staged_layers
+                    .iter()
+                    .flatten()
+                    .map(StoredKv::nbytes)
+                    .sum::<usize>(),
+            );
+            for staged in staged_layers.iter().flatten() {
+                staged.eval()?;
+            }
+            self.peak_append_coexistence_bytes = self
+                .peak_append_coexistence_bytes
+                .max(append_coexistence_bytes);
         }
 
         #[cfg(test)]
         let (tail_base_old, committed_before) = (self.tail_base, self.committed_tokens);
-        self.committed_tokens += s_new;
         #[cfg(test)]
         if !self.evict_to_next_read {
-            let sink_kept = self.sink_kept();
-            let tail_base_new = sink_kept.max(
-                self.committed_tokens
-                    .saturating_sub(self.max_attention_size),
-            );
+            let sink_kept = self.sink_tokens.min(committed_after);
+            let tail_base_new =
+                sink_kept.max(committed_after.saturating_sub(self.max_attention_size));
             let drop_start = tail_base_old.max(sink_kept);
             if tail_base_new > drop_start {
                 let sink_kept_prev = self.sink_tokens.min(committed_before);
                 let keep: Vec<i32> = (0..sink_kept)
-                    .chain(tail_base_new..self.committed_tokens)
+                    .chain(tail_base_new..committed_after)
                     .map(|g| {
                         if g < sink_kept_prev {
                             g as i32
@@ -685,19 +1089,30 @@ impl CausalKvCache {
                     })
                     .collect();
                 let idx = Array::from_slice(&keep, &[keep.len() as i32]);
-                for slot in self.layers.iter_mut() {
+                for slot in &mut staged_layers {
                     if let Some(stored) = slot.as_ref() {
                         *slot = Some(stored.take(&idx)?);
                     }
                 }
             }
+            self.layers = staged_layers;
+            self.committed_tokens = committed_after;
             self.tail_base = tail_base_new;
+            if let Some(started) = packed_append_started.as_ref() {
+                self.record_packed_append_duration(started.elapsed());
+            }
             return Ok(());
         }
         // While the sink is still filling, newly appended contiguous tokens become part of it.
         // Advancing the logical tail start needs no gather: the physical layout remains
         // `[sink prefix | rolling tail]` in global order.
-        self.tail_base = self.tail_base.max(self.sink_kept());
+        let tail_base_after = self.tail_base.max(self.sink_tokens.min(committed_after));
+        self.layers = staged_layers;
+        self.committed_tokens = committed_after;
+        self.tail_base = tail_base_after;
+        if let Some(started) = packed_append_started.as_ref() {
+            self.record_packed_append_duration(started.elapsed());
+        }
         Ok(())
     }
 }
@@ -853,23 +1268,126 @@ impl CausalKreaTransformer {
             .inner
             .prepare_rope_with_frame_offset(grid, start_frame)?;
 
-        // Windowed cache + the block-causal mask over [prev-window ‖ this-chunk].
-        let (prev_kv, prev_positions) = cache.window_prev(s_new)?;
+        // Preflight the exact logical window and block mask before a packed cache is gathered.
+        // A nontrivial additive mask must retain the current dense route rather than mutate state
+        // and discover only later that the experimental kernel cannot represent it.
+        let preview_positions = cache.preview_window_positions(s_new)?;
         let q_positions: Vec<i64> =
             (current_start_token as i64..(current_start_token + s_new) as i64).collect();
-        let mut kv_positions = prev_positions;
+        let mut kv_positions = preview_positions.clone();
         kv_positions.extend(q_positions.iter().copied());
         let mask = block_causal_mask(&q_positions, &kv_positions, self.block_size)?;
-
-        let (velocity, new_kv) = self.inner.forward_causal_chunk(
-            &tokens,
-            t,
-            cross_kv,
-            &cos,
-            &sin,
-            &prev_kv,
-            mask.as_ref(),
-        )?;
+        // A sliding/sink gather is outside the retained kernel's physical layout. Treat that as a
+        // capability miss and use the unchanged dense path before mutating the cache, rather than
+        // propagating a request error.
+        let packed_positions =
+            if cache.experimental_packed_metal_enabled() && !preview_positions.is_empty() {
+                match cache.prepare_packed_window(s_new) {
+                    Ok(positions) => Some(positions),
+                    Err(error) => {
+                        cache.packed_metal_dense_fallbacks += 1;
+                        cache.last_packed_metal_fallback = Some(error.to_string());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        let (velocity, new_kv) = if let Some(packed_positions) = packed_positions {
+            let packed_query_tokens = q_positions.len();
+            let packed_key_tokens = packed_positions.len() + packed_query_tokens;
+            let query_positions = Array::from_slice(&q_positions, &[q_positions.len() as i32]);
+            let mut key_positions = packed_positions;
+            key_positions.extend(q_positions.iter().copied());
+            let key_positions = Array::from_slice(&key_positions, &[key_positions.len() as i32]);
+            let mut backend = PackedKreaAttentionBackend {
+                cache,
+                query_positions,
+                key_positions,
+                block_size: self.block_size,
+                dispatched_outputs: Vec::with_capacity(40),
+            };
+            let packed_started = Instant::now();
+            let mut packed_result = self.inner.forward_causal_chunk_with_packed_attention(
+                &tokens,
+                t,
+                cross_kv,
+                &cos,
+                &sin,
+                &[],
+                mask.as_ref(),
+                &mut backend,
+            );
+            // MLX custom kernels compile and execute lazily. Force every packed layer output while
+            // the unchanged dense cache is still available, so a JIT/command-buffer failure is
+            // observed inside this fallback boundary instead of surfacing after the caller commits.
+            if packed_result.is_ok() {
+                if let Err(error) = mlx_rs::transforms::eval(backend.dispatched_outputs.iter()) {
+                    packed_result =
+                        Err(Error::Msg(format!("{PACKED_DISPATCH_ERROR_PREFIX}{error}")));
+                }
+            }
+            let packed_elapsed = packed_started.elapsed();
+            let dispatched_layers = backend.dispatched_outputs.len();
+            drop(backend);
+            match packed_result {
+                Ok(result)
+                    if packed_dispatch_complete(dispatched_layers, self.inner.num_blocks()) =>
+                {
+                    cache.record_packed_forward_duration(
+                        packed_elapsed,
+                        packed_query_tokens,
+                        packed_key_tokens,
+                    );
+                    cache.packed_metal_accepted_forwards += 1;
+                    result
+                }
+                Ok(_result) => {
+                    cache.packed_metal_dense_fallbacks += 1;
+                    cache.last_packed_metal_fallback = Some(format!(
+                        "{PACKED_DISPATCH_ERROR_PREFIX}packed dispatch reached {}/{} layers",
+                        dispatched_layers,
+                        self.inner.num_blocks()
+                    ));
+                    let (prev_kv, _) = cache.window_prev(s_new)?;
+                    self.inner.forward_causal_chunk(
+                        &tokens,
+                        t,
+                        cross_kv,
+                        &cos,
+                        &sin,
+                        &prev_kv,
+                        mask.as_ref(),
+                    )?
+                }
+                Err(error) if error.to_string().contains(PACKED_DISPATCH_ERROR_PREFIX) => {
+                    cache.packed_metal_dense_fallbacks += 1;
+                    cache.last_packed_metal_fallback = Some(error.to_string());
+                    let (prev_kv, _) = cache.window_prev(s_new)?;
+                    self.inner.forward_causal_chunk(
+                        &tokens,
+                        t,
+                        cross_kv,
+                        &cos,
+                        &sin,
+                        &prev_kv,
+                        mask.as_ref(),
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            let (prev_kv, _) = cache.window_prev(s_new)?;
+            self.inner.forward_causal_chunk(
+                &tokens,
+                t,
+                cross_kv,
+                &cos,
+                &sin,
+                &prev_kv,
+                mask.as_ref(),
+            )?
+        };
 
         // Unpatchify the per-token velocity [1, S, out_dim·∏patch] → [out_dim, F_chunk, H, W].
         let op = velocity.shape()[2];
@@ -1020,6 +1538,51 @@ impl AdaptableHost for CausalKreaTransformer {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn packed_acceptance_requires_every_intended_layer() {
+        assert!(packed_dispatch_complete(40, 40));
+        assert!(!packed_dispatch_complete(39, 40));
+        assert!(!packed_dispatch_complete(0, 40));
+        assert!(!packed_dispatch_complete(0, 0));
+        // A zero-layer model cannot produce a meaningful packed receipt.
+    }
+
+    #[test]
+    fn packed_timing_keeps_cold_steady_and_append_phases_distinct() {
+        let mut cache = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(11), 4, 8);
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(7), 4, 8);
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(5), 2, 10);
+        cache.record_packed_append_duration(std::time::Duration::from_nanos(3));
+        cache.record_packed_append_duration(std::time::Duration::from_nanos(2));
+
+        assert_eq!(cache.packed_metal_first_forward_ns, Some(11));
+        assert_eq!(cache.packed_metal_materialized_scratch_dispatches, 3);
+        assert_eq!(
+            cache.packed_metal_bounded_scratch_bytes,
+            PACKED_METAL_THREADGROUP_SCRATCH_BYTES
+        );
+        assert_eq!(cache.packed_metal_steady_forward_ns, 12);
+        assert_eq!(cache.packed_metal_steady_forward_count, 2);
+        assert_eq!(
+            cache.packed_metal_dispatch_geometries,
+            vec![
+                PackedMetalDispatchGeometry {
+                    query_tokens: 4,
+                    key_tokens: 8,
+                    accepted_forwards: 2,
+                },
+                PackedMetalDispatchGeometry {
+                    query_tokens: 2,
+                    key_tokens: 10,
+                    accepted_forwards: 1,
+                },
+            ]
+        );
+        assert_eq!(cache.packed_metal_append_ns, 5);
+        assert_eq!(cache.packed_metal_append_count, 2);
+    }
 
     /// A Wan-2.1-14B-T2V style LoRA (musubi-tuner / diffusion-pipe / ComfyUI), once its
     /// `diffusion_model.`/`transformer.` namespace is stripped, names exactly these per-block dotted
@@ -1377,6 +1940,65 @@ mod tests {
         vec![(k, v)]
     }
 
+    #[test]
+    fn append_rejects_cross_layer_geometry_before_mutation() {
+        let mut cache = CausalKvCache::new(2, 64, 0, None);
+        let first = Array::from_slice(&[1.0f32], &[1, 1, 1, 1]);
+        cache
+            .append(vec![
+                (first.clone(), first.clone()),
+                (first.clone(), first.clone()),
+            ])
+            .unwrap();
+        let before_bytes = cache.retained_bytes();
+
+        let two = Array::from_slice(&[2.0f32, 3.0], &[1, 1, 2, 1]);
+        let one = Array::from_slice(&[4.0f32], &[1, 1, 1, 1]);
+        let error = cache
+            .append(vec![(two.clone(), two), (one.clone(), one)])
+            .expect_err("every layer must commit the same token geometry");
+        assert!(error.to_string().contains("layer 1"), "{error:?}");
+        assert_eq!(cache.stored_tokens(), 1);
+        assert_eq!(cache.retained_bytes(), before_bytes);
+        for layer in 0..2 {
+            assert_eq!(
+                cache.layer_kv(layer).unwrap().unwrap().0.shape(),
+                &[1, 1, 1, 1]
+            );
+        }
+    }
+
+    #[test]
+    fn append_late_concat_failure_does_not_publish_earlier_layers() {
+        let mut cache = CausalKvCache::new(2, 64, 0, None);
+        let scalar = Array::from_slice(&[1.0f32], &[1, 1, 1, 1]);
+        let incompatible = Array::from_slice(&[2.0f32, 3.0], &[1, 1, 1, 2]);
+        cache.layers = vec![
+            Some(StoredKv::Dense {
+                k: scalar.clone(),
+                v: scalar.clone(),
+            }),
+            Some(StoredKv::Dense {
+                k: incompatible.clone(),
+                v: incompatible,
+            }),
+        ];
+        cache.committed_tokens = 1;
+        let before_bytes = cache.retained_bytes();
+        let incoming = Array::from_slice(&[4.0f32], &[1, 1, 1, 1]);
+        cache
+            .append(vec![
+                (incoming.clone(), incoming.clone()),
+                (incoming.clone(), incoming),
+            ])
+            .expect_err("the second layer's incompatible concat must fail");
+
+        assert_eq!(cache.stored_tokens(), 1);
+        assert_eq!(cache.retained_bytes(), before_bytes);
+        assert_eq!(cache.layer_kv(0).unwrap().unwrap().0.shape(), &[1, 1, 1, 1]);
+        assert_eq!(cache.layer_kv(1).unwrap().unwrap().0.shape(), &[1, 1, 1, 2]);
+    }
+
     fn retained_key_values(cache: &CausalKvCache) -> Vec<f32> {
         let (k, _) = cache.layer_kv(0).unwrap().expect("layer 0 populated");
         k.as_slice::<f32>().to_vec()
@@ -1500,6 +2122,97 @@ mod tests {
         let back = packed.unpack(KvCacheQuant::Q8).unwrap();
         assert_eq!(back.shape(), kv[0].0.shape());
         assert_eq!(back.dtype(), Dtype::Bfloat16);
+    }
+
+    #[test]
+    fn packed_sliding_window_rejection_is_a_capability_fallback_reason() {
+        let mut cache = CausalKvCache::new(1, 2, 0, Some(KvCacheQuant::Q8));
+        cache
+            .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
+            .unwrap();
+        let error = cache
+            .prepare_packed_window(2)
+            .expect_err("a strict sliding read needs a nonphysical gather");
+        assert!(
+            error.to_string().contains("falls back before mutation"),
+            "capability rejection must identify the dense fallback: {error}"
+        );
+        assert_eq!(cache.stored_tokens(), 4);
+        assert_eq!(cache.retained_tokens(), 4);
+    }
+
+    #[test]
+    fn packed_layer_capability_miss_requests_whole_forward_fallback() {
+        let cache = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        let positions = Array::from_slice(&[0i64], &[1]);
+        let mut backend = PackedKreaAttentionBackend {
+            cache: &cache,
+            query_positions: positions.clone(),
+            key_positions: positions,
+            block_size: 1,
+            dispatched_outputs: Vec::new(),
+        };
+        let unsupported = Array::from_slice(&[0.0f32], &[1, 1, 1, 1]);
+        let error = backend
+            .attend(0, &unsupported, &unsupported, &unsupported, None, 1.0)
+            .expect_err("unsupported packed geometry must leave the provisional packed forward");
+        assert!(
+            error.to_string().contains(PACKED_DISPATCH_ERROR_PREFIX),
+            "the whole-forward fallback boundary must recognize this decline: {error}"
+        );
+        assert!(backend.dispatched_outputs.is_empty());
+    }
+
+    #[test]
+    fn immutable_append_reports_old_plus_successor_coexistence() {
+        let mut cache = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        cache.enable_experimental_packed_metal(false).unwrap();
+        cache
+            .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
+            .unwrap();
+        let first_retained = cache.retained_bytes();
+        cache
+            .append(wide_kv_block(&[4, 5], Dtype::Bfloat16))
+            .unwrap();
+        assert!(cache.peak_append_coexistence_bytes() >= first_retained + cache.retained_bytes());
+        assert!(cache.peak_append_coexistence_bytes() > cache.retained_bytes());
+    }
+
+    /// The production cache (packed-Metal POC never armed) appends exactly as it always has: a lazy
+    /// concat/pack graph with no per-append eval barrier and no old-plus-successor coexistence. Only
+    /// the armed POC materializes its successors before publishing them.
+    #[test]
+    fn only_the_armed_packed_poc_evaluates_its_append_successor() {
+        use mlx_gen::array::is_materialized;
+        for quant in [None, Some(KvCacheQuant::Q8)] {
+            let mut cache = CausalKvCache::new(1, 16, 0, quant);
+            cache
+                .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
+                .unwrap();
+            cache
+                .append(wide_kv_block(&[4, 5], Dtype::Bfloat16))
+                .unwrap();
+            let stored = cache.layers[0].as_ref().unwrap();
+            let materialized = match stored {
+                StoredKv::Dense { k, v } => is_materialized(k) || is_materialized(v),
+                StoredKv::Packed { k, v } => is_materialized(&k.w) || is_materialized(&v.w),
+            };
+            assert!(
+                !materialized,
+                "production append ({quant:?}) must stay a lazy graph, not an eval barrier"
+            );
+            assert_eq!(cache.peak_append_coexistence_bytes(), 0);
+        }
+
+        let mut armed = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        armed.enable_experimental_packed_metal(false).unwrap();
+        armed
+            .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
+            .unwrap();
+        let Some(StoredKv::Packed { k, v }) = armed.layers[0].as_ref() else {
+            panic!("armed Q8 cache must store packed layers");
+        };
+        assert!(is_materialized(&k.w) && is_materialized(&v.w));
     }
 
     /// A group size that does not divide `head_dim` is a **config** error, and must be reported as one

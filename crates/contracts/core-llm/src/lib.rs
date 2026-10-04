@@ -40,6 +40,10 @@
 //!   served a generation, on [`TextLlmOutput::decode`]), [`LoadReport`] (what a load produced, via
 //!   [`TextLlm::load_report`]) and [`BackendCapabilities`] (what the host can serve — NVFP4, CUDA
 //!   graphs — with the refusal reason when it cannot).
+//! - [`kv_compression`] — the opt-in compressed-KV policy ([`KvCompressionPolicy`] on
+//!   [`TextLlmRequest::kv_compression`]), its one qualification table
+//!   ([`KV_COMPRESSION_QUALIFICATIONS`]) and the per-generation [`KvCacheReport`] on
+//!   [`TextLlmOutput::kv_cache`], with a [`KvCacheFallbackReason`] whenever the cache ran dense.
 //! - [`registry`] — explicit provider composition, id-based routing, and **model-first** resolution
 //!   ([`TextLlmRegistry::load_for_model`] / [`ModelRequirements`] over a weightless `can_load`
 //!   probe).
@@ -53,6 +57,7 @@ pub mod constraint;
 pub mod defaults;
 pub mod detok;
 pub mod error;
+pub mod kv_compression;
 pub mod message;
 pub mod mtp_head;
 pub mod output;
@@ -86,6 +91,14 @@ pub use constraint::{
 pub use defaults::{speculative_default, DecodeBackend, DecodeDefaults, RecommendedDepths};
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
+pub use kv_compression::{
+    compressed_kv_cache_bytes, kv_model_family, plan_kv_cache, plan_kv_cache_without_reader,
+    qualified_kv_model_family, qualify_kv_compression, CompressedKvAllocation, KvAttentionGeometry,
+    KvCacheCounters, KvCacheFallbackReason, KvCachePlan, KvCacheReport, KvCacheRequest,
+    KvCacheShape, KvCompressionFormat, KvCompressionPolicy, KvModelArchitecture, KvModelFamily,
+    KvQualification, KV_CACHE_FORMAT_VERSION, KV_COMPRESSION_QUALIFICATIONS,
+    KV_FUSED_READER_HEAD_DIMS, LLAMA_3_2_3B_ARCHITECTURE, QWEN3_1_7B_ARCHITECTURE,
+};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
 pub use mtp_head::{
     admit_companion_head, check_companion_unused, companion_head_fallback,
@@ -100,8 +113,8 @@ pub use paging::BlockAllocator;
 pub use prefix::{
     prefix_cache_budget, prefix_path_before_lookup, requested_prefix_cache_bytes, InsertOutcome,
     PrefixAdmission, PrefixHit, PrefixId, PrefixIndex, PrefixInsert, PrefixMatch, PrefixReuse,
-    PrefixStats, PrefixStore, PREFIX_COPY_FAILED, PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED,
-    PREFIX_PAGED_NOT_SNAPSHOTTED,
+    PrefixStats, PrefixStore, PREFIX_COMPRESSED_NOT_STORED, PREFIX_COPY_FAILED,
+    PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED, PREFIX_PAGED_NOT_SNAPSHOTTED,
 };
 pub use prepare::{
     detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
@@ -131,8 +144,9 @@ pub use resource::{
     available_host_memory_bytes, checkpoint_payload_bytes, checkpoint_staging_bytes,
     effective_memory_budget, estimate_chunked_request_bytes,
     estimate_chunked_request_bytes_with_recurrent_copies, estimate_request_bytes,
-    estimate_request_bytes_with_recurrent_copies, operational_memory_override, LlmMemoryGeometry,
-    AVAILABLE_MEMORY_OVERRIDE,
+    estimate_request_bytes_with_recurrent_copies, estimate_tiled_request_bytes_with_kv_bytes,
+    estimate_tiled_request_bytes_with_recurrent_copies, operational_memory_override,
+    tiled_prefill_activation_bytes, LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{

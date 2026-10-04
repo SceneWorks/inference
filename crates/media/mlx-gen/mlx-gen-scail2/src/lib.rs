@@ -71,6 +71,28 @@ pub fn conservative_video_decode_memory_profile(
     mlx_gen_wan::conservative_video_decode_memory_profile_for_vae(VAE_TILING, width, height, frames)
 }
 
+/// The provider-owned conservative VAE **encode** working set (sc-20686, epic E8), or `None` when
+/// the request encodes nothing. SCAIL-2: the driving pose clip (priced at the full output geometry, an upper bound on its half-resolution encode) and the reference still. The encode and decode phases never overlap.
+pub fn conservative_video_encode_memory_profile(
+    provider_id: &str,
+    mode: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    reference_count: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    // Every SCAIL-2 request is pose-clip conditioned, whatever its mode.
+    let _ = (mode, reference_count);
+    let encode_frames = frames;
+    mlx_gen_wan::conservative_video_encode_memory_profile_for_vae(
+        VAE_TILING,
+        width,
+        height,
+        encode_frames,
+    )
+}
+
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
 pub use convert::{quantize_scail2_dit, quantize_scail2_transformer};

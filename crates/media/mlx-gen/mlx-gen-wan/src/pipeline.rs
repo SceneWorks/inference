@@ -741,6 +741,67 @@ pub fn conservative_video_decode_peak_bytes_for_vae(
     video_decode_peak_bytes_for_vae_and_tiling(vae, width, height, frames, None)
 }
 
+// --- sc-20686 (epic E8): Wan VAE encode working set -------------------------------------------
+//
+// Both Wan encoders are chunked causal encoders (a 1-frame first chunk, then 4-frame chunks) that
+// release their dead buffers at every block, so the live encode peak is one chunk's working set plus
+// a small per-input-frame term (the input clip and the growing latent), and MLX's cache stays empty
+// (live + cache == live). There is no tiled encode: the chunking already bounds time, and space is
+// priced whole. Fit from `encode_footprint_harness` (production-width synthetic weights, f32 — the
+// dtype production encodes in for both VAEs) at 64x128 and 128x128, T = 1/5/9/13; every coefficient
+// is rounded up so each measured point is covered:
+//   z16: T=1 6,284/6,246 B/px; T>=5 (peak - 700*T*HW) / 4HW <= 4,518.
+//   z48: T=1 2,843/2,828 B/px; T>=5 (peak - 50*T*HW) / 4HW <= 2,330.
+/// z16 encode: bytes per input pixel of a single-frame encode.
+const VAE16_ENCODE_SINGLE_FRAME_BYTES_PER_PIXEL: u64 = 6_300;
+/// z16 encode: bytes per pixel of one 4-frame chunk.
+const VAE16_ENCODE_CHUNK_BYTES_PER_VOXEL: u64 = 4_600;
+/// z16 encode: bytes per input voxel of the whole clip (input + accumulated latent).
+const VAE16_ENCODE_CLIP_BYTES_PER_VOXEL: u64 = 700;
+/// z48 encode: bytes per input pixel of a single-frame encode.
+const VAE22_ENCODE_SINGLE_FRAME_BYTES_PER_PIXEL: u64 = 2_900;
+/// z48 encode: bytes per voxel of one 4-frame chunk.
+const VAE22_ENCODE_CHUNK_BYTES_PER_VOXEL: u64 = 2_400;
+/// z48 encode: bytes per input voxel of the whole clip.
+const VAE22_ENCODE_CLIP_BYTES_PER_VOXEL: u64 = 50;
+/// Frames in every chunk after the first (the encoders' temporal stride).
+const VAE_ENCODE_CHUNK_FRAMES: u64 = 4;
+
+/// Conservative live working set (bytes) of one Wan VAE encode of a `frames x height x width` clip
+/// (`frames = 1` for a still). Excludes the VAE weights. `None` for a non-Wan VAE or overflow.
+pub fn video_encode_peak_bytes_for_vae(
+    vae: VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<u64> {
+    let (single, chunk, clip) = if vae == WanVae::VAE_TILING {
+        (
+            VAE16_ENCODE_SINGLE_FRAME_BYTES_PER_PIXEL,
+            VAE16_ENCODE_CHUNK_BYTES_PER_VOXEL,
+            VAE16_ENCODE_CLIP_BYTES_PER_VOXEL,
+        )
+    } else if vae == Wan22Vae::VAE_TILING {
+        (
+            VAE22_ENCODE_SINGLE_FRAME_BYTES_PER_PIXEL,
+            VAE22_ENCODE_CHUNK_BYTES_PER_VOXEL,
+            VAE22_ENCODE_CLIP_BYTES_PER_VOXEL,
+        )
+    } else {
+        return None;
+    };
+    let pixels = u64::from(width).checked_mul(u64::from(height))?;
+    match frames {
+        0 => None,
+        1 => single.checked_mul(pixels),
+        frames => chunk
+            .checked_mul(VAE_ENCODE_CHUNK_FRAMES)?
+            .checked_mul(pixels)?
+            .max(single.checked_mul(pixels)?)
+            .checked_add(clip.checked_mul(u64::from(frames))?.checked_mul(pixels)?),
+    }
+}
+
 /// **Memory-budgeted** tiling for the z16 Wan 2.1 VAE decode (sc-6894 F-009): the z16 analogue of
 /// [`auto_tiling_budgeted`], routing the shared [`budgeted_plan`] selector through the z16 cost model.
 /// Replaces the unbudgeted [`TilingConfig::auto`] on the 14B T2V/I2V + VACE decode paths. Uses the same
@@ -834,7 +895,14 @@ struct StepCache {
     sin: Array,
     /// Forward batch width: 2 when CFG is on (cond+uncond stacked), else 1.
     batch: usize,
+    /// SC-20686 Metal-lane ownership of `cross_kv` (`None` unless a campaign is armed). Declared
+    /// last so the K/V arrays are freed before the post-release allocator remnant is sampled.
+    _sc20686: Option<mlx_gen::sc20686::CacheSetGuard>,
 }
+
+/// SC-20686 operation names for the Wan cross-K/V cache lifecycle (Metal lane).
+pub(crate) const SC20686_CROSS_KV_CREATE: &str = "WanTransformer::prepare_cross_kv";
+pub(crate) const SC20686_CROSS_KV_RELEASE: &str = "StepCache::drop";
 
 /// Build the per-expert [`StepCache`] from the embedded contexts + the (constant) RoPE grid. When CFG
 /// is on (`ctx_uncond = Some`) the cond/uncond contexts are stacked on the batch axis so the cross-K/V
@@ -850,6 +918,7 @@ fn build_cache(
         Some(uncond) => (concatenate_axis(&[ctx_cond, uncond], 0)?, 2),
         None => (ctx_cond.clone(), 1),
     };
+    mlx_gen::sc20686::mark_phase("prepare-cache");
     let cross_kv = transformer.prepare_cross_kv(&context_batch)?;
     let (cos, sin) = transformer.prepare_rope(grid)?;
     let mut to_eval: Vec<&Array> = vec![&cos, &sin];
@@ -858,11 +927,20 @@ fn build_cache(
         to_eval.push(v);
     }
     mlx_rs::transforms::eval(to_eval)?;
+    // Inert (`None`, no work) unless an SC-20686 campaign is armed on this thread.
+    let sc20686 = mlx_gen::sc20686::register_cross_kv_set(
+        &cross_kv,
+        (grid.0 * grid.1 * grid.2) as u64,
+        SC20686_CROSS_KV_CREATE,
+        SC20686_CROSS_KV_RELEASE,
+    )?;
+    mlx_gen::sc20686::mark_denoise();
     Ok(StepCache {
         cross_kv,
         cos,
         sin,
         batch,
+        _sc20686: sc20686,
     })
 }
 
@@ -1464,6 +1542,8 @@ pub(crate) fn denoise_moe_curated_swapped(
                         "wan: curated sampler timestep increased across the MoE boundary".into(),
                     ));
                 }
+                // SC-20686 Metal lane: the swap (drop, evict, load) is its own phase window.
+                mlx_gen::sc20686::mark_phase("load");
                 drop(active.take());
                 mlx_rs::memory::clear_cache();
                 let (transformer, cond, uncond, guidance) = load(false)?;
@@ -1834,6 +1914,143 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
         &multiply(mask, noise)?,
     )?)
 }
+
+/// The activation working set (bytes) [`preflight_denoise_memory_guard`] prices for one denoise
+/// forward -- the same `72 B · batch · tokens · dim` as [`estimated_denoise_peak_gib`], batch 2 when
+/// CFG runs batched -- in checked integer bytes for the SC-20686 admission estimate. `None` on
+/// overflow.
+pub(crate) fn denoise_activation_bytes(
+    tokens: usize,
+    dim: usize,
+    cfg_enabled: bool,
+) -> Option<u64> {
+    72_u64
+        .checked_mul(if cfg_enabled { 2 } else { 1 })?
+        .checked_mul(u64::try_from(tokens).ok()?)?
+        .checked_mul(u64::try_from(dim).ok()?)
+}
+
+/// The decode mode the product's automatic Wan VAE planner selects at one free-memory budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlannedDecodeMode {
+    /// The single-pass decode fits the safe budget (the planner returns no tiling).
+    SinglePass,
+    /// The largest candidate tile that fits the safe budget.
+    Tiled,
+    /// Not even the smallest tile fits: the run refuses catchably before its denoise.
+    OverBudget,
+}
+
+impl PlannedDecodeMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SinglePass => "single-pass",
+            Self::Tiled => "tiled",
+            Self::OverBudget => "over-budget",
+        }
+    }
+}
+
+/// The product's automatic decode decision at `free_bytes` of free memory, priced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlannedDecode {
+    pub mode: PlannedDecodeMode,
+    /// The safe budget the planner chose against: `free × 0.85` (`wan_vae_safe_budget_gib`'s
+    /// free-aware arm). A run given `WAN_VAE_BUDGET_GIB` = this value makes the same decision.
+    pub safe_budget_gib: f64,
+    /// The priced decode working set: the chosen plan's cost, or the conservative single-pass cost
+    /// when no plan fits (`OverBudget`).
+    pub working_set_bytes: u64,
+}
+
+/// SC-20686 / E8: price a Wan VAE decode at the decision the product's automatic planner
+/// ([`auto_tiling_budgeted`] for z48 -- bf16, as the dense 5B decodes -- and
+/// [`auto_tiling_budgeted_z16`] for z16) makes when `free_bytes` are free at decode time, instead of
+/// the conservative single-pass bound. `frames` are the decoded output frames the planner sees
+/// (z16: the full non-causal `4 · T_lat`). `None` for a non-Wan VAE or invalid geometry.
+pub fn planned_video_decode(
+    vae: VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+    free_bytes: u64,
+) -> Option<PlannedDecode> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let safe_budget_gib = free_aware_budget_gib(free_bytes as f64 / GIB, WAN_VAE_BUDGET_SAFE_FRAC);
+    let (h, w, f) = (
+        i32::try_from(height).ok()?,
+        i32::try_from(width).ok()?,
+        i32::try_from(frames).ok()?,
+    );
+    let plan = if vae == Wan22Vae::VAE_TILING {
+        plan_vae22_tiling(h, w, f, safe_budget_gib, true)
+    } else if vae == WanVae::VAE_TILING {
+        plan_z16_tiling(h, w, f, safe_budget_gib)
+    } else {
+        return None;
+    };
+    let single_pass = video_decode_peak_bytes_for_vae_and_tiling(vae, width, height, frames, None)?;
+    let (mode, working_set_bytes) = match plan {
+        Ok(None) => (PlannedDecodeMode::SinglePass, single_pass),
+        Ok(Some(tiling)) => (
+            PlannedDecodeMode::Tiled,
+            video_decode_peak_bytes_for_vae_and_tiling(vae, width, height, frames, Some(&tiling))?,
+        ),
+        Err(_) => (PlannedDecodeMode::OverBudget, single_pass),
+    };
+    Some(PlannedDecode {
+        mode,
+        safe_budget_gib,
+        working_set_bytes,
+    })
+}
+
+#[cfg(test)]
+mod planned_decode_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    /// The planned decode is exactly the product planner's decision at the same safe budget.
+    #[test]
+    fn planned_decode_follows_the_product_planner() {
+        for (vae, frames) in [(WanVae::VAE_TILING, 36), (Wan22Vae::VAE_TILING, 33)] {
+            let single =
+                video_decode_peak_bytes_for_vae_and_tiling(vae, 768, 512, frames, None).unwrap();
+            // A budget the single pass fits: single pass, priced at the single-pass cost.
+            let roomy = planned_video_decode(vae, 768, 512, frames, 200 * GIB).unwrap();
+            assert_eq!(roomy.mode, PlannedDecodeMode::SinglePass);
+            assert_eq!(roomy.working_set_bytes, single);
+            // A smaller budget tiles: the chosen tile's cost, under the safe budget, below single.
+            let tight = planned_video_decode(vae, 768, 512, frames, 40 * GIB).unwrap();
+            assert_eq!(tight.mode, PlannedDecodeMode::Tiled);
+            assert!((tight.safe_budget_gib - 34.0).abs() < 1e-9);
+            assert!(tight.working_set_bytes < single);
+            assert!(tight.working_set_bytes as f64 <= tight.safe_budget_gib * GIB as f64);
+            let (h, w, f) = (512, 768, frames as i32);
+            let expected = if vae == WanVae::VAE_TILING {
+                plan_z16_tiling(h, w, f, tight.safe_budget_gib)
+            } else {
+                plan_vae22_tiling(h, w, f, tight.safe_budget_gib, true)
+            }
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                tight.working_set_bytes,
+                video_decode_peak_bytes_for_vae_and_tiling(vae, 768, 512, frames, Some(&expected))
+                    .unwrap()
+            );
+            // No tile fits: over budget, priced at the conservative single pass.
+            let starved = planned_video_decode(vae, 768, 512, frames, GIB / 4).unwrap();
+            assert_eq!(starved.mode, PlannedDecodeMode::OverBudget);
+            assert_eq!(starved.working_set_bytes, single);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "sc20686_hooks_tests.rs"]
+mod sc20686_hooks_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3192,5 +3409,62 @@ mod tests {
         let out = ti2v_blend_init(&z_img, &mask, &noise).unwrap();
         // frame0 = z_img (9), frame1 = noise (7).
         assert_eq!(out.as_slice::<f32>(), &[9.0, 7.0]);
+    }
+
+    /// sc-20686 E8: the encode working-set model covers every point `encode_footprint_harness`
+    /// measured (production-width synthetic weights, f32, post-release live == live + cache) and
+    /// stays within 30 % above it.
+    #[test]
+    fn encode_peak_model_covers_the_measured_encodes() {
+        // (vae, frames, height, width, measured live bytes)
+        let measured = [
+            (WanVae::VAE_TILING, 1, 64, 128, 51_478_544_u64),
+            (WanVae::VAE_TILING, 5, 64, 128, 176_734_228),
+            (WanVae::VAE_TILING, 9, 64, 128, 199_360_532),
+            (WanVae::VAE_TILING, 1, 128, 128, 102_334_480),
+            (WanVae::VAE_TILING, 5, 128, 128, 352_256_020),
+            (WanVae::VAE_TILING, 13, 128, 128, 397_541_396),
+            (Wan22Vae::VAE_TILING, 1, 64, 128, 23_289_876),
+            (Wan22Vae::VAE_TILING, 5, 64, 128, 78_393_368),
+            (Wan22Vae::VAE_TILING, 9, 64, 128, 78_786_584),
+            (Wan22Vae::VAE_TILING, 1, 128, 128, 46_333_972),
+            (Wan22Vae::VAE_TILING, 5, 128, 128, 156_287_000),
+            (Wan22Vae::VAE_TILING, 13, 128, 128, 157_859_864),
+        ];
+        for (vae, frames, height, width, live) in measured {
+            let modelled = video_encode_peak_bytes_for_vae(vae, width, height, frames).unwrap();
+            assert!(
+                modelled >= live && (modelled as f64) <= live as f64 * 1.3,
+                "{vae:?} {frames}x{height}x{width}: modelled {modelled} vs measured {live}"
+            );
+        }
+        assert_eq!(
+            video_encode_peak_bytes_for_vae(WanVae::VAE_TILING, 64, 64, 0),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod denoise_activation_tests {
+    use super::*;
+
+    /// The admission estimate prices exactly the activation the generate-time fit gate does.
+    #[test]
+    fn integer_activation_matches_the_fit_gate() {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        for (tokens, dim, cfg) in [
+            (13_824, 5_120, true),
+            (1_280, 1_536, false),
+            (32_560, 3_072, true),
+        ] {
+            let bytes = denoise_activation_bytes(tokens, dim, cfg).unwrap();
+            let gib = estimated_denoise_peak_gib(0, tokens, dim, cfg);
+            assert!(
+                (bytes as f64 / GIB - gib).abs() < 1e-9,
+                "{tokens} {dim} {cfg}"
+            );
+        }
+        assert_eq!(denoise_activation_bytes(usize::MAX, usize::MAX, true), None);
     }
 }

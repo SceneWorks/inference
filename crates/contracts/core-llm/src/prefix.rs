@@ -232,6 +232,12 @@ pub const PREFIX_NOT_ADMITTED: &str =
 /// Why a request's own prefix-cache snapshot was dropped: its copy failed.
 pub const PREFIX_COPY_FAILED: &str = "not kept: the snapshot copy failed";
 
+/// Why a request on a compressed KV cache (epic sc-20669) keeps no snapshot: the store holds dense
+/// K/V and a compressed cache never re-enters it; the request still reads it — a dense hit is
+/// imported into its compressed cache.
+pub const PREFIX_COMPRESSED_NOT_STORED: &str =
+    "not kept: a compressed KV cache is not stored (a dense hit is imported into it)";
+
 /// Why a request on a paged KV cache keeps no snapshot: its blocks are shared through the pool's
 /// own copy-on-write, and the prefix cache does not copy them out.
 pub const PREFIX_PAGED_NOT_SNAPSHOTTED: &str = "not kept: paged KV backing is not snapshotted";

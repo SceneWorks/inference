@@ -88,6 +88,15 @@ pub fn host_transfers() -> HostTransfers {
     HOST_TRANSFERS.with(Cell::get)
 }
 
+/// `a` read back to the host as `f32` in its stored order, counted like every other decode host
+/// read ([`host_transfers`]) — the campaign observer's product logits (epic sc-20669), the one read
+/// outside the sampling seam.
+pub(crate) fn counted_host_f32(a: &Array) -> Result<Vec<f32>> {
+    let values = a.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+    note_host_read(values.len());
+    Ok(values)
+}
+
 fn note_host_read(elements: usize) {
     HOST_TRANSFERS.with(|t| {
         let mut v = t.get();

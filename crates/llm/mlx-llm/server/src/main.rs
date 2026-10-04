@@ -9,10 +9,12 @@
 //! health check, for a single model loaded through the **backend-neutral** `core_llm` contract and
 //! the explicit MLX provider catalog. The HTTP serving path speaks only the `TextLlm` contract.
 //!
-//! This is a *reference*, deliberately minimal: one model, one request at a time (MLX's Metal device
-//! is single-threaded — see the engine's `.cargo/config.toml`), `Connection: close`, no auth. A
-//! production gateway (multi-model, auth, batching across requests, Anthropic/Ollama compat) is the
-//! separate server-app project, not this example.
+//! This is a *reference*, deliberately minimal: one model on one serving thread (MLX's Metal device
+//! is single-threaded — see the engine's `.cargo/config.toml`), `Connection: close`, no auth.
+//! Requests that arrive while the engine is busy are decoded together on the next round through
+//! `TextLlm::generate_batch` (continuous batching on the MLX provider, each request with its own
+//! `kv_compression` opt-in and `kv_cache` report — sc-20681). A production gateway (multi-model,
+//! auth, Anthropic/Ollama compat) is the separate server-app project, not this example.
 //!
 //! ```text
 //! curl -N http://localhost:8080/v1/chat/completions \
@@ -219,8 +221,15 @@ fn load_provider(args: &Args) -> Result<(Box<dyn TextLlm>, String), Box<dyn std:
     Ok((provider, default_model))
 }
 
-/// The serial accept loop. A per-connection error (including a read timeout) drops that connection
-/// only — the loop always continues serving subsequent clients.
+/// Most connections one accept round serves together (sc-20681).
+const MAX_BATCH: usize = 8;
+
+/// The accept loop. Each round takes one connection and every other connection already waiting
+/// (up to [`MAX_BATCH`]); their chat completions run as one batch through
+/// [`TextLlm::generate_batch`] — continuous batching on a backend that implements it — so
+/// requests that arrive while the engine is busy decode together. A per-connection error
+/// (including a read timeout) drops that connection only — the loop always continues serving
+/// subsequent clients.
 fn serve(
     listener: &TcpListener,
     provider: &dyn TextLlm,
@@ -229,8 +238,18 @@ fn serve(
 ) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
-                if let Err(e) = handle_connection(stream, provider, default_model, limits) {
+            Ok(first) => {
+                let mut streams = vec![first];
+                drain_pending(listener, &mut streams);
+                let mut chats = Vec::new();
+                for stream in streams {
+                    match handle_connection(stream, provider, default_model, limits) {
+                        Ok(Some(chat)) => chats.push(chat),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("connection error: {e}"),
+                    }
+                }
+                if let Err(e) = run_chats(provider, chats) {
                     eprintln!("connection error: {e}");
                 }
             }
@@ -239,13 +258,51 @@ fn serve(
     }
 }
 
-/// Serve one request on a connection, then close it (`Connection: close`).
+/// Accept every connection already waiting on `listener`, up to [`MAX_BATCH`] in all, without
+/// blocking for new ones.
+fn drain_pending(listener: &TcpListener, streams: &mut Vec<TcpStream>) {
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    while streams.len() < MAX_BATCH {
+        match listener.accept() {
+            // An accepted socket may inherit the listener's non-blocking mode.
+            Ok((stream, _)) => match stream.set_nonblocking(false) {
+                Ok(()) => streams.push(stream),
+                Err(e) => eprintln!("accept error: {e}"),
+            },
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                break;
+            }
+        }
+    }
+    if let Err(e) = listener.set_nonblocking(false) {
+        eprintln!("listener error: {e}");
+    }
+}
+
+/// A parsed, validated chat completion waiting for the engine.
+struct ChatJob {
+    writer: DeadlineWriter,
+    req: core_llm::TextLlmRequest,
+    cancel: CancelFlag,
+    stream: bool,
+    id: String,
+    model: String,
+    created: u64,
+}
+
+/// Read one request on a connection. A chat completion comes back as a [`ChatJob`] for the
+/// engine; every other route (and any invalid request) is answered here and the connection closed
+/// (`Connection: close`).
 fn handle_connection(
     stream: TcpStream,
     provider: &dyn TextLlm,
     default_model: &str,
     limits: ConnectionLimits,
-) -> io::Result<()> {
+) -> io::Result<Option<ChatJob>> {
     let request_deadline = Instant::now() + limits.request_total;
     let read_stream = stream.try_clone()?;
     let mut reader = BufReader::new(DeadlineReader::new(
@@ -256,7 +313,7 @@ fn handle_connection(
     let mut writer = DeadlineWriter::new(stream, limits.write, limits.response_total);
     let req = match http::read_request(&mut reader) {
         Ok(Some(req)) => req,
-        Ok(None) => return Ok(()), // idle disconnect
+        Ok(None) => return Ok(None), // idle disconnect
         // Read timeout (F-022): the peer went silent mid-request — treat it as a dropped
         // connection, not an error worth replying to (the peer isn't reading anyway).
         Err(e)
@@ -265,33 +322,34 @@ fn handle_connection(
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ) =>
         {
-            return Ok(());
+            return Ok(None);
         }
         Err(e) => {
             let status = http::error_status(&e);
-            return write_json(
+            write_json(
                 &mut writer,
                 status,
                 &openai::error_body(&e.to_string(), "invalid_request"),
-            );
+            )?;
+            return Ok(None);
         }
     };
 
     match (req.method.as_str(), req.path.as_str()) {
-        ("POST", "/v1/chat/completions") => {
-            handle_chat(&mut writer, provider, &req.body, default_model)
-        }
+        ("POST", "/v1/chat/completions") => parse_chat(writer, provider, &req.body, default_model),
         ("GET", "/v1/models") => write_json(
             &mut writer,
             200,
             &openai::models_list(default_model, unix_secs()),
-        ),
-        ("GET", "/" | "/health") => write_text(&mut writer, 200, "ok"),
+        )
+        .map(|()| None),
+        ("GET", "/" | "/health") => write_text(&mut writer, 200, "ok").map(|()| None),
         _ => write_json(
             &mut writer,
             404,
             &openai::error_body("not found", "not_found"),
-        ),
+        )
+        .map(|()| None),
     }
 }
 
@@ -376,12 +434,13 @@ impl Read for DeadlineReader {
 }
 
 /// Handle a chat completion: parse → validate → stream SSE or return one JSON body.
-fn handle_chat(
-    stream: &mut DeadlineWriter,
+fn parse_chat(
+    mut writer: DeadlineWriter,
     provider: &dyn TextLlm,
     body: &[u8],
     default_model: &str,
-) -> io::Result<()> {
+) -> io::Result<Option<ChatJob>> {
+    let stream = &mut writer;
     let chat: openai::ChatRequest = match serde_json::from_slice(body) {
         Ok(c) => c,
         Err(e) => {
@@ -390,6 +449,7 @@ fn handle_chat(
                 400,
                 &openai::error_body(&e.to_string(), "invalid_request"),
             )
+            .map(|()| None)
         }
     };
     let model = chat
@@ -400,7 +460,10 @@ fn handle_chat(
 
     let mut req = match chat.into_text_llm_request() {
         Ok(r) => r,
-        Err(msg) => return write_json(stream, 400, &openai::error_body(&msg, "invalid_request")),
+        Err(msg) => {
+            return write_json(stream, 400, &openai::error_body(&msg, "invalid_request"))
+                .map(|()| None)
+        }
     };
     // Reject anything outside the provider's declared surface before sending any 200.
     if let Err(e) = provider.validate(&req) {
@@ -408,26 +471,55 @@ fn handle_chat(
             stream,
             400,
             &openai::error_body(&e.to_string(), "invalid_request"),
-        );
+        )
+        .map(|()| None);
     }
 
     let cancel = CancelFlag::new();
     req.cancel = cancel.clone();
-    let id = completion_id();
-    let created = unix_secs();
+    Ok(Some(ChatJob {
+        writer,
+        req,
+        cancel,
+        stream: want_stream,
+        id: completion_id(),
+        model,
+        created: unix_secs(),
+    }))
+}
 
-    if want_stream {
-        stream_chat(stream, provider, &req, &cancel, &id, &model, created)
+/// Run the round's chat completions: one on its own as before, several together through
+/// [`TextLlm::generate_batch`].
+fn run_chats(provider: &dyn TextLlm, mut chats: Vec<ChatJob>) -> io::Result<()> {
+    match chats.len() {
+        0 => Ok(()),
+        1 => run_chat(provider, chats.pop().expect("one chat")),
+        _ => run_chat_batch(provider, chats),
+    }
+}
+
+/// One chat completion: stream SSE or return one JSON body.
+fn run_chat(provider: &dyn TextLlm, mut job: ChatJob) -> io::Result<()> {
+    let (stream, req, cancel, id, model, created) = (
+        &mut job.writer,
+        &job.req,
+        &job.cancel,
+        job.id.as_str(),
+        job.model.as_str(),
+        job.created,
+    );
+    if job.stream {
+        stream_chat(stream, provider, req, cancel, id, model, created)
     } else {
-        match provider.complete(&req) {
+        match provider.complete(req) {
             Ok(out) => {
                 let finish = out
                     .finish_reason
                     .map(openai::finish_reason_str)
                     .unwrap_or("stop");
                 let body = openai::completion(
-                    &id,
-                    &model,
+                    id,
+                    model,
                     created,
                     &out.text,
                     finish,
@@ -436,6 +528,7 @@ fn handle_chat(
                         completion_tokens: out.usage.generated_tokens,
                     },
                     out.decode.as_ref(),
+                    out.kv_cache.as_ref(),
                 );
                 write_json(stream, 200, &body)
             }
@@ -443,6 +536,131 @@ fn handle_chat(
             Err(e) => write_json(stream, 500, &server_error_body(&e)),
         }
     }
+}
+
+/// Several chat completions decoded together. Streaming clients get their SSE headers and role
+/// chunk first, then their own content chunks as the batch decodes; a client that disconnects
+/// cancels only its own request. Each finishes with its own final chunk (or JSON body), carrying
+/// its own `kv_cache` report.
+fn run_chat_batch(provider: &dyn TextLlm, mut jobs: Vec<ChatJob>) -> io::Result<()> {
+    let mut disconnected = vec![false; jobs.len()];
+    for (job, gone) in jobs.iter_mut().zip(disconnected.iter_mut()) {
+        if job.stream
+            && (start_sse(&mut job.writer).is_err()
+                || sse(
+                    &mut job.writer,
+                    &openai::role_chunk(&job.id, &job.model, job.created),
+                )
+                .is_err())
+        {
+            job.cancel.cancel();
+            *gone = true;
+        }
+    }
+    let reqs = jobs.iter().map(|job| job.req.clone()).collect::<Vec<_>>();
+    let results = provider.generate_batch(&reqs, &mut |i, event| {
+        let job = &mut jobs[i];
+        if !job.stream || disconnected[i] {
+            return;
+        }
+        if let StreamEvent::Token { text, .. } = event {
+            if !text.is_empty()
+                && sse(
+                    &mut job.writer,
+                    &openai::content_chunk(&job.id, &job.model, job.created, &text),
+                )
+                .is_err()
+            {
+                job.cancel.cancel();
+                disconnected[i] = true;
+            }
+        }
+    });
+    for ((mut job, result), gone) in jobs.into_iter().zip(results).zip(disconnected) {
+        if gone {
+            continue;
+        }
+        let outcome = if job.stream {
+            finish_sse(&mut job.writer, &job.id, &job.model, job.created, result)
+        } else {
+            match result {
+                Ok(out) => {
+                    let finish = out
+                        .finish_reason
+                        .map(openai::finish_reason_str)
+                        .unwrap_or("stop");
+                    let body = openai::completion(
+                        &job.id,
+                        &job.model,
+                        job.created,
+                        &out.text,
+                        finish,
+                        openai::CompletionUsage {
+                            prompt_tokens: out.usage.prompt_tokens,
+                            completion_tokens: out.usage.generated_tokens,
+                        },
+                        out.decode.as_ref(),
+                        out.kv_cache.as_ref(),
+                    );
+                    write_json(&mut job.writer, 200, &body)
+                }
+                Err(CoreError::Canceled) => Ok(()),
+                Err(e) => write_json(&mut job.writer, 500, &server_error_body(&e)),
+            }
+        };
+        if let Err(e) = outcome {
+            eprintln!("connection error: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// The SSE response head.
+fn start_sse(stream: &mut DeadlineWriter) -> io::Result<()> {
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Type: text/event-stream\r\n\
+          Cache-Control: no-cache\r\n\
+          Connection: close\r\n\
+          X-Accel-Buffering: no\r\n\r\n",
+    )
+}
+
+/// The end of an SSE response: the final chunk (with the `x_decode` and `kv_cache` reports) or an
+/// error chunk, then `[DONE]`. Nothing more for a cancelled request.
+fn finish_sse(
+    stream: &mut DeadlineWriter,
+    id: &str,
+    model: &str,
+    created: u64,
+    result: core_llm::Result<core_llm::TextLlmOutput>,
+) -> io::Result<()> {
+    match result {
+        Ok(out) => {
+            let finish = out
+                .finish_reason
+                .map(openai::finish_reason_str)
+                .unwrap_or("stop");
+            let _ = sse(
+                stream,
+                &openai::final_chunk(
+                    id,
+                    model,
+                    created,
+                    finish,
+                    out.decode.as_ref(),
+                    out.kv_cache.as_ref(),
+                ),
+            );
+        }
+        Err(CoreError::Canceled) => return Ok(()),
+        Err(e) => {
+            let _ = sse(stream, &server_error_body(&e));
+        }
+    }
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+    let _ = stream.flush();
+    Ok(())
 }
 
 /// Stream a chat completion as Server-Sent Events. A failed write (client disconnected) trips the
@@ -457,13 +675,7 @@ fn stream_chat(
     model: &str,
     created: u64,
 ) -> io::Result<()> {
-    stream.write_all(
-        b"HTTP/1.1 200 OK\r\n\
-          Content-Type: text/event-stream\r\n\
-          Cache-Control: no-cache\r\n\
-          Connection: close\r\n\
-          X-Accel-Buffering: no\r\n\r\n",
-    )?;
+    start_sse(stream)?;
     // If even the role chunk can't be written, the client is already gone.
     if sse(stream, &openai::role_chunk(id, model, created)).is_err() {
         cancel.cancel();
@@ -491,25 +703,7 @@ fn stream_chat(
     if disconnected {
         return Ok(()); // socket is dead; nothing more to send
     }
-    match result {
-        Ok(out) => {
-            let finish = out
-                .finish_reason
-                .map(openai::finish_reason_str)
-                .unwrap_or("stop");
-            let _ = sse(
-                stream,
-                &openai::final_chunk(id, model, created, finish, out.decode.as_ref()),
-            );
-        }
-        Err(CoreError::Canceled) => return Ok(()),
-        Err(e) => {
-            let _ = sse(stream, &server_error_body(&e));
-        }
-    }
-    let _ = stream.write_all(b"data: [DONE]\n\n");
-    let _ = stream.flush();
-    Ok(())
+    finish_sse(stream, id, model, created, result)
 }
 
 /// Write one SSE event (`data: <payload>\n\n`) and flush it so the client sees it immediately.
@@ -1185,13 +1379,16 @@ mod tests {
             )
         });
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(
+        // The handler parses the chat into a job (sc-20681); running it is the server loop's.
+        let job = handle_connection(
             stream,
             provider.as_ref(),
             &model,
             ConnectionLimits::PRODUCTION,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a chat completion is a job");
+        run_chats(provider.as_ref(), vec![job]).unwrap();
         let resp = client.join().unwrap();
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
         let v: serde_json::Value =
@@ -1199,6 +1396,111 @@ mod tests {
         assert_eq!(v["x_decode"]["proposer"], "draft_model", "{v}");
         assert_eq!(v["x_decode"]["fallbacks"], serde_json::json!([]), "{v}");
         assert_eq!(v["x_decode"]["prefix_cache"]["path"], "miss", "{v}");
+    }
+
+    /// Records each `generate_batch` call's size; answers every request with its own index.
+    struct BatchingLlm {
+        batches: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+    impl TextLlm for BatchingLlm {
+        fn descriptor(&self) -> &core_llm::TextLlmDescriptor {
+            unreachable!("the server never asks for the descriptor")
+        }
+        fn validate(&self, _: &core_llm::TextLlmRequest) -> core_llm::Result<()> {
+            Ok(())
+        }
+        fn generate(
+            &self,
+            _: &core_llm::TextLlmRequest,
+            _: &mut dyn FnMut(StreamEvent),
+        ) -> core_llm::Result<core_llm::TextLlmOutput> {
+            unreachable!("concurrent requests go through the batch")
+        }
+        fn generate_batch(
+            &self,
+            reqs: &[core_llm::TextLlmRequest],
+            on_event: &mut dyn FnMut(usize, StreamEvent),
+        ) -> Vec<core_llm::Result<core_llm::TextLlmOutput>> {
+            self.batches.lock().unwrap().push(reqs.len());
+            (0..reqs.len())
+                .map(|i| {
+                    let text = format!("batched-{i}");
+                    on_event(
+                        i,
+                        StreamEvent::Token {
+                            id: 1,
+                            text: text.clone(),
+                            index: 0,
+                            channel: core_llm::Channel::Content,
+                        },
+                    );
+                    Ok(core_llm::TextLlmOutput {
+                        text,
+                        finish_reason: Some(core_llm::FinishReason::Stop),
+                        kv_cache: Some(core_llm::KvCacheReport::dense(
+                            core_llm::KvCacheFallbackReason::PolicyDisabled,
+                            None,
+                        )),
+                        ..Default::default()
+                    })
+                })
+                .collect()
+        }
+    }
+
+    /// sc-20681: chat completions waiting together (here two, one streamed and one buffered,
+    /// both connected before the server's next accept) run as one `generate_batch` call, and each
+    /// client gets its own answer and `kv_cache` report.
+    #[test]
+    fn concurrent_chat_requests_run_as_one_batch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let send = |stream: bool| {
+            let body =
+                format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#);
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            write!(
+                client,
+                "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            client
+        };
+        let mut buffered = send(false);
+        let mut streamed = send(true);
+        let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = batches.clone();
+        std::thread::spawn(move || {
+            let provider = BatchingLlm { batches: recorded };
+            serve(
+                &listener,
+                &provider,
+                "test-model",
+                ConnectionLimits::PRODUCTION,
+            );
+        });
+        let mut buffered_response = String::new();
+        buffered.read_to_string(&mut buffered_response).unwrap();
+        let mut streamed_response = String::new();
+        streamed.read_to_string(&mut streamed_response).unwrap();
+        assert_eq!(*batches.lock().unwrap(), vec![2]);
+        assert!(
+            buffered_response.starts_with("HTTP/1.1 200")
+                && buffered_response.contains("batched-0")
+                && buffered_response.contains("policy_disabled"),
+            "{buffered_response}"
+        );
+        assert!(
+            streamed_response.contains("text/event-stream")
+                && streamed_response.contains("batched-1")
+                && streamed_response.contains("policy_disabled")
+                && streamed_response.ends_with("data: [DONE]\n\n"),
+            "{streamed_response}"
+        );
     }
 
     #[test]
