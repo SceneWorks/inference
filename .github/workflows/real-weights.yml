@@ -289,8 +289,17 @@ on:
 permissions:
   contents: read
 
+# SC-24163: the explicit Qwen 2.1 primary-Mac dispatch selects only its MLX job.
+# rw-starvector is runner 2310 / Michaels-MacBook-Pro, physically distinct from
+# secondary Mac runner 5281 and Windows CUDA runner 2313. Its constant group
+# serializes primary Qwen dispatches without holding the other hosts' shared lock.
+# Every other event, profile and runner retains the shared physical-host group.
 concurrency:
-  group: inference-real-weights-physical-host
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch' &&
+        inputs.profile == 'qwen-image-2-1-lora-mlx' &&
+        inputs.qwen_image_2_1_lora_runner == 'rw-starvector' &&
+        'inference-real-weights-qwen21-primary-mac' || 'inference-real-weights-physical-host' }}
   cancel-in-progress: false
 
 # BUILD ARTIFACTS OUTSIDE THE DIRECTORY `actions/checkout` CLEANS.

@@ -275,6 +275,42 @@ def evaluate_policy(
     return bool(eval(rendered, {"__builtins__": {}}, {}))
 
 
+def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
+    """Exercise the real group expression across both hosts and dispatch boundaries."""
+    concurrency = workflow["concurrency"]
+    errors = []
+    if set(concurrency) != {"group", "cancel-in-progress"}:
+        errors.append("concurrency must retain only group and cancel-in-progress")
+    if concurrency.get("cancel-in-progress") is not False:
+        errors.append("running primary dispatches must never cancel one another")
+    expression = concurrency["group"].removeprefix("${{").removesuffix("}}").strip()
+    profiles = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+    for event in ("workflow_dispatch", "schedule", "push", "pull_request", "workflow_call", "merge_group"):
+        for profile in [*profiles, "", "qwen-image-2-1-lora-mlx-extra"]:
+            for runner in ("rw-starvector", "rw-mage", "nax", "real-weights", "", "rw-starvector-extra"):
+                primary = event == "workflow_dispatch" and profile == "qwen-image-2-1-lora-mlx" and runner == "rw-starvector"
+                expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
+                # Separate runs, revisions and phases on the primary must all share one group.
+                variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
+                            ("3", "c" * 40, "imports"), ("4", "d" * 40, "full")) if primary else (("1", "a" * 40, "probe"),)
+                for run_id, sha, phase in variants:
+                    values = {"github.event_name": event, "inputs.profile": profile,
+                              "inputs.qwen_image_2_1_lora_runner": runner,
+                              "inputs.qwen_image_2_1_lora_phase": phase,
+                              "github.run_id": run_id, "github.sha": sha}
+                    rendered = expression
+                    for name in sorted(values, key=len, reverse=True):
+                        rendered = rendered.replace(name, repr(values[name]))
+                    rendered = rendered.replace("&&", " and ").replace("||", " or ")
+                    try:
+                        actual = eval(f"({rendered})", {"__builtins__": {}}, {})
+                    except (NameError, SyntaxError, AttributeError) as error:
+                        return [*errors, f"unsupported group expression: {error}"]
+                    if actual != expected:
+                        return [*errors, f"wrong group for {event}/{profile}/{runner}/{phase}/{run_id}: {actual!r}"]
+    return errors
+
+
 def workflow_job_bodies(workflow: str) -> dict[str, list[str]]:
     """Return top-level job bodies without treating nested step keys as jobs."""
     lines = workflow.splitlines()
@@ -1581,9 +1617,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("test_sa3_ci_target_coverage.py", workflow[start:run])
         self.assertIn("SC_16605_REAL_WEIGHT_WORKFLOW_CLEANUP.md", workflow[start:run])
 
-    def test_real_weight_workflows_share_one_physical_host_lock(self) -> None:
+    def test_real_weight_workflows_share_lock_except_explicit_qwen_primary_dispatch(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(qwen21_primary_concurrency_errors(workflow), [])
         for path in (
-            REAL_WEIGHTS_WORKFLOW,
             LTX25_QUANT_CAMPAIGN_WORKFLOW,
             LTX25_QUANT_PROMOTION_WORKFLOW,
             YUE_WORKFLOW,
@@ -1595,6 +1632,33 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     1,
                 )
                 self.assertIn("cancel-in-progress: false", workflow)
+
+    def test_qwen_primary_group_rejects_broader_or_nonserializing_mutations(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(qwen21_primary_concurrency_errors(workflow), [])
+        expression = workflow["concurrency"]["group"]
+        mutations = {
+            "event guard omitted": expression.replace("github.event_name == 'workflow_dispatch' &&", ""),
+            "profile guard omitted": expression.replace("inputs.profile == 'qwen-image-2-1-lora-mlx' &&", ""),
+            "runner guard omitted": expression.replace("inputs.qwen_image_2_1_lora_runner == 'rw-starvector' &&", ""),
+            "secondary runner admitted": expression.replace("== 'rw-starvector'", "!= 'nax'"),
+            "all runs share global group": repr("inference-real-weights-physical-host"),
+            "group split per run": expression.replace("'inference-real-weights-qwen21-primary-mac'", "github.run_id"),
+            "group split per revision": expression.replace("'inference-real-weights-qwen21-primary-mac'", "github.sha"),
+            "group split per phase": expression.replace("'inference-real-weights-qwen21-primary-mac'", "inputs.qwen_image_2_1_lora_phase"),
+        }
+        for name, group in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertNotEqual(group, expression)
+                mutated = copy.deepcopy(workflow)
+                mutated["concurrency"]["group"] = group
+                self.assertTrue(qwen21_primary_concurrency_errors(mutated))
+        for name, changed in {"cancel active": {"cancel-in-progress": True},
+                              "change queue policy": {"queue": "max"}}.items():
+            with self.subTest(mutation=name):
+                mutated = copy.deepcopy(workflow)
+                mutated["concurrency"].update(changed)
+                self.assertTrue(qwen21_primary_concurrency_errors(mutated))
 
     def test_yue_workflow_python_installs_are_binary_hash_locked(self) -> None:
         installs = [
