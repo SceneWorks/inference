@@ -14,6 +14,7 @@ import yue2_precision_proof as proof
 SHA = "a" * 40
 LUID = "luid_0x00000000_0x00020d46"
 PCI = "0000:21:00.0"
+UUID = "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
 PMON_EMPTY = ["# gpu pid type fb sm mem enc dec jpg ofa", "0 - - - - - - - - -"]
 
 
@@ -45,8 +46,8 @@ def make_probe(root: Path) -> None:
              "adapterCommitted": r"\GPU Adapter Memory(*)\Total Committed"}
     for index in range(3):
         put(f"gpu-sample-{index}", {"exitCode": 0, "output": [
-            f"0, GPU-abc, {PCI}, RTX, 596, 97887, 0, 97887, 0, 0"]})
-        put(f"driver-mode-{index}", {"exitCode": 0, "output": ["0, GPU-abc, WDDM, Enabled"]})
+            f"0, {UUID}, {PCI}, RTX, 596, 97887, 0, 97887, 0, 0"]})
+        put(f"driver-mode-{index}", {"exitCode": 0, "output": [f"0, {UUID}, WDDM, Enabled"]})
         for gpu in (0, 1):
             put(f"pmon-{gpu}-{index}", {"exitCode": 0, "output": PMON_EMPTY})
             put(f"compute-apps-{gpu}-{index}", {"exitCode": 0, "output": []})
@@ -56,7 +57,7 @@ def make_probe(root: Path) -> None:
                                            if key.startswith("adapter") else [])}
             for key, path in paths.items()]})
     for name in ("gpu-before-cuda-properties", "gpu-after-cuda-properties"):
-        put(name, {"exitCode": 0, "output": [f"0, GPU-abc, {PCI}, 0, 0"]})
+        put(name, {"exitCode": 0, "output": [f"0, {UUID}, {PCI}, 0, 0"]})
     put("pmon-0-final", {"exitCode": 0, "output": PMON_EMPTY})
 
 
@@ -173,6 +174,22 @@ class EmptyDeviceTests(unittest.TestCase):
                 finally:
                     for name, raw in saved.items():
                         (root / f"{name}.json").write_bytes(raw)
+
+                # Coherent device re-enumeration must not transfer the owner's
+                # GPU0 authorization to a different physical card.
+                saved = {path: path.read_bytes() for path in root.glob("*.json")}
+                try:
+                    for path, raw in saved.items():
+                        changed = (raw.decode("utf-8").replace(UUID, "GPU-other")
+                                   .replace(PCI, "0000:22:00.0")
+                                   .replace(LUID, "luid_0x00000000_0x00020c10")
+                                   .replace("46-0D-02-00-00-00-00-00", "10-0C-02-00-00-00-00-00"))
+                        path.write_text(changed, encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "different physical GPU0"):
+                        idle._empty_gpu0_summary(root)
+                finally:
+                    for path, raw in saved.items():
+                        path.write_bytes(raw)
 
     def test_empty_route_requires_source_gpu0_and_no_old_receipt(self):
         with patch.object(idle, "check_device_selection"), patch.dict("os.environ", {

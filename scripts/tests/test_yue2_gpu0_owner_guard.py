@@ -539,6 +539,79 @@ class OwnerGuardTests(unittest.TestCase):
             guard.guarded_command(["node"], Path(directory), {}, None, Path(directory), "case")
         launch.assert_not_called()
 
+    def test_shared_host_install_has_job_tail_and_reaps_only_owned_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            for stamp in ("", "invalid", str(time.time_ns() - 480 * 60 * 1_000_000_000)):
+                with self.subTest(stamp=stamp), patch.dict(os.environ, {
+                    "YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": stamp}), \
+                     patch.object(guard.subprocess, "Popen") as launch, \
+                     self.assertRaises(RuntimeError):
+                    guard.shared_host_install_command(["node", "install"], cwd, {}, None)
+                launch.assert_not_called()
+
+            child = Owned()
+            waits = []
+            def expire(timeout):
+                waits.append(timeout)
+                raise subprocess.TimeoutExpired("install", timeout)
+            child.wait = expire
+            def reap(owned):
+                self.assertIs(owned, child)
+                child.code = -9
+                return -9, None
+            with patch.dict(os.environ, {"YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
+                 patch.object(guard.subprocess, "Popen", return_value=child) as launch, \
+                 patch.object(guard, "reap_tree", side_effect=reap) as cleanup, \
+                 self.assertRaises(subprocess.TimeoutExpired):
+                guard.shared_host_install_command(["node", "install"], cwd, {"CUDA_VISIBLE_DEVICES": "0"}, None)
+            self.assertEqual(launch.call_args.args[0], ["node", "install"])
+            self.assertEqual(launch.call_args.kwargs["env"], {"CUDA_VISIBLE_DEVICES": "0"})
+            self.assertEqual(len(waits), 1)
+            self.assertGreater(waits[0], 0)
+            self.assertLessEqual(waits[0], 480 * 60 - 600)
+            cleanup.assert_called_once_with(child)
+
+            child.code = 0
+            child.wait = lambda timeout: 0
+            with patch.dict(os.environ, {"YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
+                 patch.object(guard.subprocess, "Popen", return_value=child):
+                self.assertEqual(guard.shared_host_install_command(["node", "install"], cwd, {}, None), 0)
+
+            # A slow Popen cannot borrow time from the protected upload tail.
+            start = 1_000_000_000_000
+            deadline = start + (480 * 60 - 600) * 1_000_000_000
+            child.code = None
+            with patch.dict(os.environ, {"YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": str(start)}), \
+                 patch.object(guard.time, "time_ns", side_effect=[start, start, deadline + 1]), \
+                 patch.object(guard.subprocess, "Popen", return_value=child), \
+                 patch.object(guard, "reap_tree", side_effect=reap) as cleanup, \
+                 self.assertRaisesRegex(RuntimeError, "cleanup/upload tail"):
+                guard.shared_host_install_command(["node", "install"], cwd, {}, None)
+            cleanup.assert_called_once_with(child)
+
+            child.code = None
+            child.wait = expire
+            with patch.dict(os.environ, {"YUE2_APP_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
+                 patch.object(guard.subprocess, "Popen", return_value=child), \
+                 patch.object(guard, "reap_tree", return_value=(None, "termination failed")), \
+                 self.assertRaisesRegex(RuntimeError, "owned shared-host install did not release"):
+                guard.shared_host_install_command(["node", "install"], cwd, {}, None)
+
+    def test_shared_host_cli_uses_bounded_install_path(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"YUE2_CUDA_SCHEDULING_MODE": "shared-host", "GH_TOKEN": "secret"}), \
+             patch.object(sys, "argv", ["guard", "--evidence", directory, "--label", "install",
+                                        "--", "node", "scripts/yue2-acceptance.mjs", "--profile-install-only"]), \
+             patch.object(guard, "shared_host_install_command", return_value=0) as install, \
+             patch.object(guard.subprocess, "run") as unbounded, self.assertRaises(SystemExit) as exit_status:
+            guard.main()
+        self.assertEqual(exit_status.exception.code, 0)
+        self.assertEqual(install.call_args.args[0],
+                         ["node", "scripts/yue2-acceptance.mjs", "--profile-install-only"])
+        self.assertNotIn("GH_TOKEN", install.call_args.args[2])
+        unbounded.assert_not_called()
+
     def test_engine_owner_refusal_happens_before_any_popen(self):
         from scripts.tests import test_yue2_precision_proof as existing
         control = existing.CONTROL

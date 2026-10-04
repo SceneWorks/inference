@@ -639,6 +639,25 @@ def guarded_command(argv: list[str], cwd: Path, env: dict, log, evidence: Path, 
     return code
 
 
+def shared_host_install_command(argv: list[str], cwd: Path, env: dict, log) -> int:
+    """Bound the install's own process tree within the app job and upload tail."""
+    stamp = os.environ.get("YUE2_APP_PRECISION_JOB_STARTED_UTC_NS", "")
+    require(stamp.isdigit() and int(stamp) <= time.time_ns(),
+            "app shared-host job start is unavailable")
+    deadline = int(stamp) + (480 * 60 - 600) * 1_000_000_000
+    require(deadline > time.time_ns(), "app shared-host install has no cleanup/upload tail")
+    child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        remaining = (deadline - time.time_ns()) / 1_000_000_000
+        require(remaining > 0, "app shared-host install has no cleanup/upload tail")
+        return child.wait(timeout=remaining)
+    except BaseException:
+        _, cleanup = reap_tree(child)
+        require(cleanup is None and child.poll() is not None,
+                f"owned shared-host install did not release: {cleanup}")
+        raise
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
@@ -653,8 +672,9 @@ def main() -> None:
         code = guarded_command(args.argv[1:], Path.cwd(), env, None, args.evidence, args.label)
     else:
         require(env.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") == "shared-host", "unknown scheduling mode")
-        code = subprocess.run(args.argv[1:], env={k: v for k, v in env.items()
-                              if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}, check=False).returncode
+        code = shared_host_install_command(args.argv[1:], Path.cwd(),
+                                           {k: v for k, v in env.items()
+                                            if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}, None)
     raise SystemExit(code)
 
 

@@ -405,6 +405,11 @@ def _empty_gpu0_summary(directory: Path) -> dict:
     require(len(raw_luid) == 8, "empty-device LUID invalid")
     luid = f"luid_0x{int.from_bytes(raw_luid[4:], 'little'):08x}_0x{int.from_bytes(raw_luid[:4], 'little'):08x}"
     gpu = [_gpu_row(directory, f"gpu-sample-{index}", has_free=True) for index in range(3)]
+    # The owner's GPU0 allocation is bound to the authenticated physical card,
+    # even when a reboot changes its Windows adapter LUID.
+    require(gpu[0]["uuid"] == "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0" and
+            gpu[0]["pci"] == "00000000:21:00.0".lstrip("0"),
+            "empty-device probe selected a different physical GPU0")
     require(gpu[0]["usedMiB"] == 0 and all(row == gpu[0] for row in gpu) and
             devices[0]["pciBusId"].lower().lstrip("0") == gpu[0]["pci"],
             "empty-device GPU0 identity/residency changed or nonzero")
