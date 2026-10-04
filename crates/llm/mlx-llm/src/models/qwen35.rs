@@ -51,7 +51,38 @@ fn checkpoint_norm_weight(weight: Array, prism: bool) -> Result<Array> {
 
 /// Cached decode runs in bf16 (matching the rest of the engine); the delta recurrence accumulates in
 /// f32 (matching the reference GPU kernel) for stability.
-const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
+const BF16_COMPUTE: Dtype = Dtype::Bfloat16;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's compute-dtype override ([`with_compute_dtype`]).
+    static COMPUTE_OVERRIDE: std::cell::Cell<Option<Dtype>> = const { std::cell::Cell::new(None) };
+}
+
+/// The decoder's compute dtype: bf16 ([`BF16_COMPUTE`]) — or, in a test, the dtype
+/// [`with_compute_dtype`] runs it in.
+#[inline]
+fn compute() -> Dtype {
+    #[cfg(test)]
+    if let Some(dtype) = COMPUTE_OVERRIDE.with(std::cell::Cell::get) {
+        return dtype;
+    }
+    BF16_COMPUTE
+}
+
+/// Run `f` — a load and its forwards — with the hybrid decoder computing in `dtype` on this
+/// thread (test seam: the f32 twin of a bf16 parity fixture, sc-24446 merge review).
+#[cfg(test)]
+pub(crate) fn with_compute_dtype<R>(dtype: Dtype, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Dtype>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMPUTE_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(COMPUTE_OVERRIDE.with(|c| c.replace(Some(dtype))));
+    f()
+}
 
 /// Interleaved M-RoPE output of [`Qwen35Model::mrope_positions`]: the temporal / height / width
 /// position rows (each length `S`) plus the `mrope_delta` (`max_position + 1 − len`) for continuing
@@ -632,8 +663,8 @@ impl AttnKv {
         self.kv.batch_size()
     }
 
-    fn reset(&mut self) {
-        self.kv.reset();
+    fn reset(&mut self) -> Result<()> {
+        self.kv.reset()
     }
 
     /// Keep positions `0..len` — bookkeeping only: the rolled-back positions stay in the block
@@ -709,14 +740,40 @@ impl Qwen35Cache {
             .unwrap_or(0)
     }
 
+    /// Drop every attention layer's campaign ownership events
+    /// ([`ContiguousKvCache::clear_events`]) — a cache kept as a prefix-cache entry carries none.
+    pub(crate) fn clear_kv_events(&mut self) {
+        for layer in &mut self.layers {
+            if let Qwen35LayerCache::Attn(slot) = layer {
+                slot.kv.clear_events();
+            }
+        }
+    }
+
+    /// The dtypes of each full-attention layer's cached keys and values, in layer order, skipping
+    /// a layer that has cached nothing yet. Inspection only: since sc-20671 they are the compute
+    /// dtype whatever dtype the snapshot stores its quantized scales in.
+    pub fn attention_kv_dtypes(&self) -> Result<Vec<(Dtype, Dtype)>> {
+        let mut dtypes = Vec::new();
+        for layer in &self.layers {
+            if let Qwen35LayerCache::Attn(slot) = layer {
+                if let Some((keys, values)) = slot.kv.peek(0)? {
+                    dtypes.push((keys.dtype(), values.dtype()));
+                }
+            }
+        }
+        Ok(dtypes)
+    }
+
     /// Drop all cached state.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> Result<()> {
         for l in &mut self.layers {
             match l {
                 Qwen35LayerCache::Delta(c) => c.reset(),
-                Qwen35LayerCache::Attn(a) => a.reset(),
+                Qwen35LayerCache::Attn(a) => a.reset()?,
             }
         }
+        Ok(())
     }
 
     /// Bytes the cache's arrays hold: every attention layer's KV block buffers plus every linear
@@ -912,8 +969,7 @@ impl Qwen35Cache {
             return Ok(());
         }
         if len == 0 {
-            self.reset();
-            return Ok(());
+            return self.reset();
         }
         if let Some(Qwen35LayerCache::Delta(c)) = self
             .layers
@@ -1082,6 +1138,12 @@ impl Qwen35Model {
         self.quantized
     }
 
+    /// The decoder's compute dtype (bf16): its activations, logits, and full-attention K/V. The
+    /// linear-attention recurrence alone accumulates in f32.
+    pub fn compute_dtype(&self) -> Dtype {
+        compute()
+    }
+
     /// Whether projections use the packed Prism Hadamard path.
     pub fn is_prism(&self) -> bool {
         self.prism
@@ -1151,12 +1213,9 @@ impl Qwen35Model {
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
     /// hidden states `[B, S, hidden]` (before the final norm / lm_head).
     fn hidden(&self, input_ids: &Array, cache: &mut Qwen35Cache, offset: i32) -> Result<Array> {
-        let h = self
-            .embed_tokens
-            .forward(input_ids)?
-            .as_dtype(COMPUTE_DTYPE)?;
+        let h = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
         let s = h.shape()[1];
-        let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
+        let (cos, sin) = self.rope.cos_sin(s, offset, compute())?;
         self.hidden_from_embeds(&h, &cos, &sin, cache)
     }
 
@@ -1209,9 +1268,9 @@ impl Qwen35Model {
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
-            COMPUTE_DTYPE,
+            compute(),
         )?;
-        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let h0 = embeds.as_dtype(compute())?;
         let layers = &self.layers;
         let cache_layers = &mut cache.layers;
         let h = deepstack_fused_decoder_layers(
@@ -1238,9 +1297,9 @@ impl Qwen35Model {
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
-            COMPUTE_DTYPE,
+            compute(),
         )?;
-        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let h0 = embeds.as_dtype(compute())?;
         let layers = &self.layers;
         let cache_layers = &mut cache.layers;
         let h = deepstack_fused_decoder_layers(
@@ -1269,10 +1328,7 @@ impl Qwen35Model {
         cache: &mut MtpCache,
         offset: i32,
     ) -> Result<(Array, Array)> {
-        let embeds = self
-            .embed_tokens
-            .forward(input_ids)?
-            .as_dtype(COMPUTE_DTYPE)?;
+        let embeds = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
         let s = embeds.shape()[1];
         let positions = (offset..offset + s).collect::<Vec<_>>();
         self.mtp_step_from_embeds(
@@ -1334,7 +1390,7 @@ impl Qwen35Model {
                 hidden_states.shape()
             )));
         }
-        let embeds = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let embeds = embeds.as_dtype(compute())?;
         let e = rms_norm(&embeds, &mtp.pre_fc_norm_embedding, self.eps)?;
         let h = rms_norm(hidden_states, &mtp.pre_fc_norm_hidden, self.eps)?;
         let fused = concatenate_axis(&[&e, &h], 2)?;
@@ -1351,7 +1407,7 @@ impl Qwen35Model {
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
-            COMPUTE_DTYPE,
+            compute(),
         )?;
         let mut slot = Qwen35LayerCache::Attn(std::mem::take(&mut cache.layers[0]));
         let out = mtp.layers[0].forward(&x, &cos, &sin, &mut slot)?;
@@ -1423,10 +1479,7 @@ impl Qwen35Model {
     /// multimodal path overwrites image-token rows with the encoder's projected patch features
     /// ([`Self::splice_image_features`]).
     pub fn embed_input_ids(&self, input_ids: &Array) -> Result<Array> {
-        Ok(self
-            .embed_tokens
-            .forward(input_ids)?
-            .as_dtype(COMPUTE_DTYPE)?)
+        Ok(self.embed_tokens.forward(input_ids)?.as_dtype(compute())?)
     }
 
     /// Replace the `image_token_id` rows of `embeds` `[1, S, hidden]` with `image_features`
@@ -1461,7 +1514,7 @@ impl Qwen35Model {
             vision_features,
             placeholder_tokens,
             self.cfg.hidden_size,
-            COMPUTE_DTYPE,
+            compute(),
         )
     }
 
@@ -1539,9 +1592,9 @@ impl Qwen35Model {
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
-            COMPUTE_DTYPE,
+            compute(),
         )?;
-        let h = self.hidden_from_embeds(&embeds.as_dtype(COMPUTE_DTYPE)?, &cos, &sin, cache)?;
+        let h = self.hidden_from_embeds(&embeds.as_dtype(compute())?, &cos, &sin, cache)?;
         self.project_last(&h)
     }
 
@@ -1567,9 +1620,9 @@ impl Qwen35Model {
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
-            COMPUTE_DTYPE,
+            compute(),
         )?;
-        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let h0 = embeds.as_dtype(compute())?;
         let layers = &self.layers;
         let cache_layers = &mut cache.layers;
         let h = deepstack_fused_decoder_layers(
@@ -1649,7 +1702,7 @@ impl Qwen35Model {
         prism: Option<&PrismMlxPack>,
     ) -> Result<Self> {
         let eps = cfg.rms_norm_eps;
-        let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+        let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(compute())?) };
         // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
         // converted every ordinary RMSNorm tensor to its direct multiplier and must remain raw.
         let norm_w = |key: String| -> Result<Array> {
@@ -1671,12 +1724,12 @@ impl Qwen35Model {
         let saw_stored = Cell::new(false);
         let proj_q = |key: String| -> Result<Projection> {
             if let Some(pack) = prism {
-                return Ok(Projection::Prism(pack.linear(w, &key)?));
+                return Ok(Projection::Prism(pack.linear(w, &key, compute())?));
             }
             load_projection(w, &key, stored_quant, quant, &saw_stored)
         };
         let proj_dense = |key: String| -> Result<Projection> {
-            Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, None)
+            Projection::load(w.require(&key)?.as_dtype(compute())?, None)
         };
         let dp = |s: &str| format!("{prefix}.{s}");
 
@@ -1701,7 +1754,7 @@ impl Qwen35Model {
             }
             Projection::load(embed_weight.expect("dense embedding"), None)?
         } else if let Some(pack) = prism {
-            Projection::Prism(pack.linear(w, "language_model.lm_head.weight")?)
+            Projection::Prism(pack.linear(w, "language_model.lm_head.weight", compute())?)
         } else {
             Projection::load(req("lm_head.weight".to_string())?, None)?
         };
@@ -1832,7 +1885,7 @@ fn build_ffn(
     proj_q: &dyn Fn(String) -> Result<Projection>,
 ) -> Result<Ffn> {
     let lp = |s: &str| format!("{lp}{s}");
-    let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+    let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(compute())?) };
     let Some(moe) = &cfg.moe else {
         return Ok(Ffn::Dense(Mlp {
             gate: proj_q(lp("mlp.gate_proj.weight"))?,
@@ -1989,9 +2042,9 @@ fn load_projection(
             )));
         }
         saw_stored.set(true);
-        Ok(Projection::from_quantized(weight, scales, biases, spec))
+        Projection::from_quantized(weight, scales, biases, spec, compute())
     } else {
-        Projection::load(w.require(key)?.as_dtype(COMPUTE_DTYPE)?, quant)
+        Projection::load(w.require(key)?.as_dtype(compute())?, quant)
     }
 }
 
@@ -2128,7 +2181,7 @@ impl Qwen35Model {
             &self.cfg,
             prefix,
             &proj,
-            &|key| checkpoint_norm_weight(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, false),
+            &|key| checkpoint_norm_weight(w.require(&key)?.as_dtype(compute())?, false),
             // A dense target (MoE targets are refused above) → the dense SwiGLU arm.
             &|lp| build_ffn(&w, lp, &self.cfg, None, &proj),
         )?;
@@ -2164,7 +2217,7 @@ impl KvCache for Qwen35Cache {
             .unwrap_or(0)
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<()> {
         Qwen35Cache::reset(self)
     }
 
@@ -2364,7 +2417,7 @@ pub(crate) mod tests {
             assert_eq!(slot.offset(), 10);
             assert_ne!(slot.offset(), 12);
 
-            slot.reset();
+            slot.reset().unwrap();
             assert_eq!(slot.offset(), 0);
             assert_eq!(slot.batch_size(), 0);
         })
@@ -4597,7 +4650,7 @@ pub(crate) mod tests {
             e.extend(std::iter::repeat_n(r as f32, hidden));
         }
         let embeds = Array::from_slice(&e, &[1, 5, hidden as i32])
-            .as_dtype(COMPUTE_DTYPE)
+            .as_dtype(compute())
             .unwrap();
         // feats[2,hidden]: row j filled with 100 + j.
         let mut f = Vec::new();
@@ -4759,7 +4812,7 @@ pub(crate) mod tests {
 
         let v0 = 0.5f32;
         let h0 = Array::from_slice(&vec![v0; (seq * hidden) as usize], &[1, seq, hidden])
-            .as_dtype(COMPUTE_DTYPE)
+            .as_dtype(compute())
             .unwrap();
         let feat_val = [0.25f32, 0.5, 0.75];
         let deepstack: Vec<Array> = (0..taps.len())
@@ -4768,12 +4821,12 @@ pub(crate) mod tests {
                     &vec![feat_val[t]; (num_visual * hidden) as usize],
                     &[num_visual, hidden],
                 )
-                .as_dtype(COMPUTE_DTYPE)
+                .as_dtype(compute())
                 .unwrap()
             })
             .collect();
 
-        let two = Array::from_f32(2.0).as_dtype(COMPUTE_DTYPE).unwrap();
+        let two = Array::from_f32(2.0).as_dtype(compute()).unwrap();
         let mut calls: Vec<usize> = Vec::new();
         let fused = deepstack_fused_decoder_layers(
             &h0,
@@ -5089,5 +5142,75 @@ pub(crate) mod tests {
             released(&mut cache, live, &format!("verify {width}"));
         }
         assert!(model.checkpoint_ring_bytes(8) > model.checkpoint_ring_bytes(4));
+    }
+
+    /// sc-20671: stored quantized projections whose `scales`/`biases` are F16 (the mlx-community
+    /// convention) must not promote the BF16 activations to F32 — the hidden states and the full-
+    /// attention K/V stay in the compute dtype. The BF16-scale twin is the unchanged control.
+    #[test]
+    fn stored_quantized_scales_keep_activations_and_kv_in_compute_dtype() {
+        use crate::primitives::quant::QuantizedLinear;
+        let mut value = cfg_json();
+        // qwen3_5 stores 64-wide groups: widen every stored projection's input to a multiple.
+        let text = &mut value["text_config"];
+        text["hidden_size"] = json!(64);
+        text["intermediate_size"] = json!(128);
+        text["head_dim"] = json!(16);
+        text["linear_value_head_dim"] = json!(16);
+        value["quantization"] = json!({"group_size": 64, "bits": 4});
+        let cfg = Qwen35Config::from_json(&value).unwrap();
+        let dense = synthetic_weights(&cfg);
+        const STORED: [&str; 10] = [
+            "in_proj_qkv",
+            "in_proj_z",
+            "out_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ];
+        for scale_dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            let mut map = HashMap::new();
+            for key in dense.keys() {
+                let array = dense.require(key).unwrap().as_dtype(scale_dtype).unwrap();
+                let base = key.strip_suffix(".weight").unwrap_or(key);
+                if key.starts_with("model.language_model.layers.")
+                    && STORED.iter().any(|p| base.ends_with(p))
+                {
+                    let q = QuantizedLinear::quantize(&array, 64, 4, None).unwrap();
+                    assert_eq!(q.scales.dtype(), scale_dtype);
+                    map.insert(format!("{base}.weight"), q.weight);
+                    map.insert(format!("{base}.scales"), q.scales);
+                    map.insert(format!("{base}.biases"), q.biases);
+                } else {
+                    map.insert(key.to_string(), array);
+                }
+            }
+            let model = Qwen35Model::from_weights(
+                &Weights::from_map(map),
+                "model.language_model",
+                cfg.clone(),
+            )
+            .unwrap();
+            assert!(model.is_quantized());
+            let mut cache = model.new_cache();
+            let hidden = model
+                .hidden(&Array::from_slice(&[1i32, 2, 3], &[1, 3]), &mut cache, 0)
+                .unwrap();
+            assert_eq!(hidden.dtype(), compute(), "{scale_dtype:?} hidden");
+            let mut attention_layers = 0;
+            for layer in &cache.layers {
+                if let Qwen35LayerCache::Attn(slot) = layer {
+                    let (k, v) = slot.kv.peek(0).unwrap().unwrap();
+                    assert_eq!(k.dtype(), compute(), "{scale_dtype:?} keys");
+                    assert_eq!(v.dtype(), compute(), "{scale_dtype:?} values");
+                    attention_layers += 1;
+                }
+            }
+            assert_eq!(attention_layers, 1);
+        }
     }
 }

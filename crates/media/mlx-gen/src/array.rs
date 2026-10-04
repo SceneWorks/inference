@@ -44,10 +44,63 @@ pub fn scalar(v: f32) -> Array {
 /// while every *dimension* stays within it is int64-safe on this pin (probe-verified in
 /// `mlx-gen/tests/mlx_write_bound_probe.rs::reshape_and_contiguous_on_oversized_array`). Below the bound
 /// `a == total, b == 1`, byte-identical to the old round-trip.
+///
+/// **Always row-major (sc-20676).** Above the bound the `[a, b]` regrouping can be a pure view: a
+/// permutation that swaps whole dim groups (e.g. a transposed `[X, Y]` split at `a = X`) reshapes
+/// without a copy and would keep its permuted strides. A `b > 1` result therefore goes through
+/// MLX's own `contiguous` op (`mlx_contiguous`), which copies to row-major unless it already is.
 pub fn contiguous(x: &Array) -> Result<Array> {
+    let (a, b) = flat_2d(x.shape());
+    contiguous_via_split(x, a, b)
+}
+
+/// [`contiguous`] with an explicit `[a, b]` regrouping (so tests can force a `b > 1` split at a
+/// small size).
+fn contiguous_via_split(x: &Array, a: i32, b: i32) -> Result<Array> {
     let shape = x.shape().to_vec();
-    let (a, b) = flat_2d(&shape);
-    Ok(x.reshape(&[a, b])?.reshape(&shape)?)
+    let regrouped = x.reshape(&[a, b])?.reshape(&shape)?;
+    if b == 1 && shape != [a, 1] {
+        // `[total, 1]` merges every dim, which MLX can only do without a copy for data already in
+        // row-major order: the round-trip is logically contiguous. (A `[total, 1]` input is
+        // returned by `reshape` unchanged, strides and all, so it takes the explicit copy below.)
+        return Ok(regrouped);
+    }
+    // Lazy: at evaluation MLX's `Contiguous` shares an already row-contiguous buffer and copies
+    // anything else.
+    mlx_contiguous(&regrouped)
+}
+
+/// Whether an **evaluated** `x`'s strides are the row-major strides of its shape (size-1 dims
+/// ignored). An unevaluated array reports default row-major strides.
+#[cfg(test)]
+fn is_row_major(x: &Array) -> bool {
+    let mut expected = 1usize;
+    for (&dim, &stride) in x.shape().iter().zip(x.strides()).rev() {
+        if dim != 1 && stride != expected {
+            return false;
+        }
+        expected *= dim.max(1) as usize;
+    }
+    true
+}
+
+/// MLX's `contiguous` op (not wrapped by mlx-rs): a row-major copy unless already row-contiguous.
+fn mlx_contiguous(x: &Array) -> Result<Array> {
+    let stream = mlx_rs::StreamOrDevice::default();
+    // SAFETY: on success `mlx_contiguous` writes a new owned handle into `result`, which
+    // `Array::from_ptr` takes ownership of; on failure the empty handle is freed here.
+    unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status =
+            mlx_sys::mlx_contiguous(&mut result, x.as_ptr(), false, stream.as_ref().as_ptr());
+        if status != 0 {
+            mlx_sys::mlx_array_free(result);
+            return Err(Error::Msg(
+                "mlx_contiguous failed while making a row-major copy".into(),
+            ));
+        }
+        Ok(Array::from_ptr(result))
+    }
 }
 
 /// Split `shape` into two contiguous dimension groups `[a, b]` (`a·b == Π shape`) with each factor
@@ -78,9 +131,47 @@ fn flat_2d(shape: &[i32]) -> (i32, i32) {
     (a as i32, b as i32)
 }
 
+/// Whether `a` has been evaluated (its buffer is materialized, so it no longer keeps its lazy graph
+/// inputs alive). Used to prove retained caches hold only their own bytes.
+pub fn is_materialized(a: &Array) -> bool {
+    let mut available = false;
+    // SAFETY: `_mlx_array_is_available` writes one bool through a valid pointer for a live array.
+    unsafe { mlx_sys::_mlx_array_is_available(&mut available, a.as_ptr()) };
+    available
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-20676: a `b > 1` regrouping of a whole-group permutation is a pure view (the transpose of
+    /// `[6, 4]` split as `[4, 6]` reshapes without a copy), so the reshape round-trip alone would
+    /// leave it permuted and `as_slice` would read physical order. `contiguous` must still return
+    /// logical row-major values.
+    #[test]
+    fn contiguous_copies_a_permuted_view_the_regrouping_leaves_uncopied() {
+        let data: Vec<f32> = (0..24).map(|v| v as f32).collect();
+        let t = Array::from_slice(&data, &[6, 4])
+            .transpose_axes(&[1, 0])
+            .unwrap(); // [4, 6]
+        let view = t.reshape(&[4, 6]).unwrap().reshape(&[4, 6]).unwrap();
+        view.eval().unwrap();
+        assert!(
+            !is_row_major(&view),
+            "precondition: the regrouping is a view"
+        );
+        let logical: Vec<f32> = (0..4)
+            .flat_map(|i| (0..6).map(move |j| (j * 4 + i) as f32))
+            .collect();
+        let out = contiguous_via_split(&t, 4, 6).unwrap();
+        out.eval().unwrap();
+        assert!(is_row_major(&out));
+        assert_eq!(out.as_slice::<f32>(), logical.as_slice());
+        assert_eq!(
+            contiguous(&t).unwrap().as_slice::<f32>(),
+            logical.as_slice()
+        );
+    }
 
     #[test]
     fn flat_2d_splits_stay_within_i32() {

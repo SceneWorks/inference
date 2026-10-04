@@ -21,29 +21,39 @@ pub mod stream;
 
 pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
-pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
+pub use continuous::{
+    generate_continuous, generate_continuous_kv, BatchExactness, ContinuousConfig, ContinuousKv,
+    ContinuousOutput,
+};
 pub use engine::{
-    generate_speculative, CacheRollback, CheckpointRingRollback, DraftSampler, EngineOptions,
-    LogitsScope, MlxSampler, NoDraftRollback, NoProposer, Pipelining, Proposal, ProposeContext,
-    Proposer, RewindableConstraintMask, Rollback, SampledToken, SnapshotRollback,
+    generate_speculative, CacheRollback, CheckpointRingRollback, DraftSampler, DynCacheTarget,
+    EngineOptions, LogitsScope, MlxSampler, NoDraftRollback, NoProposer, Pipelining, Proposal,
+    ProposeContext, Proposer, RewindableConstraintMask, Rollback, SampledToken, SnapshotRollback,
     SpeculativePrompt, SpeculativeRun, SpeculativeTarget, StepTarget, TargetOutput, TokenSampler,
     TruncateRollback,
 };
 pub use prefix::{
     generate_cached, generate_cached_with, prefill_restored, prefill_with_prefix, Boundary,
-    PrefixCache, PrefixEntry, PrefixPrefill, PrefixSnapshot, PrefixStats, Restored,
+    PagedPrefixCache, PagedPrefixLookup, PagedPrefixStats, PrefixCache, PrefixEntry, PrefixPrefill,
+    PrefixSnapshot, PrefixStats, Restored,
 };
 pub use proposers::{
     generate_qwen35_mtp, DraftModelProposer, MtpBoundary, MtpProposer, NgramProposer,
     Qwen35MtpMultimodalPrompt,
 };
 pub use speculative::{
-    generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
+    generate_draft_speculative, generate_draft_speculative_on, generate_prompt_lookup,
+    generate_prompt_lookup_on, SpeculativeConfig, SpeculativeStats,
 };
 pub use stream::{
     generate, generate_from_prefill, generate_with, generate_with_cache, ConstraintMask, Decode,
     FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
+// The receipt producer is deliberately crate-private: ordinary callers must not install campaign
+// observers on a production decode.
+pub(crate) use stream::generate_with_observer;
+pub(crate) use stream::{forced_greedy_decode, forced_greedy_decode_from, ForcedDecode};
+pub(crate) use stream::{generate_from_prefill_observed, generate_with_cache_observed};
 
 /// Generated tokens between releases of MLX's freed-buffer cache during decode. The KV block size
 /// ([`KV_BLOCK_TOKENS`]) so each release lands right after a block growth has retired the

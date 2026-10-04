@@ -4,7 +4,7 @@
 //! is a load-time choice with no decoder changes: a dense `[out, in]` weight either stays dense
 //! (`matmul(x, wᵀ)`) or is quantized to Q4/Q8 ([`QuantizedLinear`]).
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
 use crate::primitives::nn::linear;
@@ -80,17 +80,26 @@ impl Projection {
     }
 
     /// Load from **already-quantized** parts stored in a snapshot (the packed `weight`, per-group
-    /// `scales`/`biases`) — the read side of the GGUF converter's optional MLX requant. No
-    /// quantization happens here; the parts are used as-is.
-    pub fn from_quantized(weight: Array, scales: Array, biases: Array, spec: QuantSpec) -> Self {
-        Projection::Quantized(QuantizedLinear {
+    /// `scales`/`biases`) — the read side of the GGUF converter's optional MLX requant and of
+    /// mlx-community checkpoints. No quantization happens here: the packed weight is used as-is and
+    /// the affine parameters are held in the model's `compute` dtype
+    /// ([`QuantizedLinear::from_stored`]).
+    pub fn from_quantized(
+        weight: Array,
+        scales: Array,
+        biases: Array,
+        spec: QuantSpec,
+        compute: Dtype,
+    ) -> Result<Self> {
+        Ok(Projection::Quantized(QuantizedLinear::from_stored(
             weight,
             scales,
             biases,
-            group_size: spec.group_size,
-            bits: spec.bits,
-            bias: None,
-        })
+            spec.group_size,
+            spec.bits,
+            None,
+            compute,
+        )?))
     }
 
     /// `x @ weightᵀ (+ bias)`.

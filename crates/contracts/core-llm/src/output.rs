@@ -128,6 +128,9 @@ pub struct TextLlmOutput {
     /// path — as the backend measured it (sc-24139). `None` when the provider does not report one;
     /// never a guess.
     pub decode: Option<crate::report::DecodeReport>,
+    /// The KV cache this generation ran on — compressed, or dense with the reason — as the backend
+    /// measured it (sc-20679). `None` when the provider does not report one; never a guess.
+    pub kv_cache: Option<crate::kv_compression::KvCacheReport>,
     /// Why generation stopped (`None` only on a default-constructed value).
     pub finish_reason: Option<FinishReason>,
 }

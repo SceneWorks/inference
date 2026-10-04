@@ -32,7 +32,7 @@ use std::path::Path;
 use crate::caption_upsample;
 use crate::chunk::MemoryConfig;
 use crate::config::{Flux2Variant, SIZE_MULTIPLE};
-use crate::kv_cache::{CacheMode, Flux2KvCache};
+use crate::kv_cache::{CfgBranch, Flux2KvCache, Flux2KvCfgCaches};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
     prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule_with,
@@ -983,7 +983,19 @@ impl Generator for Flux2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        let snapshot_root = match &self.loaded_spec.weights {
+            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
+        };
+        mlx_gen::sc20686::observe_generation(
+            snapshot_root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1294,6 +1306,9 @@ impl Flux2 {
                            cache: Option<&Flux2KvCache>|
                  -> Result<Array> {
                     let target_seq = latents.shape()[1];
+                    let _sc20686 = mlx_gen::sc20686::reference_forward(
+                        include_ref && cache.is_none() && reference.is_some(),
+                    );
                     let (hidden, img_ids) = match (&reference, include_ref) {
                         (Some((ref_lat, ref_ids)), true) => (
                             concatenate_axis(&[latents, ref_lat], 1)?,
@@ -1331,6 +1346,28 @@ impl Flux2 {
                     .as_ref()
                     .map(|(r, _)| r.shape()[1] as usize)
                     .unwrap_or(0);
+                // SC-20686 Metal lane (no-op unless a campaign is armed): the kv edit caches the
+                // reference K/V of every double AND single layer; the non-kv edit's recomputed
+                // reference slice is observed at the double-stream boundary the Candle lane uses.
+                if reference.is_some() && mlx_gen::sc20686::active() {
+                    mlx_gen::sc20686::bind_geometry(
+                        mlx_gen::sc20686::KvGeometry {
+                            layers: if kv_enabled {
+                                (self.config.num_double_layers + self.config.num_single_layers)
+                                    as u32
+                            } else {
+                                self.config.num_double_layers as u32
+                            },
+                            heads: self.config.num_heads as u32,
+                            head_dimension: self.config.head_dim as u32,
+                            sq: (lat_h * lat_w) as u64,
+                            skv: num_ref as u64,
+                        },
+                        None,
+                        "joint-unmasked",
+                        "flux2-4-axis",
+                    );
+                }
 
                 // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
                 // SwiGLU, gated residual, RoPE rotation) through `mx.compile`. Under MLX 0.32 bf16 is
@@ -1389,61 +1426,51 @@ impl Flux2 {
                         }
                         None => noise,
                     };
-                    // Fresh cache per seed — the cached reference K/V depend on the step-0 target latents.
-                    let cache = kv_enabled.then(|| {
-                        Flux2KvCache::new(
+                    // Fresh caches per seed — the cached reference K/V depend on the step-0 target
+                    // latents — and one cache per CFG branch: the unmasked joint attention makes the
+                    // reference K/V prompt-dependent, so the negative pass must never overwrite the
+                    // positive slots (see `Flux2KvCfgCaches`).
+                    let mut kv_caches = kv_enabled.then(|| {
+                        Flux2KvCfgCaches::new(
                             self.config.num_double_layers,
                             self.config.num_single_layers,
+                            negative.is_some(),
+                            num_ref,
                         )
                     });
                     // The curated unified-framework solver owns the loop (epic 7114 P3). KV step role:
-                    // the first executed forward extracts the reference K/V (the full `[txt, target,
-                    // ref]` pass); later forwards run `[txt, target]` and splice the cached ref K/V back
-                    // in. "First executed forward" is tracked by `extracted` so a multi-eval solver still
-                    // extracts once; the single-eval Euler default is byte-identical to the prior loop.
+                    // the first executed forward extracts each branch's reference K/V (the full `[txt,
+                    // target, ref]` pass); later forwards run `[txt, target]` and splice that branch's
+                    // cached ref K/V back in. A multi-eval solver still extracts once.
                     // FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma convention).
-                    let mut extracted = false;
                     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
                         let ts = sigma * 1000.0;
-                        let (include_ref, cache_ref) = match &cache {
-                            Some(c) => {
-                                let mode = if extracted {
-                                    CacheMode::Cached
-                                } else {
-                                    CacheMode::Extract
+                        if let Some(caches) = kv_caches.as_mut() {
+                            return caches.velocity(guidance, |branch, include_ref, cache| {
+                                let (embeds, ids) = match (branch, &negative) {
+                                    (CfgBranch::Negative, Some((neg_embeds, neg_ids))) => {
+                                        (neg_embeds, neg_ids)
+                                    }
+                                    _ => (&prompt_embeds, &text_ids),
                                 };
-                                c.configure(mode, num_ref);
-                                extracted = true;
-                                (mode == CacheMode::Extract, Some(c))
-                            }
-                            None => (true, None),
-                        };
-                        let v = run(
-                            latents,
-                            &prompt_embeds,
-                            &text_ids,
-                            ts,
-                            include_ref,
-                            cache_ref,
-                        )?;
+                                run(latents, embeds, ids, ts, include_ref, Some(cache))
+                            });
+                        }
+                        let v = run(latents, &prompt_embeds, &text_ids, ts, true, None)?;
                         // sc-8273 spike: image-guidance CFG (non-kv edit only — the ref-dropped forward
                         // must run without a KV cache in play). Recompute this step with the reference
                         // tokens dropped, then extrapolate toward the with-reference prediction.
                         let v = match img_guidance {
-                            Some(s) if include_ref && cache_ref.is_none() => {
+                            Some(s) => {
                                 let v_img0 =
                                     run(latents, &prompt_embeds, &text_ids, ts, false, None)?;
                                 add(&v_img0, &multiply(&subtract(&v, &v_img0)?, scalar(s))?)?
                             }
-                            _ => v,
+                            None => v,
                         };
                         match &negative {
                             Some((neg_embeds, neg_ids)) => {
-                                // CFG with the cache mirrors the fork: the same cache feeds both forwards
-                                // (the negative extract overwrites the positive's slots). Distilled klein
-                                // runs guidance 1.0 → no negative pass, so this is the base path.
-                                let vn =
-                                    run(latents, neg_embeds, neg_ids, ts, include_ref, cache_ref)?;
+                                let vn = run(latents, neg_embeds, neg_ids, ts, true, None)?;
                                 // noise = neg + guidance·(pos − neg)
                                 Ok(add(&vn, &multiply(&subtract(&v, &vn)?, scalar(guidance))?)?)
                             }
@@ -1453,6 +1480,7 @@ impl Flux2 {
                     // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
                     // `run_flow_sampler`. img2img slices the schedule from `start_step`.
                     let denoise_sigmas = &sched.sigmas[start_step..keep];
+                    mlx_gen::sc20686::mark_denoise();
                     let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
                     let final_latents = run_flow_sampler_with_latent_hook(
                         sampler_name,
@@ -1476,6 +1504,12 @@ impl Flux2 {
                         },
                         predict,
                     )?;
+                    // SC-20686: return the denoise's freed transients (a KV edit's reference-K/V
+                    // build is ~26 GiB at 768x512 with two references) to the OS before the VAE
+                    // decode, so the decode's working set does not stack on the pooled denoise
+                    // (D run 37041026188: 58.1 GiB at decode, 50.2 GiB during denoise).
+                    mlx_rs::transforms::eval([&final_latents])?;
+                    mlx_gen::memory_probe::clear_cache();
                     on_progress(Progress::Decoding);
                     let packed =
                         final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;

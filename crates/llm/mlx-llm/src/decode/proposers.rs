@@ -85,6 +85,9 @@ impl<T: SpeculativeTarget + ?Sized> Proposer<T> for NgramProposer {
 pub struct DraftModelProposer<'d, D: SpeculativeTarget + ?Sized> {
     draft: &'d D,
     cache: Option<D::Cache>,
+    /// A caller-chosen empty draft cache the warm-up prefills instead of a fresh
+    /// [`SpeculativeTarget::new_cache`] ([`with_cache`](Self::with_cache)).
+    seed: Option<D::Cache>,
     rollback: D::Rollback,
     /// `(proposable, width)`: draw only the first `proposable` draft ids, over logits `width`
     /// (the target's) wide. `None`: the draft's logits as they are.
@@ -107,6 +110,7 @@ impl<'d, D: SpeculativeTarget + ?Sized> DraftModelProposer<'d, D> {
         Self {
             draft,
             cache: None,
+            seed: None,
             rollback: draft.rollback(drafts),
             vocab: None,
             pending: Vec::new(),
@@ -121,6 +125,14 @@ impl<'d, D: SpeculativeTarget + ?Sized> DraftModelProposer<'d, D> {
     /// covers the target's id space.
     pub fn with_vocab(mut self, proposable: usize, width: usize) -> Self {
         self.vocab = Some((proposable.min(width) as i32, width as i32));
+        self
+    }
+
+    /// Prefill the draft into `cache` — a caller-chosen, empty cache representation (a compressed
+    /// KV cache, sc-20681) — instead of a fresh [`SpeculativeTarget::new_cache`]. Used by the
+    /// first run only.
+    pub fn with_cache(mut self, cache: D::Cache) -> Self {
+        self.seed = Some(cache);
         self
     }
 
@@ -184,7 +196,7 @@ where
     }
 
     fn warm(&mut self, _: &T, prompt: &[i32], _: Option<&Array>) -> Result<Option<Array>> {
-        self.cache = Some(self.draft.new_cache());
+        self.cache = Some(self.seed.take().unwrap_or_else(|| self.draft.new_cache()));
         self.pending.clear();
         self.fed = None;
         // The draft prefill's logits are the warm-up graph the engine synchronizes at the prefill
@@ -206,7 +218,7 @@ where
             .as_mut()
             .ok_or_else(|| Error::Msg("DraftModelProposer: propose before warm".into()))?;
         // Everything up to `cur` is target-confirmed: the step start a rejection returns to.
-        self.rollback.begin(cache);
+        self.rollback.begin(cache)?;
 
         let mut fed = 0usize;
         let mut drafts = Vec::with_capacity(ctx.max_drafts);

@@ -28,21 +28,31 @@
 //! request's state afterwards. [`generate_cached`] is the older single-sequence loop on the same
 //! cache.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use mlx_rs::Array;
 
+use core_llm::prefix::{PrefixId, PrefixIndex};
 use core_llm::{PrefixReuse, PrefixStore};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::engine::{LogitsScope, SpeculativeRun, SpeculativeTarget};
 use crate::decode::proposers::MtpBoundary;
 use crate::decode::stream::{
-    decode_loop, default_seed, ConstraintMask, GenerationConfig, GenerationOutput, StreamEvent,
+    decode_loop, default_seed, observe_cache_events, observe_packed_evidence, ConstraintMask,
+    GenerationConfig, GenerationOutput, ObservedCache, StreamEvent,
 };
 use crate::error::{Error, Result};
 use crate::models::{CausalLm, Qwen35Cache};
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::sampler::SplitMix64;
+use crate::primitives::{
+    token_digest, CacheRoute, CompiledKernelHandle, PackedPagePool, PagedCacheIdentity,
+    PagedCacheSnapshot, PagedModelKey, PagedPackedKvCache,
+};
 
 pub use core_llm::PrefixStats;
 
@@ -130,7 +140,8 @@ impl PrefixSnapshot for ContiguousKvCache {
         }
     }
 
-    fn into_entry(self, _mtp: Option<MtpBoundary>) -> PrefixEntry {
+    fn into_entry(mut self, _mtp: Option<MtpBoundary>) -> PrefixEntry {
+        self.clear_events();
         PrefixEntry::Kv(self)
     }
 
@@ -173,6 +184,7 @@ impl PrefixSnapshot for Qwen35Cache {
         // An entry is the state at its boundary alone: no checkpoint window rides along into the
         // store (charged, and handed to every restore, as if it were live state).
         self.discard_checkpoints();
+        self.clear_kv_events();
         PrefixEntry::Hybrid { cache: self, mtp }
     }
 
@@ -260,6 +272,12 @@ impl PrefixCache {
     /// [`PrefixStore::reclaim_for`]).
     pub fn reclaim_for(&mut self, required: u64, available: u64) -> u64 {
         self.store.reclaim_for(required, available)
+    }
+
+    /// [`reclaim_for`](Self::reclaim_for) that never evicts the entry the last
+    /// [`restore`](Self::restore) hit (the most recently used), whose state the request reuses.
+    pub fn reclaim_for_keeping_latest(&mut self, required: u64, available: u64) -> u64 {
+        self.store.reclaim_for_keeping_latest(required, available)
     }
 
     /// Request admission with the cache (E7): evict so the request and the snapshot it would
@@ -357,7 +375,14 @@ impl PrefixCache {
             PrefixEntry::Kv(_) => PrefixReuse::AnyPrefix,
             PrefixEntry::Hybrid { .. } => PrefixReuse::WholeEntry,
         };
-        self.store.insert(tokens, reuse, bytes, entry);
+        // An entry this insert retires (replaced, superseded or evicted) is released to the
+        // system at once: MLX's allocator reuses a freed buffer only for a request of (nearly) the
+        // same size and returns its cache to the system only near the device working-set limit,
+        // so a retired full-context KV would otherwise stay resident beside the live entry and the
+        // next request's cache (sc-20671).
+        if self.store.insert(tokens, reuse, bytes, entry).evicted > 0 {
+            mlx_rs::memory::clear_cache();
+        }
     }
 }
 
@@ -543,25 +568,71 @@ pub fn generate_cached_with(
     constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<GenerationOutput> {
+    generate_cached_with_observer(
+        model,
+        prompt_ids,
+        config,
+        cancel,
+        on_event,
+        prefix_cache,
+        constraint,
+        should_stop,
+        None,
+        None,
+    )
+}
+
+/// Campaign-only observer variant of [`generate_cached_with`].  The observer is attached to the
+/// cache-hit prefill and decode that actually execute, rather than to a later single-shot control.
+///
+/// With a `compressed` arm the request runs on that arm's compressed cache: a prefix hit is
+/// imported into it by quantize-on-append (never a reconstruction), and the compressed cache is
+/// not stored back into the dense prefix store. A declined import keeps the dense seed and is
+/// recorded on the observer as a reasoned `chunked-prefix-import` fallback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_cached_with_observer(
+    model: &CausalLm,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    prefix_cache: &mut PrefixCache,
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    mut observer: Option<&mut dyn crate::campaign::Observer>,
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
-        return Err(Error::Canceled); // typed pre-inference cancel
+        return Err(crate::error::Error::Canceled); // typed pre-inference cancel
     }
     if prompt_ids.is_empty() {
-        return Err(Error::Msg("generate_cached: empty prompt".into()));
+        return Err(crate::error::Error::Msg(
+            "generate_cached: empty prompt".into(),
+        ));
     }
 
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+
+    // Reuse the longest cached prefix (or start cold), then prefill only the uncached suffix.
     let (mut cache, matched_len) =
-        match prefix_cache.restore::<ContiguousKvCache>(prompt_ids, false)? {
-            Some(r) => (r.cache, r.reused),
-            None => (model.new_cache(), 0),
-        };
+        request_cache(model, prompt_ids, prefix_cache, compressed, &mut observer)?;
+    // Ownership events are recorded only for an attached campaign observer.
+    if observer.is_some() {
+        cache.record_events();
+    }
+    let mut observed_cache = ObservedCache::default();
     let suffix = input_ids(&prompt_ids[matched_len..]);
-    let logits = model.decode_logits(&suffix, &mut cache, matched_len as i32)?;
+    let logits = model.decode_logits(&suffix, cache.as_mut(), matched_len as i32)?;
+    if let Some(observer) = observer.as_deref_mut() {
+        let values = crate::primitives::sampler::counted_host_f32(&logits)?;
+        observer.logits("prefill", &values);
+        observer.phase("prefill-peak");
+    }
+    observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
 
     let out = decode_loop(
         model,
-        &mut cache,
+        cache.as_mut(),
         logits,
         rng,
         prompt_ids.to_vec(),
@@ -570,9 +641,437 @@ pub fn generate_cached_with(
         on_event,
         constraint,
         should_stop,
+        &mut observer,
     )?;
-    prefix_cache.store(prompt_ids, &out.tokens, cache, None, None);
+
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.phase("decode-steady");
+    }
+    observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
+    observe_packed_evidence(cache.as_ref(), &mut observer);
+    if let Some(observer) = observer.as_deref_mut() {
+        if matches!(out.finish_reason, crate::decode::FinishReason::Cancelled) {
+            observer.phase("cancellation-cleanup");
+        }
+    }
+
+    // Store the sequence whose KV the cache actually holds, so the next shared-prefix request
+    // reuses it. On a budget (`MaxTokens`) finish — and on a host-stop (`Stopped`) finish —
+    // `decode_loop` breaks *before* feeding the last generated token's KV, so the cache holds one
+    // position fewer than `prompt + generated`; truncating to `cache.offset()` keeps the index
+    // entry and the stored tensors aligned so a later prompt extending this sequence can never
+    // match past the KV (sc-12455).
+    let mut full = prompt_ids.to_vec();
+    full.extend_from_slice(&out.tokens);
+    full.truncate(cache.offset() as usize);
+    // Only a dense contiguous cache is stored; a compressed cache never re-enters the dense store.
+    // The entry shares the finished cache's buffers (a refcounted clone, no copy), which the
+    // reset below then leaves to the entry alone.
+    if let Some(dense) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() {
+        let stored = dense.clone().committed(full.len())?;
+        prefix_cache.store(&full, &[], stored, None, None);
+    }
+    cache.reset()?;
+    observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
+
     Ok(out)
+}
+
+/// The request cache of one prompt-cache lookup and the prompt length it already holds: the
+/// longest stored prefix seeded densely (or, with a `compressed` arm, imported into that arm's
+/// compressed cache by quantize-on-append), else a cold cache of the request's representation.
+fn request_cache(
+    model: &CausalLm,
+    prompt_ids: &[i32],
+    prefix_cache: &mut PrefixCache,
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) -> Result<(Box<dyn KvCache>, usize)> {
+    let seed = prefix_cache
+        .restore::<ContiguousKvCache>(prompt_ids, false)?
+        .map(|r| (r.cache, r.reused));
+    let matched_len = seed.as_ref().map_or(0, |(_, len)| *len);
+    let cache: Box<dyn KvCache> = match (seed, compressed) {
+        (Some((seed, _)), Some(arm)) => import_compressed_prefix(model, arm, seed, observer)?,
+        (None, Some(arm)) => compressed_cache(model, arm, observer).0,
+        (Some((seed, _)), None) => Box::new(seed),
+        (None, None) => Box::new(model.new_cache()),
+    };
+    Ok((cache, matched_len))
+}
+
+/// The outcome of [`forced_cached_decode`]: the decode, the request cache's packed evidence, and
+/// every reasoned fallback its lookup recorded (the reuse itself is in the store's stats).
+pub(crate) struct ForcedCachedDecode {
+    pub(crate) decode: crate::decode::ForcedDecode,
+    pub(crate) packed_evidence: Option<crate::primitives::PackedCacheEvidence>,
+    pub(crate) fallbacks: Vec<(String, String)>,
+}
+
+/// A fixed-length forced greedy decode served through the prompt cache (SC-20671 multi-turn
+/// fixture): `prompt_ids` is looked up and its cache built exactly as
+/// [`generate_cached_with_observer`] builds it (dense seed, or a `compressed` import), only the
+/// uncached suffix is prefilled, and `tokens` ids are decoded through every stop token
+/// ([`crate::decode::forced_greedy_decode`]), teacher-forced on `teacher_forced` when given. The
+/// request cache is never stored back.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_cached_decode(
+    model: &CausalLm,
+    prompt_ids: &[i32],
+    prefix_cache: &mut PrefixCache,
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+    tokens: usize,
+    stop_tokens: &[i32],
+    teacher_forced: Option<&[i32]>,
+    score: bool,
+) -> Result<ForcedCachedDecode> {
+    let mut fallbacks = FallbackCapture::default();
+    let (mut cache, reused_prefix_tokens) = {
+        let mut observer: Option<&mut dyn crate::campaign::Observer> = Some(&mut fallbacks);
+        request_cache(model, prompt_ids, prefix_cache, compressed, &mut observer)?
+    };
+    let measured = crate::decode::forced_greedy_decode_from(
+        model,
+        cache.as_mut(),
+        prompt_ids,
+        reused_prefix_tokens,
+        tokens,
+        stop_tokens,
+        teacher_forced,
+        score,
+        &mut |_| {},
+    );
+    let packed_evidence = cache.packed_evidence();
+    cache.reset()?;
+    Ok(ForcedCachedDecode {
+        decode: measured?,
+        packed_evidence,
+        fallbacks: fallbacks.0,
+    })
+}
+
+/// Reasoned fallbacks a forced cached decode's lookup recorded.
+#[derive(Default)]
+struct FallbackCapture(Vec<(String, String)>);
+
+impl crate::campaign::Observer for FallbackCapture {
+    fn phase(&mut self, _name: &'static str) {}
+    fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+    fn dense_fallback(&mut self, operation: &str, reason: &str) {
+        self.0.push((operation.into(), reason.into()));
+    }
+}
+
+/// Operation name of a reasoned fallback on the compressed prefix-import path.
+pub(crate) const COMPRESSED_PREFIX_IMPORT_OPERATION: &str = "chunked-prefix-import";
+
+fn record_prefix_fallback(
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    operation: &str,
+    reason: &str,
+) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.dense_fallback(operation, reason);
+    }
+}
+
+/// The arm's cache and whether its compressed route was selected. A selection the model refuses
+/// before any mutation is recorded, exactly as the campaign's compressed decoder records it.
+fn compressed_cache(
+    model: &CausalLm,
+    arm: &crate::campaign::CompressedKvArm,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) -> (Box<dyn KvCache>, bool) {
+    let selection = arm.select_cache(model);
+    let accepted = match selection.route() {
+        CacheRoute::DenseFallback { reason } => {
+            record_prefix_fallback(observer, "cache-selection", reason);
+            false
+        }
+        CacheRoute::ExperimentalPacked => true,
+    };
+    (selection.into_cache(), accepted)
+}
+
+/// Import a prefix hit into the arm's compressed cache by quantize-on-append. Any refusal keeps the
+/// dense seed (the ordinary dense reuse path) and records why.
+fn import_compressed_prefix(
+    model: &CausalLm,
+    arm: &crate::campaign::CompressedKvArm,
+    seed: ContiguousKvCache,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) -> Result<Box<dyn KvCache>> {
+    let (mut cache, accepted) = compressed_cache(model, arm, observer);
+    if !accepted {
+        return Ok(Box::new(seed));
+    }
+    let Some(layers) = seed.export()? else {
+        record_prefix_fallback(
+            observer,
+            COMPRESSED_PREFIX_IMPORT_OPERATION,
+            "the reused prefix has no exportable dense K/V",
+        );
+        return Ok(Box::new(seed));
+    };
+    if !cache.import_prefix(&layers)? {
+        record_prefix_fallback(
+            observer,
+            COMPRESSED_PREFIX_IMPORT_OPERATION,
+            "the compressed cache declined the reused prefix (route not live, or geometry/dtype mismatch)",
+        );
+        return Ok(Box::new(seed));
+    }
+    Ok(cache)
+}
+
+/// Cumulative accounting of a [`PagedPrefixCache`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PagedPrefixStats {
+    /// Lookups whose identity matched the store.
+    pub lookups: usize,
+    /// Lookups that started their sequence on stored pages.
+    pub hits: usize,
+    /// Positions those hits reused (prefill skipped).
+    pub reused_tokens: usize,
+    /// Sequences stored.
+    pub stored: usize,
+    /// Lookups, stores and restores refused for an identity or format mismatch (nothing reused).
+    pub refused: usize,
+}
+
+/// The outcome of one [`PagedPrefixCache::lookup`].
+#[derive(Debug)]
+pub enum PagedPrefixLookup {
+    /// A new sequence holding the first `tokens` positions of the prompt on shared pages; prefill
+    /// the rest from position `tokens`.
+    Hit {
+        cache: Box<PagedPackedKvCache>,
+        tokens: usize,
+    },
+    /// Nothing stored shares a reusable prefix with the prompt.
+    Miss,
+    /// The request's cache identity is not the store's: nothing was reused. The reason names the
+    /// first differing field.
+    Refused(String),
+}
+
+struct PagedPrefixEntry {
+    tokens: Vec<i32>,
+    cache: PagedPackedKvCache,
+}
+
+/// A bounded, LRU shared-prefix store over **paged compressed** KV (sc-20681): the paged
+/// counterpart of [`PrefixCache`]. An entry holds references to a finished (or still decoding)
+/// sequence's pages, not a copy of them; a lookup starts the new sequence on those pages with
+/// [`PagedPackedKvCache::fork_prefix`], so prefix sharing costs reference counts, and a sequence
+/// that writes into a shared page copies it first (copy-on-write). Evicting or clearing an entry
+/// drops its references; a page is freed when its last sequence or entry lets go of it.
+///
+/// Every entry is keyed by the store's [`PagedCacheIdentity`] — the model, the KV format version,
+/// the page layout version and the page geometry — and the token prefix. A lookup, store or
+/// restore under any other identity is refused and counted, never served from or into this store.
+pub struct PagedPrefixCache {
+    model: PagedModelKey,
+    identity: PagedCacheIdentity,
+    pool: Rc<RefCell<PackedPagePool>>,
+    index: PrefixIndex,
+    entries: HashMap<PrefixId, PagedPrefixEntry>,
+    stats: PagedPrefixStats,
+}
+
+impl PagedPrefixCache {
+    /// A store of at most `capacity` sequences on `pool`, for caches computed by `model` (its
+    /// name and [`crate::models::CausalLm::cache_fingerprint`]).
+    pub fn new(pool: Rc<RefCell<PackedPagePool>>, model: PagedModelKey, capacity: usize) -> Self {
+        let identity = pool.borrow().identity(&model);
+        Self {
+            model,
+            identity,
+            pool,
+            index: PrefixIndex::new(capacity),
+            entries: HashMap::new(),
+            stats: PagedPrefixStats::default(),
+        }
+    }
+
+    pub fn identity(&self) -> &PagedCacheIdentity {
+        &self.identity
+    }
+
+    /// The page pool every entry (and every sequence started from one) lives on.
+    pub fn pool(&self) -> &Rc<RefCell<PackedPagePool>> {
+        &self.pool
+    }
+
+    pub fn stats(&self) -> PagedPrefixStats {
+        self.stats
+    }
+
+    /// Stored sequences.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Every stored sequence's cache (for a pool compaction to remap).
+    pub fn caches_mut(&mut self) -> impl Iterator<Item = &mut PagedPackedKvCache> {
+        self.entries.values_mut().map(|entry| &mut entry.cache)
+    }
+
+    /// Distinct pages the entries reference.
+    pub fn held_pages(&self) -> usize {
+        self.entries
+            .values()
+            .flat_map(|entry| entry.cache.page_ids().iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    /// Count a request whose run could not use this store (another identity, or no identity).
+    pub fn record_refusal(&mut self) {
+        self.stats.refused += 1;
+    }
+
+    fn refuse(&mut self, identity: &PagedCacheIdentity) -> Option<String> {
+        let mismatch = identity.mismatch(&self.identity)?;
+        self.stats.refused += 1;
+        Some(mismatch)
+    }
+
+    /// Start a sequence of `identity` on the longest stored prefix of `prompt`: at most
+    /// `prompt.len() - 1` positions (the last prompt token is always prefilled, for its logits),
+    /// rounded as [`PagedPackedKvCache::fork_prefix`] rounds. Refused for another identity.
+    pub fn lookup(
+        &mut self,
+        identity: &PagedCacheIdentity,
+        prompt: &[i32],
+    ) -> Result<PagedPrefixLookup> {
+        if let Some(mismatch) = self.refuse(identity) {
+            return Ok(PagedPrefixLookup::Refused(mismatch));
+        }
+        self.stats.lookups += 1;
+        let Some(found) = self.index.longest_match(prompt) else {
+            return Ok(PagedPrefixLookup::Miss);
+        };
+        let Some(entry) = self.entries.get(&found.id) else {
+            return Ok(PagedPrefixLookup::Miss);
+        };
+        let wanted = found
+            .matched_len
+            .min(prompt.len().saturating_sub(1))
+            .min(entry.tokens.len());
+        let (cache, tokens) = entry.cache.fork_prefix(wanted)?;
+        if tokens == 0 {
+            return Ok(PagedPrefixLookup::Miss);
+        }
+        self.stats.hits += 1;
+        self.stats.reused_tokens += tokens;
+        Ok(PagedPrefixLookup::Hit {
+            cache: Box::new(cache),
+            tokens,
+        })
+    }
+
+    /// Store the sequence `cache` holds — whose positions are `tokens` (truncated to what the
+    /// cache holds) — by referencing its pages. Returns `false`, storing nothing, when the
+    /// identity is not the store's, the cache lives on another pool, or its fused reader faulted
+    /// (sc-20688 review): a stored entry outlives the sequence, and every sequence started from
+    /// it would inherit the faulted reader state and run on dense gathers.
+    pub fn insert(
+        &mut self,
+        identity: &PagedCacheIdentity,
+        tokens: &[i32],
+        cache: &PagedPackedKvCache,
+    ) -> Result<bool> {
+        if self.refuse(identity).is_some() {
+            return Ok(false);
+        }
+        if cache.reader_faulted() {
+            return Ok(false);
+        }
+        if !Rc::ptr_eq(cache.pool(), &self.pool) {
+            self.stats.refused += 1;
+            return Ok(false);
+        }
+        let held = (cache.offset().max(0) as usize).min(tokens.len());
+        if held == 0 {
+            return Ok(false);
+        }
+        let (entry, held) = cache.fork_prefix(held)?;
+        self.store(tokens[..held].to_vec(), entry)?;
+        Ok(true)
+    }
+
+    fn store(&mut self, tokens: Vec<i32>, cache: PagedPackedKvCache) -> Result<()> {
+        let outcome = self.index.insert(tokens.clone());
+        let mut released = false;
+        for evicted in &outcome.evicted {
+            released |= self.entries.remove(evicted).is_some();
+        }
+        if self.index.contains(outcome.id) {
+            released |= self
+                .entries
+                .insert(outcome.id, PagedPrefixEntry { tokens, cache })
+                .is_some();
+        }
+        self.stats.stored += 1;
+        if released {
+            // An evicted or replaced entry may have held the pool's top pages.
+            self.pool.borrow_mut().trim()?;
+        }
+        Ok(())
+    }
+
+    /// Every stored sequence as `(tokens, snapshot)`, each snapshot bound to its tokens
+    /// ([`PagedCacheSnapshot::bound_to`]), for saving across a process restart.
+    pub fn snapshots(&self) -> Result<Vec<(Vec<i32>, PagedCacheSnapshot)>> {
+        self.entries
+            .values()
+            .map(|entry| {
+                let snapshot = entry.cache.snapshot(&self.model)?.bound_to(&entry.tokens)?;
+                Ok((entry.tokens.clone(), snapshot))
+            })
+            .collect()
+    }
+
+    /// Restore a saved sequence into the store, read by `reader`. Refused — and counted — unless
+    /// the snapshot carries exactly the store's identity (model and fingerprint, KV format and
+    /// page layout versions, geometry) and is bound to exactly these token ids.
+    pub fn restore(
+        &mut self,
+        tokens: Vec<i32>,
+        snapshot: &PagedCacheSnapshot,
+        reader: CompiledKernelHandle,
+    ) -> Result<()> {
+        if let Some(mismatch) = self.refuse(snapshot.identity()) {
+            return Err(Error::Unsupported(format!(
+                "paged prefix restore refused: {mismatch}"
+            )));
+        }
+        if snapshot.tokens() != tokens.len()
+            || snapshot.tokens_sha256() != Some(token_digest(&tokens).as_str())
+        {
+            self.stats.refused += 1;
+            return Err(Error::Unsupported(format!(
+                "paged prefix restore refused: the snapshot is not bound to these {} token ids \
+                 (it holds {} positions)",
+                tokens.len(),
+                snapshot.tokens()
+            )));
+        }
+        let cache = PagedPackedKvCache::restore(snapshot, self.pool.clone(), reader, &self.model)?;
+        self.store(tokens, cache)
+    }
+
+    /// Drop every entry (and its page references), returning the pool's freed capacity.
+    pub fn clear(&mut self) -> Result<()> {
+        self.entries.clear();
+        self.index = PrefixIndex::new(self.index.capacity());
+        self.pool.borrow_mut().trim()
+    }
 }
 
 #[cfg(test)]
@@ -633,6 +1132,145 @@ mod tests {
         let (k, _) = again.cache.peek(0).unwrap().unwrap();
         let k: Vec<f32> = k.as_slice::<f32>().to_vec();
         assert!(k.iter().all(|&x| x == 1.0), "stored KV was written: {k:?}");
+    }
+
+    /// A random-weight Llama of the given geometry (`heads` query and KV heads, vocabulary 64).
+    #[cfg(target_os = "macos")]
+    fn synthetic_llama(
+        hidden_size: i32,
+        intermediate_size: i32,
+        num_layers: usize,
+        heads: i32,
+        head_dim: i32,
+    ) -> CausalLm {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        use crate::primitives::Weights;
+        let cfg = crate::config::ModelConfig {
+            hidden_size,
+            intermediate_size,
+            num_layers,
+            num_heads: heads,
+            num_kv_heads: heads,
+            head_dim,
+            vocab_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            tie_word_embeddings: false,
+            architecture: crate::config::Architecture::Llama,
+            max_position_embeddings: 0,
+            quantization: None,
+            moe: None,
+            attn_logit_softcap: None,
+            final_logit_softcap: None,
+            query_pre_attn_scalar: None,
+            partial_rotary_factor: 1.0,
+            mla: None,
+            yarn: None,
+            mrope_section: None,
+            gemma4: None,
+            activation_role: Default::default(),
+        };
+        let mut rng = SplitMix64::new(0x5c20671);
+        let mut randn = |shape: &[i32]| {
+            let n: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+            Array::from_slice(&data, shape)
+        };
+        let (h, v, inter) = (cfg.hidden_size, cfg.vocab_size, cfg.intermediate_size);
+        let (qd, kvd) = (
+            cfg.num_heads * cfg.head_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+        );
+        let ones = || Array::ones::<f32>(&[h]).unwrap();
+        let mut m = HashMap::new();
+        m.insert("model.embed_tokens.weight".to_string(), randn(&[v, h]));
+        m.insert("model.norm.weight".into(), ones());
+        m.insert("lm_head.weight".into(), randn(&[v, h]));
+        for i in 0..cfg.num_layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            m.insert(p("input_layernorm.weight"), ones());
+            m.insert(p("post_attention_layernorm.weight"), ones());
+            m.insert(p("self_attn.q_proj.weight"), randn(&[qd, h]));
+            m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, h]));
+            m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, h]));
+            m.insert(p("self_attn.o_proj.weight"), randn(&[h, qd]));
+            m.insert(p("mlp.gate_proj.weight"), randn(&[inter, h]));
+            m.insert(p("mlp.up_proj.weight"), randn(&[inter, h]));
+            m.insert(p("mlp.down_proj.weight"), randn(&[h, inter]));
+        }
+        CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap()
+    }
+
+    /// sc-20671: prefix reuse at long context holds at most one stored entry plus one request
+    /// cache — the "prefix + request" live KV the campaign preflight budgets — and leaves no retired
+    /// full-context KV resident. The fit-boundary row (130k tokens, ~14 GiB of KV per copy) was
+    /// killed at 68 GiB because the seed-and-hit sequence held ~3 KV copies at once (stored entry,
+    /// gathered seed, grown cache, export copy) and left ~4 more in MLX's freed-buffer cache, whose
+    /// mismatched sizes are never reused and which is only trimmed near the device working-set
+    /// limit.
+    ///
+    /// The model is KV-dominant (24 layers, 8 × 64 KV heads, 64-wide residual), so one layer's
+    /// prefill activations stay a small fraction of the KV, and the 5000-token prompt crosses the
+    /// 2048-row prefill blocks and the per-layer checkpoint, as the production path does. Everything
+    /// is measured in units of one full-prompt KV: `peak` is MLX's active high-water during one
+    /// call, `footprint` the active plus freed-buffer bytes after it (what `phys_footprint` sees).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prefix_reuse_holds_one_entry_and_one_request_cache() {
+        use mlx_rs::memory;
+        let (layers, heads, head_dim) = (24, 8, 64);
+        let model = synthetic_llama(64, 64, layers, heads, head_dim);
+        let tokens = 5000;
+        // K and V, every layer, BF16.
+        let kv = (tokens * layers * 2 * (heads * head_dim) as usize * 2) as f64;
+        let prompt = (0..tokens)
+            .map(|i| (i % 63 + 1) as i32)
+            .collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let mut store = PrefixCache::with_budget(u64::MAX);
+        let cancel = CancelFlag::new();
+        // Weights are materialized by the first forward; take the baseline after one tiny call on
+        // a separate store so only the long prompt's buffers count.
+        generate_cached(
+            &model,
+            &prompt[..4],
+            &config,
+            &cancel,
+            &mut |_| {},
+            &mut PrefixCache::with_budget(u64::MAX),
+        )
+        .unwrap();
+        memory::clear_cache();
+        let active_base = memory::get_active_memory() as f64;
+        for call in ["cold seed", "hit", "second hit", "third hit"] {
+            memory::reset_peak_memory();
+            generate_cached(&model, &prompt, &config, &cancel, &mut |_| {}, &mut store).unwrap();
+            let peak = (memory::get_peak_memory() as f64 - active_base) / kv;
+            let footprint = (memory::get_active_memory() as f64
+                + memory::get_cache_memory() as f64
+                - active_base)
+                / kv;
+            // A hit holds the stored entry and the request cache grown out of it (2 KV); the cold
+            // seed holds one cache plus one layer's prefill activations.
+            assert!(
+                peak <= 2.25,
+                "{call}: active peak {peak:.2} KV; at most the entry plus the request cache fit"
+            );
+            // Afterwards only the stored entry (one KV plus under a block of padding) and the
+            // prefill's reusable activation buffers remain.
+            assert!(
+                footprint <= 1.5,
+                "{call}: {footprint:.2} KV stays resident after the call; only the stored entry \
+                 may (a copy or a retired entry is a full KV more)"
+            );
+        }
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.stats().hits, 3);
     }
 
     #[test]

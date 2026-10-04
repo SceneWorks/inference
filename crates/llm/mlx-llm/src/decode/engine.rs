@@ -125,8 +125,9 @@ pub trait CacheRollback<C> {
     fn label(&self) -> &'static str;
     /// Remember whatever a later recovery needs, before the verify forward writes the cache. The
     /// cache is lent mutably so a strategy can arm per-step state inside it (a DeltaNet checkpoint
-    /// ring, story sc-24435).
-    fn begin(&mut self, cache: &mut C);
+    /// ring, story sc-24435; a quantizing KV cache's exact-rollback window,
+    /// [`KvCache::begin_speculation`], sc-20681).
+    fn begin(&mut self, cache: &mut C) -> Result<()>;
     /// Keep the first `keep` positions after the verify forward, ending the step. `keep` is the
     /// step start plus `1 + accepted`, at most the cache's current length.
     fn recover(&mut self, cache: &mut C, keep: i32) -> Result<Rollback>;
@@ -144,7 +145,9 @@ impl<C> CacheRollback<C> for NoDraftRollback {
         "none"
     }
 
-    fn begin(&mut self, _: &mut C) {}
+    fn begin(&mut self, _: &mut C) -> Result<()> {
+        Ok(())
+    }
 
     fn recover(&mut self, _: &mut C, _: i32) -> Result<Rollback> {
         Err(Error::Unsupported(
@@ -154,7 +157,11 @@ impl<C> CacheRollback<C> for NoDraftRollback {
 }
 
 /// Direct rollback by [`KvCache::truncate`] — every softmax KV cache: dropping rejected positions
-/// is bookkeeping, no forward.
+/// is bookkeeping, no forward. [`begin`](CacheRollback::begin) arms the cache's exact-rollback
+/// window ([`KvCache::begin_speculation`]: a no-op on a dense cache, the unquantized step rows on
+/// a compressed one, sc-20681) and every recovery truncates — to the current length too, which
+/// closes that window — so a quantizing cache ends the step exactly as if only the kept positions
+/// had been appended.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TruncateRollback;
 
@@ -163,12 +170,12 @@ impl<C: KvCache> CacheRollback<C> for TruncateRollback {
         "truncate"
     }
 
-    fn begin(&mut self, _: &mut C) {}
+    fn begin(&mut self, cache: &mut C) -> Result<()> {
+        cache.begin_speculation()
+    }
 
     fn recover(&mut self, cache: &mut C, keep: i32) -> Result<Rollback> {
-        if keep < cache.offset() {
-            cache.truncate(keep)?;
-        }
+        cache.truncate(keep.min(cache.offset()))?;
         Ok(Rollback::Direct)
     }
 }
@@ -196,8 +203,9 @@ impl<C: Clone + KvCache> CacheRollback<C> for SnapshotRollback<C> {
         "snapshot_replay"
     }
 
-    fn begin(&mut self, cache: &mut C) {
+    fn begin(&mut self, cache: &mut C) -> Result<()> {
         self.snapshot = Some(cache.clone());
+        Ok(())
     }
 
     fn recover(&mut self, cache: &mut C, keep: i32) -> Result<Rollback> {
@@ -243,8 +251,9 @@ impl CacheRollback<Qwen35Cache> for CheckpointRingRollback {
         "checkpoint_ring"
     }
 
-    fn begin(&mut self, cache: &mut Qwen35Cache) {
+    fn begin(&mut self, cache: &mut Qwen35Cache) -> Result<()> {
         cache.arm_checkpoints(self.max_tokens);
+        Ok(())
     }
 
     fn recover(&mut self, cache: &mut Qwen35Cache, keep: i32) -> Result<Rollback> {
@@ -413,17 +422,18 @@ impl SpeculativeTarget for Qwen35Model {
 /// over drafts is refused, never approximated. Rollback is [`KvCache::truncate`].
 pub struct StepTarget<'a>(pub &'a dyn Decode);
 
-impl CacheRollback<Box<dyn KvCache>> for TruncateRollback {
+impl<'c> CacheRollback<Box<dyn KvCache + 'c>> for TruncateRollback {
     fn label(&self) -> &'static str {
         "truncate"
     }
 
-    fn begin(&mut self, _: &mut Box<dyn KvCache>) {}
+    fn begin(&mut self, cache: &mut Box<dyn KvCache + 'c>) -> Result<()> {
+        cache.begin_speculation()
+    }
 
-    fn recover(&mut self, cache: &mut Box<dyn KvCache>, keep: i32) -> Result<Rollback> {
-        if keep < cache.offset() {
-            cache.truncate(keep)?;
-        }
+    fn recover(&mut self, cache: &mut Box<dyn KvCache + 'c>, keep: i32) -> Result<Rollback> {
+        let keep = keep.min(cache.offset());
+        cache.truncate(keep)?;
         Ok(Rollback::Direct)
     }
 }
@@ -469,6 +479,151 @@ impl SpeculativeTarget for StepTarget<'_> {
     fn attention_label(&self) -> &'static str {
         // The engine sees only `Decode::step`; how the wrapped model attends is not visible here.
         "opaque"
+    }
+}
+
+/// A causal decoder over a **caller-chosen KV cache representation** — the compressed
+/// group-affine and paged packed caches (epic sc-20669) as well as the dense one — as an engine
+/// target, so the compressed cache runs every engine path: the pipelined token-at-a-time loop,
+/// prompt-lookup and draft-model verification and the acceptance monitor. A verify step arms the
+/// cache's exact-rollback window before the forward ([`KvCache::begin_speculation`], through
+/// [`TruncateRollback`]) and truncates to the kept prefix after it, so a quantizing cache rolls
+/// back exactly (sc-20681).
+pub struct DynCacheTarget<'m>(pub &'m CausalLm);
+
+impl<'m> SpeculativeTarget for DynCacheTarget<'m> {
+    type Cache = Box<dyn KvCache + 'm>;
+    type Rollback = TruncateRollback;
+
+    fn new_cache(&self) -> Box<dyn KvCache + 'm> {
+        Box::new(self.0.new_cache())
+    }
+
+    fn cache_len(&self, cache: &Box<dyn KvCache + 'm>) -> i32 {
+        cache.offset()
+    }
+
+    fn rollback(&self, _: usize) -> TruncateRollback {
+        TruncateRollback
+    }
+
+    fn forward(
+        &self,
+        cache: &mut Box<dyn KvCache + 'm>,
+        ids: &Array,
+        rope_offset: i32,
+        scope: LogitsScope,
+        want_hidden: bool,
+    ) -> Result<TargetOutput> {
+        if want_hidden {
+            return Err(Error::Msg(
+                "CausalLm: the speculative target does not return hidden states".into(),
+            ));
+        }
+        let logits = match scope {
+            LogitsScope::Last => self.0.decode_logits(ids, cache.as_mut(), rope_offset)?,
+            LogitsScope::All => self.0.decode_logits_all(ids, cache.as_mut(), rope_offset)?,
+        };
+        Ok(TargetOutput {
+            logits,
+            hidden: None,
+        })
+    }
+
+    fn attention_label(&self) -> &'static str {
+        SpeculativeTarget::attention_label(self.0)
+    }
+}
+
+/// A caller's `&mut dyn KvCache` as an owned [`DynCacheTarget`] cache: every [`KvCache`] method
+/// forwards to the borrowed cache, so the engine drives the caller's representation itself (its
+/// packed attention, prefix import, speculation window and evidence included).
+pub(crate) struct BorrowedCache<'c>(pub(crate) &'c mut dyn KvCache);
+
+impl KvCache for BorrowedCache<'_> {
+    fn preflight_packed(&self, query_length: usize, mask: bool) -> crate::primitives::CacheRoute {
+        self.0.preflight_packed(query_length, mask)
+    }
+
+    fn try_packed_attention(
+        &mut self,
+        layer: usize,
+        query: &Array,
+        keys: &Array,
+        values: &Array,
+        mask: crate::primitives::PackedAttentionMask,
+        scale: f32,
+        retained_for_sharing: bool,
+    ) -> Result<Option<Array>> {
+        self.0.try_packed_attention(
+            layer,
+            query,
+            keys,
+            values,
+            mask,
+            scale,
+            retained_for_sharing,
+        )
+    }
+
+    fn import_prefix(&mut self, layers: &[(Array, Array)]) -> Result<bool> {
+        self.0.import_prefix(layers)
+    }
+
+    fn prepare_dense_fallback(&mut self, operation: &str, reason: &str) -> Result<()> {
+        self.0.prepare_dense_fallback(operation, reason)
+    }
+
+    fn packed_evidence(&self) -> Option<crate::primitives::PackedCacheEvidence> {
+        self.0.packed_evidence()
+    }
+
+    fn compressed_storage(&self) -> Result<Option<crate::primitives::CompressedCacheStorage>> {
+        self.0.compressed_storage()
+    }
+
+    fn compressed_dense_fallback(&self) -> Option<&ContiguousKvCache> {
+        self.0.compressed_dense_fallback()
+    }
+
+    fn update(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+        self.0.update(layer, keys, values)
+    }
+
+    fn offset(&self) -> i32 {
+        self.0.offset()
+    }
+
+    fn batch_size(&self) -> i32 {
+        self.0.batch_size()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.0.num_layers()
+    }
+
+    fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
+        self.0.retain_sequences(keep)
+    }
+
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        self.0.truncate(len)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.0.reset()
+    }
+
+    fn begin_speculation(&mut self) -> Result<()> {
+        self.0.begin_speculation()
+    }
+
+    fn record_events(&mut self) {
+        self.0.record_events()
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self.0.as_any_mut()
     }
 }
 
@@ -909,6 +1064,19 @@ impl SpeculativeRun {
     pub(crate) fn take_timer(&mut self) -> Option<GenerationTimer> {
         self.timer.take()
     }
+
+    /// A run that did not go through the engine — the campaign receipt producer's observed plain
+    /// decode (epic sc-20669), which measures the plain loop on purpose: its output with no
+    /// speculation counters, no timer, and an empty report the provider does not publish.
+    pub(crate) fn unmeasured(output: GenerationOutput, committed_cache_len: i32) -> Self {
+        Self {
+            output,
+            stats: SpeculativeStats::default(),
+            report: DecodeReport::default(),
+            committed_cache_len,
+            timer: None,
+        }
+    }
 }
 
 /// Generate through the engine with `proposer` proposing up to `drafts` tokens per verify step
@@ -1285,7 +1453,7 @@ where
         let (scope, input) = if num_drafts == 0 {
             (LogitsScope::Last, cur_input)
         } else {
-            rollback.begin(cache);
+            rollback.begin(cache)?;
             (LogitsScope::All, input_ids(&verify))
         };
         let out = target.forward(cache, &input, position, scope, wants_hidden)?;
@@ -2203,6 +2371,61 @@ pub(crate) mod tests {
     /// constrained — on the Causal target (direct truncation) and the Qwen35 hybrid (its DeltaNet
     /// checkpoint ring, sc-24435: direct, never a replay forward), while actually proposing,
     /// accepting and rejecting.
+    /// The production decode records no cache ownership events (sc-20669 evidence is opt-in): a
+    /// run past a block growth — the engine's pipelined loop, then prompt lookup's verify and
+    /// rollback — leaves the caller's cache with none, while the same run on a cache asked to
+    /// record ([`KvCache::record_events`], what only a campaign observer does) records them.
+    #[test]
+    fn a_production_decode_records_no_cache_events() {
+        let model = causal();
+        let run = |record: bool, drafts: usize| {
+            let mut cache = model.new_cache();
+            if record {
+                cache.record_events();
+            }
+            let logits = SpeculativeTarget::forward(
+                &model,
+                &mut cache,
+                &input_ids(&PROMPT),
+                0,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap()
+            .logits;
+            let mut proposer = NgramProposer::default();
+            let mut plain = NoProposer;
+            let proposer: &mut dyn Proposer<CausalLm> = if drafts > 0 {
+                &mut proposer
+            } else {
+                &mut plain
+            };
+            generate_speculative(
+                &model,
+                proposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &PROMPT,
+                    position_delta: 0,
+                },
+                &greedy(300),
+                drafts,
+                &CancelFlag::new(),
+                &mut |_| {},
+                EngineOptions::default(),
+            )
+            .unwrap();
+            assert!(cache.offset() > 256, "the run crosses a block growth");
+            cache.events().len()
+        };
+        for drafts in [0, 3] {
+            assert_eq!(run(false, drafts), 0, "drafts {drafts}");
+            assert!(run(true, drafts) > 0, "drafts {drafts}");
+        }
+    }
+
     #[test]
     fn greedy_prompt_lookup_is_the_plain_loop_and_recovers_both_ways() {
         let causal = causal();
@@ -2680,7 +2903,7 @@ pub(crate) mod tests {
         for kept in 0..=drafts.len() {
             let mut cache = prefilled();
             let mut rollback = SpeculativeTarget::rollback(&model, 2);
-            rollback.begin(&mut cache);
+            rollback.begin(&mut cache).unwrap();
             for &d in &drafts {
                 step(&mut cache, &[d]);
             }
@@ -4089,9 +4312,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// `src` without its `#[cfg(...test...)] mod` blocks — the production code, wherever a test
+    /// module sits in the file (a `cfg(test)` module can precede production items).
+    fn without_test_modules(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim_start();
+            if line.starts_with("#[cfg(") && line.contains("test") {
+                // The item the attribute gates: past any further attributes and doc comments.
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let next = lines[j].trim_start();
+                    if next.starts_with("#[") || next.starts_with("///") || next.starts_with("//!")
+                    {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let item = lines.get(j).map_or("", |l| l.trim_start());
+                let is_mod =
+                    item.starts_with("mod ") || (item.starts_with("pub") && item.contains(" mod "));
+                if is_mod && item.trim_end().ends_with('{') {
+                    let mut depth = 0i64;
+                    let mut k = j;
+                    loop {
+                        depth += lines[k].matches('{').count() as i64;
+                        depth -= lines[k].matches('}').count() as i64;
+                        k += 1;
+                        if depth <= 0 || k >= lines.len() {
+                            break;
+                        }
+                    }
+                    i = k;
+                    continue;
+                }
+            }
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        }
+        out
+    }
+
     /// Every device-to-host read a decode loop makes goes through the counted sampling seam
     /// ([`SampledToken::resolve`], the sampler's row copy), so the AC2 counter sees them all: no
-    /// loop in `decode/` reads an array back itself. A source scan of the non-test code.
+    /// loop in `decode/` reads an array back itself. A source scan of the non-test code — every
+    /// line outside a `cfg(test)` module, before and after one.
     #[test]
     fn decode_loops_make_no_uncounted_host_read() {
         let sources = [
@@ -4112,7 +4381,19 @@ pub(crate) mod tests {
             "as_slice_unchecked",
         ];
         for (name, src) in sources {
-            let code = src.split("\n#[cfg(test)]").next().unwrap();
+            let code = without_test_modules(src);
+            // The scan covers the production code past the first `cfg(test)` item — the pipelined
+            // loop after engine.rs's test counters, the MTP proposer after proposers.rs's test
+            // accessor — and drops the test modules.
+            let sentinel = match name {
+                "engine.rs" => Some("fn pipelined_steps<"),
+                "proposers.rs" => Some("pub struct MtpProposer<"),
+                _ => None,
+            };
+            if let Some(sentinel) = sentinel {
+                assert!(code.contains(sentinel), "{name}: {sentinel} not scanned");
+            }
+            assert!(!code.contains("fn decode_loops_make_no_uncounted_host_read"));
             for read in host_reads {
                 assert!(
                     !code.contains(read),

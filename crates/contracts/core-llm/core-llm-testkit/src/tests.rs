@@ -132,6 +132,7 @@ impl TextLlm for StubTextLlm {
                     timings: None,
                     decode: None,
                     finish_reason: Some(FinishReason::Cancelled),
+                    kv_cache: None,
                 });
             }
             state = state
@@ -173,6 +174,7 @@ impl TextLlm for StubTextLlm {
             timings: None,
             decode: None,
             finish_reason: Some(FinishReason::Length),
+            kv_cache: None,
         })
     }
 }

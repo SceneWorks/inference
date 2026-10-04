@@ -82,6 +82,11 @@ pub enum Error {
         /// The most the window records.
         max_tokens: i32,
     },
+    /// A request's memory admission refused it mid-generation (a compressed KV cache's dense
+    /// transition that the fresh memory budget cannot hold, sc-20682). Kept typed so the provider
+    /// surfaces core-llm's `RequestResourceExhausted` rather than a backend failure.
+    #[error("{0}")]
+    ResourceExhausted(core_llm::RequestResourceExhausted),
 
     /// Anything else, with a human-readable message.
     #[error("{0}")]

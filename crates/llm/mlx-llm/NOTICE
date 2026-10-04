@@ -1,0 +1,75 @@
+mlx-llm
+Copyright 2026 Michael Trefry and the SceneWorks contributors
+
+This product is licensed under the Apache License, Version 2.0. A copy of the
+license is provided in the LICENSE file.
+
+Ported third-party mechanisms (IN the shipped Rust crate)
+--------------------------------------------------------
+
+  * VeloxQuant-MLX v0.65.0                     (MIT License)
+    Copyright (c) 2025-2026 Rajveer Rathod (https://github.com/rajveer43)
+    Source: https://github.com/rajveer43/VeloxQuant-MLX at commit
+    54989ee223611627592f7f9bd925e924658f1f22 (annotated tag v0.65.0).
+
+    `src/primitives/kv_candidates/` (SC-20677) reimplements, in Rust and new
+    MSL, the TurboQuant RVQ quantizer (randomized-Hadamard rotation, Lloyd-Max
+    Gaussian stage-1 and Laplacian stage-2 codebooks, LSB-first packed index
+    words), the RaBitQ sign-bit key encoding and XOR+popcount score model, the
+    nibble-packed value layout, and the online-softmax fused decode-attention
+    structure from that release. No upstream Python or Metal source file is
+    copied verbatim.
+
+    Upstream NOTICE (reproduced verbatim from VeloxQuant-MLX at 54989ee, as it requests):
+
+      VeloxQuant-MLX
+      Copyright (c) 2025-2026 Rajveer Rathod (https://github.com/rajveer43)
+
+      This product includes software developed by Rajveer Rathod, distributed
+      under the terms of the MIT License (see LICENSE file).
+
+      Attribution
+      ───────────
+      The MIT License REQUIRES that the copyright notice and this attribution
+      be retained in all copies or substantial portions of the Software,
+      INCLUDING but not limited to:
+
+        - Source code redistributions (with or without modification)
+        - Binary distributions (PyPI wheels, Docker images, etc.)
+        - Repackaging under a different name or namespace
+        - Inclusion in larger works or derivative projects
+
+      If you fork, redistribute, or build upon this work, you must:
+        1. Retain the LICENSE file
+        2. Retain this NOTICE file
+        3. Retain copyright headers within source files
+        4. Make a reasonable effort to credit the original author
+
+      Unauthorized removal of attribution constitutes a violation of the MIT
+      License terms and may be subject to DMCA takedown procedures.
+
+      Original repository: https://github.com/rajveer43/VeloxQuant-MLX
+      PyPI package:        https://pypi.org/project/VeloxQuant-MLX/
+
+      Contact for licensing questions or to report unauthorized use:
+        rathodrajveer1311@gmail.com
+
+    MIT License text (as distributed with VeloxQuant-MLX):
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.

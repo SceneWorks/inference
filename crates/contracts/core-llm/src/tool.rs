@@ -319,11 +319,13 @@ fn parse_xml_call(body: &str) -> Option<ToolCall> {
 }
 
 /// Parse a JSON / Hermes call body: `{"name": "...", "arguments": {...}}` (arguments may also be a
-/// JSON-encoded string, or absent). Returns `None` if it isn't a JSON object with a string `name`.
+/// JSON-encoded string, or absent). Llama 3.2's shipped template names the same object
+/// `parameters`; accept that exact alias as well. Returns `None` if it isn't a JSON object with a
+/// string `name`.
 fn parse_json_call(body: &str) -> Option<ToolCall> {
     let v: Value = serde_json::from_str(body).ok()?;
     let name = v.get("name")?.as_str()?.to_string();
-    let arguments = match v.get("arguments") {
+    let arguments = match v.get("arguments").or_else(|| v.get("parameters")) {
         Some(Value::Object(m)) => m.clone(),
         Some(Value::String(s)) => serde_json::from_str::<Value>(s)
             .ok()
@@ -455,6 +457,16 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].arguments.get("location"), Some(&json!("Paris")));
         assert_eq!(calls[1].arguments.get("location"), Some(&json!("Rome")));
+    }
+
+    #[test]
+    fn llama_json_parameters_alias_is_preserved() {
+        let block = r#"<tool_call>{"name":"get_weather","parameters":{"location":"Paris","days":2}}</tool_call>"#;
+        let (content, calls) = run(&[weather_tool()], &[block]);
+        assert_eq!(content, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments.get("location"), Some(&json!("Paris")));
+        assert_eq!(calls[0].arguments.get("days"), Some(&json!(2)));
     }
 
     #[test]

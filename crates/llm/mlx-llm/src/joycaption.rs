@@ -526,16 +526,36 @@ impl TextLlm for JoyCaptionProvider {
             finish_reason: finish,
             usage,
         });
-        Ok(TextLlmOutput {
-            timings: None,
+        Ok(caption_output(
             text,
-            thinking: None,
-            tool_calls: Vec::new(),
             usage,
-            mtp: None,
-            decode: Some(report),
-            finish_reason: Some(finish),
-        })
+            Some(report),
+            finish,
+            req.kv_compression,
+        ))
+    }
+}
+
+/// The output of one caption: no reasoning or tools, its measured `decode` report, and — the
+/// LLaVA wrapper having no compressed-KV table family — the dense KV-cache report for the
+/// request's `policy` (sc-20683).
+fn caption_output(
+    text: String,
+    usage: Usage,
+    decode: Option<core_llm::DecodeReport>,
+    finish: CoreFinish,
+    policy: core_llm::KvCompressionPolicy,
+) -> TextLlmOutput {
+    TextLlmOutput {
+        timings: None,
+        text,
+        thinking: None,
+        tool_calls: Vec::new(),
+        usage,
+        mtp: None,
+        decode,
+        finish_reason: Some(finish),
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(policy)),
     }
 }
 
@@ -666,6 +686,27 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    /// sc-20683: every caption reports the dense KV cache with the shared reason for its policy.
+    #[test]
+    fn caption_output_reports_the_dense_kv_cache_for_the_policy() {
+        use core_llm::{
+            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        };
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let output = caption_output(
+                String::new(),
+                Usage::default(),
+                None,
+                CoreFinish::Stop,
+                policy,
+            );
+            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
+        }
+    }
 
     #[test]
     fn can_load_claims_llava_not_qwen_vl() {

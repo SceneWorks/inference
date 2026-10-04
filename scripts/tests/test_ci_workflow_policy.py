@@ -3869,6 +3869,31 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_windows_cuda_check_exercises_real_supervisor_without_gpu(self) -> None:
+        job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["windows-cuda-check"]
+        steps = job["steps"]
+        named = {step.get("name"): (index, step) for index, step in enumerate(steps)}
+        setup_index, setup = named["Install pinned uv for Windows supervisor smoke"]
+        install_index, install = named["Install reviewed CPython 3.12 for Windows supervisor smoke"]
+        smoke_index, smoke = named["Exercise Windows media supervisor process tree (no GPU)"]
+        compile_index, _ = named["Compile Candle CUDA packages and test binaries (no GPU required)"]
+        self.assertLess(setup_index, install_index)
+        self.assertLess(install_index, smoke_index)
+        self.assertLess(smoke_index, compile_index)
+        self.assertEqual(setup["uses"], WINDOWS_SETUP_ACTION)
+        self.assertEqual(setup["with"], {"version": "0.12.3", "enable-cache": False})
+        self.assertEqual(install["shell"], "cmd")
+        self.assertEqual(
+            install["run"],
+            r"call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd",
+        )
+        self.assertEqual(smoke["shell"], "cmd")
+        self.assertEqual(
+            smoke["run"],
+            r'"%REVIEWED_PYTHON%" -m unittest scripts.tests.test_media_campaign_supervisor.WindowsSupervisorTests -v',
+        )
+        self.assertFalse(smoke.get("continue-on-error", False))
+
     def test_windows_cuda_dispatch_schedules_no_macos_lane(self) -> None:
         """sc-24164: `lanes: windows-cuda` selects only the Windows CUDA lane set, and every macOS
         job (including self-hosted `macos-nax`) is gated on the macOS lane it leaves unselected."""
