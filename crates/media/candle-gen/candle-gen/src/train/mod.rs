@@ -38,3 +38,4 @@ pub mod lora;
 pub mod merge;
 pub mod optim;
 pub mod schedule;
+pub mod taehv;
