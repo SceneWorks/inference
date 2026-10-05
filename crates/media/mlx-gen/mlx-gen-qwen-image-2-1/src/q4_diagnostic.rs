@@ -45,6 +45,10 @@ pub(crate) fn assert_owner() {
     }
 }
 struct VariantScope(Variant);
+/// Caller-thread ownership only; no alternate representation or capture enabled.
+pub(crate) fn production_owner_scope() -> impl Drop {
+    VariantScope::enter(Variant::Production)
+}
 impl VariantScope {
     fn enter(variant: Variant) -> Self {
         let mut owner = OWNER.lock().unwrap();
@@ -193,10 +197,11 @@ pub(crate) fn install_variant(host: &mut QwenImage21Transformer, spec: &LoadSpec
     Ok(())
 }
 
-fn retirement_boundary() {
+pub(crate) fn retirement_boundary() {
     // Exact mlx-rs48ff5e7 vendored mlx-c stream.h/stream.cpp ABI. The loaded
     // library/source identity is separately captured as MLXv0.32.0 in the lane.
-    // This boundary runs ONLY while constructing the alternate test overlay.
+    // This boundary is test-only: alternate-overlay construction and the
+    // separate conditioning/velocity diagnostic's explicit phase retirement.
     assert!(mlx_rs::task_local_default_stream().is_none());
     #[repr(C)]
     #[derive(Clone, Copy)]
