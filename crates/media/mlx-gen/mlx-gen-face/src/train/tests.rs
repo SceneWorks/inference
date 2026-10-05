@@ -193,11 +193,11 @@ fn identity_path_matches_the_torch_reference() {
         "embedding drift {d_live} / {d_ref}"
     );
 
-    let r = IdentityReference {
+    let r = IdentityReference::single(
         crop,
-        image_hw: (h, w),
-        embedding: Array::from_slice(&e_ref, &[e_ref.len() as i32]),
-    };
+        (h, w),
+        Array::from_slice(&e_ref, &[e_ref.len() as i32]),
+    );
     let (l, cos) = loss.loss_and_cos(&live, &r).unwrap();
     let want_cos = f["arcface"]["cos"].as_f64().unwrap() as f32;
     assert!(
@@ -408,10 +408,9 @@ fn dataset_average_targets_the_mean_reference() {
     let r_live = loss.reference(&live).unwrap().unwrap();
     let r_ref = loss.reference(&reference).unwrap().unwrap();
     let r_ref = reference_as::<IdentityReference>("identity", r_ref.as_ref()).unwrap();
-    let r_live_e = &reference_as::<IdentityReference>("identity", r_live.as_ref())
-        .unwrap()
-        .embedding;
-    let mean = l2_normalize(&add(r_live_e, &r_ref.embedding).unwrap()).unwrap();
+    let first = |r: &IdentityReference| r.frames[0].as_ref().unwrap().embedding.clone();
+    let r_live_e = &first(reference_as::<IdentityReference>("identity", r_live.as_ref()).unwrap());
+    let mean = l2_normalize(&add(r_live_e, first(r_ref)).unwrap()).unwrap();
     let want = 1.0 - scalar(&multiply(&mean, r_live_e).unwrap().sum(None).unwrap());
     let got = scalar(&loss.loss(&live, r_ref).unwrap());
     assert!(
@@ -455,6 +454,59 @@ fn landmark_loss_trains_the_lora_and_skips_no_face() {
     )));
     skip.ensure_reference(0, &nchw(&reference)).unwrap();
     assert!(skip.plan(0, 0, 0.5).unwrap().aux.is_empty());
+}
+
+/// A detector that answers per call from a script (one entry per frame, in order).
+struct ScriptedDetector(RefCell<Vec<Option<[f32; 4]>>>);
+impl FaceBoxDetector for ScriptedDetector {
+    fn largest_face(&self, _: &[u8], _: usize, _: usize) -> Result<Option<[f32; 4]>> {
+        Ok(self.0.borrow_mut().remove(0))
+    }
+}
+
+/// A video decoder hands the loss `[F, H, W, 3]`: each frame gets its own reference box, a frame
+/// without a face is skipped (its live pixels cannot move the loss), the loss is the mean over the
+/// face-bearing frames, and a clip with no face at all is unusable. Mutations: average over every
+/// frame (divide by 2) ⇒ the value halves ⇒ red; read frame 0 for every frame ⇒ the frame-1 face
+/// is never scored ⇒ red.
+#[test]
+fn multi_frame_decodes_score_each_face_bearing_frame() {
+    let (f, _cpu) = fixture();
+    let (live, reference) = images(&f);
+    let clip = |a: &Array, b: &Array| mlx_rs::ops::concatenate_axis(&[a, b], 0).unwrap();
+    let face = Some(bbox(&f));
+    let loss = |script: Vec<Option<[f32; 4]>>| {
+        IdentityLoss::new(
+            ArcFace::from_weights(&arcface_weights(&f)).unwrap(),
+            Rc::new(ScriptedDetector(RefCell::new(script))),
+            -1.0,
+            IdentityReferenceMode::PerImage,
+        )
+    };
+    let single = f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
+
+    // Frames [face, no face]: only frame 0 counts; garbage in live frame 1 changes nothing.
+    let l = loss(vec![face, None]);
+    let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
+    let noise = synth::image(9, "noise", 72, 88);
+    let v = scalar(&l.loss(&clip(&live, &noise), r.as_ref()).unwrap());
+    assert!((v - single).abs() < 2e-5, "{v} vs {single}");
+    // Frames [no face, face]: frame 1 is the one scored.
+    let l = loss(vec![None, face]);
+    let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
+    let v = scalar(&l.loss(&clip(&noise, &live), r.as_ref()).unwrap());
+    assert!((v - single).abs() < 2e-5, "{v} vs {single}");
+    // Both frames: the mean of the two (identical) frame losses.
+    let l = loss(vec![face, face]);
+    let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
+    let v = scalar(&l.loss(&clip(&live, &live), r.as_ref()).unwrap());
+    assert!((v - single).abs() < 2e-5, "{v} vs {single}");
+    // No face anywhere ⇒ unusable; a live clip of another length is refused.
+    assert!(loss(vec![None, None])
+        .reference(&clip(&reference, &reference))
+        .unwrap()
+        .is_none());
+    assert!(l.loss(&live, r.as_ref()).is_err());
 }
 
 /// A live decode at another size than its reference is an error, never a silently misplaced crop.

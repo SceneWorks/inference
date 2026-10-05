@@ -40,7 +40,7 @@ fn err(m: impl Into<String>) -> CandleError {
     CandleError::Msg(m.into())
 }
 
-/// Cut `b` out of NHWC `[1, H, W, C]` pixels and resample it to NCHW `[1, C, out, out]`,
+/// Cut `b` out of single-frame NHWC `[1, H, W, C]` pixels and resample it to NCHW `[1, C, out, out]`,
 /// differentiably (two constant matmuls; see [`crop_resample_matrices`]).
 pub fn crop_resize(px: &Tensor, b: CropBox, square: bool, out: usize) -> Result<Tensor> {
     let (h, w) = (b.height(), b.width());
@@ -66,12 +66,12 @@ fn l2_normalize(x: &Tensor) -> Result<Tensor> {
     Ok(x.broadcast_div(&n)?)
 }
 
-/// NHWC `[1, H, W, 3]` pixels in `[0, 1]` → an RGB `u8` buffer (round, clamp).
-fn to_rgb_u8(px: &Tensor) -> Result<(Vec<u8>, usize, usize)> {
+/// NHWC `[N, H, W, 3]` pixels in `[0, 1]` → one RGB `u8` buffer per frame (round, clamp).
+fn to_rgb_u8_frames(px: &Tensor) -> Result<(Vec<Vec<u8>>, usize, usize)> {
     let (n, h, w, c) = px.dims4()?;
-    if n != 1 || c != 3 {
+    if n < 1 || c != 3 {
         return Err(err(format!(
-            "face loss: expected NHWC [1, H, W, 3] pixels, got {:?}",
+            "face loss: expected NHWC [N, H, W, 3] pixels, got {:?}",
             px.dims()
         )));
     }
@@ -81,12 +81,25 @@ fn to_rgb_u8(px: &Tensor) -> Result<(Vec<u8>, usize, usize)> {
         .flatten_all()?
         .to_dtype(DType::F32)?
         .to_vec1::<f32>()?;
-    Ok((v.iter().map(|&p| p as u8).collect(), h, w))
+    let per = h * w * 3;
+    Ok((
+        (0..n)
+            .map(|f| v[f * per..(f + 1) * per].iter().map(|&p| p as u8).collect())
+            .collect(),
+        h,
+        w,
+    ))
 }
 
-fn hw(px: &Tensor) -> Result<(usize, usize)> {
-    let (_, h, w, _) = px.dims4()?;
-    Ok((h, w))
+/// `(frames, height, width)` of NHWC pixels.
+fn geometry(px: &Tensor) -> Result<(usize, usize, usize)> {
+    let (n, h, w, _) = px.dims4()?;
+    Ok((n, h, w))
+}
+
+/// Frame `f` of NHWC pixels as `[1, H, W, C]`.
+fn frame(px: &Tensor, f: usize) -> Result<Tensor> {
+    Ok(px.narrow(0, f, 1)?)
 }
 
 /// Finds the largest face on an RGB `u8` image (reference time only).
@@ -117,33 +130,68 @@ impl FaceBoxDetector for ScrfdDetector {
     }
 }
 
-fn reference_box(detector: &dyn FaceBoxDetector, clean: &Tensor) -> Result<Option<CropBox>> {
-    let (rgb, h, w) = to_rgb_u8(clean)?;
-    Ok(detector
-        .largest_face(&rgb, h, w)?
-        .map(|bbox| face_crop_box(bbox, h, w)))
+/// Detect the reference face on every frame of the decoded round trip.
+fn reference_boxes(detector: &dyn FaceBoxDetector, clean: &Tensor) -> Result<Vec<Option<CropBox>>> {
+    let (frames, h, w) = to_rgb_u8_frames(clean)?;
+    frames
+        .iter()
+        .map(|rgb| {
+            Ok(detector
+                .largest_face(rgb, h, w)?
+                .map(|bbox| face_crop_box(bbox, h, w)))
+        })
+        .collect()
 }
 
-fn check_live(name: &str, live: &Tensor, image_hw: (usize, usize)) -> Result<()> {
-    if hw(live)? != image_hw {
+fn check_live(name: &str, live: &Tensor, frames: usize, image_hw: (usize, usize)) -> Result<()> {
+    let (n, h, w) = geometry(live)?;
+    if (n, (h, w)) != (frames, image_hw) {
         return Err(err(format!(
-            "{name} loss: live decode is {:?} but the reference was built at {image_hw:?}",
-            hw(live)?
+            "{name} loss: live decode is {n}×{h}×{w} but the reference was built at \
+             {frames}×{}×{}",
+            image_hw.0, image_hw.1
         )));
     }
     Ok(())
+}
+
+/// The mean of per-frame terms over the frames that carry a reference.
+fn mean_over(terms: Vec<Tensor>) -> Result<Tensor> {
+    let n = terms.len();
+    let mut it = terms.into_iter();
+    let first = it
+        .next()
+        .ok_or_else(|| err("face loss: no frame carries a reference"))?;
+    let sum = it.try_fold(first, |acc, t| acc + t)?;
+    Ok((sum / n as f64)?)
 }
 
 // ------------------------------------------------------------------------------------------------
 // Identity
 // ------------------------------------------------------------------------------------------------
 
-/// The per-image identity reference: the stored face box and that crop's unit ArcFace embedding.
-pub struct IdentityReference {
+/// One frame's identity reference: its face box and that crop's unit ArcFace embedding.
+pub struct IdentityFrame {
     pub crop: CropBox,
-    pub image_hw: (usize, usize),
     /// `[D]`, unit norm, detached.
     pub embedding: Tensor,
+}
+
+/// The per-image identity reference: per decoded frame, the frame's face box + embedding, or `None`
+/// for a frame without a face.
+pub struct IdentityReference {
+    pub image_hw: (usize, usize),
+    pub frames: Vec<Option<IdentityFrame>>,
+}
+
+impl IdentityReference {
+    /// A single-frame reference.
+    pub fn single(crop: CropBox, image_hw: (usize, usize), embedding: Tensor) -> Self {
+        Self {
+            image_hw,
+            frames: vec![Some(IdentityFrame { crop, embedding })],
+        }
+    }
 }
 
 #[derive(Default)]
@@ -178,9 +226,10 @@ impl IdentityLoss {
         }
     }
 
-    /// Unit ArcFace embedding `[D]` of `px`'s face crop `b` (differentiable in `px`).
+    /// Unit ArcFace embedding `[D]` of the face crop `b` of `px`'s first frame (differentiable in
+    /// `px`).
     pub fn embed(&self, px: &Tensor, b: CropBox) -> Result<Tensor> {
-        let crop = crop_resize(px, b, true, ARCFACE_INPUT)?;
+        let crop = crop_resize(&frame(px, 0)?, b, true, ARCFACE_INPUT)?;
         // `(px·255 − 127.5) / 127.5` = `2·px − 1`.
         let x = crop.affine(2.0, -1.0)?;
         let emb = self.arcface.forward(&x)?; // [1, D]
@@ -193,9 +242,9 @@ impl IdentityLoss {
             .map_err(|_| err("identity loss: dataset-mean lock poisoned"))
     }
 
-    fn target(&self, r: &IdentityReference) -> Result<Tensor> {
+    fn target(&self, f: &IdentityFrame) -> Result<Tensor> {
         match self.mode {
-            IdentityReferenceMode::PerImage => Ok(r.embedding.clone()),
+            IdentityReferenceMode::PerImage => Ok(f.embedding.clone()),
             IdentityReferenceMode::DatasetAverage => {
                 let mut m = self.lock()?;
                 if m.frozen.is_none() {
@@ -211,14 +260,21 @@ impl IdentityLoss {
         }
     }
 
-    /// `1 − cos` gated by `cos > min_cos`, with the cosine returned for diagnostics.
+    /// The mean over face-bearing frames of `1 − cos`, each gated by `cos > min_cos`, plus the
+    /// frames' mean cosine for diagnostics.
     pub fn loss_and_cos(&self, live: &Tensor, r: &IdentityReference) -> Result<(Tensor, Tensor)> {
-        check_live("identity", live, r.image_hw)?;
-        let emb = self.embed(live, r.crop)?;
-        let cos = (&emb * &self.target(r)?)?.sum_all()?;
-        let gate = cos.detach().gt(self.min_cos as f64)?.to_dtype(DType::F32)?;
-        let loss = (cos.affine(-1.0, 1.0)? * gate)?;
-        Ok((loss, cos))
+        check_live("identity", live, r.frames.len(), r.image_hw)?;
+        let mut losses = Vec::new();
+        let mut coses = Vec::new();
+        for (f, rf) in r.frames.iter().enumerate() {
+            let Some(rf) = rf else { continue };
+            let emb = self.embed(&frame(live, f)?, rf.crop)?;
+            let cos = (&emb * &self.target(rf)?)?.sum_all()?;
+            let gate = cos.detach().gt(self.min_cos as f64)?.to_dtype(DType::F32)?;
+            losses.push((cos.affine(-1.0, 1.0)? * gate)?);
+            coses.push(cos);
+        }
+        Ok((mean_over(losses)?, mean_over(coses)?))
     }
 }
 
@@ -228,28 +284,38 @@ impl PerceptualLoss for IdentityLoss {
     }
 
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {
-        let Some(crop) = reference_box(self.detector.as_ref(), clean)? else {
+        let boxes = reference_boxes(self.detector.as_ref(), clean)?;
+        if boxes.iter().all(Option::is_none) {
             return Ok(None);
-        };
-        let embedding = self.embed(&clean.detach(), crop)?.detach();
-        if self.mode == IdentityReferenceMode::DatasetAverage {
-            let mut m = self.lock()?;
-            if m.frozen.is_some() {
-                return Err(err(
-                    "identity loss: a dataset-average reference was added after training began; \
-                     every image's reference must be built before the first step",
-                ));
-            }
-            m.sum = Some(match m.sum.take() {
-                Some(s) => (s + &embedding)?,
-                None => embedding.clone(),
-            });
-            m.count += 1;
         }
+        let clean = clean.detach();
+        let mut frames = Vec::with_capacity(boxes.len());
+        for (f, crop) in boxes.into_iter().enumerate() {
+            let Some(crop) = crop else {
+                frames.push(None);
+                continue;
+            };
+            let embedding = self.embed(&frame(&clean, f)?, crop)?.detach();
+            if self.mode == IdentityReferenceMode::DatasetAverage {
+                let mut m = self.lock()?;
+                if m.frozen.is_some() {
+                    return Err(err(
+                        "identity loss: a dataset-average reference was added after training \
+                         began; every image's reference must be built before the first step",
+                    ));
+                }
+                m.sum = Some(match m.sum.take() {
+                    Some(s) => (s + &embedding)?,
+                    None => embedding.clone(),
+                });
+                m.count += 1;
+            }
+            frames.push(Some(IdentityFrame { crop, embedding }));
+        }
+        let (_, h, w) = geometry(&clean)?;
         Ok(Some(Box::new(IdentityReference {
-            crop,
-            image_hw: hw(clean)?,
-            embedding,
+            image_hw: (h, w),
+            frames,
         })))
     }
 
@@ -263,12 +329,18 @@ impl PerceptualLoss for IdentityLoss {
 // Landmarks
 // ------------------------------------------------------------------------------------------------
 
-/// The per-image landmark reference: the stored face box and that crop's normalized landmarks.
-pub struct LandmarkReference {
+/// One frame's landmark reference: its face box and that crop's normalized landmarks.
+pub struct LandmarkFrame {
     pub crop: CropBox,
-    pub image_hw: (usize, usize),
     /// `[478, 2]`, normalized, detached.
     pub landmarks: Tensor,
+}
+
+/// The per-image landmark reference: per decoded frame, the frame's face box + landmarks, or
+/// `None` for a frame without a face.
+pub struct LandmarkReference {
+    pub image_hw: (usize, usize),
+    pub frames: Vec<Option<LandmarkFrame>>,
 }
 
 /// Centre `[478, 2]` landmarks on the nose tip and scale by the inner-eye distance (≥ 0.01).
@@ -319,9 +391,10 @@ impl FaceLandmarkLoss {
         Self { mesh, detector }
     }
 
-    /// Normalized `[478, 2]` landmarks of `px`'s face crop `b` (differentiable in `px`).
+    /// Normalized `[478, 2]` landmarks of the face crop `b` of `px`'s first frame (differentiable
+    /// in `px`).
     pub fn landmarks(&self, px: &Tensor, b: CropBox) -> Result<Tensor> {
-        let crop = crop_resize(px, b, false, FACEMESH_INPUT)?;
+        let crop = crop_resize(&frame(px, 0)?, b, false, FACEMESH_INPUT)?;
         let out = self.mesh.forward(&crop)?;
         let raw = out
             .first()
@@ -347,21 +420,40 @@ impl PerceptualLoss for FaceLandmarkLoss {
     }
 
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {
-        let Some(crop) = reference_box(self.detector.as_ref(), clean)? else {
+        let boxes = reference_boxes(self.detector.as_ref(), clean)?;
+        if boxes.iter().all(Option::is_none) {
             return Ok(None);
-        };
-        let landmarks = self.landmarks(&clean.detach(), crop)?.detach();
+        }
+        let clean = clean.detach();
+        let mut frames = Vec::with_capacity(boxes.len());
+        for (f, crop) in boxes.into_iter().enumerate() {
+            frames.push(match crop {
+                Some(crop) => Some(LandmarkFrame {
+                    crop,
+                    landmarks: self.landmarks(&frame(&clean, f)?, crop)?.detach(),
+                }),
+                None => None,
+            });
+        }
+        let (_, h, w) = geometry(&clean)?;
         Ok(Some(Box::new(LandmarkReference {
-            crop,
-            image_hw: hw(clean)?,
-            landmarks,
+            image_hw: (h, w),
+            frames,
         })))
     }
 
     fn loss(&self, live: &Tensor, reference: &dyn Any) -> Result<Tensor> {
         let r = reference_as::<LandmarkReference>(self.name(), reference)?;
-        check_live("face-landmark", live, r.image_hw)?;
-        landmark_distance(&self.landmarks(live, r.crop)?, &r.landmarks)
+        check_live("face-landmark", live, r.frames.len(), r.image_hw)?;
+        let mut terms = Vec::new();
+        for (f, rf) in r.frames.iter().enumerate() {
+            let Some(rf) = rf else { continue };
+            terms.push(landmark_distance(
+                &self.landmarks(&frame(live, f)?, rf.crop)?,
+                &rf.landmarks,
+            )?);
+        }
+        mean_over(terms)
     }
 }
 

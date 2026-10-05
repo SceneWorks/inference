@@ -57,7 +57,7 @@ use mlx_gen::gen_core::train::face_loss::{
     INNER_EYES, INTER_EYE_FLOOR, LANDMARK_EPS, LANDMARK_REGIONS, NOSE_TIP,
 };
 
-/// Cut `b` out of NHWC `[1, H, W, C]` pixels and resample it to `out × out`, differentiably (two
+/// Cut `b` out of the first frame of NHWC `[N, H, W, C]` pixels and resample it to `out × out`, differentiably (two
 /// constant matmuls). `square` zero-pads the shorter side first (centred, upstream's identity crop);
 /// otherwise the crop is stretched (upstream's landmark crop).
 pub fn crop_resize(px: &Array, b: CropBox, square: bool, out: usize) -> Result<Array> {
@@ -82,16 +82,16 @@ fn l2_normalize(x: &Array) -> Result<Array> {
     Ok(divide(x, &maximum(&n, Array::from_f32(1e-12))?)?)
 }
 
-/// Read NHWC `[1, H, W, 3]` pixels in `[0, 1]` back as an RGB `u8` buffer (round, clamp) — the
-/// detector's input. Reshape first: a decode may be a transposed (non-row-contiguous) view.
-fn to_rgb_u8(px: &Array) -> Result<(Vec<u8>, usize, usize)> {
+/// Read NHWC `[N, H, W, 3]` pixels in `[0, 1]` back as one RGB `u8` buffer per frame (round, clamp)
+/// — the detector's input. Reshape first: a decode may be a transposed (non-row-contiguous) view.
+fn to_rgb_u8_frames(px: &Array) -> Result<(Vec<Vec<u8>>, usize, usize)> {
     let s = px.shape();
-    if s.len() != 4 || s[0] != 1 || s[3] != 3 {
+    if s.len() != 4 || s[0] < 1 || s[3] != 3 {
         return Err(Error::Msg(format!(
-            "face loss: expected NHWC [1, H, W, 3] pixels, got {s:?}"
+            "face loss: expected NHWC [N, H, W, 3] pixels, got {s:?}"
         )));
     }
-    let (h, w) = (s[1] as usize, s[2] as usize);
+    let (n, h, w) = (s[0] as usize, s[1] as usize, s[2] as usize);
     let flat = mlx_rs::ops::clip(&multiply(px, Array::from_f32(255.0))?, (0.0f32, 255.0f32))?
         .round(None)?
         .reshape(&[-1])?;
@@ -99,12 +99,25 @@ fn to_rgb_u8(px: &Array) -> Result<(Vec<u8>, usize, usize)> {
     let v = flat
         .try_as_slice::<f32>()
         .map_err(|e| Error::Msg(format!("face loss: pixel readback: {e}")))?;
-    Ok((v.iter().map(|&p| p as u8).collect(), h, w))
+    let per = h * w * 3;
+    Ok((
+        (0..n)
+            .map(|f| v[f * per..(f + 1) * per].iter().map(|&p| p as u8).collect())
+            .collect(),
+        h,
+        w,
+    ))
 }
 
-fn hw(px: &Array) -> (usize, usize) {
+/// `(frames, height, width)` of NHWC pixels.
+fn geometry(px: &Array) -> (usize, usize, usize) {
     let s = px.shape();
-    (s[1] as usize, s[2] as usize)
+    (s[0] as usize, s[1] as usize, s[2] as usize)
+}
+
+/// Frame `f` of NHWC pixels as `[1, H, W, C]`.
+fn frame(px: &Array, f: usize) -> Array {
+    px.index(f as i32..f as i32 + 1)
 }
 
 /// Finds the largest face on an RGB `u8` image (reference time only).
@@ -144,34 +157,70 @@ impl FaceBoxDetector for ScrfdDetector {
     }
 }
 
-/// Detect the reference face on decoded round-trip pixels ⇒ its crop box, or `None` (skip).
-fn reference_box(detector: &dyn FaceBoxDetector, clean: &Array) -> Result<Option<CropBox>> {
-    let (rgb, h, w) = to_rgb_u8(clean)?;
-    Ok(detector
-        .largest_face(&rgb, h, w)?
-        .map(|bbox| face_crop_box(bbox, h, w)))
+/// Detect the reference face on every frame of the decoded round trip ⇒ each frame's crop box, or
+/// `None` for a frame without a face.
+fn reference_boxes(detector: &dyn FaceBoxDetector, clean: &Array) -> Result<Vec<Option<CropBox>>> {
+    let (frames, h, w) = to_rgb_u8_frames(clean)?;
+    frames
+        .iter()
+        .map(|rgb| {
+            Ok(detector
+                .largest_face(rgb, h, w)?
+                .map(|bbox| face_crop_box(bbox, h, w)))
+        })
+        .collect()
 }
 
-fn check_live(name: &str, live: &Array, image_hw: (usize, usize)) -> Result<()> {
-    if hw(live) != image_hw {
+fn check_live(name: &str, live: &Array, frames: usize, image_hw: (usize, usize)) -> Result<()> {
+    let (n, h, w) = geometry(live);
+    if (n, (h, w)) != (frames, image_hw) {
         return Err(Error::Msg(format!(
-            "{name} loss: live decode is {:?} but the reference was built at {image_hw:?}",
-            hw(live)
+            "{name} loss: live decode is {n}×{h}×{w} but the reference was built at \
+             {frames}×{}×{}",
+            image_hw.0, image_hw.1
         )));
     }
     Ok(())
+}
+
+/// The mean of per-frame terms over the frames that carry a reference (a frame without a face
+/// contributes nothing; at least one frame has one — else the reference was `None`).
+fn mean_over(terms: Vec<Array>) -> Result<Array> {
+    let n = terms.len();
+    let mut it = terms.into_iter();
+    let first = it
+        .next()
+        .ok_or_else(|| Error::Msg("face loss: no frame carries a reference".into()))?;
+    let sum = it.try_fold(first, |acc, t| add(&acc, &t))?;
+    Ok(divide(&sum, Array::from_f32(n as f32))?)
 }
 
 // ------------------------------------------------------------------------------------------------
 // Identity
 // ------------------------------------------------------------------------------------------------
 
-/// The per-image identity reference: the stored face box and that crop's unit ArcFace embedding.
-pub struct IdentityReference {
+/// One frame's identity reference: its face box and that crop's unit ArcFace embedding.
+pub struct IdentityFrame {
     pub crop: CropBox,
-    pub image_hw: (usize, usize),
     /// `[D]`, unit norm, gradient-free.
     pub embedding: Array,
+}
+
+/// The per-image identity reference: per decoded frame (one for an image; the step's frames for a
+/// video decoder), the frame's face box + embedding, or `None` for a frame without a face.
+pub struct IdentityReference {
+    pub image_hw: (usize, usize),
+    pub frames: Vec<Option<IdentityFrame>>,
+}
+
+impl IdentityReference {
+    /// A single-frame reference.
+    pub fn single(crop: CropBox, image_hw: (usize, usize), embedding: Array) -> Self {
+        Self {
+            image_hw,
+            frames: vec![Some(IdentityFrame { crop, embedding })],
+        }
+    }
 }
 
 #[derive(Default)]
@@ -207,7 +256,8 @@ impl IdentityLoss {
         }
     }
 
-    /// Unit ArcFace embedding `[D]` of `px`'s face crop `b` (differentiable in `px`).
+    /// Unit ArcFace embedding `[D]` of the face crop `b` of `px`'s first frame (differentiable in
+    /// `px`).
     pub fn embed(&self, px: &Array, b: CropBox) -> Result<Array> {
         let crop = crop_resize(px, b, true, ARCFACE_INPUT)?;
         // `(px·255 − 127.5) / 127.5` = `2·px − 1`.
@@ -219,10 +269,10 @@ impl IdentityLoss {
         Ok(l2_normalize(&emb)?.reshape(&[-1])?)
     }
 
-    /// The target embedding for `r` under the configured mode.
-    fn target(&self, r: &IdentityReference) -> Result<Array> {
+    /// The target embedding for one reference frame under the configured mode.
+    fn target(&self, f: &IdentityFrame) -> Result<Array> {
         match self.mode {
-            IdentityReferenceMode::PerImage => Ok(r.embedding.clone()),
+            IdentityReferenceMode::PerImage => Ok(f.embedding.clone()),
             IdentityReferenceMode::DatasetAverage => {
                 let mut m = self.mean.borrow_mut();
                 if m.frozen.is_none() {
@@ -238,16 +288,23 @@ impl IdentityLoss {
         }
     }
 
-    /// `1 − cos` gated by `cos > min_cos`, with the cosine returned for diagnostics.
+    /// The mean over face-bearing frames of `1 − cos`, each gated by `cos > min_cos`, plus the
+    /// frames' mean cosine for diagnostics.
     pub fn loss_and_cos(&self, live: &Array, r: &IdentityReference) -> Result<(Array, Array)> {
-        check_live("identity", live, r.image_hw)?;
-        let emb = self.embed(live, r.crop)?;
-        let cos = multiply(&emb, &self.target(r)?)?.sum(None)?;
-        let gate = mlx_rs::stop_gradient(&cos)?
-            .gt(Array::from_f32(self.min_cos))?
-            .as_type::<f32>()?;
-        let loss = multiply(&subtract(Array::from_f32(1.0), &cos)?, &gate)?;
-        Ok((loss, cos))
+        check_live("identity", live, r.frames.len(), r.image_hw)?;
+        let mut losses = Vec::new();
+        let mut coses = Vec::new();
+        for (f, rf) in r.frames.iter().enumerate() {
+            let Some(rf) = rf else { continue };
+            let emb = self.embed(&frame(live, f), rf.crop)?;
+            let cos = multiply(&emb, &self.target(rf)?)?.sum(None)?;
+            let gate = mlx_rs::stop_gradient(&cos)?
+                .gt(Array::from_f32(self.min_cos))?
+                .as_type::<f32>()?;
+            losses.push(multiply(&subtract(Array::from_f32(1.0), &cos)?, &gate)?);
+            coses.push(cos);
+        }
+        Ok((mean_over(losses)?, mean_over(coses)?))
     }
 }
 
@@ -257,30 +314,39 @@ impl PerceptualLoss for IdentityLoss {
     }
 
     fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
-        let Some(crop) = reference_box(self.detector.as_ref(), clean)? else {
+        let boxes = reference_boxes(self.detector.as_ref(), clean)?;
+        if boxes.iter().all(Option::is_none) {
             return Ok(None);
-        };
-        let embedding = mlx_rs::stop_gradient(&self.embed(clean, crop)?)?;
-        embedding.eval()?;
-        if self.mode == IdentityReferenceMode::DatasetAverage {
-            let mut m = self.mean.borrow_mut();
-            if m.frozen.is_some() {
-                return Err(Error::Msg(
-                    "identity loss: a dataset-average reference was added after training began; \
-                     every image's reference must be built before the first step"
-                        .into(),
-                ));
-            }
-            m.sum = Some(match m.sum.take() {
-                Some(s) => add(&s, &embedding)?,
-                None => embedding.clone(),
-            });
-            m.count += 1;
         }
+        let mut frames = Vec::with_capacity(boxes.len());
+        for (f, crop) in boxes.into_iter().enumerate() {
+            let Some(crop) = crop else {
+                frames.push(None);
+                continue;
+            };
+            let embedding = mlx_rs::stop_gradient(&self.embed(&frame(clean, f), crop)?)?;
+            embedding.eval()?;
+            if self.mode == IdentityReferenceMode::DatasetAverage {
+                let mut m = self.mean.borrow_mut();
+                if m.frozen.is_some() {
+                    return Err(Error::Msg(
+                        "identity loss: a dataset-average reference was added after training \
+                         began; every image's reference must be built before the first step"
+                            .into(),
+                    ));
+                }
+                m.sum = Some(match m.sum.take() {
+                    Some(s) => add(&s, &embedding)?,
+                    None => embedding.clone(),
+                });
+                m.count += 1;
+            }
+            frames.push(Some(IdentityFrame { crop, embedding }));
+        }
+        let (_, h, w) = geometry(clean);
         Ok(Some(Box::new(IdentityReference {
-            crop,
-            image_hw: hw(clean),
-            embedding,
+            image_hw: (h, w),
+            frames,
         })))
     }
 
@@ -294,12 +360,18 @@ impl PerceptualLoss for IdentityLoss {
 // Landmarks
 // ------------------------------------------------------------------------------------------------
 
-/// The per-image landmark reference: the stored face box and that crop's normalized landmarks.
-pub struct LandmarkReference {
+/// One frame's landmark reference: its face box and that crop's normalized landmarks.
+pub struct LandmarkFrame {
     pub crop: CropBox,
-    pub image_hw: (usize, usize),
     /// `[478, 2]`, normalized, gradient-free.
     pub landmarks: Array,
+}
+
+/// The per-image landmark reference: per decoded frame, the frame's face box + landmarks, or
+/// `None` for a frame without a face.
+pub struct LandmarkReference {
+    pub image_hw: (usize, usize),
+    pub frames: Vec<Option<LandmarkFrame>>,
 }
 
 /// Centre `[N, 478, 2]` landmarks on the nose tip and scale by the inner-eye distance (≥ 0.01).
@@ -351,7 +423,8 @@ impl FaceLandmarkLoss {
         Self { mesh, detector }
     }
 
-    /// Normalized `[478, 2]` landmarks of `px`'s face crop `b` (differentiable in `px`).
+    /// Normalized `[478, 2]` landmarks of the face crop `b` of `px`'s first frame (differentiable
+    /// in `px`).
     pub fn landmarks(&self, px: &Array, b: CropBox) -> Result<Array> {
         let crop = crop_resize(px, b, false, FACEMESH_INPUT)?;
         let out = self.mesh.forward(&crop)?;
@@ -378,22 +451,41 @@ impl PerceptualLoss for FaceLandmarkLoss {
     }
 
     fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
-        let Some(crop) = reference_box(self.detector.as_ref(), clean)? else {
+        let boxes = reference_boxes(self.detector.as_ref(), clean)?;
+        if boxes.iter().all(Option::is_none) {
             return Ok(None);
-        };
-        let landmarks = mlx_rs::stop_gradient(&self.landmarks(clean, crop)?)?;
-        landmarks.eval()?;
+        }
+        let mut frames = Vec::with_capacity(boxes.len());
+        for (f, crop) in boxes.into_iter().enumerate() {
+            frames.push(match crop {
+                Some(crop) => {
+                    let landmarks =
+                        mlx_rs::stop_gradient(&self.landmarks(&frame(clean, f), crop)?)?;
+                    landmarks.eval()?;
+                    Some(LandmarkFrame { crop, landmarks })
+                }
+                None => None,
+            });
+        }
+        let (_, h, w) = geometry(clean);
         Ok(Some(Box::new(LandmarkReference {
-            crop,
-            image_hw: hw(clean),
-            landmarks,
+            image_hw: (h, w),
+            frames,
         })))
     }
 
     fn loss(&self, live: &Array, reference: &dyn Any) -> Result<Array> {
         let r = reference_as::<LandmarkReference>(self.name(), reference)?;
-        check_live("face-landmark", live, r.image_hw)?;
-        landmark_distance(&self.landmarks(live, r.crop)?, &r.landmarks)
+        check_live("face-landmark", live, r.frames.len(), r.image_hw)?;
+        let mut terms = Vec::new();
+        for (f, rf) in r.frames.iter().enumerate() {
+            let Some(rf) = rf else { continue };
+            terms.push(landmark_distance(
+                &self.landmarks(&frame(live, f), rf.crop)?,
+                &rf.landmarks,
+            )?);
+        }
+        mean_over(terms)
     }
 }
 

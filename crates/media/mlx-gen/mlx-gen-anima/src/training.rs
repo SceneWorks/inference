@@ -350,6 +350,9 @@ fn trainer_descriptor_for(variant: Variant) -> TrainerDescriptor {
             resolution_buckets: true,
             subject_mask_loss: true,
             depth_anchoring: true,
+            // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
+            identity_loss: true,
+            face_landmark_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }

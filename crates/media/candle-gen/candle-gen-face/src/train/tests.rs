@@ -171,11 +171,11 @@ fn identity_path_matches_the_torch_reference() {
         d_live < 2e-5 && d_ref < 2e-5,
         "embedding drift {d_live} / {d_ref}"
     );
-    let r = IdentityReference {
+    let r = IdentityReference::single(
         crop,
-        image_hw: (72, 88),
-        embedding: Tensor::from_vec(e_ref.clone(), e_ref.len(), &dev()).unwrap(),
-    };
+        (72, 88),
+        Tensor::from_vec(e_ref.clone(), e_ref.len(), &dev()).unwrap(),
+    );
     let (l, cos) = loss.loss_and_cos(&live, &r).unwrap();
     let want_cos = f["arcface"]["cos"].as_f64().unwrap() as f32;
     assert!((scalar(&cos) - want_cos).abs() < 2e-5);
@@ -354,10 +354,9 @@ fn dataset_average_targets_the_mean_reference() {
     let r_live = loss.reference(&live).unwrap().unwrap();
     let r_ref = loss.reference(&reference).unwrap().unwrap();
     let r_ref = reference_as::<IdentityReference>("identity", r_ref.as_ref()).unwrap();
-    let e_live = &reference_as::<IdentityReference>("identity", r_live.as_ref())
-        .unwrap()
-        .embedding;
-    let mean = l2_normalize(&(e_live + &r_ref.embedding).unwrap()).unwrap();
+    let first = |r: &IdentityReference| r.frames[0].as_ref().unwrap().embedding.clone();
+    let e_live = &first(reference_as::<IdentityReference>("identity", r_live.as_ref()).unwrap());
+    let mean = l2_normalize(&(e_live + &first(r_ref)).unwrap()).unwrap();
     let want = 1.0 - scalar(&(&mean * e_live).unwrap().sum_all().unwrap());
     let got = scalar(&loss.loss(&live, r_ref).unwrap());
     assert!((got - want).abs() < 1e-5, "{got} vs {want}");
@@ -390,6 +389,54 @@ fn landmark_loss_trains_the_lora_and_skips_no_face() {
     )));
     skip.ensure_reference(0, &nchw(&reference)).unwrap();
     assert!(skip.plan(0, 0, 0.5).unwrap().aux.is_empty());
+}
+
+/// A detector that answers per call from a script (one entry per frame, in order).
+struct ScriptedDetector(std::sync::Mutex<Vec<Option<[f32; 4]>>>);
+impl FaceBoxDetector for ScriptedDetector {
+    fn largest_face(&self, _: &[u8], _: usize, _: usize) -> Result<Option<[f32; 4]>> {
+        Ok(self.0.lock().unwrap().remove(0))
+    }
+}
+
+/// A video decoder hands the loss `[F, H, W, 3]`: per-frame reference boxes, frames without a face
+/// skipped, the mean over face-bearing frames, and a clip with no face unusable (the Candle twin of
+/// mlx-gen-face's test). Mutations: average over every frame ⇒ red; score frame 0 for every frame
+/// ⇒ red.
+#[test]
+fn multi_frame_decodes_score_each_face_bearing_frame() {
+    let f = fixture();
+    let (live, reference) = images(&f);
+    let clip = |a: &Tensor, b: &Tensor| Tensor::cat(&[a, b], 0).unwrap();
+    let face = Some(bbox(&f));
+    let loss = |script: Vec<Option<[f32; 4]>>| {
+        IdentityLoss::new(
+            arcface(&f),
+            Arc::new(ScriptedDetector(std::sync::Mutex::new(script))),
+            -1.0,
+            IdentityReferenceMode::PerImage,
+        )
+    };
+    let single = f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
+    let noise = synth::image(9, "noise", 72, 88, &dev()).unwrap();
+
+    let l = loss(vec![face, None]);
+    let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
+    let v = scalar(&l.loss(&clip(&live, &noise), r.as_ref()).unwrap());
+    assert!((v - single).abs() < 2e-5, "{v} vs {single}");
+    let l = loss(vec![None, face]);
+    let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
+    let v = scalar(&l.loss(&clip(&noise, &live), r.as_ref()).unwrap());
+    assert!((v - single).abs() < 2e-5, "{v} vs {single}");
+    let l = loss(vec![face, face]);
+    let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
+    let v = scalar(&l.loss(&clip(&live, &live), r.as_ref()).unwrap());
+    assert!((v - single).abs() < 2e-5, "{v} vs {single}");
+    assert!(loss(vec![None, None])
+        .reference(&clip(&reference, &reference))
+        .unwrap()
+        .is_none());
+    assert!(l.loss(&live, r.as_ref()).is_err());
 }
 
 /// A live decode at another size than its reference is an error.

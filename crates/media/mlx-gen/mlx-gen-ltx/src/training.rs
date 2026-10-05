@@ -1945,6 +1945,9 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
             resolution_buckets: id != MODEL_25_ID,
             subject_mask_loss: id == MODEL_ID,
             depth_anchoring: id == MODEL_ID,
+            // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
+            identity_loss: id == MODEL_ID,
+            face_landmark_loss: id == MODEL_ID,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
