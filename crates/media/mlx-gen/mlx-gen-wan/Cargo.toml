@@ -23,8 +23,13 @@ unicode-normalization = "0.1"
 # Decode training-dataset images (LoRA/LoKr training, sc-3046). PNG + JPEG cover the SceneWorks
 # dataset formats; the trainer center-crops + hands the Image to the VAE preprocess.
 image = { workspace = true }
+# The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
+# through the TAEHV tiny video decoder).
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
 
 [dev-dependencies]
+# Tiny random-init Depth-Anything-V2 for the depth-anchoring step tests (sc-24830).
+mlx-gen-depth = { path = "../mlx-gen-depth" }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

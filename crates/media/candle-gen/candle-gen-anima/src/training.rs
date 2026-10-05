@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
@@ -14,11 +15,14 @@ use candle_gen::gen_core::{
 };
 use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
-    self, prepared_subject_mask_weight, validate_flow_match_request, weighted_velocity_loss,
+    self, combine_terms, prepared_subject_mask_weight, step_sample, step_terms,
+    validate_flow_match_request, weighted_velocity_loss, AuxDriver, AuxStep, StepLosses,
 };
 use candle_gen::train::lora::{build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
+use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
 use candle_gen::train::schedule::schedule_updates;
+use candle_gen::train::taehv::TaehvConfig;
 use candle_gen::{CandleError, Result};
 
 use crate::adapt::AdaptLinear;
@@ -48,9 +52,17 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
         // sc-24828 (epic 2123): subject-masked loss — a per-bucket weight map cached next to each
         // latent.
+        // sc-24830 (epic 2123): depth anchoring on its one (dense) loss path — the shared
+        // decoded-x0 perceptual path through TAEW2.1, the Qwen-Image VAE's tiny decoder.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps, per
+        // decoded frame) through the shared aux-loss builder this trainer already drives, wherever
+        // depth anchoring is wired. No E-LatentLPIPS: no published weights match this latent
+        // family.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
+            depth_anchoring: true,
+            vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -186,6 +198,117 @@ fn encode_conditioner_inputs(
     Ok((source, target_ids))
 }
 
+/// One micro-step's forward+backward (epic 2123 E8): run the conditioner (→ encoder states) and the
+/// DiT on `x_t = (1−σ)·x0 + σ·noise` at the shifted `sigma`, then the step's terms — the (subject-mask
+/// weighted) velocity regression toward `noise − x0` when the diffusion term contributes, and on a
+/// planned step with aux losses the weighted perceptual term on the x0 estimate `x_t − σ·v`, each
+/// latent frame decoded by TAEW2.1. `aux = None` ⇒ exactly the pre-epic-2123 step.
+#[allow(clippy::too_many_arguments)]
+fn compute_step_loss_grads(
+    dit: &CosmosDiT,
+    conditioner: &AnimaTextConditioner,
+    x0: &Tensor,
+    source: &Tensor,
+    target_ids: &Tensor,
+    sigma: f64,
+    noise: &Tensor,
+    mask_weight: Option<&Tensor>,
+    mae: bool,
+    dtype: DType,
+    aux: Option<&AuxStep<'_>>,
+) -> Result<(StepLosses, GradStore)> {
+    let device = x0.device();
+    let (x_t, target) = flow_match::build_batch(x0, noise, sigma)?;
+    let encoder = conditioner.forward(source, target_ids, dtype)?;
+    let sigma_tensor = Tensor::new(&[sigma as f32], device)?.to_dtype(dtype)?;
+    let prediction = dit
+        .forward(&x_t.to_dtype(dtype)?, &sigma_tensor, &encoder, dtype)?
+        .to_dtype(DType::F32)?;
+    let (diffusion_on, aux_on) = step_terms(aux);
+    let diffusion = if diffusion_on {
+        Some(weighted_velocity_loss(
+            &prediction,
+            &target,
+            mask_weight,
+            mae,
+        )?)
+    } else {
+        None
+    };
+    let aux_term = match aux {
+        Some(a) if aux_on => {
+            let x0_hat = Parameterization::FlowNoiseMinusX0 {
+                sigma: sigma as f32,
+            }
+            .recover_x0(&x_t.to_dtype(DType::F32)?, &prediction)?;
+            a.aux_loss(&latent_frames_nchw(&x0_hat)?)?
+        }
+        _ => None,
+    };
+    let (loss, losses) = combine_terms(diffusion, aux_term)?;
+    let grads = loss.backward()?;
+    Ok((losses, grads))
+}
+
+/// A cached `[B, C, T, h, w]` latent (`T = 1` for a still) as the decoder's NCHW batch
+/// `[B·T, C, h, w]` — each latent frame decoded independently.
+fn latent_frames_nchw(latent: &Tensor) -> Result<Tensor> {
+    let (b, c, t, h, w) = latent.dims5()?;
+    Ok(latent
+        .permute((0, 2, 1, 3, 4))?
+        .reshape((b * t, c, h, w))?
+        .contiguous()?)
+}
+
+/// Anima's latent family for the shared aux-loss builder (epic 2123 E8): the Qwen-Image VAE
+/// (`load_vae_encoder`, whose encode yields the per-channel `(μ − latents_mean)/latents_std`
+/// latent the DiT predicts in), decoded by TAEW2.1 — upstream's TAEHV checkpoint for Qwen-Image,
+/// which takes that normalized latent with no scale/shift. A still image is one `T = 1` clip.
+fn anima_decoder() -> candle_gen_perceptual::DecoderSpec {
+    candle_gen_perceptual::DecoderSpec::Taehv {
+        name: "TAEW2.1",
+        config: TaehvConfig::taew2_1(),
+    }
+}
+
+/// The epic-2123 perceptual path through the shared builder: `None` when no aux loss is enabled.
+fn load_perceptual_path(
+    cfg: &candle_gen::gen_core::train::TrainingConfig,
+    device: &Device,
+) -> Result<Option<PerceptualPath>> {
+    candle_gen_perceptual::build_perceptual_path(
+        cfg,
+        &candle_gen_perceptual::AuxLossContext {
+            label: LABEL,
+            decoder: anima_decoder(),
+            device,
+            latent_lpips: None,
+        },
+    )
+}
+
+/// Epic 2123 E7: refuse a depth job whose resident DiT (`base_bytes`, its on-disk weights — the lower
+/// bound the aux models stack on) plus TAEW2.1 + the losses' frozen models at the largest bucket
+/// (`entries` cached references) exceeds `budget_bytes`. No-op when no aux loss is enabled. The
+/// trainer has one (dense) backward path.
+fn check_perceptual_memory(
+    cfg: &candle_gen::gen_core::train::TrainingConfig,
+    entries: usize,
+    base_bytes: u64,
+    budget_bytes: u64,
+) -> Result<()> {
+    let edge = bucket_edges(cfg).iter().copied().max().unwrap_or(0);
+    let aux = candle_gen_perceptual::perceptual_footprint(
+        cfg,
+        &anima_decoder(),
+        candle_gen_perceptual::AuxGeometry::image(edge, entries),
+    );
+    if aux == 0 {
+        return Ok(());
+    }
+    flow_match::check_aux_memory(LABEL, base_bytes, aux, budget_bytes)
+}
+
 fn shifted_sigma(cfg: &candle_gen::gen_core::train::TrainingConfig, step: u32) -> f64 {
     let sigma = flow_match::sample_unit_timestep(
         &cfg.timestep_type,
@@ -204,6 +327,27 @@ impl AnimaTrainer {
         let cfg = &req.config;
         let device = &self.device;
         on_progress(TrainingProgress::Preparing);
+        // Epic 2123 E7: the depth-anchoring models count against the device budget (no-op with
+        // nothing enabled), BEFORE any load or caching.
+        if candle_gen_perceptual::any_aux_loss(cfg) {
+            let dit_path = resolve_split_files(&self.source)?
+                .join("diffusion_models")
+                .join(Variant::Base.dit_filename());
+            let base = std::fs::metadata(&dit_path)
+                .map_err(|e| {
+                    CandleError::Msg(format!("{LABEL}: stat {}: {e}", dit_path.display()))
+                })?
+                .len();
+            check_perceptual_memory(
+                cfg,
+                req.items.len() * bucket_edges(cfg).len(),
+                base,
+                flow_match::device_training_budget_bytes(device, LABEL),
+            )?;
+        }
+        // Epic 2123 depth anchoring (sc-24830): the frozen TAEW2.1 + Depth-Anything-V2 load before
+        // the caching pass, so a missing checkpoint fails fast.
+        let perceptual = load_perceptual_path(cfg, device)?;
         on_progress(TrainingProgress::LoadingModel);
 
         let components = AnimaComponents::load(&self.source, Variant::Base, device, &[])?;
@@ -310,30 +454,50 @@ impl AnimaTrainer {
         // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the real item
+        // (the trainer has no resume, so nothing to replay).
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(AuxDriver::prepare(
+                path,
+                cache.len(),
+                |i| latent_frames_nchw(&cache[i].0),
+                &schedule,
+                accum,
+                0,
+            )?),
+            None => None,
+        };
         for step in 1..=cfg.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, source, target_ids, mask_weight) =
-                &cache[schedule.cache_index(step as usize - 1)];
-            let sigma = shifted_sigma(cfg, step);
+            let sample = step_sample(aux_driver.as_mut(), step, &schedule);
+            let (x0, source, target_ids, mask_weight) = &cache[sample.entry];
+            let mut sigma = shifted_sigma(cfg, step);
+            // Epic 2123 E8: an aux-only step trains at the (shifted) σ remapped into the window.
+            let aux = sample.plan(sigma as f32)?;
+            if let Some(a) = &aux {
+                sigma = a.noise_level() as f64;
+            }
             let noise = flow_match::sample_noise(
                 x0.dims(),
                 flow_match::noise_seed(cfg.seed, step),
                 device,
             )?;
-            let (x_t, target) = flow_match::build_batch(x0, &noise, sigma)?;
-            let encoder = conditioner.forward(source, target_ids, dtype)?;
-            let sigma_tensor = Tensor::new(&[sigma as f32], device)?.to_dtype(dtype)?;
-            let prediction = dit.forward(&x_t.to_dtype(dtype)?, &sigma_tensor, &encoder, dtype)?;
-            let loss = weighted_velocity_loss(
-                &prediction.to_dtype(DType::F32)?,
-                &target,
+            let (losses, grads) = compute_step_loss_grads(
+                &dit,
+                &conditioner,
+                x0,
+                source,
+                target_ids,
+                sigma,
+                &noise,
                 mask_weight.as_ref(),
                 flow_match::is_mae(cfg),
+                dtype,
+                aux.as_ref(),
             )?;
-            last_loss = loss.to_scalar::<f32>()?;
-            let grads = loss.backward()?;
+            last_loss = losses.total;
             accumulate_grads(&mut accumulated, grads, &set.vars)?;
             if step.is_multiple_of(accum) {
                 flow_match::apply_update(
@@ -482,5 +646,399 @@ mod tests {
             .expect("explicit packed tier must be rejected")
             .to_string()
             .contains("packed"));
+    }
+}
+
+/// sc-24830 (epic 2123 depth anchoring) — the candle Anima step seam on a tiny synthetic Cosmos
+/// DiT + conditioner (16-channel latent `[1, 16, 1, 4, 4]`, deterministic `splitmix_uniform` weights)
+/// with a random-init tiny-width TAEW2.1 (16 latent channels) and a
+/// random-init tiny Depth-Anything-V2, planned through the shared flow-match `AuxDriver` exactly as
+/// `train_impl` plans. CPU.
+#[cfg(test)]
+mod depth_anchoring_tests {
+    use super::*;
+    use crate::config::{ConditionerConfig, DitConfig};
+    use candle_gen::candle_core::Var;
+    use candle_gen::candle_nn::VarBuilder;
+    use candle_gen::gen_core::train::{AuxLossSchedule, ResolutionBucket, TrainingConfig};
+    use candle_gen::train::lora::LoraSet;
+    use candle_gen::train::perceptual::AuxLoss;
+    use candle_gen::train::taehv::{splitmix_uniform, synthetic_taehv_weights, TaehvDecoder};
+
+    fn schedule() -> AuxLossSchedule {
+        AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        }
+    }
+
+    fn path() -> PerceptualPath {
+        let tae = TaehvConfig {
+            channels: [8, 6, 4, 4],
+            ..TaehvConfig::taew2_1()
+        };
+        let dec = TaehvDecoder::from_weights(
+            &synthetic_taehv_weights(&tae, 11, &Device::Cpu).unwrap(),
+            tae,
+        )
+        .unwrap();
+        let loss = candle_gen_depth::anchor::tiny_depth_anchor_loss(12, &Device::Cpu).unwrap();
+        PerceptualPath::new(
+            Some(Box::new(dec)),
+            vec![AuxLoss {
+                schedule: schedule(),
+                loss: Box::new(loss),
+            }],
+        )
+        .unwrap()
+    }
+
+    struct Fixture {
+        dit: CosmosDiT,
+        cond: AnimaTextConditioner,
+        set: LoraSet,
+        x0: Tensor,
+        source: Tensor,
+        ids: Tensor,
+        noise: Tensor,
+    }
+
+    /// Deterministic synthetic weights in the checkpoint key layout (mirrors
+    /// `tests/adapter_residuals.rs`): norm scales near 1, everything else `U·√(1/fan_in)`.
+    fn put(map: &mut HashMap<String, Tensor>, key: &str, shape: &[usize]) {
+        let seed = key.bytes().map(u64::from).sum::<u64>() % 997 + 3000;
+        let fan_in = shape.get(1).copied().unwrap_or(1).max(1);
+        let t = if key.ends_with("norm.weight") {
+            splitmix_uniform(shape, seed, 0.05, 1.0, &Device::Cpu)
+        } else {
+            splitmix_uniform(shape, seed, (1.0 / fan_in as f64).sqrt(), 0.0, &Device::Cpu)
+        };
+        map.insert(key.to_string(), t.unwrap());
+    }
+
+    fn dit_cfg() -> DitConfig {
+        DitConfig {
+            in_channels: 16,
+            out_channels: 16,
+            num_attention_heads: 2,
+            attention_head_dim: 6,
+            num_layers: 2,
+            mlp_ratio: 4.0,
+            text_embed_dim: 8,
+            adaln_lora_dim: 8,
+            max_size: (128, 120, 120),
+            patch_size: (1, 2, 2),
+            rope_scale: (1.0, 4.0, 4.0),
+            concat_padding_mask: true,
+        }
+    }
+
+    fn cond_cfg() -> ConditionerConfig {
+        ConditionerConfig {
+            source_dim: 8,
+            target_dim: 8,
+            model_dim: 8,
+            num_layers: 1,
+            num_attention_heads: 2,
+            mlp_ratio: 4.0,
+            target_vocab_size: 16,
+            min_sequence_length: 8,
+            rope_theta: 10000.0,
+            norm_eps: 1e-6,
+        }
+    }
+
+    fn dit_map(cfg: &DitConfig) -> HashMap<String, Tensor> {
+        let h = cfg.hidden_size();
+        let hd = cfg.attention_head_dim;
+        let lora = cfg.adaln_lora_dim;
+        let ctx = cfg.text_embed_dim;
+        let ff = (cfg.mlp_ratio * h as f32) as usize;
+        let (pt, ph, pw) = cfg.patch_size;
+        let patch_in = cfg.patch_in_channels() * pt * ph * pw;
+        let proj_out = ph * pw * pt * cfg.out_channels;
+        let mut w = HashMap::new();
+        put(&mut w, "net.x_embedder.proj.1.weight", &[h, patch_in]);
+        put(&mut w, "net.t_embedder.1.linear_1.weight", &[3 * h, h]);
+        put(&mut w, "net.t_embedder.1.linear_2.weight", &[3 * h, 3 * h]);
+        put(&mut w, "net.t_embedding_norm.weight", &[h]);
+        for i in 0..cfg.num_layers {
+            let b = format!("net.blocks.{i}");
+            for m in [
+                "adaln_modulation_self_attn",
+                "adaln_modulation_cross_attn",
+                "adaln_modulation_mlp",
+            ] {
+                put(&mut w, &format!("{b}.{m}.1.weight"), &[lora, h]);
+                put(&mut w, &format!("{b}.{m}.2.weight"), &[3 * h, lora]);
+            }
+            for (attn, kv_in) in [("self_attn", h), ("cross_attn", ctx)] {
+                put(&mut w, &format!("{b}.{attn}.q_proj.weight"), &[h, h]);
+                put(&mut w, &format!("{b}.{attn}.k_proj.weight"), &[h, kv_in]);
+                put(&mut w, &format!("{b}.{attn}.v_proj.weight"), &[h, kv_in]);
+                put(&mut w, &format!("{b}.{attn}.output_proj.weight"), &[h, h]);
+                put(&mut w, &format!("{b}.{attn}.q_norm.weight"), &[hd]);
+                put(&mut w, &format!("{b}.{attn}.k_norm.weight"), &[hd]);
+            }
+            put(&mut w, &format!("{b}.mlp.layer1.weight"), &[ff, h]);
+            put(&mut w, &format!("{b}.mlp.layer2.weight"), &[h, ff]);
+        }
+        put(
+            &mut w,
+            "net.final_layer.adaln_modulation.1.weight",
+            &[lora, h],
+        );
+        put(
+            &mut w,
+            "net.final_layer.adaln_modulation.2.weight",
+            &[2 * h, lora],
+        );
+        put(&mut w, "net.final_layer.linear.weight", &[proj_out, h]);
+        w
+    }
+
+    fn cond_map(cfg: &ConditionerConfig) -> HashMap<String, Tensor> {
+        let d = cfg.model_dim;
+        let hd = cfg.head_dim();
+        let ff = (cfg.mlp_ratio * d as f32) as usize;
+        let mut w = HashMap::new();
+        put(
+            &mut w,
+            "llm_adapter.embed.weight",
+            &[cfg.target_vocab_size, d],
+        );
+        for i in 0..cfg.num_layers {
+            let b = format!("llm_adapter.blocks.{i}");
+            put(&mut w, &format!("{b}.norm_self_attn.weight"), &[d]);
+            put(&mut w, &format!("{b}.norm_cross_attn.weight"), &[d]);
+            put(&mut w, &format!("{b}.norm_mlp.weight"), &[d]);
+            for attn in ["self_attn", "cross_attn"] {
+                for p in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                    put(&mut w, &format!("{b}.{attn}.{p}.weight"), &[d, d]);
+                }
+                put(&mut w, &format!("{b}.{attn}.q_norm.weight"), &[hd]);
+                put(&mut w, &format!("{b}.{attn}.k_norm.weight"), &[hd]);
+            }
+            put(&mut w, &format!("{b}.mlp.0.weight"), &[ff, d]);
+            put(&mut w, &format!("{b}.mlp.0.bias"), &[ff]);
+            put(&mut w, &format!("{b}.mlp.2.weight"), &[d, ff]);
+            put(&mut w, &format!("{b}.mlp.2.bias"), &[d]);
+        }
+        put(&mut w, "llm_adapter.out_proj.weight", &[cfg.target_dim, d]);
+        put(&mut w, "llm_adapter.out_proj.bias", &[cfg.target_dim]);
+        put(&mut w, "llm_adapter.norm.weight", &[cfg.target_dim]);
+        w
+    }
+
+    fn fixture() -> Fixture {
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_tensors(dit_map(&dit_cfg()), DType::F32, &dev);
+        let mut dit = CosmosDiT::new(&vb.pp("net"), dit_cfg()).unwrap();
+        let vb = VarBuilder::from_tensors(cond_map(&cond_cfg()), DType::F32, &dev);
+        let mut cond = AnimaTextConditioner::new(&vb.pp("llm_adapter"), cond_cfg()).unwrap();
+        let set = {
+            let mut host = AnimaTrainHost {
+                dit: &mut dit,
+                conditioner: &mut cond,
+            };
+            build_adapt_lora_targets(&mut host, &[], 4, 4.0, 7, &dev).unwrap()
+        };
+        assert!(!set.vars.is_empty());
+        let x0 = splitmix_uniform(&[1, 16, 1, 4, 4], 1, 1.0, 0.0, &dev).unwrap();
+        let noise = splitmix_uniform(&[1, 16, 1, 4, 4], 2, 1.0, 0.0, &dev).unwrap();
+        let source = splitmix_uniform(&[1, 6, 8], 3, 1.0, 0.0, &dev).unwrap();
+        let ids = Tensor::from_vec(vec![1u32, 5, 9, 3], (1, 4), &dev).unwrap();
+        Fixture {
+            dit,
+            cond,
+            set,
+            x0,
+            source,
+            ids,
+            noise,
+        }
+    }
+
+    fn step(f: &Fixture, sigma: f64, aux: Option<&AuxStep<'_>>) -> (StepLosses, GradStore) {
+        compute_step_loss_grads(
+            &f.dit,
+            &f.cond,
+            &f.x0,
+            &f.source,
+            &f.ids,
+            sigma,
+            &f.noise,
+            None,
+            false,
+            DType::F32,
+            aux,
+        )
+        .unwrap()
+    }
+
+    fn driver(f: &Fixture) -> (AuxDriver, BucketSchedule) {
+        let sched = BucketSchedule::new(
+            1,
+            &[ResolutionBucket {
+                resolution: 32,
+                repeats: 1,
+            }],
+            7,
+        );
+        let d = AuxDriver::prepare(path(), 1, |_| latent_frames_nchw(&f.x0), &sched, 1, 0).unwrap();
+        (d, sched)
+    }
+
+    fn grad_bits(g: &GradStore, vars: &[Var]) -> Vec<Vec<u32>> {
+        vars.iter()
+            .map(|v| {
+                g.get(v.as_tensor())
+                    .map(|t| {
+                        t.flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// AC (a)+(b): the driver's step 2 is a depth step — no diffusion term, total == the weighted
+    /// depth term, a nonzero finite gradient through the decoded x0 on the adapter factors — and
+    /// step 1 carries no depth term. Mutation: compute the diffusion term unconditionally ⇒ red.
+    #[test]
+    fn depth_step_trains_the_lora_through_depth_only() {
+        let f = fixture();
+        let (mut d, sched) = driver(&f);
+        let s1 = d.sample(1, &sched).plan(0.5).unwrap().unwrap();
+        let (diff, _) = step(&f, 0.5, Some(&s1));
+        assert_eq!(diff.aux, None);
+        assert_eq!(Some(diff.total), diff.diffusion);
+        let s2 = d.sample(2, &sched).plan(0.5).unwrap().unwrap();
+        assert!(!s2.diffusion());
+        let (depth, g) = step(&f, s2.noise_level() as f64, Some(&s2));
+        assert_eq!(depth.diffusion, None);
+        let a = depth.aux.expect("depth term");
+        assert!(a > 0.0 && a.is_finite(), "{a}");
+        assert!((depth.total - a).abs() <= 1e-6 * a.abs());
+        let gsum: f32 = f
+            .set
+            .vars
+            .iter()
+            .map(|v| {
+                g.get(v.as_tensor())
+                    .map(|t| {
+                        t.abs()
+                            .unwrap()
+                            .sum_all()
+                            .unwrap()
+                            .to_scalar::<f32>()
+                            .unwrap()
+                    })
+                    .unwrap_or(0.0)
+            })
+            .sum();
+        assert!(gsum > 0.0 && gsum.is_finite(), "adapter grad {gsum}");
+    }
+
+    /// AC (c): depth off ⇒ bit-identical to the pre-epic-2123 loop body (reproduced here), and a
+    /// diffusion-only planned step equals it too. Mutation: scale the diffusion loss (×1.0001) ⇒ red.
+    #[test]
+    fn depth_off_is_bit_identical_to_the_legacy_step() {
+        assert!(
+            load_perceptual_path(&TrainingConfig::default(), &Device::Cpu)
+                .unwrap()
+                .is_none()
+        );
+        let f = fixture();
+        for (i, v) in f.set.vars.iter().enumerate() {
+            v.set(
+                &splitmix_uniform(
+                    v.as_tensor().dims(),
+                    900 + i as u64,
+                    0.02,
+                    0.0,
+                    &Device::Cpu,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let (off, g_off) = step(&f, 0.5, None);
+        let (x_t, target) = flow_match::build_batch(&f.x0, &f.noise, 0.5).unwrap();
+        let encoder = f.cond.forward(&f.source, &f.ids, DType::F32).unwrap();
+        let sigma_tensor = Tensor::new(&[0.5f32], &Device::Cpu).unwrap();
+        let prediction = f
+            .dit
+            .forward(&x_t, &sigma_tensor, &encoder, DType::F32)
+            .unwrap();
+        let loss = weighted_velocity_loss(
+            &prediction.to_dtype(DType::F32).unwrap(),
+            &target,
+            None,
+            false,
+        )
+        .unwrap();
+        let legacy = loss.to_scalar::<f32>().unwrap();
+        let g_legacy = loss.backward().unwrap();
+        assert_eq!(off.total.to_bits(), legacy.to_bits());
+        assert_eq!(
+            grad_bits(&g_off, &f.set.vars),
+            grad_bits(&g_legacy, &f.set.vars)
+        );
+        let (mut d, sched) = driver(&f);
+        let s1 = d.sample(1, &sched).plan(0.5).unwrap().unwrap();
+        let (on, g_on) = step(&f, 0.5, Some(&s1));
+        assert_eq!(on, off);
+        assert_eq!(
+            grad_bits(&g_on, &f.set.vars),
+            grad_bits(&g_off, &f.set.vars)
+        );
+    }
+
+    /// AC (d), E7: depth grows the guarded footprint (more for Large) and the guard refuses at a
+    /// synthetic budget between base and base+aux. Mutation: compare `base` alone ⇒ red.
+    #[test]
+    fn memory_guard_counts_the_aux_models() {
+        let mut on = TrainingConfig::default();
+        on.depth_anchoring.schedule = schedule();
+        let fp = |c: &TrainingConfig| {
+            candle_gen_perceptual::perceptual_footprint(
+                c,
+                &anima_decoder(),
+                candle_gen_perceptual::AuxGeometry::image(1024, 1),
+            )
+        };
+        let small = fp(&on);
+        on.depth_anchoring.model_size = gen_core::train::DepthModelSize::Large;
+        let large = fp(&on);
+        assert!(small > 0 && large > small + (1u64 << 30), "{small} {large}");
+        let base = 4u64 << 30;
+        assert!(check_perceptual_memory(&TrainingConfig::default(), 1, base, base).is_ok());
+        assert!(check_perceptual_memory(&on, 1, base, base + large / 2).is_err());
+        assert!(check_perceptual_memory(&on, 1, base, base + large + (1 << 30)).is_ok());
+    }
+
+    /// AC (e): the descriptor declares depth anchoring; a missing TAEW2.1 checkpoint is a named
+    /// error.
+    #[test]
+    fn descriptor_declares_depth_and_missing_decoder_is_named() {
+        assert!(trainer_descriptor().techniques.depth_anchoring);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = TrainingConfig::default();
+        c.depth_anchoring.schedule = schedule();
+        c.perceptual_decoder_dir = Some(tmp.path().join("no-taehv"));
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let err = load_perceptual_path(&c, &Device::Cpu)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("TAEW2.1"), "{err}");
     }
 }

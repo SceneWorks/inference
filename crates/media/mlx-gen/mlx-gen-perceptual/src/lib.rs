@@ -30,6 +30,7 @@ use mlx_gen::train::perceptual::{
     X0Decoder,
 };
 use mlx_gen::train::tae::{TinyDecoder, TinyDecoderSpec};
+use mlx_gen::train::taehv::{TaehvConfig, TaehvDecoder};
 use mlx_gen::{Error, Result};
 
 /// A decoder a trainer supplies itself (a video tiny decoder run per frame, or a full-VAE
@@ -55,6 +56,13 @@ pub enum DecoderSpec {
         /// …).
         config: TinyDecoderSpec,
     },
+    /// A TAEHV tiny video decoder (`taew2_1` / `taew2_2` / `taeltx2_3`) loaded from
+    /// `TrainingConfig::perceptual_decoder_dir`, decoding each latent frame as a `T = 1` clip.
+    Taehv {
+        /// Display name for errors (e.g. `"TAEW2.1"`).
+        name: &'static str,
+        config: TaehvConfig,
+    },
     /// A trainer-built decoder.
     Custom(Box<dyn CustomDecoder>),
 }
@@ -64,7 +72,7 @@ impl DecoderSpec {
     pub fn name(&self) -> Option<&'static str> {
         match self {
             Self::None => None,
-            Self::Tiny { name, .. } => Some(name),
+            Self::Tiny { name, .. } | Self::Taehv { name, .. } => Some(name),
             Self::Custom(c) => Some(c.name()),
         }
     }
@@ -73,6 +81,7 @@ impl DecoderSpec {
         match self {
             Self::None => None,
             Self::Tiny { config, .. } => Some(config.footprint(h, w)),
+            Self::Taehv { config, .. } => Some(config.footprint(h, w)),
             Self::Custom(c) => Some(c.footprint(h, w)),
         }
     }
@@ -321,6 +330,22 @@ fn build_perceptual_path_with(
                 ))
             })?;
             let dec = TinyDecoder::from_dir(dir, config.clone()).map_err(|e| {
+                Error::Msg(format!(
+                    "{}: could not load the {name} decoder from {}: {e}",
+                    ctx.label,
+                    dir.display()
+                ))
+            })?;
+            Some(Box::new(dec))
+        }
+        (Some(_), DecoderSpec::Taehv { name, config }) => {
+            let dir = cfg.perceptual_decoder_dir.as_ref().ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: the perceptual losses need the {name} decoder (perceptual_decoder_dir)",
+                    ctx.label
+                ))
+            })?;
+            let dec = TaehvDecoder::from_path(dir, config.clone()).map_err(|e| {
                 Error::Msg(format!(
                     "{}: could not load the {name} decoder from {}: {e}",
                     ctx.label,
