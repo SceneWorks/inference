@@ -935,6 +935,18 @@ fn checkpointed_baseline_gb(bf16: bool) -> f64 {
 /// `checkpointed`, the DiT projection is [`checkpointed_baseline_gb`] (no fitted checkpointed curve
 /// exists, so the resident base is the lower bound the auxiliary models stack on).
 fn preflight_memory_guard(edge: u32, bf16: bool, extra_gb: f64, checkpointed: bool) -> Result<()> {
+    preflight_memory_guard_with_budget(edge, bf16, extra_gb, checkpointed, get_memory_limit())
+}
+
+/// [`preflight_memory_guard`] against an explicit memory budget (`budget_bytes`, the live MLX limit
+/// in production) — so the guard's arithmetic is testable on any host.
+fn preflight_memory_guard_with_budget(
+    edge: u32,
+    bf16: bool,
+    extra_gb: f64,
+    checkpointed: bool,
+    budget_bytes: usize,
+) -> Result<()> {
     let tokens_per_side = (edge as f64 / 16.0).ceil();
     // The padded caption block can reach the model's max prompt length (~512 tokens), not just the
     // 32-token padding granularity; under-counting it lets a near-threshold long-prompt dense run slip
@@ -945,7 +957,7 @@ fn preflight_memory_guard(edge: u32, bf16: bool, extra_gb: f64, checkpointed: bo
     } else {
         projected_dense_peak_gb(s, bf16)
     } + extra_gb;
-    let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let budget_gb = budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
     if projected > safe && checkpointed {
         return Err(format!(
@@ -2470,8 +2482,8 @@ mod depth_anchoring_tests {
     }
 
     /// E7: depth anchoring grows the trainer memory estimate by the TAEF1 + DA2 footprint, more for
-    /// a larger DA2, and the pre-flight guard counts it on the dense and the checkpointed path. Mutation: drop `extra_gb` from
-    /// `preflight_memory_guard`'s projection ⇒ the huge-extra case passes ⇒ red.
+    /// a larger DA2, and the pre-flight guard counts it on the dense and the checkpointed path
+    /// (host-independent: synthetic budgets).
     #[test]
     fn memory_estimate_includes_the_aux_models() {
         let mut on = TrainingConfig::default();
@@ -2485,12 +2497,27 @@ mod depth_anchoring_tests {
         );
         // The DA2-Large weights alone are ~1.3 GB.
         assert!(large - small > 1.0, "large - small = {} GB", large - small);
-        assert!(preflight_memory_guard(64, true, 0.0, false).is_ok());
-        assert!(preflight_memory_guard(64, true, 1.0e9, false).is_err());
-        // Review major: the guard also applies on the (default) checkpointed path when auxiliary
-        // models add memory. Mutation: drop `+ extra_gb` on the checkpointed branch ⇒ red.
-        assert!(preflight_memory_guard(1024, true, 0.0, true).is_ok());
-        assert!(preflight_memory_guard(1024, true, 1.0e9, true).is_err());
+
+        // The guard against fixed synthetic budgets (never the host's): a budget whose safe share
+        // sits halfway between the DiT projection and projection + aux admits the plain run and
+        // refuses the depth run — on the dense path and on the (default) checkpointed path.
+        // Mutations: drop `+ extra_gb` (dense or checkpointed branch) ⇒ the aux case passes ⇒ red;
+        // skip the checkpointed branch's projection ⇒ red.
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        let between = |base_gb: f64| ((base_gb + large / 2.0) / 0.85 * GIB) as usize;
+        let dense_tokens = (64.0f64 / 16.0).ceil().powi(2) + 544.0;
+        let dense_base = projected_dense_peak_gb(dense_tokens, true);
+        let budget = between(dense_base);
+        assert!(preflight_memory_guard_with_budget(64, true, 0.0, false, budget).is_ok());
+        assert!(preflight_memory_guard_with_budget(64, true, large, false, budget).is_err());
+        let ckpt_base = checkpointed_baseline_gb(true);
+        let budget = between(ckpt_base);
+        assert!(preflight_memory_guard_with_budget(1024, true, 0.0, true, budget).is_ok());
+        assert!(preflight_memory_guard_with_budget(1024, true, large, true, budget).is_err());
+        // A budget comfortably above projection + aux admits the depth run on both paths.
+        let roomy = ((dense_base.max(ckpt_base) + large) / 0.85 * GIB) as usize * 2;
+        assert!(preflight_memory_guard_with_budget(64, true, large, false, roomy).is_ok());
+        assert!(preflight_memory_guard_with_budget(1024, true, large, true, roomy).is_ok());
     }
 
     /// E3: the Z-Image MLX descriptor declares depth anchoring.
