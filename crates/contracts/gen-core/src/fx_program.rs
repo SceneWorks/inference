@@ -107,10 +107,6 @@ fn uint_min(v: &Value, what: &str, min: usize) -> Result<usize> {
         })
 }
 
-fn uint(v: &Value, what: &str) -> Result<usize> {
-    uint_min(v, what, 0)
-}
-
 fn pair_min(v: &Value, what: &str, min: usize) -> Result<(usize, usize)> {
     let a = v
         .as_array()

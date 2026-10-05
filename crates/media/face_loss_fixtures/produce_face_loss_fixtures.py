@@ -20,6 +20,10 @@ set (conv / depthwise conv / PReLU / max-pool / pad incl. channel pad / add / mu
 reshape), lowered through `mlx-gen/tools/fx_program.py` exactly as the real one is — so the fixture
 also pins the converter.
 
+The identity numbers are upstream's bias-centred cosines (`normalize(e - noise_mean)`, the mean
+unit embedding of 200 counter-based noise images), including the dataset-average mode's clean-cos
+normalizer and noise probes that must land below the 0.2 gate.
+
 The committed JSON records this script's sha256; the Rust tests refuse a fixture whose producer bytes
 changed without regenerating it.
 """
@@ -74,6 +78,22 @@ def uniform(seed: int, key: str, n: int) -> np.ndarray:
         idx = (np.uint64(k) + np.arange(n, dtype=np.uint64)).astype(np.uint64)
         z = splitmix64_np(idx)
     return (z >> np.uint64(40)).astype(np.float64) / 16777216.0
+
+
+def gaussian(seed: int, key: str, n: int) -> np.ndarray:
+    """`n` standard normals: Box-Muller `sqrt(-2 ln(u0 + 2^-25)) * cos(2 pi u1)` over `uniform` pairs
+    (twin of gen_core `face_loss::synth::gaussian`)."""
+    u = uniform(seed, key, 2 * n)
+    r = np.sqrt(-2.0 * np.log(u[0::2] + 2.0 ** -25))
+    return r * np.cos(2.0 * np.pi * u[1::2])
+
+
+def identity_noise_image(index: int, edge: int) -> torch.Tensor:
+    """Upstream's bias-direction noise `clamp(randn*0.3+0.5, 0, 1)` as NCHW [1,3,edge,edge]
+    (generated NHWC; twin of `synth::identity_noise_image`)."""
+    z = gaussian(IDENTITY_NOISE_SEED, f"identity-noise-{index}", edge * edge * 3)
+    v = np.clip(z * 0.3 + 0.5, 0.0, 1.0).astype(np.float32).reshape(1, edge, edge, 3)
+    return torch.from_numpy(v).permute(0, 3, 1, 2).contiguous()
 
 
 def role(key: str, shape: tuple[int, ...]) -> tuple[float, float]:
@@ -217,6 +237,32 @@ def embed(w, px, box):
     return F.normalize(emb, p=2, dim=-1)
 
 
+IDENTITY_NOISE_SEED = 0x5EED_24831
+IDENTITY_NOISE_SAMPLES = 200
+NOISE_PROBES = 4
+
+
+def noise_mean(w):
+    """Upstream's `_identity_mean_embed`: the mean unit ArcFace embedding of 200 noise images at 112^2
+    (the full noise image, no crop)."""
+    embs = []
+    for i in range(IDENTITY_NOISE_SAMPLES):
+        x = identity_noise_image(i, 112)
+        embs.append(F.normalize(arcface_forward(w, (x * 255.0 - 127.5) / 127.5), p=2, dim=-1))
+    return torch.cat(embs).mean(dim=0)
+
+
+def noise_image(h: int, w: int, key: str) -> torch.Tensor:
+    """`clamp(randn*0.3+0.5, 0, 1)` at h x w as NCHW (twin of `synth::noise_image`)."""
+    z = gaussian(IDENTITY_NOISE_SEED, key, h * w * 3)
+    v = np.clip(z * 0.3 + 0.5, 0.0, 1.0).astype(np.float32).reshape(1, h, w, 3)
+    return torch.from_numpy(v).permute(0, 3, 1, 2).contiguous()
+
+
+def center(e, mean):
+    return F.normalize(e - mean, p=2, dim=-1)
+
+
 # ---------------------------------------------------------------------------------------------
 # Synthetic FaceMesh-shaped network (the real checkpoint's op set, tiny widths).
 # ---------------------------------------------------------------------------------------------
@@ -317,7 +363,24 @@ def main():
     aw = arcface_weights()
     e_live = embed(aw, live, box)
     e_ref = embed(aw, ref, box)
-    cos = float((e_live * e_ref).sum())
+    mean = noise_mean(aw)
+    # Upstream's bias-centred cosine (SDTrainer ~2950-2961).
+    cos = float((center(e_live, mean) * center(e_ref, mean)).sum())
+    # Noise crops against the synthetic reference: 112^2 noise drawn like the bias set (full-frame
+    # crop), scored bias-centred, all land below upstream's 0.2 gate.
+    probe_box = (0, 0, 112, 112)
+    noise_probe_cos = []
+    for i in range(NOISE_PROBES):
+        e_probe = embed(aw, noise_image(112, 112, f"noise-probe-{i}"), probe_box)
+        noise_probe_cos.append(float((center(e_probe, mean) * center(e_ref, mean)).sum()))
+    assert max(noise_probe_cos) < 0.2, noise_probe_cos
+    # Dataset-average mode (upstream identity_loss_use_average): references {reference, reference2}.
+    ref2 = image(IMG_SEED, "reference2", IMG_H, IMG_W)
+    e_ref2 = embed(aw, ref2, box)
+    avg = F.normalize((e_ref + e_ref2) / 2.0, p=2, dim=-1)
+    clean = max(float((center(e_ref, mean) * center(avg, mean)).sum()), 0.1)
+    avg_cos = float((center(e_live, mean) * center(avg, mean)).sum())
+    avg_loss = max(0.0, 1.0 - avg_cos / clean)
 
     mesh = mesh_model()
     program, params = fx_program.lower(mesh)
@@ -342,8 +405,19 @@ def main():
             "keys": {k: list(s) for k, s in arcface_keys().items()},
             "embedding": fl(e_live),
             "reference_embedding": fl(e_ref),
+            "noise_seed": IDENTITY_NOISE_SEED,
+            "noise_samples": IDENTITY_NOISE_SAMPLES,
+            "noise_mean": fl(mean),
             "cos": cos,
             "identity_loss": 1.0 - cos,
+            "noise_probe_keys": [f"noise-probe-{i}" for i in range(NOISE_PROBES)],
+            "noise_probe_cos": noise_probe_cos,
+            "average": {
+                "reference2_key": "reference2",
+                "clean_cos": clean,
+                "cos": avg_cos,
+                "identity_loss": avg_loss,
+            },
         },
         "facemesh": {
             "seed": MESH_SEED,
@@ -358,7 +432,8 @@ def main():
     with open(path, "w") as f:
         json.dump(out, f, indent=1)
         f.write("\n")
-    print(f"wrote {path}: cos={cos:.6f} identity_loss={1 - cos:.6f} landmark_loss={lm_loss:.6f}")
+    print(f"wrote {path}: cos={cos:.6f} identity_loss={1 - cos:.6f} landmark_loss={lm_loss:.6f} "
+          f"noise_probe_max={max(noise_probe_cos):.4f} avg_loss={avg_loss:.6f} clean={clean:.4f}")
 
 
 if __name__ == "__main__":

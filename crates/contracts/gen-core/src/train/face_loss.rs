@@ -389,14 +389,19 @@ pub mod synth {
             .collect()
     }
 
-    /// Noise image `index` of the identity loss's bias-direction set: upstream's
-    /// `clamp(randn · 0.3 + 0.5, 0, 1)` at `edge × edge`, NHWC row-major, from the counter-based
-    /// [`gaussian`] so every backend averages identical inputs.
-    pub fn identity_noise_image(seed: u64, index: usize, edge: usize) -> Vec<f32> {
-        gaussian(seed, &format!("identity-noise-{index}"), edge * edge * 3)
+    /// A `clamp(randn · 0.3 + 0.5, 0, 1)` noise image (upstream's bias-direction noise) for
+    /// `(seed, key)` at `h × w`, NHWC row-major, from the counter-based [`gaussian`].
+    pub fn noise_image(seed: u64, key: &str, h: usize, w: usize) -> Vec<f32> {
+        gaussian(seed, key, h * w * 3)
             .into_iter()
             .map(|z| (z * 0.3 + 0.5).clamp(0.0, 1.0) as f32)
             .collect()
+    }
+
+    /// Noise image `index` of the identity loss's bias-direction set at `edge × edge` — identical on
+    /// every backend.
+    pub fn identity_noise_image(seed: u64, index: usize, edge: usize) -> Vec<f32> {
+        noise_image(seed, &format!("identity-noise-{index}"), edge, edge)
     }
 
     /// Key → shape of the fixture's tiny IResNet (stem 8, widths 8/16/32/64, blocks `[1,2,1,1]`,
@@ -576,6 +581,41 @@ mod tests {
         let lm = face_landmark_loss_footprint();
         assert_eq!(lm.param_bytes, det + FACEMESH_V2_PARAMS * 4);
         assert!(lm.reference_bytes_per_image >= (FACEMESH_LANDMARKS * 2 * 4) as u64);
+    }
+
+    /// Upstream's retry: a miss re-detects on the image centred in a 128-gray border of
+    /// `max(h, w) / 4`, and the hit is mapped back (pad subtracted, clamped to the frame); a first
+    /// hit is returned untouched. Mutations: skip the retry ⇒ `None` ⇒ red; forget to subtract the
+    /// pad ⇒ red; drop the clamp ⇒ the negative / overflowing edges survive ⇒ red; pad with 0 ⇒ the
+    /// border check reds.
+    #[test]
+    fn detection_retries_on_a_gray_padded_image_and_maps_the_box_back() {
+        let (h, w) = (40usize, 60usize);
+        let rgb: Vec<u8> = (0..h * w * 3).map(|i| (i % 7) as u8).collect();
+        let mut calls = Vec::new();
+        let got = detect_with_retry(&rgb, h, w, |img, ih, iw| {
+            calls.push((ih, iw));
+            if (ih, iw) == (h, w) {
+                return Ok::<_, ()>(None);
+            }
+            // The padded frame: gray border, the original pixels at (pad, pad).
+            let pad = 15;
+            assert_eq!((ih, iw), (h + 2 * pad, w + 2 * pad));
+            assert_eq!(&img[..3], &[128, 128, 128]);
+            let at = ((pad + 2) * iw + pad + 3) * 3;
+            assert_eq!(&img[at..at + 3], &rgb[(2 * w + 3) * 3..(2 * w + 3) * 3 + 3]);
+            // A face straddling the top-left of the original frame and past its right edge.
+            Ok(Some([10.0, 20.0, 90.0, 50.0]))
+        })
+        .unwrap();
+        assert_eq!(calls, vec![(h, w), (70, 90)]);
+        assert_eq!(got, Some([0.0, 5.0, 60.0, 35.0]));
+        let first = detect_with_retry(&rgb, h, w, |_, _, _| {
+            Ok::<_, ()>(Some([1.0, 2.0, 3.0, 4.0]))
+        });
+        assert_eq!(first.unwrap(), Some([1.0, 2.0, 3.0, 4.0]));
+        let none = detect_with_retry(&rgb, h, w, |_, _, _| Ok::<_, ()>(None));
+        assert_eq!(none.unwrap(), None);
     }
 
     /// Pinned values (the Python producer's generator) — a drift breaks the cross-backend fixture.
