@@ -1353,10 +1353,15 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         max_reference_images: 0,
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps, per
+        // decoded frame) through the shared aux-loss builder this trainer already drives, wherever
+        // depth anchoring is wired. No E-LatentLPIPS: no published weights match this latent
+        // family.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets,
             subject_mask_loss,
             depth_anchoring,
+            vae_anchor_loss: depth_anchoring,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -1468,7 +1473,9 @@ fn validate_ltx_request(req: &TrainingRequest, label: &str) -> Result<()> {
 /// (which `validate` runs) and at the top of `train`, ahead of the generic technique floor. Also
 /// validates the [`DEPTH_ANCHORING_FRAMES_KEY`] knob.
 fn refuse_ltx25_depth_anchoring(req: &TrainingRequest) -> Result<()> {
-    if !req.config.depth_anchoring.schedule.is_enabled() {
+    // sc-24833: every decoded-x0 aux loss (depth anchoring, the VAE anchor) decodes the same
+    // generated video frames, so the refusal covers whichever one is on.
+    if !candle_gen_perceptual::any_aux_loss(&req.config) {
         return Ok(());
     }
     depth_anchoring_frames(&req.config)?;
@@ -5800,7 +5807,17 @@ mod ltx25_depth_anchoring_tests {
             } else {
                 assert!(result.is_ok(), "{}: {result:?}", workflow.id());
             }
+            // sc-24833: the VAE anchor decodes the same frames — refused on the same workflows.
             req.config.depth_anchoring.schedule = AuxLossSchedule::OFF;
+            req.config.vae_anchor.schedule = schedule();
+            req.config.vae_anchor.model_dir = Some("/m/flux2-vae".into());
+            assert_eq!(
+                refuse_ltx25_depth_anchoring(&req).is_err(),
+                refused.contains(&workflow.id()),
+                "{}: VAE anchor",
+                workflow.id()
+            );
+            req.config.vae_anchor.schedule = AuxLossSchedule::OFF;
             assert!(refuse_ltx25_depth_anchoring(&req).is_ok());
         }
         let mut cfg = TrainingConfig::default();

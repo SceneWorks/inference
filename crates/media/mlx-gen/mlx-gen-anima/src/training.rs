@@ -346,10 +346,15 @@ fn trainer_descriptor_for(variant: Variant) -> TrainerDescriptor {
         // sc-24830 (epic 2123): depth anchoring on that same loss path (dense and
         // block-checkpointed) — the shared decoded-x0 perceptual path through TAEW2.1, the
         // Qwen-Image VAE's tiny decoder.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps, per
+        // decoded frame) through the shared aux-loss builder this trainer already drives, wherever
+        // depth anchoring is wired. No E-LatentLPIPS: no published weights match this latent
+        // family.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
             depth_anchoring: true,
+            vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }

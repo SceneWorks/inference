@@ -5,12 +5,15 @@
 
 pub mod checkpoint;
 pub mod dataset;
+pub mod formula;
+pub mod latent_lpips;
 pub mod lora;
 pub mod loss;
 pub mod optim;
 pub mod perceptual;
 pub mod tae;
 pub mod taehv;
+pub mod vae_anchor;
 
 /// The pure LR-schedule policy (`LrSchedule`, `lr_multiplier`, `schedule_updates`) moved to
 /// gen-core; re-exported here so `mlx_gen::train::schedule::…` keeps resolving for the family

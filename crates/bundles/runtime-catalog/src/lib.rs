@@ -699,6 +699,10 @@ pub struct TrainerCapabilitySnapshot {
     pub supports_resolution_buckets: bool,
     /// Honors `TrainingConfig::subject_mask_loss` (epic 2123 subject-masked loss, sc-24828).
     pub supports_subject_mask_loss: bool,
+    /// Honors `TrainingConfig::vae_anchor` (epic 2123 VAE perceptual anchor, sc-24833).
+    pub supports_vae_anchor_loss: bool,
+    /// Honors `TrainingConfig::latent_lpips` (epic 2123 E-LatentLPIPS, sc-24833).
+    pub supports_latent_lpips_loss: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -718,6 +722,8 @@ impl TrainerCapabilitySnapshot {
             supports_gradient_noise: descriptor.techniques.gradient_noise,
             supports_resolution_buckets: descriptor.techniques.resolution_buckets,
             supports_subject_mask_loss: descriptor.techniques.subject_mask_loss,
+            supports_vae_anchor_loss: descriptor.techniques.vae_anchor_loss,
+            supports_latent_lpips_loss: descriptor.techniques.latent_lpips_loss,
         }
     }
 
@@ -737,6 +743,8 @@ impl TrainerCapabilitySnapshot {
             "supports_gradient_noise": self.supports_gradient_noise,
             "supports_resolution_buckets": self.supports_resolution_buckets,
             "supports_subject_mask_loss": self.supports_subject_mask_loss,
+            "supports_vae_anchor_loss": self.supports_vae_anchor_loss,
+            "supports_latent_lpips_loss": self.supports_latent_lpips_loss,
         })
     }
 }
@@ -1048,6 +1056,19 @@ mod tests {
         masked.techniques.subject_mask_loss = true;
         let masked_json = TrainerCapabilitySnapshot::from_descriptor(&masked).to_json();
         assert_eq!(masked_json["supports_subject_mask_loss"], true);
+        // sc-24833: the two latent-space perceptual losses are advertised from their own flags.
+        assert_eq!(json["supports_vae_anchor_loss"], false);
+        assert_eq!(json["supports_latent_lpips_loss"], false);
+        let mut anchored = descriptor;
+        anchored.techniques.vae_anchor_loss = true;
+        let anchored_json = TrainerCapabilitySnapshot::from_descriptor(&anchored).to_json();
+        assert_eq!(anchored_json["supports_vae_anchor_loss"], true);
+        assert_eq!(anchored_json["supports_latent_lpips_loss"], false);
+        let mut lpips = descriptor;
+        lpips.techniques.latent_lpips_loss = true;
+        let lpips_json = TrainerCapabilitySnapshot::from_descriptor(&lpips).to_json();
+        assert_eq!(lpips_json["supports_latent_lpips_loss"], true);
+        assert_eq!(lpips_json["supports_vae_anchor_loss"], false);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {
