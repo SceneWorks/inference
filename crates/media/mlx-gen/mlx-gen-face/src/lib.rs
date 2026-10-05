@@ -15,13 +15,20 @@
 //! - **Unified `FaceAnalysis`** ([`face`]) — the one entry point (`analyze` + `face_features_image`)
 //!   that orchestrates all four, mirroring insightface `app.get()` for the PuLID/InstantID ports
 //!   (sc-3085).
+//! - **Training face losses** ([`train`]) — the decoded-x0 ArcFace identity loss and the FaceMesh
+//!   landmark loss of the perceptual-character-LoRA epic (epic 2123, sc-24831), running the FaceMesh
+//!   program checkpoint through the [`program`] executor; [`synth`] builds the synthetic weights
+//!   their cross-backend parity fixture is pinned on.
 
 pub mod align;
 pub mod bisenet;
 pub(crate) mod common;
 pub mod face;
 pub mod iresnet;
+pub mod program;
 pub mod scrfd;
+pub mod synth;
+pub mod train;
 
 pub use align::{
     align_face_512, estimate_norm, norm_crop, to_arcface_input, warp_affine, Affine2x3,

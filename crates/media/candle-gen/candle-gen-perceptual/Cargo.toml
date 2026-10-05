@@ -9,11 +9,13 @@ repository = "https://github.com/michaeltrefry/candle-gen"
 [dependencies]
 candle-gen = { path = "../candle-gen" }
 candle-gen-depth = { path = "../candle-gen-depth" }
+# ArcFace identity + FaceMesh landmark arms (sc-24831).
+candle-gen-face = { path = "../candle-gen-face" }
 
 [features]
 default = []
-metal = ["candle-gen/metal", "candle-gen-depth/metal"]
-cuda = ["candle-gen/cuda", "candle-gen-depth/cuda"]
+metal = ["candle-gen/metal", "candle-gen-depth/metal", "candle-gen-face/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-depth/cuda", "candle-gen-face/cuda"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

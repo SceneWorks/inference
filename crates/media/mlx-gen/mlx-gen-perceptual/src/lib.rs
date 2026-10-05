@@ -31,7 +31,7 @@
 use std::path::Path;
 
 use mlx_gen::gen_core;
-use mlx_gen::gen_core::train::TrainingConfig;
+use mlx_gen::gen_core::train::{IdentityLossConfig, TrainingConfig};
 use mlx_gen::train::perceptual::{
     perceptual_footprint_bytes, AuxLoss, AuxModelFootprint, PerceptualInput, PerceptualPath,
     X0Decoder,
@@ -174,6 +174,64 @@ fn depth_footprint(cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
     mlx_gen_depth::anchor::depth_anchor_footprint(cfg.depth_anchoring.model_size, h, w)
 }
 
+/// The face-analysis stack dir both face arms detect with (`face_analysis_dir`).
+fn face_dir<'a>(cfg: &'a TrainingConfig, ctx: &AuxLossContext<'_>, loss: &str) -> Result<&'a Path> {
+    cfg.face_analysis_dir.as_deref().ok_or_else(|| {
+        Error::Msg(format!(
+            "{}: the {loss} needs the SCRFD + ArcFace face-analysis stack (face_analysis_dir)",
+            ctx.label
+        ))
+    })
+}
+
+/// ArcFace identity loss (sc-24831): SCRFD box at reference time, ArcFace on the decoded x0 crop.
+fn build_identity(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let dir = face_dir(cfg, ctx, "identity loss")?;
+    let loss = mlx_gen_face::train::load_identity_loss(dir, &cfg.identity_loss)
+        .map_err(|e| Error::Msg(format!("{}: {e}", ctx.label)))?;
+    Ok(AuxLoss {
+        schedule: cfg.identity_loss.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// The identity loss's pre-load footprint (fixed 112² crop; the shipped glintr100 checkpoint).
+fn identity_footprint(_cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_face::train::identity_loss_footprint(mlx_gen_face::iresnet::IRESNET100_LAYERS)
+}
+
+/// The identity loss's config when it is enabled: upstream gates the landmark loss on the identity
+/// cosine only then (the two arms share one identity scorer).
+fn identity_gate(cfg: &TrainingConfig) -> Option<&IdentityLossConfig> {
+    cfg.identity_loss
+        .schedule
+        .is_enabled()
+        .then_some(&cfg.identity_loss)
+}
+
+/// FaceMesh landmark loss (sc-24831): SCRFD box at reference time, FaceMesh-v2 on the x0 crop.
+fn build_landmark(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let dir = face_dir(cfg, ctx, "face-landmark loss")?;
+    let mesh = cfg.face_landmark_loss.model_dir.as_deref().ok_or_else(|| {
+        Error::Msg(format!(
+            "{}: the face-landmark loss needs the MediaPipe FaceMesh-v2 checkpoint \
+             (face_landmark_loss.model_dir)",
+            ctx.label
+        ))
+    })?;
+    let loss = mlx_gen_face::train::load_face_landmark_loss(dir, mesh, identity_gate(cfg))
+        .map_err(|e| Error::Msg(format!("{}: {e}", ctx.label)))?;
+    Ok(AuxLoss {
+        schedule: cfg.face_landmark_loss.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// The landmark loss's pre-load footprint (fixed 256² crop).
+fn landmark_footprint(_cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_face::train::face_landmark_loss_footprint()
+}
+
 /// The VAE perceptual anchor (sc-24833): a frozen FLUX.2 VAE encoder's multi-scale features on the
 /// decoded x0.
 fn build_vae_anchor(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
@@ -257,6 +315,20 @@ pub const ARMS: &[AuxArm] = &[
         build: build_depth,
     },
     AuxArm {
+        name: "identity",
+        enabled: |cfg| cfg.identity_loss.schedule.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: identity_footprint,
+        build: build_identity,
+    },
+    AuxArm {
+        name: "face-landmark",
+        enabled: |cfg| cfg.face_landmark_loss.schedule.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: landmark_footprint,
+        build: build_landmark,
+    },
+    AuxArm {
         name: "vae_anchor",
         enabled: |cfg| cfg.vae_anchor.schedule.is_enabled(),
         input: PerceptualInput::DecodedPixels,
@@ -275,6 +347,16 @@ pub const ARMS: &[AuxArm] = &[
 /// Whether any auxiliary loss is enabled in `cfg`.
 pub fn any_aux_loss(cfg: &TrainingConfig) -> bool {
     ARMS.iter().any(|a| (a.enabled)(cfg))
+}
+
+/// The names of the enabled auxiliary losses that decode x0 to pixels (depth, identity,
+/// face-landmark, …), in arm order — what a trainer whose decode can be unavailable for a request
+/// (e.g. an LTX-2.5 workflow that generates no video) refuses by name. Empty when none is on.
+pub fn enabled_pixel_aux_losses(cfg: &TrainingConfig) -> Vec<&'static str> {
+    ARMS.iter()
+        .filter(|a| a.input == PerceptualInput::DecodedPixels && (a.enabled)(cfg))
+        .map(|a| a.name)
+        .collect()
 }
 
 fn enabled_arms<'a>(arms: &'a [AuxArm], cfg: &TrainingConfig) -> Vec<&'a AuxArm> {
@@ -603,6 +685,70 @@ mod tests {
         };
         let e = build_perceptual_path(&c, &ctx).err().unwrap().to_string();
         assert!(e.contains("Depth-Anything-V2"), "{e}");
+    }
+
+    /// sc-24831: the identity and face-landmark arms build from their checkpoint dirs into the path
+    /// (after the decoder), in arm order; their footprints join the estimate; a missing face stack
+    /// is a named error. Mutations: drop either arm from `ARMS` ⇒ the loss names / footprint go red;
+    /// enable the identity arm on the landmark knob ⇒ red.
+    #[test]
+    fn face_arms_build_and_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dec_dir = tmp.path().join("tae");
+        let cfg4 = testing::tiny_decoder_config(4);
+        testing::write_tiny_decoder(&dec_dir, &cfg4, 1).unwrap();
+        let face = tmp.path().join("face");
+        let mesh = tmp.path().join("mesh");
+        mlx_gen_face::train::testing::write_face_stack(&face).unwrap();
+        mlx_gen_face::train::testing::write_facemesh(&mesh).unwrap();
+        let sched = AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        };
+        let mut c = TrainingConfig {
+            perceptual_decoder_dir: Some(dec_dir),
+            face_analysis_dir: Some(face),
+            ..TrainingConfig::default()
+        };
+        c.identity_loss.schedule = sched;
+        let ctx = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::Tiny {
+                name: "TINY",
+                config: cfg4.clone().into(),
+            },
+            latent_lpips: None,
+        };
+        let g = AuxGeometry::image(512, 3);
+        let id_only = perceptual_footprint(&c, &ctx.decoder, g);
+        let id_fp =
+            mlx_gen_face::train::identity_loss_footprint(mlx_gen_face::iresnet::IRESNET100_LAYERS);
+        assert_eq!(
+            id_only,
+            perceptual_footprint_bytes(Some(cfg4.footprint(512, 512)), &[id_fp], 3)
+        );
+        c.face_landmark_loss.schedule = sched;
+        c.face_landmark_loss.model_dir = Some(mesh);
+        assert!(any_aux_loss(&c));
+        let path = build_perceptual_path(&c, &ctx).unwrap().unwrap();
+        let names: Vec<&str> = path.losses().iter().map(|l| l.loss.name()).collect();
+        assert_eq!(names, ["identity", "face-landmark"]);
+        let both = perceptual_footprint(&c, &ctx.decoder, g);
+        let lm_fp = mlx_gen_face::train::face_landmark_loss_footprint();
+        assert_eq!(
+            both,
+            perceptual_footprint_bytes(Some(cfg4.footprint(512, 512)), &[id_fp, lm_fp], 3)
+        );
+
+        let mut no_face = c.clone();
+        no_face.face_analysis_dir = None;
+        let e = build_perceptual_path(&no_face, &ctx)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("face_analysis_dir"), "{e}");
     }
 
     /// A latent-input arm (the shape of S12's E-LatentLPIPS) runs on a family with no decoder.

@@ -647,6 +647,10 @@ dependencies = [
  "candle-gen",
  "candle-nn",
  "image",
+ "safetensors 0.7.0",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -864,6 +868,7 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-depth",
+ "candle-gen-face",
  "tempfile",
 ]
 
@@ -2458,6 +2463,9 @@ dependencies = [
  "image",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2658,6 +2666,7 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen",
  "mlx-gen-depth",
+ "mlx-gen-face",
  "pmetal-mlx-rs",
  "tempfile",
 ]

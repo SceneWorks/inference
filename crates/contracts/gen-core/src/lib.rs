@@ -27,6 +27,7 @@ pub mod error;
 pub mod execution_domains;
 pub mod exr_io;
 pub mod face;
+pub mod fx_program;
 pub mod gemma_assets;
 pub mod generator;
 pub mod guidance;
@@ -277,11 +278,11 @@ pub use ::core_llm;
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{
-    AuxLossSchedule, BucketSchedule, DepthAnchoringConfig, DepthModelSize, LatentLpipsConfig,
-    LatentLpipsFamily, LrSchedule, NetworkType, ResolutionBucket, SubjectMaskLoss, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
-    TrainingRequest, TrainingTechniques, VaeAnchorConfig, LATENT_PERCEPTUAL_SCHEDULE,
-    MAX_RESOLUTION_BUCKETS, RESOLUTION_BUCKET_STRIDE,
+    AuxLossSchedule, BucketSchedule, DepthAnchoringConfig, DepthModelSize, FaceLandmarkLossConfig,
+    IdentityLossConfig, IdentityReferenceMode, LatentLpipsConfig, LatentLpipsFamily, LrSchedule,
+    NetworkType, ResolutionBucket, SubjectMaskLoss, Trainer, TrainerDescriptor, TrainingConfig,
+    TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest, TrainingTechniques,
+    VaeAnchorConfig, LATENT_PERCEPTUAL_SCHEDULE, MAX_RESOLUTION_BUCKETS, RESOLUTION_BUCKET_STRIDE,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,

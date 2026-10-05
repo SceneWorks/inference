@@ -1361,6 +1361,9 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
             resolution_buckets,
             subject_mask_loss,
             depth_anchoring,
+            // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
+            identity_loss: depth_anchoring,
+            face_landmark_loss: depth_anchoring,
             vae_anchor_loss: depth_anchoring,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -1473,9 +1476,11 @@ fn validate_ltx_request(req: &TrainingRequest, label: &str) -> Result<()> {
 /// (which `validate` runs) and at the top of `train`, ahead of the generic technique floor. Also
 /// validates the [`DEPTH_ANCHORING_FRAMES_KEY`] knob.
 fn refuse_ltx25_depth_anchoring(req: &TrainingRequest) -> Result<()> {
-    // sc-24833: every decoded-x0 aux loss (depth anchoring, the VAE anchor) decodes the same
-    // generated video frames, so the refusal covers whichever one is on.
-    if !candle_gen_perceptual::any_aux_loss(&req.config) {
+    // Every decoded-x0 perceptual loss (depth anchoring, the sc-24831 identity / face-landmark
+    // losses, the sc-24833 VAE anchor) decodes the same generated video frames, so the refusal
+    // covers whichever ones are on and names them.
+    let pixel_losses = candle_gen_perceptual::enabled_pixel_aux_losses(&req.config);
+    if pixel_losses.is_empty() {
         return Ok(());
     }
     depth_anchoring_frames(&req.config)?;
@@ -1500,9 +1505,10 @@ fn refuse_ltx25_depth_anchoring(req: &TrainingRequest) -> Result<()> {
     };
     if !(present && generated) {
         return Err(CandleError::Unsupported(format!(
-            "{MODEL_25_ID} trainer: depth anchoring decodes the generated video stream, but \
-             workflow `{}` generates no video (the video stream is {}); turn depth anchoring off \
-             for this workflow",
+            "{MODEL_25_ID} trainer: depth anchoring and the other decoded-x0 losses ({}) decode \
+             the generated video stream, but workflow `{}` generates no video (the video stream \
+             is {}); turn them off for this workflow",
+            pixel_losses.join(", "),
             workflow.id(),
             if present {
                 "frozen conditioning"
@@ -5819,6 +5825,23 @@ mod ltx25_depth_anchoring_tests {
             );
             req.config.vae_anchor.schedule = AuxLossSchedule::OFF;
             assert!(refuse_ltx25_depth_anchoring(&req).is_ok());
+            // sc-24831: the identity / face-landmark losses decode the same stream ⇒ the same
+            // refusal, naming the loss. Mutation: gate on depth alone ⇒ red.
+            req.config.identity_loss.schedule = schedule();
+            req.config.face_landmark_loss.schedule = schedule();
+            let face = refuse_ltx25_depth_anchoring(&req);
+            if refused.contains(&workflow.id()) {
+                match face {
+                    Err(CandleError::Unsupported(m)) => {
+                        assert!(m.contains("identity") && m.contains("face-landmark"), "{m}")
+                    }
+                    other => panic!("{}: expected Unsupported, got {other:?}", workflow.id()),
+                }
+            } else {
+                assert!(face.is_ok(), "{}: {face:?}", workflow.id());
+            }
+            req.config.identity_loss.schedule = AuxLossSchedule::OFF;
+            req.config.face_landmark_loss.schedule = AuxLossSchedule::OFF;
         }
         let mut cfg = TrainingConfig::default();
         cfg.model_options

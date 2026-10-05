@@ -131,6 +131,10 @@ fn trainer_descriptor() -> TrainerDescriptor {
             resolution_buckets: true,
             depth_anchoring: true,
             subject_mask_loss: true,
+            // sc-24831: the ArcFace identity + FaceMesh landmark losses, picked up through the
+            // same shared perceptual builder arms (no trainer-loop change).
+            identity_loss: true,
+            face_landmark_loss: true,
             vae_anchor_loss: true,
             latent_lpips_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
@@ -2846,6 +2850,9 @@ mod depth_anchoring_tests {
     #[test]
     fn descriptor_declares_depth_anchoring() {
         assert!(trainer_descriptor().techniques.depth_anchoring);
+        // sc-24831: the face losses ride the same builder arms.
+        assert!(trainer_descriptor().techniques.identity_loss);
+        assert!(trainer_descriptor().techniques.face_landmark_loss);
     }
 
     /// A missing aux checkpoint is a clear error naming the model, before any caching.

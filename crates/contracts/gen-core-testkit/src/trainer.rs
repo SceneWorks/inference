@@ -270,6 +270,31 @@ const TECHNIQUE_PROBES: &[TechniqueProbe] = &[
         adapter_only: false,
     },
     TechniqueProbe {
+        name: "identity_loss",
+        knob: "identity_loss.schedule.weight",
+        enable: |r| {
+            // A decoded-x0 loss term (sc-24831), not adapter-only. The directories only need to be
+            // named — validate never loads them.
+            r.config.identity_loss.schedule.weight = 0.1;
+            r.config.face_analysis_dir = Some(PathBuf::from("/conformance/face-stack"));
+            r.config.perceptual_decoder_dir = Some(PathBuf::from("/conformance/taef1"));
+        },
+        declared: |t| t.identity_loss,
+        adapter_only: false,
+    },
+    TechniqueProbe {
+        name: "face_landmark_loss",
+        knob: "face_landmark_loss.schedule.weight",
+        enable: |r| {
+            r.config.face_landmark_loss.schedule.weight = 0.1;
+            r.config.face_landmark_loss.model_dir = Some(PathBuf::from("/conformance/facemesh"));
+            r.config.face_analysis_dir = Some(PathBuf::from("/conformance/face-stack"));
+            r.config.perceptual_decoder_dir = Some(PathBuf::from("/conformance/taef1"));
+        },
+        declared: |t| t.face_landmark_loss,
+        adapter_only: false,
+    },
+    TechniqueProbe {
         name: "vae_anchor_loss",
         knob: "vae_anchor.schedule.weight",
         enable: |r| {

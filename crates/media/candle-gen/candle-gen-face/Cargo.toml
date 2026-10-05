@@ -17,8 +17,15 @@ candle-gen = { path = "../candle-gen" }
 # candle-transformers model. Same workspace pin candle-gen uses → one candle build (no skew).
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+# Face-loss test stand-ins (sc-24831) write fx-program checkpoints with metadata; candle's own
+# safetensors version (0.7) so its `View` impl for `Tensor` applies (same pin as candle-gen).
+safetensors = "0.7"
 
 [dev-dependencies]
+# The face-loss parity fixture is JSON and pins its producer script's sha256 (sc-24831).
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 # `face_cosine` example (epic 10871 P4.2 identity scoring, sc-10886) loads PNG/JPG inputs. Mirrors the
 # `mlx-gen-face` dev-dep; PNG + JPEG so it can score either the person ref or an edit output.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

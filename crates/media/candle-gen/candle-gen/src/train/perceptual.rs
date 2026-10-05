@@ -125,6 +125,13 @@ pub trait PerceptualLoss: Send + Sync {
     /// The unweighted scalar loss of the live input for one image, given its reference.
     /// Differentiable in `live`.
     fn loss(&self, live: &Tensor, reference: &dyn Any) -> Result<Tensor>;
+    /// The step weight of this loss at the plan's noise level `t ∈ [0, 1]` (flow `σ`, or `t / T`),
+    /// multiplied into its scheduled weight by [`PerceptualPath::aux_loss`] — e.g. upstream's
+    /// `t_ratio` scaling of the face losses. Default `1.0` (no timestep weighting).
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        let _ = noise_level;
+        1.0
+    }
 }
 
 /// A scheduled auxiliary loss.
@@ -292,7 +299,8 @@ impl PerceptualPath {
                 PerceptualInput::Latents => x0,
             };
             let raw = l.loss.loss(input, reference)?;
-            let w = (&raw * l.schedule.weight as f64)?;
+            let step_weight = l.schedule.weight * l.loss.timestep_weight(plan.noise_level);
+            let w = (&raw * step_weight as f64)?;
             weighted = Some(match weighted {
                 Some(acc) => (acc + w)?,
                 None => w,
@@ -619,6 +627,47 @@ mod tests {
         let live = (&clean + 0.5).unwrap();
         let l = scalar(&path.aux_loss(&plan, 0, &live).unwrap().unwrap().weighted);
         assert!((l - 0.25).abs() < 1e-5, "{l}");
+    }
+
+    /// sc-24831: a loss's `timestep_weight` scales its term by the plan's noise level, on top of
+    /// its scheduled weight; the default is 1. Mutation: ignore `timestep_weight` in `aux_loss` ⇒
+    /// the weighted term equals the unweighted one ⇒ red.
+    #[test]
+    fn timestep_weight_scales_the_term_by_the_plan_noise_level() {
+        struct TWeighted;
+        impl PerceptualLoss for TWeighted {
+            fn name(&self) -> &'static str {
+                "t-weighted"
+            }
+            fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {
+                BrightCrop.reference(clean)
+            }
+            fn loss(&self, live: &Tensor, reference: &dyn Any) -> Result<Tensor> {
+                BrightCrop.loss(live, reference)
+            }
+            fn timestep_weight(&self, t: f32) -> f32 {
+                t * t
+            }
+        }
+        assert_eq!(BrightCrop.timestep_weight(0.3), 1.0);
+        let mut path = PerceptualPath::new(
+            Some(Box::new(Identity)),
+            vec![AuxLoss {
+                schedule: sched(0.5, 0.0, 1.0, 1),
+                loss: Box::new(TWeighted),
+            }],
+        )
+        .unwrap();
+        let (clean, mut v) = clean_image(true);
+        path.ensure_reference(0, &clean).unwrap();
+        v[6 + 3] = 0.1;
+        let x0 = Tensor::from_vec(v.clone(), (1, 3, 6, 6), &Device::Cpu).unwrap();
+        let plan = path.plan(0, 0, 0.6).unwrap();
+        let terms = path.aux_loss(&plan, 0, &x0).unwrap().unwrap();
+        let raw = scalar(&terms.per_loss[0].1);
+        let t = plan.noise_level;
+        assert!(raw > 1e-4);
+        assert!((scalar(&terms.weighted) - 0.5 * t * t * raw).abs() < 1e-7);
     }
 
     /// References are built once per image however often `ensure_reference` is called. Mutation:
