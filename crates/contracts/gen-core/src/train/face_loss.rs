@@ -154,6 +154,63 @@ pub fn crop_resample_matrices(b: CropBox, square: bool, out: usize) -> (Vec<f32>
     (axis_matrix(out, sy, oy, h), axis_matrix(out, sx, ox, w))
 }
 
+/// Upstream's reference-detection retry (`FaceIDExtractor._detect`): when no face is found, the
+/// detector runs again on the image centred in a mid-gray (128) border of `max(h, w) / 4` per side
+/// (tight close-ups otherwise fire no anchors). Returns `(padded RGB u8, padded h, padded w, pad)`.
+pub fn pad_for_detection_retry(rgb: &[u8], h: usize, w: usize) -> (Vec<u8>, usize, usize, usize) {
+    let pad = h.max(w) / 4;
+    let (ph, pw) = (h + 2 * pad, w + 2 * pad);
+    let mut out = vec![128u8; ph * pw * 3];
+    for y in 0..h {
+        let src = &rgb[y * w * 3..(y + 1) * w * 3];
+        let dst = ((y + pad) * pw + pad) * 3;
+        out[dst..dst + w * 3].copy_from_slice(src);
+    }
+    (out, ph, pw, pad)
+}
+
+/// Map a box found on the [`pad_for_detection_retry`] image back to the original `h × w` image:
+/// subtract the pad and clamp to the frame.
+pub fn unpad_detection_box(bbox: [f32; 4], pad: usize, h: usize, w: usize) -> [f32; 4] {
+    let p = pad as f32;
+    [
+        (bbox[0] - p).clamp(0.0, w as f32),
+        (bbox[1] - p).clamp(0.0, h as f32),
+        (bbox[2] - p).clamp(0.0, w as f32),
+        (bbox[3] - p).clamp(0.0, h as f32),
+    ]
+}
+
+/// Detect the largest face with upstream's retry: `detect(rgb, h, w)` first, then on the
+/// [`pad_for_detection_retry`] image, mapping a retry hit back with [`unpad_detection_box`].
+pub fn detect_with_retry<E>(
+    rgb: &[u8],
+    h: usize,
+    w: usize,
+    mut detect: impl FnMut(&[u8], usize, usize) -> Result<Option<[f32; 4]>, E>,
+) -> Result<Option<[f32; 4]>, E> {
+    if let Some(b) = detect(rgb, h, w)? {
+        return Ok(Some(b));
+    }
+    let (padded, ph, pw, pad) = pad_for_detection_retry(rgb, h, w);
+    Ok(detect(&padded, ph, pw)?.map(|b| unpad_detection_box(b, pad, h, w)))
+}
+
+/// Upstream's face-loss timestep weighting (`id_weight = lm_weight = t_ratio`): the loss term of a
+/// step at noise level `t ∈ [0, 1]` (flow `σ`, or `t / T`) is scaled by `t` — the face of a
+/// high-noise x0 prediction is a genuine generation, a low-noise one is mostly the input.
+pub fn face_loss_timestep_weight(noise_level: f32) -> f32 {
+    noise_level.clamp(0.0, 1.0)
+}
+
+/// Number of noise images whose mean ArcFace embedding is the identity loss's bias direction
+/// (upstream: 200).
+pub const IDENTITY_NOISE_SAMPLES: usize = 200;
+/// Seed of the identity loss's noise set (see [`synth::identity_noise_image`]).
+pub const IDENTITY_NOISE_SEED: u64 = 0x5EED_24831;
+/// Upstream's floor on a dataset-average clean-cos target.
+pub const IDENTITY_CLEAN_COS_FLOOR: f32 = 0.1;
+
 /// Published SCRFD-10g (bnkps) parameter count (insightface model zoo: 4.23 M).
 pub const SCRFD_10G_PARAMS: u64 = 4_230_000;
 /// Upper bound of the FaceMesh-v2 landmark detector's parameters: the upstream checkpoint is a
@@ -317,6 +374,28 @@ pub mod synth {
         uniform(seed, key, h * w * 3)
             .into_iter()
             .map(|u| u as f32)
+            .collect()
+    }
+
+    /// `n` standard-normal values for `(seed, key)` (Box–Muller over [`uniform`] pairs:
+    /// `√(−2 ln(u₀ + 2⁻²⁵)) · cos(2π u₁)`), f64.
+    pub fn gaussian(seed: u64, key: &str, n: usize) -> Vec<f64> {
+        let u = uniform(seed, key, 2 * n);
+        (0..n)
+            .map(|i| {
+                let r = (-2.0 * (u[2 * i] + 2f64.powi(-25)).ln()).sqrt();
+                r * (2.0 * std::f64::consts::PI * u[2 * i + 1]).cos()
+            })
+            .collect()
+    }
+
+    /// Noise image `index` of the identity loss's bias-direction set: upstream's
+    /// `clamp(randn · 0.3 + 0.5, 0, 1)` at `edge × edge`, NHWC row-major, from the counter-based
+    /// [`gaussian`] so every backend averages identical inputs.
+    pub fn identity_noise_image(seed: u64, index: usize, edge: usize) -> Vec<f32> {
+        gaussian(seed, &format!("identity-noise-{index}"), edge * edge * 3)
+            .into_iter()
+            .map(|z| (z * 0.3 + 0.5).clamp(0.0, 1.0) as f32)
             .collect()
     }
 

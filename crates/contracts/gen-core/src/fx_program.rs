@@ -91,18 +91,45 @@ fn msg(m: impl Into<String>) -> Error {
     Error::Msg(format!("fx-program: {}", m.into()))
 }
 
-fn uint(v: &Value, what: &str) -> Result<usize> {
+/// Largest padding (conv / max-pool / pad op) a program may ask for, per side.
+pub const MAX_PAD: usize = 4096;
+
+/// A non-negative integer that fits `i32` (the MLX executor's index type) and is `>= min`.
+fn uint_min(v: &Value, what: &str, min: usize) -> Result<usize> {
     v.as_u64()
+        .filter(|&n| n <= i32::MAX as u64 && n as usize >= min)
         .map(|n| n as usize)
-        .ok_or_else(|| msg(format!("{what} must be a non-negative integer, got {v}")))
+        .ok_or_else(|| {
+            msg(format!(
+                "{what} must be an integer in [{min}, {}], got {v}",
+                i32::MAX
+            ))
+        })
 }
 
-fn pair(v: &Value, what: &str) -> Result<(usize, usize)> {
+fn uint(v: &Value, what: &str) -> Result<usize> {
+    uint_min(v, what, 0)
+}
+
+fn pair_min(v: &Value, what: &str, min: usize) -> Result<(usize, usize)> {
     let a = v
         .as_array()
         .filter(|a| a.len() == 2)
         .ok_or_else(|| msg(format!("{what} must be a pair, got {v}")))?;
-    Ok((uint(&a[0], what)?, uint(&a[1], what)?))
+    Ok((uint_min(&a[0], what, min)?, uint_min(&a[1], what, min)?))
+}
+
+fn pair(v: &Value, what: &str) -> Result<(usize, usize)> {
+    pair_min(v, what, 0)
+}
+
+/// A padding pair, each side at most [`MAX_PAD`].
+fn pad_pair(v: &Value, what: &str) -> Result<(usize, usize)> {
+    let p = pair(v, what)?;
+    if p.0 > MAX_PAD || p.1 > MAX_PAD {
+        return Err(msg(format!("{what} {p:?} exceeds the {MAX_PAD} cap")));
+    }
+    Ok(p)
 }
 
 fn string(v: &Value, key: &str) -> Result<String> {
@@ -170,10 +197,10 @@ impl ProgramSpec {
                 "conv2d" => Op::Conv {
                     weight: string(n, "weight")?,
                     bias: n.get("bias").and_then(Value::as_str).map(str::to_owned),
-                    stride: pair(&n["stride"], "stride")?,
-                    padding: pair(&n["padding"], "padding")?,
-                    dilation: pair(&n["dilation"], "dilation")?,
-                    groups: uint(&n["groups"], "groups")?,
+                    stride: pair_min(&n["stride"], "stride", 1)?,
+                    padding: pad_pair(&n["padding"], "padding")?,
+                    dilation: pair_min(&n["dilation"], "dilation", 1)?,
+                    groups: uint_min(&n["groups"], "groups", 1)?,
                 },
                 "prelu" => Op::Prelu {
                     slope: string(n, "slope")?,
@@ -185,9 +212,9 @@ impl ProgramSpec {
                 "mul" => Op::Binary(BinaryOp::Mul),
                 "div" => Op::Binary(BinaryOp::Div),
                 "maxpool2d" => Op::MaxPool {
-                    kernel: pair(&n["kernel"], "kernel")?,
-                    stride: pair(&n["stride"], "stride")?,
-                    padding: pair(&n["padding"], "padding")?,
+                    kernel: pair_min(&n["kernel"], "kernel", 1)?,
+                    stride: pair_min(&n["stride"], "stride", 1)?,
+                    padding: pad_pair(&n["padding"], "padding")?,
                 },
                 "pad" => {
                     let p = n["pads"]
@@ -196,7 +223,7 @@ impl ProgramSpec {
                         .ok_or_else(|| msg("pad needs 4 axis pairs"))?;
                     let mut pads = [(0, 0); 4];
                     for (dst, src) in pads.iter_mut().zip(p) {
-                        *dst = pair(src, "pads")?;
+                        *dst = pad_pair(src, "pads")?;
                     }
                     Op::Pad {
                         pads,
@@ -208,7 +235,11 @@ impl ProgramSpec {
                         .as_array()
                         .ok_or_else(|| msg("reshape needs a shape"))?
                         .iter()
-                        .map(|d| d.as_i64().ok_or_else(|| msg("reshape dims are integers")))
+                        .map(|d| {
+                            d.as_i64()
+                                .filter(|&d| d >= -1 && d <= i32::MAX as i64)
+                                .ok_or_else(|| msg(format!("bad reshape dim {d}")))
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 ),
                 "concat" => Op::Concat(
@@ -263,7 +294,11 @@ impl ProgramSpec {
 
     /// Resolve a reshape `shape` (one `-1`) for a tensor of `elems` elements.
     pub fn resolve_shape(shape: &[i64], elems: usize) -> Result<Vec<usize>> {
-        let known: i64 = shape.iter().filter(|&&d| d != -1).product();
+        let known = shape
+            .iter()
+            .filter(|&&d| d != -1)
+            .try_fold(1i64, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| msg(format!("reshape {shape:?} overflows")))?;
         let holes = shape.iter().filter(|&&d| d == -1).count();
         if holes > 1 || known <= 0 || shape.iter().any(|&d| d < -1) {
             return Err(msg(format!("bad reshape {shape:?}")));
@@ -307,5 +342,44 @@ mod tests {
             [2, 1, 1, 6]
         );
         assert!(ProgramSpec::resolve_shape(&[-1, 5], 12).is_err());
+    }
+
+    /// Malformed numeric fields are refused at parse time, never left to panic an executor:
+    /// zero stride / dilation / groups / kernel, integers past i32, oversized pads, and reshape
+    /// products that overflow. Mutation: accept a zero stride (`pair` instead of `pair_min(.., 1)`)
+    /// ⇒ red.
+    #[test]
+    fn malformed_numeric_fields_are_refused() {
+        let conv = |stride: &str, pad: &str, dil: &str, groups: &str| {
+            format!(
+                r#"{{"inputs":["x"],"outputs":["y"],"nodes":[{{"op":"conv2d","out":"y","inputs":["x"],
+                "weight":"w","bias":null,"stride":{stride},"padding":{pad},"dilation":{dil},
+                "groups":{groups}}}]}}"#
+            )
+        };
+        assert!(ProgramSpec::parse(&conv("[1,1]", "[0,0]", "[1,1]", "1")).is_ok());
+        for bad in [
+            conv("[0,1]", "[0,0]", "[1,1]", "1"),
+            conv("[1,1]", "[0,0]", "[0,1]", "1"),
+            conv("[1,1]", "[0,0]", "[1,1]", "0"),
+            conv("[1,1]", "[4097,0]", "[1,1]", "1"),
+            conv("[3000000000,1]", "[0,0]", "[1,1]", "1"),
+        ] {
+            assert!(ProgramSpec::parse(&bad).is_err(), "{bad}");
+        }
+        let pool = |k: &str| {
+            format!(
+                r#"{{"inputs":["x"],"outputs":["y"],"nodes":[{{"op":"maxpool2d","out":"y",
+                "inputs":["x"],"kernel":{k},"stride":[1,1],"padding":[0,0]}}]}}"#
+            )
+        };
+        assert!(ProgramSpec::parse(&pool("[0,2]")).is_err());
+        let pad = r#"{"inputs":["x"],"outputs":["y"],"nodes":[{"op":"pad","out":"y","inputs":["x"],
+            "pads":[[0,0],[0,0],[0,5000],[0,0]],"value":0}]}"#;
+        assert!(ProgramSpec::parse(pad).is_err());
+        let reshape = r#"{"inputs":["x"],"outputs":["y"],"nodes":[{"op":"reshape","out":"y",
+            "inputs":["x"],"shape":[-2,4]}]}"#;
+        assert!(ProgramSpec::parse(reshape).is_err());
+        assert!(ProgramSpec::resolve_shape(&[i64::MAX, 4], 8).is_err());
     }
 }
