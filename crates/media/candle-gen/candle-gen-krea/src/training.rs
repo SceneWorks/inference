@@ -468,6 +468,7 @@ impl FlowMatchTrainer for KreaTrainer {
         _aux: &(),
         cfg: &TrainingConfig,
         step: u32,
+        _sample: flow_match::StepSample<'_>,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
         let (x0, cap, mask_weight) = cached;
