@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+from contextlib import redirect_stdout
 import importlib.util
 import hashlib
+from io import StringIO
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -71,6 +75,52 @@ def write_record(record: Path, body: dict) -> None:
 
 
 class PrecisionControlTests(unittest.TestCase):
+    def test_preflight_console_is_compact_but_retains_full_physical_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence"
+            files = {f"counter-{index:02}.json": json.dumps({"index": index,
+                     "physicalEvidence": "retained raw counter bytes" * 80}) for index in range(29)}
+            encoded = {name: base64.b64encode(body.encode()).decode() for name, body in files.items()}
+            raw = json.dumps({"physicalMode": "shared-gpu1", "diagnosticFiles": files,
+                              "diagnosticFileBytesB64": encoded})
+            proof_spec = importlib.util.spec_from_file_location(
+                "preflight_retain_control", MODULE_PATH.with_name("yue2_precision_proof.py"))
+            proof = importlib.util.module_from_spec(proof_spec)
+            proof_spec.loader.exec_module(proof)
+
+            census = types.SimpleNamespace(cuda_physical_census=lambda **_: (raw, []),
+                                           metal_census=Mock(), physical_busy_message=Mock(),
+                                           same_selected_cuda_device=Mock(),
+                                           retain_cuda_physical_evidence=proof.retain_cuda_physical_evidence,
+                                           retain_reviewed_baseline=Mock())
+            idle = types.SimpleNamespace(check_shared_gpu1_dispatch=Mock())
+            argv = ["yue2_app_precision_profile.py", "preflight", "--backend", "cuda",
+                    "--evidence", str(evidence), "--label", "initial"]
+            stdout = StringIO()
+            with patch.dict(sys.modules, {"yue2_precision_proof": census,
+                                          "yue2_cuda_idle_context": idle}), \
+                 patch.dict(os.environ, {"COMPUTERNAME": "unit-host", "YUE2_IDLE_CONTEXT_RUN_ID": ""}), \
+                 patch.object(control, "remaining_app_budget", return_value=3600), \
+                 patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)), \
+                 patch.object(sys, "argv", argv), redirect_stdout(stdout):
+                self.assertEqual(control.main(), 0)
+
+            receipt = evidence / "preflight-initial.json"
+            stored = json.loads(receipt.read_text(encoding="utf-8"))
+            line = stdout.getvalue()
+            printed = json.loads(line)
+            self.assertEqual(stored["census"], raw)
+            self.assertIn(encoded["counter-00.json"], receipt.read_text(encoding="utf-8"))
+            self.assertEqual(len(list((evidence / "physical-initial").iterdir())), 29)
+            self.assertEqual((evidence / "physical-initial" / "counter-00.json").read_bytes(),
+                             files["counter-00.json"].encode())
+            self.assertNotIn("diagnosticFileBytesB64", line)
+            self.assertNotIn(encoded["counter-00.json"], line)
+            self.assertLess(len(line), 1024)
+            self.assertEqual(printed["receipt_sha256"], control.sha256(receipt))
+            self.assertEqual(printed["physical_file_count"], 29)
+            idle.check_shared_gpu1_dispatch.assert_called_once()
+
     def test_eight_cuda_cases_and_seven_metal_cases_keep_exact_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

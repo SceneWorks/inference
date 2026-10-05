@@ -572,6 +572,16 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
         copy_partial(output, evidence, backend)
 
 
+def preflight_console_receipt(result: dict, evidence: Path) -> dict:
+    """Keep the complete physical census in the run artifact, not the Actions log."""
+    receipt = evidence / f"preflight-{result['label']}.json"
+    require(receipt.is_file(), "retained preflight receipt missing")
+    return {"backend": result["backend"], "label": result["label"],
+            "runner": result["runner"], "admitted": result["admitted"],
+            "physical_file_count": len(result["physical_files"] or []),
+            "receipt_path": str(receipt), "receipt_sha256": sha256(receipt)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -599,6 +609,7 @@ def main() -> int:
         result = prepare_cases(Path(args.templates), Path(args.destination), args.backend)
     elif args.command == "preflight":
         result = preflight(args.backend, Path(args.evidence), args.label)
+        result = preflight_console_receipt(result, Path(args.evidence))
     elif args.command == "collect":
         result = collect(Path(args.profile), Path(args.evidence), args.backend,
                          Path(args.app), Path(args.engine))
