@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+from contextlib import redirect_stdout
 import importlib.util
 import hashlib
+from io import StringIO
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -46,7 +50,25 @@ def measured_scope(backend: str) -> dict:
 
 def write_record(record: Path, body: dict) -> None:
     record.parent.mkdir(parents=True, exist_ok=True)
+    case_name = next(name for name in control.names_for_backend(body["backend"])
+                     if control.case_id(body["backend"], name) == body["caseId"])
+    fixture = json.loads((MODULE_PATH.with_name("yue2-app-precision-cases") /
+                          f"{case_name}.json").read_text(encoding="utf-8"))
+    fixture["id"] = body["caseId"]
+    (record.parent / "case.json").write_text(json.dumps(fixture), encoding="utf-8")
+    body.setdefault("request", {}).setdefault("planning", fixture["request"]["planning"])
     if body.get("backend") == "cuda":
+        measured = body.get("measured", {})
+        global_lines = []
+        for index, stage in enumerate(control.STAGES):
+            summary = measured.get("stages", {}).get(stage, {"peakBytes": 1, "samples": 1})
+            count = summary.get("samples", 1)
+            for sample_index in range(count):
+                at = index + 1 + (sample_index + 1) / (count + 1)
+                global_lines.append(json.dumps({"at": at, "startedAt": at - 0.01,
+                                                "bytes": summary.get("peakBytes", 1)}))
+        (record.parent / "cuda-samples.jsonl").write_text("\n".join(global_lines) + "\n",
+                                                          encoding="utf-8")
         owned = body.get("measured", {}).get("owned")
         if isinstance(owned, dict):
             (record.parent / "stages.jsonl").write_text("".join(
@@ -71,6 +93,52 @@ def write_record(record: Path, body: dict) -> None:
 
 
 class PrecisionControlTests(unittest.TestCase):
+    def test_preflight_console_is_compact_but_retains_full_physical_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence"
+            files = {f"counter-{index:02}.json": json.dumps({"index": index,
+                     "physicalEvidence": "retained raw counter bytes" * 80}) for index in range(29)}
+            encoded = {name: base64.b64encode(body.encode()).decode() for name, body in files.items()}
+            raw = json.dumps({"physicalMode": "shared-gpu1", "diagnosticFiles": files,
+                              "diagnosticFileBytesB64": encoded})
+            proof_spec = importlib.util.spec_from_file_location(
+                "preflight_retain_control", MODULE_PATH.with_name("yue2_precision_proof.py"))
+            proof = importlib.util.module_from_spec(proof_spec)
+            proof_spec.loader.exec_module(proof)
+
+            census = types.SimpleNamespace(cuda_physical_census=lambda **_: (raw, []),
+                                           metal_census=Mock(), physical_busy_message=Mock(),
+                                           same_selected_cuda_device=Mock(),
+                                           retain_cuda_physical_evidence=proof.retain_cuda_physical_evidence,
+                                           retain_reviewed_baseline=Mock())
+            idle = types.SimpleNamespace(check_shared_gpu1_dispatch=Mock())
+            argv = ["yue2_app_precision_profile.py", "preflight", "--backend", "cuda",
+                    "--evidence", str(evidence), "--label", "initial"]
+            stdout = StringIO()
+            with patch.dict(sys.modules, {"yue2_precision_proof": census,
+                                          "yue2_cuda_idle_context": idle}), \
+                 patch.dict(os.environ, {"COMPUTERNAME": "unit-host", "YUE2_IDLE_CONTEXT_RUN_ID": ""}), \
+                 patch.object(control, "remaining_app_budget", return_value=3600), \
+                 patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)), \
+                 patch.object(sys, "argv", argv), redirect_stdout(stdout):
+                self.assertEqual(control.main(), 0)
+
+            receipt = evidence / "preflight-initial.json"
+            stored = json.loads(receipt.read_text(encoding="utf-8"))
+            line = stdout.getvalue()
+            printed = json.loads(line)
+            self.assertEqual(stored["census"], raw)
+            self.assertIn(encoded["counter-00.json"], receipt.read_text(encoding="utf-8"))
+            self.assertEqual(len(list((evidence / "physical-initial").iterdir())), 29)
+            self.assertEqual((evidence / "physical-initial" / "counter-00.json").read_bytes(),
+                             files["counter-00.json"].encode())
+            self.assertNotIn("diagnosticFileBytesB64", line)
+            self.assertNotIn(encoded["counter-00.json"], line)
+            self.assertLess(len(line), 1024)
+            self.assertEqual(printed["receipt_sha256"], control.sha256(receipt))
+            self.assertEqual(printed["physical_file_count"], 29)
+            idle.check_shared_gpu1_dispatch.assert_called_once()
+
     def test_eight_cuda_cases_and_seven_metal_cases_keep_exact_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -183,6 +251,71 @@ class PrecisionControlTests(unittest.TestCase):
             write_record(record, body)
             with self.assertRaisesRegex(ValueError, "decoder identity"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+
+    def test_off_planning_receipt_uses_four_exact_source_bound_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            name = "strict-bf16-standard"
+            body = {
+                "caseId": control.case_id("cuda", name), "backend": "cuda",
+                "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
+                "request": {"name": name, "computePolicy": "bf16"},
+                "admission": {"outcome": "admitted", "estimate": {"stages": estimated_stages()}},
+                "outcome": {"status": "completed", "engineComputePolicy": "bf16",
+                            "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16",
+                            "engineVaeCudaBf16MathPolicy": M4_POLICY},
+                "measured": {"peakBytes": 1024, "stages": {
+                    stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES},
+                    **measured_scope("cuda")},
+            }
+            write_record(record, body)
+            self.assertEqual(list(control.verify_record(record, "cuda", name, M4_POLICY)["stage_samples"]),
+                             ["load", "semantic", "acoustic", "decode"])
+
+            global_journal = record.parent / "cuda-samples.jsonl"
+            valid_global_lines = global_journal.read_text(encoding="utf-8").splitlines()
+            for out_of_stage_at in (0.5, 6):
+                out_of_stage = json.dumps({"at": out_of_stage_at,
+                                           "startedAt": out_of_stage_at - 0.01,
+                                           "bytes": 8192})
+                global_journal.write_text("\n".join([*valid_global_lines, out_of_stage]) + "\n",
+                                          encoding="utf-8")
+                self.assertEqual(control.verify_record(record, "cuda", name, M4_POLICY)
+                                 ["stage_samples"], {stage: 1 for stage in control.STAGES})
+
+            global_lines = list(valid_global_lines)
+            altered = json.loads(global_lines[0])
+            altered["bytes"] += 1
+            global_lines[0] = json.dumps(altered)
+            global_journal.write_text("\n".join(global_lines) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "global stage peaks differ"):
+                control.verify_record(record, "cuda", name, M4_POLICY)
+            write_record(record, body)
+
+            marks = record.parent / "stages.jsonl"
+            valid_marks = marks.read_text(encoding="utf-8")
+            for mutated in (
+                valid_marks.replace('"stage": "semantic"', '"stage": "plan"', 1),
+                valid_marks.replace('"stage": "semantic"', '"stage": "load"', 1),
+                valid_marks.replace('"stage": "semantic"', '"stage": "acoustic"', 1),
+            ):
+                marks.write_text(mutated, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "stage marks are incomplete or unordered"):
+                    control.verify_record(record, "cuda", name, M4_POLICY)
+            marks.write_text(valid_marks, encoding="utf-8")
+
+            body["request"]["planning"] = "full"
+            write_record(record, body)
+            with self.assertRaisesRegex(ValueError, "record planning mode"):
+                control.verify_record(record, "cuda", name, M4_POLICY)
+            body["request"]["planning"] = "off"
+            write_record(record, body)
+            case_path = record.parent / "case.json"
+            case = json.loads(case_path.read_text(encoding="utf-8"))
+            case["request"]["planning"] = "full"
+            case_path.write_text(json.dumps(case), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "captured case differs"):
+                control.verify_record(record, "cuda", name, M4_POLICY)
 
     def test_effective_cuda_bf16_vae_math_policy_is_required_only_for_cuda_bf16(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -699,6 +832,9 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("--control control --app-sha", workflow)
         self.assertLess(workflow.index("Select the app checkout's pinned Rust channel"),
                         workflow.index("uses: ./app/.github/actions/prepare-rust-runner"))
+        self.assertRegex(workflow,
+                         r"(?m)^\s+- uses: \./app/\.github/actions/prepare-rust-runner\n"
+                         r"\s+with:\n\s+workspace-directory: app$")
         self.assertIn("RUSTUP_TOOLCHAIN=", workflow)
         self.assertIn("Verify selected app Rust channel", workflow)
 

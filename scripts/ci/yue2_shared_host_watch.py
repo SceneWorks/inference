@@ -3,7 +3,8 @@
 
 This does not grant a physical lease. The in-job selected GPU1 census and owned process
 cleanup remain mandatory. The shared-gpu1 route observes concurrent foreign work and
-revokes only on owned identity or inventory failure; strict shared-host retains exclusivity.
+retains incomplete foreign inventory while the owned identity stays authenticated;
+strict shared-host retains exclusivity.
 """
 from __future__ import annotations
 
@@ -35,6 +36,18 @@ class InventorySnapshotError(RuntimeError):
         super().__init__(message)
         self.source = source
         self.pages = pages
+
+
+class OwnedInventoryTransition(RuntimeError):
+    """Complete aggregate lacks the directly authenticated own run's active state."""
+
+
+class OwnedIdentityDrift(RuntimeError):
+    """A positive mismatch in the immutable run or job identity."""
+
+
+class OwnedBindingUnavailable(RuntimeError):
+    """Current run/job state cannot provide an active binding yet."""
 
 
 def require(value: bool, message: str) -> None:
@@ -122,7 +135,8 @@ def snapshot(*, reviewed_gpu1: bool = False) -> dict:
 
 
 def classify(data: dict, own_id: int, head: str, workflow: str,
-             *, mode: str = "shared-host", own_job_name: str = "cuda") -> dict:
+             *, mode: str = "shared-host", own_job_name: str = "cuda",
+             owned_binding: dict | None = None) -> dict:
     require(re.fullmatch(r"[0-9a-f]{40}", head) is not None and workflow in
             ("yue2-precision-proof.yml", "yue2-app-precision-profile.yml"),
             "invalid exact owned source")
@@ -176,21 +190,58 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
                 "physical CUDA runner identity/status changed")
     own_key = ("SceneWorks/inference", own_id)
     own = data["runs"].get(own_key)
-    require(isinstance(own, dict) and own.get("head_sha") == head and
-            own.get("run_attempt") == 1 and own.get("event") == "workflow_dispatch" and
-            own.get("path") == f".github/workflows/{workflow}" and
-            own.get("status") == "in_progress" and own.get("conclusion") is None,
+    transition = own is None or (isinstance(own, dict) and own.get("status") in
+                                 {"queued", "pending", "requested", "waiting"})
+    if own is not None:
+        require(isinstance(own, dict) and own.get("id") == own_id and
+                own.get("head_sha") == head and own.get("run_attempt") == 1 and
+                own.get("event") == "workflow_dispatch" and
+                own.get("path") == f".github/workflows/{workflow}",
+                "owned run/source/attempt changed")
+        if isinstance(owned_binding, dict):
+            if own.get("created_at") != owned_binding["run"].get("created_at"):
+                raise OwnedIdentityDrift("owned run creation identity changed")
+        if own.get("status") == "in_progress" and own.get("conclusion") is None:
+            transition = False
+        elif own.get("status") not in {"queued", "pending", "requested", "waiting"}:
+            raise RuntimeError("owned run/source/attempt/status changed")
+        require(own.get("conclusion") is None,
+                "owned run/source/attempt/status changed")
+    require(not transition or isinstance(owned_binding, dict),
             "owned run/source/attempt/status changed")
     own_jobs = data["jobs"].get(own_key, [])
-    selected = [job for job in own_jobs if job.get("name") == own_job_name and
-                job.get("status") == "in_progress"]
-    require(len(selected) == 1 and selected[0].get("run_id") == own_id and
-            selected[0].get("run_attempt") == 1 and selected[0].get("head_sha") == head and
-            selected[0].get("conclusion") is None and
-            selected[0].get("runner_name") in ("cuda-windows", "cuda-windows-2") and
-            selected[0].get("runner_id") == RUNNERS[selected[0]["runner_name"]],
-            "exact owned CUDA job/runner missing")
-    owned = selected[0]
+    if transition:
+        direct_job = owned_binding["job"]
+        require(direct_job.get("id") == owned_binding.get("job_id") and
+                direct_job.get("run_id") == own_id and direct_job.get("run_attempt") == 1 and
+                direct_job.get("head_sha") == head and direct_job.get("name") == own_job_name and
+                direct_job.get("runner_name") in ("cuda-windows", "cuda-windows-2") and
+                direct_job.get("runner_id") == RUNNERS[direct_job["runner_name"]] and
+                direct_job.get("started_at") == owned_binding.get("start"),
+                "direct owned job transition binding changed")
+        observed_direct_job = next((job for job in own_jobs
+                                    if job.get("id") == owned_binding["job_id"]), None)
+        if observed_direct_job is not None:
+            require(all(observed_direct_job.get(field) == direct_job.get(field)
+                        for field in ("id", "run_id", "run_attempt", "head_sha", "name",
+                                      "runner_name", "runner_id", "started_at")) and
+                    observed_direct_job.get("status") in STATUSES and
+                    observed_direct_job.get("conclusion") is None,
+                    "owned job identity/status changed during run transition")
+        require(all(job.get("id") == owned_binding["job_id"] or
+                    job.get("status") == "completed" for job in own_jobs),
+                "another owned job is active")
+        owned = direct_job
+    else:
+        selected = [job for job in own_jobs if job.get("name") == own_job_name and
+                    job.get("status") == "in_progress"]
+        require(len(selected) == 1 and selected[0].get("run_id") == own_id and
+                selected[0].get("run_attempt") == 1 and selected[0].get("head_sha") == head and
+                selected[0].get("conclusion") is None and
+                selected[0].get("runner_name") in ("cuda-windows", "cuda-windows-2") and
+                selected[0].get("runner_id") == RUNNERS[selected[0]["runner_name"]],
+                "exact owned CUDA job/runner missing")
+        owned = selected[0]
     require(observed[owned["runner_name"]][0].get("status") == "online",
             "owned CUDA runner is offline")
     require(observed[owned["runner_name"]][0].get("busy") is True,
@@ -212,8 +263,9 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
     foreign_runs = []
     for key, run in data["runs"].items():
         if key == own_key:
-            require(all(job is owned or job.get("status") == "completed" for job in own_jobs),
-                    "another owned job is active")
+            if not transition:
+                require(all(job is owned or job.get("status") == "completed" for job in own_jobs),
+                        "another owned job is active")
             continue
         if mode == "shared-gpu1":
             foreign_runs.append({"repository": key[0], "run_id": key[1],
@@ -274,6 +326,8 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
         require(companion_state != "active" or
                 ("SceneWorks/inference", gpu1.RUN) in data["runs"],
                 "reviewed GPU1 active run absent from complete inventory")
+    if transition:
+        raise OwnedInventoryTransition("owned run absent or stale in complete aggregate")
     return {"own_run": own_id, "own_job": owned["id"],
             "own_runner": owned["runner_name"], "historical_zero_job_runs": historical,
             "foreign_runs_observed": foreign_runs,
@@ -283,12 +337,12 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
 
 def owned_run(own_id: int, head: str, workflow: str) -> dict:
     row = api(f"repos/SceneWorks/inference/actions/runs/{own_id}")
-    require(isinstance(row, dict) and row.get("id") == own_id and
+    if not (isinstance(row, dict) and row.get("id") == own_id and
             row.get("head_sha") == head and row.get("run_attempt") == 1 and
             row.get("event") == "workflow_dispatch" and
             row.get("path") == f".github/workflows/{workflow}" and
-            row.get("repository", {}).get("full_name") == "SceneWorks/inference",
-            "owned run/source/attempt changed")
+            row.get("repository", {}).get("full_name") == "SceneWorks/inference"):
+        raise OwnedIdentityDrift("owned run/source/attempt changed")
     return row
 
 
@@ -296,19 +350,101 @@ def bind_owned_job(own_id: int, head: str, workflow: str, job_id: int,
                    runner_name: str, runner_id: int,
                    *, own_job_name: str = "cuda") -> dict:
     run = owned_run(own_id, head, workflow)
-    require(run.get("status") == "in_progress" and run.get("conclusion") is None,
-            "owned run not active for binding")
-    require(isinstance(run.get("created_at"), str) and run["created_at"],
-            "owned run start identity unavailable")
+    if run.get("status") != "in_progress" or run.get("conclusion") is not None:
+        raise OwnedBindingUnavailable("owned run not active for binding")
+    if not isinstance(run.get("created_at"), str) or not run["created_at"]:
+        raise OwnedBindingUnavailable("owned run start identity unavailable")
     job = api(f"repos/SceneWorks/inference/actions/jobs/{job_id}")
-    require(isinstance(job, dict) and job.get("id") == job_id and
-            job.get("run_id") == own_id and job.get("run_attempt") == 1 and
-            job.get("head_sha") == head and job.get("name") == own_job_name and
-            job.get("runner_name") == runner_name and job.get("runner_id") == runner_id and
-            job.get("status") == "in_progress" and job.get("conclusion") is None and
-            job.get("completed_at") is None and isinstance(job.get("started_at"), str),
-            "owned job/runner/start binding unavailable")
+    if not isinstance(job, dict):
+        raise OwnedBindingUnavailable("owned job/runner/start binding unavailable")
+    immutable = {"id": job_id, "run_id": own_id, "run_attempt": 1, "head_sha": head,
+                 "name": own_job_name, "runner_name": runner_name, "runner_id": runner_id}
+    if any(key in job and job[key] is not None and job[key] != expected
+           for key, expected in immutable.items()):
+        raise OwnedIdentityDrift("owned job immutable identity changed")
+    if any(job.get(key) != expected for key, expected in immutable.items()) or \
+            job.get("status") != "in_progress" or job.get("conclusion") is not None or \
+            job.get("completed_at") is not None or not isinstance(job.get("started_at"), str):
+        raise OwnedBindingUnavailable("owned job/runner/start binding unavailable")
     return {"run": run, "job": job, "start": job["started_at"]}
+
+
+def sanitized_inventory(data: dict) -> dict:
+    """Retain a complete compact inventory without arbitrary API payload fields."""
+    keep = ("id", "head_sha", "run_attempt", "event", "path", "status", "conclusion",
+            "created_at", "updated_at", "name")
+    job_keep = ("id", "run_id", "run_attempt", "head_sha", "name", "status", "conclusion",
+                "runner_name", "runner_id", "started_at", "completed_at", "labels")
+    runners = {}
+    for scope, rows in data["runners"].items():
+        runners[scope] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                runners[scope].append({"invalidRow": True})
+                continue
+            compact = {key: value for key, value in row.items()
+                       if key in {"id", "name", "status", "busy"} and
+                       (value is None or isinstance(value, (str, int, bool)))}
+            if isinstance(row.get("labels"), list):
+                compact["labels"] = [label.get("name") if isinstance(label, dict) and
+                                      isinstance(label.get("name"), str) else "<invalid>"
+                                      for label in row["labels"]]
+            runners[scope].append(compact)
+    runs = []
+    for (repo, run_id), row in data["runs"].items():
+        compact = {"repository": repo, "run_id": run_id}
+        if isinstance(row, dict):
+            compact.update({key: value for key, value in row.items()
+                            if key in keep and (value is None or isinstance(value, (str, int, bool)))})
+        else:
+            compact["invalidRow"] = True
+        runs.append(compact)
+    jobs = []
+    for (repo, run_id), rows in data["jobs"].items():
+        compact_rows = []
+        for job in rows:
+            if not isinstance(job, dict):
+                compact_rows.append({"invalidRow": True})
+                continue
+            compact = {}
+            for key, value in job.items():
+                if key not in job_keep:
+                    continue
+                if key == "labels" and isinstance(value, list):
+                    compact[key] = [label if isinstance(label, str) else "<invalid>"
+                                    for label in value]
+                elif value is None or isinstance(value, (str, int, bool)):
+                    compact[key] = value
+            compact_rows.append(compact)
+        jobs.append({"repository": repo, "run_id": run_id, "rows": compact_rows})
+    return {"checked_at": data.get("checked_at"), "runners": runners,
+            "runs": runs, "jobs": jobs}
+
+
+def same_owned_binding(first: dict, second: dict, job_id: int,
+                       runner_name: str, runner_id: int) -> bool:
+    return (first["run"].get("created_at") == second["run"].get("created_at") and
+            first["job"].get("id") == second["job"].get("id") == job_id and
+            first["job"].get("started_at") == second["job"].get("started_at") == first["start"] and
+            second["start"] == first["start"] and
+            first["job"].get("runner_name") == second["job"].get("runner_name") == runner_name and
+            first["job"].get("runner_id") == second["job"].get("runner_id") == runner_id and
+            first["job"].get("head_sha") == second["job"].get("head_sha"))
+
+
+def exact_job_terminal(job: object, binding: dict, own_id: int, head: str,
+                       job_id: int, runner_name: str, runner_id: int,
+                       own_job_name: str) -> bool:
+    if not isinstance(job, dict):
+        return False
+    expected = {"id": job_id, "run_id": own_id, "run_attempt": 1, "head_sha": head,
+                "name": own_job_name, "runner_name": runner_name, "runner_id": runner_id,
+                "started_at": binding["start"]}
+    if any(key in job and job[key] is not None and job[key] != value
+           for key, value in expected.items()):
+        raise OwnedIdentityDrift("owned job immutable identity changed")
+    return (all(job.get(key) == value for key, value in expected.items()) and
+            job.get("status") == "completed" and isinstance(job.get("completed_at"), str))
 
 
 def cancel_bound_run(own_id: int, head: str, workflow: str, binding: dict,
@@ -365,8 +501,48 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
     index = 0
     identity_drift = False
     source_checked = False
+    inventory_sequence = 0
+
+    def bounded_snapshot() -> dict | None:
+        nonlocal inventory_sequence
+        for inventory_attempt in range(1, SHARED_GPU1_INVENTORY_ATTEMPTS + 1):
+            try:
+                return snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
+            except (InventorySnapshotError, subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired, TimeoutError, json.JSONDecodeError) as error:
+                if mode != "shared-gpu1":
+                    raise
+                # A changing REST status count or transport failure never
+                # supplies a partial inventory. Retain the rejected page,
+                # then fetch a wholly new snapshot after direct own reauth.
+                inventory_sequence += 1
+                (output / f"inventory-attempt-{index:04d}-{inventory_sequence}.json").write_text(
+                    json.dumps({"errorType": type(error).__name__, "error": str(error),
+                                "source": getattr(error, "source", None),
+                                "pages": getattr(error, "pages", None)}, indent=2) + "\n",
+                    encoding="utf-8")
+                fresh = bind_owned_job(own_id, head, workflow, job_id, runner_name,
+                                       runner_id, own_job_name=own_job_name)
+                require(same_owned_binding(binding, fresh, job_id, runner_name, runner_id),
+                        "owned identity drifted during inventory retry")
+                if (inventory_attempt == SHARED_GPU1_INVENTORY_ATTEMPTS or
+                        time.monotonic() >= deadline):
+                    (output / f"incomplete-foreign-inventory-{index:04d}.json").write_text(
+                        json.dumps({"checked_at": datetime.now(timezone.utc).isoformat(),
+                                    "inventory_complete": False, "attempts": inventory_attempt,
+                                    "errorType": type(error).__name__, "error": str(error),
+                                    "owned_binding_authenticated": True,
+                                    "own_run": own_id, "own_job": job_id,
+                                    "own_head": head, "own_runner": runner_name,
+                                    "own_runner_id": runner_id, "own_start": binding["start"],
+                                    "physical_lease": False}, indent=2) + "\n", encoding="utf-8")
+                    return None
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
+
     while time.monotonic() < deadline:
         index += 1
+        inventory_sequence = 0
+        data = None
         try:
             if mode == "gpu0-with-reviewed-gpu1" and not source_checked:
                 for path in gpu1.SOURCES:
@@ -379,51 +555,60 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
             if direct.get("status") == "completed":
                 (output / "terminal.json").write_text(json.dumps(direct, indent=2) + "\n", encoding="utf-8")
                 return  # Final child/postflight and physical release still require independent audit.
-            for inventory_attempt in range(1, SHARED_GPU1_INVENTORY_ATTEMPTS + 1):
+            data = bounded_snapshot()
+            if data is None:
+                time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                continue  # Rejected aggregate pages never reach classification or a complete receipt.
+            for transition_attempt in range(1, SHARED_GPU1_INVENTORY_ATTEMPTS + 1):
+                observed_job = next((job for job in data["jobs"].get(("SceneWorks/inference", own_id), [])
+                                     if job.get("id") == job_id), None)
+                if observed_job is not None and any((
+                        observed_job.get("run_id") != own_id,
+                        observed_job.get("run_attempt") != 1,
+                        observed_job.get("head_sha") != head,
+                        observed_job.get("runner_id") != runner_id,
+                        observed_job.get("runner_name") != runner_name,
+                        observed_job.get("started_at") != binding["start"])):
+                    raise RuntimeError("owned job identity drifted")
                 try:
-                    data = snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
+                    proof = classify(data, own_id, head, workflow, mode=mode,
+                                     own_job_name=own_job_name, owned_binding=binding)
                     break
-                except (InventorySnapshotError, subprocess.CalledProcessError,
-                        subprocess.TimeoutExpired, TimeoutError, json.JSONDecodeError) as error:
-                    if mode != "shared-gpu1":
-                        raise
-                    # A changing REST status count or transport failure never
-                    # supplies a partial inventory. Retain the rejected page,
-                    # then fetch a wholly new snapshot after direct own reauth.
-                    (output / f"inventory-attempt-{index:04d}-{inventory_attempt}.json").write_text(
-                        json.dumps({"errorType": type(error).__name__, "error": str(error),
-                                    "source": getattr(error, "source", None),
-                                    "pages": getattr(error, "pages", None)}, indent=2) + "\n",
-                        encoding="utf-8")
-                    if (inventory_attempt == SHARED_GPU1_INVENTORY_ATTEMPTS or
-                            time.monotonic() >= deadline):
-                        raise
+                except OwnedInventoryTransition as error:
+                    retained = {"attempt": transition_attempt, "reason": str(error),
+                                "inventory": sanitized_inventory(data)}
+                    (output / f"own-transition-{index:04d}-{transition_attempt}.json").write_text(
+                        json.dumps(retained, indent=2) + "\n", encoding="utf-8")
+                    if transition_attempt == SHARED_GPU1_INVENTORY_ATTEMPTS or \
+                            time.monotonic() >= deadline:
+                        raise RuntimeError("owned aggregate state remained unresolved after bounded retries")
                     try:
                         fresh = bind_owned_job(own_id, head, workflow, job_id, runner_name,
                                                runner_id, own_job_name=own_job_name)
-                    except RuntimeError as identity_error:
-                        # bind_owned_job uses RuntimeError for a positive run/job identity
-                        # mismatch. API transport and decoding failures are not drift: the
-                        # previously authenticated binding still permits owned-only cancel.
-                        raise RuntimeError(
-                            "owned identity drifted during inventory retry"
-                        ) from identity_error
-                    require(fresh["run"].get("created_at") == binding["run"].get("created_at") and
-                            fresh["job"].get("id") == binding["job_id"] and
-                            fresh["job"].get("started_at") == binding["start"],
-                            "owned identity drifted during inventory retry")
+                    except OwnedBindingUnavailable as unavailable:
+                        current = owned_run(own_id, head, workflow)
+                        if current.get("created_at") != binding["run"].get("created_at"):
+                            raise OwnedIdentityDrift("owned run creation identity changed") from unavailable
+                        if current.get("status") == "completed":
+                            (output / "terminal.json").write_text(
+                                json.dumps({"observed_after_transition": str(error),
+                                            "run": current}, indent=2) + "\n", encoding="utf-8")
+                            return
+                        raise unavailable
+                    except OwnedIdentityDrift:
+                        identity_drift = True
+                        raise
+                    require(same_owned_binding(binding, fresh, job_id, runner_name, runner_id),
+                            "owned identity drifted during aggregate retry")
                     time.sleep(min(1, max(0, deadline - time.monotonic())))
+                    data = bounded_snapshot()
+                    if data is None:
+                        break
+            if data is None:
+                time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                continue
             observed_job = next((job for job in data["jobs"].get(("SceneWorks/inference", own_id), [])
                                  if job.get("id") == job_id), None)
-            if observed_job is not None and any((
-                    observed_job.get("run_id") != own_id,
-                    observed_job.get("run_attempt") != 1,
-                    observed_job.get("head_sha") != head,
-                    observed_job.get("runner_id") != runner_id,
-                    observed_job.get("runner_name") != runner_name,
-                    observed_job.get("started_at") != binding["start"])):
-                raise RuntimeError("owned job identity drifted")
-            proof = classify(data, own_id, head, workflow, mode=mode, own_job_name=own_job_name)
             require(proof["own_job"] == job_id and proof["own_runner"] == runner_name and
                     observed_job is not None and observed_job.get("started_at") == binding["start"],
                     "inventory differs from direct immutable owned job binding")
@@ -440,21 +625,54 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
                            indent=2) + "\n",
                 encoding="utf-8")
         except BaseException as error:
-            if "identity drifted" in str(error) or "owned run/source/attempt changed" in str(error):
+            if (isinstance(error, OwnedIdentityDrift) or
+                    "identity drifted" in str(error) or
+                    "owned run/source/attempt changed" in str(error) or
+                    "owned run/source/attempt/status changed" in str(error) or
+                    "owned run creation identity changed" in str(error) or
+                    "owned job identity/status changed" in str(error)):
                 identity_drift = True
+            terminal = False
             try:
+                if isinstance(data, dict):
+                    (output / f"inventory-refusal-{index:04d}.json").write_text(
+                        json.dumps({"errorType": type(error).__name__, "reason": str(error),
+                                    "inventory": sanitized_inventory(data)}, indent=2) + "\n",
+                        encoding="utf-8")
                 current = owned_run(own_id, head, workflow)
+                if current.get("created_at") != binding["run"].get("created_at"):
+                    raise OwnedIdentityDrift("owned run creation identity changed")
                 if current.get("status") == "completed":
                     (output / "terminal.json").write_text(
                         json.dumps({"observed_after_error": str(error), "run": current}, indent=2) + "\n",
                         encoding="utf-8")
-                    return
+                    terminal = True
+                elif isinstance(error, OwnedBindingUnavailable):
+                    current_job = api(f"repos/SceneWorks/inference/actions/jobs/{job_id}")
+                    if exact_job_terminal(current_job, binding, own_id, head, job_id,
+                                          runner_name, runner_id, own_job_name):
+                        (output / "job-terminal.json").write_text(
+                            json.dumps({"scope": "job only; whole run may still be active",
+                                        "run": {"id": own_id, "created_at": current["created_at"],
+                                                "status": current.get("status")},
+                                        "job": {key: current_job.get(key) for key in (
+                                            "id", "run_id", "run_attempt", "head_sha", "name",
+                                            "runner_name", "runner_id", "started_at", "status",
+                                            "conclusion", "completed_at")}},
+                                       indent=2) + "\n", encoding="utf-8")
+                        terminal = True
+            except OwnedIdentityDrift:
+                identity_drift = True
             except Exception:
                 pass  # Source was authenticated before the watch; cancel that one run.
             try:
-                (output / "refusal.txt").write_text(str(error) + "\n", encoding="utf-8")
+                if not terminal:
+                    (output / "refusal.txt").write_text(str(error) + "\n", encoding="utf-8")
             finally:
-                cancel_bound_run(own_id, head, workflow, binding, identity_drift=identity_drift)
+                if not terminal:
+                    cancel_bound_run(own_id, head, workflow, binding, identity_drift=identity_drift)
+            if terminal:
+                return
             raise
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
     cancel_bound_run(own_id, head, workflow, binding, identity_drift=identity_drift)
