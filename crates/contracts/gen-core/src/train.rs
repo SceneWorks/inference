@@ -16,6 +16,7 @@
 // The pure LR-schedule policy lives here (gen-core); the MLX training kernels
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.
 pub mod aux_schedule;
+pub mod body;
 pub mod resume;
 pub mod schedule;
 pub mod subject_mask;
@@ -23,6 +24,7 @@ pub mod subject_mask;
 use std::path::PathBuf;
 
 pub use aux_schedule::{combine_step_terms, plan_step, AuxAlternation, StepPlan};
+pub use body::BodyLossesConfig;
 pub use schedule::LrSchedule;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -247,6 +249,16 @@ pub struct TrainingConfig {
     /// declare [`subject_mask_loss`](TrainingTechniques::subject_mask_loss), and refused when any
     /// item lacks a mask — see [`validate_training_techniques`].
     pub subject_mask_loss: Option<SubjectMaskLoss>,
+    /// **Body losses** (epic 2123, sc-24832) — three decoded-x0 auxiliary perceptual losses on the
+    /// shared path: ViTPose+ bone-length **proportions**, HybrIK SMPL-beta **shape**, and Sapiens
+    /// surface **normals**, each with its own [`AuxLossSchedule`] (see [`body`]). Every loss is
+    /// off by default; each is refused (typed [`crate::Error::Unsupported`]) by a trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare its flag
+    /// ([`body_proportion_loss`](TrainingTechniques::body_proportion_loss),
+    /// [`body_shape_loss`](TrainingTechniques::body_shape_loss),
+    /// [`normal_loss`](TrainingTechniques::normal_loss)) — see [`validate_training_techniques`].
+    /// An image with no detected person is skipped by all three.
+    pub body_losses: BodyLossesConfig,
 }
 
 /// The weights of [`TrainingConfig::subject_mask_loss`] (epic 2123, sc-24828). A latent cell with
@@ -467,6 +479,8 @@ impl Default for TrainingConfig {
             // Subject-masked loss is OFF by default (epic 2123 E1): no mask is read and the loss is
             // the plain unweighted mean.
             subject_mask_loss: None,
+            // Body losses are OFF by default (epic 2123 E1): all three weights 0, no model loaded.
+            body_losses: BodyLossesConfig::default(),
         }
     }
 }
@@ -868,6 +882,12 @@ pub struct TrainingTechniques {
     pub resolution_buckets: bool,
     /// Honors [`TrainingConfig::subject_mask_loss`] (subject-masked loss weighting, sc-24828).
     pub subject_mask_loss: bool,
+    /// Honors [`BodyLossesConfig::proportion`] (ViTPose+ bone-length-ratio loss, sc-24832).
+    pub body_proportion_loss: bool,
+    /// Honors [`BodyLossesConfig::shape`] (HybrIK SMPL-beta loss, sc-24832).
+    pub body_shape_loss: bool,
+    /// Honors [`BodyLossesConfig::normal`] (Sapiens surface-normal loss, sc-24832).
+    pub normal_loss: bool,
 }
 
 impl TrainingTechniques {
@@ -878,6 +898,9 @@ impl TrainingTechniques {
         depth_anchoring: false,
         gradient_noise: false,
         resolution_buckets: false,
+        body_proportion_loss: false,
+        body_shape_loss: false,
+        normal_loss: false,
     };
 
     /// The adapter-noise pair every LoRA/LoKr trainer implements at its optimizer step (epic 2123
@@ -888,6 +911,9 @@ impl TrainingTechniques {
         resolution_buckets: false,
         depth_anchoring: false,
         subject_mask_loss: false,
+        body_proportion_loss: false,
+        body_shape_loss: false,
+        normal_loss: false,
     };
 }
 
@@ -1046,7 +1072,78 @@ pub fn validate_training_techniques(
         }
         subject_mask::require_subject_masks(desc.id, &req.items)?;
     }
+    validate_body_losses(desc, req)?;
     validate_resolution_buckets(desc, &cfg.resolution_buckets)?;
+    Ok(())
+}
+
+/// Body-loss half of [`validate_training_techniques`] (sc-24832): a malformed schedule/knob is a
+/// `Msg`; an enabled loss the trainer does not declare is `Unsupported`; an enabled loss without
+/// its checkpoint (or the x0 decoder, or — normal restricted to the subject — every item's mask)
+/// is a `Msg` naming what is missing.
+fn validate_body_losses(desc: &TrainerDescriptor, req: &TrainingRequest) -> crate::Result<()> {
+    let body = &req.config.body_losses;
+    body.validate(desc.id).map_err(crate::Error::Msg)?;
+    let losses = [
+        ("body proportion loss", &body.proportion, desc.techniques.body_proportion_loss),
+        ("body shape loss", &body.shape, desc.techniques.body_shape_loss),
+        ("normal loss", &body.normal, desc.techniques.normal_loss),
+    ];
+    for (name, schedule, declared) in losses {
+        if schedule.is_enabled() && !declared {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: the {name} (weight {}) is not supported by this trainer",
+                desc.id, schedule.weight
+            )));
+        }
+    }
+    if !body.any_enabled() {
+        return Ok(());
+    }
+    let missing = |what: &str| {
+        Err(crate::Error::Msg(format!(
+            "{}: the body losses need {what}",
+            desc.id
+        )))
+    };
+    if body.pose_model_dir.is_none() {
+        return missing(
+            "the ViTPose+ base checkpoint — the proportion encoder and every body loss's person \
+             detector (body_losses.pose_model_dir is unset)",
+        );
+    }
+    if body.shape.is_enabled() && body.shape_model_dir.is_none() {
+        return missing("the HybrIK checkpoint (body_losses.shape_model_dir is unset)");
+    }
+    if body.normal.is_enabled() && body.normal_model_dir.is_none() {
+        return missing("the Sapiens normal checkpoint (body_losses.normal_model_dir is unset)");
+    }
+    if req.config.perceptual_decoder_dir.is_none() {
+        return missing("the family's small x0 decoder (perceptual_decoder_dir is unset)");
+    }
+    if body.normal.is_enabled() && body.normal_restrict_to_subject {
+        let lacking: Vec<String> = req
+            .items
+            .iter()
+            .filter(|i| i.subject_mask_path.is_none())
+            .map(|i| {
+                i.image_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| i.image_path.display().to_string())
+            })
+            .collect();
+        if !lacking.is_empty() {
+            return Err(crate::Error::Msg(format!(
+                "{}: the normal loss restricted to the subject needs a subject mask for every \
+                 dataset image; {} of {} have none: {}",
+                desc.id,
+                lacking.len(),
+                req.items.len(),
+                subject_mask::name_list(&lacking)
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1682,6 +1779,83 @@ mod tests {
             .flat_map(|b| (0..4).flat_map(move |i| std::iter::repeat_n((i, b), [2, 1][b])))
             .collect();
         assert_ne!(order(11, 0..12), unshuffled);
+    }
+
+    /// sc-24832 (epic 2123 E3): each body loss is refused unless its own flag is declared, needs
+    /// ViTPose (every loss's person detector), its own checkpoint and the x0 decoder, and the
+    /// subject-restricted normal loss needs every item's mask. Mutations: check
+    /// `body_proportion_loss` for the shape loss ⇒ the shape-only descriptor passes ⇒ red; drop the
+    /// `pose_model_dir` requirement ⇒ red.
+    #[test]
+    fn validate_training_techniques_body_loss_floor() {
+        let items = vec![TrainingItem::captioned(PathBuf::from("a.png"), "a".into())];
+        let off = train_req(None, items);
+        assert!(!off.config.body_losses.any_enabled());
+        assert!(validate_training_techniques(&trainer_desc(false), &off).is_ok());
+        let full = |r: &mut TrainingRequest| {
+            r.config.body_losses.pose_model_dir = Some(PathBuf::from("/m/vitpose"));
+            r.config.body_losses.shape_model_dir = Some(PathBuf::from("/m/hybrik"));
+            r.config.body_losses.normal_model_dir = Some(PathBuf::from("/m/sapiens"));
+            r.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
+        };
+        type Pick = fn(&mut TrainingRequest);
+        type Flag = fn(&mut TrainingTechniques);
+        let cases: [(&str, Pick, Flag); 3] = [
+            ("proportion", |r| r.config.body_losses.proportion.weight = 0.1, |t| t.body_proportion_loss = true),
+            ("shape", |r| r.config.body_losses.shape.weight = 0.1, |t| t.body_shape_loss = true),
+            ("normal", |r| r.config.body_losses.normal.weight = 0.1, |t| t.normal_loss = true),
+        ];
+        for (name, enable, declare) in cases {
+            let mut on = off.clone();
+            enable(&mut on);
+            full(&mut on);
+            // Declaring every OTHER body flag is not enough.
+            let mut others = trainer_desc(false);
+            for (n2, _, d2) in cases {
+                if n2 != name {
+                    d2(&mut others.techniques);
+                }
+            }
+            let err = validate_training_techniques(&others, &on).unwrap_err();
+            assert!(matches!(err, crate::Error::Unsupported(ref m) if m.contains(name)), "{name}: {err:?}");
+            let mut desc = trainer_desc(false);
+            declare(&mut desc.techniques);
+            validate_training_techniques(&desc, &on).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut no_pose = on.clone();
+            no_pose.config.body_losses.pose_model_dir = None;
+            let err = validate_training_techniques(&desc, &no_pose).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("ViTPose")), "{err:?}");
+            let mut no_dec = on.clone();
+            no_dec.config.perceptual_decoder_dir = None;
+            let err = validate_training_techniques(&desc, &no_dec).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")), "{err:?}");
+        }
+        let mut shape = off.clone();
+        shape.config.body_losses.shape.weight = 0.1;
+        full(&mut shape);
+        shape.config.body_losses.shape_model_dir = None;
+        let mut d = trainer_desc(false);
+        d.techniques.body_shape_loss = true;
+        let err = validate_training_techniques(&d, &shape).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("HybrIK")), "{err:?}");
+        let mut normal = off.clone();
+        normal.config.body_losses.normal.weight = 0.1;
+        full(&mut normal);
+        normal.config.body_losses.normal_restrict_to_subject = true;
+        let mut d = trainer_desc(false);
+        d.techniques.normal_loss = true;
+        let err = validate_training_techniques(&d, &normal).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("subject mask")), "{err:?}");
+        normal.items[0].subject_mask_path = Some(PathBuf::from("a.mask.png"));
+        assert!(validate_training_techniques(&d, &normal).is_ok());
+        normal.config.body_losses.normal_model_dir = None;
+        let err = validate_training_techniques(&d, &normal).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("Sapiens")), "{err:?}");
+        // A malformed knob is a Msg regardless of support.
+        let mut bad = off.clone();
+        bad.config.body_losses.shape_min_cos = f32::NAN;
+        let err = validate_training_techniques(&trainer_desc(false), &bad).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("shape_min_cos")), "{err:?}");
     }
 
     #[test]

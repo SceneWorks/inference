@@ -699,6 +699,12 @@ pub struct TrainerCapabilitySnapshot {
     pub supports_resolution_buckets: bool,
     /// Honors `TrainingConfig::subject_mask_loss` (epic 2123 subject-masked loss, sc-24828).
     pub supports_subject_mask_loss: bool,
+    /// Honors `BodyLossesConfig::proportion` (epic 2123 ViTPose body-proportion loss, sc-24832).
+    pub supports_body_proportion_loss: bool,
+    /// Honors `BodyLossesConfig::shape` (epic 2123 HybrIK body-shape loss, sc-24832).
+    pub supports_body_shape_loss: bool,
+    /// Honors `BodyLossesConfig::normal` (epic 2123 Sapiens normal loss, sc-24832).
+    pub supports_normal_loss: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -718,6 +724,9 @@ impl TrainerCapabilitySnapshot {
             supports_gradient_noise: descriptor.techniques.gradient_noise,
             supports_resolution_buckets: descriptor.techniques.resolution_buckets,
             supports_subject_mask_loss: descriptor.techniques.subject_mask_loss,
+            supports_body_proportion_loss: descriptor.techniques.body_proportion_loss,
+            supports_body_shape_loss: descriptor.techniques.body_shape_loss,
+            supports_normal_loss: descriptor.techniques.normal_loss,
         }
     }
 
@@ -737,6 +746,9 @@ impl TrainerCapabilitySnapshot {
             "supports_gradient_noise": self.supports_gradient_noise,
             "supports_resolution_buckets": self.supports_resolution_buckets,
             "supports_subject_mask_loss": self.supports_subject_mask_loss,
+            "supports_body_proportion_loss": self.supports_body_proportion_loss,
+            "supports_body_shape_loss": self.supports_body_shape_loss,
+            "supports_normal_loss": self.supports_normal_loss,
         })
     }
 }
@@ -1022,6 +1034,20 @@ mod tests {
         let noisy_json = TrainerCapabilitySnapshot::from_descriptor(&noisy).to_json();
         assert_eq!(noisy_json["supports_weight_noise"], true);
         assert_eq!(noisy_json["supports_depth_anchoring"], false);
+
+        // sc-24832: each body loss is advertised from its own flag.
+        for (key, set) in [
+            ("supports_body_proportion_loss", (|t: &mut gen_core::train::TrainingTechniques| t.body_proportion_loss = true) as fn(&mut _)),
+            ("supports_body_shape_loss", |t| t.body_shape_loss = true),
+            ("supports_normal_loss", |t| t.normal_loss = true),
+        ] {
+            assert_eq!(json[key], false);
+            let mut body = descriptor;
+            set(&mut body.techniques);
+            let body_json = TrainerCapabilitySnapshot::from_descriptor(&body).to_json();
+            assert_eq!(body_json[key], true, "{key}");
+            assert_eq!(body_json["supports_depth_anchoring"], false);
+        }
 
         // sc-2125: depth anchoring is advertised from its own flag.
         assert_eq!(json["supports_depth_anchoring"], false);

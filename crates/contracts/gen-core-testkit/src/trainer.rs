@@ -269,7 +269,47 @@ const TECHNIQUE_PROBES: &[TechniqueProbe] = &[
         declared: |t| t.subject_mask_loss,
         adapter_only: false,
     },
+    TechniqueProbe {
+        name: "body_proportion_loss",
+        knob: "body_losses.proportion.weight",
+        enable: |r| {
+            r.config.body_losses.proportion.weight = 0.1;
+            name_body_models(r);
+        },
+        declared: |t| t.body_proportion_loss,
+        adapter_only: false,
+    },
+    TechniqueProbe {
+        name: "body_shape_loss",
+        knob: "body_losses.shape.weight",
+        enable: |r| {
+            r.config.body_losses.shape.weight = 0.1;
+            name_body_models(r);
+        },
+        declared: |t| t.body_shape_loss,
+        adapter_only: false,
+    },
+    TechniqueProbe {
+        name: "normal_loss",
+        knob: "body_losses.normal.weight",
+        enable: |r| {
+            r.config.body_losses.normal.weight = 0.1;
+            name_body_models(r);
+        },
+        declared: |t| t.normal_loss,
+        adapter_only: false,
+    },
 ];
+
+/// Name every body-loss checkpoint and the x0 decoder (sc-24832) — validate never loads them, so a
+/// declaring trainer accepts the probe and a non-declaring one must refuse it on the flag alone.
+fn name_body_models(r: &mut TrainingRequest) {
+    let b = &mut r.config.body_losses;
+    b.pose_model_dir = Some(PathBuf::from("/conformance/vitpose-plus-base"));
+    b.shape_model_dir = Some(PathBuf::from("/conformance/hybrik"));
+    b.normal_model_dir = Some(PathBuf::from("/conformance/sapiens-normal"));
+    r.config.perceptual_decoder_dir = Some(PathBuf::from("/conformance/taef1"));
+}
 
 /// The masked-loss probe weights (sc-24828): drop the background entirely.
 const SUBJECT_MASK_PROBE: gen_core::SubjectMaskLoss = gen_core::SubjectMaskLoss {

@@ -518,6 +518,9 @@ fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
         stub.desc.techniques = gen_core::TrainingTechniques {
             depth_anchoring: true,
             subject_mask_loss: true,
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             ..gen_core::TrainingTechniques::ADAPTER_NOISE
         };
         Box::new(stub)
@@ -601,6 +604,52 @@ fn declared_depth_anchoring_passes_the_technique_checks() {
     let make = || -> Box<dyn Trainer> {
         let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
         stub.desc.techniques.depth_anchoring = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-24832: for each body loss, a trainer that declares every other probed technique but
+/// silently accepts that loss fails both technique checks on its probe; declaring it passes.
+/// Mutation: drop any body probe row from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn each_body_loss_probe_catches_a_silently_ignored_loss() {
+    type Flag = fn(&mut gen_core::TrainingTechniques);
+    let flags: [(&str, Flag); 3] = [
+        ("body_proportion_loss", |t| t.body_proportion_loss = true),
+        ("body_shape_loss", |t| t.body_shape_loss = true),
+        ("normal_loss", |t| t.normal_loss = true),
+    ];
+    for (name, _) in flags {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = || -> Box<dyn Trainer> {
+            let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+            let mut t = gen_core::TrainingTechniques {
+                depth_anchoring: true,
+                subject_mask_loss: true,
+                resolution_buckets: true,
+                ..gen_core::TrainingTechniques::ADAPTER_NOISE
+            };
+            for (other, set) in flags {
+                if other != name {
+                    set(&mut t);
+                }
+            }
+            stub.desc.techniques = t;
+            Box::new(stub)
+        };
+        let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+        assert!(err.contains(&format!("techniques.{name} == false")), "{name}: {err}");
+        let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+        assert!(err.contains(name) && err.contains("silently ignored"), "{name}: {err}");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.body_proportion_loss = true;
+        stub.desc.techniques.body_shape_loss = true;
+        stub.desc.techniques.normal_loss = true;
         Box::new(stub)
     };
     check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
