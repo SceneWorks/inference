@@ -518,9 +518,15 @@ def sapiens_checkpoint_keys(model):
 
 def to_f16_and_back(model):
     """Round every parameter/buffer to f16 (the fixture's storage precision) so the stored weights
-    reproduce the stored outputs exactly."""
+    reproduce the stored outputs exactly. The normalization constants are not stored, so they stay
+    exact."""
     with torch.no_grad():
-        for p in list(model.parameters()) + [b for b in model.buffers() if b.is_floating_point()]:
+        buffers = [
+            b
+            for n, b in model.named_buffers()
+            if b.is_floating_point() and n not in ("img_mean", "img_std")
+        ]
+        for p in list(model.parameters()) + buffers:
             p.copy_(p.half().float())
 
 

@@ -12,33 +12,36 @@
 //! Every loss builds its reference with the same ViTPose pass ([`VitPose::detect`]): an image with
 //! **no detected person** returns `Ok(None)` and the shared path skips the loss for it (zero
 //! contribution, the step falls back to diffusion). The backend-neutral half — configs, parameter
-//! counts, footprints and all host-side geometry — is [`gen_core::train::body`].
+//! counts, footprints and all host-side geometry — is [`mlx_gen::gen_core::train::body`].
 
 pub mod hybrik;
 pub mod sapiens;
 pub mod vitpose;
 
 use std::any::Any;
-use std::rc::Rc;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{
-    abs, add, divide, greater, greater_equal, less, logical_and, matmul, maximum, minimum,
+    abs, add, divide, ge, gt, logical_and, lt, maximum, minimum,
     multiply, r#where, subtract,
 };
 use mlx_rs::Array;
 
-pub use gen_core::train::body::{
-    BodyLossesConfig, BodyModelFootprint, HybrikConfig, SapiensConfig, VitPoseConfig,
+pub use mlx_gen::gen_core::train::body::{
+    body_arm_footprint, BodyArm, TwoTap, BodyLossesConfig, BodyModelFootprint, HybrikConfig,
+    SapiensConfig, VitPoseConfig,
 };
-use gen_core::train::body::{
+use mlx_gen::gen_core::train::body::{
     keypoint_box, MIN_MEAN_RATIO_VISIBILITY, MISSING_REFERENCE_VISIBILITY, NUM_BODY_RATIOS,
     NUM_HEAD_RATIOS, RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
 };
 
-use super::perceptual::{reference_as, AuxLoss, AuxModelFootprint, LossReference, PerceptualLoss};
-use crate::weights::{join, to_f32, Weights};
-use crate::{Error, Result};
+use mlx_gen::train::perceptual::{reference_as, AuxModelFootprint, LossReference, PerceptualLoss};
+use mlx_gen::weights::{join, to_f32, Weights};
+use mlx_gen::{Error, Result};
 
 pub use hybrik::HybrikEncoder;
 pub use sapiens::SapiensNormal;
@@ -76,20 +79,36 @@ pub(crate) fn normalize(x: &Array, mean: [f32; 3], std: [f32; 3]) -> Result<Arra
     Ok(divide(&subtract(x, &m)?, &s)?)
 }
 
-/// One axis of a separable resample, `[out, in]` (see [`gen_core::train::body::resize_weights`]).
-pub struct AxisMatrix(Array);
+/// One axis of a separable resample (see [`mlx_gen::gen_core::train::body::resize_weights`]), in
+/// the exact two-tap gather form ([`TwoTap`]) — a dense matmul here ran on a reduced-precision
+/// GEMM and missed torch by ~1e-3.
+pub struct AxisMatrix {
+    i0: Array,
+    w0: Array,
+    i1: Array,
+    w1: Array,
+    out: i32,
+}
 
 impl AxisMatrix {
-    /// From row-major `[out, in]` weights.
+    /// From row-major `[out, in]` weights (at most two taps per row).
     pub fn from_weights(out: usize, input: usize, w: Vec<f32>) -> Self {
-        Self(Array::from_slice(&w, &[out as i32, input as i32]))
+        let t = TwoTap::from_matrix(&w, out, input);
+        let n = out as i32;
+        Self {
+            i0: Array::from_slice(&t.i0, &[n]),
+            w0: Array::from_slice(&t.w0, &[n]),
+            i1: Array::from_slice(&t.i1, &[n]),
+            w1: Array::from_slice(&t.w1, &[n]),
+            out: n,
+        }
     }
     /// torch bilinear resize `input → out`.
     pub fn resize(input: usize, out: usize, align_corners: bool) -> Self {
         Self::from_weights(
             out,
             input,
-            gen_core::train::body::resize_weights(input, out, align_corners),
+            mlx_gen::gen_core::train::body::resize_weights(input, out, align_corners),
         )
     }
     /// torch `grid_sample` (bilinear, zeros, `align_corners=True`) of `source = o·scale + offset`.
@@ -97,18 +116,24 @@ impl AxisMatrix {
         Self::from_weights(
             out,
             input,
-            gen_core::train::body::affine_sample_weights(input, out, scale, offset),
+            mlx_gen::gen_core::train::body::affine_sample_weights(input, out, scale, offset),
         )
+    }
+
+    /// Resample `axis` of the rank-4 `x`.
+    fn apply(&self, x: &Array, axis: i32) -> Result<Array> {
+        let mut shape = vec![1i32; 4];
+        shape[axis as usize] = self.out;
+        let a = multiply(&x.take_axis(&self.i0, axis)?, &self.w0.reshape(&shape)?)?;
+        let b = multiply(&x.take_axis(&self.i1, axis)?, &self.w1.reshape(&shape)?)?;
+        Ok(add(&a, &b)?)
     }
 }
 
 /// Separable resample of an NHWC map: `out[b, i, j, c] = Σ ay[i, h] · ax[j, w] · x[b, h, w, c]`
-/// — two matmuls, differentiable in `x`.
+/// — gathers and weighted adds, exact in f32 and differentiable in `x`.
 pub fn resample_nhwc(x: &Array, ay: &AxisMatrix, ax: &AxisMatrix) -> Result<Array> {
-    let t = x.transpose_axes(&[0, 3, 1, 2])?; // [B, C, H, W]
-    let t = matmul(&ay.0, &t)?; // [B, C, oh, W]
-    let t = matmul(&t, ax.0.t())?; // [B, C, oh, ow]
-    Ok(t.transpose_axes(&[0, 2, 3, 1])?)
+    ax.apply(&ay.apply(x, 1)?, 2)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -175,7 +200,7 @@ pub fn substitute_low_confidence(
     vis: &Array,
     reference: &Array,
 ) -> Result<(Array, Array)> {
-    let low = less(vis, Array::from_f32(VIS_THRESHOLD))?;
+    let low = lt(vis, Array::from_f32(VIS_THRESHOLD))?;
     Ok((
         r#where(&low, &mlx_rs::stop_gradient(reference)?, ratios)?,
         r#where(&low, Array::from_f32(0.0), vis)?,
@@ -194,8 +219,8 @@ pub fn proportion_comparison(
     let combined = minimum(ref_vis, live_vis)?;
     let num = multiply(&abs(&subtract(live_ratios, ref_ratios)?)?, &combined)?.sum_axes(&[-1], false)?;
     let den = maximum(&combined.sum_axes(&[-1], false)?, Array::from_f32(1e-6))?;
-    let high = greater_equal(ref_vis, Array::from_f32(MISSING_REFERENCE_VISIBILITY))?;
-    let dropped = logical_and(&high, &less(live_vis, Array::from_f32(VIS_THRESHOLD))?)?;
+    let high = ge(ref_vis, Array::from_f32(MISSING_REFERENCE_VISIBILITY))?;
+    let dropped = logical_and(&high, &lt(live_vis, Array::from_f32(VIS_THRESHOLD))?)?;
     let missing = dropped.as_dtype(mlx_rs::Dtype::Float32)?.sum_axes(&[-1], false)?;
     let high_n = maximum(
         &high.as_dtype(mlx_rs::Dtype::Float32)?.sum_axes(&[-1], false)?,
@@ -338,7 +363,7 @@ pub fn shape_comparison(reference: &Array, live: &Array, min_cos: f32) -> Result
         &live.square()?.sum_axes(&[-1], false)?.sqrt()?,
     )?;
     let cos = mlx_rs::stop_gradient(divide(&dot, &maximum(&norms, Array::from_f32(1e-8))?)?)?;
-    let gate = greater(&cos, Array::from_f32(min_cos))?.as_dtype(mlx_rs::Dtype::Float32)?;
+    let gate = gt(&cos, Array::from_f32(min_cos))?.as_dtype(mlx_rs::Dtype::Float32)?;
     let l1 = abs(&subtract(live, reference)?)?.mean_axes(&[-1], false)?;
     Ok(multiply(&l1, &gate)?.mean(None)?)
 }
@@ -440,71 +465,88 @@ impl PerceptualLoss for NormalLoss {
 // Construction + memory.
 // ---------------------------------------------------------------------------------------------
 
-/// The enabled body losses of `cfg`, loaded from their checkpoint directories (ViTPose shared by
-/// all three as the person detector), each with its own schedule — the body arm of a trainer's
-/// [`super::perceptual::PerceptualPath`]. Empty when every body loss is off (nothing is loaded).
-pub fn body_aux_losses(cfg: &BodyLossesConfig) -> Result<Vec<AuxLoss>> {
-    if !cfg.any_enabled() {
-        return Ok(Vec::new());
-    }
-    let dir = |d: &Option<std::path::PathBuf>, what: &str| {
-        d.clone().ok_or_else(|| {
-            Error::Msg(format!(
-                "body losses: the {what} checkpoint directory is unset"
-            ))
-        })
-    };
-    let load_err = |what: &str, d: &std::path::Path, e: Error| {
+fn model_dir(d: &Option<PathBuf>, what: &str, knob: &str) -> Result<PathBuf> {
+    d.clone().ok_or_else(|| {
         Error::Msg(format!(
-            "body losses: could not load {what} from {}: {e}",
-            d.display()
+            "body losses: the {what} checkpoint directory is unset (body_losses.{knob})"
         ))
-    };
-    let pose_dir = dir(&cfg.pose_model_dir, "ViTPose+")?;
-    let pose = Rc::new(
-        VitPose::from_dir(&pose_dir, VitPoseConfig::plus_base())
-            .map_err(|e| load_err("ViTPose+", &pose_dir, e))?,
-    );
-    let mut out = Vec::new();
-    if cfg.proportion.is_enabled() {
-        out.push(AuxLoss {
-            schedule: cfg.proportion,
-            loss: Box::new(BodyProportionLoss::new(pose.clone(), cfg.include_head)),
-        });
-    }
-    if cfg.shape.is_enabled() {
-        let d = dir(&cfg.shape_model_dir, "HybrIK")?;
-        let hybrik = HybrikEncoder::from_dir(&d, HybrikConfig::resnet34())
-            .map_err(|e| load_err("HybrIK", &d, e))?;
-        out.push(AuxLoss {
-            schedule: cfg.shape,
-            loss: Box::new(BodyShapeLoss::new(pose.clone(), hybrik, cfg.shape_min_cos)),
-        });
-    }
-    if cfg.normal.is_enabled() {
-        let d = dir(&cfg.normal_model_dir, "Sapiens normal")?;
-        let sapiens = SapiensNormal::from_dir(&d, SapiensConfig::normal_0_3b())
-            .map_err(|e| load_err("Sapiens normal", &d, e))?;
-        out.push(AuxLoss {
-            schedule: cfg.normal,
-            loss: Box::new(NormalLoss::new(pose, sapiens, cfg.normal_restrict_to_subject)),
-        });
-    }
-    Ok(out)
+    })
 }
 
-/// The E7 footprints of the enabled body losses' models (see
-/// [`gen_core::train::body::body_loss_footprints`]), for
-/// [`super::perceptual::perceptual_footprint_bytes`].
-pub fn body_loss_footprints(cfg: &BodyLossesConfig) -> Vec<AuxModelFootprint> {
-    gen_core::train::body::body_loss_footprints(cfg)
-        .into_iter()
-        .map(|f| AuxModelFootprint {
-            param_bytes: f.param_bytes,
-            working_set_bytes: f.working_set_bytes,
-            reference_bytes_per_image: f.reference_bytes_per_image,
-        })
-        .collect()
+fn load_err(what: &str, dir: &Path, e: Error) -> Error {
+    Error::Msg(format!(
+        "body losses: could not load {what} from {}: {e}",
+        dir.display()
+    ))
+}
+
+thread_local! {
+    /// The ViTPose every enabled body loss shares (it is the proportion encoder and all three
+    /// losses' person detector): loaded once per checkpoint directory while any loss holds it.
+    static SHARED_POSE: RefCell<Option<(PathBuf, Weak<VitPose>)>> = const { RefCell::new(None) };
+}
+
+/// The shared ViTPose+ base of `cfg.pose_model_dir` — loaded by the first body loss that asks and
+/// reused by the others (one resident copy, as [`body_arm_footprint`] budgets).
+pub fn shared_pose(cfg: &BodyLossesConfig) -> Result<Rc<VitPose>> {
+    let dir = model_dir(&cfg.pose_model_dir, "ViTPose+", "pose_model_dir")?;
+    if let Some(p) = SHARED_POSE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(d, _)| *d == dir)
+            .and_then(|(_, w)| w.upgrade())
+    }) {
+        return Ok(p);
+    }
+    let pose = Rc::new(
+        VitPose::from_dir(&dir, VitPoseConfig::plus_base())
+            .map_err(|e| load_err("ViTPose+", &dir, e))?,
+    );
+    SHARED_POSE.with(|c| *c.borrow_mut() = Some((dir, Rc::downgrade(&pose))));
+    Ok(pose)
+}
+
+/// The body-proportion loss of `cfg` (the builder's `body-proportion` arm).
+pub fn proportion_loss(cfg: &BodyLossesConfig) -> Result<Box<dyn PerceptualLoss>> {
+    Ok(Box::new(BodyProportionLoss::new(
+        shared_pose(cfg)?,
+        cfg.include_head,
+    )))
+}
+
+/// The body-shape loss of `cfg` (the builder's `body-shape` arm).
+pub fn shape_loss(cfg: &BodyLossesConfig) -> Result<Box<dyn PerceptualLoss>> {
+    let d = model_dir(&cfg.shape_model_dir, "HybrIK", "shape_model_dir")?;
+    let hybrik = HybrikEncoder::from_dir(&d, HybrikConfig::resnet34())
+        .map_err(|e| load_err("HybrIK", &d, e))?;
+    Ok(Box::new(BodyShapeLoss::new(
+        shared_pose(cfg)?,
+        hybrik,
+        cfg.shape_min_cos,
+    )))
+}
+
+/// The normal loss of `cfg` (the builder's `normal` arm).
+pub fn normal_loss(cfg: &BodyLossesConfig) -> Result<Box<dyn PerceptualLoss>> {
+    let d = model_dir(&cfg.normal_model_dir, "Sapiens normal", "normal_model_dir")?;
+    let sapiens = SapiensNormal::from_dir(&d, SapiensConfig::normal_0_3b())
+        .map_err(|e| load_err("Sapiens normal", &d, e))?;
+    Ok(Box::new(NormalLoss::new(
+        shared_pose(cfg)?,
+        sapiens,
+        cfg.normal_restrict_to_subject,
+    )))
+}
+
+/// One body arm's E7 footprint ([`body_arm_footprint`]: its model + the shared ViTPose on the
+/// first enabled arm).
+pub fn arm_footprint(cfg: &BodyLossesConfig, arm: BodyArm) -> AuxModelFootprint {
+    let f = body_arm_footprint(cfg, arm);
+    AuxModelFootprint {
+        param_bytes: f.param_bytes,
+        working_set_bytes: f.working_set_bytes,
+        reference_bytes_per_image: f.reference_bytes_per_image,
+    }
 }
 
 #[cfg(test)]

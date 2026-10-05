@@ -8,12 +8,12 @@ use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
 use mlx_rs::ops::{add, maximum, multiply};
 use mlx_rs::Array;
 
-use gen_core::train::body::{hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD};
+use mlx_gen::gen_core::train::body::{hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD};
 
 use super::{bn_fold, conv_ohwi, normalize, resample_nhwc, w32, AxisMatrix};
-use crate::nn::{conv2d, linear};
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::nn::{conv2d, linear};
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 struct Conv {
     w: Array,

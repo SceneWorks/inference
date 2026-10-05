@@ -2,14 +2,15 @@
 //! through the shared perceptual path, the no-person skip, and the real-weight parity harness.
 
 use super::*;
-use crate::train::perceptual::{AuxLossSchedule, PerceptualPath};
-use crate::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder, TinyDecoderConfig};
+use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule, PerceptualPath};
+use mlx_gen::train::perceptual::X0Decoder;
 use mlx_rs::transforms::{eval, grad};
+use mlx_rs::ops::matmul;
 use mlx_rs::{random, Array};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/migration/body-losses-reference/body_losses_tiny.safetensors"
+    "/../../../../docs/migration/body-losses-reference/body_losses_tiny.safetensors"
 );
 
 fn fixture() -> Weights {
@@ -36,11 +37,34 @@ fn scalar(a: &Array) -> f32 {
     a.item::<f32>()
 }
 
+thread_local! {
+    /// Tolerance multiplier of the parity checks: `1` on the CPU stream (exact f32 GEMMs), larger
+    /// on the default GPU stream, whose f32 GEMMs run on the matrix unit at reduced (TF32-class)
+    /// precision.
+    static TOL_SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
 fn close(name: &str, got: &Array, want: &Array, tol: f32) {
     assert_eq!(got.shape(), want.shape(), "{name}: shape");
+    let tol = tol * TOL_SCALE.with(|c| c.get());
     let d = max_abs_diff(got, want);
     assert!(d <= tol, "{name}: max |Δ| {d} > {tol}");
 }
+
+/// Run a parity check on the CPU stream at the stated tolerances.
+fn on_cpu(f: impl FnOnce()) {
+    mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), f);
+}
+
+/// Run a parity check on the default (GPU) stream at `scale ×` the stated tolerances.
+fn on_gpu(scale: f32, f: impl FnOnce()) {
+    TOL_SCALE.with(|c| c.set(scale));
+    f();
+    TOL_SCALE.with(|c| c.set(1.0));
+}
+
+/// The GPU stream's tolerance multiplier (TF32-class f32 GEMMs, ~1e-3 relative).
+const GPU_TOL_SCALE: f32 = 100.0;
 
 fn vitpose(w: &Weights) -> VitPose {
     VitPose::from_weights(w, "vitpose.w", VitPoseConfig::tiny()).unwrap()
@@ -54,15 +78,15 @@ fn sapiens(w: &Weights) -> SapiensNormal {
     SapiensNormal::from_weights(w, "sapiens.w", SapiensConfig::tiny()).unwrap()
 }
 
-/// The fixture's ViTPose with every keypoint peak shifted by `bias` (a large positive shift makes
-/// every keypoint confident — a detected person; a large negative one makes none confident).
-fn vitpose_with_peak(bias: f32) -> VitPose {
+/// The fixture's ViTPose with its keypoint head rescaled: heatmaps `gain · conv + bias + shift`.
+fn vitpose_with_head(gain: f32, shift: f32) -> VitPose {
     let mut w = fixture();
-    let b = t(&w, "vitpose.w.head.conv.bias");
-    w.insert(
-        "vitpose.w.head.conv.bias",
-        add(&b, Array::from_f32(bias)).unwrap(),
-    );
+    let k = "vitpose.w.head.conv.weight";
+    let cw = t(&w, k);
+    w.insert(k, multiply(&cw, Array::from_f32(gain)).unwrap());
+    let k = "vitpose.w.head.conv.bias";
+    let b = t(&w, k);
+    w.insert(k, add(&b, Array::from_f32(shift)).unwrap());
     vitpose(&w)
 }
 
@@ -75,7 +99,16 @@ fn vitpose_with_peak(bias: f32) -> VitPose {
 /// Mutations: drop `+ pos[:, :1]` in `VitPose::from_weights`; swap `(x, y)` in
 /// `heatmaps_to_keypoints`; skip `substitute_low_confidence` in the loss — each ⇒ red.
 #[test]
-fn vitpose_matches_the_reference_implementation() {
+fn vitpose_matches_the_reference_implementation_on_cpu() {
+    on_cpu(vitpose_parity);
+}
+
+#[test]
+fn vitpose_matches_the_reference_implementation_on_gpu() {
+    on_gpu(GPU_TOL_SCALE, vitpose_parity);
+}
+
+fn vitpose_parity() {
     let w = fixture();
     let m = vitpose(&w);
     let a = nhwc(&w, "input.a");
@@ -108,7 +141,16 @@ fn vitpose_matches_the_reference_implementation() {
 /// HybrIK: upstream's square person crop + ResNet + beta head, and the shape comparison.
 /// Mutations: use `align_corners=True` in `forward_crop`'s resize; drop `+ init_shape` ⇒ red.
 #[test]
-fn hybrik_matches_the_reference_implementation() {
+fn hybrik_matches_the_reference_implementation_on_cpu() {
+    on_cpu(hybrik_parity);
+}
+
+#[test]
+fn hybrik_matches_the_reference_implementation_on_gpu() {
+    on_gpu(GPU_TOL_SCALE, hybrik_parity);
+}
+
+fn hybrik_parity() {
     let w = fixture();
     let m = hybrik(&w);
     let bbox_v = t(&w, "input.person_bbox");
@@ -133,7 +175,16 @@ fn hybrik_matches_the_reference_implementation() {
 /// mask and both normal losses. Mutations: drop the pos-embedding resample (add the stored grid
 /// unresampled ⇒ shape error / mismatch); drop an InstanceNorm ⇒ red.
 #[test]
-fn sapiens_matches_the_reference_implementation() {
+fn sapiens_matches_the_reference_implementation_on_cpu() {
+    on_cpu(sapiens_parity);
+}
+
+#[test]
+fn sapiens_matches_the_reference_implementation_on_gpu() {
+    on_gpu(GPU_TOL_SCALE, sapiens_parity);
+}
+
+fn sapiens_parity() {
     let w = fixture();
     let m = sapiens(&w);
     let na = m.forward_pixels(&nhwc(&w, "input.a")).unwrap();
@@ -155,14 +206,40 @@ fn sapiens_matches_the_reference_implementation() {
 // AC1: gradient into a LoRA through the shared path; zero on a no-person reference.
 // ---------------------------------------------------------------------------------------------
 
-/// A 4-channel TAESD-shaped decoder (upscale 8): latent `[1, 4, 4, 3]` → pixels `[1, 32, 24, 3]`.
-fn tiny_decoder() -> TinyDecoder {
-    let cfg = TinyDecoderConfig {
-        latent_channels: 4,
-        channels: 8,
-        blocks: [1, 1, 1, 1],
-    };
-    TinyDecoder::from_weights(&synthetic_tiny_decoder_weights(&cfg, 7).unwrap(), cfg).unwrap()
+/// A tiny differentiable x0 decoder: latent NCHW `[1, 4, h, w]` → a fixed 1×1 channel mix →
+/// sigmoid → ×8 bilinear upsample → NHWC pixels `[1, 8h, 8w, 3]` in `(0, 1)`. (A random-init
+/// TAESD saturates its `[0, 1]` clamp on ~99% of pixels, which zeroes the gradient the test is
+/// about; the sigmoid never saturates.)
+struct TinyTestDecoder {
+    mix: Array,
+}
+
+impl TinyTestDecoder {
+    fn new() -> Self {
+        Self {
+            mix: normal(31, &[3, 4], 0.8),
+        }
+    }
+}
+
+impl mlx_gen::train::perceptual::X0Decoder for TinyTestDecoder {
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        let sh = latents.shape();
+        let (h, w) = (sh[2] as usize, sh[3] as usize);
+        let flat = latents.reshape(&[4, -1])?;
+        let rgb = mlx_rs::ops::sigmoid(&matmul(&self.mix, &flat)?)?
+            .reshape(&[1, 3, sh[2], sh[3]])?
+            .transpose_axes(&[0, 2, 3, 1])?;
+        resample_nhwc(
+            &rgb,
+            &AxisMatrix::resize(h, 8 * h, false),
+            &AxisMatrix::resize(w, 8 * w, false),
+        )
+    }
+}
+
+fn tiny_decoder() -> TinyTestDecoder {
+    TinyTestDecoder::new()
 }
 
 fn normal(seed: u64, shape: &[i32], std: f32) -> Array {
@@ -245,12 +322,16 @@ fn lora_grad(path: &mut PerceptualPath, mask: Option<&Array>) -> Option<f32> {
     Some(scalar(&g.abs().unwrap().sum(None).unwrap()))
 }
 
+/// A ViTPose that finds a person: a ×10 head gain makes peaked, confident heatmaps whose
+/// keypoints move with the image (the random-init heatmaps alone are nearly flat, so every
+/// keypoint lands on the centre and every bone length sits on the `1e-6` floor).
 fn person_pose() -> Rc<VitPose> {
-    Rc::new(vitpose_with_peak(50.0))
+    Rc::new(vitpose_with_head(10.0, 5.0))
 }
 
+/// A ViTPose that finds nobody: every heatmap is far below zero (no confident keypoint).
 fn nobody_pose() -> Rc<VitPose> {
-    Rc::new(vitpose_with_peak(-50.0))
+    Rc::new(vitpose_with_head(1.0, -50.0))
 }
 
 fn full_mask() -> Array {
@@ -342,20 +423,32 @@ fn the_subject_restricted_normal_loss_needs_and_uses_the_mask() {
     assert!((a - b).abs() > 1e-5, "masked {a} vs full {b}");
 }
 
-/// E7: the MLX footprints mirror the backend-neutral figures. Mutation: drop ViTPose from
-/// `gen_core::train::body::body_loss_footprints` for the normal-only case ⇒ red.
+/// E7: the MLX arm footprints are the backend-neutral split (ViTPose once). Mutation: drop the
+/// ViTPose attribution in `body_arm_footprint` ⇒ red.
 #[test]
-fn footprints_count_the_detector_and_each_enabled_model() {
+fn arm_footprints_count_the_detector_once() {
     let mut cfg = BodyLossesConfig::default();
-    assert!(body_loss_footprints(&cfg).is_empty());
-    assert!(body_aux_losses(&cfg).unwrap().is_empty(), "off ⇒ nothing loads");
     cfg.normal.weight = 0.1;
-    let f = body_loss_footprints(&cfg);
-    assert_eq!(f.len(), 2);
+    let f = arm_footprint(&cfg, BodyArm::Normal);
     assert_eq!(
-        f[0].param_bytes,
-        VitPoseConfig::plus_base().param_count() * 4
+        f.param_bytes,
+        (VitPoseConfig::plus_base().param_count() + SapiensConfig::normal_0_3b().param_count()) * 4
     );
+    assert_eq!(arm_footprint(&cfg, BodyArm::Proportion), AuxModelFootprint::default());
+}
+
+/// The arm builders name the missing checkpoint instead of loading nothing.
+#[test]
+fn arm_builders_name_a_missing_checkpoint() {
+    let mut cfg = BodyLossesConfig::default();
+    cfg.shape.weight = 0.1;
+    let e = shape_loss(&cfg).err().unwrap().to_string();
+    assert!(e.contains("HybrIK") && e.contains("shape_model_dir"), "{e}");
+    cfg.shape_model_dir = Some(std::path::PathBuf::from("/nonexistent/hybrik"));
+    let e = shape_loss(&cfg).err().unwrap().to_string();
+    assert!(e.contains("HybrIK"), "{e}");
+    let e = proportion_loss(&cfg).err().unwrap().to_string();
+    assert!(e.contains("pose_model_dir"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -395,3 +488,7 @@ fn real_checkpoints_match_the_reference_implementation() {
     let want = t(&r, "sapiens.out.normals_a").transpose_axes(&[0, 2, 3, 1]).unwrap();
     close("real normals", &sap.forward_pixels(&img).unwrap(), &want, 5e-3);
 }
+
+
+
+

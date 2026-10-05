@@ -14,12 +14,12 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{add, conv_transpose2d, divide, multiply, subtract};
 use mlx_rs::Array;
 
-use gen_core::train::body::{Letterbox, SapiensConfig, IMAGENET_MEAN, IMAGENET_STD};
+use mlx_gen::gen_core::train::body::{Letterbox, SapiensConfig, IMAGENET_MEAN, IMAGENET_STD};
 
 use super::{conv_ohwi, normalize, resample_nhwc, w32, AxisMatrix};
-use crate::nn::{conv2d, gelu_exact, linear, silu};
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::nn::{conv2d, gelu_exact, linear, silu};
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 struct Layer {
     ln1: (Array, Array),

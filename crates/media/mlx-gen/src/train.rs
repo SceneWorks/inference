@@ -3,7 +3,6 @@
 //! the contract types — plus the schedule module and the MLX-bound [`TrainOptimizer`] — at the
 //! historical `mlx_gen::train::…` paths (epic 3720, D4 / Appendix A).
 
-pub mod body;
 pub mod checkpoint;
 pub mod dataset;
 pub mod lora;

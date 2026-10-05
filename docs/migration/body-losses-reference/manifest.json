@@ -2,8 +2,8 @@
   "story": "sc-24832",
   "upstream": "BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual@6e01a6e",
   "producer": "scripts/reference/body_losses_reference.py",
-  "producer_sha256": "eb9a30d3336e51c92589bfa7f65a3e4b8f0f456d87d2ed34c1f4127a936811d3",
-  "fixture_sha256": "d309d6a59173cf77589e0f094037f8c9c6e6382e468a29b6be7db9308f98ec77",
+  "producer_sha256": "1d5f9eb1930734284acabc81c66bb2cf6d07bd4e110e13799968e651f6fa99f6",
+  "fixture_sha256": "681f33bdb197a0ce4b1775f6f9dabd0a35c3e7e316ad4fae0f1a22cf99647de0",
   "environment": {
     "torch": "2.9.1",
     "torchvision": "0.24.1",

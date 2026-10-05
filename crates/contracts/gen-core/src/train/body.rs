@@ -448,6 +448,44 @@ pub fn nearest_weights(in_len: usize, out_len: usize) -> Vec<f32> {
     m
 }
 
+/// A resampling matrix with at most two taps per output row (every matrix above is one), as the
+/// gather form backends apply with two index-selects and a weighted add: `out[o] = w0[o] ·
+/// x[i0[o]] + w1[o] · x[i1[o]]`. Exact in f32, unlike a dense matmul on a reduced-precision GEMM.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TwoTap {
+    pub i0: Vec<u32>,
+    pub w0: Vec<f32>,
+    pub i1: Vec<u32>,
+    pub w1: Vec<f32>,
+}
+
+impl TwoTap {
+    /// From a row-major `[out, in]` matrix. Panics on a row with more than two nonzeros (a
+    /// programming error in the matrix builders).
+    pub fn from_matrix(m: &[f32], out: usize, input: usize) -> Self {
+        assert_eq!(m.len(), out * input, "two-tap: matrix size");
+        let mut t = Self {
+            i0: vec![0; out],
+            w0: vec![0.0; out],
+            i1: vec![0; out],
+            w1: vec![0.0; out],
+        };
+        for o in 0..out {
+            let nz: Vec<usize> = (0..input).filter(|&i| m[o * input + i] != 0.0).collect();
+            assert!(nz.len() <= 2, "two-tap: row {o} has {} taps", nz.len());
+            if let Some(&i) = nz.first() {
+                t.i0[o] = i as u32;
+                t.w0[o] = m[o * input + i];
+            }
+            if let Some(&i) = nz.get(1) {
+                t.i1[o] = i as u32;
+                t.w1[o] = m[o * input + i];
+            }
+        }
+        t
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // HybrIK (ResNet-34 backbone + linear beta head).
 // ---------------------------------------------------------------------------------------------
@@ -548,11 +586,12 @@ pub fn hybrik_square_crop(bbox: [f32; 4], in_h: usize, in_w: usize) -> (usize, u
     let [x1, y1, x2, y2] = bbox.map(|v| v as f64);
     let (cx, cy) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
     let half = (x2 - x1).max(y2 - y1) * 1.25 / 2.0;
-    let lo = |v: f64| (v.round().max(0.0)) as usize;
-    let cx1 = lo(cx - half);
-    let cy1 = lo(cy - half);
-    let cx2 = ((cx + half).round().max(0.0) as usize).min(in_w);
-    let cy2 = ((cy + half).round().max(0.0) as usize).min(in_h);
+    // Python's `round` (upstream) rounds half to even.
+    let r = |v: f64| v.round_ties_even().max(0.0) as usize;
+    let cx1 = r(cx - half);
+    let cy1 = r(cy - half);
+    let cx2 = r(cx + half).min(in_w);
+    let cy2 = r(cy + half).min(in_h);
     if cx2 > cx1 && cy2 > cy1 {
         (cy1, cy2, cx1, cx2)
     } else {
@@ -729,9 +768,54 @@ impl Letterbox {
     }
 }
 
-/// The total E7 footprint of the enabled body losses' models on `images` cached references:
-/// ViTPose whenever any loss is on (it is every loss's person detector), HybrIK with the shape
-/// loss, Sapiens with the normal loss. Empty when all are off.
+/// One of the three body losses (one builder arm each).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyArm {
+    Proportion,
+    Shape,
+    Normal,
+}
+
+impl BodyArm {
+    /// The arms in builder order.
+    pub const ALL: [BodyArm; 3] = [BodyArm::Proportion, BodyArm::Shape, BodyArm::Normal];
+
+    /// Whether `cfg` enables this arm.
+    pub fn enabled(self, cfg: &BodyLossesConfig) -> bool {
+        match self {
+            Self::Proportion => cfg.proportion.is_enabled(),
+            Self::Shape => cfg.shape.is_enabled(),
+            Self::Normal => cfg.normal.is_enabled(),
+        }
+    }
+}
+
+/// The E7 footprint one body arm adds: its own model (HybrIK / Sapiens; nothing extra for the
+/// proportion arm), plus the shared ViTPose — which every body loss uses as its person detector
+/// but which is loaded **once** — attributed to the first enabled arm in [`BodyArm::ALL`] order.
+/// Zero for a disabled arm.
+pub fn body_arm_footprint(cfg: &BodyLossesConfig, arm: BodyArm) -> BodyModelFootprint {
+    if !arm.enabled(cfg) {
+        return BodyModelFootprint::default();
+    }
+    let mut f = match arm {
+        BodyArm::Proportion => BodyModelFootprint::default(),
+        BodyArm::Shape => HybrikConfig::resnet34().footprint(),
+        BodyArm::Normal => SapiensConfig::normal_0_3b().footprint(cfg.normal_restrict_to_subject),
+    };
+    let owner = BodyArm::ALL.into_iter().find(|a| a.enabled(cfg));
+    if owner == Some(arm) {
+        let v = VitPoseConfig::plus_base().footprint(cfg.ratio_count());
+        f.param_bytes += v.param_bytes;
+        f.working_set_bytes += v.working_set_bytes;
+        f.reference_bytes_per_image += v.reference_bytes_per_image;
+    }
+    f
+}
+
+/// The E7 footprints of the enabled body losses' models: ViTPose whenever any loss is on (it is
+/// every loss's person detector), HybrIK with the shape loss, Sapiens with the normal loss. Empty
+/// when all are off.
 pub fn body_loss_footprints(cfg: &BodyLossesConfig) -> Vec<BodyModelFootprint> {
     if !cfg.any_enabled() {
         return Vec::new();
@@ -815,6 +899,11 @@ mod tests {
         assert_eq!(&m[0..3], &[0.5, 0.0, 0.0]);
         assert_eq!(&m[3..6], &[0.5, 0.5, 0.0]);
         assert_eq!(nearest_weights(4, 2), vec![1., 0., 0., 0., 0., 0., 1., 0.]);
+        let t = TwoTap::from_matrix(&resize_weights(4, 2, false), 2, 4);
+        assert_eq!(
+            (t.i0, t.w0, t.i1, t.w1),
+            (vec![0, 2], vec![0.5, 0.5], vec![1, 3], vec![0.5, 0.5])
+        );
     }
 
     #[test]
@@ -825,6 +914,9 @@ mod tests {
             (35, 85, 25, 75)
         );
         assert_eq!(hybrik_square_crop([5.0, 5.0, 5.0, 5.0], 10, 10), (0, 10, 0, 10));
+        // Ties round to even like Python's `round`: cy − half = 4.5 → 4 (Rust `round` gives 5).
+        // Mutation: `round` instead of `round_ties_even` ⇒ red.
+        assert_eq!(hybrik_square_crop([5.0, 8.0, 22.0, 36.0], 40, 30), (4, 40, 0, 30));
         let s = SapiensConfig::normal_0_3b();
         let lb = s.letterbox(1024, 1024);
         assert_eq!((lb.target_h, lb.target_w, lb.new_h, lb.new_w), (512, 384, 384, 384));
@@ -859,6 +951,34 @@ mod tests {
         assert!(f[1].working_set_bytes > 1 << 30, "Sapiens-0.3B backward is GB-scale");
         cfg.shape.weight = 0.1;
         assert_eq!(body_loss_footprints(&cfg).len(), 3);
+    }
+
+    /// The per-arm split counts ViTPose exactly once (on the first enabled arm) and sums to the
+    /// total. Mutation: attribute ViTPose to every enabled arm ⇒ the sum overshoots ⇒ red.
+    #[test]
+    fn arm_footprints_count_the_shared_detector_once() {
+        let total = |cfg: &BodyLossesConfig| -> u64 {
+            body_loss_footprints(cfg)
+                .iter()
+                .map(|f| f.param_bytes + f.working_set_bytes + f.reference_bytes_per_image)
+                .sum()
+        };
+        let split = |cfg: &BodyLossesConfig| -> u64 {
+            BodyArm::ALL
+                .iter()
+                .map(|&a| body_arm_footprint(cfg, a))
+                .map(|f| f.param_bytes + f.working_set_bytes + f.reference_bytes_per_image)
+                .sum()
+        };
+        let mut cfg = BodyLossesConfig::default();
+        for (p, sh, n) in [(1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 1), (0, 1, 1)] {
+            cfg.proportion.weight = p as f32;
+            cfg.shape.weight = sh as f32;
+            cfg.normal.weight = n as f32;
+            assert_eq!(split(&cfg), total(&cfg), "{p}{sh}{n}");
+        }
+        assert_eq!(body_arm_footprint(&cfg, BodyArm::Proportion), BodyModelFootprint::default());
+        assert!(body_arm_footprint(&cfg, BodyArm::Shape).param_bytes > VitPoseConfig::plus_base().param_count() * 4);
     }
 
     #[test]
