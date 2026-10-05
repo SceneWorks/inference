@@ -15,11 +15,13 @@
 
 // The pure LR-schedule policy lives here (gen-core); the MLX training kernels
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.
+pub mod aux_schedule;
 pub mod resume;
 pub mod schedule;
 
 use std::path::PathBuf;
 
+pub use aux_schedule::{combine_step_terms, plan_step, AuxAlternation, StepPlan};
 pub use schedule::LrSchedule;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -203,12 +205,13 @@ pub struct AuxLossSchedule {
     pub t_min: f32,
     /// Inclusive upper bound of the noise-level window (see [`t_min`](Self::t_min)).
     pub t_max: f32,
-    /// Alternation period, in micro-steps (1-based step numbering):
+    /// Alternation period, counted per image and per optimizer update (see
+    /// [`aux_schedule::AuxAlternation`]):
     /// - `1` — the weighted aux loss is **added** to the diffusion loss on every in-window step;
-    /// - `n ≥ 2` — every `n`-th step (`step % n == 0`) is an **aux-only** step on which the
-    ///   diffusion loss contributes **zero**; every other step is diffusion-only. An aux-only step
-    ///   whose sampled noise level falls outside the window trains the diffusion loss instead, so
-    ///   no step is wasted. `2` (the default) is the upstream strict alternation.
+    /// - `n ≥ 2` — every `n`-th update of each image is an **aux-only** update on which the
+    ///   diffusion loss contributes **zero**; the others are diffusion-only. An aux-only update
+    ///   samples its noise level inside `[t_min, t_max]`, so no step is wasted. `2` (the default)
+    ///   is the upstream strict alternation.
     pub every_n: u32,
 }
 
@@ -555,7 +558,7 @@ pub struct TrainerDescriptor {
 }
 
 /// Per-technique support flags for the optional training techniques of epic 2123 (weight noising
-/// and depth anchoring today; gradient noise, aspect buckets, masked loss, depth anchoring and the perceptual
+/// and depth anchoring today; gradient noise, aspect buckets, masked loss and the perceptual
 /// identity/body/latent losses join here as their stories land). Each flag gates exactly one
 /// [`TrainingConfig`] knob through [`validate_training_techniques`].
 ///

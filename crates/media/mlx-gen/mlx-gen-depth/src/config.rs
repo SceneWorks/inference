@@ -162,6 +162,23 @@ impl DepthAnythingConfig {
         (backbone + fusion + head) * 4 * 2
     }
 
+    /// The aspect-preserving model input size for an `h × w` image (upstream
+    /// `DifferentiableDepthEncoder._aspect_preserving_hw`): the long side becomes
+    /// [`image_size`](Self::image_size), the short side is scaled to match and rounded to a
+    /// multiple of the patch size (at least one patch). Square inputs map to the native square.
+    pub fn input_hw(&self, h: i32, w: i32) -> (i32, i32) {
+        let (s, p) = (self.image_size, self.patch_size);
+        let short = |short: i32, long: i32| -> i32 {
+            let scaled = (short as f64 * s as f64 / long as f64 / p as f64).round() as i32 * p;
+            scaled.max(p)
+        };
+        if h >= w {
+            (s, short(w, h))
+        } else {
+            (short(h, w), s)
+        }
+    }
+
     /// `head_dim = hidden_size / num_attention_heads`.
     pub fn head_dim(&self) -> i32 {
         self.hidden_size / self.num_attention_heads

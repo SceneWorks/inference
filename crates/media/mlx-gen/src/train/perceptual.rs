@@ -1,51 +1,60 @@
 //! The **shared decoded-x0 perceptual auxiliary-loss path** (epic 2123 E8, sc-2125).
 //!
 //! Every auxiliary perceptual loss of the perceptual-character-LoRA epic — depth anchoring
-//! (sc-2125, this story), ArcFace identity + face landmarks, ViTPose/HybrIK/Sapiens body losses,
-//! and the latent-space VAE-anchor / E-LatentLPIPS losses — runs through this one module instead
-//! of re-implementing the plumbing per loss or per trainer:
+//! (sc-2125), ArcFace identity + face landmarks, ViTPose/HybrIK/Sapiens body losses, and the
+//! latent-space VAE-anchor / E-LatentLPIPS losses — runs through this one module instead of
+//! re-implementing the plumbing per loss or per trainer:
 //!
 //! 1. **Recover x0** from the model prediction for the trainer's parameterisation
 //!    ([`Parameterization::recover_x0`]).
 //! 2. **Decode x0** with the family's small differentiable decoder ([`X0Decoder`]; TAEF1 for the
 //!    Flux-VAE 16-channel families — [`super::tae::TinyDecoder`]). Losses whose
 //!    [`PerceptualLoss::input`] is [`PerceptualInput::Latents`] skip the decode.
-//! 3. **Run the frozen auxiliary model** ([`PerceptualLoss::features`]) — differentiable end to
-//!    end in its input, frozen in its own weights (they are captured constants, never trainable
-//!    params, so autograd only produces gradients for the adapter factors).
-//! 4. **Compare against a per-image reference** cached once per job
-//!    ([`PerceptualPath::ensure_reference`]): the reference is the same features computed from
-//!    the training image's own encode→decode round trip (the trainer's cached clean latent through
-//!    the same decoder), so the loss has a true zero floor.
-//! 5. **Schedule**: each loss carries its own [`AuxLossSchedule`] (weight, inclusive noise-level
-//!    window, alternation period); [`plan_step`] turns the schedules into a per-step
-//!    [`StepPlan`] — which terms contribute this step. On an aux-only step the diffusion loss
-//!    contributes **zero**.
+//! 3. **Build a per-image reference once per job** ([`PerceptualPath::ensure_reference`]): each
+//!    loss turns the training image's own encode→decode round trip (the trainer's cached clean
+//!    latent through the same decoder) into **its own reference type** — features plus any
+//!    per-image data it needs at loss time (a face crop box, keypoints, a mask) — or reports the
+//!    image **unusable** (`Ok(None)`, e.g. no face found), which skips that loss for that image.
+//! 4. **Run the frozen auxiliary model on the live x0 with the reference in hand**
+//!    ([`PerceptualLoss::loss`]) — differentiable in the live input, frozen in its own weights
+//!    (captured constants, never trainable params, so autograd only produces adapter gradients).
+//! 5. **Schedule**: the backend-neutral step policy lives in gen-core
+//!    ([`gen_core::train::aux_schedule`], re-exported here): [`AuxAlternation`] keys alternation
+//!    per image and per optimizer update, [`plan_step`] builds the [`StepPlan`], and
+//!    [`PerceptualPath::plan`] applies the per-image skips (an aux-only step whose claiming losses
+//!    all skip the image trains the diffusion loss instead).
 //!
 //! ## How a trainer uses it
 //! ```text
 //! let mut path = PerceptualPath::new(Some(Box::new(taef1)), vec![AuxLoss { schedule, loss }])?;
-//! for (i, latent) in cached_latents { path.ensure_reference(i, &latent)?; }   // once per image
-//! // per step:
-//! let plan = path.plan(step, sigma);
+//! for (i, latent) in cached_latents { path.ensure_reference(i, &latent)?; }  // once per image
+//! let mut alternation = AuxAlternation::new(images, gradient_accumulation);
+//! // per micro-step (image chosen by the trainer's own schedule):
+//! let plan = path.plan(alternation.key(step, image), image, sampled_sigma)?;
+//! let sigma = plan.noise_level;
 //! // inside the traced loss closure:
 //! let x0 = Parameterization::FlowNoiseMinusX0 { sigma }.recover_x0(&x_t, &pred)?;
-//! let aux = path.aux_loss(&plan, image_idx, &x0_nchw)?;                       // weighted sum
+//! let aux = path.aux_loss(&plan, image, &x0_nchw)?;                          // weighted sum
 //! let total = combine_step_loss(plan.diffusion.then_some(diffusion), aux.map(|a| a.weighted))?;
 //! ```
+//! Memory (E7): [`perceptual_footprint_bytes`] sums the decoder's and every enabled loss's
+//! [`AuxModelFootprint`] (computed from configs, before anything loads).
 //!
 //! ## How a new aux loss plugs in
-//! Implement [`PerceptualLoss`] (name, input kind, frozen-model `features`, `compare`, and the two
-//! memory figures), give it an [`AuxLossSchedule`], and push an [`AuxLoss`] onto the trainer's
-//! [`PerceptualPath`]. Decode, reference caching, the timestep window, alternation, and the
-//! memory estimate (E7) come for free.
+//! Implement [`PerceptualLoss`] (name, input kind, `reference` returning its own per-image type or
+//! `None` to skip, `loss` reading it back via [`reference_as`]), give it a typed
+//! [`AuxLossSchedule`] + a `TrainingTechniques` flag, provide its [`AuxModelFootprint`], and push an
+//! [`AuxLoss`] onto the trainer's [`PerceptualPath`]. Decode, reference caching, skipping, the
+//! timestep window, alternation and accumulation come for free.
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{abs, add, divide, maximum, multiply, subtract};
 use mlx_rs::Array;
 
+pub use gen_core::train::aux_schedule::{combine_step_terms, plan_step, AuxAlternation, StepPlan};
 pub use gen_core::train::AuxLossSchedule;
 
 use super::tae::TinyDecoder;
@@ -93,21 +102,11 @@ pub trait X0Decoder {
     /// Model-space latents NCHW `[B, C, h, w]` → pixels NHWC `[B, H, W, 3]` in `[0, 1]`,
     /// differentiable in `latents`.
     fn decode(&self, latents: &Array) -> Result<Array>;
-    /// Resident parameter bytes (trainer memory estimate, E7).
-    fn param_bytes(&self) -> u64;
-    /// Training working set of one differentiable decode to `out_h × out_w` pixels, in bytes.
-    fn training_working_set_bytes(&self, out_h: u32, out_w: u32) -> u64;
 }
 
 impl X0Decoder for TinyDecoder {
     fn decode(&self, latents: &Array) -> Result<Array> {
         TinyDecoder::decode(self, latents)
-    }
-    fn param_bytes(&self) -> u64 {
-        TinyDecoder::param_bytes(self)
-    }
-    fn training_working_set_bytes(&self, out_h: u32, out_w: u32) -> u64 {
-        self.config().training_working_set_bytes(out_h, out_w)
     }
 }
 
@@ -120,80 +119,42 @@ pub enum PerceptualInput {
     Latents,
 }
 
+/// A loss's per-image reference: whatever type the loss defines (features, crop box, keypoints,
+/// mask, …), read back in [`PerceptualLoss::loss`] with [`reference_as`].
+pub type LossReference = Box<dyn Any>;
+
+/// Borrow a [`LossReference`] as the loss's own type `T` (a mismatch is a loss bug ⇒ error).
+pub fn reference_as<'a, T: 'static>(loss: &str, reference: &'a dyn Any) -> Result<&'a T> {
+    reference.downcast_ref::<T>().ok_or_else(|| {
+        Error::Msg(format!(
+            "perceptual path: the '{loss}' loss was handed a reference of another type"
+        ))
+    })
+}
+
 /// One frozen auxiliary perceptual model + its comparison.
 pub trait PerceptualLoss {
     /// Short name for errors/diagnostics (e.g. `"depth"`).
     fn name(&self) -> &'static str;
-    /// What [`features`](Self::features) consumes.
+    /// What [`reference`](Self::reference) and [`loss`](Self::loss) consume.
     fn input(&self) -> PerceptualInput {
         PerceptualInput::DecodedPixels
     }
-    /// Frozen-model features of the input — called with the live x0 (inside the traced loss, so it
-    /// must be differentiable in its input) and once per image for the reference.
-    fn features(&self, input: &Array) -> Result<Array>;
-    /// Scalar loss between the live features and the cached reference (differentiable in `live`).
-    fn compare(&self, live: &Array, reference: &Array) -> Result<Array>;
-    /// Resident parameter bytes of the frozen model (E7).
-    fn param_bytes(&self) -> u64;
-    /// Training working set of one differentiable forward + backward, in bytes (E7).
-    fn training_working_set_bytes(&self) -> u64;
+    /// Build image's reference from its clean input (decoded round trip, or the clean latent for
+    /// [`PerceptualInput::Latents`]). Called once per image per job, outside autograd; the loss
+    /// must return evaluated, gradient-free data. `Ok(None)` ⇒ the image is **unusable** for this
+    /// loss (e.g. no face detected): the loss is skipped for that image on every step.
+    fn reference(&self, clean: &Array) -> Result<Option<LossReference>>;
+    /// The unweighted scalar loss of the live input for one image, given that image's reference
+    /// (crop boxes / keypoints / masks it carries are applied to the live input here).
+    /// Differentiable in `live`.
+    fn loss(&self, live: &Array, reference: &dyn Any) -> Result<Array>;
 }
 
 /// A scheduled auxiliary loss.
 pub struct AuxLoss {
     pub schedule: AuxLossSchedule,
     pub loss: Box<dyn PerceptualLoss>,
-}
-
-/// Which loss terms contribute on one training step.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StepPlan {
-    /// Whether the diffusion loss contributes. `false` ⇔ an aux-only step (the diffusion term
-    /// contributes zero).
-    pub diffusion: bool,
-    /// Indices (into the path's losses) of the aux losses that contribute, ascending.
-    pub aux: Vec<usize>,
-}
-
-impl StepPlan {
-    /// The plain diffusion step (no aux term) — every step when no aux loss is enabled.
-    pub fn diffusion_only() -> Self {
-        Self {
-            diffusion: true,
-            aux: Vec::new(),
-        }
-    }
-}
-
-/// Turn per-loss schedules into the plan for 1-based micro-step `step` at noise level `t`:
-///
-/// - a loss is *live* this step when it is enabled and `t` is inside its window;
-/// - if any live loss with `every_n ≥ 2` claims the step (`step % every_n == 0`), the step is
-///   **aux-only**: every claiming live loss plus every live `every_n == 1` loss contributes, and the
-///   diffusion loss contributes zero;
-/// - otherwise the diffusion loss contributes, plus every live `every_n == 1` (summed) loss.
-///
-/// A claimed step whose `t` falls outside every claiming loss's window therefore trains the
-/// diffusion loss (no step is wasted).
-pub fn plan_step(schedules: &[AuxLossSchedule], step: u32, t: f32) -> StepPlan {
-    let live = |s: &AuxLossSchedule| s.is_enabled() && s.in_window(t);
-    let claiming: Vec<usize> = schedules
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| live(s) && s.every_n >= 2 && step.is_multiple_of(s.every_n))
-        .map(|(i, _)| i)
-        .collect();
-    let summed = schedules
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| live(s) && s.every_n == 1)
-        .map(|(i, _)| i);
-    let mut aux: Vec<usize> = summed.chain(claiming.iter().copied()).collect();
-    aux.sort_unstable();
-    StepPlan {
-        diffusion: claiming.is_empty(),
-        aux,
-    }
 }
 
 /// The weighted aux contribution of one step, plus each contributing loss's raw value.
@@ -204,25 +165,54 @@ pub struct AuxTerms {
     pub per_loss: Vec<(usize, Array)>,
 }
 
-/// Sum the step's loss terms: the diffusion loss (when the plan has it) plus the weighted aux sum
-/// (when the plan has any aux loss). Both absent is a planning bug and errors.
+/// Sum the step's loss terms ([`combine_step_terms`]): the diffusion loss (when the plan has it)
+/// plus the weighted aux sum (when the plan has any aux loss). Both absent errors.
 pub fn combine_step_loss(diffusion: Option<Array>, aux: Option<Array>) -> Result<Array> {
-    match (diffusion, aux) {
-        (Some(d), Some(a)) => Ok(add(&d, &a)?),
-        (Some(d), None) => Ok(d),
-        (None, Some(a)) => Ok(a),
-        (None, None) => Err(Error::Msg(
-            "perceptual path: a training step with neither a diffusion nor an aux loss term".into(),
-        )),
-    }
+    combine_step_terms(
+        diffusion,
+        aux,
+        |d, a| Ok(add(&d, &a)?),
+        || {
+            Error::Msg(
+                "perceptual path: a training step with neither a diffusion nor an aux loss term"
+                    .into(),
+            )
+        },
+    )
+}
+
+/// Pre-load memory figures of one auxiliary model (epic 2123 E7), computed from its config.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuxModelFootprint {
+    /// Resident frozen weights.
+    pub param_bytes: u64,
+    /// One differentiable forward + backward at the training resolution.
+    pub working_set_bytes: u64,
+    /// The cached per-image reference.
+    pub reference_bytes_per_image: u64,
+}
+
+/// The extra training memory the perceptual path adds, in bytes: the decoder (when any loss
+/// decodes) plus every enabled loss — weights, working sets (summed: one traced backward holds the
+/// step's aux terms together) and `images` cached references each.
+pub fn perceptual_footprint_bytes(
+    decoder: Option<AuxModelFootprint>,
+    losses: &[AuxModelFootprint],
+    images: usize,
+) -> u64 {
+    decoder
+        .iter()
+        .chain(losses.iter())
+        .map(|f| f.param_bytes + f.working_set_bytes + f.reference_bytes_per_image * images as u64)
+        .sum()
 }
 
 /// The trainer-owned perceptual path: decoder + scheduled losses + the per-image reference cache.
 pub struct PerceptualPath {
     decoder: Option<Box<dyn X0Decoder>>,
     losses: Vec<AuxLoss>,
-    /// image index → one reference per loss (same order as `losses`).
-    references: HashMap<usize, Vec<Array>>,
+    /// image index → one reference per loss (same order as `losses`; `None` = unusable ⇒ skipped).
+    references: HashMap<usize, Vec<Option<LossReference>>>,
     reference_computations: usize,
 }
 
@@ -248,7 +238,7 @@ impl PerceptualPath {
         })
     }
 
-    /// Whether any loss is enabled (otherwise every step is [`StepPlan::diffusion_only`]).
+    /// Whether any loss is enabled (otherwise every step is the plain diffusion step).
     pub fn is_active(&self) -> bool {
         self.losses.iter().any(|l| l.schedule.is_enabled())
     }
@@ -256,12 +246,6 @@ impl PerceptualPath {
     /// The losses, in index order.
     pub fn losses(&self) -> &[AuxLoss] {
         &self.losses
-    }
-
-    /// The plan for 1-based micro-step `step` at noise level `t` ([`plan_step`]).
-    pub fn plan(&self, step: u32, t: f32) -> StepPlan {
-        let schedules: Vec<AuxLossSchedule> = self.losses.iter().map(|l| l.schedule).collect();
-        plan_step(&schedules, step, t)
     }
 
     fn needs_pixels<'a>(&self, idxs: impl IntoIterator<Item = &'a usize>) -> bool {
@@ -276,17 +260,29 @@ impl PerceptualPath {
             .decode(latents)
     }
 
-    /// Compute and cache image `image`'s reference features from its clean latent (NCHW, model
+    fn references_of(&self, image: usize) -> Result<&[Option<LossReference>]> {
+        self.references
+            .get(&image)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                "perceptual path: no cached reference for image {image} (ensure_reference first)"
+            ))
+            })
+    }
+
+    /// Build and cache image `image`'s per-loss references from its clean latent (NCHW, model
     /// space — the trainer's cached VAE encode of the training image), once per image per job: a
-    /// second call for the same image is a no-op. The reference is evaluated eagerly and carries no
-    /// autograd history.
+    /// second call for the same image is a no-op. The round-trip decode is gradient-stopped.
     pub fn ensure_reference(&mut self, image: usize, clean_latents: &Array) -> Result<()> {
         if self.references.contains_key(&image) {
             return Ok(());
         }
         let all: Vec<usize> = (0..self.losses.len()).collect();
         let pixels = if self.needs_pixels(&all) {
-            Some(self.decode(clean_latents)?)
+            let px = mlx_rs::stop_gradient(self.decode(clean_latents)?)?;
+            px.eval()?;
+            Some(px)
         } else {
             None
         };
@@ -296,32 +292,41 @@ impl PerceptualPath {
                 PerceptualInput::DecodedPixels => pixels.as_ref().expect("decoded above"),
                 PerceptualInput::Latents => clean_latents,
             };
-            let f = mlx_rs::stop_gradient(l.loss.features(input)?)?;
-            f.eval()?;
-            refs.push(f);
+            refs.push(l.loss.reference(input)?);
         }
         self.references.insert(image, refs);
         self.reference_computations += 1;
         Ok(())
     }
 
-    /// How many images have had their references computed this job (each exactly once).
+    /// How many images have had their references built this job (each exactly once).
     pub fn reference_computations(&self) -> usize {
         self.reference_computations
     }
 
+    /// Whether loss `loss` has a usable reference for `image` (`false` ⇒ skipped for that image).
+    pub fn is_usable(&self, image: usize, loss: usize) -> Result<bool> {
+        Ok(self.references_of(image)?[loss].is_some())
+    }
+
+    /// The plan for alternation `key` (from [`AuxAlternation::key`]) on `image` at sampled noise
+    /// level `raw_t`: [`plan_step`], minus the losses this image is unusable for (an aux-only step
+    /// left with no claiming loss trains the diffusion loss instead). Requires the image's
+    /// reference ([`ensure_reference`](Self::ensure_reference)).
+    pub fn plan(&self, key: u32, image: usize, raw_t: f32) -> Result<StepPlan> {
+        let refs = self.references_of(image)?;
+        let schedules: Vec<AuxLossSchedule> = self.losses.iter().map(|l| l.schedule).collect();
+        Ok(plan_step(&schedules, key, raw_t).without_skipped(|i| refs[i].is_none()))
+    }
+
     /// The weighted aux term for `plan` on image `image`'s live x0 latent (NCHW, model space),
-    /// differentiable in `x0`. `None` when the plan has no aux loss. Requires
-    /// [`ensure_reference`](Self::ensure_reference) for `image` first.
+    /// differentiable in `x0`. `None` when the plan has no aux loss. A loss the plan names but the
+    /// image has no usable reference for is an error (plans from [`plan`](Self::plan) never do).
     pub fn aux_loss(&self, plan: &StepPlan, image: usize, x0: &Array) -> Result<Option<AuxTerms>> {
         if plan.aux.is_empty() {
             return Ok(None);
         }
-        let refs = self.references.get(&image).ok_or_else(|| {
-            Error::Msg(format!(
-                "perceptual path: no cached reference for image {image} (ensure_reference first)"
-            ))
-        })?;
+        let refs = self.references_of(image)?;
         let pixels = if self.needs_pixels(&plan.aux) {
             Some(self.decode(x0)?)
         } else {
@@ -331,11 +336,18 @@ impl PerceptualPath {
         let mut per_loss = Vec::with_capacity(plan.aux.len());
         for &i in &plan.aux {
             let l = &self.losses[i];
+            let reference = refs[i].as_deref().ok_or_else(|| {
+                Error::Msg(format!(
+                    "perceptual path: the '{}' loss is skipped for image {image} but the plan \
+                     names it",
+                    l.loss.name()
+                ))
+            })?;
             let input = match l.loss.input() {
                 PerceptualInput::DecodedPixels => pixels.as_ref().expect("decoded above"),
                 PerceptualInput::Latents => x0,
             };
-            let raw = l.loss.compare(&l.loss.features(input)?, &refs[i])?;
+            let raw = l.loss.loss(input, reference)?;
             let w = multiply(&raw, Array::from_f32(l.schedule.weight))?;
             weighted = Some(match weighted {
                 Some(acc) => add(&acc, &w)?,
@@ -347,57 +359,6 @@ impl PerceptualPath {
             weighted: weighted.expect("plan.aux is non-empty"),
             per_loss,
         }))
-    }
-
-    /// Resident parameter bytes of the decoder + every enabled loss's frozen model (E7).
-    pub fn param_bytes(&self) -> u64 {
-        if !self.is_active() {
-            return 0;
-        }
-        let dec = self.decoder.as_ref().map_or(0, |d| d.param_bytes());
-        dec + self
-            .losses
-            .iter()
-            .filter(|l| l.schedule.is_enabled())
-            .map(|l| l.loss.param_bytes())
-            .sum::<u64>()
-    }
-
-    /// Peak extra training memory the path adds at an `out_h × out_w` decode, in bytes (E7):
-    /// resident weights, the cached references, plus the decode working set and the largest single
-    /// loss working set (the aux terms of one step run inside one traced backward, so they are
-    /// summed conservatively).
-    pub fn training_footprint_bytes(&self, out_h: u32, out_w: u32, images: usize) -> u64 {
-        if !self.is_active() {
-            return 0;
-        }
-        let enabled: Vec<&AuxLoss> = self
-            .losses
-            .iter()
-            .filter(|l| l.schedule.is_enabled())
-            .collect();
-        let decode = if enabled
-            .iter()
-            .any(|l| l.loss.input() == PerceptualInput::DecodedPixels)
-        {
-            self.decoder
-                .as_ref()
-                .map_or(0, |d| d.training_working_set_bytes(out_h, out_w))
-        } else {
-            0
-        };
-        let losses: u64 = enabled
-            .iter()
-            .map(|l| l.loss.training_working_set_bytes())
-            .sum();
-        let refs: u64 = self
-            .references
-            .values()
-            .next()
-            .map(|r| r.iter().map(|a| a.nbytes() as u64).sum::<u64>())
-            .unwrap_or(0)
-            * images as u64;
-        self.param_bytes() + decode + losses + refs
     }
 }
 
@@ -535,6 +496,177 @@ mod tests {
         a.item::<f32>()
     }
 
+    /// "Decoder" for the plumbing tests: NCHW `[1, 3, H, W]` → NHWC, unchanged values.
+    struct Identity;
+    impl X0Decoder for Identity {
+        fn decode(&self, latents: &Array) -> Result<Array> {
+            Ok(latents.transpose_axes(&[0, 2, 3, 1])?)
+        }
+    }
+
+    /// The toy per-image crop loss the face/body losses (S10/S11) are shaped like: at reference
+    /// time it finds the bright region of channel 0 (the "face"), stores its bounding box plus the
+    /// clean crop's mean colour, and reports images with no bright region as unusable; at loss time
+    /// it crops the LIVE pixels with the stored box and compares means.
+    struct BrightCrop;
+    struct CropRef {
+        /// `(y0, y1, x0, x1)`, half-open.
+        bbox: (i32, i32, i32, i32),
+        mean: Array,
+    }
+    impl BrightCrop {
+        fn crop(px: &Array, b: (i32, i32, i32, i32)) -> Array {
+            px.index((.., b.0..b.1, b.2..b.3, ..))
+        }
+    }
+    impl PerceptualLoss for BrightCrop {
+        fn name(&self) -> &'static str {
+            "bright-crop"
+        }
+        fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
+            // Read pixels by index: the decode is a transposed view, so its raw buffer is not in
+            // NHWC order.
+            let (h, w) = (clean.shape()[1], clean.shape()[2]);
+            let (mut y0, mut y1, mut x0, mut x1) = (h, 0, w, 0);
+            for y in 0..h {
+                for x in 0..w {
+                    if clean.index((0, y, x, 0)).item::<f32>() > 0.5 {
+                        (y0, y1, x0, x1) = (y0.min(y), y1.max(y + 1), x0.min(x), x1.max(x + 1));
+                    }
+                }
+            }
+            if y1 == 0 {
+                return Ok(None);
+            }
+            let bbox = (y0, y1, x0, x1);
+            let mean = mlx_rs::stop_gradient(Self::crop(clean, bbox).mean(None)?)?;
+            mean.eval()?;
+            Ok(Some(Box::new(CropRef { bbox, mean })))
+        }
+        fn loss(&self, live: &Array, reference: &dyn Any) -> Result<Array> {
+            let r = reference_as::<CropRef>(self.name(), reference)?;
+            let m = Self::crop(live, r.bbox).mean(None)?;
+            Ok(subtract(&m, &r.mean)?.square()?)
+        }
+    }
+
+    /// A clean NCHW image `[1, 3, 6, 6]`: zeros, with a bright 2×3 patch at rows 1..3, cols 2..5
+    /// when `face` is set.
+    fn clean_image(face: bool) -> (Array, Vec<f32>) {
+        let mut v = vec![0.1f32; 3 * 36];
+        if face {
+            for y in 1..3 {
+                for x in 2..5 {
+                    v[y * 6 + x] = 0.9; // channel 0 plane of NCHW
+                }
+            }
+        }
+        (Array::from_slice(&v, &[1, 3, 6, 6]), v)
+    }
+
+    fn crop_path() -> PerceptualPath {
+        PerceptualPath::new(
+            Some(Box::new(Identity)),
+            vec![AuxLoss {
+                schedule: sched(0.5, 0.0, 1.0, 2),
+                loss: Box::new(BrightCrop),
+            }],
+        )
+        .unwrap()
+    }
+
+    /// Review major (S10/S11 shape): a loss builds its own per-image reference (a crop box computed
+    /// at reference time) and applies it to the LIVE decode. Changing live pixels outside the box
+    /// leaves the loss at zero; changing them inside raises it. Mutation: crop the live pixels with
+    /// the full frame instead of `r.bbox` ⇒ the outside change moves the loss ⇒ red.
+    #[test]
+    fn a_crop_loss_applies_its_reference_box_to_the_live_decode() {
+        let mut path = crop_path();
+        let (clean, v) = clean_image(true);
+        path.ensure_reference(0, &clean).unwrap();
+        let plan = path.plan(2, 0, 0.5).unwrap();
+        assert!(!plan.diffusion && plan.aux == vec![0], "{plan:?}");
+        let at = |v: &[f32]| {
+            let x0 = Array::from_slice(v, &[1, 3, 6, 6]);
+            scalar(&path.aux_loss(&plan, 0, &x0).unwrap().unwrap().weighted)
+        };
+        assert!(at(&v).abs() < 1e-10, "self loss");
+        let mut outside = v.clone();
+        outside[5 * 6] = 0.0; // row 5, col 0: outside the box
+        assert!(
+            at(&outside).abs() < 1e-10,
+            "outside-box change must not count"
+        );
+        let mut inside = v.clone();
+        inside[6 + 3] = 0.1; // row 1, col 3: inside the box
+        assert!(at(&inside) > 1e-4, "inside-box change must count");
+    }
+
+    /// Review major: an image a loss cannot use (no "face") is skipped — no error. On a step its
+    /// alternation claims, the step trains the diffusion loss instead and the aux term is absent
+    /// (zero contribution). Mutation: drop `without_skipped` in `PerceptualPath::plan` ⇒ the plan
+    /// names the loss ⇒ `aux_loss` errors ⇒ red.
+    #[test]
+    fn an_unusable_image_is_skipped_and_falls_back_to_diffusion() {
+        let mut path = crop_path();
+        let (clean, _) = clean_image(false);
+        path.ensure_reference(1, &clean).unwrap();
+        assert!(!path.is_usable(1, 0).unwrap());
+        let plan = path.plan(2, 1, 0.5).unwrap();
+        assert!(plan.diffusion && plan.aux.is_empty(), "{plan:?}");
+        assert!(path.aux_loss(&plan, 1, &clean).unwrap().is_none());
+        // An image never prepared is an error, never a silent skip.
+        assert!(path.plan(2, 7, 0.5).is_err());
+    }
+
+    #[test]
+    fn a_pixel_loss_without_a_decoder_is_refused() {
+        let r = PerceptualPath::new(
+            None,
+            vec![AuxLoss {
+                schedule: sched(0.1, 0.0, 1.0, 2),
+                loss: Box::new(BrightCrop),
+            }],
+        );
+        assert!(r.is_err());
+    }
+
+    /// References are built once per image per job however often `ensure_reference` is called.
+    /// Mutation: drop the `contains_key` early return ⇒ counter 6 ⇒ red.
+    #[test]
+    fn references_are_computed_once_per_image() {
+        let mut path = crop_path();
+        let imgs = [clean_image(true).0, clean_image(false).0];
+        for _epoch in 0..3 {
+            for (i, l) in imgs.iter().enumerate() {
+                path.ensure_reference(i, l).unwrap();
+            }
+        }
+        assert_eq!(path.reference_computations(), 2);
+        assert!(combine_step_loss(None, None).is_err());
+    }
+
+    /// E7: the shared pre-load estimator sums weights, working sets and per-image references.
+    /// Mutation: drop the `× images` term ⇒ red.
+    #[test]
+    fn footprint_sums_models_and_references() {
+        let dec = AuxModelFootprint {
+            param_bytes: 10,
+            working_set_bytes: 100,
+            reference_bytes_per_image: 0,
+        };
+        let loss = AuxModelFootprint {
+            param_bytes: 1_000,
+            working_set_bytes: 10_000,
+            reference_bytes_per_image: 7,
+        };
+        assert_eq!(
+            perceptual_footprint_bytes(Some(dec), &[loss], 3),
+            11_110 + 21
+        );
+        assert_eq!(perceptual_footprint_bytes(None, &[], 3), 0);
+    }
+
     /// AC3: the SSI loss (and the full depth loss) is invariant to scale and shift of the
     /// predicted depth. Mutation: replace `aligned = s·p + t` with `aligned = p` in `ssi_l1` ⇒ the
     /// scaled/shifted losses differ ⇒ red.
@@ -593,56 +725,6 @@ mod tests {
         assert!(scalar(&multiscale_grad_loss(&other, &t, 4).unwrap()) > 0.01);
     }
 
-    /// AC1 (alternation): with `every_n = 2` the depth steps and diffusion steps alternate; on a
-    /// depth step the diffusion term is off. Mutation: `diffusion: true` in `plan_step` ⇒ red.
-    #[test]
-    fn strict_alternation_pattern() {
-        let s = [sched(0.1, 0.0, 1.0, 2)];
-        let pattern: Vec<bool> = (1..=6)
-            .map(|step| plan_step(&s, step, 0.5).diffusion)
-            .collect();
-        assert_eq!(pattern, vec![true, false, true, false, true, false]);
-        for step in 1..=6 {
-            let p = plan_step(&s, step, 0.5);
-            assert_eq!(p.aux.is_empty(), p.diffusion, "step {step}: {p:?}");
-        }
-    }
-
-    #[test]
-    fn period_three_window_and_sum_mode() {
-        let s = [sched(0.1, 0.2, 0.6, 3)];
-        // every 3rd step is aux-only when in window.
-        assert!(!plan_step(&s, 3, 0.4).diffusion);
-        assert!(plan_step(&s, 4, 0.4).diffusion && plan_step(&s, 4, 0.4).aux.is_empty());
-        // a claimed step out of window trains diffusion instead (no wasted step).
-        assert_eq!(plan_step(&s, 6, 0.9), StepPlan::diffusion_only());
-        // window bounds are inclusive.
-        assert!(!plan_step(&s, 3, 0.2).diffusion && !plan_step(&s, 3, 0.6).diffusion);
-        // every_n = 1 sums with diffusion on every in-window step.
-        let sum = [sched(0.1, 0.0, 1.0, 1)];
-        assert_eq!(
-            plan_step(&sum, 7, 0.5),
-            StepPlan {
-                diffusion: true,
-                aux: vec![0]
-            }
-        );
-        // off ⇒ diffusion only, always.
-        let off = [AuxLossSchedule::OFF];
-        for step in 1..=4 {
-            assert_eq!(plan_step(&off, step, 0.5), StepPlan::diffusion_only());
-        }
-        // a summed loss rides along on another loss's aux-only step.
-        let both = [sched(0.1, 0.0, 1.0, 2), sched(0.2, 0.0, 1.0, 1)];
-        assert_eq!(
-            plan_step(&both, 2, 0.5),
-            StepPlan {
-                diffusion: false,
-                aux: vec![0, 1]
-            }
-        );
-    }
-
     #[test]
     fn recover_x0_inverts_each_parameterisation() {
         let x0 = map(7, &[1, 2, 3, 3]);
@@ -693,91 +775,5 @@ mod tests {
                 .unwrap(),
             &x0,
         );
-    }
-
-    /// A latent-input toy loss (mean-squared vs reference) to exercise the cache + plumbing
-    /// without a decoder.
-    struct LatentMse;
-    impl PerceptualLoss for LatentMse {
-        fn name(&self) -> &'static str {
-            "latent-mse"
-        }
-        fn input(&self) -> PerceptualInput {
-            PerceptualInput::Latents
-        }
-        fn features(&self, input: &Array) -> Result<Array> {
-            Ok(input.clone())
-        }
-        fn compare(&self, live: &Array, reference: &Array) -> Result<Array> {
-            Ok(subtract(live, reference)?.square()?.mean(None)?)
-        }
-        fn param_bytes(&self) -> u64 {
-            0
-        }
-        fn training_working_set_bytes(&self) -> u64 {
-            0
-        }
-    }
-
-    struct PixelLoss;
-    impl PerceptualLoss for PixelLoss {
-        fn name(&self) -> &'static str {
-            "pixel"
-        }
-        fn features(&self, input: &Array) -> Result<Array> {
-            Ok(input.clone())
-        }
-        fn compare(&self, live: &Array, reference: &Array) -> Result<Array> {
-            Ok(subtract(live, reference)?.abs()?.mean(None)?)
-        }
-        fn param_bytes(&self) -> u64 {
-            0
-        }
-        fn training_working_set_bytes(&self) -> u64 {
-            0
-        }
-    }
-
-    #[test]
-    fn a_pixel_loss_without_a_decoder_is_refused() {
-        let r = PerceptualPath::new(
-            None,
-            vec![AuxLoss {
-                schedule: sched(0.1, 0.0, 1.0, 2),
-                loss: Box::new(PixelLoss),
-            }],
-        );
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn references_are_computed_once_per_image_and_weighted() {
-        let mut path = PerceptualPath::new(
-            None,
-            vec![AuxLoss {
-                schedule: sched(0.5, 0.0, 1.0, 2),
-                loss: Box::new(LatentMse),
-            }],
-        )
-        .unwrap();
-        let lat = [map(10, &[1, 2, 2, 2]), map(11, &[1, 2, 2, 2])];
-        for _epoch in 0..3 {
-            for (i, l) in lat.iter().enumerate() {
-                path.ensure_reference(i, l).unwrap();
-            }
-        }
-        assert_eq!(path.reference_computations(), 2);
-        let plan = path.plan(2, 0.5);
-        let live = add(&lat[0], Array::from_f32(1.0)).unwrap();
-        let terms = path.aux_loss(&plan, 0, &live).unwrap().unwrap();
-        assert!((scalar(&terms.weighted) - 0.5).abs() < 1e-5);
-        assert!((scalar(&terms.per_loss[0].1) - 1.0).abs() < 1e-5);
-        assert!(path
-            .aux_loss(&path.plan(1, 0.5), 0, &live)
-            .unwrap()
-            .is_none());
-        // An image with no reference is an error, never a silent zero.
-        assert!(path.aux_loss(&plan, 5, &live).is_err());
-        assert!(combine_step_loss(None, None).is_err());
     }
 }

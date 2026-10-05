@@ -5,13 +5,16 @@
 //! `TrainingTechniques::depth_anchoring` reuses the same decode → DA2 → cached-reference → SSI +
 //! multi-scale-gradient comparison.
 
+use std::any::Any;
 use std::path::Path;
 
 use mlx_rs::ops::multiply;
 use mlx_rs::{random, Array};
 
 use mlx_gen::gen_core::train::DepthModelSize;
-use mlx_gen::train::perceptual::{depth_consistency_loss, PerceptualLoss};
+use mlx_gen::train::perceptual::{
+    depth_consistency_loss, reference_as, AuxModelFootprint, LossReference, PerceptualLoss,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -20,14 +23,18 @@ use crate::{DepthAnythingConfig, DepthAnythingV2};
 /// Frozen Depth-Anything-V2 + the MiDaS depth-consistency comparison.
 pub struct DepthAnchorLoss {
     model: DepthAnythingV2,
-    param_bytes: u64,
+}
+
+/// The per-image depth-anchoring reference: the DA2 depth of the image's clean round trip.
+pub struct DepthReference {
+    /// `[1, h, w]` relative depth at the aspect-preserving model size.
+    pub depth: Array,
 }
 
 impl DepthAnchorLoss {
     /// Wrap a loaded estimator.
     pub fn new(model: DepthAnythingV2) -> Self {
-        let param_bytes = model.config().param_count() * 4;
-        Self { model, param_bytes }
+        Self { model }
     }
 
     /// Load the `size` checkpoint from `dir` (a `Depth-Anything-V2-{Small,Base,Large}-hf` snapshot).
@@ -49,30 +56,37 @@ impl PerceptualLoss for DepthAnchorLoss {
         "depth"
     }
 
-    /// Decoded x0 pixels `[B, H, W, 3]` in `[0, 1]` → relative depth `[B, S, S]`.
-    fn features(&self, pixels: &Array) -> Result<Array> {
-        self.model.forward_pixels(pixels)
+    /// The clean round trip's depth. Every image is usable for depth.
+    fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
+        let depth = mlx_rs::stop_gradient(self.model.forward_pixels(clean)?)?;
+        depth.eval()?;
+        Ok(Some(Box::new(DepthReference { depth })))
     }
 
-    fn compare(&self, live: &Array, reference: &Array) -> Result<Array> {
-        depth_consistency_loss(live, reference)
-    }
-
-    fn param_bytes(&self) -> u64 {
-        self.param_bytes
-    }
-
-    fn training_working_set_bytes(&self) -> u64 {
-        self.model.config().training_working_set_bytes()
+    /// Live decoded pixels `[1, H, W, 3]` → DA2 depth → SSI-L1 + multi-scale gradient vs the
+    /// reference depth (same shape: same-sized decode, same aspect-preserving resize).
+    fn loss(&self, live: &Array, reference: &dyn Any) -> Result<Array> {
+        let r = reference_as::<DepthReference>(self.name(), reference)?;
+        depth_consistency_loss(&self.model.forward_pixels(live)?, &r.depth)
     }
 }
 
-/// The extra training memory depth anchoring adds for a DA2 checkpoint of `size`, before any model
-/// is loaded (resident f32 weights + one differentiable forward/backward) — what a trainer's
-/// pre-flight memory estimate adds when the technique is on (epic 2123 E7).
-pub fn depth_anchor_footprint_bytes(size: DepthModelSize) -> u64 {
+/// The pre-load memory figures of depth anchoring with a DA2 checkpoint of `size` on
+/// `image_h × image_w` training images (epic 2123 E7): resident f32 weights, one differentiable
+/// forward/backward at the native size (an upper bound for any aspect), and one cached depth map
+/// per image at the aspect-preserving model size.
+pub fn depth_anchor_footprint(
+    size: DepthModelSize,
+    image_h: u32,
+    image_w: u32,
+) -> AuxModelFootprint {
     let cfg = DepthAnythingConfig::for_size(size);
-    cfg.param_count() * 4 + cfg.training_working_set_bytes()
+    let (h, w) = cfg.input_hw(image_h as i32, image_w as i32);
+    AuxModelFootprint {
+        param_bytes: cfg.param_count() * 4,
+        working_set_bytes: cfg.training_working_set_bytes(),
+        reference_bytes_per_image: h as u64 * w as u64 * 4,
+    }
 }
 
 /// A complete random-init checkpoint for `cfg` (every key [`DepthAnythingV2::from_weights`]
@@ -231,55 +245,100 @@ mod tests {
         assert!(w.unused_keys().is_empty(), "unused: {:?}", w.unused_keys());
     }
 
-    /// The DA2 forward is differentiable end to end in its pixel input (no host round trip,
-    /// argmax or stop-gradient), so the depth loss can train the adapter through it.
-    #[test]
-    fn depth_anchor_loss_is_differentiable_in_the_pixels() {
+    fn tiny_loss() -> DepthAnchorLoss {
         let cfg = tiny_config();
-        let loss = DepthAnchorLoss::new(
+        DepthAnchorLoss::new(
             DepthAnythingV2::from_weights(&synthetic_weights(&cfg, 4).unwrap(), cfg).unwrap(),
-        );
-        let px = random::uniform::<_, f32>(
+        )
+    }
+
+    fn pixels(seed: u64, h: i32, w: i32) -> Array {
+        random::uniform::<_, f32>(
             0.0f32,
             1.0f32,
-            &[1, 16, 16, 3],
-            Some(&random::key(1).unwrap()),
+            &[1, h, w, 3],
+            Some(&random::key(seed).unwrap()),
         )
-        .unwrap();
-        let reference = loss
-            .features(
-                &random::uniform::<_, f32>(
-                    0.0f32,
-                    1.0f32,
-                    &[1, 16, 16, 3],
-                    Some(&random::key(2).unwrap()),
-                )
-                .unwrap(),
-            )
+        .unwrap()
+    }
+
+    /// The DA2 forward is differentiable end to end in its pixel input (no host round trip,
+    /// argmax or stop-gradient), so the depth loss can train the adapter through it — for square
+    /// and non-square inputs alike.
+    #[test]
+    fn depth_anchor_loss_is_differentiable_in_the_pixels() {
+        let loss = tiny_loss();
+        for (h, w, depth_hw) in [(16, 16, [8, 8]), (16, 24, [6, 8])] {
+            let reference = loss
+                .reference(&pixels(2, h, w))
+                .unwrap()
+                .expect("depth usable");
+            let r = reference.downcast_ref::<DepthReference>().unwrap();
+            assert_eq!(r.depth.shape(), &[1, depth_hw[0], depth_hw[1]], "{h}x{w}");
+            let px = pixels(1, h, w);
+            let f = |p: &Array| -> mlx_rs::error::Result<Array> {
+                loss.loss(p, r)
+                    .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+            };
+            let g = grad(f)(&px).unwrap();
+            eval([&g]).unwrap();
+            let mag = g.abs().unwrap().sum(None).unwrap().item::<f32>();
+            assert!(
+                mag > 0.0 && mag.is_finite(),
+                "{h}x{w}: pixel gradient {mag}"
+            );
+        }
+    }
+
+    /// Review minor: a non-square input is resized aspect-preservingly (long side `image_size`,
+    /// short side a multiple of the patch size), not squashed to a square. Mutation: resize to
+    /// `(image_size, image_size)` in `forward_pixels` ⇒ the 16×24 depth is 8×8 ⇒ red.
+    #[test]
+    fn non_square_inputs_keep_their_aspect() {
+        let cfg = tiny_config(); // image_size 8, patch 2
+        assert_eq!(cfg.input_hw(16, 16), (8, 8));
+        assert_eq!(cfg.input_hw(16, 24), (6, 8));
+        assert_eq!(cfg.input_hw(24, 16), (8, 6));
+        assert_eq!(cfg.input_hw(2, 100), (2, 8), "at least one patch");
+        let real = DepthAnythingConfig::small();
+        assert_eq!(real.input_hw(1024, 1024), (518, 518));
+        assert_eq!(real.input_hw(768, 1024), (392, 518));
+        let d = tiny_loss()
+            .model()
+            .forward_pixels(&pixels(3, 16, 24))
             .unwrap();
-        assert_eq!(reference.shape(), &[1, 8, 8]);
-        let f = |p: &Array| -> mlx_rs::error::Result<Array> {
-            let d = loss
-                .features(p)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
-            loss.compare(&d, &reference)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
-        };
-        let g = grad(f)(&px).unwrap();
-        eval([&g]).unwrap();
-        let mag = g.abs().unwrap().sum(None).unwrap().item::<f32>();
-        assert!(
-            mag > 0.0 && mag.is_finite(),
-            "pixel gradient magnitude {mag}"
-        );
+        assert_eq!(d.shape(), &[1, 6, 8]);
+        // A square input at the native size never resamples the position embedding: the result
+        // is the plain forward of the normalized pixels.
+        let sq = pixels(4, 8, 8);
+        let a = tiny_loss().model().forward_pixels(&sq).unwrap();
+        let mean = Array::from_slice(&crate::preprocess::IMAGE_MEAN, &[1, 1, 1, 3]);
+        let std = Array::from_slice(&crate::preprocess::IMAGE_STD, &[1, 1, 1, 3]);
+        let norm = mlx_rs::ops::divide(mlx_rs::ops::subtract(&sq, &mean).unwrap(), &std).unwrap();
+        let b = tiny_loss().model().forward_batch(&norm).unwrap();
+        let diff = a.subtract(&b).unwrap().abs().unwrap().max(None).unwrap();
+        eval([&diff]).unwrap();
+        assert!(diff.item::<f32>() < 1e-6);
     }
 
     #[test]
     fn footprint_grows_with_model_size() {
-        let s = depth_anchor_footprint_bytes(DepthModelSize::Small);
-        let b = depth_anchor_footprint_bytes(DepthModelSize::Base);
-        let l = depth_anchor_footprint_bytes(DepthModelSize::Large);
-        assert!(s < b && b < l, "{s} {b} {l}");
-        assert!(s > DepthAnythingConfig::small().param_count() * 4);
+        let f = |s| depth_anchor_footprint(s, 1024, 1024);
+        let (s, b, l) = (
+            f(DepthModelSize::Small),
+            f(DepthModelSize::Base),
+            f(DepthModelSize::Large),
+        );
+        let total = |x: AuxModelFootprint| x.param_bytes + x.working_set_bytes;
+        assert!(total(s) < total(b) && total(b) < total(l));
+        assert_eq!(
+            s.param_bytes,
+            DepthAnythingConfig::small().param_count() * 4
+        );
+        assert_eq!(s.reference_bytes_per_image, 518 * 518 * 4);
+        assert_eq!(
+            depth_anchor_footprint(DepthModelSize::Small, 768, 1024).reference_bytes_per_image,
+            392 * 518 * 4
+        );
     }
 }

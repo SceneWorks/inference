@@ -65,6 +65,17 @@ impl TinyDecoderConfig {
             + conv(c, 3, true)
     }
 
+    /// The pre-load memory figures of this decoder for `out_h × out_w` training images (resident
+    /// f32 weights + one differentiable decode); the shared estimator
+    /// [`super::perceptual::perceptual_footprint_bytes`] sums it with the losses'.
+    pub fn footprint(&self, out_h: u32, out_w: u32) -> super::perceptual::AuxModelFootprint {
+        super::perceptual::AuxModelFootprint {
+            param_bytes: self.param_count() * 4,
+            working_set_bytes: self.training_working_set_bytes(out_h, out_w),
+            reference_bytes_per_image: 0,
+        }
+    }
+
     /// Conservative upper bound on the **training working set** of one differentiable decode to an
     /// `out_h × out_w` image, in bytes: every intermediate the backward retains (each Block keeps
     /// its three conv outputs, two ReLUs, the residual sum and the fused ReLU; each stage keeps its

@@ -98,7 +98,9 @@ impl DepthAnythingV2 {
     /// Batched [`forward`](Self::forward): normalized NHWC `[B, S, S, 3]` (`S = image_size`) →
     /// depth `[B, S, S]`.
     pub fn forward_batch(&self, pixel_values: &Array) -> Result<Array> {
-        let grid = self.cfg.grid();
+        let sh = pixel_values.shape();
+        let p = self.cfg.patch_size;
+        let grid = (sh[1] / p, sh[2] / p);
         let hidden = self.backbone.forward(pixel_values)?;
         if hidden.len() != 4 {
             return Err(Error::Msg(format!(
@@ -111,16 +113,19 @@ impl DepthAnythingV2 {
     }
 
     /// The **differentiable** pixel entry point the depth-anchoring training loss uses (epic 2123,
-    /// sc-2125): NHWC pixels `[B, H, W, 3]` in `[0, 1]` → depth `[B, S, S]`. The resize to the
-    /// native square `S = image_size` (bilinear, half-pixel centers) and the ImageNet
-    /// normalization run as MLX ops, so — unlike the host-side
+    /// sc-2125): NHWC pixels `[B, H, W, 3]` in `[0, 1]` → depth `[B, h, w]` at the
+    /// aspect-preserving model size [`DepthAnythingConfig::input_hw`] (long side `image_size`,
+    /// short side a multiple of the patch size, as upstream). The resize (bilinear, half-pixel
+    /// centers — upstream uses antialiased bicubic; bilinear keeps the op set autograd-safe) and the
+    /// ImageNet normalization run as MLX ops, so — unlike the host-side
     /// [`estimate_control_rgb8`](Self::estimate_control_rgb8) preprocessor — the gradient flows from
-    /// the depth map back to the pixels. (Upstream resizes aspect-preservingly with antialiased
-    /// bicubic; the trainers feed square crops, so the square resize is the same geometry, and
-    /// bilinear keeps the op set autograd-safe.)
+    /// the depth map back to the pixels. A non-square grid resamples the position embedding. The
+    /// training reference is produced by this same call on the same-sized clean decode, so live
+    /// and reference maps always share a shape.
     pub fn forward_pixels(&self, pixels: &Array) -> Result<Array> {
-        let s = self.cfg.image_size;
-        let x = util::bilinear_resize(pixels, s, s, false)?;
+        let sh = pixels.shape();
+        let (h, w) = self.cfg.input_hw(sh[1], sh[2]);
+        let x = util::bilinear_resize(pixels, h, w, false)?;
         let mean = Array::from_slice(&preprocess::IMAGE_MEAN, &[1, 1, 1, 3]);
         let std = Array::from_slice(&preprocess::IMAGE_STD, &[1, 1, 1, 3]);
         let x = mlx_rs::ops::divide(&mlx_rs::ops::subtract(&x, &mean)?, &std)?;
