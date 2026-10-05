@@ -21,7 +21,7 @@ use candle_gen::gen_core::{
     self, safetensors_file_metadata, safetensors_path_tensor_headers, CancelFlag, Image, LoadSpec,
     Modality, Progress, SafetensorsTensorHeader, WeightsSource,
 };
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
     self, run_flow_match_training, velocity_loss, FlowMatchTrainer, SamplePlan,
 };
@@ -1216,6 +1216,8 @@ pub struct LtxSampleState {
     contexts: Vec<SampleContext>,
     vae: Arc<LtxVideoVae>,
     aux: TrainingAux,
+    /// LTX-2.3 preview latent edge: the largest training bucket's (sc-2127); `0` for LTX-2.5, whose
+    /// previews take their geometry from the validation plan.
     latent_edge: usize,
 }
 
@@ -1237,9 +1239,12 @@ pub struct AvTrainingPositions {
     audio: Option<Tensor>,
 }
 
+/// Run-wide state the driver threads into every micro-step. LTX-2.3 carries nothing run-wide: its
+/// RoPE position grid depends on the sample's resolution bucket, so it lives in each
+/// [`TrainingCached::Ltx23`] entry (sc-2127).
 #[derive(Clone)]
 pub enum TrainingAux {
-    Ltx23(Tensor),
+    Ltx23,
     Ltx25(AvTrainingPositions),
 }
 
@@ -1258,7 +1263,13 @@ impl LoraHost for TrainingDiT {
 }
 
 pub enum TrainingCached {
-    Ltx23 { clean: Tensor, context: Tensor },
+    /// One `(item, bucket)` still: clean latent tokens, caption context, and the bucket's RoPE
+    /// position grid (shared across items by refcounted clone).
+    Ltx23 {
+        clean: Tensor,
+        context: Tensor,
+        positions: Tensor,
+    },
     Ltx25(Box<AvTrainingExample>),
 }
 
@@ -1303,6 +1314,11 @@ pub fn trainer_descriptor_25() -> TrainerDescriptor {
 }
 
 fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
+    // sc-2127 (epic 2123): LTX-2.3 encodes stills at each bucket's spatial edge. LTX-2.5 trains on
+    // pre-encoded prepared AV latents whose geometry is fixed by the prepared bundle (one shared
+    // geometry per run, enforced at cache time) — it never resizes an image, so there is no edge
+    // a bucket could change and the shared floor keeps refusing buckets there.
+    let resolution_buckets = id == TRAINER_ID;
     TrainerDescriptor {
         id,
         family: "ltx",
@@ -1313,7 +1329,12 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
@@ -1439,8 +1460,13 @@ pub fn projected_dense_peak_gb(latent_tokens: usize) -> f64 {
     16.9 + 0.0251 * latent_tokens as f64
 }
 
-fn preflight_against_budget(resolution: u32, available_bytes: u64) -> Result<()> {
-    let edge = bucket_resolution(resolution);
+/// Refuse a dense (non-checkpointed) run whose first step projects past the safe budget, sized at the
+/// LARGEST training bucket edge (sc-2127 / epic 2123 E7 — just the floored `resolution` when buckets
+/// are off). The projection models the per-step activation peak, which only the sampled bucket's
+/// token count drives; the in-memory latent cache (one small latent per item per bucket) is not part
+/// of it.
+fn preflight_against_budget(cfg: &TrainingConfig, available_bytes: u64) -> Result<()> {
+    let edge = bucket_edges(cfg).into_iter().max().unwrap_or(0);
     let latent_edge = edge as usize / SPATIAL_SCALE;
     let projected = projected_dense_peak_gb(latent_edge * latent_edge);
     let available_gb = available_bytes as f64 / 1024f64.powi(3);
@@ -1453,6 +1479,32 @@ fn preflight_against_budget(resolution: u32, available_bytes: u64) -> Result<()>
         )));
     }
     Ok(())
+}
+
+/// One LTX-2.3 resolution bucket's still geometry (sc-2127): the floored pixel edge the image is
+/// resized to, its latent edge, and the matching single-frame RoPE position grid.
+struct Ltx23BucketGrid {
+    edge: u32,
+    latent_edge: usize,
+    positions: Tensor,
+}
+
+/// The per-bucket still geometry of `cfg`, in [`TrainingConfig::training_buckets`] order (exactly the
+/// one legacy `bucket_resolution(cfg.resolution)` grid when buckets are off).
+fn ltx23_bucket_grids(cfg: &TrainingConfig, device: &Device) -> Result<Vec<Ltx23BucketGrid>> {
+    bucket_edges(cfg)
+        .into_iter()
+        .map(|edge| {
+            let latent_edge = edge as usize / SPATIAL_SCALE;
+            let positions =
+                create_position_grid(1, latent_edge, latent_edge, DEFAULT_FPS as f32, device)?;
+            Ok(Ltx23BucketGrid {
+                edge,
+                latent_edge,
+                positions,
+            })
+        })
+        .collect()
 }
 
 fn available_device_bytes() -> u64 {
@@ -1799,6 +1851,9 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     gen_core::train::validate_control_request(&descriptor, req)?;
     gen_core::train::validate_full_finetune_request(&descriptor, req)?;
     gen_core::train::validate_edit_request(&descriptor, req)?;
+    // Epic 2123 E3: refuse an undeclared technique (weight noise, resolution buckets) here too, so
+    // the public preflight matches the `train` entry floor.
+    gen_core::train::validate_training_techniques(&descriptor, req)?;
     validate_ltx_request(req, MODEL_25_ID)?;
     if !req.config.alpha.is_finite() || req.config.alpha <= 0.0 {
         return Err(CandleError::Msg(
@@ -2523,7 +2578,7 @@ impl FlowMatchTrainer for LtxTrainer {
             )));
         }
         if !req.config.gradient_checkpointing {
-            preflight_against_budget(req.config.resolution, available_device_bytes())?;
+            preflight_against_budget(&req.config, available_device_bytes())?;
         }
         if matches!(self.route, TrainingRoute::Ltx25 { .. }) {
             Ltx25ConditioningPlan::from_request(req)?;
@@ -2563,11 +2618,12 @@ impl FlowMatchTrainer for LtxTrainer {
                 )?;
                 let tokenizer = TrainingTokenizer::Gemma3(tokenizer);
                 let encoder = TrainingTextEncoder::Gemma3(Box::new(encoder));
-                let edge = bucket_resolution(req.config.resolution);
-                let latent_edge = edge as usize / SPATIAL_SCALE;
-                let positions =
-                    create_position_grid(1, latent_edge, latent_edge, DEFAULT_FPS as f32, device)?;
-                let mut cached = Vec::with_capacity(req.items.len());
+                // sc-2127 — one spatial edge (+ its RoPE grid) per resolution bucket; stills, so the
+                // frame axis stays 1. Previews render at the largest bucket.
+                let grids = ltx23_bucket_grids(&req.config, device)?;
+                let latent_edge = grids.iter().map(|g| g.latent_edge).max().unwrap_or(0);
+                // Item-major: `cached[item * grids.len() + bucket]`.
+                let mut cached = Vec::with_capacity(req.items.len() * grids.len());
                 for (i, item) in req.items.iter().enumerate() {
                     if req.cancel.is_cancelled() {
                         break;
@@ -2576,11 +2632,18 @@ impl FlowMatchTrainer for LtxTrainer {
                         current: i as u32 + 1,
                         total: req.items.len() as u32,
                     });
-                    let image = load_image_tensor(&item.image_path, edge, device)?;
-                    let video = image.unsqueeze(2)?;
-                    let clean = flatten_latent(&vae.encode(&video)?)?.to_dtype(DType::F32)?;
                     let context = encode_context(&tokenizer, &encoder, &item.caption, device)?;
-                    cached.push(TrainingCached::Ltx23 { clean, context });
+                    let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+                    for grid in &grids {
+                        let image = square_image_tensor(&square, grid.edge, device)?;
+                        let video = image.unsqueeze(2)?;
+                        let clean = flatten_latent(&vae.encode(&video)?)?.to_dtype(DType::F32)?;
+                        cached.push(TrainingCached::Ltx23 {
+                            clean,
+                            context: context.clone(),
+                            positions: grid.positions.clone(),
+                        });
+                    }
                 }
                 let sample_plan =
                     if req.config.sample_every > 0 && !req.config.sample_prompts.is_empty() {
@@ -2605,14 +2668,14 @@ impl FlowMatchTrainer for LtxTrainer {
                             state: Some(LtxSampleState {
                                 contexts,
                                 vae: Arc::new(vae),
-                                aux: TrainingAux::Ltx23(positions.clone()),
+                                aux: TrainingAux::Ltx23,
                                 latent_edge,
                             }),
                         }
                     } else {
                         SamplePlan::disabled()
                     };
-                Ok((cached, TrainingAux::Ltx23(positions), sample_plan))
+                Ok((cached, TrainingAux::Ltx23, sample_plan))
             }
             TrainingRoute::Ltx25 { bundle, tier, .. } => {
                 // A packed tier is a complete release unit: even though this trainer consumes
@@ -2790,8 +2853,12 @@ impl FlowMatchTrainer for LtxTrainer {
         match (dit, cached, positions) {
             (
                 TrainingDiT::Ltx23(dit),
-                TrainingCached::Ltx23 { clean, context },
-                TrainingAux::Ltx23(positions),
+                TrainingCached::Ltx23 {
+                    clean,
+                    context,
+                    positions,
+                },
+                TrainingAux::Ltx23,
             ) => {
                 let noise = flow_match::sample_noise(
                     clean.dims(),
@@ -2871,12 +2938,10 @@ impl FlowMatchTrainer for LtxTrainer {
         seed: u64,
     ) -> Result<Image> {
         match (dit, &state.contexts[index], &state.aux) {
-            (
-                TrainingDiT::Ltx23(dit),
-                SampleContext::Ltx23(context),
-                TrainingAux::Ltx23(positions),
-            ) => {
+            (TrainingDiT::Ltx23(dit), SampleContext::Ltx23(context), TrainingAux::Ltx23) => {
                 let edge = state.latent_edge;
+                let positions =
+                    &create_position_grid(1, edge, edge, DEFAULT_FPS as f32, &self.device)?;
                 let latent = crate::pipeline::create_noise(seed, 1, edge, edge, &self.device)?;
                 let noise = flatten_latent(&latent)?;
                 let cancel = CancelFlag::new();
@@ -3321,11 +3386,67 @@ mod tests {
     #[test]
     fn memory_projection_and_guard_are_testable_before_cache() {
         assert!((projected_dense_peak_gb(1024) - 42.6024).abs() < 1e-4);
-        preflight_against_budget(512, 64 * 1024 * 1024 * 1024).unwrap();
-        let err = preflight_against_budget(2048, 16 * 1024 * 1024 * 1024)
+        let at = |resolution: u32| TrainingConfig {
+            resolution,
+            ..TrainingConfig::default()
+        };
+        preflight_against_budget(&at(512), 64 * 1024 * 1024 * 1024).unwrap();
+        let err = preflight_against_budget(&at(2048), 16 * 1024 * 1024 * 1024)
             .unwrap_err()
             .to_string();
         assert!(err.contains("gradient checkpointing"), "{err}");
+    }
+
+    fn bucketed(resolution: u32, edges: &[u32]) -> TrainingConfig {
+        TrainingConfig {
+            resolution,
+            resolution_buckets: edges
+                .iter()
+                .map(|&resolution| gen_core::ResolutionBucket {
+                    resolution,
+                    repeats: 1,
+                })
+                .collect(),
+            ..TrainingConfig::default()
+        }
+    }
+
+    /// sc-2127 / E7: the dense-step guard sizes for the LARGEST bucket, not `resolution` or the
+    /// first bucket — `[512, 2048]` at 32 GiB refuses exactly like a 2048 run although 512 alone
+    /// passes. (Mutation: sizing from `cfg.resolution` or `bucket_edges(cfg)[0]` makes it pass.)
+    #[test]
+    fn memory_guard_sizes_for_the_largest_bucket() {
+        let budget = 32 * 1024 * 1024 * 1024;
+        preflight_against_budget(&bucketed(512, &[]), budget).unwrap();
+        preflight_against_budget(&bucketed(2048, &[512]), budget).unwrap();
+        let err = preflight_against_budget(&bucketed(512, &[512, 2048]), budget)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2048px"), "{err}");
+    }
+
+    /// sc-2127: one still grid per bucket, in bucket order — floored edge, latent edge and a RoPE
+    /// grid with that bucket's token count (one frame); buckets off ⇒ the single legacy grid.
+    /// (Mutation: building every grid from the max edge makes the 512 grid the wrong size.)
+    #[test]
+    fn ltx23_bucket_grids_follow_each_bucket_edge() {
+        let dev = Device::Cpu;
+        let legacy = ltx23_bucket_grids(&bucketed(1000, &[]), &dev).unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].edge, 992);
+        let grids = ltx23_bucket_grids(&bucketed(1000, &[512, 1024]), &dev).unwrap();
+        assert_eq!(
+            grids.iter().map(|g| g.edge).collect::<Vec<_>>(),
+            [512, 1024]
+        );
+        for g in &grids {
+            assert_eq!(g.latent_edge, g.edge as usize / SPATIAL_SCALE);
+            let expected =
+                create_position_grid(1, g.latent_edge, g.latent_edge, DEFAULT_FPS as f32, &dev)
+                    .unwrap();
+            assert_eq!(g.positions.dims(), expected.dims(), "edge {}", g.edge);
+        }
+        assert_ne!(grids[0].positions.dims(), grids[1].positions.dims());
     }
 
     #[test]
@@ -3333,6 +3454,8 @@ mod tests {
         let d = trainer_descriptor();
         assert_eq!(d.id, TRAINER_ID);
         assert_eq!(d.backend, "candle");
+        assert!(d.techniques.resolution_buckets);
+        assert!(!trainer_descriptor_25().techniques.resolution_buckets);
         assert!(d.supports_lora);
         assert!(!d.supports_lokr);
         assert_eq!(LTX_ATTN_TARGETS, ["to_q", "to_k", "to_v", "to_out.0"]);
@@ -3880,6 +4003,21 @@ mod tests {
         match validate_ltx25_training_request(&req) {
             Err(CandleError::Unsupported(message)) => {
                 assert!(message.contains("instruction-edit"), "{message}")
+            }
+            other => panic!("expected a typed Unsupported, got {other:?}"),
+        }
+    }
+
+    /// sc-2127: LTX-2.5 (prepared fixed-geometry latents) does not declare resolution buckets, and
+    /// its public preflight refuses them typed — not only the `train` entry floor. (Mutation:
+    /// dropping the `validate_training_techniques` call from `validate_ltx25_training_request`.)
+    #[test]
+    fn ltx25_preflight_refuses_resolution_buckets_typed() {
+        let mut req = request();
+        req.config.resolution_buckets = bucketed(512, &[512, 1024]).resolution_buckets;
+        match validate_ltx25_training_request(&req) {
+            Err(CandleError::Unsupported(message)) => {
+                assert!(message.contains("bucket"), "{message}")
             }
             other => panic!("expected a typed Unsupported, got {other:?}"),
         }

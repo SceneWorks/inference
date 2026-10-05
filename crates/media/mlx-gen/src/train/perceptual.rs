@@ -273,7 +273,9 @@ impl PerceptualPath {
 
     /// Build and cache image `image`'s per-loss references from its clean latent (NCHW, model
     /// space — the trainer's cached VAE encode of the training image), once per image per job: a
-    /// second call for the same image is a no-op. The round-trip decode is gradient-stopped.
+    /// second call for the same image is a no-op. `image` is the trainer's reference key: a
+    /// trainer that caches one latent per (item, resolution bucket) keys it per cache entry, so
+    /// each bucket's reference matches that bucket's decode size (Z-Image does). The round-trip decode is gradient-stopped.
     pub fn ensure_reference(&mut self, image: usize, clean_latents: &Array) -> Result<()> {
         if self.references.contains_key(&image) {
             return Ok(());

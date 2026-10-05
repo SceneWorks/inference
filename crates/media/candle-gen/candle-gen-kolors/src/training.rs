@@ -16,15 +16,19 @@ use candle_gen::gen_core::sampling::AlphaSchedule;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, NetworkType, Precision, WeightsSource};
+use candle_gen::gen_core::{
+    self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
+};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{effective_weight_decay, noise_seed, sample_noise};
 use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
-    SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
+    adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
+    AdapterKind, LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use candle_gen::train::optim::{
+    accumulate_grads, accumulation_divisor, scale_grads, TrainOptimizer,
+};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
@@ -54,8 +58,24 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
+}
+
+/// One SDXL-style `time_ids` row (`[h, w, 0, 0, h, w]`) per bucket edge, in bucket order, at
+/// `dtype` (sc-2127). A step selects the row of the bucket its cached latent was encoded at, so the
+/// micro-conditioning always names the size the latent really has.
+fn bucket_time_ids(device: &Device, edges: &[u32], dtype: DType) -> Result<Vec<Tensor>> {
+    edges
+        .iter()
+        .map(|&edge| Ok(build_time_ids(device, 1, edge, edge)?.to_dtype(dtype)?))
+        .collect()
 }
 
 pub struct KolorsTrainer {
@@ -163,16 +183,6 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
-fn accumulation_divisor(micro_step: u32, configured: u32) -> u32 {
-    let configured = configured.max(1);
-    let pending = micro_step % configured;
-    if pending == 0 {
-        configured
-    } else {
-        pending
-    }
-}
-
 fn packed_component(root: &Path, component: &str) -> Result<bool> {
     let path = root.join(component).join("config.json");
     if !path.is_file() {
@@ -272,7 +282,8 @@ impl KolorsTrainer {
         let cfg = &req.config;
         let device = &self.device;
         let dtype = compute_dtype(&cfg.train_dtype);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
+        let edges = bucket_edges(cfg);
         on_progress(TrainingProgress::Preparing);
         on_progress(TrainingProgress::LoadingModel);
 
@@ -292,7 +303,8 @@ impl KolorsTrainer {
                 )?,
             )?,
         };
-        let mut cache = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+        let mut cache = Vec::with_capacity(req.items.len() * edges.len());
         for (index, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -301,10 +313,13 @@ impl KolorsTrainer {
                 current: index as u32 + 1,
                 total: req.items.len() as u32,
             });
-            let image = load_image_tensor(&item.image_path, edge, device)?;
-            let x0 = vae.encode_mean(&image)?.detach();
             let (context, pooled) = cache_caption(&caption_encoder, &item.caption)?;
-            cache.push((x0, context, pooled));
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            for &edge in &edges {
+                let image = square_image_tensor(&square, edge, device)?;
+                let x0 = vae.encode_mean(&image)?.detach();
+                cache.push((x0, context.clone(), pooled.clone()));
+            }
         }
         drop(caption_encoder);
         drop(vae);
@@ -349,7 +364,11 @@ impl KolorsTrainer {
         let mut update = 0;
         let mut steps_run = 0;
         let mut last_loss = 0.0;
-        let time_ids = build_time_ids(device, 1, edge, edge)?.to_dtype(dtype)?;
+        let time_ids = bucket_time_ids(device, &edges, dtype)?;
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let sample_order =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mae = matches!(cfg.loss_type.to_ascii_lowercase().as_str(), "mae" | "l1");
         let stem = file_stem(&req.file_name).to_string();
 
@@ -357,7 +376,9 @@ impl KolorsTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, context, pooled) = &cache[(step as usize - 1) % cache.len()];
+            let index = sample_order.cache_index(step as usize - 1);
+            let (x0, context, pooled) = &cache[index];
+            let step_time_ids = &time_ids[index % edges.len()];
             let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(step as u64));
             let timestep = rng.random_range(0..NUM_TRAIN_TIMESTEPS);
             let noise = sample_noise(x0.dims(), noise_seed(cfg.seed, step), device)?;
@@ -368,7 +389,7 @@ impl KolorsTrainer {
                 timestep as f64,
                 &projected,
                 &pooled.to_dtype(dtype)?,
-                &time_ids,
+                step_time_ids,
                 None,
                 None,
             )?;
@@ -385,8 +406,8 @@ impl KolorsTrainer {
                     .expect("an update has accumulated gradients");
                 let divisor = accumulation_divisor(step, accum);
                 scale_grads(&mut grads, &set.vars, 1.0 / divisor as f64)?;
-                clip_grad_norm(&mut grads, &set.vars, 1.0)?;
-                optimizer.step(&grads)?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_step(&mut optimizer, &mut grads, &set, cfg, update, cfg.seed)?;
                 update += 1;
             }
             on_progress(TrainingProgress::Training {
@@ -468,6 +489,43 @@ mod tests {
         let alpha = schedule.alphas_cumprod[t];
         let expected = alpha.sqrt() * 2.0 + (1.0 - alpha).sqrt() * 3.0;
         assert!((got - expected).abs() < 1e-6);
+    }
+
+    /// sc-2127: the trainer declares buckets, every bucket gets the `time_ids` of its own edge, and
+    /// the item-major cache index a step samples maps (`index % n_buckets`) to the bucket the
+    /// schedule chose — so the micro-conditioning never names a size the latent does not have.
+    #[test]
+    fn each_bucket_conditions_on_its_own_edge() {
+        use candle_gen::gen_core::ResolutionBucket;
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        let edges = [512u32, 1024];
+        let rows = bucket_time_ids(&Device::Cpu, &edges, DType::F32).unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, edge) in rows.iter().zip(edges) {
+            let e = edge as f32;
+            assert_eq!(
+                row.to_vec2::<f32>().unwrap(),
+                vec![vec![e, e, 0.0, 0.0, e, e]]
+            );
+        }
+        let buckets = [
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 4,
+            },
+            ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+        ];
+        let order = BucketSchedule::new(3, &buckets, 9);
+        for k in 0..60 {
+            assert_eq!(
+                order.cache_index(k) % edges.len(),
+                order.sample(k).1,
+                "k {k}"
+            );
+        }
     }
 
     #[test]

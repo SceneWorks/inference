@@ -173,6 +173,46 @@ pub struct TrainingConfig {
     /// [`weight_noise`](TrainingTechniques::weight_noise), and by every trainer for a
     /// [`full_finetune`](Self::full_finetune) run — see [`validate_training_techniques`].
     pub weight_noise_sigma: f32,
+    /// **Gradient noise** (epic 2123, sc-24827) — annealed Gaussian noise on the trainable adapter
+    /// gradients, the `neelakantan` mode of ai-toolkit-perceptual (Neelakantan et al. 2015). On
+    /// every **real optimizer update** `t` (0-based update index, not the micro-step), after the
+    /// window's gradients are averaged and globally norm-clipped and **before** the optimizer step
+    /// (upstream's placement: "after clip so the clip doesn't eat the noise"), every adapter gradient
+    /// `g` gets `g += N(0, 1) · σ_t` with `σ_t = gradient_noise_eta / (1 + t)^gradient_noise_gamma`
+    /// (see [`gradient_noise_std`]). The noise is drawn from an RNG derived from
+    /// [`seed`](Self::seed) and the update index on a stream independent of weight noising (E4).
+    /// Upstream's suggested strength when enabled is `0.01`.
+    ///
+    /// `0.0` (the default) is **off**: no extra RNG draws, the adapter is exactly the pre-sc-24827
+    /// one. A non-zero eta is refused (typed [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`gradient_noise`](TrainingTechniques::gradient_noise), and for a
+    /// [`full_finetune`](Self::full_finetune) run (it perturbs adapter gradients only) — see
+    /// [`validate_training_techniques`].
+    pub gradient_noise_eta: f32,
+    /// Annealing exponent `γ` of [`gradient_noise_eta`](Self::gradient_noise_eta)'s schedule
+    /// `σ_t = η / (1 + t)^γ`. Default `0.55` (the paper's / upstream's default). Must be finite and
+    /// `>= 0` (a negative exponent would grow the noise without bound); ignored while eta is `0`.
+    pub gradient_noise_gamma: f32,
+    /// **Multi-resolution buckets with per-bucket repeat counts** (epic 2123, sc-2127), ported from
+    /// ai-toolkit-perceptual's dataset `resolution: [..]` + `num_repeats: [..]` lists. Each dataset
+    /// item is cached once **per bucket** (square-cropped to that bucket's edge, which the trainer
+    /// floors to its latent stride exactly as it does [`resolution`](Self::resolution)), and every
+    /// epoch visits each item `repeats` times per bucket — so buckets `512/768/1024` with repeats
+    /// `16/4/1` train on a `16:4:1` per-image sample mix at those three latent sizes. The order is
+    /// a shuffle seeded from [`seed`](Self::seed) and the epoch index (E4), see [`BucketSchedule`].
+    ///
+    /// Empty (the default) is **off**: the trainer caches one latent per item at
+    /// [`resolution`](Self::resolution) and walks the cache round-robin exactly as before. A single
+    /// bucket is never shuffled, so a single bucket equal to today's resolution reproduces today's
+    /// sample order. A non-empty list is refused (typed [`crate::Error::Unsupported`]) by any
+    /// trainer whose [`TrainerDescriptor::techniques`] does not declare
+    /// [`resolution_buckets`](TrainingTechniques::resolution_buckets); a malformed list (a zero
+    /// resolution or repeat count, a resolution off the [`RESOLUTION_BUCKET_STRIDE`], a duplicate
+    /// resolution, more than [`MAX_RESOLUTION_BUCKETS`]) is
+    /// refused by [`validate_training_techniques`]. Memory pre-flights size for
+    /// [`max_training_resolution`](Self::max_training_resolution) (E7).
+    pub resolution_buckets: Vec<ResolutionBucket>,
     /// **Depth anchoring** (epic 2123, sc-2125) — an auxiliary perceptual loss that keeps the
     /// adapter's predicted geometry consistent with the training image: the model's x0 prediction
     /// is decoded with the family's small differentiable decoder, run through a frozen
@@ -355,8 +395,184 @@ impl Default for TrainingConfig {
             // Depth anchoring is OFF by default (epic 2123 E1): weight 0, no aux model loaded.
             depth_anchoring: DepthAnchoringConfig::default(),
             perceptual_decoder_dir: None,
+            // Gradient noise is OFF by default (epic 2123 E1); gamma carries the upstream default
+            // so turning eta on alone gives the paper's schedule.
+            gradient_noise_eta: 0.0,
+            gradient_noise_gamma: DEFAULT_GRADIENT_NOISE_GAMMA,
+            // Resolution buckets are OFF by default (epic 2123 E1): one bucket at `resolution`,
+            // walked round-robin exactly as before.
+            resolution_buckets: Vec::new(),
         }
     }
+}
+
+/// Most resolution buckets one training run may declare (epic 2123 sc-2127). Each bucket adds one
+/// cached latent per dataset item and one more latent size the trainer must fit, so the list is
+/// kept short; SceneWorks validates the same bound at submit time.
+pub const MAX_RESOLUTION_BUCKETS: usize = 8;
+
+/// Every [`ResolutionBucket::resolution`] must be a multiple of this (sc-2127): the trainers floor
+/// each training edge to a multiple of 32, so an off-stride bucket would silently train at another
+/// size — and two buckets that floor to the same edge (e.g. 512 and 520) would cache the same
+/// latent twice and silently double that size's weight. SceneWorks validates the same stride.
+pub const RESOLUTION_BUCKET_STRIDE: u32 = 32;
+
+/// One training resolution bucket (see [`TrainingConfig::resolution_buckets`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolutionBucket {
+    /// Square training edge in pixels, floored to the trainer's latent stride exactly like
+    /// [`TrainingConfig::resolution`].
+    pub resolution: u32,
+    /// How many times each item is visited at this resolution per epoch (`>= 1`).
+    pub repeats: u32,
+}
+
+impl TrainingConfig {
+    /// The buckets this run trains on: [`resolution_buckets`](Self::resolution_buckets) when set,
+    /// otherwise the single legacy bucket `{ resolution, repeats: 1 }`. Every trainer caches one
+    /// latent per item per returned bucket, in this order.
+    pub fn training_buckets(&self) -> Vec<ResolutionBucket> {
+        if self.resolution_buckets.is_empty() {
+            vec![ResolutionBucket {
+                resolution: self.resolution,
+                repeats: 1,
+            }]
+        } else {
+            self.resolution_buckets.clone()
+        }
+    }
+
+    /// The largest training edge of [`training_buckets`](Self::training_buckets) — the resolution
+    /// every memory pre-flight / estimate must size for (epic 2123 E7).
+    pub fn max_training_resolution(&self) -> u32 {
+        self.training_buckets()
+            .iter()
+            .map(|b| b.resolution)
+            .max()
+            .unwrap_or(self.resolution)
+    }
+}
+
+/// The per-step sample order over a bucketed latent cache (epic 2123 sc-2127).
+///
+/// Trainers cache `n_items × n_buckets` latents laid out item-major (`item * n_buckets + bucket`,
+/// buckets in [`TrainingConfig::training_buckets`] order) and ask
+/// [`cache_index`](Self::cache_index) which entry the `k`-th sample (0-based; usually `step - 1`)
+/// reads.
+///
+/// - **One bucket** — `k % n_items`, unshuffled: exactly the round-robin walk every trainer used
+///   before buckets existed, so a single bucket at today's resolution gives today's order. (A lone
+///   bucket's repeat count cannot change a one-bucket per-image mix, so it is not consulted.)
+/// - **Several buckets** — each epoch holds every `(item, bucket)` pair `repeats[bucket]` times
+///   (`epoch_len = n_items · Σ repeats`), shuffled with a Fisher–Yates permutation whose RNG is
+///   derived from the job seed and the epoch index (E4): reproducible, and a fresh order each
+///   epoch.
+#[derive(Clone, Debug)]
+pub struct BucketSchedule {
+    n_items: usize,
+    n_buckets: usize,
+    seed: u64,
+    /// One epoch's unshuffled `(item, bucket)` multiset (empty for the single-bucket walk).
+    epoch: Vec<(usize, usize)>,
+    /// The most recently shuffled epoch `(epoch index, order)`, so consecutive steps reuse one
+    /// permutation instead of reshuffling the whole epoch per sample.
+    shuffled: std::cell::RefCell<Option<ShuffledEpoch>>,
+}
+
+/// A shuffled epoch: `(epoch index, (item, bucket) order)`.
+type ShuffledEpoch = (usize, Vec<(usize, usize)>);
+
+impl BucketSchedule {
+    /// Build the schedule for `n_items` cached items over `buckets` (from
+    /// [`TrainingConfig::training_buckets`]).
+    pub fn new(n_items: usize, buckets: &[ResolutionBucket], seed: u64) -> Self {
+        let n_buckets = buckets.len().max(1);
+        let mut epoch = Vec::new();
+        if n_buckets > 1 {
+            for (b, bucket) in buckets.iter().enumerate() {
+                for item in 0..n_items {
+                    for _ in 0..bucket.repeats {
+                        epoch.push((item, b));
+                    }
+                }
+            }
+        }
+        Self {
+            n_items,
+            n_buckets,
+            seed,
+            epoch,
+            shuffled: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Number of buckets each item is cached at (the cache stride).
+    pub fn n_buckets(&self) -> usize {
+        self.n_buckets
+    }
+
+    /// Samples per epoch (`n_items` for one bucket; `n_items · Σ repeats` otherwise).
+    pub fn epoch_len(&self) -> usize {
+        if self.n_buckets == 1 {
+            self.n_items
+        } else {
+            self.epoch.len()
+        }
+    }
+
+    /// The `(item, bucket)` the `k`-th sample (0-based) trains on.
+    ///
+    /// # Panics
+    /// When the schedule is empty (no items); every trainer refuses an empty cache before looping.
+    pub fn sample(&self, k: usize) -> (usize, usize) {
+        let len = self.epoch_len();
+        assert!(len > 0, "BucketSchedule::sample on an empty schedule");
+        if self.n_buckets == 1 {
+            return (k % len, 0);
+        }
+        let (epoch_idx, pos) = (k / len, k % len);
+        let mut shuffled = self.shuffled.borrow_mut();
+        if let Some((cached_epoch, order)) = shuffled.as_ref() {
+            if *cached_epoch == epoch_idx {
+                return order[pos];
+            }
+        }
+        let order = self.shuffle_epoch(epoch_idx);
+        let sample = order[pos];
+        *shuffled = Some((epoch_idx, order));
+        sample
+    }
+
+    /// Epoch `epoch_idx`'s order: Fisher–Yates over a splitmix64 stream seeded from (job seed,
+    /// epoch index) — a pure function of both, so resume and re-runs see the same order.
+    fn shuffle_epoch(&self, epoch_idx: usize) -> Vec<(usize, usize)> {
+        let mut order = self.epoch.clone();
+        let mut state = self
+            .seed
+            .wrapping_add(0x5EED_B0C4_E7A0_0001)
+            .wrapping_add((epoch_idx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93));
+        for i in (1..order.len()).rev() {
+            let j = (splitmix64_next(&mut state) % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        order
+    }
+
+    /// The cache entry (`item * n_buckets + bucket`) the `k`-th sample (0-based) reads.
+    pub fn cache_index(&self, k: usize) -> usize {
+        let (item, bucket) = self.sample(k);
+        item * self.n_buckets + bucket
+    }
+}
+
+/// One step of a splitmix64 *stream* (advances `state`) — the bucket shuffle's RNG; the stateless
+/// [`splitmix64`] hash serves the technique-noise keys.
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// One training example. Paths are resolved by the caller (the worker resolves the dataset's
@@ -558,9 +774,9 @@ pub struct TrainerDescriptor {
 }
 
 /// Per-technique support flags for the optional training techniques of epic 2123 (weight noising
-/// and depth anchoring today; gradient noise, aspect buckets, masked loss and the perceptual
-/// identity/body/latent losses join here as their stories land). Each flag gates exactly one
-/// [`TrainingConfig`] knob through [`validate_training_techniques`].
+/// weight noising, gradient noise, resolution buckets and depth anchoring today; masked loss and
+/// the perceptual identity/body/latent losses join here as their stories land). Each flag gates one
+/// technique's [`TrainingConfig`] knob(s) through [`validate_training_techniques`].
 ///
 /// Non-supporting descriptors spell [`TrainingTechniques::NONE`], so a new flag defaults to
 /// *unsupported* everywhere without touching them; a supporting descriptor names the flags it
@@ -571,6 +787,12 @@ pub struct TrainingTechniques {
     pub weight_noise: bool,
     /// Honors [`TrainingConfig::depth_anchoring`] (decoded-x0 Depth-Anything-V2 anchoring loss).
     pub depth_anchoring: bool,
+    /// Honors [`TrainingConfig::gradient_noise_eta`] / [`TrainingConfig::gradient_noise_gamma`]
+    /// (annealed adapter gradient noise, sc-24827).
+    pub gradient_noise: bool,
+    /// Honors [`TrainingConfig::resolution_buckets`] (multi-resolution buckets with per-bucket
+    /// repeat counts, sc-2127).
+    pub resolution_buckets: bool,
 }
 
 impl TrainingTechniques {
@@ -578,19 +800,75 @@ impl TrainingTechniques {
     pub const NONE: Self = Self {
         weight_noise: false,
         depth_anchoring: false,
+        gradient_noise: false,
+        resolution_buckets: false,
     };
+
+    /// The adapter-noise pair every LoRA/LoKr trainer implements at its optimizer step (epic 2123
+    /// S2, sc-24827): weight noising after the update and gradient noise between clip and step.
+    pub const ADAPTER_NOISE: Self = Self {
+        weight_noise: true,
+        gradient_noise: true,
+        resolution_buckets: false,
+        depth_anchoring: false,
+    };
+}
+
+/// Upstream / Neelakantan et al. (2015) default annealing exponent for gradient noise.
+pub const DEFAULT_GRADIENT_NOISE_GAMMA: f32 = 0.55;
+
+/// The gradient-noise standard deviation at optimizer update `update_idx` (0-based):
+/// `σ_t = eta / (1 + t)^gamma` — upstream ai-toolkit-perceptual's `neelakantan` mode, the one
+/// formula both backends' gradient-noise kernels share. `eta == 0` ⇒ `0` (off).
+pub fn gradient_noise_std(eta: f32, gamma: f32, update_idx: u32) -> f32 {
+    if eta == 0.0 {
+        return 0.0;
+    }
+    (eta as f64 / (1.0 + update_idx as f64).powf(gamma as f64)) as f32
+}
+
+/// Domain-separation salt for the **weight-noise** RNG stream (epic 2123, sc-24826).
+pub const WEIGHT_NOISE_SALT: u64 = 0x5745_4947_4854_4E5A; // "WEIGHTNZ"
+/// Domain-separation salt for the **gradient-noise** RNG stream (sc-24827) — independent of the
+/// weight-noise stream so turning one technique on never shifts the other's draws.
+pub const GRADIENT_NOISE_SALT: u64 = 0x4752_4144_4E4F_4953; // "GRADNOIS"
+
+/// SplitMix64 finalizer — a bijective 64-bit mix, so distinct inputs map to well-separated keys.
+pub fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The RNG seed for one adapter tensor's technique-noise draw (epic 2123 E4): derived only from
+/// the job `seed`, the technique's stream `salt` ([`WEIGHT_NOISE_SALT`] / [`GRADIENT_NOISE_SALT`]),
+/// the 0-based optimizer `update_idx`, and the tensor's index in **sorted key order** — so a
+/// seeded run (or a resumed one) reproduces the same noise on either backend's kernel, and
+/// `HashMap` iteration order can never leak in.
+pub fn technique_noise_key(seed: u64, salt: u64, update_idx: u32, tensor_idx: usize) -> u64 {
+    let stream = splitmix64(seed ^ salt).wrapping_add(update_idx as u64);
+    splitmix64(splitmix64(stream) ^ tensor_idx as u64)
 }
 
 /// The shared **training-technique floor** (epic 2123 E3/E5) — every trainer's `validate` *and*
 /// `train` entry point calls it before any expensive work, so a requested technique the trainer
 /// does not implement is refused instead of silently ignored.
 ///
-/// - `weight_noise_sigma` not finite or negative ⇒ [`crate::Error::Msg`] (malformed request).
+/// - `weight_noise_sigma` / `gradient_noise_eta` / `gradient_noise_gamma` not finite or negative
+///   ⇒ [`crate::Error::Msg`] (malformed request).
 /// - `weight_noise_sigma > 0` on a trainer whose [`TrainerDescriptor::techniques`] lacks
-///   [`weight_noise`](TrainingTechniques::weight_noise) ⇒ typed [`crate::Error::Unsupported`].
-/// - `weight_noise_sigma > 0` with [`TrainingConfig::full_finetune`] ⇒ typed
-///   [`crate::Error::Unsupported`]: weight noise perturbs adapter factors only and must never touch
-///   base weights (E5).
+///   [`weight_noise`](TrainingTechniques::weight_noise) ⇒ typed [`crate::Error::Unsupported`];
+///   likewise `gradient_noise_eta > 0` without
+///   [`gradient_noise`](TrainingTechniques::gradient_noise).
+/// - either noise technique with [`TrainingConfig::full_finetune`] ⇒ typed
+///   [`crate::Error::Unsupported`]: both perturb adapter factors / adapter gradients only and must
+///   never touch base weights (E5).
+/// - `resolution_buckets` non-empty but malformed (a zero resolution or repeat count, a resolution
+///   off the [`RESOLUTION_BUCKET_STRIDE`], a duplicate resolution, more than
+///   [`MAX_RESOLUTION_BUCKETS`]) ⇒ [`crate::Error::Msg`]; well formed on a
+///   trainer that lacks [`resolution_buckets`](TrainingTechniques::resolution_buckets) ⇒ typed
+///   [`crate::Error::Unsupported`].
 /// - a malformed [`TrainingConfig::depth_anchoring`] schedule ⇒ [`crate::Error::Msg`].
 /// - depth anchoring enabled on a trainer whose descriptor lacks
 ///   [`depth_anchoring`](TrainingTechniques::depth_anchoring) ⇒ typed [`crate::Error::Unsupported`].
@@ -601,15 +879,22 @@ pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
     req: &TrainingRequest,
 ) -> crate::Result<()> {
-    let sigma = req.config.weight_noise_sigma;
-    if !sigma.is_finite() || sigma < 0.0 {
-        return Err(crate::Error::Msg(format!(
-            "{}: weight_noise_sigma must be a finite value >= 0, got {sigma}",
-            desc.id
-        )));
+    let cfg = &req.config;
+    for (name, value) in [
+        ("weight_noise_sigma", cfg.weight_noise_sigma),
+        ("gradient_noise_eta", cfg.gradient_noise_eta),
+        ("gradient_noise_gamma", cfg.gradient_noise_gamma),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: {name} must be a finite value >= 0, got {value}",
+                desc.id
+            )));
+        }
     }
+    let sigma = cfg.weight_noise_sigma;
     if sigma > 0.0 {
-        if req.config.full_finetune {
+        if cfg.full_finetune {
             return Err(crate::Error::Unsupported(format!(
                 "{}: weight noising (weight_noise_sigma {sigma}) perturbs adapter factors only and \
                  cannot be combined with a full base fine-tune",
@@ -619,6 +904,22 @@ pub fn validate_training_techniques(
         if !desc.techniques.weight_noise {
             return Err(crate::Error::Unsupported(format!(
                 "{}: weight noising (weight_noise_sigma {sigma}) is not supported by this trainer",
+                desc.id
+            )));
+        }
+    }
+    let eta = cfg.gradient_noise_eta;
+    if eta > 0.0 {
+        if cfg.full_finetune {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: gradient noise (gradient_noise_eta {eta}) perturbs adapter gradients only and \
+                 cannot be combined with a full base fine-tune",
+                desc.id
+            )));
+        }
+        if !desc.techniques.gradient_noise {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: gradient noise (gradient_noise_eta {eta}) is not supported by this trainer",
                 desc.id
             )));
         }
@@ -650,6 +951,54 @@ pub fn validate_training_techniques(
                 desc.id
             )));
         }
+    }
+    validate_resolution_buckets(desc, &cfg.resolution_buckets)?;
+    Ok(())
+}
+
+/// Resolution-bucket half of [`validate_training_techniques`] (sc-2127): an empty list is off; a
+/// non-empty one must be well formed (`Msg`) and declared by the trainer (`Unsupported`).
+fn validate_resolution_buckets(
+    desc: &TrainerDescriptor,
+    buckets: &[ResolutionBucket],
+) -> crate::Result<()> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    if buckets.len() > MAX_RESOLUTION_BUCKETS {
+        return Err(crate::Error::Msg(format!(
+            "{}: resolution_buckets has {} buckets; at most {MAX_RESOLUTION_BUCKETS} are allowed",
+            desc.id,
+            buckets.len()
+        )));
+    }
+    for (i, b) in buckets.iter().enumerate() {
+        if b.resolution == 0 || b.repeats == 0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets[{i}] needs a resolution and a repeat count >= 1, got \
+                 resolution {} repeats {}",
+                desc.id, b.resolution, b.repeats
+            )));
+        }
+        if b.resolution % RESOLUTION_BUCKET_STRIDE != 0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets[{i}] resolution {} is not a multiple of \
+                 {RESOLUTION_BUCKET_STRIDE} (the trainers' latent stride)",
+                desc.id, b.resolution
+            )));
+        }
+        if buckets[..i].iter().any(|p| p.resolution == b.resolution) {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets lists resolution {} twice",
+                desc.id, b.resolution
+            )));
+        }
+    }
+    if !desc.techniques.resolution_buckets {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: multi-resolution buckets (resolution_buckets) are not supported by this trainer",
+            desc.id
+        )));
     }
     Ok(())
 }
@@ -1027,6 +1376,218 @@ mod tests {
             let err = validate_training_techniques(&noisy_desc, &r).unwrap_err();
             assert!(matches!(err, crate::Error::Msg(_)), "{bad}: {err:?}");
         }
+    }
+
+    #[test]
+    fn validate_training_techniques_gates_gradient_noise() {
+        // sc-24827 (epic 2123 E3/E5): gradient noise is refused unless declared, refused with a
+        // full fine-tune, and malformed eta/gamma are refused outright. Independent of weight noise.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut wn_only = trainer_desc_with(false, true);
+        wn_only.techniques.weight_noise = true;
+        let mut both = trainer_desc_with(false, true);
+        both.techniques = TrainingTechniques::ADAPTER_NOISE;
+
+        let off = train_req(None, items);
+        assert_eq!(off.config.gradient_noise_eta, 0.0, "off by default (E1)");
+        assert_eq!(
+            off.config.gradient_noise_gamma,
+            DEFAULT_GRADIENT_NOISE_GAMMA
+        );
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.gradient_noise_eta = 0.01;
+        for desc in [&plain, &wn_only] {
+            let err = validate_training_techniques(desc, &on).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m) if m.contains("gradient noise")),
+                "{err:?}"
+            );
+        }
+        assert!(validate_training_techniques(&both, &on).is_ok());
+
+        let mut full = on.clone();
+        full.config.full_finetune = true;
+        let err = validate_training_techniques(&both, &full).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("full base fine-tune")),
+            "{err:?}"
+        );
+
+        for bad in [-0.01f32, f32::NAN, f32::INFINITY] {
+            let mut r = off.clone();
+            r.config.gradient_noise_eta = bad;
+            let err = validate_training_techniques(&both, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("gradient_noise_eta")));
+            let mut r = off.clone();
+            r.config.gradient_noise_gamma = bad;
+            let err = validate_training_techniques(&both, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("gradient_noise_gamma")));
+        }
+    }
+
+    #[test]
+    fn gradient_noise_std_anneals_per_the_neelakantan_formula() {
+        // sc-24827: σ_t = η / (1 + t)^γ, t the 0-based optimizer update.
+        assert_eq!(gradient_noise_std(0.0, 0.55, 0), 0.0, "eta 0 is off");
+        assert_eq!(gradient_noise_std(0.01, 0.55, 0), 0.01, "σ_0 = η");
+        for t in [1u32, 9, 99, 999] {
+            let want = 0.01 / (1.0 + t as f64).powf(0.55);
+            let got = gradient_noise_std(0.01, 0.55, t) as f64;
+            assert!((got - want).abs() <= want * 1e-6, "t={t}: {got} vs {want}");
+            assert!(
+                got < gradient_noise_std(0.01, 0.55, t - 1) as f64,
+                "shrinks with t"
+            );
+        }
+        // γ = 0 is constant noise.
+        assert_eq!(gradient_noise_std(0.02, 0.0, 500), 0.02);
+    }
+
+    #[test]
+    fn technique_noise_keys_separate_streams_updates_and_tensors() {
+        let k = |salt, u, i| technique_noise_key(7, salt, u, i);
+        assert_eq!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 3, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(GRADIENT_NOISE_SALT, 3, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 4, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 3, 1));
+        assert_ne!(
+            technique_noise_key(7, WEIGHT_NOISE_SALT, 0, 0),
+            technique_noise_key(8, WEIGHT_NOISE_SALT, 0, 0)
+        );
+    }
+
+    fn rb(resolution: u32, repeats: u32) -> ResolutionBucket {
+        ResolutionBucket {
+            resolution,
+            repeats,
+        }
+    }
+
+    #[test]
+    fn validate_resolution_buckets_floor() {
+        // sc-2127 (epic 2123 E3): buckets are refused unless declared; malformed lists are refused
+        // regardless of support; an empty list is off everywhere.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut bucketed = trainer_desc(false);
+        bucketed.techniques.resolution_buckets = true;
+
+        let off = train_req(None, items);
+        assert!(off.config.resolution_buckets.is_empty());
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.resolution_buckets = vec![rb(512, 16), rb(768, 4), rb(1024, 1)];
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("resolution_buckets")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&bucketed, &on).is_ok());
+
+        let too_many: Vec<_> = (1..=MAX_RESOLUTION_BUCKETS as u32 + 1)
+            .map(|i| rb(256 * i, 1))
+            .collect();
+        for bad in [
+            vec![rb(512, 0)],
+            vec![rb(0, 1)],
+            vec![rb(512, 1), rb(512, 2)],
+            // 520 floors to the 512 edge: it would cache 512 twice and double its weight.
+            vec![rb(512, 1), rb(520, 1)],
+            vec![rb(520, 1)],
+            too_many,
+        ] {
+            let mut r = off.clone();
+            r.config.resolution_buckets = bad.clone();
+            let err = validate_training_techniques(&bucketed, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad:?}: {err:?}");
+        }
+        // The cap itself is accepted.
+        let mut at_cap = off.clone();
+        at_cap.config.resolution_buckets = (1..=MAX_RESOLUTION_BUCKETS as u32)
+            .map(|i| rb(256 * i, 1))
+            .collect();
+        assert!(validate_training_techniques(&bucketed, &at_cap).is_ok());
+    }
+
+    #[test]
+    fn training_buckets_default_to_the_legacy_resolution() {
+        let mut cfg = TrainingConfig {
+            resolution: 768,
+            ..TrainingConfig::default()
+        };
+        assert_eq!(cfg.training_buckets(), vec![rb(768, 1)]);
+        assert_eq!(cfg.max_training_resolution(), 768);
+        cfg.resolution_buckets = vec![rb(512, 16), rb(1024, 1), rb(768, 4)];
+        assert_eq!(cfg.training_buckets(), cfg.resolution_buckets);
+        assert_eq!(cfg.max_training_resolution(), 1024);
+    }
+
+    #[test]
+    fn single_bucket_schedule_is_the_legacy_round_robin() {
+        // AC: a single bucket equal to today's resolution gives today's sample order — the exact
+        // `cache[(step - 1) % cache.len()]` walk — whatever its repeat count.
+        for repeats in [1, 3] {
+            let s = BucketSchedule::new(5, &[rb(1024, repeats)], 42);
+            assert_eq!(s.n_buckets(), 1);
+            for k in 0..37 {
+                assert_eq!(s.cache_index(k), k % 5, "repeats {repeats} k {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_bucket_schedule_mixes_16_4_1_per_image() {
+        // AC: buckets 512/768/1024 with repeats 16/4/1 ⇒ each image is sampled 16:4:1 across the
+        // three buckets every epoch.
+        let buckets = [rb(512, 16), rb(768, 4), rb(1024, 1)];
+        let n_items = 3;
+        let s = BucketSchedule::new(n_items, &buckets, 7);
+        assert_eq!(s.epoch_len(), n_items * 21);
+        for epoch in 0..3 {
+            let mut counts = vec![[0usize; 3]; n_items];
+            for k in epoch * s.epoch_len()..(epoch + 1) * s.epoch_len() {
+                let (item, bucket) = s.sample(k);
+                counts[item][bucket] += 1;
+                assert_eq!(s.cache_index(k), item * 3 + bucket);
+            }
+            for (item, c) in counts.iter().enumerate() {
+                assert_eq!(*c, [16, 4, 1], "epoch {epoch} item {item}");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_bucket_schedule_is_seeded_and_reshuffled_per_epoch() {
+        // E4: the order is a pure function of the job seed; a different seed reorders; each epoch
+        // gets its own permutation.
+        let buckets = [rb(512, 2), rb(1024, 1)];
+        let order = |seed: u64, range: std::ops::Range<usize>| {
+            let s = BucketSchedule::new(4, &buckets, seed);
+            range.map(|k| s.sample(k)).collect::<Vec<_>>()
+        };
+        assert_eq!(order(11, 0..24), order(11, 0..24));
+        // The memoized epoch never leaks across epochs: random access matches a sequential walk.
+        let s = BucketSchedule::new(4, &buckets, 11);
+        let mut backwards: Vec<_> = (0..24).rev().map(|k| s.sample(k)).collect();
+        backwards.reverse();
+        assert_eq!(backwards, order(11, 0..24));
+        assert_ne!(order(11, 0..12), order(12, 0..12));
+        assert_ne!(order(11, 0..12), order(11, 12..24));
+        // Not the unshuffled multiset order.
+        let unshuffled: Vec<_> = (0..2)
+            .flat_map(|b| (0..4).flat_map(move |i| std::iter::repeat_n((i, b), [2, 1][b])))
+            .collect();
+        assert_ne!(order(11, 0..12), unshuffled);
     }
 
     #[test]

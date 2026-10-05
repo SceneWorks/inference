@@ -47,17 +47,18 @@ use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::gen_core::train::{
-    NetworkType, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    NetworkType, ResolutionBucket, TrainingConfig, TrainingOutput, TrainingProgress,
+    TrainingRequest,
 };
-use crate::gen_core::Image;
+use crate::gen_core::{BucketSchedule, Image};
 use crate::train::checkpoint::{
     checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
 };
 use crate::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
-    LoraSet,
+    adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
+    AdapterKind, LoraHost, LoraSet,
 };
-use crate::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use crate::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
 use crate::train::schedule::{lr_multiplier, schedule_updates};
 use crate::{CandleError, Result};
 
@@ -333,8 +334,9 @@ pub fn install_adapters(
     }
 }
 
-/// Fire one optimizer update: LR-schedule, average the accumulated grads by `1/micro_count`, grad-norm
-/// clip, step. `micro_count` is the ACTUAL number of micro-grads accumulated into this window — for a
+/// Fire one optimizer update: LR-schedule, average the accumulated grads by `1/micro_count`, then the
+/// shared [`adapter_optimizer_step`] — grad-norm clip, epic 2123 gradient noise, step, weight noise
+/// (sc-24827), seeded by `noise_seed` (the job seed; Wan passes its per-expert seed). `micro_count` is the ACTUAL number of micro-grads accumulated into this window — for a
 /// full window that equals `gradient_accumulation`, but for the final partial flush (when
 /// `steps % accum != 0`, or a mid-window cancel) it is the sub-`accum` remainder, so the tail update is
 /// a true mean of the `k` grads it holds rather than a `k/accum`-scaled underweighted step (F-034,
@@ -350,6 +352,7 @@ pub fn apply_update(
     update_idx: u32,
     total_updates: u32,
     warmup_updates: u32,
+    noise_seed: u64,
 ) -> Result<()> {
     assert!(
         micro_count > 0,
@@ -361,9 +364,7 @@ pub fn apply_update(
         .take()
         .expect("apply_update called with a pending accumulation");
     scale_grads(&mut avg, &set.vars, 1.0 / micro_count as f64)?;
-    clip_grad_norm(&mut avg, &set.vars, 1.0)?;
-    opt.step(&avg)?;
-    Ok(())
+    adapter_optimizer_step(opt, &mut avg, set, cfg, update_idx, noise_seed)
 }
 
 /// The preview-sample plan a [`FlowMatchTrainer::cache`] builds while the text encoder (and any VAE
@@ -516,6 +517,32 @@ fn validate_resume_step(label: &str, restored: u32, requested: u32) -> Result<()
     Ok(())
 }
 
+/// The sample schedule over an **item-major** cache of `cache_len` entries
+/// (`cache[item * buckets.len() + bucket]`, buckets in
+/// [`TrainingConfig::training_buckets`] order) — sc-2127. The cache must hold a whole number of
+/// items; anything else is a typed error prefixed with `label`. For one bucket (the buckets-off
+/// default, and every trainer that does not declare
+/// [`resolution_buckets`](crate::gen_core::train::TrainingTechniques::resolution_buckets)) the
+/// schedule's `cache_index(k)` is exactly the pre-bucket round-robin `k % cache_len`.
+///
+/// [`run_flow_match_training`] walks its cache through this; trainers with their own loop call it
+/// with their cache length and `cfg.training_buckets()`.
+pub fn item_major_schedule(
+    label: &str,
+    cache_len: usize,
+    buckets: &[ResolutionBucket],
+    seed: u64,
+) -> Result<BucketSchedule> {
+    let n_buckets = buckets.len().max(1);
+    if !cache_len.is_multiple_of(n_buckets) {
+        return Err(CandleError::Msg(format!(
+            "{label}: cache holds {cache_len} entries, not a whole number of items over \
+             {n_buckets} resolution buckets"
+        )));
+    }
+    Ok(BucketSchedule::new(cache_len / n_buckets, buckets, seed))
+}
+
 /// Drive a single-model flow-match trainer end to end: cache → install adapters → train loop → save.
 ///
 /// Owns the loop scaffolding every single-model trainer shared verbatim — optimizer + LR-schedule
@@ -594,11 +621,12 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // A PEFT checkpoint cadence may fall mid-accumulation. Delay the corresponding resume bundle
     // until the next completed optimizer boundary instead of snapshotting without pending grads.
     let mut resume_due = false;
+    let schedule = item_major_schedule(T::LABEL, cache.len(), &cfg.training_buckets(), cfg.seed)?;
     for step in start_step.saturating_add(1)..=cfg.steps {
         if req.cancel.is_cancelled() {
             break;
         }
-        let cached = &cache[((step - 1) as usize) % cache.len()];
+        let cached = &cache[schedule.cache_index((step - 1) as usize)];
         let (loss, grads) = model.micro_step(&dit, &set.vars, cached, &aux, cfg, step, device)?;
         last_loss = loss;
         steps_run = step;
@@ -617,6 +645,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                 update_idx,
                 total_updates,
                 warmup_updates,
+                cfg.seed,
             )?;
             pending = 0;
             update_idx += 1;
@@ -723,6 +752,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             update_idx,
             total_updates,
             warmup_updates,
+            cfg.seed,
         )?;
         if resume_due {
             save_resume(
@@ -912,6 +942,53 @@ mod tests {
         assert!(err.contains("exceeds requested total steps"), "{err}");
     }
 
+    /// sc-2127: with buckets off the driver's schedule is exactly the pre-bucket `(step-1) % len`
+    /// round-robin; with buckets on, each item is visited at each bucket `repeats` times per epoch
+    /// (item-major indices), and a cache that is not a whole number of items is refused.
+    #[test]
+    fn driver_cache_schedule_matches_round_robin_and_mixes_buckets() {
+        let off = TrainingConfig::default();
+        for len in [1usize, 2, 3, 7] {
+            let s = item_major_schedule("mock", len, &off.training_buckets(), off.seed).unwrap();
+            for step in 1u32..=50 {
+                assert_eq!(
+                    s.cache_index((step - 1) as usize),
+                    ((step - 1) as usize) % len
+                );
+            }
+        }
+
+        let on = TrainingConfig {
+            resolution_buckets: vec![
+                ResolutionBucket {
+                    resolution: 512,
+                    repeats: 16,
+                },
+                ResolutionBucket {
+                    resolution: 768,
+                    repeats: 4,
+                },
+                ResolutionBucket {
+                    resolution: 1024,
+                    repeats: 1,
+                },
+            ],
+            ..TrainingConfig::default()
+        };
+        // 2 items × 3 buckets = 6 cache entries; one epoch = 2 · (16+4+1) = 42 samples.
+        let s = item_major_schedule("mock", 6, &on.training_buckets(), on.seed).unwrap();
+        let mut counts = [0u32; 6];
+        for k in 0..42 {
+            counts[s.cache_index(k)] += 1;
+        }
+        assert_eq!(counts, [16, 4, 1, 16, 4, 1]);
+
+        let err = item_major_schedule("mock", 7, &on.training_buckets(), on.seed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a whole number of items"), "{err}");
+    }
+
     // --- A mock single-model trainer exercising the Tier-2 driver (the loop scaffolding that had no
     //     unit coverage before sc-7787). The DiT is a single adaptable Linear; micro_step makes a loss
     //     out of the adapter factors directly so backprop reaches them with no real model. ---
@@ -1051,6 +1128,96 @@ mod tests {
             self.saves.set(self.saves.get() + 1);
             Ok(())
         }
+    }
+
+    /// A [`MockTrainer`] whose cache entries are their own indices, recording which entry each
+    /// micro-step trains on (sc-2127 — the driver's bucket schedule).
+    struct IndexRecordingTrainer {
+        inner: MockTrainer,
+        seen: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl FlowMatchTrainer for IndexRecordingTrainer {
+        type Dit = MockDit;
+        type Cached = usize;
+        type Aux = ();
+        type SampleState = ();
+        const LABEL: &'static str = "index-recording trainer";
+
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn default_targets(&self) -> &'static [&'static str] {
+            self.inner.default_targets()
+        }
+        fn cache(
+            &self,
+            req: &TrainingRequest,
+            device: &Device,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<usize>, (), SamplePlan<()>)> {
+            let (cache, (), plan) = self.inner.cache(req, device, on_progress)?;
+            Ok(((0..cache.len()).collect(), (), plan))
+        }
+        fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<MockDit> {
+            self.inner.build_dit(req, device)
+        }
+        fn micro_step(
+            &self,
+            dit: &MockDit,
+            vars: &[Var],
+            cached: &usize,
+            aux: &(),
+            cfg: &TrainingConfig,
+            step: u32,
+            device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            self.seen.borrow_mut().push(*cached);
+            self.inner
+                .micro_step(dit, vars, &(), aux, cfg, step, device)
+        }
+        fn save(&self, set: &LoraSet, path: &Path) -> Result<()> {
+            self.inner.save(set, path)
+        }
+    }
+
+    /// sc-2127: the driver walks its cache through the bucket schedule — the plain round-robin with
+    /// buckets off, the item-major `(item, bucket)` mix with buckets on.
+    #[test]
+    fn driver_walks_the_cache_through_the_bucket_schedule() {
+        let recording = |cache_len| IndexRecordingTrainer {
+            inner: MockTrainer {
+                device: Device::Cpu,
+                steps_seen: Cell::new(0),
+                saves: Cell::new(0),
+                cache_len,
+            },
+            seen: Default::default(),
+        };
+        let model = recording(3);
+        let (_fixture, req) = mock_request(3, 7, 1, 0, CancelFlag::new());
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        assert_eq!(*model.seen.borrow(), vec![0, 1, 2, 0, 1, 2, 0]);
+
+        // 2 items × 2 buckets (repeats 3 and 1) = 4 entries; one epoch = 2 · (3 + 1) = 8 steps.
+        let model = recording(4);
+        let (_fixture, mut req) = mock_request(2, 8, 1, 0, CancelFlag::new());
+        req.config.resolution_buckets = vec![
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 3,
+            },
+            ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+        ];
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let mut counts = [0u32; 4];
+        for &i in model.seen.borrow().iter() {
+            counts[i] += 1;
+        }
+        assert_eq!(counts, [3, 1, 3, 1]);
     }
 
     /// Build a driver request over a throwaway on-disk dataset.
@@ -1557,5 +1724,171 @@ mod tests {
             !frozen_after.get(),
             "the thaw pass must still run after a freeze failure so no adapter is left frozen"
         );
+    }
+
+    /// Epic 2123 (sc-24827): a `MockTrainer` that snapshots the adapter factors at the final save,
+    /// so a test can compare what the driver actually trained.
+    struct CaptureTrainer {
+        inner: MockTrainer,
+        saved: std::cell::RefCell<Vec<(String, Vec<f32>)>>,
+    }
+
+    impl FlowMatchTrainer for CaptureTrainer {
+        type Dit = MockDit;
+        type Cached = ();
+        type Aux = ();
+        type SampleState = ();
+        const LABEL: &'static str = "capture trainer";
+
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn default_targets(&self) -> &'static [&'static str] {
+            self.inner.default_targets()
+        }
+        fn cache(
+            &self,
+            req: &TrainingRequest,
+            device: &Device,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<()>, (), SamplePlan<()>)> {
+            self.inner.cache(req, device, on_progress)
+        }
+        fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<MockDit> {
+            // A non-zero base so both LoRA factors receive gradients.
+            let w = Tensor::from_vec(
+                (0..16)
+                    .map(|i| 0.1 * (i as f32 - 7.5))
+                    .collect::<Vec<f32>>(),
+                (4, 4),
+                device,
+            )?;
+            let _ = req;
+            Ok(MockDit(LoraLinear::from_linear(
+                Linear::new(w, None),
+                4,
+                4,
+                "to_q".into(),
+            )))
+        }
+        fn micro_step(
+            &self,
+            dit: &MockDit,
+            vars: &[Var],
+            cached: &(),
+            aux: &(),
+            cfg: &TrainingConfig,
+            step: u32,
+            device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            // Loss through the adapted forward so B (zero-init) gets a gradient too.
+            let x = Tensor::from_vec(vec![1.0f32, -2.0, 0.5, 3.0], (1, 4), device)?;
+            let y = candle_core::Module::forward(&dit.0, &x)?;
+            let target = Tensor::from_vec(vec![0.3f32, 0.1, -0.2, 0.4], (1, 4), device)?;
+            let loss = (y - target)?.sqr()?.sum_all()?;
+            let _ = (vars, cached, aux, cfg, step);
+            self.inner.steps_seen.set(step);
+            Ok((loss.to_scalar::<f32>()?, loss.backward()?))
+        }
+        fn save(&self, set: &LoraSet, _path: &Path) -> Result<()> {
+            let mut named = set.named_vars();
+            named.sort_by(|a, b| a.0.cmp(&b.0));
+            *self.saved.borrow_mut() = named
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        v.as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            Ok(())
+        }
+    }
+
+    fn capture_run(
+        weight_sigma: f32,
+        grad_eta: f32,
+        steps: u32,
+        accum: u32,
+    ) -> Vec<(String, Vec<f32>)> {
+        let model = CaptureTrainer {
+            inner: MockTrainer {
+                device: Device::Cpu,
+                steps_seen: Cell::new(0),
+                saves: Cell::new(0),
+                cache_len: 1,
+            },
+            saved: Default::default(),
+        };
+        let (_fixture, mut req) = mock_request(1, steps, accum, 0, CancelFlag::new());
+        req.config.seed = 11;
+        req.config.rank = 2;
+        req.config.alpha = 2.0;
+        req.config.weight_noise_sigma = weight_sigma;
+        req.config.gradient_noise_eta = grad_eta;
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let saved = model.saved.borrow().clone();
+        assert!(!saved.is_empty());
+        saved
+    }
+
+    /// Call site (epic 2123, sc-24827): the shared driver invokes weight noise exactly once per
+    /// REAL optimizer update, after the step, with that update's index — never on the
+    /// gradient-accumulation micro-steps. One update (steps = accum = 2): the noisy run's adapter is
+    /// bit-identical to the clean run's adapter plus `apply_weight_noise(.., update 0)`. Noise on
+    /// micro-step 1 would perturb micro-step 2's gradient (and add a second draw); a wrong index
+    /// draws different noise — either breaks the equality.
+    ///
+    /// *Mutation that reds this:* calling the update (or the weight-noise kernel) on every
+    /// micro-step, or `apply_update` dropping the noise call.
+    #[test]
+    fn driver_applies_weight_noise_once_per_real_update() {
+        let sigma = 0.05f32;
+        let clean = capture_run(0.0, 0.0, 2, 2);
+        let noisy = capture_run(sigma, 0.0, 2, 2);
+        assert_ne!(clean, noisy, "weight noise must reach the trained adapter");
+        // Rebuild a set holding the clean factors and noise it as update 0 would.
+        let mut host = MockDit(LoraLinear::from_linear(
+            Linear::new(
+                Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap(),
+                None,
+            ),
+            4,
+            4,
+            "to_q".into(),
+        ));
+        let set =
+            build_lora_targets(&mut host, &["to_q".to_string()], 2, 2.0, 0, &Device::Cpu).unwrap();
+        let mut named = set.named_vars();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((name, var), (cname, values)) in named.iter().zip(&clean) {
+            assert_eq!(name, cname);
+            var.set(&Tensor::from_vec(values.clone(), var.dims(), &Device::Cpu).unwrap())
+                .unwrap();
+        }
+        crate::train::lora::apply_weight_noise(&set, sigma, 11, 0).unwrap();
+        let mut named = set.named_vars();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected: Vec<(String, Vec<f32>)> = named
+            .into_iter()
+            .map(|(k, v)| (k, v.as_tensor().flatten_all().unwrap().to_vec1().unwrap()))
+            .collect();
+        assert_eq!(noisy, expected);
+    }
+
+    /// Call site: gradient noise reaches the driver's optimizer step (the adapter differs from the
+    /// clean run) and is seeded (two runs agree), including the final partial-window flush.
+    #[test]
+    fn driver_applies_gradient_noise_reproducibly() {
+        let clean = capture_run(0.0, 0.0, 3, 2);
+        let a = capture_run(0.0, 0.05, 3, 2);
+        let b = capture_run(0.0, 0.05, 3, 2);
+        assert_ne!(clean, a, "gradient noise must reach the trained adapter");
+        assert_eq!(a, b, "seeded gradient noise must reproduce");
     }
 }
