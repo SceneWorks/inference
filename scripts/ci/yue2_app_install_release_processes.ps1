@@ -1,11 +1,11 @@
-# Read-only follow-up for the one completed YuE2 app run. The stopped run
-# root and worker ID arrive through environment, never this collector's argv.
+# Read-only follow-up for one completed YuE2 app run. The stopped run root
+# and optional worker ID arrive through the environment, never collector argv.
 param([Parameter(Mandatory = $true)][string]$OutputDirectory)
 
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) { throw 'evidence directory missing' }
-if ($env:YUE2_RELEASE_OLD_ROOT -cne 'E:\sceneworks-terminal\sc-23002-yue2-precision\37295993157-1' -or
-    $env:YUE2_RELEASE_WORKER_ID -cne 'yue2-acceptance-ed59cf8e2088') { throw 'stopped run target is not the reviewed App8 run' }
+if ([string]::IsNullOrWhiteSpace($env:YUE2_RELEASE_OLD_ROOT) -or
+    -not [System.IO.Path]::IsPathRooted($env:YUE2_RELEASE_OLD_ROOT)) { throw 'stopped run root is missing or not absolute' }
 
 function Hash-Text([string]$Value) {
     if ($null -eq $Value) { return $null }
@@ -40,7 +40,8 @@ function Save-Snapshot([string]$Name) {
             $digest = Hash-Text $command
             $rootMatch = Has-Old-Root $command
             $exeRootMatch = Has-Old-Root $exe
-            $workerMatch = $null -ne $command -and $command.IndexOf($env:YUE2_RELEASE_WORKER_ID, [StringComparison]::OrdinalIgnoreCase) -ge 0
+            $workerMatch = -not [string]::IsNullOrWhiteSpace($env:YUE2_RELEASE_WORKER_ID) -and
+                $null -ne $command -and $command.IndexOf($env:YUE2_RELEASE_WORKER_ID, [StringComparison]::OrdinalIgnoreCase) -ge 0
             $relevant = $_.Name -match '^(?:sceneworks-(?:rust-api|api|worker)|sceneworks_worker-[0-9a-f]{16}|candle[^.]*|node|python(?:3(?:\.\d+)?)?|powershell|pwsh|cmd|cargo|rustc|ffmpeg|nvidia-smi)\.exe$'
             if ($relevant -or $rootMatch -or $exeRootMatch -or $workerMatch -or $_.ProcessId -eq $PID) {
                 @{ pid = $_.ProcessId; parentPid = $_.ParentProcessId; name = $_.Name;

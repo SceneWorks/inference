@@ -275,6 +275,8 @@ jobs:
           enable-cache: false
       - name: Observe GPU1 and stopped app process release without model work
         shell: cmd
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
           for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"

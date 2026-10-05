@@ -9,9 +9,11 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from zipfile import ZipFile
 
 
 SOURCE = Path(__file__).with_name("yue2_app_install_release_probe.py")
+TEST_WORKER_ID = "yue2-acceptance-test-worker"
 sys.path.insert(0, str(SOURCE.parent))
 SPEC = importlib.util.spec_from_file_location("yue2_app_install_release_probe", SOURCE)
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -41,9 +43,9 @@ def row(pid=100, name="node.exe", created="2026-10-05T10:50:00+00:00",
             "executablePath": executable, "commandLineAvailable": command is not None,
             "commandLineLength": len(command) if command is not None else None,
             "commandLineSha256": sha256(command.encode()).hexdigest() if command is not None else None,
-            "oldRootInCommandLine": MODULE.has_old_root(command, MODULE.OLD_RUN_ROOT) if command else False,
-            "oldRootInExecutable": MODULE.has_old_root(executable, MODULE.OLD_RUN_ROOT) if executable else False,
-            "workerIdInCommandLine": MODULE.OLD_WORKER_ID.casefold() in command.casefold() if command else False}
+            "oldRootInCommandLine": MODULE.has_old_root(command, MODULE.TARGET_RUN_ROOT) if command else False,
+            "oldRootInExecutable": MODULE.has_old_root(executable, MODULE.TARGET_RUN_ROOT) if executable else False,
+            "workerIdInCommandLine": TEST_WORKER_ID.casefold() in command.casefold() if command else False}
 
 
 def snapshot(rows, start="2026-10-05T11:00:00+00:00", end="2026-10-05T11:00:01+00:00",
@@ -69,7 +71,7 @@ def snapshot_pair(pair_number, inaccessible=False, persistent=False, old_after_u
             rows.append(row(pid=24516, created=created.isoformat(), command=None))
         if old_after_unknown and suffix == "before":
             rows.append(row(pid=24517, created=created.isoformat(),
-                            command='node.exe "' + MODULE.OLD_RUN_ROOT + r'\child.exe"'))
+                            command='node.exe "' + MODULE.TARGET_RUN_ROOT + r'\child.exe"'))
         if malformed_after_unknown and suffix == "before":
             malformed = row(pid=24518, created=created.isoformat())
             malformed["parentPid"] = None
@@ -80,6 +82,52 @@ def snapshot_pair(pair_number, inaccessible=False, persistent=False, old_after_u
         return result
 
     return make(first_start, "before"), make(second_start, "after")
+
+
+def write_source_bound_case(metrics: Path, name: str, index: int, outcome="completed", faults=b"",
+                            process_witness=True, layout="profile"):
+    case_dir = metrics / layout / name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    pid, parent = 5232 + index, 4000 + index
+    exe_name = f"sceneworks_worker-{index:016x}.exe"
+    exe = str(MODULE.PureWindowsPath(MODULE.TARGET_RUN_ROOT) / "target" / "release" / "deps" / exe_name)
+    case_bytes = (SOURCE.parent / "yue2-app-precision-cases" / f"{name}.json").read_bytes()
+    (case_dir / "case.json").write_bytes(case_bytes)
+    journal = {"pid": pid, "luid": "luid_0x00000000_0x0001f78f", "bytes": 1024,
+               "counter": {"parentPid": parent}}
+    journal_bytes = (json.dumps(journal) + "\n").encode()
+    (case_dir / "cuda-owned-samples.jsonl").write_bytes(journal_bytes)
+    (case_dir / "cuda-owned-faults.jsonl").write_bytes(faults)
+    (case_dir / "profile-process.json").write_text(json.dumps({"processId": pid}), encoding="utf-8")
+    _, case_name, _, policy, _, _ = MODULE.CASES[name]
+    owned = {"journalSha256": sha256(journal_bytes).hexdigest(),
+             "selectedLuid": "luid_0x00000000_0x0001f78f"}
+    if process_witness:
+        owned["process"] = {"pid": pid, "parentPid": parent,
+            "createdUtc": "2026-10-05T13:30:00+00:00", "executablePath": exe,
+            "executableSha256": f"{index + 1:064x}"}
+    record = {"caseId": MODULE.case_id("cuda", name), "backend": "cuda",
+              "request": {"name": case_name, "computePolicy": policy},
+              "outcome": {"status": outcome},
+              "measured": {"owned": owned}}
+    (case_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
+    return sha256(case_bytes).hexdigest()
+
+
+def binding_metadata(metrics_zip: Path, run_conclusion="failure", job_conclusion="failure"):
+    run = {"id": MODULE.TARGET_RUN_ID, "run_attempt": MODULE.TARGET_ATTEMPT,
+           "head_sha": MODULE.TARGET_CONTROL_SHA, "event": "workflow_dispatch",
+           "path": MODULE.TARGET_WORKFLOW, "status": "completed", "conclusion": run_conclusion,
+           "repository": {"full_name": MODULE.TARGET_REPOSITORY}}
+    job = {"id": MODULE.TARGET_JOB_ID, "name": "cuda", "run_id": MODULE.TARGET_RUN_ID,
+           "status": "completed", "conclusion": job_conclusion,
+           "runner_name": MODULE.TARGET_RUNNER, "runner_id": MODULE.TARGET_RUNNER_ID,
+           "started_at": "2026-10-05T13:25:52Z", "completed_at": "2026-10-05T14:00:00Z"}
+    artifact = {"id": MODULE.TARGET_ARTIFACT_ID, "name": MODULE.TARGET_ARTIFACT_NAME, "expired": False,
+           "workflow_run": {"id": MODULE.TARGET_RUN_ID, "run_attempt": MODULE.TARGET_ATTEMPT,
+                                 "head_sha": MODULE.TARGET_CONTROL_SHA},
+                "digest": "sha256:" + MODULE.file_sha256(metrics_zip)}
+    return run, job, artifact
 
 
 class FakePairCollector:
@@ -115,24 +163,190 @@ class FakePairCollector:
 
 
 class ReleaseProbeTests(unittest.TestCase):
-    def test_frozen_target_matches_stopped_app8_run_receipt(self):
-        self.assertEqual((MODULE.OLD_RUN_ID, MODULE.OLD_RUN_ATTEMPT, MODULE.OLD_JOB_ID),
-                         ("37295993157", "1", "111717219895"))
-        self.assertEqual((MODULE.OLD_CONTROL_SHA, MODULE.OLD_APP_SHA, MODULE.OLD_ENGINE_SHA),
-                         ("6a14bcd709f68f8ebcb6a3b2a360fe04aa5b96d8",
+    def _binding_fixture(self, root: Path, count: int, *, outcome="completed", no_process_at=None):
+        metrics = root / "metrics"
+        metrics.mkdir()
+        (metrics / "sources.json").write_text(json.dumps({
+            "control_sha": MODULE.TARGET_CONTROL_SHA, "app_sha": MODULE.TARGET_APP_SHA,
+            "engine_sha": MODULE.TARGET_ENGINE_SHA, "app_pins": [MODULE.TARGET_ENGINE_SHA]}),
+            encoding="utf-8")
+        target_device = {"physicalMode": "shared-gpu1", "physicalIndex": 1, "cudaOrdinal": 0,
+            "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe", "pci": "00000000:C1:00.0",
+            "luid": "luid_0x00000000_0x0001f78f"}
+        (metrics / "preflight-initial.json").write_text(json.dumps({"backend": "cuda", "label": "initial",
+            "admitted": True, "runner": MODULE.TARGET_RUNNER, "hostname": "MICHAEL-TRX50",
+            "census": json.dumps({"validatedDevice": target_device})}),
+            encoding="utf-8")
+        manifest_rows = []
+        for index, name in enumerate(MODULE.NAMES[:count]):
+            case_hash = write_source_bound_case(metrics, name, index,
+                outcome=outcome if index == count - 1 else "completed",
+                faults=b"{}\n" if index == count - 1 and outcome != "completed" else b"",
+                process_witness=index != no_process_at,
+                layout="profile" if outcome == "completed" and count == len(MODULE.NAMES)
+                    else "partial-profile")
+            manifest_rows.append({"name": name, "case_id": MODULE.case_id("cuda", name),
+                "source_sha256": MODULE.CASE_SOURCE_SHA256[name], "run_case_sha256": case_hash})
+        (metrics / "cases-manifest.json").write_text(json.dumps({"backend": "cuda",
+            "cases": [{"name": name, "case_id": MODULE.case_id("cuda", name),
+                "source_sha256": MODULE.CASE_SOURCE_SHA256[name],
+                "run_case_sha256": next((r["run_case_sha256"] for r in manifest_rows if r["name"] == name),
+                    "0" * 64)} for name in MODULE.NAMES]}), encoding="utf-8")
+        zip_path = root / "metrics.zip"
+        zip_path.write_bytes(b"authentic-metrics-fixture")
+        run, job, artifact = binding_metadata(zip_path,
+            run_conclusion="success" if outcome == "completed" and count == len(MODULE.NAMES) else "failure",
+            job_conclusion="success" if outcome == "completed" and count == len(MODULE.NAMES) else "failure")
+        return metrics, zip_path, run, job, artifact
+
+    def test_frozen_target_matches_current_app8_run_receipt(self):
+        self.assertEqual((MODULE.TARGET_RUN_ID, MODULE.TARGET_ATTEMPT, MODULE.TARGET_JOB_ID),
+                         (37314391667, 1, 111777364558))
+        self.assertEqual((MODULE.TARGET_CONTROL_SHA, MODULE.TARGET_APP_SHA, MODULE.TARGET_ENGINE_SHA),
+                         ("2c820231926094566d1ed719c085ba7a7a2284a5",
                           "c1f86907ae41183fa8ddc9126a821df36cc597dd",
                           "25bd55cdb6a56c78b07584a12150c9f5d46be439"))
-        self.assertEqual(MODULE.OLD_RUN_ROOT,
-                         r"E:\sceneworks-terminal\sc-23002-yue2-precision\37295993157-1")
-        self.assertEqual((MODULE.OLD_WORKER_ID, MODULE.OLD_RUNNER, MODULE.OLD_HOST),
-                         ("yue2-acceptance-ed59cf8e2088", "cuda-windows", "MICHAEL-TRX50"))
-        self.assertEqual(MODULE.OLD_JOB_STARTED.isoformat(), "2026-10-05T10:35:14+00:00")
-        self.assertEqual(MODULE.OLD_JOB_COMPLETED, "2026-10-05T10:59:07+00:00")
-        self.assertEqual(MODULE.OLD_METRICS_ZIP_SHA256,
-                         "e4fe7f5ad2ed80b2f3294064f49f113ac5a83a0ef734a0bcfc3d5160cfead5ad")
+        self.assertEqual(MODULE.TARGET_RUN_ROOT,
+                         r"E:\sceneworks-terminal\sc-23002-yue2-precision\37314391667-1")
+        self.assertEqual((MODULE.TARGET_RUNNER, MODULE.TARGET_RUNNER_ID), ("cuda-windows-2", 2619))
         collector = SOURCE.with_name("yue2_app_install_release_processes.ps1").read_text(encoding="utf-8")
-        self.assertIn(MODULE.OLD_RUN_ROOT, collector)
-        self.assertIn(MODULE.OLD_WORKER_ID, collector)
+        self.assertIn("$env:YUE2_RELEASE_OLD_ROOT", collector)
+        self.assertNotIn("37295993157", collector)
+        self.assertNotIn("yue2-acceptance-ed59cf8e2088", collector)
+
+    def test_run_binding_uses_exact_eight_verified_case_generations_and_binary_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics, zip_path, run, job, artifact = self._binding_fixture(Path(directory), 8)
+            binding = MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+            self.assertEqual(binding["sourceCaseIds"], [MODULE.case_id("cuda", name) for name in MODULE.NAMES])
+            self.assertTrue(binding["captureRecordSetComplete"])
+            self.assertFalse(binding["captureAcceptanceEvaluated"])
+            self.assertEqual(len(binding["caseProcessWitnesses"]), 8)
+            self.assertEqual(len(binding["binaryHashTargets"]), 8)
+            expected = {row["path"]: row["sha256"] for row in binding["binaryHashTargets"]}
+            actual = MODULE.rehash_recorded_binaries(binding,
+                lambda path: expected[path])
+            self.assertEqual(len(actual), 8)
+            witness = binding["caseProcessWitnesses"][0]
+            row = globals()["row"](pid=witness["pid"], created=witness["createdUtc"])
+            row["parentPid"] = witness["parentPid"]
+            snapshot_payload = snapshot([row], start="2026-10-05T13:40:00+00:00",
+                end="2026-10-05T13:40:01+00:00")
+            with self.assertRaisesRegex(ValueError, "old app install process"):
+                MODULE.validate_snapshot(snapshot_payload,
+                binding["target"]["runRoot"], recorded_generations=binding["caseProcessWitnesses"],
+                job_started=binding["target"]["jobStartedUtc"])
+
+    def test_current_runner_route_and_device_binding_are_exact_but_allow_same_host_runner_alias(self):
+        current = {"id": 9001, "head_sha": "c" * 40}
+        jobs = {"total_count": 1, "jobs": [{"name": "cuda_release_check", "status": "in_progress",
+            "runner_name": "cuda-windows", "runner_id": 812}]}
+        with patch.dict("os.environ", {"GITHUB_RUN_ID": "9001", "GITHUB_SHA": "c" * 40}):
+            selected = MODULE.select_release_runner(jobs, current, "cuda_release_check")
+            self.assertEqual(selected["runner_name"], "cuda-windows")
+            jobs["jobs"][0]["runner_id"] = MODULE.TARGET_RUNNER_ID
+            with self.assertRaisesRegex(ValueError, "release-check job"):
+                MODULE.select_release_runner(jobs, current, "cuda_release_check")
+        device = {"physicalIndex": 1, "cudaOrdinal": 0, "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+                  "pci": "00000000:C1:00.0", "luid": "luid_0x00000000_0x0001f78f"}
+        self.assertEqual(MODULE.verify_same_selected_device(device,
+            {"physicalMode": "shared-gpu1", "validatedDevice": dict(device)}), device)
+        changed = dict(device, luid="luid_0x00000000_0x00000000")
+        with self.assertRaisesRegex(ValueError, "differs"):
+            MODULE.verify_same_selected_device(device,
+                {"physicalMode": "shared-gpu1", "validatedDevice": changed})
+
+    def test_partial_capture_preserves_only_observed_prefix_and_does_not_invent_pids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics, zip_path, run, job, artifact = self._binding_fixture(
+                Path(directory), 2, outcome="failed", no_process_at=1)
+            binding = MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+            self.assertEqual(binding["sourceCaseIds"], [MODULE.case_id("cuda", name) for name in MODULE.NAMES[:2]])
+            self.assertFalse(binding["captureRecordSetComplete"])
+            self.assertFalse(binding["captureAcceptanceEvaluated"])
+            self.assertEqual(binding["caseLayout"], "partial-profile")
+            self.assertEqual([item["pid"] for item in binding["caseProcessWitnesses"]], [5232])
+            self.assertEqual(binding["caseOutcomeStatuses"], ["completed", "failed"])
+            self.assertEqual(binding["caseProcessWitnesses"][0]["faultBytes"], 0)
+            self.assertEqual(binding["rawSamplerReceipts"][1]["sampleRows"], 1)
+            self.assertEqual(binding["rawSamplerReceipts"][1]["faultsBytes"], 3)
+
+    def test_no_records_yields_run_root_only_scope_and_nonprefix_or_wrong_source_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics, zip_path, run, job, artifact = self._binding_fixture(Path(directory), 0)
+            binding = MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+            self.assertEqual(binding["caseProcessWitnesses"], [])
+            self.assertIn("run-root markers only", binding["releaseScope"])
+        with tempfile.TemporaryDirectory() as directory:
+            metrics, zip_path, run, job, artifact = self._binding_fixture(Path(directory), 2)
+            (metrics / "partial-profile" / MODULE.NAMES[0] / "record.json").unlink()
+            with self.assertRaisesRegex(ValueError, "contiguous capture prefix"):
+                MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+            run["head_sha"] = "f" * 40
+            with self.assertRaisesRegex(ValueError, "run identity/source"):
+                MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+
+    def test_binding_refuses_artifact_zip_and_source_or_executable_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics, zip_path, run, job, artifact = self._binding_fixture(Path(directory), 1)
+            artifact["digest"] = "sha256:" + "0" * 64
+            with self.assertRaisesRegex(ValueError, "artifact binding"):
+                MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+            artifact["digest"] = "sha256:" + MODULE.file_sha256(zip_path)
+            (metrics / "sources.json").write_text(json.dumps({"control_sha": "f" * 40}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "source/pin"):
+                MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+
+    def test_fixed_case_source_and_selected_device_mutations_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics, zip_path, run, job, artifact = self._binding_fixture(Path(directory), 1)
+            manifest_path = metrics / "cases-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["cases"][0]["source_sha256"] = "f" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "manifest source differs"):
+                MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+            manifest["cases"][0]["source_sha256"] = MODULE.CASE_SOURCE_SHA256[MODULE.NAMES[0]]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            record_path = metrics / "partial-profile" / MODULE.NAMES[0] / "record.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["measured"]["owned"]["selectedLuid"] = "luid_0x00000000_0x00000000"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "selected device differs"):
+                MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+
+    def test_binary_rehash_refuses_changed_or_out_of_tree_executable(self):
+        binding = {"binaryHashTargets": [{"path": str(MODULE.PureWindowsPath(MODULE.TARGET_RUN_ROOT) /
+            "target" / "release" / "deps" / "sceneworks_worker-0000000000000001.exe"), "sha256": "a" * 64}]}
+        with self.assertRaisesRegex(ValueError, "bytes changed"):
+            MODULE.rehash_recorded_binaries(binding, lambda _path: "b" * 64)
+        binding["binaryHashTargets"][0]["path"] = r"E:\other\sceneworks_worker-0000000000000001.exe"
+        with self.assertRaisesRegex(ValueError, "outside"):
+            MODULE.rehash_recorded_binaries(binding, lambda _path: "a" * 64)
+
+    def test_original_zip_digest_and_safe_extraction_refuse_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            zip_path = root / "metrics.zip"
+            with ZipFile(zip_path, "w") as archive:
+                archive.writestr("evidence/sources.json", "{}")
+                archive.writestr("install/evidence/summary.json", "{}")
+            artifact = {"id": MODULE.TARGET_ARTIFACT_ID, "name": MODULE.TARGET_ARTIFACT_NAME, "expired": False,
+                "workflow_run": {"head_sha": MODULE.TARGET_CONTROL_SHA},
+                "digest": "sha256:" + MODULE.file_sha256(zip_path)}
+            result = MODULE.safe_extract_metrics(zip_path, artifact, root / "extracted")
+            self.assertEqual(Path(result["extractedRoot"]).name, "evidence")
+            self.assertEqual(Path(result["installEvidenceRoot"]).name, "install")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            zip_path = root / "bad.zip"
+            with ZipFile(zip_path, "w") as archive:
+                archive.writestr("../escape.json", "{}");
+            artifact = {"id": MODULE.TARGET_ARTIFACT_ID, "name": MODULE.TARGET_ARTIFACT_NAME, "expired": False,
+                "workflow_run": {"head_sha": MODULE.TARGET_CONTROL_SHA},
+                "digest": "sha256:" + MODULE.file_sha256(zip_path)}
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                MODULE.safe_extract_metrics(zip_path, artifact, root / "extracted")
 
     def test_clean_pair_stops_at_original_two_observation_guarantee(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(MODULE, "datetime", FixedDateTime):
@@ -181,14 +395,14 @@ class ReleaseProbeTests(unittest.TestCase):
     def test_known_rust_test_worker_is_retained_and_unresolved_identity_refuses(self):
         name = "sceneworks_worker-625c59022a418279.exe"
         self.assertIsNotNone(MODULE.RELEVANT_NAME.fullmatch(name))
-        ps_source = SOURCE.with_name("yue2_app_install_release_processes.ps1").read_text()
+        ps_source = SOURCE.with_name("yue2_app_install_release_processes.ps1").read_text(encoding="utf-8")
         self.assertIn("sceneworks_worker-[0-9a-f]{16}", ps_source)
         unknown = row(pid=5232, name=name, executable=None, command=None)
         with self.assertRaises(MODULE.TransientCandidateError):
             MODULE.validate_snapshot(snapshot([unknown]))
         with self.assertRaisesRegex(ValueError, "old app install process"):
             MODULE.validate_snapshot(snapshot([row(pid=5232, name=name,
-                executable=MODULE.OLD_RUN_ROOT + "\\target\\release\\deps\\" + name)]))
+                executable=MODULE.TARGET_RUN_ROOT + "\\target\\release\\deps\\" + name)]))
 
     def test_old_marker_and_malformed_later_row_override_transient_retry(self):
         with patch.object(MODULE, "datetime", FixedDateTime):
@@ -269,27 +483,27 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertFalse(MODULE.RELEVANT_NAME.fullmatch("LM Studio.exe"))
 
     def test_old_root_match_respects_directory_boundary(self):
-        suffix = row(command='node.exe "' + MODULE.OLD_RUN_ROOT + '-other\\server.js"')
+        suffix = row(command='node.exe "' + MODULE.TARGET_RUN_ROOT + '-other\\server.js"')
         self.assertFalse(suffix["oldRootInCommandLine"])
-        self.assertFalse(MODULE.has_old_root(suffix["executablePath"], MODULE.OLD_RUN_ROOT))
+        self.assertFalse(MODULE.has_old_root(suffix["executablePath"], MODULE.TARGET_RUN_ROOT))
         self.assertEqual(MODULE.validate_snapshot(snapshot([suffix]))["oldOwnedMatches"], [])
 
     def test_old_root_or_worker_in_either_snapshot_refuses(self):
         normal = snapshot([row()])
-        old_root = snapshot([row(command='node.exe "' + MODULE.OLD_RUN_ROOT + r'\install\server.js"')],
+        old_root = snapshot([row(command='node.exe "' + MODULE.TARGET_RUN_ROOT + r'\install\server.js"')],
                             "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00")
         with self.assertRaisesRegex(ValueError, "old app install"):
             MODULE.validate_pair(normal, old_root)
-        worker = snapshot([row(command='node.exe --worker-id ' + MODULE.OLD_WORKER_ID)])
+        worker = snapshot([row(command='node.exe --worker-id ' + TEST_WORKER_ID)])
         with self.assertRaisesRegex(ValueError, "old app install"):
             MODULE.validate_pair(worker, snapshot([row()], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00"))
-        arbitrary_exe = snapshot([row(name="git.exe", executable=MODULE.OLD_RUN_ROOT + r"\tools\git.exe")])
+        arbitrary_exe = snapshot([row(name="git.exe", executable=MODULE.TARGET_RUN_ROOT + r"\tools\git.exe")])
         with self.assertRaisesRegex(ValueError, "old app install"):
             MODULE.validate_pair(arbitrary_exe, snapshot([], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00"))
-        arbitrary_command = snapshot([row(name="git.exe", command="git.exe --work-tree " + MODULE.OLD_RUN_ROOT)])
+        arbitrary_command = snapshot([row(name="git.exe", command="git.exe --work-tree " + MODULE.TARGET_RUN_ROOT)])
         with self.assertRaisesRegex(ValueError, "old app install"):
             MODULE.validate_pair(arbitrary_command, snapshot([], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00"))
-        arbitrary_worker = snapshot([row(name="git.exe", command="git.exe --worker " + MODULE.OLD_WORKER_ID)])
+        arbitrary_worker = snapshot([row(name="git.exe", command="git.exe --worker " + TEST_WORKER_ID)])
         with self.assertRaisesRegex(ValueError, "old app install"):
             MODULE.validate_pair(arbitrary_worker, snapshot([], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00"))
 
@@ -332,6 +546,7 @@ class ReleaseProbeTests(unittest.TestCase):
         section = workflow.split("  cuda_release_check:\n", 1)[1].split("\n  metal:\n", 1)[0]
         self.assertIn("if: inputs.backend == 'cuda' && inputs.release_check_only", section)
         self.assertIn("yue2_app_install_release_probe.py", section)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", section)
         self.assertNotIn("run-captures", section)
         self.assertNotIn("profile-install-only", section)
         self.assertIn("CUDA_VISIBLE_DEVICES: \"1\"", section)
