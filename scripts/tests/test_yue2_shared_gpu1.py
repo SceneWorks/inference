@@ -170,6 +170,11 @@ class SharedGpu1Tests(unittest.TestCase):
             idle.check_shared_gpu1_dispatch()
             with patch.dict("os.environ", {"YUE2_CUDA_SCHEDULING_MODE": "shared-gpu1"}):
                 idle.check_shared_gpu1_dispatch()
+            with patch.dict("os.environ", {"GITHUB_JOB": "cuda_release_check"}):
+                idle.check_shared_gpu1_dispatch()
+            with patch.dict("os.environ", {"GITHUB_JOB": "unreviewed_release_job"}):
+                with self.assertRaises(RuntimeError):
+                    idle.check_shared_gpu1_dispatch()
             with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0"}):
                 with self.assertRaises(RuntimeError):
                     idle.check_shared_gpu1_dispatch()

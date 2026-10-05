@@ -547,7 +547,7 @@ def check_shared_gpu1_dispatch() -> None:
             not os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID") and
             os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host") in ("shared-host", "shared-gpu1") and
             os.environ.get("GITHUB_REPOSITORY") == "SceneWorks/inference" and
-            os.environ.get("GITHUB_JOB") in ("cuda", "cuda_diagnostic") and
+            os.environ.get("GITHUB_JOB") in ("cuda", "cuda_diagnostic", "cuda_release_check") and
             os.environ.get("GITHUB_RUN_ATTEMPT") == "1" and
             os.environ.get("RUNNER_NAME") in ("cuda-windows", "cuda-windows-2") and
             re.fullmatch(r"[0-9a-f]{40}", os.environ.get("EXPECTED_ENGINE_SHA", "")) is not None and

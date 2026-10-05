@@ -9,6 +9,11 @@ on:
         type: choice
         required: true
         options: [cuda, metal]
+      release_check_only:
+        type: boolean
+        required: false
+        default: false
+        description: Read-only release observation for the stopped CUDA install run; no capture or model
       cuda_scheduling_mode:
         type: choice
         required: false
@@ -48,8 +53,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  invalid_release_check:
+    if: inputs.release_check_only && inputs.backend != 'cuda'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse a non-CUDA release observation
+        run: exit 1
+
   cuda:
-    if: inputs.backend == 'cuda'
+    if: inputs.backend == 'cuda' && !inputs.release_check_only
     runs-on: [self-hosted, Windows, X64, cuda, real-weights]
     timeout-minutes: 480
     env:
@@ -220,8 +232,65 @@ jobs:
           if ($env:CAPTURE_OUTCOME -ne 'success' -or -not (Test-Path "$env:APP_EVIDENCE\verdict.json")) { throw 'CUDA app precision profile incomplete; inspect retained receipts' }
           Get-Content "$env:APP_EVIDENCE\verdict.json"
 
+  cuda_release_check:
+    if: inputs.backend == 'cuda' && inputs.release_check_only
+    runs-on: [self-hosted, Windows, X64, cuda, real-weights]
+    timeout-minutes: 15
+    env:
+      EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+      EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+      YUE2_CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}
+      YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
+      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      RELEASE_ROOT: 'E:\sceneworks-terminal\sc-23002-yue2-release-check\${{ github.run_id }}-${{ github.run_attempt }}'
+      RELEASE_EVIDENCE: 'E:\sceneworks-terminal\sc-23002-yue2-release-check\${{ github.run_id }}-${{ github.run_attempt }}\evidence'
+    steps:
+      - name: Bind read-only release-check dispatch and new evidence path
+        shell: powershell
+        run: |
+          if ($env:YUE2_CUDA_SCHEDULING_MODE -cne 'shared-gpu1' -or $env:YUE2_IDLE_CONTEXT_RUN_ID -cne '') { throw 'release check requires shared-gpu1 without an old desktop receipt' }
+          if ($env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_CONTROL_SHA -cne $env:GITHUB_SHA) { throw 'release check source/ref mismatch' }
+          if (Test-Path -LiteralPath $env:RELEASE_ROOT) { throw 'release-check evidence path already exists' }
+          New-Item -ItemType Directory -Path $env:RELEASE_ROOT -Force | Out-Null
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: SceneWorks/SceneWorks
+          ref: ${{ inputs.expected_app_sha }}
+          path: app
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Observe GPU1 and old install process release without model work
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_install_release_probe.py --evidence "%RELEASE_EVIDENCE%" --app app --engine engine --control control
+      - name: Upload private read-only process and physical receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-app-install-release-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_EVIDENCE }}
+          if-no-files-found: warn
+          retention-days: 30
+
   metal:
-    if: inputs.backend == 'metal'
+    if: inputs.backend == 'metal' && !inputs.release_check_only
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 480
     env:
