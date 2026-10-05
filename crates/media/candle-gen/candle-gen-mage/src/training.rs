@@ -76,7 +76,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
 /// 128-channel / 16× latent space has no tiny decoder. Runs [`MageVae::decode_differentiable`]
 /// (every op has a candle backward) and maps the raw `[-1, 1]` RGB to NHWC `[0, 1]`. Candle has no
 /// activation-checkpoint primitive for a graph inside one `backward()`, so the decode's activations
-/// stay on the tape until the step's backward; [`MageDecoderSpec::footprint`] budgets for that.
+/// stay on the tape until the step's backward; the builder footprint (`MageDecoderSpec`) budgets for that.
 pub struct MageX0Decoder {
     vae: MageVae,
 }
@@ -108,6 +108,53 @@ fn mage_vae_peak_gb(h: u32, w: u32) -> f64 {
     0.267 + 2.039 * (h as f64 * w as f64 / 1e6)
 }
 
+/// The `pipeline.*` sub-trees [`MageVae`]'s decoder half loads (`vae.rs` `load_inner` with no
+/// encoder): everything under `pipeline.` except the discarded FLUX.2-encoder side.
+fn is_decoder_key(key: &str) -> bool {
+    key.starts_with("pipeline.")
+        && !key.starts_with("pipeline.y_embedder.encoder.")
+        && !key.starts_with("pipeline.y_embedder.bottleneck.")
+}
+
+/// Resident f32 bytes of the Mage-VAE decoder half, read from the safetensors **headers** in
+/// `vae_dir` (tensor shapes of the decoder keys × 4 bytes; no tensor data is read).
+fn mage_decoder_param_bytes(vae_dir: &Path) -> Result<u64> {
+    use std::io::Read;
+    let files = candle_gen::sorted_safetensors(vae_dir, LABEL)?;
+    let mut elems = 0u64;
+    for file in files {
+        let mut f = std::fs::File::open(&file)
+            .map_err(|e| CandleError::Msg(format!("{LABEL}: open {}: {e}", file.display())))?;
+        let mut len = [0u8; 8];
+        f.read_exact(&mut len)
+            .map_err(|e| CandleError::Msg(format!("{LABEL}: read {}: {e}", file.display())))?;
+        let mut header = vec![0u8; u64::from_le_bytes(len) as usize];
+        f.read_exact(&mut header)
+            .map_err(|e| CandleError::Msg(format!("{LABEL}: read {}: {e}", file.display())))?;
+        let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
+            .map_err(|e| CandleError::Msg(format!("{LABEL}: header {}: {e}", file.display())))?;
+        for (key, entry) in &header {
+            if !is_decoder_key(key) {
+                continue;
+            }
+            let shape = entry["shape"].as_array().ok_or_else(|| {
+                CandleError::Msg(format!("{LABEL}: {key} has no shape in {}", file.display()))
+            })?;
+            elems += shape
+                .iter()
+                .map(|d| d.as_u64().unwrap_or(0))
+                .product::<u64>();
+        }
+    }
+    if elems == 0 {
+        return Err(CandleError::Msg(format!(
+            "{LABEL}: no Mage-VAE decoder tensors found in {}",
+            vae_dir.display()
+        )));
+    }
+    Ok(elems * 4)
+}
+
 /// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from the trainer's own resolved
 /// VAE directory only when an enabled loss decodes pixels. Mage has no separately cataloged x0
 /// decoder: `TrainingConfig::perceptual_decoder_dir` (which the shared floor requires) names the
@@ -115,6 +162,37 @@ fn mage_vae_peak_gb(h: u32, w: u32) -> f64 {
 /// trainer already resolved where.
 struct MageDecoderSpec {
     vae_dir: PathBuf,
+    /// Resident f32 decoder bytes ([`mage_decoder_param_bytes`]).
+    param_bytes: u64,
+}
+
+impl MageDecoderSpec {
+    /// Size the decoder from `vae_dir`'s safetensors headers.
+    fn new(vae_dir: &Path) -> Result<Self> {
+        let param_bytes = mage_decoder_param_bytes(vae_dir).map_err(|e| {
+            CandleError::Msg(format!(
+                "{LABEL}: cannot size the Mage-VAE decoder for depth anchoring from {}: {e}",
+                vae_dir.display()
+            ))
+        })?;
+        Ok(Self {
+            vae_dir: vae_dir.to_path_buf(),
+            param_bytes,
+        })
+    }
+}
+
+/// Mage's x0 decoder for the shared builder: the full Mage-VAE decoder sized from `vae_dir`, built
+/// only when an aux loss is enabled (otherwise nothing is read and the builder loads nothing).
+fn mage_decoder_spec(
+    cfg: &gen_core::train::TrainingConfig,
+    vae_dir: &Path,
+) -> Result<candle_gen_perceptual::DecoderSpec> {
+    Ok(if candle_gen_perceptual::any_aux_loss(cfg) {
+        candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec::new(vae_dir)?))
+    } else {
+        candle_gen_perceptual::DecoderSpec::None
+    })
 }
 
 impl candle_gen_perceptual::CustomDecoder for MageDecoderSpec {
@@ -122,21 +200,20 @@ impl candle_gen_perceptual::CustomDecoder for MageDecoderSpec {
         "Mage-VAE decoder"
     }
 
-    /// Conservative pre-load figures from Mage's measured inference decode curve: f32 weights at
-    /// twice the bf16 fixed term, and a working set of 4× the f32 decode peak (no activation
-    /// checkpointing on candle: the decode's activations and their cotangents are both live in the
-    /// backward). Not a measured training value.
+    /// Pre-load figures: the decoder's f32 weights exactly (from the checkpoint headers), and an
+    /// ESTIMATED working set of 4× the f32 inference decode peak (Mage's measured decode curve; no
+    /// activation checkpointing on candle, so activations and cotangents are both live in the
+    /// backward). The working set is an estimate, not a measured training value.
     fn footprint(&self, h: u32, w: u32) -> AuxModelFootprint {
-        let gb = |v: f64| (v * 1e9) as u64;
         AuxModelFootprint {
-            param_bytes: gb(2.0 * 0.267),
-            working_set_bytes: gb(4.0 * 2.0 * mage_vae_peak_gb(h, w)),
+            param_bytes: self.param_bytes,
+            working_set_bytes: (4.0 * 2.0 * mage_vae_peak_gb(h, w) * 1e9) as u64,
             reference_bytes_per_image: 0,
         }
     }
 
     fn load(&self, _dir: Option<&Path>, device: &Device) -> Result<Box<dyn X0Decoder>> {
-        Ok(Box::new(MageX0Decoder::new(MageVae::load_full_dtype(
+        Ok(Box::new(MageX0Decoder::new(MageVae::load_dtype(
             &self.vae_dir,
             device,
             DType::F32,
@@ -145,15 +222,13 @@ impl candle_gen_perceptual::CustomDecoder for MageDecoderSpec {
 }
 
 /// Mage's latent family for the shared aux-loss builder (epic 2123 E8).
-fn aux_loss_context<'a>(
-    device: &'a Device,
-    vae_dir: &Path,
-) -> candle_gen_perceptual::AuxLossContext<'a> {
+fn aux_loss_context(
+    device: &Device,
+    decoder: candle_gen_perceptual::DecoderSpec,
+) -> candle_gen_perceptual::AuxLossContext<'_> {
     candle_gen_perceptual::AuxLossContext {
         label: LABEL,
-        decoder: candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
-            vae_dir: vae_dir.to_path_buf(),
-        })),
+        decoder,
         device,
         latent_lpips: None,
     }
@@ -163,14 +238,13 @@ fn aux_loss_context<'a>(
 /// `entries` cached (item, bucket) references (epic 2123 E7). `0` when none is enabled.
 fn perceptual_footprint_bytes(
     cfg: &gen_core::train::TrainingConfig,
+    decoder: &candle_gen_perceptual::DecoderSpec,
     edge: u32,
     entries: usize,
 ) -> u64 {
     candle_gen_perceptual::perceptual_footprint(
         cfg,
-        &candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
-            vae_dir: PathBuf::new(),
-        })),
+        decoder,
         candle_gen_perceptual::AuxGeometry::image(edge, entries),
     )
 }
@@ -637,8 +711,9 @@ impl MageTrainer {
         // caching (one reference per (item, bucket) entry, sized at the largest bucket edge).
         let edges = bucket_edges(&req.config);
         let edge = edges.iter().copied().max().unwrap_or(req.config.resolution);
+        let decoder = mage_decoder_spec(&req.config, &self.dirs.vae)?;
         let aux_bytes =
-            perceptual_footprint_bytes(&req.config, edge, req.items.len() * edges.len());
+            perceptual_footprint_bytes(&req.config, &decoder, edge, req.items.len() * edges.len());
         if aux_bytes > 0 {
             check_aux_memory(
                 LABEL,
@@ -651,7 +726,7 @@ impl MageTrainer {
         // missing checkpoint fails fast); `None` — nothing loaded — when no aux loss is enabled.
         let perceptual = candle_gen_perceptual::build_perceptual_path(
             &req.config,
-            &aux_loss_context(&self.device, &self.dirs.vae),
+            &aux_loss_context(&self.device, decoder),
         )?;
         let cache = cache_samples(&self.dirs, req, &self.device, on_progress)?;
         let cfg_text = std::fs::read_to_string(self.dirs.transformer.join(TRANSFORMER_CONFIG))
@@ -1546,11 +1621,17 @@ mod tests {
             };
             assert!(candle_gen_perceptual::build_perceptual_path(
                 &c,
-                &aux_loss_context(&Device::Cpu, Path::new("/nonexistent"))
+                &aux_loss_context(
+                    &Device::Cpu,
+                    mage_decoder_spec(&c, Path::new("/nonexistent")).unwrap()
+                )
             )
             .unwrap()
             .is_none());
-            assert_eq!(perceptual_footprint_bytes(&c, 1024, 4), 0);
+            assert_eq!(
+                perceptual_footprint_bytes(&c, &candle_gen_perceptual::DecoderSpec::None, 1024, 4),
+                0
+            );
             let (loss, off) = run_step(
                 &f.model,
                 &cache,
@@ -1608,13 +1689,14 @@ mod tests {
         fn memory_estimate_includes_the_aux_models() {
             let mut on = TrainingConfig::default();
             on.depth_anchoring.schedule = schedule();
-            let small = perceptual_footprint_bytes(&on, 1024, 10);
+            let vae = fake_vae_dir();
+            let spec = mage_decoder_spec(&on, vae.path()).unwrap();
+            let small = perceptual_footprint_bytes(&on, &spec, 1024, 10);
             let da2 =
                 candle_gen_depth::anchor::depth_anchor_footprint(DepthModelSize::Small, 1024, 1024);
-            let decoder = MageDecoderSpec {
-                vae_dir: PathBuf::new(),
-            }
-            .footprint_for_test(1024);
+            let decoder = MageDecoderSpec::new(vae.path())
+                .unwrap()
+                .footprint_for_test(1024);
             assert_eq!(
                 small,
                 candle_gen::train::perceptual::perceptual_footprint_bytes(
@@ -1624,7 +1706,7 @@ mod tests {
                 )
             );
             on.depth_anchoring.model_size = DepthModelSize::Large;
-            let large = perceptual_footprint_bytes(&on, 1024, 10);
+            let large = perceptual_footprint_bytes(&on, &spec, 1024, 10);
             assert!(large > small + 1_000_000_000, "{small} {large}");
             let base = 10_000_000_000u64;
             assert!(check_aux_memory(LABEL, base, 0, base + large / 2).is_ok());
@@ -1647,14 +1729,91 @@ mod tests {
             let mut c = cfg();
             c.perceptual_decoder_dir = Some(tmp.path().join("no-vae"));
             c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
-            let e = candle_gen_perceptual::build_perceptual_path(
-                &c,
-                &aux_loss_context(&Device::Cpu, &tmp.path().join("no-vae")),
-            )
-            .err()
-            .unwrap()
-            .to_string();
+            let e = mage_decoder_spec(&c, &tmp.path().join("no-vae"))
+                .err()
+                .unwrap()
+                .to_string();
             assert!(e.contains("Mage-VAE decoder"), "{e}");
+        }
+
+        /// A VAE dir whose safetensors header carries decoder keys (pipeline.*: 10 + 6 f32
+        /// elements), a skipped FLUX.2-encoder key and an encoder key — none of the latter count.
+        fn fake_vae_dir() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            let t = |n: usize| Tensor::zeros(n, DType::F32, &Device::Cpu).unwrap();
+            let map: HashMap<String, Tensor> = [
+                ("pipeline.blocks.0.conv1.weight", t(10)),
+                ("pipeline.final_layer.linear.weight", t(6)),
+                ("pipeline.y_embedder.encoder.conv_in.weight", t(1000)),
+                ("student.dconv_encoder.x.weight", t(5000)),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+            candle_core::safetensors::save(&map, dir.path().join("vae.safetensors")).unwrap();
+            dir
+        }
+
+        /// Review fix: the decoder's resident bytes come from the header's decoder keys only (f32),
+        /// not a guess and not the encoder. Mutation: count every key (drop `is_decoder_key`) ⇒ red.
+        #[test]
+        fn decoder_param_bytes_come_from_the_header_decoder_keys() {
+            let vae = fake_vae_dir();
+            assert_eq!(mage_decoder_param_bytes(vae.path()).unwrap(), 16 * 4);
+            assert_eq!(
+                MageDecoderSpec::new(vae.path()).unwrap().param_bytes,
+                16 * 4
+            );
+        }
+
+        /// Review fix: the depth decoder loads the decoder half only. A checkpoint with every
+        /// decoder tensor (shape-free stand-ins discovered from the loader's own requests) and no
+        /// encoder loads through `load_dtype` with no encoder, while the encoder-loading entry point
+        /// needs encoder tensors it does not have. Mutation: use `load_full_dtype` in
+        /// `MageDecoderSpec::load` ⇒ the load fails ⇒ red.
+        #[test]
+        fn depth_decoder_loads_without_the_encoder() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("vae.safetensors");
+            let mut map: HashMap<String, Tensor> = HashMap::new();
+            map.insert(
+                "pipeline.final_layer.norm.weight".into(),
+                Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap(),
+            );
+            let spec = || MageDecoderSpec {
+                vae_dir: dir.path().to_path_buf(),
+                param_bytes: 0,
+            };
+            let mut loaded = None;
+            for _ in 0..5000 {
+                candle_core::safetensors::save(&map, &file).unwrap();
+                match candle_gen_perceptual::CustomDecoder::load(&spec(), None, &Device::Cpu) {
+                    Ok(d) => {
+                        loaded = Some(d);
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let key = msg
+                            .split("cannot find tensor ")
+                            .nth(1)
+                            .unwrap_or_else(|| panic!("unexpected load error: {msg}"))
+                            .split_whitespace()
+                            .next()
+                            .unwrap()
+                            .to_string();
+                        assert!(
+                            !key.starts_with("student."),
+                            "the depth decoder asked for an encoder tensor: {key}"
+                        );
+                        map.insert(key, Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap());
+                    }
+                }
+            }
+            assert!(loaded.is_some(), "decoder never loaded");
+            let vae = MageVae::load_dtype(dir.path(), &Device::Cpu, DType::F32).unwrap();
+            assert!(!vae.has_encoder());
+            assert!(MageVae::load_full_dtype(dir.path(), &Device::Cpu, DType::F32).is_err());
         }
 
         impl MageDecoderSpec {

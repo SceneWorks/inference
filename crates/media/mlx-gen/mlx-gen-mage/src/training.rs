@@ -250,9 +250,10 @@ fn trainer_descriptor() -> TrainerDescriptor {
 
 /// The full Mage-VAE decoder as the perceptual path's x0 decoder (epic 2123 E8, sc-24830): Mage's
 /// 128-channel / 16× latent space has no tiny decoder, so the shared path falls back to the real
-/// one-step decoder. The decode runs inside an MLX gradient checkpoint, so its activations are not
-/// retained between the forward and the backward (the backward recomputes the decode once); its
-/// weights are captured constants (frozen). Output: NHWC pixels in `[0, 1]` (the decoder's raw
+/// one-step decoder. The decode is wrapped in an MLX gradient checkpoint, so the backward
+/// recomputes it rather than reading retained activations; since the aux backward follows the
+/// forward immediately, the saving is modest (the recompute still materializes the decode's
+/// activations once). Its weights are captured constants (frozen). Output: NHWC pixels in `[0, 1]` (the decoder's raw
 /// `[-1, 1]` RGB mapped and clamped).
 pub struct MageX0Decoder {
     vae: MageVae,
@@ -348,19 +349,38 @@ fn perceptual_footprint_gb(cfg: &TrainingConfig, edge: u32, entries: usize) -> f
         / 1e9
 }
 
-/// Refuse a run whose auxiliary training models do not fit (epic 2123 E7): the dense base's
-/// measured resident peak ([`crate::memory::generation_resident_gb`], a lower bound for training)
-/// plus `extra_gb` against `safe_gb` (the live safe budget in production — injected for tests).
-/// Consulted only when an aux loss is enabled, so a plain run's admission is unchanged.
-fn preflight_aux_memory(extra_gb: f64, safe_gb: f64) -> Result<()> {
-    let projected = crate::memory::generation_resident_gb(None) + extra_gb;
+/// Projected LoRA training-step memory (decimal GB) at the square `edge` WITHOUT auxiliary models:
+/// the dense base's measured resident peak ([`crate::memory::generation_resident_gb`]) plus an
+/// ESTIMATE of the DiT backward's retained activations — per double-stream block ~24
+/// `tokens × hidden` f32 tensors (both streams' norms, QKV, attention output, MLP hidden at 4×,
+/// residuals) plus the `heads × tokens²` attention probabilities, ×2 for the backward's cotangents.
+/// Tokens = the image grid `(edge/16)²` plus the full caption cap. Not a measured value; Mage has no
+/// fitted training curve.
+fn projected_training_step_gb(edge: u32) -> f64 {
+    let cfg = MageFlowConfig::mage_flow();
+    let image = (edge / VAE_DOWNSAMPLE_FACTOR) as f64;
+    let tokens =
+        image * image + crate::config::max_prompt_tokens(crate::config::DROP_IDX_GEN) as f64;
+    let hidden = cfg.hidden_size as f64;
+    let heads = cfg.num_heads as f64;
+    let per_block = 24.0 * tokens * hidden + heads * tokens * tokens;
+    let activations = per_block * cfg.depth as f64 * 4.0 * 2.0 / 1e9;
+    crate::memory::generation_resident_gb(None) + activations
+}
+
+/// Refuse a run whose auxiliary training models do not fit (epic 2123 E7): the projected training
+/// step at `edge` ([`projected_training_step_gb`]) plus `extra_gb` (the aux models) against
+/// `safe_gb` (the live safe budget in production — injected for tests). Consulted only when an aux
+/// loss is enabled, so a plain run's admission is unchanged.
+fn preflight_aux_memory(edge: u32, extra_gb: f64, safe_gb: f64) -> Result<()> {
+    let base = projected_training_step_gb(edge);
+    let projected = base + extra_gb;
     if !safe_gb.is_finite() || safe_gb <= 0.0 || projected > safe_gb {
         return Err(format!(
             "mage_flow_base trainer: the perceptual-loss models (~{extra_gb:.1} GB for the \
-             Mage-VAE decoder and Depth-Anything-V2) on top of the ~{base:.1} GB base need \
-             ~{projected:.1} GB, exceeding this machine's ~{safe_gb:.1} GB safe budget. Use a smaller \
-             depth model or a lower training resolution.",
-            base = crate::memory::generation_resident_gb(None)
+             Mage-VAE decoder and Depth-Anything-V2) on top of the ~{base:.1} GB estimated training \
+             step at resolution {edge} need ~{projected:.1} GB, exceeding this machine's \
+             ~{safe_gb:.1} GB safe budget. Use a smaller depth model or a lower training resolution."
         )
         .into());
     }
@@ -635,7 +655,11 @@ impl MageFlowTrainer {
         // heavy runs (one cached reference per (item, bucket) entry, sized at the largest edge).
         let aux_gb = perceptual_footprint_gb(cfg, preview_edge, req.items.len() * edges.len());
         if aux_gb > 0.0 {
-            preflight_aux_memory(aux_gb, crate::memory::production_safe_budget_gb()?)?;
+            preflight_aux_memory(
+                preview_edge,
+                aux_gb,
+                crate::memory::production_safe_budget_gb()?,
+            )?;
         }
         // Epic 2123 E8: the shared builder loads the decoder + enabled losses before caching, so a
         // missing checkpoint fails fast; `None` (nothing loaded) when no aux loss is enabled.
@@ -1433,10 +1457,6 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
     Ok(t.clamp(1e-3, 1.0 - 1e-3))
 }
 
-/// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), pack the
-/// single training sample, run the DiT training forward, regress the velocity toward `noise − x0`,
-/// return `(loss, grads)`.
-#[allow(clippy::too_many_arguments)]
 /// The per-step loss breakdown [`compute_loss_grads`] returns (epic 2123 E8).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StepLosses {
@@ -2966,11 +2986,20 @@ mod depth_anchoring_tests {
             small > 0.0 && large - small > 1.0,
             "small {small}, large {large}"
         );
-        let base = crate::memory::generation_resident_gb(None);
+        // Review fix: the base is the projected training step (resident + DiT activations), which
+        // grows with resolution. Mutation: drop the activation term from
+        // `projected_training_step_gb` ⇒ the 1024 base equals the resident peak ⇒ red.
+        let resident = crate::memory::generation_resident_gb(None);
+        let base = projected_training_step_gb(1024);
+        assert!(base > resident && projected_training_step_gb(512) < base);
         let between = base + large / 2.0;
-        assert!(preflight_aux_memory(0.0, between).is_ok());
-        assert!(preflight_aux_memory(large, between).is_err());
-        assert!(preflight_aux_memory(large, (base + large) * 2.0).is_ok());
+        assert!(preflight_aux_memory(1024, 0.0, between).is_ok());
+        assert!(preflight_aux_memory(1024, large, between).is_err());
+        assert!(preflight_aux_memory(1024, large, (base + large) * 2.0).is_ok());
+        // A budget the resident peak + aux would fit but the training step + aux does not.
+        assert!(
+            preflight_aux_memory(1024, large, resident + large + (base - resident) / 2.0).is_err()
+        );
     }
 
     /// E3: declared; the full base fine-tune refuses it (typed); a missing decoder dir is named.

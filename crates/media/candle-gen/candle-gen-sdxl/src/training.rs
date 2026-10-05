@@ -58,7 +58,10 @@ use candle_gen::gen_core::train::{
 use candle_gen::gen_core::{self, BucketSchedule, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
-use candle_gen::train::flow_match::{prepared_subject_mask_weight, weighted_velocity_loss};
+use candle_gen::train::flow_match::{
+    self, combine_terms, prepared_subject_mask_weight, step_sample, step_terms,
+    weighted_velocity_loss, AuxDriver, AuxStep, StepLosses, StepSample,
+};
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
 use candle_gen::train::lora::{
     adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
@@ -67,8 +70,11 @@ use candle_gen::train::lora::{
 use candle_gen::train::optim::{
     accumulate_grads, accumulation_divisor, scale_grads, TrainOptimizer,
 };
+use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
+use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
+use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
 
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
@@ -396,9 +402,74 @@ fn preview_latents(
     Ok(out.to_dtype(compute_dtype)?)
 }
 
+/// ᾱ at integer DDPM timestep `t`, read from the trainer's OWN noising scheduler (`add_noise(1, 0,
+/// t) = √ᾱ_t`), so the x0 recovery uses exactly the coefficients the batch was noised with.
+fn alpha_bar_at(scheduler: &dyn Scheduler, t: usize) -> Result<f32> {
+    let one = Tensor::ones((1,), DType::F64, &Device::Cpu)?;
+    let sqrt_ab = scheduler
+        .add_noise(&one, one.zeros_like()?, t)?
+        .to_vec1::<f64>()?[0];
+    Ok((sqrt_ab * sqrt_ab) as f32)
+}
+
+/// The `[0, 1]` noise level of integer timestep `t` (`t / (T − 1)`, 1 = pure noise) — what the
+/// perceptual plan's loss windows are expressed in.
+fn noise_level_of(t: usize) -> f32 {
+    t as f32 / (NUM_TRAIN_TIMESTEPS - 1) as f32
+}
+
+/// The integer timestep training a `[0, 1]` noise level (`round(level · (T − 1))`).
+fn timestep_at(level: f32) -> usize {
+    ((level.clamp(0.0, 1.0) * (NUM_TRAIN_TIMESTEPS - 1) as f32).round() as usize)
+        .min(NUM_TRAIN_TIMESTEPS - 1)
+}
+
+/// Epic 2123 E8: plan the step on timestep `t`'s noise level; an aux-only step trains at the
+/// plan's remapped level (a diffusion step keeps `t` exactly). `(t, None)` without a perceptual path.
+fn plan_timestep<'a>(sample: &StepSample<'a>, t: usize) -> Result<(usize, Option<AuxStep<'a>>)> {
+    let aux = sample.plan(noise_level_of(t))?;
+    let t = match aux.as_ref() {
+        Some(a) if !a.diffusion() => timestep_at(a.noise_level()),
+        _ => t,
+    };
+    Ok((t, aux))
+}
+
+/// The step's loss on the predicted ε: the ε→noise regression and — epic 2123 E8, when `aux` plans
+/// one — the weighted perceptual term on the ε-prediction's x0 `(x_t − √(1−ᾱ)·ε)/√ᾱ` (the cached
+/// latent is the scaled SDXL latent TAESDXL decodes directly). On an aux-only step the diffusion
+/// term is not computed. `aux = None` is exactly the pre-epic-2123 loss.
+#[allow(clippy::too_many_arguments)]
+fn step_loss(
+    eps: &Tensor,
+    target: &Tensor,
+    noisy_f32: &Tensor,
+    alpha_bar: f32,
+    mask_weight: Option<&Tensor>,
+    mae: bool,
+    aux: Option<&AuxStep<'_>>,
+) -> Result<(Tensor, StepLosses)> {
+    let (diffusion_on, aux_on) = step_terms(aux);
+    let diffusion = if diffusion_on {
+        Some(eps_loss(eps, target, mask_weight, mae)?)
+    } else {
+        None
+    };
+    let aux_term = match aux {
+        Some(a) if aux_on => {
+            let x0_hat = Parameterization::Epsilon { alpha_bar }
+                .recover_x0(noisy_f32, &eps.to_dtype(DType::F32)?)?;
+            a.aux_loss(&x0_hat)?
+        }
+        _ => None,
+    };
+    combine_terms(diffusion, aux_term)
+}
+
 /// One micro-step's forward+backward over the installed adapter `Var`s: build the noised latent at
-/// timestep `t`, predict ε, regress it toward `noise`, and return `(loss, grads)` — `grads` keyed by
-/// the adapter `Var`s (ready for [`clip_grad_norm`] + [`TrainOptimizer::step`]).
+/// timestep `t`, predict ε, regress it toward `noise` (plus, epic 2123 E8, the planned perceptual
+/// term — [`step_loss`]), and return the step's [`StepLosses`] + grads keyed by the adapter `Var`s
+/// (ready for [`clip_grad_norm`] + [`TrainOptimizer::step`]).
 ///
 /// `use_checkpoint` selects the gradient-checkpointed backward (recompute each block) over the dense
 /// `loss.backward()`; both yield the same grads (the `tests` parity gate). A free function (not a
@@ -416,10 +487,14 @@ fn compute_loss_grads(
     mask_weight: Option<&Tensor>,
     compute_dtype: DType,
     use_checkpoint: bool,
-) -> Result<(f32, GradStore)> {
-    let noisy = scheduler
-        .add_noise(x0, noise.clone(), t)?
-        .to_dtype(compute_dtype)?;
+    aux: Option<&AuxStep<'_>>,
+) -> Result<(StepLosses, GradStore)> {
+    let noisy_f32 = scheduler.add_noise(x0, noise.clone(), t)?;
+    let noisy = noisy_f32.to_dtype(compute_dtype)?;
+    let alpha_bar = match aux {
+        Some(_) => alpha_bar_at(scheduler, t)?,
+        None => 0.0,
+    };
     let target = noise.to_dtype(DType::F32)?;
     let cond_c = cond.to_dtype(compute_dtype)?;
     let bsize = x0.dim(0)?;
@@ -433,22 +508,43 @@ fn compute_loss_grads(
             .time_embed(t_f64, bsize, compute_dtype, device)?
             .detach();
         let h0 = unet.conv_in_forward(&noisy)?;
+        // The final segment's loss breakdown is read back through `parts` (declared before the
+        // segments, which borrow it).
+        let parts = std::cell::Cell::new(None);
         let mut segs: Vec<Segment> = unet.block_segments(&emb, &cond_c);
-        // Final segment: the frozen head + the ε→noise regression, mapping [final_hidden] → [loss].
+        // Final segment: the frozen head + the ε→noise regression (+ the planned perceptual term),
+        // mapping [final_hidden] → [loss].
         let target_owned = target.clone();
+        let (noisy_ref, parts_ref) = (&noisy_f32, &parts);
         segs.push(Box::new(move |st: &[Tensor]| {
             let eps = unet.head_out(&st[0])?;
-            Ok(vec![eps_loss(&eps, &target_owned, mask_weight, mae)?])
+            let (loss, losses) = step_loss(
+                &eps,
+                &target_owned,
+                noisy_ref,
+                alpha_bar,
+                mask_weight,
+                mae,
+                aux,
+            )
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            parts_ref.set(Some(losses));
+            Ok(vec![loss])
         }));
         // State seed: hidden = conv_in_out, res₀ = conv_in_out (the UNet's `down_block_res_xs[0]`).
         let inputs = [h0.clone(), h0];
-        checkpointed_backward(&segs, &inputs, lora_vars)
+        let (_, grads) = checkpointed_backward(&segs, &inputs, lora_vars)?;
+        drop(segs);
+        let losses = parts.take().ok_or_else(|| {
+            CandleError::Msg("sdxl trainer: the checkpointed loss segment never ran".into())
+        })?;
+        Ok((losses, grads))
     } else {
         let eps = unet.forward(&noisy, t_f64, &cond_c)?;
-        let loss = eps_loss(&eps, &target, mask_weight, mae)?;
-        let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        let (loss, losses) =
+            step_loss(&eps, &target, &noisy_f32, alpha_bar, mask_weight, mae, aux)?;
         let grads = loss.backward()?;
-        Ok((loss_val, grads))
+        Ok((losses, grads))
     }
 }
 
@@ -520,6 +616,66 @@ fn save_adapter(set: &LoraSet, cfg: &TrainingConfig, path: &Path) -> Result<()> 
     }
 }
 
+/// Error label of the SDXL trainer (aux-loss builder, preflight).
+const LABEL: &str = "sdxl trainer";
+
+/// SDXL's latent family for the shared aux-loss builder (epic 2123 E8): the 4-channel SDXL VAE
+/// latent (`mean × 0.13025`), decoded by TAESDXL (diffusers `scaling_factor 1.0`: it decodes the
+/// scaled latent directly); latent-LPIPS family SDXL.
+fn aux_loss_context(device: &Device) -> AuxLossContext<'_> {
+    AuxLossContext {
+        label: LABEL,
+        decoder: taesdxl_decoder(),
+        latent_lpips: Some(gen_core::train::LatentLpipsFamily::Sdxl),
+        device,
+    }
+}
+
+fn taesdxl_decoder() -> DecoderSpec {
+    DecoderSpec::Tiny {
+        name: "TAESDXL",
+        config: TinyDecoderSpec::taesdxl(),
+    }
+}
+
+/// The epic-2123 perceptual path for `cfg`: `None` when no aux loss is enabled (nothing loads).
+fn load_perceptual_path(cfg: &TrainingConfig, device: &Device) -> Result<Option<PerceptualPath>> {
+    candle_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context(device))
+}
+
+/// Extra training memory (bytes) of the enabled perceptual losses for `items` items: TAESDXL + each
+/// loss at the largest bucket edge, plus one reference per (item, bucket) entry (E7).
+fn perceptual_footprint_bytes(cfg: &TrainingConfig, items: usize) -> u64 {
+    let edges = bucket_edges(cfg);
+    let edge = edges.iter().copied().max().unwrap_or(0);
+    candle_gen_perceptual::perceptual_footprint(
+        cfg,
+        &taesdxl_decoder(),
+        AuxGeometry::image(edge, items * edges.len()),
+    )
+}
+
+/// Epic 2123 E7 preflight: with a perceptual loss on, the UNet's resident weights (the `unet/`
+/// checkpoint — the lower bound; this trainer has no fitted activation model, so the same base
+/// applies checkpointed or dense) plus the aux footprint must fit `budget_bytes`. Depth off ⇒ no
+/// check.
+fn aux_memory_preflight(
+    root: &Path,
+    cfg: &TrainingConfig,
+    items: usize,
+    budget_bytes: u64,
+) -> Result<()> {
+    let aux = perceptual_footprint_bytes(cfg, items);
+    if aux == 0 {
+        return Ok(());
+    }
+    let unet = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+    let base = std::fs::metadata(&unet)
+        .map_err(|e| CandleError::Msg(format!("{LABEL}: stat {}: {e}", unet.display())))?
+        .len();
+    flow_match::check_aux_memory(LABEL, base, aux, budget_bytes)
+}
+
 /// Identity + capabilities of the candle SDXL trainer: LoRA + LoKr, `backend = "candle"` (the two
 /// backend-correct deviations from `mlx-gen-sdxl`'s descriptor are `backend` and the host platform).
 pub fn trainer_descriptor() -> TrainerDescriptor {
@@ -541,9 +697,17 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
         // sc-24828 (epic 2123): subject-masked loss.
+        // sc-24830 (epic 2123): depth anchoring through the shared perceptual path (TAESDXL +
+        // Depth-Anything-V2), dense and gradient-checkpointed.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps) and
+        // E-LatentLPIPS (this latent family's published weights) through the shared aux-loss
+        // builder this trainer already drives.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
+            depth_anchoring: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -688,6 +852,15 @@ impl SdxlTrainer {
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
         let edges = bucket_edges(cfg);
         let compute_dtype = parse_compute_dtype(&cfg.train_dtype);
+        // Epic 2123 E7 + E8: admit the perceptual models, then load them BEFORE caching so a missing
+        // checkpoint fails fast (`None` — nothing loaded — when no aux loss is on).
+        aux_memory_preflight(
+            &self.root,
+            cfg,
+            req.items.len(),
+            flow_match::device_training_budget_bytes(device, LABEL),
+        )?;
+        let perceptual = load_perceptual_path(cfg, device)?;
 
         // --- load + cache: VAE latents (.mean × scale) + dual-CLIP conditioning ---
         on_progress(TrainingProgress::LoadingModel);
@@ -849,6 +1022,19 @@ impl SdxlTrainer {
         // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: references per (item, bucket) entry once (the cached latent is already
+        // TAESDXL's NCHW input), alternation keyed on the real item.
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(AuxDriver::prepare(
+                path,
+                cache.len(),
+                |i| Ok(cache[i].0.clone()),
+                &schedule,
+                accum,
+                0,
+            )?),
+            None => None,
+        };
         let mut accumulated: Option<GradStore> = None;
         let mut update_idx = 0u32;
         let mut last_loss = 0.0f32;
@@ -857,14 +1043,16 @@ impl SdxlTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, cond, mask_weight) = &cache[schedule.cache_index((step - 1) as usize)];
+            let sample = step_sample(aux_driver.as_mut(), step, &schedule);
+            let (x0, cond, mask_weight) = &cache[sample.entry];
             let t = sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64));
             let noise = sample_noise(
                 x0.dims(),
                 cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
                 device,
             )?;
-            let (loss, grads) = compute_loss_grads(
+            let (t, aux) = plan_timestep(&sample, t)?;
+            let (losses, grads) = compute_loss_grads(
                 &unet,
                 scheduler.as_ref(),
                 &lora_set.vars,
@@ -876,8 +1064,9 @@ impl SdxlTrainer {
                 mask_weight.as_ref(),
                 compute_dtype,
                 use_checkpoint,
+                aux.as_ref(),
             )?;
-            last_loss = loss;
+            last_loss = losses.total;
             steps_run = step;
             accumulate_grads(&mut accumulated, grads, &lora_set.vars)?;
 
@@ -1033,6 +1222,38 @@ mod tests {
             use_linear_projection: false,
         };
         UNet2DConditionModel::new(vb, 4, 4, false, cfg).unwrap()
+    }
+
+    /// The pre-epic-2123 call shape (no perceptual step) for the legacy tests.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_loss_grads(
+        unet: &UNet2DConditionModel,
+        scheduler: &dyn Scheduler,
+        lora_vars: &[Var],
+        x0: &Tensor,
+        cond: &Tensor,
+        t: usize,
+        noise: &Tensor,
+        mae: bool,
+        mask_weight: Option<&Tensor>,
+        compute_dtype: DType,
+        use_checkpoint: bool,
+    ) -> Result<(f32, GradStore)> {
+        super::compute_loss_grads(
+            unet,
+            scheduler,
+            lora_vars,
+            x0,
+            cond,
+            t,
+            noise,
+            mae,
+            mask_weight,
+            compute_dtype,
+            use_checkpoint,
+            None,
+        )
+        .map(|(l, g)| (l.total, g))
     }
 
     fn grad_vec(grads: &GradStore, v: &Var) -> Vec<f32> {
@@ -1477,5 +1698,300 @@ mod tests {
             ..base
         };
         assert!(t.validate(&bad_opt).is_err());
+    }
+
+    /// Epic 2123 depth anchoring (sc-24830) on the candle SDXL trainer: the tiny UNet + a random-init
+    /// tiny 4-channel decoder + tiny DA2, through the real step.
+    mod depth_anchoring {
+        use super::*;
+        use candle_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
+
+        fn schedule() -> AuxLossSchedule {
+            AuxLossSchedule {
+                weight: 0.5,
+                t_min: 0.6,
+                t_max: 0.9,
+                every_n: 2,
+            }
+        }
+
+        struct Fixture {
+            unet: UNet2DConditionModel,
+            vars: Vec<Var>,
+            x0: Tensor,
+            cond: Tensor,
+            noise: Tensor,
+        }
+
+        fn fixture() -> Fixture {
+            let dev = Device::Cpu;
+            let vm = VarMap::new();
+            let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+            let mut unet = tiny_unet(vb);
+            // Same target set as the dense-vs-checkpoint gate (the time embedding is a detached
+            // per-step constant on the checkpointed path).
+            let paths: Vec<String> = unet
+                .lora_target_paths()
+                .unwrap()
+                .into_iter()
+                .filter(|p| !p.starts_with("time_embedding.") && !p.starts_with("add_embedding."))
+                .collect();
+            let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
+            for v in &set.vars {
+                v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                    .unwrap();
+            }
+            Fixture {
+                unet,
+                vars: set.vars,
+                x0: Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap(),
+                cond: Tensor::randn(0f32, 1f32, (1, 7, 64), &dev).unwrap(),
+                noise: Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap(),
+            }
+        }
+
+        /// Step 1 = diffusion step, step 2 = the item's 2nd window ⇒ aux-only.
+        fn driver(f: &Fixture) -> (AuxDriver, BucketSchedule) {
+            let path = candle_gen_perceptual::testing::tiny_depth_path(4, schedule(), &Device::Cpu)
+                .unwrap();
+            let sched = BucketSchedule::new(1, &[], 3);
+            let x0 = f.x0.clone();
+            let d = AuxDriver::prepare(path, 1, |_| Ok(x0.clone()), &sched, 1, 0).unwrap();
+            (d, sched)
+        }
+
+        fn run(
+            f: &Fixture,
+            t: usize,
+            ckpt: bool,
+            aux: Option<&AuxStep<'_>>,
+        ) -> (StepLosses, GradStore) {
+            let scheduler = DDIMSchedulerConfig::default()
+                .build(NUM_TRAIN_TIMESTEPS)
+                .unwrap();
+            super::super::compute_loss_grads(
+                &f.unet,
+                scheduler.as_ref(),
+                &f.vars,
+                &f.x0,
+                &f.cond,
+                t,
+                &f.noise,
+                false,
+                None,
+                DType::F32,
+                ckpt,
+                aux,
+            )
+            .unwrap()
+        }
+
+        fn grad_bits(g: &GradStore, v: &Var) -> Vec<u32> {
+            g.get(v.as_tensor())
+                .map(|t| {
+                    t.flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// The ε recovery uses the trainer's own noising ᾱ: with ε = the true noise it returns the
+        /// clean latent at low, mid and high t; the level ↔ timestep mapping round-trips. Mutation:
+        /// return `1 − √ᾱ²` from `alpha_bar_at` ⇒ red.
+        #[test]
+        fn epsilon_recovery_uses_the_noising_alpha_bar() {
+            let f = fixture();
+            let scheduler = DDIMSchedulerConfig::default()
+                .build(NUM_TRAIN_TIMESTEPS)
+                .unwrap();
+            for t in [10usize, 500, 990] {
+                let noisy = scheduler.add_noise(&f.x0, f.noise.clone(), t).unwrap();
+                let alpha_bar = alpha_bar_at(scheduler.as_ref(), t).unwrap();
+                let rec = Parameterization::Epsilon { alpha_bar }
+                    .recover_x0(&noisy, &f.noise)
+                    .unwrap();
+                let err = (rec - &f.x0)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(err < 1e-3, "t={t}: x0 recovery error {err}");
+                assert_eq!(timestep_at(noise_level_of(t)), t);
+            }
+            // Half-way rounds to the nearer index (0.5 · (T − 1) ends in .5).
+            assert_eq!(timestep_at(0.5), 500);
+        }
+
+        /// (a)/(b) on both backward paths: the diffusion step has no aux term; the aux-only step has
+        /// no diffusion term, total == aux and a nonzero finite LoRA B gradient. Mutations: compute
+        /// the diffusion term unconditionally ⇒ red; drop `aux` in the checkpointed segment ⇒ red.
+        #[test]
+        fn aux_only_step_trains_the_adapter_through_depth_alone() {
+            let f = fixture();
+            let (mut d, sched) = driver(&f);
+            let s1 = d.sample(1, &sched).plan(0.5).unwrap().unwrap();
+            assert!(s1.diffusion() && !s1.has_aux());
+            for ckpt in [false, true] {
+                let (l, _) = run(&f, 500, ckpt, Some(&s1));
+                assert!(
+                    l.diffusion.is_some() && l.aux.is_none(),
+                    "ckpt={ckpt}: {l:?}"
+                );
+                assert_eq!(l.total, l.diffusion.unwrap());
+            }
+            let s2 = d.sample(2, &sched).plan(0.5).unwrap().unwrap();
+            assert!(!s2.diffusion() && s2.has_aux());
+            let t = timestep_at(s2.noise_level());
+            assert!((599..=900).contains(&t), "remapped into the window: {t}");
+            for ckpt in [false, true] {
+                let (l, g) = run(&f, t, ckpt, Some(&s2));
+                assert!(l.diffusion.is_none(), "ckpt={ckpt}: {l:?}");
+                let aux = l.aux.expect("aux term");
+                assert!(aux.is_finite() && aux > 0.0, "ckpt={ckpt}: {aux}");
+                assert_eq!(l.total, aux);
+                let mut nonzero_b = false;
+                for (i, v) in f.vars.iter().enumerate() {
+                    let gv: Vec<f32> = grad_bits(&g, v).into_iter().map(f32::from_bits).collect();
+                    assert!(gv.iter().all(|x| x.is_finite()), "ckpt={ckpt} var {i}");
+                    nonzero_b |= i % 2 == 1 && gv.iter().any(|x| *x != 0.0);
+                }
+                assert!(
+                    nonzero_b,
+                    "ckpt={ckpt}: no LoRA B gradient from the depth term"
+                );
+            }
+        }
+
+        /// The loop trains an aux-only step at the plan's remapped timestep and keeps the sampled one
+        /// on a diffusion step / without a path. Mutation: return the sampled `t` on an aux step ⇒
+        /// red.
+        #[test]
+        fn aux_steps_train_at_the_planned_timestep() {
+            let f = fixture();
+            let (mut d, sched) = driver(&f);
+            let (t1, a1) = plan_timestep(&d.sample(1, &sched), 100).unwrap();
+            assert_eq!(t1, 100);
+            assert!(a1.unwrap().diffusion());
+            let (t2, a2) = plan_timestep(&d.sample(2, &sched), 100).unwrap();
+            assert!(!a2.unwrap().diffusion());
+            assert!((599..=900).contains(&t2), "aux-only step at {t2}");
+            assert_eq!(plan_timestep(&StepSample::plain(0, 0), 100).unwrap().0, 100);
+        }
+
+        /// The aux term is the depth loss of THE trainer's x0 estimate: recomputed independently from
+        /// the model output with the trainer's parameterisation, it matches the step's aux bits.
+        /// Mutation: swap the parameterisation in `step_loss` (e.g. `VPrediction`) ⇒ red.
+        #[test]
+        fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
+            let f = fixture();
+            let (mut d, sched) = driver(&f);
+            let _ = d.sample(1, &sched);
+            let s2 = d.sample(2, &sched).plan(0.5).unwrap().unwrap();
+            let t = timestep_at(s2.noise_level());
+            let (l, _) = run(&f, t, false, Some(&s2));
+            let scheduler = DDIMSchedulerConfig::default()
+                .build(NUM_TRAIN_TIMESTEPS)
+                .unwrap();
+            let noisy = scheduler.add_noise(&f.x0, f.noise.clone(), t).unwrap();
+            let eps = f.unet.forward(&noisy, t as f64, &f.cond).unwrap();
+            let ab = alpha_bar_at(scheduler.as_ref(), t).unwrap() as f64;
+            let x0 = ((&noisy - (eps * (1.0 - ab).sqrt()).unwrap()).unwrap() / ab.sqrt()).unwrap();
+            let want = s2
+                .aux_loss(&x0)
+                .unwrap()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let got = l.aux.unwrap();
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "{got} vs {want}"
+            );
+        }
+
+        /// (c) Depth off is bit-identical to the pre-epic-2123 dense step (reproduced verbatim).
+        /// Mutation: perturb the `None` combine ⇒ red.
+        #[test]
+        fn depth_off_is_bit_identical_to_the_legacy_step() {
+            let f = fixture();
+            let (l, g) = run(&f, 500, false, None);
+            assert_eq!((l.diffusion, l.aux), (Some(l.total), None));
+            let scheduler = DDIMSchedulerConfig::default()
+                .build(NUM_TRAIN_TIMESTEPS)
+                .unwrap();
+            let noisy = scheduler.add_noise(&f.x0, f.noise.clone(), 500).unwrap();
+            let eps = f.unet.forward(&noisy, 500.0, &f.cond).unwrap();
+            let loss = eps_loss(&eps, &f.noise, None, false).unwrap();
+            let legacy = loss.to_scalar::<f32>().unwrap();
+            let lg = loss.backward().unwrap();
+            assert_eq!(l.total.to_bits(), legacy.to_bits());
+            for v in &f.vars {
+                assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
+            }
+        }
+
+        fn depth_on() -> TrainingConfig {
+            let mut cfg = TrainingConfig::default();
+            cfg.depth_anchoring.schedule = schedule();
+            cfg
+        }
+
+        /// (d) E7: footprint 0 off, larger for Large DA2; the preflight refuses between base and
+        /// base + aux, checkpointed or dense. Mutation: skip the guard ⇒ red.
+        #[test]
+        fn preflight_counts_the_perceptual_models() {
+            assert_eq!(perceptual_footprint_bytes(&TrainingConfig::default(), 4), 0);
+            let mut cfg = depth_on();
+            let small = perceptual_footprint_bytes(&cfg, 4);
+            assert!(small > 0);
+            cfg.depth_anchoring.model_size = DepthModelSize::Large;
+            assert!(perceptual_footprint_bytes(&cfg, 4) > small);
+            cfg.depth_anchoring.model_size = DepthModelSize::Small;
+            let tmp = tempfile::tempdir().unwrap();
+            let udir = tmp.path().join("unet");
+            std::fs::create_dir_all(&udir).unwrap();
+            std::fs::write(
+                udir.join("diffusion_pytorch_model.fp16.safetensors"),
+                vec![0u8; 4096],
+            )
+            .unwrap();
+            let base = 4096u64;
+            assert!(aux_memory_preflight(tmp.path(), &TrainingConfig::default(), 4, 1).is_ok());
+            for ckpt in [false, true] {
+                cfg.gradient_checkpointing = ckpt;
+                assert!(aux_memory_preflight(tmp.path(), &cfg, 4, base + small).is_ok());
+                let e = aux_memory_preflight(tmp.path(), &cfg, 4, base + small - 1)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("perceptual"), "ckpt={ckpt}: {e}");
+            }
+        }
+
+        /// (e) The descriptor declares depth anchoring; depth off builds no path; a missing decoder
+        /// dir names TAESDXL. Mutation: `depth_anchoring: false` ⇒ red.
+        #[test]
+        fn descriptor_and_loader_errors() {
+            assert!(trainer_descriptor().techniques.depth_anchoring);
+            let dev = Device::Cpu;
+            assert!(load_perceptual_path(&TrainingConfig::default(), &dev)
+                .unwrap()
+                .is_none());
+            let tmp = tempfile::tempdir().unwrap();
+            let mut cfg = depth_on();
+            cfg.depth_anchoring.model_dir = Some(tmp.path().join("da2"));
+            let e = load_perceptual_path(&cfg, &dev).err().unwrap().to_string();
+            assert!(e.contains("TAESDXL"), "{e}");
+            cfg.perceptual_decoder_dir = Some(tmp.path().join("no-taesdxl"));
+            let e = load_perceptual_path(&cfg, &dev).err().unwrap().to_string();
+            assert!(e.contains("TAESDXL"), "{e}");
+        }
     }
 }

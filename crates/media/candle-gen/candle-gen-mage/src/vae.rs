@@ -497,6 +497,17 @@ impl MageVae {
         Self::load_inner(dir, device, true, dtype)
     }
 
+    /// The decoder half only, at `dtype` (no `student.dconv_encoder.*` encoder) — what the
+    /// depth-anchoring x0 decoder needs (sc-24830).
+    pub fn load_dtype(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        Self::load_inner(dir, device, false, dtype)
+    }
+
+    /// Whether the encoder half is loaded.
+    pub fn has_encoder(&self) -> bool {
+        self.encoder.is_some()
+    }
+
     fn load_inner(dir: &Path, device: &Device, with_encoder: bool, dtype: DType) -> Result<Self> {
         let w = Weights::from_dir(dir, device, dtype)?;
         let mut blocks = Vec::with_capacity(21);
