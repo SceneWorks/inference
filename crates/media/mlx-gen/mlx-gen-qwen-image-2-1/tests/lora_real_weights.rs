@@ -27,6 +27,10 @@
 //!    LoRA/LoKr and preserved MLX 1000-step LoRA, plus this candidate's corrected edit LoKr in
 //!    `edit`/`full` phases, on both routes at every tier. `probe` runs two training steps per mode
 //!    without renders; `edit` reuses the completed T2I file; `imports` runs only donor/public cells.
+//!    The retained style donor's T2I cells use its original style-only request and three dedicated
+//!    bare bases; the terminal edit phase therefore has 51 renders. Other donor requests stay fixed.
+//! 6. [`diagnostic_reused_t2i_style_direction`] — explicitly diagnostic-only six style renders
+//!    (three bare/adapted pairs), reusing the immutable original donor without training.
 //!
 //! EVERY TEST WRITES ITS EVIDENCE BEFORE IT ASSERTS. The PNGs and the `<test>.json` metrics
 //! (per-render mean |Δ|, the learned-direction scores, MLX active peaks, process footprint and the
@@ -127,10 +131,12 @@ const EDIT_ADAPTER: &str = "qwen21_edit_lokr.safetensors";
 pub(crate) mod edit_protocol;
 #[path = "support/edit_training_balanced64.rs"]
 mod edit_training_balanced64;
+#[path = "support/style_protocol.rs"]
+mod style_protocol;
 use edit_protocol::{EDIT_INSTRUCTION, T2I_EVAL_PROMPT, TRAIN_EDIT_INSTRUCTION};
 
 /// The T2I training style: concentric rings in exactly these three colours.
-const PALETTE: [[u8; 3]; 3] = [[0, 150, 150], [240, 120, 20], [250, 220, 60]];
+const PALETTE: [[u8; 3]; 3] = style_protocol::PALETTE;
 /// RGB distance under which a pixel counts as "a palette colour".
 const PALETTE_RADIUS: f64 = 60.0;
 
@@ -503,22 +509,7 @@ fn static_row_fraction(img: &Image) -> f64 {
 /// [`palette_fraction`]: it moves with every partial shift toward the style, not only once a pixel
 /// lands inside [`PALETTE_RADIUS`].
 fn palette_distance(img: &Image) -> f64 {
-    let px = img.pixels.chunks_exact(3);
-    let n = px.len().max(1) as f64;
-    px.map(|px| {
-        PALETTE
-            .iter()
-            .map(|c| {
-                px.iter()
-                    .zip(c)
-                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
-                    .sum::<f64>()
-                    .sqrt()
-            })
-            .fold(f64::INFINITY, f64::min)
-    })
-    .sum::<f64>()
-        / n
+    style_protocol::palette_distance(&img.pixels)
 }
 
 fn palette_fraction(img: &Image) -> f64 {
@@ -1127,6 +1118,34 @@ pub(crate) fn t2i_request() -> GenerationRequest {
     }
 }
 
+fn original_style_request() -> GenerationRequest {
+    GenerationRequest {
+        prompt: style_protocol::ORIGINAL_STYLE_PROMPT.to_owned(),
+        ..t2i_request()
+    }
+}
+
+fn direction_request_facts(request: &GenerationRequest) -> Value {
+    json!({"prompt": request.prompt, "width": request.width, "height": request.height,
+        "steps": request.steps, "seed": request.seed, "guidance": request.guidance,
+        "strength": request.strength, "count": request.count,
+        "negativePrompt": request.negative_prompt, "trueCfg": request.true_cfg,
+        "conditioningCount": request.conditioning.len()})
+}
+
+fn verify_original_style_donor(entry: &Value, file: &Path) {
+    assert_eq!(entry["name"], style_protocol::DONOR_NAME);
+    assert_eq!(entry["kind"], "lora");
+    assert_eq!(entry["origin"], "MLX run 37127726908");
+    assert_eq!(entry["sha256"], style_protocol::DONOR_SHA256);
+    assert_eq!(entry["size"], style_protocol::DONOR_BYTES);
+    assert_eq!(
+        std::fs::metadata(file).unwrap().len(),
+        style_protocol::DONOR_BYTES
+    );
+    assert_eq!(sha256_file(file), style_protocol::DONOR_SHA256);
+}
+
 // ── 1. text-to-image LoRA ────────────────────────────────────────────────────────────────────────
 
 /// A short text-to-image LoRA run on real weights, then the same-seed with/without comparison at
@@ -1703,6 +1722,9 @@ fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
             entry["sha256"].as_str().unwrap(),
             "transferred adapter hash"
         );
+        if entry["name"] == style_protocol::DONOR_NAME {
+            verify_original_style_donor(entry, &file);
+        }
         let kind = match entry["kind"].as_str().unwrap() {
             "lora" => AdapterKind::Lora,
             "lokr" => AdapterKind::Lokr,
@@ -1765,28 +1787,52 @@ fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
                 &guard,
                 &out,
             );
+            // The retained style donor was trained/evaluated before the mixed edit-prefix
+            // diagnostic. Its learned direction uses that frozen request and its own base.
+            let style_request = original_style_request();
+            let style_base = (mode == "t2i").then(|| {
+                render(
+                    &format!("{tier}_t2i_original_style_base"),
+                    &spec,
+                    &style_request,
+                    &guard,
+                    &out,
+                )
+            });
             for (name, file, kind) in &imports {
                 let label = format!("{tier}_{mode}_{name}");
+                let (paired_base, paired_base_facts, paired_request) =
+                    if style_protocol::uses_original_style_request(name, mode) {
+                        let (image, facts) = style_base.as_ref().unwrap();
+                        (image, facts, &style_request)
+                    } else {
+                        (&base, &base_facts, &request)
+                    };
                 let (adapted, adapted_facts) = render(
                     &label,
                     &spec.clone().with_adapters(vec![adapter(file, 1.0, *kind)]),
-                    &request,
+                    paired_request,
                     &guard,
                     &out,
                 );
                 cases.push(json!({"tier": tier, "mode": mode, "adapter": name,
-                    "base": base_facts, "adapted": adapted_facts,
-                    "meanAbsDiff": mean_abs_diff(&adapted, &base),
-                    "paletteDistanceGain": palette_distance(&base) - palette_distance(&adapted),
+                    "base": paired_base_facts, "adapted": adapted_facts,
+                    "request": direction_request_facts(paired_request),
+                    "requestProtocol": if style_protocol::uses_original_style_request(name, mode) {
+                        "original-1000-step-style" } else if mode == "t2i" {
+                        "common-edit-prefix" } else { "ordered-two-reference-edit" },
+                    "meanAbsDiff": mean_abs_diff(&adapted, paired_base),
+                    "paletteDistanceGain": palette_distance(paired_base) - palette_distance(&adapted),
                 }));
-                images.push((label, base.clone(), adapted));
+                images.push((label, paired_base.clone(), adapted));
             }
         }
     }
     write_json(
         &out_dir(),
         "imported_adapters",
-        &json!({"manifest": manifest, "correctedEditAdapter": corrected_edit, "renders": cases}),
+        &json!({"manifest": manifest, "correctedEditAdapter": corrected_edit, "renders": cases,
+            "additionalOriginalStyleBaseRenders": 3, "stylePalette": PALETTE}),
     );
     assert_eq!(
         cases.len(),
@@ -1805,6 +1851,99 @@ fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
             assert!(case["paletteDistanceGain"].as_f64().unwrap() >= PALETTE_DISTANCE_GAIN_FLOOR,
                 "{label}: the preserved 1000-step adapter must still move toward its learned palette");
         }
+    }
+}
+
+/// Fixed style-protocol diagnosis: six renders, no training or terminal acceptance.
+#[test]
+#[ignore = "needs pinned snapshots, immutable original style donor and Metal"]
+fn diagnostic_reused_t2i_style_direction() {
+    let source = std::env::var("GITHUB_SHA").expect("record exact diagnostic source SHA");
+    assert!(source.len() == 40 && source.bytes().all(|b| b.is_ascii_hexdigit()));
+    let manifest_path = PathBuf::from(
+        std::env::var("QWEN_IMAGE_2_1_IMPORT_MANIFEST")
+            .expect("exact hash-pinned original donor manifest required"),
+    );
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let directory = PathBuf::from(manifest["directory"].as_str().unwrap());
+    assert!(directory.is_absolute() && directory.is_dir());
+    let entries = manifest["adapters"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    let donors: Vec<_> = entries
+        .iter()
+        .filter(|e| e["name"] == style_protocol::DONOR_NAME)
+        .collect();
+    assert_eq!(
+        donors.len(),
+        1,
+        "exactly one immutable original style donor"
+    );
+    let entry = donors[0];
+    let basename = entry["file"].as_str().unwrap();
+    assert!(Path::new(basename).components().count() == 1);
+    assert_eq!(Path::new(basename).file_name().unwrap(), basename);
+    let file = directory.join(basename);
+    verify_original_style_donor(entry, &file);
+
+    let out = out_dir().join("style-protocol");
+    std::fs::create_dir_all(&out).unwrap();
+    let request = original_style_request();
+    let provenance = json!({"trainingSource": style_protocol::TRAINING_SOURCE,
+        "trainingRun": style_protocol::TRAINING_RUN, "trainingSteps": 1000,
+        "donorSha256": style_protocol::DONOR_SHA256, "donorBytes": style_protocol::DONOR_BYTES});
+    write_json(
+        &out,
+        "DIAGNOSTIC_ONLY",
+        &json!({
+        "purpose": "DIAGNOSTIC_ONLY", "acceptanceEvidence": false, "retrain": false,
+        "sourceCandidate": source, "trainingProvenance": provenance,
+        "request": direction_request_facts(&request), "adapterStrength": 1.0,
+        "stylePalette": PALETTE, "renderCount": 6,
+        "movementFloor": ADAPTER_MOVES_FLOOR, "paletteGainFloor": PALETTE_DISTANCE_GAIN_FLOOR}),
+    );
+    let guard = Footprint::start(&out);
+    let mut cases = Vec::new();
+    let mut images = Vec::new();
+    for (tier, quant) in tiers() {
+        let spec = tier_spec(tier, quant);
+        let (base, base_facts) =
+            render(&format!("{tier}_style_base"), &spec, &request, &guard, &out);
+        let label = format!("{tier}_style_mlx_t2i_1000_steps");
+        let (adapted, adapted_facts) = render(
+            &label,
+            &spec.with_adapters(vec![adapter(&file, 1.0, AdapterKind::Lora)]),
+            &request,
+            &guard,
+            &out,
+        );
+        cases.push(json!({"tier": tier, "mode": "t2i", "adapter": style_protocol::DONOR_NAME,
+            "base": base_facts, "adapted": adapted_facts, "request": direction_request_facts(&request),
+            "requestProtocol": "original-1000-step-style", "adapterSha256": sha256_file(&file),
+            "meanAbsDiff": mean_abs_diff(&adapted, &base),
+            "paletteDistanceBase": palette_distance(&base),
+            "paletteDistanceAdapted": palette_distance(&adapted),
+            "paletteDistanceGain": palette_distance(&base) - palette_distance(&adapted)}));
+        images.push((label, base, adapted));
+    }
+    // Persist all six fixed cells before a learned-direction assertion can fail.
+    write_json(
+        &out,
+        "style-direction",
+        &json!({
+        "purpose": "DIAGNOSTIC_ONLY", "acceptanceEvidence": false, "retrain": false,
+        "sourceCandidate": source, "trainingProvenance": provenance, "donor": entry,
+        "stylePalette": PALETTE, "renderCount": 6, "renders": cases}),
+    );
+    assert_eq!(cases.len(), 3);
+    for ((label, base, adapted), case) in images.iter().zip(&cases) {
+        assert_sane(label, base);
+        assert_sane(label, adapted);
+        assert_overlay_not_underpredicted(label, &case["base"], &case["adapted"]);
+        assert!(case["meanAbsDiff"].as_f64().unwrap() >= ADAPTER_MOVES_FLOOR);
+        assert!(
+            case["paletteDistanceGain"].as_f64().unwrap() >= PALETTE_DISTANCE_GAIN_FLOOR,
+            "{label}: original style donor must move toward its frozen training palette"
+        );
     }
 }
 
