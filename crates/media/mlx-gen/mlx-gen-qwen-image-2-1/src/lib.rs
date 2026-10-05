@@ -192,6 +192,8 @@ mod e2e_real_weights {
     pub(crate) use super::diagnostic_physical_footprint::phys_footprint;
 }
 #[cfg(test)]
+mod conditioning_velocity_diagnostic;
+#[cfg(test)]
 mod q4_diagnostic;
 #[cfg(test)]
 #[path = "../tests/lora_real_weights.rs"]

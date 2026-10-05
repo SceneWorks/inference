@@ -198,7 +198,7 @@ class WiringTests(unittest.TestCase):
         workflow = yaml.safe_load((ROOT / ".github/workflows/real-weights.yml").read_text(encoding="utf-8"))
         inputs = workflow[True]["workflow_dispatch"]["inputs"]
         self.assertEqual(inputs["qwen_image_2_1_lora_phase"]["options"],
-                         ["probe", "diagnostic", "q4-numeric", "edit", "imports", "full"])
+                         ["probe", "diagnostic", "q4-numeric", "direction-protocol", "edit", "imports", "full"])
         job = workflow["jobs"]["mlx-qwen-image-2-1"]
         self.assertEqual(job["timeout-minutes"], 300)
         self.assertEqual(job["permissions"], {"contents": "write"})

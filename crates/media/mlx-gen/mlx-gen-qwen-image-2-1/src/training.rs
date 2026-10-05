@@ -1332,6 +1332,11 @@ fn encode_latents(vae: &QwenImage21Vae, image: &Image, width: u32, height: u32) 
     pack_latents(&vae.normalize(&mode)?)
 }
 
+#[cfg(test)]
+pub(crate) fn diagnostic_encode_latents(vae: &QwenImage21Vae, image: &Image) -> Result<Array> {
+    encode_latents(vae, image, 768, 768)
+}
+
 /// Tokens a caption contributes to the joint sequence (template rendered, system prefix dropped)
 /// — the tokenizer alone, so the preflight knows the exact sequence before any weight loads.
 fn caption_tokens(tokenizer: &TextTokenizer, drop: usize, caption: &str) -> Result<u64> {
@@ -1347,6 +1352,11 @@ fn build_batch(x0: &Array, noise: &Array, t: f32) -> Result<(Array, Array)> {
     let x_t = add(&multiply(x0, &one_minus)?, &multiply(noise, &s)?)?;
     let target = subtract(noise, x0)?;
     Ok((x_t, target))
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_midpoint_batch(x0: &Array, noise: &Array) -> Result<(Array, Array)> {
+    build_batch(x0, noise, 0.5)
 }
 
 /// Sample a normalized flow-match timestep `t ∈ [1e-3, 1−1e-3]` — the SceneWorks

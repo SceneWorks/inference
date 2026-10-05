@@ -28,7 +28,7 @@ class PhaseTests(unittest.TestCase):
             cargo.write_text('#!/bin/bash\n'
                 'printf "%s|probe=%s|t2i=%s|edit=%s\\n" "$*" "$QWEN_IMAGE_2_1_PROBE_ONLY" '
                 '"$QWEN_IMAGE_2_1_LORA_T2I_STEPS" "$QWEN_IMAGE_2_1_LORA_EDIT_STEPS" >> "$CARGO_CALLS"\n'
-                'if [[ -n "$FAIL_TEST" && "$*" == *"$FAIL_TEST"* ]]; then exit 1; fi\n'
+                'if [[ -n "$FAIL_TEST" && "$*" == *"$FAIL_TEST"* ]]; then exit "${FAIL_EXIT:-1}"; fi\n'
                 'if [[ "$ZERO_TESTS" == 1 ]]; then echo "test result: ok. 0 passed"; '
                 'else echo "test result: ok. 1 passed"; fi\n', encoding="utf-8")
             cargo.chmod(0o755)

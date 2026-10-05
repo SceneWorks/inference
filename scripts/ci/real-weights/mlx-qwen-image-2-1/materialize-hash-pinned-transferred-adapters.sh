@@ -1,3 +1,11 @@
+if [[ "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" == direction-protocol ]]; then
+  # Immutable original style donor plus separately named FAILED edit donor. No c233 replacement.
+  python3.12 scripts/ci/qwen21_adapter_imports.py --manifest scripts/ci/qwen21_adapter_imports.json --destination "$QWEN_IMAGE_2_1_RENDER_OUT/direction-imports/adapters"
+  echo "QWEN_IMAGE_2_1_IMPORT_MANIFEST=$QWEN_IMAGE_2_1_RENDER_OUT/direction-imports/adapters/adapter-imports-resolved.json" >> "$GITHUB_ENV"
+  python3.12 -m scripts.ci.qwen21_velocity_adapter --manifest scripts/ci/qwen21_velocity_adapter.json --destination "$QWEN_IMAGE_2_1_RENDER_OUT/velocity-input/adapters"
+  echo "QWEN_IMAGE_2_1_VELOCITY_MANIFEST=$QWEN_IMAGE_2_1_RENDER_OUT/velocity-input/adapters/velocity-adapter-resolved.json" >> "$GITHUB_ENV"
+  exit 0
+fi
 if [[ "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" == diagnostic || "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" == q4-numeric ]]; then
   # A failed terminal candidate's completed training may inform this diagnostic only.
   # The exact adapter/receipt hashes and original source/run are checked before model work.
