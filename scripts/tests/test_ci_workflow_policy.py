@@ -4616,5 +4616,63 @@ class WorkflowFileSizeTests(unittest.TestCase):
         )
 
 
+class Qwen21TerminalPhysicalCeilingTests(unittest.TestCase):
+    CAP = "QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB"
+    JOB = "mlx-qwen-image-2-1"
+
+    @classmethod
+    def ceiling_errors(cls, workflow: dict) -> list[str]:
+        errors: list[str] = []
+        jobs = workflow.get("jobs", {})
+        job = jobs.get(cls.JOB, {})
+        if job.get("env", {}).get(cls.CAP) != "100":
+            errors.append("Qwen 2.1 profile must bind the existing physical cap to literal 100 GB")
+        if cls.CAP in workflow.get("env", {}):
+            errors.append("Qwen's selected cap must not change other profiles through global env")
+        for name, other in jobs.items():
+            if name != cls.JOB and cls.CAP in other.get("env", {}):
+                errors.append(f"Qwen's selected cap leaked into {name}")
+        for step in job.get("steps", []):
+            if cls.CAP in step.get("env", {}):
+                errors.append("a step must not override the fixed profile cap")
+            if re.search(rf"\b{cls.CAP}\s*=", step.get("run", "")):
+                errors.append("a script must not override the fixed profile cap")
+        return errors
+
+    def test_selected_profile_binds_existing_cap_without_other_profile_changes(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(self.ceiling_errors(workflow), [])
+
+    def test_omitted_raised_dynamic_or_unscoped_caps_are_rejected(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        mutations = []
+        for value in [None, "101", "nan", "${{ vars.QWEN_PHYSICAL_CAP || '100' }}"]:
+            mutant = copy.deepcopy(workflow)
+            env = mutant["jobs"][self.JOB]["env"]
+            if value is None:
+                env.pop(self.CAP)
+            else:
+                env[self.CAP] = value
+            mutations.append((f"job value {value!r}", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["env"].pop(self.CAP)
+        mutant.setdefault("env", {})[self.CAP] = "100"
+        mutations.append(("global instead of profile", mutant))
+        mutant = copy.deepcopy(workflow)
+        other = next(name for name in mutant["jobs"] if name != self.JOB)
+        mutant["jobs"][other].setdefault("env", {})[self.CAP] = "100"
+        mutations.append(("other job leak", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["steps"][0].setdefault("env", {})[self.CAP] = "101"
+        mutations.append(("step env override", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["steps"].append({"run": f"export {self.CAP}=101"})
+        mutations.append(("script override", mutant))
+        self.assertEqual(len(mutations), 8)
+        for name, mutant in mutations:
+            with self.subTest(mutation=name):
+                self.assertTrue(self.ceiling_errors(mutant))
+
+
 if __name__ == "__main__":
     unittest.main()

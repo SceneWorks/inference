@@ -5079,6 +5079,10 @@ jobs:
       # Through env, never interpolated into a script: the materialize step validates its shape.
       QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC: ${{ inputs.qwen_image_2_1_third_party_lora }}
       QWEN_IMAGE_2_1_LORA_PHASE: ${{ inputs.qwen_image_2_1_lora_phase }}
+      # Training otherwise derives its physical ceiling from the host census; its 100 GB
+      # default applies only before admission/inference. Bind the selected terminal safety
+      # ceiling explicitly for this profile, in addition to the existing host reserves.
+      QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB: "100"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Resolve runner-local snapshot paths
