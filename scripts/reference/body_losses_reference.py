@@ -33,8 +33,9 @@ Other modes (no fixture write):
 - `--convert PTH OUT_DIR` re-containers the HybrIK / Sapiens `.pth` checkpoints as
   `model.safetensors` with keys unchanged — the rehost the catalog pins (neither upstream ships
   safetensors);
-- `--real VITPOSE_DIR HYBRIK_PTH SAPIENS_PTH IMAGE OUT_DIR --bbox X1 Y1 X2 Y2` writes the real-scale
-  reference outputs the ports' ignored real-weight parity tests read (`SCENEWORKS_BODY_LOSS_REAL`).
+- `--real IMAGE OUT_DIR [--vitpose DIR] [--hybrik PTH --bbox X1 Y1 X2 Y2] [--sapiens PTH]` writes
+  the real-scale reference outputs of the given models that the ports' ignored real-weight parity
+  tests read (`SCENEWORKS_BODY_LOSS_REAL`; each model's re-hosted snapshot sits in `OUT_DIR/<model>/`).
 """
 
 from __future__ import annotations
@@ -623,54 +624,59 @@ def convert(src: Path, dst_dir: Path) -> None:
     print("wrote", dst_dir / "model.safetensors", len(sd), "tensors")
 
 
-def real_reference(vitpose_dir: Path, hybrik_pth: Path, sapiens_pth: Path, image: Path,
-                   bbox: list[float], out: Path) -> None:
-    """The reference implementations at real scale on `image` — what the ports'
-    `real_checkpoints_match_the_reference_implementation` tests compare against (S9's real-weight
-    phase; never run in ordinary CI)."""
+def real_reference(image: Path, out: Path, vitpose_dir: Path | None, hybrik_pth: Path | None,
+                   sapiens_pth: Path | None, bbox: list[float] | None) -> None:
+    """The reference implementations at real scale on `image` — what the ports' ignored
+    `real_*_matches_the_reference_implementation` tests compare against. Each model is optional;
+    only the given ones write their outputs (never run in ordinary CI)."""
     from PIL import Image
-    from transformers import VitPoseForPoseEstimation
 
     img = torch.from_numpy(np.asarray(Image.open(image).convert("RGB"), dtype=np.float32) / 255.0)
     img = img.permute(2, 0, 1).unsqueeze(0).contiguous()
-    vit = VitPoseForPoseEstimation.from_pretrained(str(vitpose_dir)).float().eval()
-    hyb = TinyHybrik(blocks=(3, 4, 6, 3), widths=(64, 128, 256, 512), fc_hidden=1024, input_size=256)
-    sd = {}
-    for k, v in torch_checkpoint_state(hybrik_pth).items():
-        if k == "init_shape":
-            sd[k] = v.reshape(1, 10)
-        elif k.startswith("preact."):
-            sd[k[len("preact."):]] = v
-        elif k.startswith(("fc1.", "fc2.", "decshape.")):
-            sd[k] = v
-    missing = [k for k in hyb.load_state_dict(sd, strict=False).missing_keys if k not in ("img_mean", "img_std")]
-    assert not missing, missing
-    hyb.eval()
-    sap = SapiensNormal(embed_dim=1024, num_layers=24, num_heads=16, ffn_dim=4096, patch=16, pos=(64, 48), mid=768)
-    sd = {}
-    for k, v in torch_checkpoint_state(sapiens_pth).items():
-        if k.startswith("backbone."):
-            k = k[len("backbone."):].replace("ffn.layers.0.0.", "ffn.fc1.").replace("ffn.layers.1.", "ffn.fc2.")
-        elif not k.startswith("decode_head."):
-            continue
-        sd[k] = v
-    missing = [k for k in sap.load_state_dict(sd, strict=False).missing_keys if k not in ("img_mean", "img_std")]
-    assert not missing, missing
-    sap.eval()
+    t = {"input.a": img}
     with torch.no_grad():
-        hm, co, cf, r, v = vitpose_forward(vit, img, (256, 192), include_head=True)
-        t = {
-            "input.a": img,
-            "input.person_bbox": torch.tensor(bbox),
-            "vitpose.out.heatmaps_a": hm,
-            "vitpose.out.ratios_a": r,
-            "vitpose.out.ratio_vis_a": v,
-            "hybrik.out.betas_a": hyb(img, [bbox]),
-            "sapiens.out.normals_a": sapiens_forward(sap, img, train_size=(512, 384), normal_size=256),
-        }
+        if vitpose_dir is not None:
+            from transformers import VitPoseForPoseEstimation
+
+            vit = VitPoseForPoseEstimation.from_pretrained(str(vitpose_dir)).float().eval()
+            hm, co, cf, r, v = vitpose_forward(vit, img, (256, 192), include_head=True)
+            t.update({"vitpose.out.heatmaps_a": hm, "vitpose.out.ratios_a": r, "vitpose.out.ratio_vis_a": v})
+        if hybrik_pth is not None:
+            if bbox is None:
+                raise SystemExit("--hybrik needs --bbox X1 Y1 X2 Y2")
+            hyb = TinyHybrik(blocks=(3, 4, 6, 3), widths=(64, 128, 256, 512), fc_hidden=1024, input_size=256)
+            sd = {}
+            for k, v in torch_checkpoint_state(hybrik_pth).items():
+                if k == "init_shape":
+                    sd[k] = v.reshape(1, 10)
+                elif k.startswith("preact."):
+                    sd[k[len("preact."):]] = v
+                elif k.startswith(("fc1.", "fc2.", "decshape.")):
+                    sd[k] = v
+            res = hyb.load_state_dict(sd, strict=False)
+            missing = [k for k in res.missing_keys if k not in ("img_mean", "img_std")]
+            assert not missing, missing
+            hyb.eval()
+            t["input.person_bbox"] = torch.tensor(bbox)
+            t["hybrik.out.betas_a"] = hyb(img, [bbox])
+        if sapiens_pth is not None:
+            sap = SapiensNormal(embed_dim=1024, num_layers=24, num_heads=16, ffn_dim=4096, patch=16,
+                                pos=(64, 48), mid=768)
+            sd = {}
+            for k, v in torch_checkpoint_state(sapiens_pth).items():
+                if k.startswith("backbone."):
+                    k = k[len("backbone."):].replace("ffn.layers.0.0.", "ffn.fc1.").replace("ffn.layers.1.", "ffn.fc2.")
+                elif not k.startswith("decode_head."):
+                    continue
+                sd[k] = v
+            res = sap.load_state_dict(sd, strict=False)
+            missing = [k for k in res.missing_keys if k not in ("img_mean", "img_std")]
+            assert not missing, missing
+            sap.eval()
+            t["sapiens.out.normals_a"] = sapiens_forward(sap, img, train_size=(512, 384), normal_size=256)
     out.mkdir(parents=True, exist_ok=True)
     save_file({k: x.contiguous().float() for k, x in t.items()}, str(out / "reference.safetensors"))
-    print("wrote", out / "reference.safetensors")
+    print("wrote", out / "reference.safetensors", sorted(t))
 
 
 def main() -> None:
@@ -678,8 +684,11 @@ def main() -> None:
     ap.add_argument("--verify", action="store_true", help="check the manifest hashes only")
     ap.add_argument("--convert", nargs=2, metavar=("PTH", "OUT_DIR"),
                     help="re-container a HybrIK/Sapiens .pth as OUT_DIR/model.safetensors (keys unchanged)")
-    ap.add_argument("--real", nargs=5, metavar=("VITPOSE_DIR", "HYBRIK_PTH", "SAPIENS_PTH", "IMAGE", "OUT_DIR"),
+    ap.add_argument("--real", nargs=2, metavar=("IMAGE", "OUT_DIR"),
                     help="real-scale reference outputs for the ports' real-weight parity tests")
+    ap.add_argument("--vitpose", metavar="DIR", help="--real: the vitpose-plus-base snapshot")
+    ap.add_argument("--hybrik", metavar="PTH", help="--real: upstream hybrik_resnet34.pth")
+    ap.add_argument("--sapiens", metavar="PTH", help="--real: upstream sapiens normal 0.3b .pth")
     ap.add_argument("--bbox", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"),
                     help="the person box HybrIK crops to in --real mode")
     args = ap.parse_args()
@@ -688,10 +697,9 @@ def main() -> None:
         convert(Path(args.convert[0]), Path(args.convert[1]))
         return
     if args.real:
-        if not args.bbox:
-            raise SystemExit("--real needs --bbox X1 Y1 X2 Y2")
-        v, h, sp, im, out = (Path(x) for x in args.real)
-        real_reference(v, h, sp, im, list(args.bbox), out)
+        opt = lambda x: Path(x) if x else None  # noqa: E731
+        real_reference(Path(args.real[0]), Path(args.real[1]), opt(args.vitpose), opt(args.hybrik),
+                       opt(args.sapiens), list(args.bbox) if args.bbox else None)
         return
     if args.verify:
         manifest = json.loads(MANIFEST.read_text())

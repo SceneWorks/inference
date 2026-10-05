@@ -433,16 +433,21 @@ fn arm_builders_name_a_missing_checkpoint() {
     assert!(e.contains("pose_model_dir"), "{e}");
 }
 
-/// Real-weight parity (S9's real-weight phase) — see the MLX twin for the directory layout.
-#[test]
-#[ignore = "needs the real ViTPose+/HybrIK/Sapiens checkpoints + --real reference outputs \
-            (SCENEWORKS_BODY_LOSS_REAL); never downloaded in ordinary test runs"]
-fn real_checkpoints_match_the_reference_implementation() {
+/// The real-weight parity directory (see the MLX twin).
+fn real_dir() -> (PathBuf, Weights) {
     let root = PathBuf::from(
         std::env::var("SCENEWORKS_BODY_LOSS_REAL")
             .expect("SCENEWORKS_BODY_LOSS_REAL must name the real-weight directory"),
     );
     let r = Weights::from_file(&root.join("reference.safetensors"), &dev(), DType::F32).unwrap();
+    (root, r)
+}
+
+/// AC2 at real scale: ViTPose+ base vs HF transformers + upstream's encoder.
+#[test]
+#[ignore = "needs the real vitpose-plus-base snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
+fn real_vitpose_matches_the_reference_implementation() {
+    let (root, r) = real_dir();
     let img = nhwc(&r, "input.a");
     let pose = VitPose::from_dir(root.join("vitpose"), VitPoseConfig::plus_base(), &dev()).unwrap();
     let (hm, _) = pose.forward_pixels(&img).unwrap();
@@ -461,6 +466,14 @@ fn real_checkpoints_match_the_reference_implementation() {
         &t(&r, "vitpose.out.ratio_vis_a"),
         2e-3,
     );
+}
+
+/// AC2 at real scale: the re-hosted HybrIK ResNet-34 vs upstream's encoder on the original `.pth`.
+#[test]
+#[ignore = "needs the real HybrIK snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
+fn real_hybrik_matches_the_reference_implementation() {
+    let (root, r) = real_dir();
+    let img = nhwc(&r, "input.a");
     let b: Vec<f32> = t(&r, "input.person_bbox").to_vec1().unwrap();
     let (_, h, w, _) = img.dims4().unwrap();
     let crop = HybrikEncoder::crop_for([b[0], b[1], b[2], b[3]], h, w);
@@ -472,6 +485,14 @@ fn real_checkpoints_match_the_reference_implementation() {
         &t(&r, "hybrik.out.betas_a"),
         1e-3,
     );
+}
+
+/// AC2 at real scale: the re-hosted Sapiens normal 0.3B vs upstream's estimator on the `.pth`.
+#[test]
+#[ignore = "needs the real Sapiens snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
+fn real_sapiens_matches_the_reference_implementation() {
+    let (root, r) = real_dir();
+    let img = nhwc(&r, "input.a");
     let sap = SapiensNormal::from_dir(root.join("sapiens"), SapiensConfig::normal_0_3b(), &dev())
         .unwrap();
     close(

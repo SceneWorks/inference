@@ -510,58 +510,86 @@ fn arm_builders_name_a_missing_checkpoint() {
 // AC2 at real scale: the real checkpoints vs the reference implementation's outputs.
 // ---------------------------------------------------------------------------------------------
 
-/// Real-weight parity — runs only where the three checkpoints and the reference outputs exist
-/// (S9's real-weight phase): `SCENEWORKS_BODY_LOSS_REAL` names a directory holding `vitpose/`,
-/// `hybrik/`, `sapiens/` (each a `model.safetensors` snapshot, as the catalog installs them) and
-/// `reference.safetensors` from `scripts/reference/body_losses_reference.py --real`. Fails —
-/// never passes vacuously — when run without them.
-#[test]
-#[ignore = "needs the real ViTPose+/HybrIK/Sapiens checkpoints + --real reference outputs \
-            (SCENEWORKS_BODY_LOSS_REAL); never downloaded in ordinary test runs"]
-fn real_checkpoints_match_the_reference_implementation() {
+/// The real-weight parity directory (`SCENEWORKS_BODY_LOSS_REAL`): `reference.safetensors` from
+/// `scripts/reference/body_losses_reference.py --real` plus each model's re-hosted snapshot in
+/// `vitpose/`, `hybrik/`, `sapiens/`. These tests run on the CPU stream (no long Metal job) and
+/// fail — never pass vacuously — when the directory or the model's outputs are missing.
+fn real_dir() -> (std::path::PathBuf, Weights) {
+    // CPU end to end: the default device too, so the checkpoints' lazy loads never land on the GPU
+    // (a 1.4 GB Sapiens graph on Metal is the long GPU job these tests must not be).
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     let root = std::path::PathBuf::from(
         std::env::var("SCENEWORKS_BODY_LOSS_REAL")
             .expect("SCENEWORKS_BODY_LOSS_REAL must name the real-weight directory"),
     );
     let r = Weights::from_file(root.join("reference.safetensors")).unwrap();
-    let img = nhwc(&r, "input.a");
-    let pose = VitPose::from_dir(root.join("vitpose"), VitPoseConfig::plus_base()).unwrap();
-    let (hm, _) = pose.forward_pixels(&img).unwrap();
-    let (coords, conf) = vitpose::heatmaps_to_keypoints(&hm).unwrap();
-    let (ratios, vis) = body_ratios(&coords, &conf, true).unwrap();
-    close(
-        "real heatmaps",
-        &hm.transpose_axes(&[0, 3, 1, 2]).unwrap(),
-        &t(&r, "vitpose.out.heatmaps_a"),
-        2e-3,
-    );
-    close("real ratios", &ratios, &t(&r, "vitpose.out.ratios_a"), 1e-3);
-    close(
-        "real ratio vis",
-        &vis,
-        &t(&r, "vitpose.out.ratio_vis_a"),
-        2e-3,
-    );
-    let bbox_v = t(&r, "input.person_bbox");
-    eval([&bbox_v]).unwrap();
-    let b = bbox_v.as_slice::<f32>();
-    let sh = img.shape();
-    let crop = HybrikEncoder::crop_for([b[0], b[1], b[2], b[3]], sh[1] as usize, sh[2] as usize);
-    let hyb = HybrikEncoder::from_dir(root.join("hybrik"), HybrikConfig::resnet34()).unwrap();
-    close(
-        "real betas",
-        &hyb.forward_crop(&img, crop).unwrap(),
-        &t(&r, "hybrik.out.betas_a"),
-        1e-3,
-    );
-    let sap = SapiensNormal::from_dir(root.join("sapiens"), SapiensConfig::normal_0_3b()).unwrap();
-    let want = t(&r, "sapiens.out.normals_a")
-        .transpose_axes(&[0, 2, 3, 1])
-        .unwrap();
-    close(
-        "real normals",
-        &sap.forward_pixels(&img).unwrap(),
-        &want,
-        5e-3,
-    );
+    (root, r)
+}
+
+/// AC2 at real scale: ViTPose+ base vs HF transformers + upstream's encoder.
+#[test]
+#[ignore = "needs the real vitpose-plus-base snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
+fn real_vitpose_matches_the_reference_implementation() {
+    on_cpu(|| {
+        let (root, r) = real_dir();
+        let img = nhwc(&r, "input.a");
+        let pose = VitPose::from_dir(root.join("vitpose"), VitPoseConfig::plus_base()).unwrap();
+        let (hm, _) = pose.forward_pixels(&img).unwrap();
+        let (coords, conf) = vitpose::heatmaps_to_keypoints(&hm).unwrap();
+        let (ratios, vis) = body_ratios(&coords, &conf, true).unwrap();
+        let hm_nchw = hm.transpose_axes(&[0, 3, 1, 2]).unwrap();
+        close(
+            "real heatmaps",
+            &hm_nchw,
+            &t(&r, "vitpose.out.heatmaps_a"),
+            2e-3,
+        );
+        close("real ratios", &ratios, &t(&r, "vitpose.out.ratios_a"), 1e-3);
+        close(
+            "real ratio vis",
+            &vis,
+            &t(&r, "vitpose.out.ratio_vis_a"),
+            2e-3,
+        );
+    });
+}
+
+/// AC2 at real scale: the re-hosted HybrIK ResNet-34 vs upstream's encoder on the original `.pth`.
+#[test]
+#[ignore = "needs the real HybrIK snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
+fn real_hybrik_matches_the_reference_implementation() {
+    on_cpu(|| {
+        let (root, r) = real_dir();
+        let img = nhwc(&r, "input.a");
+        let bbox_v = t(&r, "input.person_bbox");
+        eval([&bbox_v]).unwrap();
+        let b = bbox_v.as_slice::<f32>();
+        let sh = img.shape();
+        let crop =
+            HybrikEncoder::crop_for([b[0], b[1], b[2], b[3]], sh[1] as usize, sh[2] as usize);
+        let hyb = HybrikEncoder::from_dir(root.join("hybrik"), HybrikConfig::resnet34()).unwrap();
+        let got = hyb.forward_crop(&img, crop).unwrap();
+        close("real betas", &got, &t(&r, "hybrik.out.betas_a"), 1e-3);
+    });
+}
+
+/// AC2 at real scale: the re-hosted Sapiens normal 0.3B vs upstream's estimator on the `.pth`.
+#[test]
+#[ignore = "needs the real Sapiens snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
+fn real_sapiens_matches_the_reference_implementation() {
+    on_cpu(|| {
+        let (root, r) = real_dir();
+        let img = nhwc(&r, "input.a");
+        let sap =
+            SapiensNormal::from_dir(root.join("sapiens"), SapiensConfig::normal_0_3b()).unwrap();
+        let want = t(&r, "sapiens.out.normals_a")
+            .transpose_axes(&[0, 2, 3, 1])
+            .unwrap();
+        close(
+            "real normals",
+            &sap.forward_pixels(&img).unwrap(),
+            &want,
+            5e-3,
+        );
+    });
 }
