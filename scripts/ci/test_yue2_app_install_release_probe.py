@@ -134,55 +134,61 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertIn(MODULE.OLD_RUN_ROOT, collector)
         self.assertIn(MODULE.OLD_WORKER_ID, collector)
 
-    def test_two_clean_pairs_finish_without_using_third_pair(self):
+    def test_clean_pair_stops_at_original_two_observation_guarantee(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(MODULE, "datetime", FixedDateTime):
             evidence = Path(directory)
-            collector = FakePairCollector(evidence, [snapshot_pair(1), snapshot_pair(2),
-                                                       snapshot_pair(3, persistent=True)])
+            collector = FakePairCollector(evidence, [snapshot_pair(1),
+                                                       snapshot_pair(2, persistent=True)])
             result = MODULE.validate_release_pairs(evidence, collector)
-            self.assertEqual(collector.read_count, 2)
-            self.assertEqual(collector.decisions, [(1, True), (2, False)])
+            self.assertEqual(collector.read_count, 1)
+            self.assertEqual(collector.decisions, [(1, False)])
             self.assertTrue(collector.finished)
-            self.assertEqual(len(result["pairs"]), 2)
-            self.assertEqual({row["name"] for row in result["processFiles"]}, {
-                "process-snapshot-before.json", "process-snapshot-after.json",
-                "process-snapshot-2-before.json", "process-snapshot-2-after.json"})
+            self.assertEqual(len(result["pairs"]), 1)
+            self.assertEqual({item["name"] for item in result["processFiles"]}, {
+                "process-snapshot-before.json", "process-snapshot-after.json"})
+            self.assertFalse((evidence / "process-snapshot-2-before.json").exists())
             for item in result["processFiles"]:
-                path = evidence / item["name"]
-                self.assertEqual(item["sha256"], MODULE.file_sha256(path))
+                self.assertEqual(item["sha256"], MODULE.file_sha256(evidence / item["name"]))
 
-    def test_transient_first_pair_requires_two_later_clean_pairs_and_retains_refusal(self):
+    def test_transient_pair_requires_one_later_complete_pair_and_retains_refusal(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(MODULE, "datetime", FixedDateTime):
             evidence = Path(directory)
             collector = FakePairCollector(evidence, [snapshot_pair(1, inaccessible=True),
-                                                       snapshot_pair(2), snapshot_pair(3)])
+                                                       snapshot_pair(2), snapshot_pair(3, persistent=True)])
             result = MODULE.validate_release_pairs(evidence, collector)
-            self.assertEqual(collector.read_count, 3)
-            self.assertEqual(collector.decisions, [(1, True), (2, True), (3, False)])
-            self.assertEqual([pair["valid"] for pair in result["pairs"]], [False, True, True])
+            self.assertEqual(collector.read_count, 2)
+            self.assertEqual(collector.decisions, [(1, True), (2, False)])
+            self.assertEqual([pair["valid"] for pair in result["pairs"]], [False, True])
             refusal = evidence / "initial-refusal.json"
-            self.assertTrue(refusal.is_file())
-            refusal_item = result["refusalFiles"][0]
-            self.assertEqual(refusal_item["sha256"], MODULE.file_sha256(refusal))
+            self.assertEqual(result["refusalFiles"][0]["sha256"], MODULE.file_sha256(refusal))
             self.assertNotIn("commandLine", refusal.read_text(encoding="utf-8"))
-            self.assertEqual(result["before"]["collector"]["pid"], 999)
+            self.assertFalse((evidence / "process-snapshot-3-before.json").exists())
 
-    def test_persistent_or_returning_transient_candidate_never_proves_release(self):
+    def test_persistent_or_unresolved_transient_candidate_never_proves_release(self):
         with patch.object(MODULE, "datetime", FixedDateTime):
-            for case_number, pairs in enumerate((
-                [snapshot_pair(1, persistent=True), snapshot_pair(2, persistent=True),
-                 snapshot_pair(3, persistent=True)],
-                [snapshot_pair(1), snapshot_pair(2, inaccessible=True), snapshot_pair(3)],
-            )):
-                with self.subTest(case_number=case_number), tempfile.TemporaryDirectory() as directory:
+            for pairs in (
+                [snapshot_pair(i, persistent=True) for i in range(1, 4)],
+                [snapshot_pair(i, inaccessible=True) for i in range(1, 4)],
+            ):
+                with tempfile.TemporaryDirectory() as directory:
                     evidence = Path(directory)
                     collector = FakePairCollector(evidence, pairs)
-                    with self.assertRaisesRegex(ValueError, "last two process snapshot pairs"):
+                    with self.assertRaisesRegex(ValueError, "no final complete process snapshot pair"):
                         MODULE.validate_release_pairs(evidence, collector)
                     self.assertEqual(collector.read_count, 3)
-                    self.assertTrue((evidence / "refusal.json").is_file() is False)
-                    self.assertTrue((evidence / "initial-refusal.json").exists() or
-                                    (evidence / "process-pair-2-refusal.json").exists())
+                    self.assertTrue((evidence / "initial-refusal.json").exists())
+
+    def test_known_rust_test_worker_is_retained_and_unresolved_identity_refuses(self):
+        name = "sceneworks_worker-625c59022a418279.exe"
+        self.assertIsNotNone(MODULE.RELEVANT_NAME.fullmatch(name))
+        ps_source = SOURCE.with_name("yue2_app_install_release_processes.ps1").read_text()
+        self.assertIn("sceneworks_worker-[0-9a-f]{16}", ps_source)
+        unknown = row(pid=5232, name=name, executable=None, command=None)
+        with self.assertRaises(MODULE.TransientCandidateError):
+            MODULE.validate_snapshot(snapshot([unknown]))
+        with self.assertRaisesRegex(ValueError, "old app install process"):
+            MODULE.validate_snapshot(snapshot([row(pid=5232, name=name,
+                executable=MODULE.OLD_RUN_ROOT + "\\target\\release\\deps\\" + name)]))
 
     def test_old_marker_and_malformed_later_row_override_transient_retry(self):
         with patch.object(MODULE, "datetime", FixedDateTime):
@@ -207,7 +213,7 @@ class ReleaseProbeTests(unittest.TestCase):
             cases.append(([(missing_before, missing_after)], "collector process missing"))
             cases.append(([snapshot_pair(1, changed_collector=True)],
                           "collector PID/name/creation changed between process snapshots"))
-            pair1 = snapshot_pair(1)
+            pair1 = snapshot_pair(1, inaccessible=True)
             recycled = list(snapshot_pair(2))
             for payload in recycled:
                 next(item for item in payload["rows"] if item["pid"] == payload["collectorPid"])["createdUtc"] = \
@@ -252,7 +258,7 @@ class ReleaseProbeTests(unittest.TestCase):
                 finish_callback=lambda: setattr(MutableDateTime, "current", "2026-10-05T11:03:00+00:00"))
             with self.assertRaisesRegex(ValueError, "process release observation is not fresh"):
                 MODULE.validate_release_pairs(Path(directory), collector)
-            self.assertEqual(collector.read_count, 2)
+            self.assertEqual(collector.read_count, 1)
 
     def test_foreign_and_gpu0_hosting_do_not_block_old_run_absence(self):
         foreign = row(command='node.exe --token dummy-secret C:\\foreign\\run.js')

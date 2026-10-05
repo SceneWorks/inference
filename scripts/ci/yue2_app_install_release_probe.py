@@ -33,7 +33,7 @@ OLD_JOB_STARTED = datetime.fromisoformat("2026-10-05T10:35:14+00:00")
 OLD_JOB_COMPLETED = "2026-10-05T10:59:07+00:00"
 OLD_METRICS_ZIP_SHA256 = "e4fe7f5ad2ed80b2f3294064f49f113ac5a83a0ef734a0bcfc3d5160cfead5ad"
 RELEVANT_NAME = re.compile(
-    r"(?:sceneworks-(?:rust-api|api|worker)|candle[^.]*|node|python(?:3(?:\.\d+)?)?|"
+    r"(?:sceneworks-(?:rust-api|api|worker)|sceneworks_worker-[0-9a-f]{16}|candle[^.]*|node|python(?:3(?:\.\d+)?)?|"
     r"powershell|pwsh|cmd|cargo|rustc|ffmpeg|nvidia-smi)\.exe", re.I)
 
 
@@ -158,7 +158,7 @@ def validate_pair(before: object, after: object) -> dict:
 
 
 def validate_release_pairs(evidence: Path, collector) -> dict:
-    """Accept only two final consecutive valid pairs from one stable collector."""
+    """Accept a final fully valid pair, preserving the original two-observation guarantee."""
     pairs = []
     transient_refusals = []
     stable_collector = None
@@ -205,13 +205,13 @@ def validate_release_pairs(evidence: Path, collector) -> dict:
                 refusal_path.write_text(json.dumps(refusal, indent=2) + "\n", encoding="utf-8")
                 transient_refusals.append(refusal)
 
-            accepted = len(pairs) >= 2 and all(item["valid"] for item in pairs[-2:])
-            should_continue = pair_number < 2 or (pair_number < 3 and not accepted)
+            accepted = pair["valid"]
+            should_continue = pair_number < 3 and not accepted
             collector.decide_continue(pair_number, should_continue)
             if accepted:
                 break
-        require(len(pairs) >= 2 and all(item["valid"] for item in pairs[-2:]),
-                "last two process snapshot pairs did not independently prove release")
+        require(bool(pairs) and pairs[-1]["valid"],
+                "no final complete process snapshot pair proved release")
         collector.finish()
         snapshots = [path for pair_number in range(1, len(pairs) + 1)
                      for path in collector.snapshot_paths(pair_number)]

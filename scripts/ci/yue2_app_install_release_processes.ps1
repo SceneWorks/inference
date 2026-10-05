@@ -41,7 +41,7 @@ function Save-Snapshot([string]$Name) {
             $rootMatch = Has-Old-Root $command
             $exeRootMatch = Has-Old-Root $exe
             $workerMatch = $null -ne $command -and $command.IndexOf($env:YUE2_RELEASE_WORKER_ID, [StringComparison]::OrdinalIgnoreCase) -ge 0
-            $relevant = $_.Name -match '^(?:sceneworks-(?:rust-api|api|worker)|candle[^.]*|node|python(?:3(?:\.\d+)?)?|powershell|pwsh|cmd|cargo|rustc|ffmpeg|nvidia-smi)\.exe$'
+            $relevant = $_.Name -match '^(?:sceneworks-(?:rust-api|api|worker)|sceneworks_worker-[0-9a-f]{16}|candle[^.]*|node|python(?:3(?:\.\d+)?)?|powershell|pwsh|cmd|cargo|rustc|ffmpeg|nvidia-smi)\.exe$'
             if ($relevant -or $rootMatch -or $exeRootMatch -or $workerMatch -or $_.ProcessId -eq $PID) {
                 @{ pid = $_.ProcessId; parentPid = $_.ParentProcessId; name = $_.Name;
                    createdUtc = $created; executablePath = $exe;
