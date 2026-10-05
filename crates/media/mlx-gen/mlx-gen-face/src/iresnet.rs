@@ -124,6 +124,11 @@ impl ArcFace {
     /// Load from a converted IResNet checkpoint — `arcface_iresnet100.safetensors` (see
     /// `tools/convert_glintr100.py`) or any other depth: the per-layer block counts are read from
     /// the keys ([`infer_layers`]) and every width from the stored tensors' shapes.
+    ///
+    /// The epic-2123 identity loss (sc-24831) uses the shipped glintr100 (iresnet100). Upstream
+    /// ai-toolkit-perceptual uses buffalo_l `w600k_r50` (iresnet50) instead; a converted
+    /// `w600k_r50` loads here unchanged — convert it with
+    /// `ARCFACE_ONNX=<w600k_r50.onnx> ARCFACE_LAYERS=3,4,14,3 python3 tools/convert_glintr100.py`.
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let depth = infer_layers(|k| w.get(k).is_some())?;
         let mut layers = Vec::with_capacity(depth.len());

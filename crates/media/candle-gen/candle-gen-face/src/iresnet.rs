@@ -116,6 +116,11 @@ pub struct ArcFace {
 impl ArcFace {
     /// Load from a converted IResNet checkpoint (shared with the MLX path) — any depth: the block
     /// counts are read from the keys ([`infer_layers`]) and every width from the tensors' shapes.
+    ///
+    /// The epic-2123 identity loss (sc-24831) uses the shipped glintr100 (iresnet100); upstream's
+    /// buffalo_l `w600k_r50` (iresnet50) loads here unchanged once converted with
+    /// `ARCFACE_ONNX=<w600k_r50.onnx> ARCFACE_LAYERS=3,4,14,3 python3
+    /// crates/media/mlx-gen/tools/convert_glintr100.py`.
     pub(crate) fn from_weights(w: &Weights) -> Result<Self> {
         let depth = infer_layers(|k| w.contains(k))?;
         let mut layers = Vec::with_capacity(depth.len());
