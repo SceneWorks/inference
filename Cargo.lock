@@ -2516,6 +2516,7 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
@@ -2563,6 +2564,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-flux2",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
@@ -2679,6 +2681,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-z-image",
  "mlx-llm",
  "pmetal-mlx-rs",
@@ -2739,6 +2743,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-flux",
+ "mlx-gen-perceptual",
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
@@ -2754,6 +2759,7 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "regex",
