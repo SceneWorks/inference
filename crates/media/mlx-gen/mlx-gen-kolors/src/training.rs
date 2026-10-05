@@ -234,10 +234,15 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // sc-24830 (epic 2123): depth anchoring, wired in the shared SDXL-family `train_family`
         // (Kolors decodes with TAESDXL — its VAE is the SDXL VAE — and recovers x0 from ε with
         // its own direct-DDPM `ᾱ_t`).
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps) and
+        // E-LatentLPIPS (this latent family's published weights), both through the shared aux-loss
+        // builder this trainer already drives.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
             depth_anchoring: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
