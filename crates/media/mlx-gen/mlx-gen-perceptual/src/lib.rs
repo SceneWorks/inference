@@ -152,14 +152,83 @@ fn depth_footprint(cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
     mlx_gen_depth::anchor::depth_anchor_footprint(cfg.depth_anchoring.model_size, h, w)
 }
 
+/// Body losses (sc-24832): one arm per loss; the three share one ViTPose (loaded once, budgeted on
+/// the first enabled arm — see `mlx_gen_body::arm_footprint`).
+fn body_arm(
+    ctx: &AuxLossContext<'_>,
+    schedule: mlx_gen::gen_core::train::AuxLossSchedule,
+    loss: Result<Box<dyn mlx_gen::train::perceptual::PerceptualLoss>>,
+) -> Result<AuxLoss> {
+    Ok(AuxLoss {
+        schedule,
+        loss: loss.map_err(|e| Error::Msg(format!("{}: {e}", ctx.label)))?,
+    })
+}
+
+/// The body-proportion arm's model (ViTPose+, shared).
+fn build_body_proportion(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let b = &cfg.body_losses;
+    body_arm(ctx, b.proportion, mlx_gen_body::proportion_loss(b))
+}
+
+/// The body-shape arm's model (HybrIK + the shared ViTPose).
+fn build_body_shape(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let b = &cfg.body_losses;
+    body_arm(ctx, b.shape, mlx_gen_body::shape_loss(b))
+}
+
+/// The normal arm's model (Sapiens + the shared ViTPose).
+fn build_normal(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let b = &cfg.body_losses;
+    body_arm(ctx, b.normal, mlx_gen_body::normal_loss(b))
+}
+
+/// Body-proportion pre-load footprint (frame-size independent: the models run at fixed inputs).
+fn body_proportion_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Proportion)
+}
+
+/// Body-shape pre-load footprint.
+fn body_shape_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Shape)
+}
+
+/// Normal-loss pre-load footprint.
+fn normal_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Normal)
+}
+
 /// Every auxiliary loss, in loss-index order. **Extension point**: later stories append an arm.
-pub const ARMS: &[AuxArm] = &[AuxArm {
-    name: "depth",
-    enabled: |cfg| cfg.depth_anchoring.schedule.is_enabled(),
-    input: PerceptualInput::DecodedPixels,
-    footprint: depth_footprint,
-    build: build_depth,
-}];
+pub const ARMS: &[AuxArm] = &[
+    AuxArm {
+        name: "depth",
+        enabled: |cfg| cfg.depth_anchoring.schedule.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: depth_footprint,
+        build: build_depth,
+    },
+    AuxArm {
+        name: "body-proportion",
+        enabled: |cfg| cfg.body_losses.proportion.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: body_proportion_footprint,
+        build: build_body_proportion,
+    },
+    AuxArm {
+        name: "body-shape",
+        enabled: |cfg| cfg.body_losses.shape.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: body_shape_footprint,
+        build: build_body_shape,
+    },
+    AuxArm {
+        name: "normal",
+        enabled: |cfg| cfg.body_losses.normal.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: normal_footprint,
+        build: build_normal,
+    },
+];
 
 /// Whether any auxiliary loss is enabled in `cfg`.
 pub fn any_aux_loss(cfg: &TrainingConfig) -> bool {
@@ -381,6 +450,48 @@ mod tests {
             name: "TAEF1",
             config: TinyDecoderConfig::taef1(),
         }
+    }
+
+    /// sc-24832: the body arms are on the seam — ViTPose budgeted once across the three arms, the
+    /// decoder counted, and a missing checkpoint named with the trainer label. Mutations: drop
+    /// an arm from `ARMS` ⇒ its footprint is missing ⇒ red; build the arm without the label ⇒ red.
+    #[test]
+    fn body_arms_are_on_the_seam() {
+        let mut cfg = TrainingConfig::default();
+        cfg.body_losses.proportion.weight = 0.1;
+        cfg.body_losses.shape.weight = 0.1;
+        cfg.body_losses.normal.weight = 0.1;
+        assert!(any_aux_loss(&cfg));
+        let g = AuxGeometry::image(512, 3);
+        let dec = TinyDecoderConfig::taef1().footprint(512, 512);
+        let models: Vec<AuxModelFootprint> = [
+            mlx_gen_body::BodyArm::Proportion,
+            mlx_gen_body::BodyArm::Shape,
+            mlx_gen_body::BodyArm::Normal,
+        ]
+        .into_iter()
+        .map(|a| mlx_gen_body::arm_footprint(&cfg.body_losses, a))
+        .collect();
+        assert_eq!(
+            perceptual_footprint(&cfg, &taef1(), g),
+            perceptual_footprint_bytes(Some(dec), &models, 3)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dec_dir = tmp.path().join("tae");
+        let cfg4 = testing::tiny_decoder_config(4);
+        testing::write_tiny_decoder(&dec_dir, &cfg4, 1).unwrap();
+        let mut c = TrainingConfig::default();
+        c.body_losses.shape.weight = 0.1;
+        c.perceptual_decoder_dir = Some(dec_dir);
+        let ctx = AuxLossContext {
+            label: "fam trainer",
+            decoder: DecoderSpec::Tiny {
+                name: "TINY",
+                config: cfg4,
+            },
+        };
+        let e = build_perceptual_path(&c, &ctx).err().unwrap().to_string();
+        assert!(e.contains("fam trainer") && e.contains("HybrIK"), "{e}");
     }
 
     /// E1: nothing enabled ⇒ no path, nothing loaded, zero footprint. Mutation: return

@@ -11,6 +11,7 @@ mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 mlx-gen-depth = { path = "../mlx-gen-depth" }
+mlx-gen-body = { path = "../mlx-gen-body" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

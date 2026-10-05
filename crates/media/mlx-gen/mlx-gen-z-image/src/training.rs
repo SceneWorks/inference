@@ -124,11 +124,16 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // (`adapter_optimizer_update`, sc-24826/sc-24827), multi-resolution buckets (sc-2127),
         // depth anchoring (sc-2125) — the shared decoded-x0 perceptual path (TAEF1 decode →
         // Depth-Anything-V2 → cached round-trip reference) — and subject-masked loss (sc-24828,
-        // a per-(item, bucket) weight map cached next to each latent, applied by `reduce_loss`).
+        // a per-(item, bucket) weight map cached next to each latent, applied by `reduce_loss`),
+        // and the body losses (sc-24832: ViTPose proportion, HybrIK shape, Sapiens normals) on the
+        // same perceptual path through the `mlx-gen-perceptual` builder's arms.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             depth_anchoring: true,
             subject_mask_loss: true,
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -2841,6 +2846,14 @@ mod depth_anchoring_tests {
     #[test]
     fn descriptor_declares_depth_anchoring() {
         assert!(trainer_descriptor().techniques.depth_anchoring);
+    }
+
+    /// sc-24832: Z-Image builds its perceptual path through the builder, so it declares the body
+    /// losses the builder's arms provide.
+    #[test]
+    fn descriptor_declares_the_body_losses() {
+        let t = trainer_descriptor().techniques;
+        assert!(t.body_proportion_loss && t.body_shape_loss && t.normal_loss);
     }
 
     /// A missing aux checkpoint is a clear error naming the model, before any caching.
