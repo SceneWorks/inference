@@ -425,8 +425,10 @@ fn read_decoder_dir(dir: &std::path::Path) -> Result<Weights> {
 }
 
 impl TinyDecoder {
-    /// Load the decoder half of a TAESD-family checkpoint directory (see [`read_decoder_dir`]
-    /// for which file is read).
+    /// Load the decoder half of a TAESD-family checkpoint directory: the diffusers
+    /// `diffusion_pytorch_model.safetensors` when present, otherwise the one `.safetensors` that
+    /// carries the diffusers-layout decoder (`decoder.layers.0.weight`; taef2 / taeqi2_1 ship a
+    /// single `<variant>.safetensors`). Unrelated files are skipped; none or several is an error.
     pub fn from_dir(
         dir: impl AsRef<std::path::Path>,
         cfg: impl Into<TinyDecoderSpec>,
