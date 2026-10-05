@@ -27,7 +27,7 @@ CASES = {
 }
 NAMES = tuple(CASES)
 CUDA_ONLY_CASES = frozenset({"experimental-fp8-auto"})
-STAGES = ("load", "plan", "semantic", "acoustic", "decode")
+STAGES = ("load", "semantic", "acoustic", "decode")
 CASE_SOURCE_SHA256 = {
     "strict-bf16-standard": "a43f2b1c3f8c288a4963885a924a91c6449d8d654db8a0c59619fba74c7f88bc",
     "strict-bf16-legacy": "077cef67bb570c0bbbddd6bff8caa6696363376b4194600af83336256f3ac5b2",
@@ -44,6 +44,8 @@ SUPPORTED_RUNTIME_POLICIES = {
     "825341ff8d0110ea448213485891b39d57806fa4": "disallow_reduced_precision_reduction_v1",
     # M5 replaces only CUDA BF16 convolution leaves with fixed-order BF16 kernels.
     "190e20e7c6b5bac006194c729baabd22c0c44a5d": "fixed_order_bf16_convolution_v1",
+    # M6 merges the BF16 smoke fixture repair and qualified vendored-core closure.
+    "25bd55cdb6a56c78b07584a12150c9f5d46be439": "fixed_order_bf16_convolution_v1",
 }
 
 
@@ -173,6 +175,21 @@ def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
     return manifest
 
 
+def verified_case_stages(case_path: Path, backend: str, name: str) -> tuple[str, ...]:
+    """Bind stage expectations to the immutable, source-reviewed case fixture."""
+    source = Path(__file__).with_name("yue2-app-precision-cases") / f"{name}.json"
+    require(source.is_file() and sha256(source) == CASE_SOURCE_SHA256[name],
+            f"fixed case {name} changed")
+    expected = json.loads(source.read_text(encoding="utf-8"))
+    expected["id"] = case_id(backend, name)
+    require(case_path.is_file() and not case_path.is_symlink() and
+            json.loads(case_path.read_text(encoding="utf-8")) == expected,
+            "captured case differs from its immutable source fixture")
+    planning = expected.get("request", {}).get("planning")
+    require(planning == "off", f"unsupported fixed planning mode: {planning!r}")
+    return STAGES
+
+
 def preflight(backend: str, evidence: Path, label: str) -> dict:
     # The merged engine control owns the typed process census. Refuse if absent;
     # a generic process-name guess would weaken the shared physical-host lock.
@@ -262,6 +279,7 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
                   proof_path: Path | None = None) -> dict:
     require(name in names_for_backend(backend), "unknown case/backend")
     row = json.loads(record_path.read_text(encoding="utf-8"))
+    stages_expected = verified_case_stages(record_path.parent / "case.json", backend, name)
     _, case_name, decoder, policy, model_dtype, vae_dtype = CASES[name]
     require(row.get("caseId") == case_id(backend, name) and row.get("backend") == backend,
             "record case/backend mismatch")
@@ -271,6 +289,8 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
     require(row.get("request", {}).get("name") == case_name and
             row.get("request", {}).get("computePolicy") == policy,
             "record request name/policy mismatch")
+    require(row.get("request", {}).get("planning") == "off",
+            "record planning mode differs from immutable fixed case")
     expected_ar_mode = "experimentalFp8" if name in CUDA_ONLY_CASES else None
     require(row.get("request", {}).get("arMode") == expected_ar_mode,
             "record AR mode mismatch")
@@ -299,12 +319,14 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
                 measured.get("sampler") == "nvidia-smi memory.used",
                 "shared CUDA profile did not label global selected-device samples")
     stages = measured.get("stages", {})
-    require(all(stages.get(stage, {}).get("samples", 0) > 0 and
-                stages[stage].get("peakBytes", 0) > 0 for stage in STAGES),
-            "profile lacks a sampled stage")
+    require(set(stages) == set(stages_expected) and
+            all(stages.get(stage, {}).get("samples", 0) > 0 and
+                stages[stage].get("peakBytes", 0) > 0 for stage in stages_expected),
+            "profile stage set differs from its fixed case or lacks a sampled stage")
     estimated = row.get("admission", {}).get("estimate", {}).get("stages", {})
-    require(all(type(estimated.get(stage, {}).get("deviceBytes")) is int and
-                estimated[stage]["deviceBytes"] > 0 for stage in STAGES) if backend == "cuda" else True,
+    require((set(estimated) == set(stages_expected) if backend == "cuda" else True) and
+            all(type(estimated.get(stage, {}).get("deviceBytes")) is int and
+                estimated[stage]["deviceBytes"] > 0 for stage in stages_expected) if backend == "cuda" else True,
             "shared CUDA admission lacks a modeled stage device allocation")
     owned = measured.get("owned") if backend == "cuda" else None
     if backend == "cuda":
@@ -339,15 +361,16 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
                 re.fullmatch(r"[0-9a-f]{64}", process.get("executableSha256", "")) is not None,
                 "shared CUDA owned-process memory proof incomplete")
         own_stages = owned.get("stages", {})
-        require(all(type(own_stages.get(stage, {}).get("peakBytes")) is int and
+        require(set(own_stages) == set(stages_expected) and
+                all(type(own_stages.get(stage, {}).get("peakBytes")) is int and
                     own_stages[stage]["peakBytes"] > 0 and
                     type(own_stages[stage].get("samples")) is int and
                     own_stages[stage]["samples"] > 0 and
                     own_stages[stage]["peakBytes"] <= estimated[stage]["deviceBytes"] + 2 * 1024 ** 3
-                    for stage in STAGES),
+                    for stage in stages_expected),
                 "shared CUDA owned-stage peak is absent or exceeds admitted estimate plus reserve")
         require(type(owned.get("peakBytes")) is int and owned["peakBytes"] > 0 and
-                owned["peakBytes"] >= max(own_stages[stage]["peakBytes"] for stage in STAGES),
+                owned["peakBytes"] >= max(own_stages[stage]["peakBytes"] for stage in stages_expected),
                 "shared CUDA owned overall peak is inconsistent with stage peaks")
         source_dir = record_path.parent
         marks_file = source_dir / "stages.jsonl"
@@ -384,16 +407,41 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
                        item["instance"].lower() == instance and item.get("status") == "0" and
                        safe_nonnegative_integer(item.get("cookedValue"))
                        for item in rows) and sum(item["cookedValue"] for item in rows) == sample["bytes"]
-        require(len(raw_samples) >= sum(own_stages[stage]["samples"] for stage in STAGES) and
+        require(len(raw_samples) >= sum(own_stages[stage]["samples"] for stage in stages_expected) and
                 all(valid_owned_sample(sample) for sample in raw_samples),
                 "shared CUDA owned counter journal lacks bound stage samples")
         marks = [json.loads(line) for line in marks_file.read_text(encoding="utf-8").splitlines()
                  if line.strip()]
-        require([mark.get("stage") for mark in marks] == [*STAGES, "done"] and
+        require([mark.get("stage") for mark in marks] == [*stages_expected, "done"] and
                 all(type(mark.get("at")) in (int, float) and math.isfinite(mark["at"])
                     for mark in marks) and
                 all(first["at"] <= second["at"] for first, second in zip(marks, marks[1:])),
                 "shared CUDA stage marks are incomplete or unordered")
+        global_journal = source_dir / "cuda-samples.jsonl"
+        require(global_journal.is_file() and not global_journal.is_symlink(),
+                "shared CUDA global selected-device journal is missing")
+        global_samples = [json.loads(line) for line in
+                          global_journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+        global_derived = {}
+        for sample in global_samples:
+            require(isinstance(sample, dict) and
+                    type(sample.get("at")) in (int, float) and math.isfinite(sample["at"]) and
+                    type(sample.get("bytes")) is int and sample["bytes"] >= 0,
+                    "shared CUDA global selected-device sample is malformed")
+            stage = None
+            for mark in marks:
+                if mark["at"] <= sample["at"]:
+                    stage = mark["stage"]
+                else:
+                    break
+            if stage in stages_expected:
+                peak_row = global_derived.setdefault(stage, {"peakBytes": 0, "samples": 0})
+                peak_row["peakBytes"] = max(peak_row["peakBytes"], sample["bytes"])
+                peak_row["samples"] += 1
+        require(all(stages[stage] == global_derived.get(stage) for stage in stages_expected) and
+                measured["peakBytes"] == max(global_derived[stage]["peakBytes"]
+                                             for stage in stages_expected),
+                "shared CUDA global stage peaks differ from retained selected-device timeline")
         derived = {}
         for sample in raw_samples:
             stage = None
@@ -402,12 +450,12 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
                     stage = mark["stage"]
                 else:
                     break
-            if stage in STAGES:
+            if stage in stages_expected:
                 peak_row = derived.setdefault(stage, {"peakBytes": 0, "samples": 0})
                 peak_row["peakBytes"] = max(peak_row["peakBytes"], sample["bytes"])
                 peak_row["samples"] += 1
-        require(all(own_stages[stage] == derived.get(stage) for stage in STAGES) and
-                owned["peakBytes"] == max(derived[stage]["peakBytes"] for stage in STAGES),
+        require(all(own_stages[stage] == derived.get(stage) for stage in stages_expected) and
+                owned["peakBytes"] == max(derived[stage]["peakBytes"] for stage in stages_expected),
                 "shared CUDA owned-stage peaks differ from retained counter timeline")
     result = {"case_id": row["caseId"], "backend": backend, "admission": "admitted",
               "effective_compute_policy": policy, "effective_model_dtype": model_dtype,
@@ -570,6 +618,16 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
         copy_partial(output, evidence, backend)
 
 
+def preflight_console_receipt(result: dict, evidence: Path) -> dict:
+    """Keep the complete physical census in the run artifact, not the Actions log."""
+    receipt = evidence / f"preflight-{result['label']}.json"
+    require(receipt.is_file(), "retained preflight receipt missing")
+    return {"backend": result["backend"], "label": result["label"],
+            "runner": result["runner"], "admitted": result["admitted"],
+            "physical_file_count": len(result["physical_files"] or []),
+            "receipt_path": str(receipt), "receipt_sha256": sha256(receipt)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -597,6 +655,7 @@ def main() -> int:
         result = prepare_cases(Path(args.templates), Path(args.destination), args.backend)
     elif args.command == "preflight":
         result = preflight(args.backend, Path(args.evidence), args.label)
+        result = preflight_console_receipt(result, Path(args.evidence))
     elif args.command == "collect":
         result = collect(Path(args.profile), Path(args.evidence), args.backend,
                          Path(args.app), Path(args.engine))
