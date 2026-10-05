@@ -494,8 +494,9 @@ mod tests {
             label: "fam trainer",
             decoder: DecoderSpec::Tiny {
                 name: "TINY",
-                config: cfg4,
+                config: cfg4.into(),
             },
+            latent_lpips: None,
         };
         let e = build_perceptual_path(&c, &ctx).err().unwrap().to_string();
         assert!(e.contains("fam trainer") && e.contains("HybrIK"), "{e}");
