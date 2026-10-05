@@ -154,6 +154,26 @@ fn hybrik_matches_the_reference_implementation() {
         0.0
     );
     assert!(scalar(&shape_comparison(&ba, &bb, cos - 1e-3).unwrap()) > 0.0);
+    // The reference path (upstream `encode`): the `int()`-truncated crop, which differs from the
+    // rounded live crop on this box. Mutation: round in `hybrik_encode_crop` ⇒ red.
+    let enc = HybrikEncoder::encode_crop_for([b[0], b[1], b[2], b[3]], 40, 30);
+    assert_ne!(enc, crop);
+    let br = m.forward_crop(&a, enc).unwrap();
+    close(
+        "betas_a_encode",
+        &br,
+        &t(&w, "hybrik.out.betas_a_encode"),
+        1e-4,
+    );
+    close(
+        "encode shape loss",
+        &shape_comparison(&br, &bb, -1.0)
+            .unwrap()
+            .reshape(1)
+            .unwrap(),
+        &t(&w, "hybrik.out.l1_encode"),
+        1e-5,
+    );
 }
 
 /// Sapiens vs upstream's estimator. Mutations: drop an InstanceNorm; skip the letterbox pad ⇒ red.
@@ -185,6 +205,35 @@ fn sapiens_matches_the_reference_implementation() {
         "masked normal loss",
         &lm.reshape(1).unwrap(),
         &t(&w, "sapiens.out.loss_masked"),
+        1e-4,
+    );
+    // The reference path (upstream `encode`): the native-size letterbox, resampled to the same
+    // grid. Mutation: letterbox `encode_pixels` at the training size ⇒ red.
+    let nr = m.encode_pixels(&nhwc(&w, "input.a")).unwrap();
+    close(
+        "normals_a_encode",
+        &nr,
+        &nhwc(&w, "sapiens.out.normals_a_encode"),
+        2e-4,
+    );
+    let gap = scalar(&(&nr - &na).unwrap().abs().unwrap().max_all().unwrap());
+    assert!(gap > 1e-2, "the two letterboxes differ: {gap}");
+    close(
+        "encode normal loss",
+        &sapiens::normal_comparison(&nr, &nb, None)
+            .unwrap()
+            .reshape(1)
+            .unwrap(),
+        &t(&w, "sapiens.out.loss_encode"),
+        1e-4,
+    );
+    close(
+        "encode masked normal loss",
+        &sapiens::normal_comparison(&nr, &nb, Some(&grid))
+            .unwrap()
+            .reshape(1)
+            .unwrap(),
+        &t(&w, "sapiens.out.loss_masked_encode"),
         1e-4,
     );
 }
@@ -485,6 +534,13 @@ fn real_hybrik_matches_the_reference_implementation() {
         &t(&r, "hybrik.out.betas_a"),
         1e-3,
     );
+    let enc = HybrikEncoder::encode_crop_for([b[0], b[1], b[2], b[3]], h, w);
+    close(
+        "real encode betas",
+        &hyb.forward_crop(&img, enc).unwrap(),
+        &t(&r, "hybrik.out.betas_a_encode"),
+        1e-3,
+    );
 }
 
 /// AC2 at real scale: the re-hosted Sapiens normal 0.3B vs upstream's estimator on the `.pth`.
@@ -499,6 +555,12 @@ fn real_sapiens_matches_the_reference_implementation() {
         "real normals",
         &sap.forward_pixels(&img).unwrap(),
         &nhwc(&r, "sapiens.out.normals_a"),
+        5e-3,
+    );
+    close(
+        "real encode normals",
+        &sap.encode_pixels(&img).unwrap(),
+        &nhwc(&r, "sapiens.out.normals_a_encode"),
         5e-3,
     );
 }
@@ -585,4 +647,113 @@ fn each_body_loss_is_weighted_by_the_noise_level() {
             0.5 * t * raw
         );
     }
+}
+
+/// Keypoint `i` of a synthetic pose at DSNT `[-1, 1]` coordinates — distinct, non-degenerate bones.
+fn synthetic_keypoint(i: usize) -> (f32, f32) {
+    (-0.8 + 0.07 * i as f32, -0.9 + 0.1 * i as f32)
+}
+
+fn detection(
+    frames: &[Vec<(f32, f32)>],
+    conf: &[f32],
+    include_head: bool,
+) -> Option<PersonDetection> {
+    let b = frames.len();
+    let c: Vec<f32> = frames.iter().flatten().flat_map(|&(x, y)| [x, y]).collect();
+    let k: Vec<f32> = frames.iter().flat_map(|_| conf.iter().copied()).collect();
+    let warp = VitPoseWarp::full_frame(64, 48, (256, 192));
+    detection_from_keypoints(
+        &Tensor::from_vec(c, (b, 17, 2), &dev()).unwrap(),
+        &Tensor::from_vec(k, (b, 17), &dev()).unwrap(),
+        &warp,
+        include_head,
+        64,
+        48,
+    )
+    .unwrap()
+}
+
+/// The person box spans the confident keypoints of EVERY frame (the MLX twin's rule): frame 1
+/// moves one keypoint further right, and the box follows it. Mutation: build the points from frame
+/// 0 only (`0..17`) ⇒ the box stops at frame 0's extent ⇒ red.
+#[test]
+fn detect_box_spans_every_frame() {
+    let f0: Vec<(f32, f32)> = (0..17).map(synthetic_keypoint).collect();
+    let mut f1 = f0.clone();
+    f1[1].0 = 0.95;
+    let conf = [0.9f32; 17];
+    let warp = VitPoseWarp::full_frame(64, 48, (256, 192));
+    let pts = |frames: &[&Vec<(f32, f32)>]| -> Vec<(f32, f32)> {
+        frames
+            .iter()
+            .flat_map(|f| f.iter().map(|&(x, y)| warp.keypoint_to_input(x, y)))
+            .collect()
+    };
+    let both = keypoint_box(&pts(&[&f0, &f1]), &[0.9; 34], 64, 48).unwrap();
+    let first = keypoint_box(&pts(&[&f0]), &[0.9; 17], 64, 48).unwrap();
+    assert!(
+        both[2] > first[2] + 1.0,
+        "frame 1 extends the box: {both:?} vs {first:?}"
+    );
+    let got = detection(&[f0, f1], &conf, false)
+        .expect("a person")
+        .person_box;
+    assert_eq!(got, both);
+}
+
+/// Upstream's no-person rule averages the visibility of EVERY ratio in use: body ratios at 0.12
+/// pass alone (mean 0.12), but with the two head ratios at 0 the mean is 0.096 < 0.1 ⇒ no person.
+/// Mutation: average only the first `NUM_BODY_RATIOS` ⇒ the head case detects a person ⇒ red.
+#[test]
+fn no_person_gate_averages_every_ratio_in_use() {
+    let f: Vec<(f32, f32)> = (0..17).map(synthetic_keypoint).collect();
+    let mut conf = [0.12f32; 17];
+    for k in [0, 3, 4] {
+        conf[k] = 0.0;
+    }
+    // Eyes (in no ratio group) are confident, so the box itself exists either way.
+    conf[1] = 0.9;
+    conf[2] = 0.9;
+    assert!(detection(std::slice::from_ref(&f), &conf, false).is_some());
+    assert!(detection(&[f], &conf, true).is_none());
+}
+
+/// The losses' reference paths follow upstream `encode`, the live paths `forward`: the shape
+/// reference betas come from the `int()`-truncated crop while the stored live crop is the rounded
+/// one; the normal reference is the native-letterbox `encode_pixels`. Mutations: compute the
+/// reference betas on `crop_for` ⇒ red; compute the reference normals with `forward_pixels` ⇒ red.
+#[test]
+fn reference_paths_follow_upstream_encode() {
+    let w = fixture();
+    let clean = nhwc(&w, "input.a");
+    let bx = person_pose()
+        .detect(&clean, false)
+        .unwrap()
+        .expect("a person")
+        .person_box;
+    let (crop, enc) = (
+        HybrikEncoder::crop_for(bx, 40, 30),
+        HybrikEncoder::encode_crop_for(bx, 40, 30),
+    );
+    assert_ne!(crop, enc, "the detected box tells the two crops apart");
+    let shape = BodyShapeLoss::new(person_pose(), hybrik(&w), -1.0);
+    let r = shape.reference(&clean).unwrap().unwrap();
+    let r = r.downcast_ref::<ShapeReference>().unwrap();
+    assert_eq!(r.crop, crop);
+    close(
+        "shape reference",
+        &r.betas,
+        &hybrik(&w).forward_crop(&clean, enc).unwrap(),
+        1e-6,
+    );
+    let normal = NormalLoss::new(person_pose(), sapiens(&w), false);
+    let r = normal.reference(&clean).unwrap().unwrap();
+    let r = r.downcast_ref::<NormalReference>().unwrap();
+    close(
+        "normal reference",
+        &r.normals,
+        &sapiens(&w).encode_pixels(&clean).unwrap(),
+        1e-6,
+    );
 }

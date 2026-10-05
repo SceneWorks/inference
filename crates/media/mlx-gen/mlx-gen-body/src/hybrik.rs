@@ -8,7 +8,9 @@ use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
 use mlx_rs::ops::{add, maximum, multiply};
 use mlx_rs::Array;
 
-use mlx_gen::gen_core::train::body::{hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD};
+use mlx_gen::gen_core::train::body::{
+    hybrik_encode_crop, hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD,
+};
 
 use super::{bn_fold, conv_ohwi, normalize, resample_nhwc, w32, AxisMatrix};
 use mlx_gen::nn::{conv2d, linear};
@@ -211,8 +213,13 @@ impl HybrikEncoder {
         self.forward(&normalize(&x, HYBRIK_MEAN, HYBRIK_STD)?)
     }
 
-    /// The crop of a person box on an `h × w` frame.
+    /// The live (upstream `forward`, rounded) crop of a person box on an `h × w` frame.
     pub fn crop_for(bbox: [f32; 4], h: usize, w: usize) -> (usize, usize, usize, usize) {
         hybrik_square_crop(bbox, h, w)
+    }
+
+    /// The reference (upstream `encode`, `int()`-truncated) crop of a person box.
+    pub fn encode_crop_for(bbox: [f32; 4], h: usize, w: usize) -> (usize, usize, usize, usize) {
+        hybrik_encode_crop(bbox, h, w)
     }
 }

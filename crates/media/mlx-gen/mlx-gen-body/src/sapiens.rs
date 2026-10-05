@@ -163,9 +163,8 @@ impl SapiensNormal {
         conv2d(&m, &self.seg.0, Some(&self.seg.1), 1, 0)
     }
 
-    /// The letterbox of an `h × w` frame as two axis matrices `[target, in]`.
-    fn letterbox_axes(&self, h: usize, w: usize) -> (Letterbox, AxisMatrix, AxisMatrix) {
-        let lb = self.cfg.letterbox(h, w);
+    /// A letterbox `lb` of an `h × w` frame as two axis matrices `[target, in]`.
+    fn letterbox_axes(lb: Letterbox, h: usize, w: usize) -> (AxisMatrix, AxisMatrix) {
         let ay = AxisMatrix::from_weights(
             lb.target_h,
             h,
@@ -176,7 +175,7 @@ impl SapiensNormal {
             w,
             Letterbox::axis_weights(lb.target_w, lb.new_w, lb.pad_left, w),
         );
-        (lb, ay, ax)
+        (ay, ax)
     }
 
     /// The **differentiable** training entry (upstream `DifferentiableNormalEncoder.forward`):
@@ -184,7 +183,21 @@ impl SapiensNormal {
     /// resample to `normal_size²` → L2-normalized (`+ 1e-5`) normals NHWC `[1, S, S, 3]`.
     pub fn forward_pixels(&self, pixels: &Array) -> Result<Array> {
         let sh = pixels.shape();
-        let (_, ay, ax) = self.letterbox_axes(sh[1] as usize, sh[2] as usize);
+        let lb = self.cfg.letterbox(sh[1] as usize, sh[2] as usize);
+        self.normals_at(pixels, lb)
+    }
+
+    /// The **reference** entry (upstream `encode`): the same pipeline at the native encode
+    /// letterbox (1024 × 768), resampled to the same `normal_size²` grid as the live normals.
+    pub fn encode_pixels(&self, pixels: &Array) -> Result<Array> {
+        let sh = pixels.shape();
+        let lb = self.cfg.encode_letterbox(sh[1] as usize, sh[2] as usize);
+        self.normals_at(pixels, lb)
+    }
+
+    fn normals_at(&self, pixels: &Array, lb: Letterbox) -> Result<Array> {
+        let sh = pixels.shape();
+        let (ay, ax) = Self::letterbox_axes(lb, sh[1] as usize, sh[2] as usize);
         let raw = self.forward(&resample_nhwc(pixels, &ay, &ax)?)?;
         let rs = raw.shape();
         let s = self.cfg.normal_size;
@@ -202,7 +215,8 @@ impl SapiensNormal {
     pub fn mask_to_normal_grid(&self, mask: &Array) -> Result<Array> {
         let sh = mask.shape();
         let (h, w) = (sh[0] as usize, sh[1] as usize);
-        let (lb, ay, ax) = self.letterbox_axes(h, w);
+        let lb = self.cfg.letterbox(h, w);
+        let (ay, ax) = Self::letterbox_axes(lb, h, w);
         let m = resample_nhwc(&mask.reshape(&[1, sh[0], sh[1], 1])?, &ay, &ax)?;
         let s = self.cfg.normal_size;
         let m = resample_nhwc(

@@ -154,13 +154,13 @@ impl SapiensNormal {
         Ok(out.permute([0, 2, 3, 1])?.contiguous()?)
     }
 
+    /// A letterbox `lb` of an `h × w` frame as two axis matrices `[target, in]`.
     fn letterbox_axes(
-        &self,
+        lb: Letterbox,
         h: usize,
         w: usize,
         dev: &Device,
-    ) -> Result<(Letterbox, AxisMatrix, AxisMatrix)> {
-        let lb = self.cfg.letterbox(h, w);
+    ) -> Result<(AxisMatrix, AxisMatrix)> {
         let ay = AxisMatrix::from_weights(
             lb.target_h,
             h,
@@ -173,7 +173,7 @@ impl SapiensNormal {
             Letterbox::axis_weights(lb.target_w, lb.new_w, lb.pad_left, w),
             dev,
         )?;
-        Ok((lb, ay, ax))
+        Ok((ay, ax))
     }
 
     /// The differentiable training entry: NHWC `[1, H, W, 3]` → letterbox →
@@ -181,8 +181,20 @@ impl SapiensNormal {
     /// normals NHWC `[1, S, S, 3]`.
     pub fn forward_pixels(&self, pixels: &Tensor) -> Result<Tensor> {
         let (_, h, w, _) = pixels.dims4()?;
+        self.normals_at(pixels, self.cfg.letterbox(h, w))
+    }
+
+    /// The reference entry (upstream `encode`): the same pipeline at the native encode letterbox
+    /// (1024 × 768), resampled to the same `normal_size²` grid as the live normals.
+    pub fn encode_pixels(&self, pixels: &Tensor) -> Result<Tensor> {
+        let (_, h, w, _) = pixels.dims4()?;
+        self.normals_at(pixels, self.cfg.encode_letterbox(h, w))
+    }
+
+    fn normals_at(&self, pixels: &Tensor, lb: Letterbox) -> Result<Tensor> {
+        let (_, h, w, _) = pixels.dims4()?;
         let dev = pixels.device();
-        let (_, ay, ax) = self.letterbox_axes(h, w, dev)?;
+        let (ay, ax) = Self::letterbox_axes(lb, h, w, dev)?;
         let raw = self.forward(&resample_nhwc(pixels, &ay, &ax)?)?;
         let (_, rh, rw, _) = raw.dims4()?;
         let s = self.cfg.normal_size;
@@ -199,7 +211,8 @@ impl SapiensNormal {
     pub fn mask_to_normal_grid(&self, mask: &Tensor) -> Result<Tensor> {
         let (h, w) = mask.dims2()?;
         let dev = mask.device();
-        let (lb, ay, ax) = self.letterbox_axes(h, w, dev)?;
+        let lb = self.cfg.letterbox(h, w);
+        let (ay, ax) = Self::letterbox_axes(lb, h, w, dev)?;
         let m = resample_nhwc(&mask.reshape((1, h, w, 1))?, &ay, &ax)?;
         let s = self.cfg.normal_size;
         let m = resample_nhwc(

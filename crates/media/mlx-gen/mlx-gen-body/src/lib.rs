@@ -34,8 +34,8 @@ pub use mlx_gen::gen_core::train::body::{
     TwoTap, VitPoseConfig,
 };
 use mlx_gen::gen_core::train::body::{
-    keypoint_box, MIN_MEAN_RATIO_VISIBILITY, MISSING_REFERENCE_VISIBILITY, NUM_BODY_RATIOS,
-    NUM_HEAD_RATIOS, RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
+    keypoint_box, VitPoseWarp, MIN_MEAN_RATIO_VISIBILITY, MISSING_REFERENCE_VISIBILITY,
+    NUM_BODY_RATIOS, NUM_HEAD_RATIOS, RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
 };
 
 use mlx_gen::train::perceptual::{reference_as, AuxModelFootprint, LossReference, PerceptualLoss};
@@ -248,42 +248,60 @@ pub struct PersonDetection {
 }
 
 impl VitPose {
-    /// Detect the person in a clean decode `[1, H, W, 3]` (outside autograd): `None` when the mean
-    /// visibility of the eight body ratios is below [`MIN_MEAN_RATIO_VISIBILITY`] (upstream's
-    /// no-body rule) or fewer than two keypoints are confident.
+    /// Detect the person in a clean decode `[B, H, W, 3]` (outside autograd): `None` when the mean
+    /// visibility of all the ratios in use is below [`MIN_MEAN_RATIO_VISIBILITY`] (upstream's
+    /// no-body rule) or fewer than two keypoints are confident. The person box spans the confident
+    /// keypoints of every frame.
     pub fn detect(&self, clean: &Array, include_head: bool) -> Result<Option<PersonDetection>> {
         let (heatmaps, warp) = self.forward_pixels(clean)?;
         let (coords, conf) = vitpose::heatmaps_to_keypoints(&heatmaps)?;
-        let (ratios, ratio_vis) = body_ratios(&coords, &conf, include_head)?;
-        let (ratios, ratio_vis) = (
-            mlx_rs::stop_gradient(&ratios)?,
-            mlx_rs::stop_gradient(&ratio_vis)?,
-        );
-        mlx_rs::transforms::eval([&ratios, &ratio_vis, &coords, &conf])?;
-        let body_vis = ratio_vis
-            .index((.., ..NUM_BODY_RATIOS as i32))
-            .mean(None)?
-            .item::<f32>();
-        if body_vis < MIN_MEAN_RATIO_VISIBILITY {
-            return Ok(None);
-        }
-        let k = coords.shape()[1] as usize;
-        let c: Vec<f32> = coords.reshape(&[-1])?.as_slice::<f32>().to_vec();
-        let points: Vec<(f32, f32)> = (0..k)
-            .map(|i| warp.keypoint_to_input(c[2 * i], c[2 * i + 1]))
-            .collect();
-        let confidence: Vec<f32> = conf.reshape(&[-1])?.as_slice::<f32>().to_vec();
         let sh = clean.shape();
-        let Some(person_box) = keypoint_box(&points, &confidence, sh[1] as usize, sh[2] as usize)
-        else {
-            return Ok(None);
-        };
-        Ok(Some(PersonDetection {
-            ratios,
-            ratio_vis,
-            person_box,
-        }))
+        detection_from_keypoints(
+            &coords,
+            &conf,
+            &warp,
+            include_head,
+            sh[1] as usize,
+            sh[2] as usize,
+        )
     }
+}
+
+/// [`VitPose::detect`] past the heatmaps: the `[B, 17, 2]` keypoints (normalized heatmap
+/// coordinates) and `[B, 17]` confidences of an `in_h × in_w` frame batch → the detection.
+fn detection_from_keypoints(
+    coords: &Array,
+    conf: &Array,
+    warp: &VitPoseWarp,
+    include_head: bool,
+    in_h: usize,
+    in_w: usize,
+) -> Result<Option<PersonDetection>> {
+    let (ratios, ratio_vis) = body_ratios(coords, conf, include_head)?;
+    let (ratios, ratio_vis) = (
+        mlx_rs::stop_gradient(&ratios)?,
+        mlx_rs::stop_gradient(&ratio_vis)?,
+    );
+    mlx_rs::transforms::eval([&ratios, &ratio_vis, coords, conf])?;
+    // Upstream `encode`: the mean over ALL the ratios in use (10 with the head ratios).
+    let mean_vis = ratio_vis.mean(None)?.item::<f32>();
+    if mean_vis < MIN_MEAN_RATIO_VISIBILITY {
+        return Ok(None);
+    }
+    // The person box spans every frame's keypoints (a video reference's person moves).
+    let c: Vec<f32> = coords.reshape(&[-1])?.as_slice::<f32>().to_vec();
+    let points: Vec<(f32, f32)> = (0..c.len() / 2)
+        .map(|i| warp.keypoint_to_input(c[2 * i], c[2 * i + 1]))
+        .collect();
+    let confidence: Vec<f32> = conf.reshape(&[-1])?.as_slice::<f32>().to_vec();
+    let Some(person_box) = keypoint_box(&points, &confidence, in_h, in_w) else {
+        return Ok(None);
+    };
+    Ok(Some(PersonDetection {
+        ratios,
+        ratio_vis,
+        person_box,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -391,8 +409,14 @@ impl PerceptualLoss for BodyShapeLoss {
             return Ok(None);
         };
         let sh = clean.shape();
-        let crop = HybrikEncoder::crop_for(d.person_box, sh[1] as usize, sh[2] as usize);
-        let betas = mlx_rs::stop_gradient(self.hybrik.forward_crop(clean, crop)?)?;
+        let (h, w) = (sh[1] as usize, sh[2] as usize);
+        // Upstream: the reference betas come from `encode` (`int()`-truncated crop), the live ones
+        // from `forward` (rounded crop) of the same person box.
+        let crop = HybrikEncoder::crop_for(d.person_box, h, w);
+        let betas = mlx_rs::stop_gradient(
+            self.hybrik
+                .forward_crop(clean, HybrikEncoder::encode_crop_for(d.person_box, h, w))?,
+        )?;
         betas.eval()?;
         Ok(Some(Box::new(ShapeReference { betas, crop })))
     }
@@ -468,7 +492,7 @@ impl PerceptualLoss for NormalLoss {
         } else {
             None
         };
-        let normals = mlx_rs::stop_gradient(self.sapiens.forward_pixels(clean)?)?;
+        let normals = mlx_rs::stop_gradient(self.sapiens.encode_pixels(clean)?)?;
         normals.eval()?;
         Ok(Some(Box::new(NormalReference { normals, mask })))
     }

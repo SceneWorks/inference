@@ -5,7 +5,7 @@
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::train::body::{
-    hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD,
+    hybrik_encode_crop, hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD,
 };
 use candle_gen::weights::Weights;
 use candle_gen::Result;
@@ -202,8 +202,13 @@ impl HybrikEncoder {
         self.forward(&normalize(&x, HYBRIK_MEAN, HYBRIK_STD)?)
     }
 
-    /// The crop of a person box on an `h × w` frame.
+    /// The live (upstream `forward`, rounded) crop of a person box on an `h × w` frame.
     pub fn crop_for(bbox: [f32; 4], h: usize, w: usize) -> (usize, usize, usize, usize) {
         hybrik_square_crop(bbox, h, w)
+    }
+
+    /// The reference (upstream `encode`, `int()`-truncated) crop of a person box.
+    pub fn encode_crop_for(bbox: [f32; 4], h: usize, w: usize) -> (usize, usize, usize, usize) {
+        hybrik_encode_crop(bbox, h, w)
     }
 }

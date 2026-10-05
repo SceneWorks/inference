@@ -35,8 +35,8 @@ pub use candle_gen::gen_core::train::body::{
     TwoTap, VitPoseConfig,
 };
 use candle_gen::gen_core::train::body::{
-    keypoint_box, MIN_MEAN_RATIO_VISIBILITY, MISSING_REFERENCE_VISIBILITY, NUM_BODY_RATIOS,
-    NUM_HEAD_RATIOS, RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
+    keypoint_box, VitPoseWarp, MIN_MEAN_RATIO_VISIBILITY, MISSING_REFERENCE_VISIBILITY,
+    NUM_BODY_RATIOS, NUM_HEAD_RATIOS, RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
 };
 
 pub use hybrik::HybrikEncoder;
@@ -333,37 +333,49 @@ pub struct PersonDetection {
 }
 
 impl VitPose {
-    /// Detect the person in a clean decode `[1, H, W, 3]`: `None` below
-    /// [`MIN_MEAN_RATIO_VISIBILITY`] mean body-ratio visibility or with fewer than two confident
-    /// keypoints (the MLX twin's rule).
+    /// Detect the person in a clean decode `[B, H, W, 3]`: `None` below
+    /// [`MIN_MEAN_RATIO_VISIBILITY`] mean visibility over all the ratios in use (upstream's rule) or
+    /// with fewer than two confident keypoints. The person box spans the confident keypoints of
+    /// every frame (the MLX twin's rule).
     pub fn detect(&self, clean: &Tensor, include_head: bool) -> Result<Option<PersonDetection>> {
         let clean = clean.detach();
         let (heatmaps, warp) = self.forward_pixels(&clean)?;
         let (coords, conf) = vitpose::heatmaps_to_keypoints(&heatmaps)?;
-        let (ratios, ratio_vis) = body_ratios(&coords, &conf, include_head)?;
-        let (ratios, ratio_vis) = (ratios.detach(), ratio_vis.detach());
-        let body_vis = ratio_vis
-            .narrow(1, 0, NUM_BODY_RATIOS)?
-            .mean_all()?
-            .to_scalar::<f32>()?;
-        if body_vis < MIN_MEAN_RATIO_VISIBILITY {
-            return Ok(None);
-        }
-        let c: Vec<f32> = coords.flatten_all()?.to_vec1()?;
-        let points: Vec<(f32, f32)> = (0..c.len() / 2)
-            .map(|i| warp.keypoint_to_input(c[2 * i], c[2 * i + 1]))
-            .collect();
-        let confidence: Vec<f32> = conf.flatten_all()?.to_vec1()?;
         let (_, h, w, _) = clean.dims4()?;
-        let Some(person_box) = keypoint_box(&points, &confidence, h, w) else {
-            return Ok(None);
-        };
-        Ok(Some(PersonDetection {
-            ratios,
-            ratio_vis,
-            person_box,
-        }))
+        detection_from_keypoints(&coords, &conf, &warp, include_head, h, w)
     }
+}
+
+/// [`VitPose::detect`] past the heatmaps: the `[B, 17, 2]` keypoints (normalized heatmap
+/// coordinates) and `[B, 17]` confidences of an `in_h × in_w` frame batch → the detection.
+fn detection_from_keypoints(
+    coords: &Tensor,
+    conf: &Tensor,
+    warp: &VitPoseWarp,
+    include_head: bool,
+    in_h: usize,
+    in_w: usize,
+) -> Result<Option<PersonDetection>> {
+    let (ratios, ratio_vis) = body_ratios(coords, conf, include_head)?;
+    let (ratios, ratio_vis) = (ratios.detach(), ratio_vis.detach());
+    // Upstream `encode`: the mean over ALL the ratios in use (10 with the head ratios).
+    let mean_vis = ratio_vis.mean_all()?.to_scalar::<f32>()?;
+    if mean_vis < MIN_MEAN_RATIO_VISIBILITY {
+        return Ok(None);
+    }
+    let c: Vec<f32> = coords.flatten_all()?.to_vec1()?;
+    let points: Vec<(f32, f32)> = (0..c.len() / 2)
+        .map(|i| warp.keypoint_to_input(c[2 * i], c[2 * i + 1]))
+        .collect();
+    let confidence: Vec<f32> = conf.flatten_all()?.to_vec1()?;
+    let Some(person_box) = keypoint_box(&points, &confidence, in_h, in_w) else {
+        return Ok(None);
+    };
+    Ok(Some(PersonDetection {
+        ratios,
+        ratio_vis,
+        person_box,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -466,8 +478,16 @@ impl PerceptualLoss for BodyShapeLoss {
             return Ok(None);
         };
         let (_, h, w, _) = clean.dims4()?;
+        // Upstream: the reference betas come from `encode` (`int()`-truncated crop), the live ones
+        // from `forward` (rounded crop) of the same person box.
         let crop = HybrikEncoder::crop_for(d.person_box, h, w);
-        let betas = self.hybrik.forward_crop(&clean.detach(), crop)?.detach();
+        let betas = self
+            .hybrik
+            .forward_crop(
+                &clean.detach(),
+                HybrikEncoder::encode_crop_for(d.person_box, h, w),
+            )?
+            .detach();
         Ok(Some(Box::new(ShapeReference { betas, crop })))
     }
 
@@ -538,7 +558,7 @@ impl PerceptualLoss for NormalLoss {
         } else {
             None
         };
-        let normals = self.sapiens.forward_pixels(&clean.detach())?.detach();
+        let normals = self.sapiens.encode_pixels(&clean.detach())?.detach();
         Ok(Some(Box::new(NormalReference { normals, mask })))
     }
 

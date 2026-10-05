@@ -16,17 +16,27 @@ Reference implementations:
   substitution is `dsntnn.dsnt`, a 3-line expectation over `normalized_linspace`, reproduced here
   (`dsnt`) because dsntnn is not installed.
 - HybrIK: upstream `DifferentiableBodyShapeEncoder` (`_backbone` / `_predict_betas` / `forward`)
-  verbatim over torchvision `BasicBlock`s, with the stage widths/blocks shrunk.
+  verbatim over torchvision `BasicBlock`s, with the stage widths/blocks shrunk; the reference betas
+  follow upstream `encode` (`_square_crop`'s `int()`-truncated square, then the same resize), the
+  live betas `forward` (the `round`-ed square of the same person box).
 - Sapiens: upstream `SapiensNormal` / `_NormalDecoder` / `DifferentiableNormalEncoder.forward`
-  verbatim, with the hard-coded sizes (64x48 position grid, 768 decoder width, 512x384 letterbox,
-  256 normal size) lifted into constructor arguments, and the LayerNorm eps set to Sapiens' own
-  1e-6 (upstream's port uses torch's 1e-5 default).
+  verbatim, with the hard-coded sizes (64x48 position grid, 768 decoder width, 512x384 training
+  letterbox, 1024x768 reference letterbox, 256 normal size) lifted into constructor arguments, and
+  the LayerNorm eps set to Sapiens' own 1e-6 (upstream's port uses torch's 1e-5 default). The
+  reference normals follow upstream `encode` (native-size letterbox), the live ones `forward`
+  (half-size letterbox); both are resampled to the same `NORMAL_SIZE`² grid, which is how upstream
+  compares them.
 
 Deliberate deviations of the port, reproduced here so the fixture pins the port's behaviour:
 - the fixture's losses are the per-sample terms before upstream's `t_ratio` scaling, which the port
   applies on the shared path (`PerceptualLoss::timestep_weight`, tested in the ports);
 - the normal loss's subject mask is letterboxed with the normals (upstream resizes the raw mask
-  straight to the letterboxed map, misaligning it with the padding).
+  straight to the letterboxed map, misaligning it with the padding);
+- the reference image is the trainer's decoded clean x0 as a float tensor (the shared perceptual
+  path's round-trip reference), not the dataset file as an 8-bit PIL image, so `encode`'s
+  `_letterbox_pil` / `pil_image.crop` become upstream's own `_letterbox_tensor` / a tensor slice:
+  the same geometry, without the 8-bit quantization and with torch's bilinear resample in place
+  of PIL's (identical when upscaling; PIL antialiases a downscale).
 
 Run with any Python that has torch, torchvision, transformers (>= 4.47) and safetensors.
 
@@ -307,6 +317,25 @@ class TinyHybrik(nn.Module):
         return self._predict_betas(self._backbone(pixels))
 
 
+def hybrik_encode(model, pixels, bbox):
+    """Upstream DifferentiableBodyShapeEncoder.encode (+ `_square_crop`) on a reference tensor:
+    the `int()`-truncated square crop as a tensor slice (see the module docstring), the bilinear
+    resize, HybrIK normalization, backbone + beta head."""
+    ph, pw = pixels.shape[2], pixels.shape[3]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    size = max(x2 - x1, y2 - y1) * 1.25
+    half = size / 2
+    x1 = max(0, int(cx - half))
+    y1 = max(0, int(cy - half))
+    x2 = min(pw, int(cx + half))
+    y2 = min(ph, int(cy + half))
+    crop = pixels[:, :, y1:y2, x1:x2].float()
+    crop = F.interpolate(crop, size=(model.INPUT_SIZE, model.INPUT_SIZE), mode="bilinear", align_corners=False)
+    crop = (crop - model.img_mean) / model.img_std
+    return model._predict_betas(model._backbone(crop))
+
+
 def build_hybrik():
     model = TinyHybrik()
     with torch.no_grad():
@@ -478,6 +507,18 @@ def sapiens_forward(model, pixels, train_size=(32, 24), normal_size=16):
     return raw / (raw.norm(dim=1, keepdim=True) + 1e-5)
 
 
+def sapiens_encode(model, pixels, encode_size=(64, 48), normal_size=16):
+    """Upstream DifferentiableNormalEncoder.encode on a reference tensor: `_best_orientation`
+    (the native letterbox), `_letterbox_tensor` in place of `_letterbox_pil` (see the module
+    docstring), the model, the resample to the normal grid, L2 normalization."""
+    B, C, H, W = pixels.shape
+    target_h, target_w = encode_size if H >= W else (encode_size[1], encode_size[0])
+    pixels = letterbox_tensor(pixels, target_h, target_w)
+    raw = model(pixels)
+    raw = F.interpolate(raw.float(), size=(normal_size, normal_size), mode="bilinear", align_corners=False)
+    return raw / (raw.norm(dim=1, keepdim=True) + 1e-5)
+
+
 def sapiens_mask(mask, train_size=(32, 24), normal_size=16):
     """The port's mask path: the same letterbox + resize as the normals (see module docstring)."""
     B, C, H, W = mask.shape
@@ -568,16 +609,22 @@ def produce() -> dict[str, torch.Tensor]:
         )
         beta_a = hyb(img_a, [PERSON_BBOX])
         beta_b = hyb(img_b, [PERSON_BBOX])
+        # The reference (encode) betas of image a: the truncated crop differs from the rounded one
+        # for this box (y2 = 39 vs 40), so the fixture tells the two paths apart.
+        beta_ref = hybrik_encode(hyb, img_a, PERSON_BBOX)
         t.update(
             {
                 "hybrik.out.betas_a": beta_a,
                 "hybrik.out.betas_b": beta_b,
                 "hybrik.out.cos": F.cosine_similarity(beta_b, beta_a, dim=-1),
                 "hybrik.out.l1": (beta_b - beta_a).abs().mean(dim=-1),
+                "hybrik.out.betas_a_encode": beta_ref,
+                "hybrik.out.l1_encode": (beta_b - beta_ref).abs().mean(dim=-1),
             }
         )
         n_a = sapiens_forward(sap, img_a)
         n_b = sapiens_forward(sap, img_b)
+        n_ref = sapiens_encode(sap, img_a)
         m = sapiens_mask(mask)
         t.update(
             {
@@ -586,6 +633,9 @@ def produce() -> dict[str, torch.Tensor]:
                 "sapiens.out.mask": m,
                 "sapiens.out.loss": normal_loss(n_a, n_b),
                 "sapiens.out.loss_masked": normal_loss(n_a, n_b, m),
+                "sapiens.out.normals_a_encode": n_ref,
+                "sapiens.out.loss_encode": normal_loss(n_ref, n_b),
+                "sapiens.out.loss_masked_encode": normal_loss(n_ref, n_b, m),
             }
         )
     for k, v in vit.state_dict().items():
@@ -661,6 +711,7 @@ def real_reference(image: Path, out: Path, vitpose_dir: Path | None, hybrik_pth:
             hyb.eval()
             t["input.person_bbox"] = torch.tensor(bbox)
             t["hybrik.out.betas_a"] = hyb(img, [bbox])
+            t["hybrik.out.betas_a_encode"] = hybrik_encode(hyb, img, bbox)
         if sapiens_pth is not None:
             sap = SapiensNormal(embed_dim=1024, num_layers=24, num_heads=16, ffn_dim=4096, patch=16,
                                 pos=(64, 48), mid=768)
@@ -676,6 +727,7 @@ def real_reference(image: Path, out: Path, vitpose_dir: Path | None, hybrik_pth:
             assert not missing, missing
             sap.eval()
             t["sapiens.out.normals_a"] = sapiens_forward(sap, img, train_size=(512, 384), normal_size=256)
+            t["sapiens.out.normals_a_encode"] = sapiens_encode(sap, img, encode_size=(1024, 768), normal_size=256)
     out.mkdir(parents=True, exist_ok=True)
     save_file({k: x.contiguous().float() for k, x in t.items()}, str(out / "reference.safetensors"))
     print("wrote", out / "reference.safetensors", sorted(t))

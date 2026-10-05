@@ -23,9 +23,10 @@
 //! **Person detection.** All three losses need "is there a person in this reference image".
 //! Upstream gates body proportion on ViTPose's own keypoint confidence (its video path needs no
 //! other detector) and never really gates the other two. Here every body loss gates on the same
-//! reference-time ViTPose pass: a reference whose mean body-ratio visibility is below
-//! [`MIN_MEAN_RATIO_VISIBILITY`] has **no detected person** and the loss is skipped for that image.
-//! The confident keypoints' bounding box is the person box HybrIK crops to.
+//! reference-time ViTPose pass: a reference whose mean visibility over every ratio in use (10 with
+//! the head ratios — upstream `encode`) is below [`MIN_MEAN_RATIO_VISIBILITY`] has **no detected
+//! person** and the loss is skipped for that image. The confident keypoints' bounding box (over
+//! every frame of a video reference) is the person box HybrIK crops to.
 
 use std::path::PathBuf;
 
@@ -590,20 +591,39 @@ impl HybrikConfig {
     }
 }
 
-/// HybrIK's square person crop of an `in_h × in_w` frame (upstream `forward` with a person box):
-/// side `max(w, h) · 1.25` around the box centre, rounded and clamped to the frame. Returns
-/// half-open `(y0, y1, x0, x1)`; a degenerate crop falls back to the whole frame (upstream's
-/// `else: crop = pixels[i:i+1]`).
+/// HybrIK's square person crop of an `in_h × in_w` frame (upstream `forward` with a person box —
+/// the live, differentiable path): side `max(w, h) · 1.25` around the box centre, rounded
+/// (Python's half-to-even `round`) and clamped to the frame. Returns half-open `(y0, y1, x0, x1)`;
+/// a degenerate crop falls back to the whole frame (upstream's `else: crop = pixels[i:i+1]`).
 pub fn hybrik_square_crop(
     bbox: [f32; 4],
     in_h: usize,
     in_w: usize,
 ) -> (usize, usize, usize, usize) {
+    square_crop(bbox, in_h, in_w, f64::round_ties_even)
+}
+
+/// HybrIK's square person crop on the **reference** path (upstream `encode` → `_square_crop`): the
+/// same square as [`hybrik_square_crop`], but each edge truncated toward zero (Python `int()`)
+/// before clamping.
+pub fn hybrik_encode_crop(
+    bbox: [f32; 4],
+    in_h: usize,
+    in_w: usize,
+) -> (usize, usize, usize, usize) {
+    square_crop(bbox, in_h, in_w, f64::trunc)
+}
+
+fn square_crop(
+    bbox: [f32; 4],
+    in_h: usize,
+    in_w: usize,
+    to_int: fn(f64) -> f64,
+) -> (usize, usize, usize, usize) {
     let [x1, y1, x2, y2] = bbox.map(|v| v as f64);
     let (cx, cy) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
     let half = (x2 - x1).max(y2 - y1) * 1.25 / 2.0;
-    // Python's `round` (upstream) rounds half to even.
-    let r = |v: f64| v.round_ties_even().max(0.0) as usize;
+    let r = |v: f64| to_int(v).max(0.0) as usize;
     let cx1 = r(cx - half);
     let cy1 = r(cy - half);
     let cx2 = r(cx + half).min(in_w);
@@ -641,6 +661,10 @@ pub struct SapiensConfig {
     /// The training-time letterbox target `(h, w)` for a portrait frame (512 × 384, half the
     /// native size — upstream `_best_orientation_train`); a landscape frame uses `(w, h)`.
     pub train_size: (usize, usize),
+    /// The reference-time letterbox target `(h, w)` for a portrait frame (1024 × 768, the native
+    /// size — upstream `encode` / `_best_orientation`); a landscape frame uses `(w, h)`. The
+    /// reference normals are resampled to the same `normal_size²` grid as the live ones.
+    pub encode_size: (usize, usize),
     /// LayerNorm epsilon (1e-6, the mmpretrain ViT setting).
     pub layer_norm_eps: f32,
     /// InstanceNorm epsilon (1e-5, torch default).
@@ -663,6 +687,7 @@ impl SapiensConfig {
             decoder_channels: 768,
             decoder_stages: 3,
             train_size: (512, 384),
+            encode_size: (1024, 768),
             layer_norm_eps: 1e-6,
             instance_norm_eps: 1e-5,
             normal_size: NORMAL_SIZE,
@@ -681,6 +706,7 @@ impl SapiensConfig {
             decoder_channels: 8,
             decoder_stages: 3,
             train_size: (32, 24),
+            encode_size: (64, 48),
             layer_norm_eps: 1e-6,
             instance_norm_eps: 1e-5,
             normal_size: 16,
@@ -716,7 +742,19 @@ impl SapiensConfig {
     /// (deconv out, norm, SiLU, conv, norm, SiLU), the output and the 256² resample — doubled for
     /// the backward.
     pub fn training_working_set_bytes(&self) -> u64 {
-        let (gh, gw) = self.grid(self.train_size.0, self.train_size.1);
+        2 * self.forward_bytes(self.train_size, self.num_layers as u64)
+    }
+
+    /// Conservative reference-time (no-grad) working set at the native encode letterbox: one
+    /// layer's activations and attention matrix live at a time, the decoder's maps, the output and
+    /// the resample.
+    pub fn reference_working_set_bytes(&self) -> u64 {
+        self.forward_bytes(self.encode_size, 1)
+    }
+
+    /// One forward at a `size` letterbox with `layers` layers' activations retained.
+    fn forward_bytes(&self, size: (usize, usize), layers: u64) -> u64 {
+        let (gh, gw) = self.grid(size.0, size.1);
         let n = (gh * gw) as u64;
         let c = self.embed_dim as u64;
         let per_layer = n * (8 * c + 2 * self.ffn_dim as u64) + self.num_heads as u64 * n * n;
@@ -728,8 +766,8 @@ impl SapiensConfig {
             dec += 6 * d * px;
         }
         let out = 3 * px + 2 * 3 * (self.normal_size * self.normal_size) as u64;
-        let input = 3 * (self.train_size.0 * self.train_size.1) as u64 * 2;
-        2 * F32 * (self.num_layers as u64 * per_layer + dec + out + input)
+        let input = 3 * (size.0 * size.1) as u64 * 2;
+        F32 * (layers * per_layer + dec + out + input)
     }
 
     /// E7 figures; the reference holds a 3 × 256² normal map and (restricted) a 256² mask.
@@ -737,7 +775,9 @@ impl SapiensConfig {
         let px = (self.normal_size * self.normal_size) as u64;
         BodyModelFootprint {
             param_bytes: self.param_count() * F32,
-            working_set_bytes: self.training_working_set_bytes(),
+            working_set_bytes: self
+                .training_working_set_bytes()
+                .max(self.reference_working_set_bytes()),
             reference_bytes_per_image: (3 + u64::from(restrict_to_subject)) * px * F32,
         }
     }
@@ -745,19 +785,31 @@ impl SapiensConfig {
     /// The training letterbox of an `in_h × in_w` frame (upstream `_best_orientation_train` +
     /// `_letterbox_tensor`).
     pub fn letterbox(&self, in_h: usize, in_w: usize) -> Letterbox {
-        let (ph, pw) = self.train_size;
-        let (target_h, target_w) = if in_h >= in_w { (ph, pw) } else { (pw, ph) };
-        let scale = (target_w as f64 / in_w as f64).min(target_h as f64 / in_h as f64);
-        let new_w = ((in_w as f64 * scale) as usize).clamp(1, target_w);
-        let new_h = ((in_h as f64 * scale) as usize).clamp(1, target_h);
-        Letterbox {
-            target_h,
-            target_w,
-            new_h,
-            new_w,
-            pad_top: (target_h - new_h) / 2,
-            pad_left: (target_w - new_w) / 2,
-        }
+        letterbox_to(self.train_size, in_h, in_w)
+    }
+
+    /// The reference letterbox of an `in_h × in_w` frame (upstream `encode`: `_best_orientation`
+    /// + `_letterbox_pil`, applied to the reference tensor).
+    pub fn encode_letterbox(&self, in_h: usize, in_w: usize) -> Letterbox {
+        letterbox_to(self.encode_size, in_h, in_w)
+    }
+}
+
+/// Letterbox an `in_h × in_w` frame onto a portrait `size = (h, w)` target (`(w, h)` for a
+/// landscape frame).
+fn letterbox_to(size: (usize, usize), in_h: usize, in_w: usize) -> Letterbox {
+    let (ph, pw) = size;
+    let (target_h, target_w) = if in_h >= in_w { (ph, pw) } else { (pw, ph) };
+    let scale = (target_w as f64 / in_w as f64).min(target_h as f64 / in_h as f64);
+    let new_w = ((in_w as f64 * scale) as usize).clamp(1, target_w);
+    let new_h = ((in_h as f64 * scale) as usize).clamp(1, target_h);
+    Letterbox {
+        target_h,
+        target_w,
+        new_h,
+        new_w,
+        pad_top: (target_h - new_h) / 2,
+        pad_left: (target_w - new_w) / 2,
     }
 }
 
@@ -969,6 +1021,41 @@ mod tests {
         );
         let m = Letterbox::axis_weights(4, 2, 1, 2);
         assert_eq!(m, vec![0., 0., 1., 0., 0., 1., 0., 0.]);
+    }
+
+    /// The reference path's geometry (upstream `encode`): the HybrIK crop truncates like Python
+    /// `int()` (cy + half = 39.5 -> 39 where the live crop rounds to 40), and Sapiens letterboxes
+    /// at the native 1024 x 768 — whose no-grad forward bounds the normal model's working set when
+    /// it outgrows training. Mutations: round in `hybrik_encode_crop` => red; letterbox the
+    /// reference at `train_size` => red; drop the reference term from `footprint` => red.
+    #[test]
+    fn reference_crop_and_letterbox_follow_upstream_encode() {
+        assert_eq!(
+            hybrik_encode_crop([5.0, 8.0, 22.0, 36.0], 40, 30),
+            (4, 39, 0, 30)
+        );
+        // Integral edges: both crops agree.
+        assert_eq!(
+            hybrik_encode_crop([40.0, 40.0, 60.0, 80.0], 100, 100),
+            (35, 85, 25, 75)
+        );
+        let s = SapiensConfig::normal_0_3b();
+        let lb = s.encode_letterbox(1024, 1024);
+        assert_eq!(
+            (lb.target_h, lb.target_w, lb.new_h, lb.new_w, lb.pad_top),
+            (1024, 768, 768, 768, 128)
+        );
+        let land = s.encode_letterbox(768, 1024);
+        assert_eq!((land.target_h, land.target_w), (768, 1024));
+        let tiny = SapiensConfig::tiny();
+        let mut big = tiny.clone();
+        big.encode_size = (256, 192);
+        assert!(big.reference_working_set_bytes() > big.training_working_set_bytes());
+        assert_eq!(
+            big.footprint(false).working_set_bytes,
+            big.reference_working_set_bytes()
+        );
+        assert!(s.footprint(false).working_set_bytes >= s.reference_working_set_bytes());
     }
 
     #[test]

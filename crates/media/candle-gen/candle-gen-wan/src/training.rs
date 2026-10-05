@@ -378,8 +378,6 @@ fn compute_step_loss_grads(
     }
 }
 
-/// A cached `[B, C, T, h, w]` latent (`T = 1` for a still) as the decoder's NCHW batch
-/// `[B·T, C, h, w]` — each latent frame decoded independently.
 /// Build every cache entry's perceptual reference once (item-major entries, each clean `[B, C, T,
 /// h, w]` latent as the decoder's NCHW frame batch), handing the path the job's subject masks
 /// first (sc-24832) so a mask-reading loss gets each entry's item mask on its decoded grid.
@@ -395,6 +393,8 @@ fn prepare_perceptual_references<'a>(
     Ok(())
 }
 
+/// A cached `[B, C, T, h, w]` latent (`T = 1` for a still) as the decoder's NCHW batch
+/// `[B·T, C, h, w]` — each latent frame decoded independently.
 fn latent_frames_nchw(latent: &Tensor) -> Result<Tensor> {
     let (b, c, t, h, w) = latent.dims5()?;
     Ok(latent
