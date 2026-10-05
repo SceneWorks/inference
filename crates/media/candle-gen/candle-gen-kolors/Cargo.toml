@@ -28,6 +28,8 @@ candle-transformers = { workspace = true }
 # IP-Adapter path reuses this IP-capable stack with the Kolors UNet weights + an external
 # `encoder_hid_proj`. Same candle build (backend features forwarded below) → no skew.
 candle-gen-sdxl = { path = "../candle-gen-sdxl" }
+# Epic 2123 E8: the shared auxiliary perceptual-loss builder (depth anchoring via TAESDXL + DA2).
+candle-gen-perceptual = { path = "../candle-gen-perceptual" }
 # ChatGLM3 prompt tokenization. The fast `tokenizer.json` is loaded from the snapshot's `tokenizer/`
 # dir (materialized by Kolors' `tools/build_kolors_tokenizer.py`, mirroring the mlx provider), and
 # this wrapper applies the ChatGLM framing (GMASK/SOP prefix + left-pad + position_ids).
@@ -44,8 +46,8 @@ sha2 = { workspace = true }
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-sdxl/metal", "candle-gen-pid/metal"]
-cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda", "candle-gen-pid/cuda"]
+metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-sdxl/metal", "candle-gen-pid/metal", "candle-gen-perceptual/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda", "candle-gen-pid/cuda", "candle-gen-perceptual/cuda"]
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
