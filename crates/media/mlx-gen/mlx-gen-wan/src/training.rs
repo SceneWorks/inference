@@ -47,10 +47,10 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint;
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
-    TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, LoraParams, TrainAdapter,
 };
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates, LrSchedule};
+use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     gen_core, CancelFlag, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
@@ -60,7 +60,6 @@ use mlx_gen::{
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
-use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -219,6 +218,9 @@ struct ExpertState {
     accumulated: Option<LoraParams>,
     micro: u32,      // micro-steps routed to this expert so far (drives accumulation)
     update_idx: u32, // optimizer updates applied (drives the LR schedule)
+    /// Epic 2123 (sc-24827): this expert's adapter-noise RNG seed — the same per-expert seed its
+    /// factors were initialised from, so the two experts draw independent weight/gradient noise.
+    noise_seed: u64,
     total_updates: u32,
     warmup_updates: u32,
 }
@@ -251,7 +253,9 @@ fn trainer_descriptor(id: &'static str) -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
     }
 }
 
@@ -598,6 +602,7 @@ impl WanMoeTrainer {
                 accumulated: None,
                 micro: 0,
                 update_idx: 0,
+                noise_seed: seed,
                 total_updates,
                 warmup_updates,
             });
@@ -699,7 +704,7 @@ impl WanMoeTrainer {
                 // flush is usually a partial window (cfg.steps % accum != 0); dividing by `accum`
                 // down-scaled that update (halved effective LR on the tail). Mirrors the z-image/lens
                 // F-069 fix. (z-image/lens port of sc-9097's shared floor.)
-                flush_expert_update(st, cfg.lr_scheduler, accum_window(st.micro, accum))?;
+                flush_expert_update(st, cfg, accum_window(st.micro, accum))?;
             }
 
             on_progress(TrainingProgress::Training {
@@ -796,7 +801,7 @@ impl WanMoeTrainer {
         // (the run only saves below when `steps_run > 0`).
         for st in &mut states {
             if st.accumulated.is_some() {
-                flush_expert_update(st, cfg.lr_scheduler, accum_window(st.micro, accum))?;
+                flush_expert_update(st, cfg, accum_window(st.micro, accum))?;
             }
         }
 
@@ -875,8 +880,13 @@ fn expert_item_index(step: u32, dual: bool, len: usize) -> usize {
 /// One optimizer update from `st`'s pending grad accumulator, averaged by `window` (the actual
 /// in-window micro-step count, F-017). Shared by the in-loop window/final-step flush and the
 /// loop-exit tail flush so both fire the identical update sequence.
-fn flush_expert_update(st: &mut ExpertState, schedule: LrSchedule, window: u32) -> Result<()> {
-    let mult = lr_multiplier(schedule, st.update_idx, st.total_updates, st.warmup_updates);
+fn flush_expert_update(st: &mut ExpertState, cfg: &TrainingConfig, window: u32) -> Result<()> {
+    let mult = lr_multiplier(
+        cfg.lr_scheduler,
+        st.update_idx,
+        st.total_updates,
+        st.warmup_updates,
+    );
     st.opt.set_lr_scaled(mult);
     let avg = average_grads(
         st.accumulated
@@ -884,13 +894,15 @@ fn flush_expert_update(st: &mut ExpertState, schedule: LrSchedule, window: u32) 
             .expect("an update fires only after accumulation"),
         window,
     )?;
-    let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-    let clipped: LoraParams = clipped
-        .into_iter()
-        .map(|(k, v)| (k, v.into_owned()))
-        .collect();
-    st.opt.step(&mut st.params, &clipped)?;
-    eval(st.params.values())?;
+    // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise, on this expert's stream.
+    adapter_optimizer_update(
+        &mut st.opt,
+        &mut st.params,
+        &avg,
+        cfg,
+        st.update_idx,
+        st.noise_seed,
+    )?;
     st.update_idx += 1;
     Ok(())
 }

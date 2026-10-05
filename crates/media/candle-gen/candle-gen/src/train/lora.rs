@@ -28,6 +28,7 @@ use std::sync::{
     Arc,
 };
 
+use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, VarBuilder};
 use rand::distr::Uniform;
@@ -1546,6 +1547,141 @@ pub fn save_lokr(set: &LoraSet, extra_meta: &HashMap<String, String>, path: &Pat
     write_safetensors(tensors, meta, path)
 }
 
+/// The adapter's trainable factors as `(PEFT key, Var)` in **sorted key order** — the order the
+/// epic 2123 technique-noise kernels index their RNG streams by (E4), so a rebuilt [`LoraSet`]
+/// (or a resumed run) visits the same tensor at the same index.
+fn sorted_named_vars(set: &LoraSet) -> Vec<(String, Var)> {
+    let mut named = set.named_vars();
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    named
+}
+
+/// One unit-normal draw shaped like `like`, from a seeded CPU `StdRng` (launch/device-portable,
+/// like the factor init), moved to `like`'s device as f32.
+fn seeded_unit_noise(key: u64, like: &Tensor) -> Result<Tensor> {
+    let mut rng = StdRng::seed_from_u64(key);
+    let data = crate::seeded_normal_vec(&mut rng, like.elem_count());
+    Ok(Tensor::from_vec(data, like.dims(), &Device::Cpu)?.to_device(like.device())?)
+}
+
+/// **Weight noising** (epic 2123 — the candle twin of `mlx_gen::train::lora::apply_weight_noise`,
+/// identical semantics): permanently perturb every trainable adapter factor of `set` (LoRA A/B,
+/// LoKr factors — never a base weight, which lives in the frozen model and is not in the set) by
+/// `w ← w + N(0, 1) · sigma · rms(w)`, `rms(w) = sqrt(mean(w²))` taken per tensor in f32.
+///
+/// Call it right after each **real optimizer update** (never on a gradient-accumulation
+/// micro-step) with the 0-based index of that update. Tensor `i` (sorted key order) draws from
+/// [`gen_core::train::technique_noise_key`]`(seed, WEIGHT_NOISE_SALT, update_idx, i)` (E4).
+/// `sigma == 0.0` returns before touching anything or drawing any randomness (E1); a negative /
+/// non-finite sigma is an error.
+pub fn apply_weight_noise(set: &LoraSet, sigma: f32, seed: u64, update_idx: u32) -> Result<()> {
+    if !sigma.is_finite() || sigma < 0.0 {
+        return Err(CandleError::Msg(format!(
+            "weight noise: sigma must be a finite value >= 0, got {sigma}"
+        )));
+    }
+    if sigma == 0.0 {
+        return Ok(());
+    }
+    for (i, (_, var)) in sorted_named_vars(set).iter().enumerate() {
+        let w = var.as_tensor();
+        let dtype = w.dtype();
+        let wf = w.to_dtype(DType::F32)?;
+        // Stays on device as a 0-d tensor: no host sync per factor.
+        let scale = (wf.sqr()?.mean_all()?.sqrt()? * sigma as f64)?;
+        let key = gen_core::train::technique_noise_key(
+            seed,
+            gen_core::train::WEIGHT_NOISE_SALT,
+            update_idx,
+            i,
+        );
+        let delta = seeded_unit_noise(key, &wf)?.broadcast_mul(&scale)?;
+        var.set(&(wf + delta)?.to_dtype(dtype)?)?;
+    }
+    Ok(())
+}
+
+/// **Gradient noise** (epic 2123, sc-24827 — the candle twin of
+/// `mlx_gen::train::lora::apply_gradient_noise`): add `N(0, 1) · σ_t` to the gradient of every
+/// trainable factor of `set` held in `grads`, `σ_t = eta / (1 + update_idx)^gamma`
+/// ([`gen_core::train::gradient_noise_std`]). Call once per **real optimizer update** after the
+/// global-norm clip and before the optimizer step (upstream's placement). Seeded like
+/// [`apply_weight_noise`] on the independent `GRADIENT_NOISE_SALT` stream (E4). `eta == 0.0`
+/// returns before any RNG draw (E1); a malformed eta/gamma is an error.
+pub fn apply_gradient_noise(
+    grads: &mut GradStore,
+    set: &LoraSet,
+    eta: f32,
+    gamma: f32,
+    seed: u64,
+    update_idx: u32,
+) -> Result<()> {
+    if !eta.is_finite() || eta < 0.0 || !gamma.is_finite() || gamma < 0.0 {
+        return Err(CandleError::Msg(format!(
+            "gradient noise: eta and gamma must be finite values >= 0, got eta {eta}, gamma {gamma}"
+        )));
+    }
+    if eta == 0.0 {
+        return Ok(());
+    }
+    let std = gen_core::train::gradient_noise_std(eta, gamma, update_idx) as f64;
+    for (i, (_, var)) in sorted_named_vars(set).iter().enumerate() {
+        let Some(g) = grads.get(var.as_tensor()) else {
+            continue;
+        };
+        let key = gen_core::train::technique_noise_key(
+            seed,
+            gen_core::train::GRADIENT_NOISE_SALT,
+            update_idx,
+            i,
+        );
+        let noise = (seeded_unit_noise(key, g)? * std)?.to_dtype(g.dtype())?;
+        let noised = (g + noise)?;
+        grads.insert(var.as_tensor(), noised);
+    }
+    Ok(())
+}
+
+/// One real **adapter optimizer step** — the update every candle LoRA/LoKr trainer fires once per
+/// gradient-accumulation window, on gradients already averaged over the window (epic 2123 S2,
+/// sc-24827): global-norm clip to 1.0 → [`apply_gradient_noise`] → optimizer step →
+/// [`apply_weight_noise`]. `update_idx` is the 0-based update index (noise schedule + RNG streams);
+/// `noise_seed` is the job seed (a multi-expert trainer passes its per-expert seed). With both
+/// techniques off this is exactly the pre-epic-2123 `clip_grad_norm` + `step`.
+pub fn adapter_optimizer_step(
+    opt: &mut crate::train::optim::TrainOptimizer,
+    grads: &mut GradStore,
+    set: &LoraSet,
+    cfg: &gen_core::TrainingConfig,
+    update_idx: u32,
+    noise_seed: u64,
+) -> Result<()> {
+    clip_and_noise_grads(grads, set, cfg, update_idx, noise_seed)?;
+    opt.step(grads)?;
+    apply_weight_noise(set, cfg.weight_noise_sigma, noise_seed, update_idx)
+}
+
+/// The gradient half of [`adapter_optimizer_step`]: clip `grads` (over `set`'s factors) to unit
+/// global norm, then [`apply_gradient_noise`] on the clipped gradients (upstream's order — the clip
+/// must not shrink the noise).
+pub fn clip_and_noise_grads(
+    grads: &mut GradStore,
+    set: &LoraSet,
+    cfg: &gen_core::TrainingConfig,
+    update_idx: u32,
+    noise_seed: u64,
+) -> Result<()> {
+    crate::train::optim::clip_grad_norm(grads, &set.vars, 1.0)?;
+    apply_gradient_noise(
+        grads,
+        set,
+        cfg.gradient_noise_eta,
+        cfg.gradient_noise_gamma,
+        noise_seed,
+        update_idx,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2907,5 +3043,335 @@ mod tests {
         )
         .unwrap();
         assert_eq!((rank, alpha), (4.0, 2.5));
+    }
+}
+
+/// Epic 2123 adapter noise on candle (sc-24827) — the candle twins of the MLX
+/// `apply_weight_noise` / `apply_gradient_noise` / shared-update tests, on tiny CPU adapter sets.
+#[cfg(test)]
+mod adapter_noise_tests {
+    use super::*;
+    use crate::train::optim::{clip_grad_norm, TrainOptimizer};
+    use gen_core::{NetworkType, TrainingConfig};
+
+    struct TwoHost(LoraLinear, LoraLinear);
+    impl LoraHost for TwoHost {
+        fn visit_lora_mut(
+            &mut self,
+            f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>,
+        ) -> Result<()> {
+            f(&mut self.0)?;
+            f(&mut self.1)
+        }
+    }
+
+    fn linear(path: &str, out_f: usize, in_f: usize, seed: u64) -> LoraLinear {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let w = Tensor::from_vec(
+            crate::seeded_normal_vec(&mut rng, out_f * in_f),
+            (out_f, in_f),
+            &Device::Cpu,
+        )
+        .unwrap();
+        LoraLinear::from_linear(Linear::new(w, None), in_f, out_f, path.into())
+    }
+
+    /// A two-projection adapter set; LoRA `B` (zero-init) is given a non-zero value so every factor
+    /// has a non-zero rms.
+    fn set(kind: NetworkType) -> LoraSet {
+        let mut host = TwoHost(
+            linear("blk.to_q", 128, 96, 1),
+            linear("blk.to_k", 64, 96, 2),
+        );
+        let paths = ["to_q".to_string(), "to_k".to_string()];
+        let set = match kind {
+            NetworkType::Lora => build_lora_targets(&mut host, &paths, 32, 32.0, 7, &Device::Cpu),
+            NetworkType::Lokr => build_lokr_targets(&mut host, &paths, 4, 4.0, -1, 7, &Device::Cpu),
+        }
+        .unwrap();
+        for (i, (_, var)) in sorted_named_vars(&set).iter().enumerate() {
+            let mut rng = StdRng::seed_from_u64(100 + i as u64);
+            let scale = 0.01 * (1 + 10 * i) as f32; // very different per-tensor scales
+            let data: Vec<f32> = crate::seeded_normal_vec(&mut rng, var.elem_count())
+                .into_iter()
+                .map(|x| x * scale)
+                .collect();
+            var.set(&Tensor::from_vec(data, var.dims(), &Device::Cpu).unwrap())
+                .unwrap();
+        }
+        set
+    }
+
+    fn snapshot(set: &LoraSet) -> Vec<(String, Vec<f32>)> {
+        sorted_named_vars(set)
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    v.as_tensor()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn rms(v: &[f32]) -> f64 {
+        (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+    }
+
+    /// Weight noise: every adapter factor (and only adapter factors) moves by noise whose RMS is
+    /// `sigma · rms(w)` of that factor.
+    ///
+    /// *Mutation that reds this:* dropping the `rms` factor (absolute noise) or using a global rms.
+    #[test]
+    fn weight_noise_is_rms_relative_per_adapter_factor() {
+        let sigma = 0.0125f32;
+        for kind in [NetworkType::Lora, NetworkType::Lokr] {
+            let s = set(kind);
+            let before = snapshot(&s);
+            assert!(
+                before
+                    .iter()
+                    .all(|(k, _)| k.contains(".lora_") || k.contains(".lokr_")),
+                "{kind:?}: the noised surface must be adapter factors only: {:?}",
+                before.iter().map(|(k, _)| k).collect::<Vec<_>>()
+            );
+            apply_weight_noise(&s, sigma, 7, 0).unwrap();
+            for ((k, w0), (_, w1)) in before.iter().zip(snapshot(&s)) {
+                if w0.len() < 256 {
+                    continue; // too few samples for a tight rms estimate
+                }
+                let delta: Vec<f32> = w0.iter().zip(&w1).map(|(a, b)| b - a).collect();
+                let ratio = rms(&delta) / (sigma as f64 * rms(w0));
+                assert!(
+                    (0.85..1.15).contains(&ratio),
+                    "{kind:?} {k}: delta rms / (sigma·rms(w)) = {ratio} (n={})",
+                    w0.len()
+                );
+            }
+        }
+    }
+
+    /// E1: sigma 0 / eta 0 are bit-identical no-ops.
+    #[test]
+    fn zero_strength_noise_is_bit_identical() {
+        let s = set(NetworkType::Lora);
+        let before = snapshot(&s);
+        apply_weight_noise(&s, 0.0, 7, 3).unwrap();
+        assert_eq!(before, snapshot(&s));
+
+        let named = sorted_named_vars(&s);
+        let loss = named
+            .iter()
+            .map(|(_, v)| v.as_tensor().sqr().unwrap().sum_all().unwrap())
+            .reduce(|a, b| (a + b).unwrap())
+            .unwrap();
+        let mut grads = loss.backward().unwrap();
+        let g0: Vec<Vec<f32>> = named
+            .iter()
+            .map(|(_, v)| {
+                grads
+                    .get(v.as_tensor())
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap()
+            })
+            .collect();
+        apply_gradient_noise(&mut grads, &s, 0.0, 0.55, 7, 3).unwrap();
+        let g1: Vec<Vec<f32>> = named
+            .iter()
+            .map(|(_, v)| {
+                grads
+                    .get(v.as_tensor())
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(g0, g1);
+    }
+
+    /// E4: same (seed, update) ⇒ identical noise; a different seed or update ⇒ different.
+    #[test]
+    fn weight_noise_is_derived_from_seed_and_update_index() {
+        let run = |seed: u64, t: u32| {
+            let s = set(NetworkType::Lora);
+            apply_weight_noise(&s, 0.0125, seed, t).unwrap();
+            snapshot(&s)
+        };
+        assert_eq!(run(7, 2), run(7, 2));
+        assert_ne!(run(7, 2), run(8, 2));
+        assert_ne!(run(7, 2), run(7, 3));
+    }
+
+    /// Zero gradients for every factor of `s` (so the post-noise gradient IS the noise).
+    fn zero_grads(s: &LoraSet) -> GradStore {
+        let named = sorted_named_vars(s);
+        let mut grads = named[0]
+            .1
+            .as_tensor()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        for (_, v) in &named {
+            grads.insert(v.as_tensor(), v.as_tensor().zeros_like().unwrap());
+        }
+        grads
+    }
+
+    fn grad_values(grads: &GradStore, s: &LoraSet) -> Vec<f32> {
+        sorted_named_vars(s)
+            .iter()
+            .flat_map(|(_, v)| {
+                grads
+                    .get(v.as_tensor())
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// AC3 annealing: the measured std of the injected gradient noise equals
+    /// `eta / (1 + t)^gamma` at t = 0, 9, 99, 999, so it shrinks with the update index per formula.
+    ///
+    /// *Mutation that reds this:* any change to the exponent in `gen_core::train::gradient_noise_std`.
+    #[test]
+    fn gradient_noise_std_anneals_with_the_update_index() {
+        let s = set(NetworkType::Lora);
+        let (eta, gamma) = (0.01f32, 0.55f32);
+        let mut prev = f64::INFINITY;
+        for t in [0u32, 9, 99, 999] {
+            let mut g = zero_grads(&s);
+            apply_gradient_noise(&mut g, &s, eta, gamma, 7, t).unwrap();
+            let all = grad_values(&g, &s);
+            assert!(all.len() > 5000, "enough samples: {}", all.len());
+            let measured = rms(&all);
+            let want = eta as f64 / (1.0 + t as f64).powf(gamma as f64);
+            assert!(
+                (measured / want - 1.0).abs() < 0.04,
+                "t={t}: measured std {measured}, formula {want}"
+            );
+            assert!(measured < prev);
+            prev = measured;
+        }
+    }
+
+    /// Placement: gradient noise is added after the unit-norm clip (the clip cannot shrink it).
+    ///
+    /// *Mutation that reds this:* noising before `clip_grad_norm` in `clip_and_noise_grads`.
+    #[test]
+    fn gradient_noise_is_added_after_the_clip() {
+        let s = set(NetworkType::Lora);
+        let named = sorted_named_vars(&s);
+        // A huge gradient on the first factor only (norm ≫ 1 ⇒ the clip scales by ~1e-4).
+        let loss = (named[0].1.as_tensor().sum_all().unwrap() * 1.0e4).unwrap();
+        let mut grads = loss.backward().unwrap();
+        for (_, v) in &named[1..] {
+            grads.insert(v.as_tensor(), v.as_tensor().zeros_like().unwrap());
+        }
+        let cfg = TrainingConfig {
+            gradient_noise_eta: 0.01,
+            ..Default::default()
+        };
+        clip_and_noise_grads(&mut grads, &s, &cfg, 0, 7).unwrap();
+        let rest: Vec<f32> = named[1..]
+            .iter()
+            .flat_map(|(_, v)| {
+                grads
+                    .get(v.as_tensor())
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect();
+        let measured = rms(&rest);
+        assert!(
+            (measured / 0.01 - 1.0).abs() < 0.05,
+            "post-clip noise std {measured}, want 0.01"
+        );
+    }
+
+    fn loss_grads(s: &LoraSet, t: u32) -> GradStore {
+        let named = sorted_named_vars(s);
+        let loss = named
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| {
+                (v.as_tensor().sqr().unwrap().sum_all().unwrap() * (1.0 + i as f64 + t as f64))
+                    .unwrap()
+            })
+            .reduce(|a, b| (a + b).unwrap())
+            .unwrap();
+        loss.backward().unwrap()
+    }
+
+    /// E1: both techniques off ⇒ the shared step is the legacy clip + step, bit for bit; and with
+    /// weight noise on it is the legacy step followed by `apply_weight_noise(.., update_idx)` (noise
+    /// AFTER the step, on the update's own index).
+    ///
+    /// *Mutation that reds this:* weight noise before `opt.step`, or an off-by-one update index.
+    #[test]
+    fn shared_step_matches_legacy_then_weight_noise() {
+        for sigma in [0.0f32, 0.0125] {
+            let cfg = TrainingConfig {
+                weight_noise_sigma: sigma,
+                ..Default::default()
+            };
+            let (a, b) = (set(NetworkType::Lora), set(NetworkType::Lora));
+            let mut oa = TrainOptimizer::from_config("adamw", a.vars.clone(), 1e-2, 0.0).unwrap();
+            let mut ob = TrainOptimizer::from_config("adamw", b.vars.clone(), 1e-2, 0.0).unwrap();
+            for t in 0..3 {
+                let mut ga = loss_grads(&a, t);
+                adapter_optimizer_step(&mut oa, &mut ga, &a, &cfg, t, 42).unwrap();
+                let mut gb = loss_grads(&b, t);
+                clip_grad_norm(&mut gb, &b.vars, 1.0).unwrap();
+                ob.step(&gb).unwrap();
+                apply_weight_noise(&b, sigma, 42, t).unwrap();
+            }
+            assert_eq!(snapshot(&a), snapshot(&b), "sigma {sigma}");
+        }
+    }
+
+    /// Gradient noise reaches the optimizer and reproduces under the same seed (E4).
+    #[test]
+    fn gradient_noise_changes_the_step_reproducibly() {
+        let run = |eta: f32| {
+            let cfg = TrainingConfig {
+                gradient_noise_eta: eta,
+                ..Default::default()
+            };
+            let s = set(NetworkType::Lora);
+            let mut o = TrainOptimizer::from_config("adamw", s.vars.clone(), 1e-2, 0.0).unwrap();
+            for t in 0..2 {
+                let mut g = loss_grads(&s, t);
+                adapter_optimizer_step(&mut o, &mut g, &s, &cfg, t, 9).unwrap();
+            }
+            snapshot(&s)
+        };
+        assert_ne!(run(0.0), run(0.05));
+        assert_eq!(run(0.05), run(0.05));
+    }
+
+    #[test]
+    fn malformed_strengths_are_refused() {
+        let s = set(NetworkType::Lora);
+        assert!(apply_weight_noise(&s, -0.1, 0, 0).is_err());
+        assert!(apply_weight_noise(&s, f32::NAN, 0, 0).is_err());
+        let mut g = zero_grads(&s);
+        assert!(apply_gradient_noise(&mut g, &s, -0.1, 0.55, 0, 0).is_err());
+        assert!(apply_gradient_noise(&mut g, &s, 0.01, -1.0, 0, 0).is_err());
     }
 }

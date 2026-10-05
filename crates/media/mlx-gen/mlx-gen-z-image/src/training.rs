@@ -35,8 +35,8 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, apply_weight_noise, average_grads, build_lokr_targets, build_lora_targets,
-    LoraParams, TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, LoraParams, TrainAdapter,
 };
 // Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
 // unchanged (the host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
@@ -50,7 +50,6 @@ use mlx_gen::{
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{multiply, subtract};
-use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -115,9 +114,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        // sc-24826 (epic 2123): honors `weight_noise_sigma` — `apply_weight_noise` after every
-        // optimizer update.
-        techniques: gen_core::train::TrainingTechniques { weight_noise: true },
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the shared adapter optimizer
+        // update (`adapter_optimizer_update`).
+        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
     }
 }
 
@@ -680,13 +679,13 @@ impl ZImageTurboTrainer {
     }
 }
 
-/// One real optimizer update over the (already window-averaged) adapter gradients: clip to unit
-/// global norm, step the optimizer, materialize the factors, then — epic 2123 weight noising
-/// (sc-24826) — perturb the freshly-stepped adapter factors by `cfg.weight_noise_sigma · rms(w)`
-/// noise seeded from `(cfg.seed, update_idx)`. Only ever called once per *update* (never per
-/// gradient-accumulation micro-step), and only `params` (adapter factors) is touched — the frozen
-/// base weights live in the transformer and are not reachable from here. At `sigma == 0` this is
-/// exactly the pre-sc-24826 update (clip → step → eval).
+/// One real optimizer update over the (already window-averaged) adapter gradients — the shared
+/// [`adapter_optimizer_update`]: clip to unit global norm, epic 2123 gradient noise (sc-24827),
+/// step the optimizer, materialize the factors, then weight noising (sc-24826), both seeded from
+/// `(cfg.seed, update_idx)`. Only ever called once per *update* (never per gradient-accumulation
+/// micro-step), and only `params` (adapter factors) is touched — the frozen base weights live in
+/// the transformer and are not reachable from here. With both techniques off this is exactly the
+/// pre-epic-2123 update (clip → step → eval).
 fn optimizer_update(
     opt: &mut TrainOptimizer,
     params: &mut LoraParams,
@@ -694,15 +693,7 @@ fn optimizer_update(
     cfg: &TrainingConfig,
     update_idx: u32,
 ) -> Result<()> {
-    let (clipped, _norm) = clip_grad_norm(avg_grads, 1.0)?;
-    let clipped: LoraParams = clipped
-        .into_iter()
-        .map(|(k, v)| (k, v.into_owned()))
-        .collect();
-    opt.step(params, &clipped)?;
-    eval(params.values())?;
-    apply_weight_noise(params, cfg.weight_noise_sigma, cfg.seed, update_idx)?;
-    Ok(())
+    adapter_optimizer_update(opt, params, avg_grads, cfg, update_idx, cfg.seed)
 }
 
 /// Projected DENSE (non-block-checkpointed) first-step peak memory, in GB, as a function of the
@@ -1670,6 +1661,7 @@ mod validate_request_tests {
 mod weight_noise_update_tests {
     use super::*;
     use mlx_gen::adapters::AdaptableLinear;
+    use mlx_rs::optimizers::clip_grad_norm;
 
     struct OneLin(AdaptableLinear);
     impl AdaptableHost for OneLin {
