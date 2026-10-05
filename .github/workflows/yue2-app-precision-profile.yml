@@ -225,9 +225,9 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 480
     env:
-      APP_RUN_ROOT: /Volumes/Models/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}
-      APP_EVIDENCE: /Volumes/Models/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/evidence
-      CARGO_TARGET_DIR: /Volumes/Models/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/target
+      APP_RUN_ROOT: /Users/MTrefry/actions-runner-nax/_work/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}
+      APP_EVIDENCE: /Users/MTrefry/actions-runner-nax/_work/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/evidence
+      CARGO_TARGET_DIR: /Users/MTrefry/actions-runner-nax/_work/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/target
     steps:
       - name: Assert designated runner, exact dispatch, and fresh path before provisioning
         id: run-root
@@ -245,10 +245,11 @@ jobs:
           [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_APP_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$EXPECTED_CONTROL_SHA" = "$GITHUB_SHA"
-          test -d /Volumes/Models
+          test "$GITHUB_WORKSPACE" = /Users/MTrefry/actions-runner-nax/_work/inference/inference
+          test -d /Users/MTrefry/actions-runner-nax/_work
           test ! -e "$APP_RUN_ROOT"
           mkdir -p "$APP_EVIDENCE"
-          { hostname; sw_vers; sysctl hw.memsize; df -h /Volumes/Models; } > "$APP_EVIDENCE/hardware-before.txt"
+          { hostname; sw_vers; sysctl hw.memsize; df -h "$APP_RUN_ROOT"; } > "$APP_EVIDENCE/hardware-before.txt"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           path: control
