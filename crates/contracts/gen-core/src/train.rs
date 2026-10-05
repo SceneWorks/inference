@@ -22,7 +22,10 @@ pub mod subject_mask;
 
 use std::path::PathBuf;
 
-pub use aux_schedule::{combine_step_terms, plan_step, AuxAlternation, StepPlan};
+pub use aux_schedule::{
+    combine_step_terms, perceptual_footprint_bytes, plan_step, AuxAlternation, AuxModelFootprint,
+    StepPlan,
+};
 pub use schedule::LrSchedule;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -363,6 +366,18 @@ impl Default for AuxLossSchedule {
     fn default() -> Self {
         Self::OFF
     }
+}
+
+/// Which E-LatentLPIPS weight set matches a trainer's latent space (epic 2123, the latent
+/// perceptual loss): the trainer names its family in the aux-loss builder context; `None` there
+/// means no E-LatentLPIPS weights exist for that latent space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatentLpipsFamily {
+    Sd15,
+    Sd21,
+    Sdxl,
+    Sd3,
+    Flux,
 }
 
 /// Which Depth-Anything-V2 checkpoint depth anchoring runs (all three share one module graph).

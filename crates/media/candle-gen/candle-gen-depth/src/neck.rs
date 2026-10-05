@@ -67,12 +67,12 @@ impl ReassembleLayer {
     }
 
     /// `hidden`: a captured backbone state `[B, grid²+1, hidden]` → an NHWC feature map.
-    fn forward(&self, hidden: &Tensor, grid: usize, hidden_dim: usize) -> Result<Tensor> {
-        // Drop CLS (index 0), reshape patch tokens to [B, grid, grid, hidden] (NHWC).
+    fn forward(&self, hidden: &Tensor, grid: (usize, usize), hidden_dim: usize) -> Result<Tensor> {
+        // Drop CLS (index 0), reshape patch tokens to [B, rows, cols, hidden] (NHWC).
         let b = hidden.dim(0)?;
         let n = hidden.dim(1)?;
         let patches = hidden.narrow(1, 1, n - 1)?;
-        let map = patches.reshape((b, grid, grid, hidden_dim))?;
+        let map = patches.reshape((b, grid.0, grid.1, hidden_dim))?;
         // 1×1 projection.
         let map = conv2d_nhwc(&map, &self.proj_w, Some(&self.proj_b), 1, 0)?;
         match &self.resize {
@@ -190,7 +190,7 @@ impl DptNeck {
     pub fn forward(
         &self,
         hidden_states: &[Tensor],
-        grid: usize,
+        grid: (usize, usize),
         hidden_dim: usize,
     ) -> Result<Tensor> {
         // Reassemble + project each level (shallow→deep order).

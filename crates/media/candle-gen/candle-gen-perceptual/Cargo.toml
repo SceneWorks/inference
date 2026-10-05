@@ -1,0 +1,19 @@
+[package]
+name = "candle-gen-perceptual"
+version = "0.0.0"
+edition = "2021"
+description = "The shared auxiliary perceptual-loss builder for the candle-gen trainers (epic 2123): one TrainingConfig -> PerceptualPath seam every trainer calls; each loss (depth anchoring, identity, body, latent losses) is one arm."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+candle-gen-depth = { path = "../candle-gen-depth" }
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-gen-depth/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-depth/cuda"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

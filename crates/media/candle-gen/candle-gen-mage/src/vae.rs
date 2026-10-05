@@ -125,6 +125,22 @@ impl Resnet {
     }
 }
 
+/// The attention softmax: candle's fused `softmax_last_dim` for inference, or the composable
+/// `softmax` (which has a backward) when the decode is differentiated (epic 2123 depth anchoring,
+/// sc-24830 — the fused op is `apply_op1_no_bwd`, so the gradient would silently stop there).
+type SoftmaxFn = fn(&Tensor) -> Result<Tensor>;
+
+fn fused_softmax(t: &Tensor) -> Result<Tensor> {
+    candle_nn::ops::softmax_last_dim(t)
+}
+
+fn composable_softmax(t: &Tensor) -> Result<Tensor> {
+    candle_nn::ops::softmax(t, D::Minus1)
+}
+
+/// The softmax [`MageVae::decode_differentiable`] runs.
+const DIFFERENTIABLE_SOFTMAX: SoftmaxFn = composable_softmax;
+
 struct LocalAttention {
     norm: AffineNorm,
     q: Conv2d,
@@ -150,7 +166,7 @@ impl LocalAttention {
         Tensor::from_vec(ids, padded, device)
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, softmax: SoftmaxFn) -> Result<Tensor> {
         let (_, c, h, w) = x.dims4()?;
         let norm = self.norm.group(x)?;
         let hi = Self::padded_index(h, 32, x.device())?;
@@ -174,7 +190,7 @@ impl LocalAttention {
             &v,
             (c as f64).powf(-0.5),
             None,
-            candle_nn::ops::softmax_last_dim,
+            softmax,
             candle_gen::ATTN_SCORES_BUDGET,
         )?;
         let hp = h.div_ceil(32) * 32;
@@ -214,11 +230,11 @@ impl CodDecoder {
             output: conv(w, &format!("{p}.conv_out"), 1, 1, 1, true)?,
         })
     }
-    fn forward(&self, z: &Tensor) -> Result<Tensor> {
+    fn forward(&self, z: &Tensor, softmax: SoftmaxFn) -> Result<Tensor> {
         let h = self.r0.forward(&self.input.forward(z)?)?;
-        let h = self.a0.forward(&h)?;
+        let h = self.a0.forward(&h, softmax)?;
         let h = self.r1.forward(&h)?;
-        let h = self.a1.forward(&h)?;
+        let h = self.a1.forward(&h, softmax)?;
         let h = self.r2.forward(&h)?;
         self.output.forward(&self.norm.group(&h)?.silu()?)
     }
@@ -481,6 +497,17 @@ impl MageVae {
         Self::load_inner(dir, device, true, dtype)
     }
 
+    /// The decoder half only, at `dtype` (no `student.dconv_encoder.*` encoder) — what the
+    /// depth-anchoring x0 decoder needs (sc-24830).
+    pub fn load_dtype(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        Self::load_inner(dir, device, false, dtype)
+    }
+
+    /// Whether the encoder half is loaded.
+    pub fn has_encoder(&self) -> bool {
+        self.encoder.is_some()
+    }
+
     fn load_inner(dir: &Path, device: &Device, with_encoder: bool, dtype: DType) -> Result<Self> {
         let w = Weights::from_dir(dir, device, dtype)?;
         let mut blocks = Vec::with_capacity(21);
@@ -550,11 +577,22 @@ impl MageVae {
 
     /// `[B,128,h,w]` raw latent -> `[B,3,h*16,w*16]` raw RGB in `[-1,1]`.
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
+        self.decode_with(latent, fused_softmax)
+    }
+
+    /// [`decode`](Self::decode) with every op differentiable (the composable attention softmax), for
+    /// the depth-anchoring training loss (epic 2123, sc-24830): the gradient flows from the pixels
+    /// back to `latent`. Same values as `decode` up to softmax rounding.
+    pub fn decode_differentiable(&self, latent: &Tensor) -> Result<Tensor> {
+        self.decode_with(latent, DIFFERENTIABLE_SOFTMAX)
+    }
+
+    fn decode_with(&self, latent: &Tensor, softmax: SoftmaxFn) -> Result<Tensor> {
         let (b, c, h, w) = latent.dims4()?;
         if c != LATENT_CHANNELS {
             candle_core::bail!("mage vae: expected 128 latent channels, got {c}")
         }
-        let cond = self.cod.forward(&latent.to_dtype(self.dtype)?)?;
+        let cond = self.cod.forward(&latent.to_dtype(self.dtype)?, softmax)?;
         let zeros = Tensor::zeros(
             (b, 3, h * VAE_DOWNSAMPLE, w * VAE_DOWNSAMPLE),
             self.dtype,
@@ -613,6 +651,91 @@ impl MageVae {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rand(shape: &[usize], seed: u64) -> Tensor {
+        let n: usize = shape.iter().product();
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32) / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+    }
+
+    fn tiny_attention(c: usize) -> LocalAttention {
+        let conv1 = |seed| {
+            Conv2d::new(
+                rand(&[c, c, 1, 1], seed),
+                Some(rand(&[c], seed + 1)),
+                Conv2dConfig::default(),
+            )
+        };
+        LocalAttention {
+            norm: AffineNorm {
+                weight: Tensor::ones(c, DType::F32, &Device::Cpu).unwrap(),
+                bias: rand(&[c], 3),
+            },
+            q: conv1(10),
+            k: conv1(20),
+            v: conv1(30),
+            out: conv1(40),
+        }
+    }
+
+    /// sc-24830: the differentiable decode's attention softmax matches the fused forward and its
+    /// autograd gradient is the true gradient (a central finite difference along a random
+    /// direction agrees). Mutation: set `DIFFERENTIABLE_SOFTMAX = fused_softmax` (no backward) ⇒
+    /// the probability path drops out of the gradient ⇒ the directional derivatives disagree ⇒ red.
+    #[test]
+    fn differentiable_attention_matches_fused_and_has_the_true_gradient() {
+        let attn = tiny_attention(32);
+        let x = rand(&[1, 32, 3, 5], 7);
+        let fused = attn.forward(&x, fused_softmax).unwrap();
+        let comp = attn.forward(&x, DIFFERENTIABLE_SOFTMAX).unwrap();
+        let d = (&fused - &comp)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(d < 1e-5, "{d}");
+        let loss = |t: &Tensor| -> Tensor {
+            attn.forward(t, DIFFERENTIABLE_SOFTMAX)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+        };
+        let v = candle_core::Var::from_tensor(&x).unwrap();
+        let g = loss(v.as_tensor()).backward().unwrap();
+        let g = g.get(v.as_tensor()).unwrap().clone();
+        let dir = rand(&[1, 32, 3, 5], 99);
+        let analytic = (&g * &dir)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap() as f64;
+        let eps = 1e-2;
+        let plus = loss(&(&x + (&dir * eps).unwrap()).unwrap())
+            .to_scalar::<f32>()
+            .unwrap() as f64;
+        let minus = loss(&(&x - (&dir * eps).unwrap()).unwrap())
+            .to_scalar::<f32>()
+            .unwrap() as f64;
+        let numeric = (plus - minus) / (2.0 * eps);
+        assert!(
+            (analytic - numeric).abs() <= 2e-2 * numeric.abs().max(1e-3),
+            "analytic {analytic} vs numeric {numeric}"
+        );
+    }
 
     #[test]
     fn dct_uses_inclusive_zero_to_eight_frequency_ramp() {
