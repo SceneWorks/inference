@@ -775,13 +775,14 @@ fn aux_loss_context() -> mlx_gen_perceptual::AuxLossContext<'static> {
     mlx_gen_perceptual::AuxLossContext {
         label: "z_image_turbo trainer",
         decoder: taef1_decoder(),
+        latent_lpips: Some(gen_core::train::LatentLpipsFamily::Flux),
     }
 }
 
 fn taef1_decoder() -> mlx_gen_perceptual::DecoderSpec {
     mlx_gen_perceptual::DecoderSpec::Tiny {
         name: "TAEF1",
-        config: TinyDecoderConfig::taef1(),
+        config: TinyDecoderConfig::taef1().into(),
     }
 }
 

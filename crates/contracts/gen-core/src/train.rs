@@ -464,6 +464,18 @@ impl Default for AuxLossSchedule {
     }
 }
 
+/// Which E-LatentLPIPS weight set matches a trainer's latent space (epic 2123, the latent
+/// perceptual loss): the trainer names its family in the aux-loss builder context; `None` there
+/// means no E-LatentLPIPS weights exist for that latent space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatentLpipsFamily {
+    Sd15,
+    Sd21,
+    Sdxl,
+    Sd3,
+    Flux,
+}
+
 /// Which Depth-Anything-V2 checkpoint depth anchoring runs (all three share one module graph).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DepthModelSize {
