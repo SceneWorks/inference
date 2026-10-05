@@ -47,9 +47,14 @@ fn env_value_enables(v: &str) -> bool {
     !matches!(v, "0" | "off" | "false" | "no" | "cublaslt")
 }
 
-/// The NVFP4 decode-GEMV switch (on unless the environment turns it off), on the crate's one
-/// switch implementation, [`ProcessSwitch`].
-static SWITCH: ProcessSwitch = ProcessSwitch::new(NVFP4_GEMV_ENV, true, env_value_enables);
+/// The NVFP4 decode-GEMV switch, on the crate's one switch implementation, [`ProcessSwitch`]:
+/// unset, the Candle CUDA row of the defaults table ([`core_llm::defaults::CANDLE_CUDA`]) — NVFP4
+/// is a CUDA format.
+static SWITCH: ProcessSwitch = ProcessSwitch::new(
+    NVFP4_GEMV_ENV,
+    core_llm::defaults::CANDLE_CUDA.nvfp4_gemv,
+    env_value_enables,
+);
 
 /// Whether the fused GEMV may be tried for decode-sized NVFP4 projections.
 pub fn nvfp4_gemv_enabled() -> bool {

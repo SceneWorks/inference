@@ -199,7 +199,10 @@ impl VisionBlock {
     }
 
     fn mlp(&self, x: &Array) -> Result<Array> {
-        let h = gelu_tanh(&linear(x, &self.fc1_w, self.fc1_b.as_ref())?)?;
+        let h = gelu_tanh(
+            &linear(x, &self.fc1_w, self.fc1_b.as_ref())?,
+            crate::primitives::activation::ActivationRole::VisionEncoder,
+        )?;
         linear(&h, &self.fc2_w, self.fc2_b.as_ref())
     }
 }
@@ -336,6 +339,9 @@ impl Qwen35VisionModel {
             cfg,
         };
         w.verify_accessed_gpu_view()?;
+        // The patch kernel is the tower's one derived array (a channels-last kernel is
+        // transposed into a contiguous copy); it exists before a request needs it (sc-24446).
+        model.patch_embed.weight.eval()?;
         Ok(model)
     }
 

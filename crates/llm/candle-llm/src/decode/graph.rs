@@ -8,12 +8,14 @@
 //! position only when every per-step position its kernels read is **device data** (staged by
 //! [`DecodeCache::stage_positions`]) and its state lives at **stable addresses** (a static KV
 //! cache, and — since sc-24131 — the per-token DeltaNet checkpoint ring, whose live state is a view
-//! of a preallocated slot written in place). No Qwen3.5/3.8 step meets that on this revision —
-//! `Qwen35Model` keeps its positions as Rust-side scalars and declares so
-//! ([`StepModel::graph_support`] → `positions_host_scalar`); a ring-less hybrid cache still
-//! replaces its DeltaNet state per step (`deltanet_state_unstable`) — so the runner refuses those
-//! steps by name before any capture. The synthetic step model in the CUDA tests below meets it,
-//! and is what proves the runner end to end.
+//! of a preallocated slot written in place). Since sc-24441 the production decoders meet it: a
+//! static cache built with device positions ([`DevicePositions`](crate::primitives::DevicePositions),
+//! the CUDA default) stages the step start, the RoPE positions and the DeltaNet ring slots on the
+//! device, and the dense `CausalLm` / `Qwen35Model` steps read them there (the KV write, the
+//! length-aware decode attention, the ring reads and writes). What still refuses by name before
+//! any capture: a Mixture-of-Experts router that reads the host (`moe_router_host_read`), a
+//! ring-less hybrid cache that replaces its DeltaNet state per step (`deltanet_state_unstable`), a
+//! cache or model without device positions (`positions_host_scalar`).
 //!
 //! ## What a captured step is
 //! Stream capture records every launch, memcpy and stream-ordered allocation the step issues
@@ -28,23 +30,25 @@
 //! step's outputs are copied into preallocated staging tensors inside the capture so nothing
 //! the step allocated outlives it.
 //!
-//! ## The POC finding: candle uploads layout metadata per op
+//! ## Layout metadata: the parameter cache
 //! Every candle CUDA op whose kernel takes a layout — `index_select` (the embedding lookup),
 //! reductions, `where_cond`, comparisons, gathers / scatters, any unary / binary / copy op on a
 //! **non-contiguous** operand (a transpose, a broadcast, a narrow that is then made contiguous)
-//! — uploads its `[dims, strides]` from a transient host `Vec` (`SlicePtrOrNull::params_from_layout`
-//! / `CudaDevice::clone_htod` in `cuda_backend/mod.rs`) with a pageable `cuMemcpyHtoDAsync`.
-//! Inside a capture the driver records that as a memcpy node that re-reads the host address on
-//! every launch — an address freed the moment the op returned — so a replay copies whatever the
-//! heap holds by then into the kernel's layout buffer (an illegal address, or silently wrong
-//! indexing). The runner therefore takes a **census** of every captured graph before it is
-//! instantiated ([`GraphCensus`]) and refuses one with a host-sourced memcpy node
-//! ([`REASON_HOST_UPLOAD_IN_CAPTURE`]). A Qwen3.5/3.8 step recorded with the evidence-only
-//! `census_step` shows exactly that on this candle revision (the runner itself never records
-//! one: the declarations above refuse it first). What would fix it in candle: pass layouts by
-//! value as kernel parameters (or cache the `[dims, strides]` device buffers per layout) so no
-//! per-op host upload exists. Until then only a step built from contiguous-only ops, cuBLAS
-//! matmuls, `copy2d` (`slice_set`) and the nvrtc-seam kernels (scalar arguments) is replayable.
+//! — uploads its `[dims, strides]` from a transient host `Vec` with a pageable
+//! `cuMemcpyHtoDAsync`. Inside a capture the driver records that as a memcpy node that re-reads
+//! the host address on every launch — an address freed the moment the op returned — so a replay
+//! would copy whatever the heap holds by then into the kernel's layout buffer (the sc-24134 POC
+//! finding). The workspace's vendored candle-core carries upstream's parameter cache (#3564 +
+//! #3598, `crates/media/candle-gen/vendor/candle-core/VENDORED.md`): while a
+//! `CudaDevice::enable_cuda_graph_htod_cache` guard is alive, each distinct parameter vector is
+//! uploaded once into a device buffer that is reused, and any host<->device copy the cache does
+//! not cover **fails** during capture instead of recording a broken node. The runner holds the
+//! guard over a shape's eager warm-up (which fills the cache — a step's layouts depend on its
+//! shape, never its position) and over its capture step. It still takes a **census** of every
+//! captured graph before instantiating it ([`GraphCensus`]) and refuses one with a host-sourced
+//! memcpy node ([`REASON_HOST_UPLOAD_IN_CAPTURE`]); a copy the guard refused during capture is
+//! named the same way ([`REASON_HOST_UPLOAD_IN_CAPTURE`] / [`REASON_HOST_READ_IN_CAPTURE`]).
+//! Outside the guard candle's eager behaviour is unchanged.
 //!
 //! ## Verification before trust
 //! A graph is only ever used after two bit-exact self-checks, at the capture step and at the
@@ -71,9 +75,9 @@
 //! then neither the graph's state nor the eager one can be trusted.
 //!
 //! ## Switch and accounting
-//! `CANDLE_LLM_CUDA_GRAPHS` (`1` / `on` / `true` / `yes` enable; the default is **off** —
-//! opt-in until a capturable step model exists and the decode bench shows a win, see the
-//! story's evidence) or [`set_cuda_graphs`] at runtime; a load's own `LoadSpec::cuda_graphs`
+//! `CANDLE_LLM_CUDA_GRAPHS` (`1` / `on` / `true` / `yes` enable; unset, the device's row of the
+//! defaults table: [`CUDA_GRAPHS_DEFAULT`] on CUDA, off on Metal and the CPU —
+//! [`cuda_graphs_default_for`]) or [`set_cuda_graphs`] at runtime; a load's own `LoadSpec::cuda_graphs`
 //! overrides both for that model — its load (the stream it lands on) and every generation on it
 //! ([`cuda_graphs_scope`], sc-24139). Admission prices graph memory up front with
 //! [`graph_workspace_admission_bytes`] (E6); [`GraphRunner::workspace`] reports what a runner
@@ -96,9 +100,17 @@ use crate::primitives::attention::AttnFormulation;
 use crate::primitives::decode_cache::DecodeCache;
 use crate::primitives::switch::{ProcessSwitch, SwitchGuard};
 
-/// Environment switch: `1` / `on` / `true` / `yes` enable the graph runner; anything else (and
-/// unset) leaves it off.
+/// Environment switch: `1` / `on` / `true` / `yes` enable the graph runner; anything else leaves
+/// it off, and unset — or blank, as `CANDLE_LLM_CUDA_STREAM` reads a blank value — leaves the
+/// device's default ([`cuda_graphs_default_for`]).
 pub const CUDA_GRAPHS_ENV: &str = "CANDLE_LLM_CUDA_GRAPHS";
+
+/// **The Candle CUDA-graph default** (epic sc-24432 E5): whether the runner captures when neither
+/// [`CUDA_GRAPHS_ENV`], [`set_cuda_graphs`] nor a load's `LoadSpec::cuda_graphs` says otherwise —
+/// read from the per-backend defaults table ([`core_llm::defaults::CANDLE_CUDA`]), where the
+/// value and its justification live (on, measured by the sc-24446 campaign). It is the CUDA
+/// device's default; Metal and the CPU take their own rows (off: no graph runner there).
+pub const CUDA_GRAPHS_DEFAULT: bool = core_llm::defaults::CANDLE_CUDA.cuda_graphs;
 
 /// Fallback reason: the switch is off.
 pub const REASON_DISABLED: &str = "disabled";
@@ -165,9 +177,11 @@ fn env_value_enables(v: &str) -> bool {
     matches!(v, "1" | "on" | "true" | "yes")
 }
 
-/// The process CUDA-graph switch (off unless the environment turns it on), on the crate's one
-/// switch implementation, [`ProcessSwitch`].
-static SWITCH: ProcessSwitch = ProcessSwitch::new(CUDA_GRAPHS_ENV, false, env_value_enables);
+/// The process CUDA-graph switch, on the crate's one switch implementation, [`ProcessSwitch`]. Its
+/// unset state is per device ([`cuda_graphs_default_for`]), so it is read through
+/// [`ProcessSwitch::explicit`].
+static SWITCH: ProcessSwitch =
+    ProcessSwitch::new_blank_unset(CUDA_GRAPHS_ENV, CUDA_GRAPHS_DEFAULT, env_value_enables);
 
 thread_local! {
     /// The thread-scoped switch ([`cuda_graphs_scope`]); `None` defers to the process switch.
@@ -179,10 +193,42 @@ thread_local! {
 /// scoped over its load and each of its generations by [`cuda_graphs_scope`] — wins over the
 /// process switch ([`set_cuda_graphs`] / [`CUDA_GRAPHS_ENV`]).
 pub fn cuda_graphs_enabled() -> bool {
+    cuda_graphs_default_for(crate::device::selected_device_is_cuda())
+}
+
+/// [`cuda_graphs_enabled`] for a load on a CUDA device (`cuda`) or not, without opening one (a
+/// load estimate knows no more): the thread's scoped policy, else what the process asked for
+/// ([`set_cuda_graphs`], else [`CUDA_GRAPHS_ENV`]), else that device's row of the defaults table —
+/// [`CUDA_GRAPHS_DEFAULT`] on CUDA, off on Metal and the CPU, where no graph runner exists — and
+/// off on a CUDA build that can never capture: a `flash-attn` build or
+/// `CANDLE_LLM_CUDA_STREAM=legacy` (both pin the legacy stream). A default left on there would
+/// only price graph memory and name a refusal on every load.
+pub fn cuda_graphs_default_for(cuda: bool) -> bool {
     if let Some(enabled) = REQUEST_POLICY.with(Cell::get) {
         return enabled;
     }
-    SWITCH.enabled()
+    SWITCH.explicit().unwrap_or_else(|| {
+        unset_default(
+            cuda,
+            cfg!(feature = "flash-attn"),
+            crate::device::stream_env_value(),
+        )
+    })
+}
+
+/// The switch's unset state for a `cuda` load in a build with (`flash_attn`) or without
+/// candle-flash-attn, under the raw `CANDLE_LLM_CUDA_STREAM` value `stream_env`: the device's row
+/// of the defaults table unless the load is pinned to the legacy stream, which no capture runs on.
+fn unset_default(cuda: bool, flash_attn: bool, stream_env: Option<&str>) -> bool {
+    let legacy = matches!(
+        crate::device::CudaStreamKind::parse(stream_env),
+        Ok(Some(crate::device::CudaStreamKind::Legacy))
+    );
+    !flash_attn
+        && !legacy
+        && crate::device::decode_backend_for(cuda)
+            .defaults()
+            .cuda_graphs
 }
 
 /// Override the switch for the process: `Some(true)` / `Some(false)` force it, `None` returns to
@@ -283,6 +329,19 @@ impl GraphTally {
             } else {
                 None
             },
+        }
+    }
+
+    /// The graph path a request's steps took (E3, sc-24441), for
+    /// [`DecodeReport::graph_path`](core_llm::DecodeReport::graph_path): `captured` when a
+    /// captured, verified graph served at least one step (the rest — warm-up, self-checks,
+    /// prefills — ran eager), `eager` when steps went through the runner but none replayed (the
+    /// fallback reason says why), `none` when no step went through the runner.
+    pub fn graph_path(&self) -> &'static str {
+        match (self.replayed, self.eager) {
+            (0, 0) => "none",
+            (0, _) => "eager",
+            _ => "captured",
         }
     }
 
@@ -417,15 +476,54 @@ impl GraphWorkspace {
 /// costs its own copy of one step's working set: the projections, MLP intermediates and residuals
 /// (`M · (3·intermediate + 8·hidden + vocab)`), the attention scores / weights over every position
 /// the request can reach (`3 · M · query_heads · total_positions`), plus the runner's staging
-/// tensors (ids, all-position logits, hidden rows). The speculative engine can present
+/// tensors (ids, all-position logits, hidden rows). On the device-positions path (sc-24441) a
+/// step's attention is the length-aware decode attention, whose partial-softmax workspace is sized
+/// to the cache capacity — `(head_dim + 2)` f32 per query head and key chunk
+/// ([`candle_quant_kernels::decode_attention_workspace_bytes`]) — so that is priced per token-row
+/// too. (The vendored candle's parameter cache the captures fill is **not** a request's: it
+/// outlives every request and the model itself, so a load prices it once —
+/// [`graph_param_cache_load_bytes`].) The speculative engine can present
 /// `max_step_tokens` token counts (`1 ..= K + 1`: the verify and every replay length) in two logits
-/// scopes each, so every one is priced. `None` on overflow (the caller fails closed).
+/// scopes each, so every one is priced. A request whose steps ask for hidden rows (MTP) presents
+/// one shape outside that set once `auto` demotes it (sc-24446): the plain one-token step without
+/// hidden rows — [`graph_demoted_step_admission_bytes`], which the caller adds for such a route.
+/// `None` on overflow (the caller fails closed).
 pub fn graph_workspace_admission_bytes(
     geometry: &core_llm::LlmMemoryGeometry,
     total_positions: u64,
     max_step_tokens: u32,
 ) -> Option<u64> {
+    // Σ_{M=1}^{N} M = N (N + 1) / 2 token-rows, in two scopes.
+    let n = u64::from(max_step_tokens);
+    let rows = n.checked_mul(n.checked_add(1)?)? / 2;
+    graph_token_row_bytes(geometry, total_positions)?
+        .checked_mul(rows)?
+        .checked_mul(2)
+}
+
+/// The graph a demoted MTP request may add (sc-24446): its steps ask for hidden rows, so the
+/// shape key of every step [`graph_workspace_admission_bytes`] priced carries `want_hidden`, and
+/// the plain one-token step it takes after `auto` demotes it — `(1 token, all-position logits, no
+/// hidden rows)` — is one more captured shape: one token-row. `None` on overflow.
+pub fn graph_demoted_step_admission_bytes(
+    geometry: &core_llm::LlmMemoryGeometry,
+    total_positions: u64,
+) -> Option<u64> {
+    graph_token_row_bytes(geometry, total_positions)
+}
+
+/// One captured token-row's working set (see [`graph_workspace_admission_bytes`]).
+fn graph_token_row_bytes(
+    geometry: &core_llm::LlmMemoryGeometry,
+    total_positions: u64,
+) -> Option<u64> {
     let e = geometry.element_bytes;
+    let chunk = candle_quant_kernels::DECODE_ATTN_CHUNK as u64;
+    let decode_attention = geometry
+        .query_heads
+        .checked_mul(total_positions.div_ceil(chunk))?
+        .checked_mul(geometry.head_dim.checked_add(2)?)?
+        .checked_mul(4)?;
     let per_token = geometry
         .intermediate_size
         .checked_mul(3)?
@@ -439,6 +537,7 @@ pub fn graph_workspace_admission_bytes(
                 .checked_mul(e)?
                 .checked_mul(3)?,
         )?
+        .checked_add(decode_attention)?
         // Staging: the id, a logits row and a hidden row per token.
         .checked_add(4)?
         .checked_add(
@@ -447,10 +546,42 @@ pub fn graph_workspace_admission_bytes(
                 .checked_add(geometry.hidden_size)?
                 .checked_mul(e)?,
         )?;
-    // Σ_{M=1}^{N} M = N (N + 1) / 2 token-rows, in two scopes.
-    let n = u64::from(max_step_tokens);
-    let rows = n.checked_mul(n.checked_add(1)?)? / 2;
-    per_token.checked_mul(rows)?.checked_mul(2)
+    Some(per_token)
+}
+
+/// What a load charges per step shape its graph runner may capture for the vendored candle's
+/// CUDA parameter cache (sc-24441, E7): the `[dims, strides]` vectors of every distinct layout a
+/// shape's step uses are uploaded once, under the runner's guard, into small device buffers. A
+/// decoder step has a few hundred distinct layouts at most (they repeat across layers — the cache
+/// is keyed by value), each a few dozen bytes in a stream-ordered-pool allocation; 1 MiB per shape
+/// covers ~2000 such entries at a 512-byte allocation granularity, which also absorbs the layout
+/// variants of different verify depths. The small-upload content cache the same guard enables
+/// (positions, token ids: at most 4 KiB each, a handful per warm-up) fits in the same allowance.
+///
+/// **Resident for the process.** The cache is a process-global map keyed by the candle device
+/// (`CUDA_PARAM_CACHE` in the vendored `cuda_backend/mod.rs`) with no eviction and no public way
+/// to clear it: every entry holds its device buffer — and through it the load's CUDA stream — past
+/// the model's unload, and each load opens a new device, so a later load of the same model does
+/// not reuse the earlier one's entries. It is therefore priced **per load**
+/// ([`graph_param_cache_load_bytes`]), never per request; what earlier loads left behind is
+/// already in use when a later load or request reads the device's free memory. See the vendored
+/// crate's `VENDORED.md`.
+pub const PARAM_CACHE_ADMISSION_BYTES: u64 = 1 << 20;
+
+/// Device bytes a load whose decoder the graph runner wraps leaves resident in the vendored
+/// candle's parameter cache (sc-24441, E7): [`PARAM_CACHE_ADMISSION_BYTES`] for every step shape
+/// the runner can capture — each token count up to
+/// [`MAX_DEVICE_STEP_TOKENS`](crate::primitives::MAX_DEVICE_STEP_TOKENS) (the runner's
+/// [`GraphRunner::MAX_CAPTURED_TOKENS`]) in both logits scopes, and, when the load can run steps
+/// that ask for hidden rows (`want_hidden`: an MTP head, native or companion), each of those again
+/// with hidden rows — the runner keys a shape on `want_hidden` too (`ShapeKey`), and a
+/// hidden-row step stages a hidden output the plain one does not (sc-24446).
+pub fn graph_param_cache_load_bytes(want_hidden: bool) -> u64 {
+    let hidden_variants = if want_hidden { 2 } else { 1 };
+    crate::primitives::MAX_DEVICE_STEP_TOKENS as u64
+        * 2
+        * hidden_variants
+        * PARAM_CACHE_ADMISSION_BYTES
 }
 
 /// What a captured graph is made of — the node census the runner takes before instantiating it,
@@ -617,34 +748,31 @@ impl<'m, M: StepModel> GraphRunner<'m, M> {
     }
 
     /// Why this runner cannot capture on `cache` at all (checked before any capture, E5), or
-    /// `None` when it can.
+    /// `None` when it can: the device and build first ([`device_refusal`]), then the context's
+    /// event tracking, the cache's declaration and the model's.
     fn capability_refusal(&self, cache: &M::Cache) -> Option<&'static str> {
         if !cuda_graphs_enabled() {
             return Some(REASON_DISABLED);
         }
+        if let Some(reason) = device_refusal(self.model.device()) {
+            return Some(reason);
+        }
         #[cfg(not(feature = "cuda"))]
         {
+            // `device_refusal` refuses every device in a build without CUDA.
             let _ = cache;
             Some(REASON_CUDA_FEATURE_OFF)
         }
         #[cfg(feature = "cuda")]
         {
-            let Device::Cuda(dev) = self.model.device() else {
-                return Some(REASON_NOT_CUDA);
-            };
-            if cfg!(feature = "flash-attn") {
-                return Some(REASON_FLASH_ATTN_STREAM);
-            }
-            let stream = dev.cuda_stream();
-            if stream.cu_stream().is_null() {
-                return Some(REASON_LEGACY_STREAM);
-            }
-            let ctx = stream.context();
-            if !ctx.has_async_alloc() {
-                return Some(REASON_NO_ASYNC_ALLOC);
-            }
-            if ctx.is_managing_stream_synchronization() {
-                return Some(REASON_EVENT_TRACKING);
+            if let Device::Cuda(dev) = self.model.device() {
+                if dev
+                    .cuda_stream()
+                    .context()
+                    .is_managing_stream_synchronization()
+                {
+                    return Some(REASON_EVENT_TRACKING);
+                }
             }
             // The cache's declaration first: it names the state a cache change lifts (a
             // ring-less DeltaNet cache's replaced state, a growing KV), the gate ahead of the
@@ -657,6 +785,38 @@ impl<'m, M: StepModel> GraphRunner<'m, M> {
             }
             None
         }
+    }
+}
+
+/// Why no step on `device` can ever be captured in this build — the device-and-build half of the
+/// runner's capability check, settled before any capture and known at load (sc-24441, E3):
+/// `cuda_feature_off` (a build without CUDA), `not_cuda` (a CPU or Metal device), and on CUDA
+/// `flash_attn_stream` (a flash-attn build keeps every model on the legacy stream),
+/// `legacy_stream` (the device runs on the legacy stream) or `no_async_alloc` (no
+/// stream-ordered allocator). `None` when the device and build can capture; the decoder and its
+/// cache may still refuse ([`StepModel::graph_support`]).
+pub(crate) fn device_refusal(device: &Device) -> Option<&'static str> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+        Some(REASON_CUDA_FEATURE_OFF)
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let Device::Cuda(dev) = device else {
+            return Some(REASON_NOT_CUDA);
+        };
+        if cfg!(feature = "flash-attn") {
+            return Some(REASON_FLASH_ATTN_STREAM);
+        }
+        let stream = dev.cuda_stream();
+        if stream.cu_stream().is_null() {
+            return Some(REASON_LEGACY_STREAM);
+        }
+        if !stream.context().has_async_alloc() {
+            return Some(REASON_NO_ASYNC_ALLOC);
+        }
+        None
     }
 }
 
@@ -753,7 +913,11 @@ pub fn census_step<M: StepModel + ?Sized>(
     };
     let base = cache.len();
     cache.stage_positions()?;
+    // Recorded as the runner records: under the parameter-cache guard (a warmed step finds its
+    // layout parameters cached; a miss fails the recording).
+    let htod = dev.enable_cuda_graph_htod_cache();
     let recorded = cuda::capture(dev, || model.forward_step(cache, request).map(|_| ()));
+    drop(htod);
     let census = match recorded {
         Ok((recorded, ())) => Some(recorded.census()),
         Err(cuda::Abandoned(reason)) => {
@@ -1055,11 +1219,23 @@ mod cuda {
         )
     }
 
-    /// Classify a driver / candle error raised inside a capture into a fallback reason.
+    /// Classify a driver / candle error raised inside a capture into a fallback reason. Under the
+    /// parameter-cache guard candle refuses, during capture, a host upload its caches do not
+    /// cover and every device->host read (the vendored candle-core's messages); those are named
+    /// like the census names the recorded copies.
     pub(super) fn classify_capture_error(e: &Error) -> &'static str {
         let text = format!("{e:?}");
         if text.contains("STREAM_CAPTURE") {
             REASON_CAPTURE_INVALIDATED
+        } else if text.contains("param cache miss during CUDA graph capture")
+            || text.contains("CUDA graph capture cannot upload uncached host data")
+            || text.contains("CUDA graph capture missing cached host data")
+        {
+            REASON_HOST_UPLOAD_IN_CAPTURE
+        } else if text.contains("dtoh during CUDA graph capture")
+            || text.contains("to_cpu_storage during CUDA graph capture")
+        {
+            REASON_HOST_READ_IN_CAPTURE
         } else {
             REASON_STEP_FAILED_IN_CAPTURE
         }
@@ -1145,6 +1321,11 @@ mod cuda {
         };
         let value = match outcome {
             Ok(v) => v,
+            // A step that noted a host transfer and then failed on it (the guard refuses the
+            // read) is named by the transfer.
+            Err(_) if host_sync_count() != syncs_before => {
+                return Err(Abandoned(REASON_SYNC_IN_CAPTURE));
+            }
             Err(e) => {
                 let reason = classify_capture_error(&e);
                 eprintln!("[cuda-graph] step failed during capture ({reason}): {e}");
@@ -1351,8 +1532,25 @@ mod cuda {
             }
         };
         let base = cache.len();
+        if base == 0 || request.prefill {
+            // A step from an empty cache, or one marked a prefill segment (a prefix-cache hit's
+            // suffix, sc-24437), is a prompt prefill: never captured, so it runs plain eager —
+            // outside the parameter-cache guard (the prefill builds host-side RoPE tables and
+            // masks, uploads a guarded forward must not make; see `guarded_request`) and outside
+            // the warm-up bookkeeping.
+            let out = model.forward_step(cache, request)?;
+            note_eager(None);
+            return Ok(out);
+        }
         match plan {
             Plan::WarmUp => {
+                // The step's host data goes up first, outside the guard (see `guarded_request`).
+                let ids = request.tokens.ids(&device)?;
+                cache.stage_positions()?;
+                let request = guarded_request(&request, &ids);
+                // Under the parameter-cache guard: every layout parameter this shape's step uploads
+                // lands in the cache the capture step then reuses (see the module docs).
+                let _htod = dev.enable_cuda_graph_htod_cache();
                 let out = model.forward_step(cache, request)?;
                 note_eager(None);
                 runner
@@ -1364,6 +1562,13 @@ mod cuda {
                 Ok(out)
             }
             Plan::Capture => {
+                // The step's host data goes up first, outside the guard (see `guarded_request`).
+                let ids = request.tokens.ids(&device)?;
+                cache.stage_positions()?;
+                let request = guarded_request(&request, &ids);
+                // The guard spans the eager reference and the recording: the recording must find
+                // every layout parameter cached (a miss fails the step, never records an upload).
+                let htod = dev.enable_cuda_graph_htod_cache();
                 // The eager reference first: the warm-up proved the step runs, its outputs give
                 // the staging tensors their shapes, and it is what the caller gets either way.
                 let eager = match eager_reference(runner, cache, request, base)? {
@@ -1398,10 +1603,13 @@ mod cuda {
                             tokens: StepTokens::Device(&ids),
                             scope: request.scope,
                             want_hidden: request.want_hidden,
+                            prefill: request.prefill,
+                            snapshot_at: request.snapshot_at,
                         },
                     )?;
                     stage_outputs(&logits, hidden.as_ref(), out)
                 });
+                drop(htod);
                 // From here every failure falls back through `fall_back`, which takes the cache
                 // back to the step start: the recording advanced its Rust-side state (or part of
                 // it, on a failed step), and a launch wrote its device state.
@@ -1504,6 +1712,23 @@ mod cuda {
                 }
                 Err(reason) => fall_back(runner, cache, request, base, reason),
             },
+        }
+    }
+
+    /// The step as it runs under the parameter-cache guard: its tokens already on the device
+    /// (`ids`), so nothing the guarded forward does uploads host data. (Under the guard a small
+    /// upload goes through the vendored candle's per-thread content cache, whose device buffers
+    /// are freed when the thread exits — on Windows after the driver has detached the thread, a
+    /// failure cudarc records on the model's context and a later operation on another thread
+    /// would report. The cache's positions are staged before the guard for the same reason; its
+    /// `stage_positions` skips values it already staged.)
+    fn guarded_request<'a>(request: &StepRequest<'_>, ids: &'a Tensor) -> StepRequest<'a> {
+        StepRequest {
+            tokens: StepTokens::Device(ids),
+            scope: request.scope,
+            want_hidden: request.want_hidden,
+            prefill: request.prefill,
+            snapshot_at: request.snapshot_at,
         }
     }
 
@@ -1621,20 +1846,63 @@ mod tests {
     }
 
     #[test]
-    fn switch_env_default_is_off_and_runtime_override_round_trips() {
+    fn switch_env_default_is_the_devices_row_and_runtime_override_round_trips() {
         let _guard = cuda_graphs_policy_guard(None);
-        // The environment is not set in the test process: the default is off.
-        if std::env::var_os(CUDA_GRAPHS_ENV).is_none() {
-            assert!(!cuda_graphs_enabled());
+        // The environment is not set in the test process: the default is the selected device's
+        // row of the defaults table (CUDA's on a CUDA build, off on Metal and the CPU).
+        let unset = std::env::var_os(CUDA_GRAPHS_ENV).is_none();
+        let default = crate::device::decode_backend_for(crate::device::selected_device_is_cuda())
+            .defaults()
+            .cuda_graphs;
+        let pinned_legacy = cfg!(feature = "flash-attn")
+            || std::env::var(crate::device::CUDA_STREAM_ENV)
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("legacy"));
+        if unset {
+            assert_eq!(cuda_graphs_enabled(), default && !pinned_legacy);
+            assert_eq!(
+                cuda_graphs_default_for(true),
+                CUDA_GRAPHS_DEFAULT && !pinned_legacy
+            );
+            assert!(!cuda_graphs_default_for(false));
         }
         set_cuda_graphs(Some(true));
         assert!(cuda_graphs_enabled());
         set_cuda_graphs(Some(false));
         assert!(!cuda_graphs_enabled());
         set_cuda_graphs(None);
-        if std::env::var_os(CUDA_GRAPHS_ENV).is_none() {
-            assert!(!cuda_graphs_enabled());
+        if unset {
+            assert_eq!(cuda_graphs_enabled(), default && !pinned_legacy);
         }
+    }
+
+    /// sc-24446: a CUDA build that can never capture — candle-flash-attn, or the stream switch
+    /// pinned to legacy — takes graphs off when nothing asks; any other stream setting leaves the
+    /// CUDA row's default, and a host load is off whatever the stream.
+    #[test]
+    fn the_unset_default_is_off_where_no_capture_can_run() {
+        assert_eq!(unset_default(true, false, None), CUDA_GRAPHS_DEFAULT);
+        assert_eq!(unset_default(true, false, Some("")), CUDA_GRAPHS_DEFAULT);
+        assert_eq!(unset_default(true, false, Some("own")), CUDA_GRAPHS_DEFAULT);
+        assert!(!unset_default(true, true, None), "flash-attn build");
+        assert!(
+            !unset_default(true, false, Some(" LEGACY ")),
+            "legacy stream"
+        );
+        assert!(!unset_default(false, false, Some("own")), "host load");
+    }
+
+    /// sc-24446: a blank `CANDLE_LLM_CUDA_GRAPHS=` is unset (the device's default), as a blank
+    /// `CANDLE_LLM_CUDA_STREAM` is; a set value still parses.
+    #[test]
+    fn a_blank_graph_switch_is_unset() {
+        assert_eq!(SWITCH.parse_setting(Some("")), None);
+        assert_eq!(SWITCH.parse_setting(Some("  ")), None);
+        assert_eq!(SWITCH.parse_setting(Some(" On ")), Some(true));
+        assert_eq!(SWITCH.parse_setting(Some("0")), Some(false));
+        assert_eq!(
+            crate::device::CudaStreamKind::parse(Some("  ")).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1669,19 +1937,20 @@ mod tests {
 
     #[test]
     fn the_policy_guard_restores_the_switch_it_found() {
-        let outer = cuda_graphs_policy_guard(Some(false));
-        assert!(!cuda_graphs_enabled());
-        drop(outer);
-        {
-            let _inner = cuda_graphs_policy_guard(Some(true));
-            assert!(cuda_graphs_enabled());
-        }
-        let _check = cuda_graphs_policy_guard(None);
-        if std::env::var_os(CUDA_GRAPHS_ENV).is_none() {
-            assert!(
-                !cuda_graphs_enabled(),
-                "the guard must restore the previous policy"
-            );
+        for found in [Some(false), Some(true), None] {
+            let _outer = cuda_graphs_policy_guard(found);
+            let before = (SWITCH.explicit(), cuda_graphs_enabled());
+            for inner in [Some(true), Some(false)] {
+                {
+                    let _inner = cuda_graphs_policy_guard(inner);
+                    assert_eq!(cuda_graphs_enabled(), inner.unwrap());
+                }
+                assert_eq!(
+                    (SWITCH.explicit(), cuda_graphs_enabled()),
+                    before,
+                    "the guard must restore the previous policy ({found:?} under {inner:?})"
+                );
+            }
         }
     }
 
@@ -1715,6 +1984,37 @@ mod tests {
         );
     }
 
+    /// Every step shape the runner captures runs on the device-positions path (sc-24441): the
+    /// two bounds are one number.
+    #[test]
+    fn captured_steps_fit_the_device_positions_bound() {
+        assert_eq!(
+            GraphRunner::<Counter>::MAX_CAPTURED_TOKENS,
+            crate::primitives::MAX_DEVICE_STEP_TOKENS
+        );
+    }
+
+    /// sc-24441 (E7): a load under the graph runner prices the parameter cache its captures
+    /// leave resident — 1 MiB for each of the 16 token counts in both logits scopes, and twice
+    /// that for a load whose steps can also ask for hidden rows (sc-24446: `want_hidden` is part
+    /// of the shape key, so those are distinct captures).
+    #[test]
+    fn a_load_prices_the_parameter_cache_its_captures_leave_resident() {
+        assert_eq!(PARAM_CACHE_ADMISSION_BYTES, 1 << 20);
+        assert_eq!(graph_param_cache_load_bytes(false), 32 << 20);
+        assert_eq!(graph_param_cache_load_bytes(true), 64 << 20);
+        let shape = |want_hidden| ShapeKey {
+            tokens: 1,
+            scope: LogitsScope::All,
+            want_hidden,
+        };
+        assert_ne!(
+            shape(true),
+            shape(false),
+            "want_hidden keys a distinct capture"
+        );
+    }
+
     #[test]
     fn graph_admission_prices_every_step_shape_of_a_request() {
         let geometry = core_llm::LlmMemoryGeometry {
@@ -1729,16 +2029,27 @@ mod tests {
             vocab_size: 50,
             recurrent_bytes: 0,
         };
-        let per_token = (3 * 64 + 8 * 32 + 50) * 4 + 4 * 100 * 4 * 3 + 4 + (50 + 32) * 4;
-        // A decode-only request (one 1-token shape, two scopes).
+        // The decode attention's workspace (sc-24441): 4 heads × 2 chunks (100 positions span two
+        // 64-key chunks, sc-24446) × (8 + 2) f32.
+        let decode_attention =
+            4 * 100u64.div_ceil(candle_quant_kernels::DECODE_ATTN_CHUNK as u64) * (8 + 2) * 4;
+        let per_token =
+            (3 * 64 + 8 * 32 + 50) * 4 + 4 * 100 * 4 * 3 + decode_attention + 4 + (50 + 32) * 4;
+        assert_eq!(
+            decode_attention, 320,
+            "the decode attention's workspace, literally"
+        );
+        assert_eq!(per_token, 7_444, "one token-row, literally");
+        // A decode-only request (one 1-token shape, two scopes). The parameter cache is a load's,
+        // not a request's (`graph_param_cache_load_bytes`).
         assert_eq!(
             graph_workspace_admission_bytes(&geometry, 100, 1),
-            Some(2 * per_token)
+            Some(2 * 7_444)
         );
         // K = 3: token counts 1..=4 → 10 token-rows per scope.
         assert_eq!(
             graph_workspace_admission_bytes(&geometry, 100, 4),
-            Some(2 * 10 * per_token)
+            Some(2 * 10 * 7_444)
         );
         assert_eq!(graph_workspace_admission_bytes(&geometry, 100, 0), Some(0));
         let huge = core_llm::LlmMemoryGeometry {
@@ -2508,7 +2819,7 @@ mod cuda_tests {
 
     impl Proposer for FixedDrafts {
         fn kind(&self) -> ProposerKind {
-            ProposerKind::Ngram
+            ProposerKind::PromptLookup
         }
         fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
             Ok(())
@@ -2826,7 +3137,8 @@ mod cuda_tests {
         let start = graph_tally();
         for (i, t) in [3i32, 7, 11, 2, 7, 5, 9, 4, 8, 6].into_iter().enumerate() {
             if i == 6 {
-                // Steps 0–1 warm up and capture, 2 is the verified replay, 3–5 replay.
+                // Step 0 (from an empty cache) runs plain eager, 1–2 warm up and capture, 3 is the
+                // verified replay, 4–5 replay.
                 assert_eq!(runner.captured_graphs(), 1);
                 super::cuda::FAIL_NEXT_LAUNCH.with(|f| f.set(true));
             }
@@ -2853,8 +3165,8 @@ mod cuda_tests {
         let tally = graph_tally().since(&start);
         eprintln!("[runner] failed launch: {}", tally.describe());
         assert_eq!(
-            tally.replayed, 4,
-            "the verified replay and three replays before the failure"
+            tally.replayed, 3,
+            "the verified replay and two replays before the failure"
         );
         assert_eq!(runner.refusal(), Some(REASON_LAUNCH_FAILED));
         assert_eq!(runner.captured_graphs(), 0);
@@ -2958,26 +3270,42 @@ mod cuda_tests {
         assert_eq!(reserved(&dev), 0, "dropping the graphs trims the pool");
     }
 
-    /// The Qwen3.5/3.8 decoder is refused by declaration before any capture: on the pure-attention
-    /// and the hybrid tiny configs alike, on the engine's cache (static KV, and on the hybrid the
-    /// per-token DeltaNet ring of sc-24131, whose state stays at stable addresses), by the model's
-    /// Rust-scalar positions (`positions_host_scalar`). What a recording of its step would hold is
-    /// measured with `census_step`: candle's per-op layout uploads (host-sourced memcpy nodes),
-    /// and — on the hybrid — no allocation outliving the step (`escaped=0`: the ring is written
-    /// in place, where the S1 cache replaced every linear layer's states).
-    #[test]
-    fn qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads() {
+    /// The production step models the runner wraps (sc-24441): a dense Qwen3 `CausalLm`, the
+    /// Qwen3.5/3.8 hybrid and its attention-only shape, each on its own stream.
+    fn production_models(device: &Device) -> Vec<(&'static str, ProductionModel)> {
         use crate::models::qwen35::tests::{text_model_attention_only_on, text_model_on};
-        let Some((_guard, device, _)) = device() else {
-            return;
-        };
-        let config = greedy(8);
-        let prompt = [1i32, 7, 3, 42, 9];
+        let (w, cfg) = crate::models::llama::tests::tiny_qwen3(64, false, device);
+        vec![
+            (
+                "qwen3 dense",
+                ProductionModel::Causal(
+                    crate::models::CausalLm::from_weights(&w, "", cfg).unwrap(),
+                ),
+            ),
+            (
+                "qwen35 hybrid",
+                ProductionModel::Qwen35(text_model_on(device).1),
+            ),
+            (
+                "qwen35 attention-only",
+                ProductionModel::Qwen35(text_model_attention_only_on(device).1),
+            ),
+        ]
+    }
 
-        let (_cfg, model) = text_model_attention_only_on(&device);
-        assert_eq!(model.graph_support(), Err("positions_host_scalar"));
-        let (bare, _) = generate_step(
-            &model,
+    enum ProductionModel {
+        Causal(crate::models::CausalLm),
+        Qwen35(crate::models::Qwen35Model),
+    }
+
+    /// One production model through the runner vs bare (see the test below).
+    fn assert_production_model_captures<M: StepModel>(what: &str, model: &M, bare_host: &M) {
+        let config = greedy(24);
+        let prompt = [1i32, 7, 3, 42, 9];
+        assert_eq!(model.graph_support(), Ok(()), "{what}: declared capturable");
+        // Graphs off: the eager step, on the device-positions path.
+        let (bare, bare_record) = generate_step(
+            model,
             &prompt,
             &config,
             &CancelFlag::new(),
@@ -2985,7 +3313,24 @@ mod cuda_tests {
             None,
         )
         .unwrap();
-        let runner = GraphRunner::new(&model);
+        assert_eq!(bare.tokens.len(), 24);
+        assert_eq!(bare_record.report(false).graph_path, "none");
+        // The pre-change path (host positions, `sdpa_gqa` attention) emits the same greedy tokens.
+        let (host_path, _) = generate_step(
+            bare_host,
+            &prompt,
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            host_path.tokens, bare.tokens,
+            "{what}: device vs host positions"
+        );
+        // Graphs on.
+        let runner = GraphRunner::new(model);
         let (wrapped, record) = generate_step(
             &runner,
             &prompt,
@@ -2995,43 +3340,142 @@ mod cuda_tests {
             None,
         )
         .unwrap();
-        assert_eq!(wrapped.tokens, bare.tokens);
+        let tally = record.cuda_graphs;
+        eprintln!("[runner] {what}: {}", tally.describe());
+        assert_eq!(wrapped.tokens, bare.tokens, "{what}: graphs on vs off");
+        assert_eq!(tally.fallback_reason, None, "{what}");
+        assert_eq!(tally.captured, 1, "{what}: the 1-token decode shape");
+        assert!(tally.replayed > 0, "{what}: decode steps replay");
+        assert_eq!(runner.refusal(), None);
+        let census = runner.last_census().expect("a capture was recorded");
+        eprintln!("[runner] {what} 1-token step census: {}", census.describe());
+        assert_eq!(
+            census.memcpy_from_host, 0,
+            "{what}: no host upload recorded"
+        );
+        assert_eq!(census.refusal(), None);
+        let report = record.report(true);
+        assert_eq!(report.graph_path, "captured", "{what}");
+        assert_eq!(report.cuda_graphs.fallback_reason, None);
+
+        // Speculative K = 3 through the runner: verify steps of 4 tokens, accepts and rejects
+        // (with the rollbacks a hybrid serves from its ring), token-identical to the bare engine.
+        let proposer = || FixedDrafts {
+            k: 3,
+            vocab: model.vocab_size() as i32,
+            prompt_len: prompt.len(),
+            continuation: bare.tokens.clone(),
+        };
+        let spec = |m: &dyn StepModel<Cache = M::Cache>| {
+            generate_speculative(
+                m,
+                &mut proposer(),
+                SpeculativePrompt::Tokens(&prompt),
+                &config,
+                3,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap()
+        };
+        let bare_spec = spec(model);
+        let runner = GraphRunner::new(model);
+        let graph_spec = spec(&runner);
+        let tally = graph_spec.record.cuda_graphs;
         eprintln!(
-            "[runner] qwen35 attention-only static: {}",
-            record.cuda_graphs.describe()
+            "[runner] {what} K=3: {} (accepted {} / proposed {})",
+            tally.describe(),
+            graph_spec.stats.accepted,
+            graph_spec.stats.proposed
         );
         assert_eq!(
-            record.cuda_graphs.fallback_reason,
-            Some("positions_host_scalar")
+            graph_spec.output.tokens, bare_spec.output.tokens,
+            "{what}: K=3"
         );
-        assert!(runner.last_census().is_none(), "refused before any capture");
+        assert_eq!(bare_spec.output.tokens, bare.tokens, "{what}: greedy-exact");
+        assert!(bare_spec.stats.accepted < bare_spec.stats.proposed);
+        assert_eq!(tally.fallback_reason, None, "{what}: K=3");
+        assert!(
+            tally.captured >= 1 && tally.replayed > 0,
+            "{what}: verify replays"
+        );
+        assert_eq!(graph_spec.record.report(true).graph_path, "captured");
+    }
 
-        // The measurement: record one warmed 1-token step (evidence only; the cache is
-        // discarded afterwards).
-        let mut cache = model.new_cache_for(prompt.len() + 8, 0).unwrap();
-        model
-            .forward_step(&mut cache, StepRequest::last(&prompt))
-            .unwrap();
-        model
-            .forward_step(&mut cache, StepRequest::last(&[3]))
-            .unwrap();
-        let census = census_step(&model, &mut cache, StepRequest::last(&[5]))
+    /// sc-24441 AC1 + AC2: with graphs on, a dense Qwen3 (`CausalLm`) and the Qwen3.5/3.8
+    /// decoder (hybrid and attention-only) declare `graph_support() == Ok`, capture their decode
+    /// step (no host upload in the census — the positions are device data and the layout
+    /// parameters come from the vendored candle's cache), replay it, report
+    /// `graph_path = captured`, and emit greedy tokens identical to graphs off — on the step
+    /// driver and through `K = 3` verify steps. Graphs off, the device-positions path emits the
+    /// same greedy tokens as the pre-change host-position path.
+    #[test]
+    fn production_decoders_capture_and_replay_token_identical() {
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
+        let hosts = production_models(&device);
+        for ((what, model), (_, host)) in production_models(&device).into_iter().zip(hosts) {
+            match (model, host) {
+                (ProductionModel::Causal(m), ProductionModel::Causal(mut h)) => {
+                    assert!(m.device_positions(), "on by default on CUDA");
+                    h.set_device_positions(false);
+                    assert_production_model_captures(what, &m, &h);
+                }
+                (ProductionModel::Qwen35(m), ProductionModel::Qwen35(mut h)) => {
+                    assert!(m.device_positions(), "on by default on CUDA");
+                    h.set_device_positions(false);
+                    assert_production_model_captures(what, &m, &h);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// A request decoded through the runner on a thread that then exits leaves nothing recorded
+    /// on the model's CUDA context: the guarded steps upload no host data (their tokens and
+    /// positions go up before the guard, and the prompt prefill — host RoPE tables and masks —
+    /// runs outside it), so no per-thread cache holds device buffers the thread's exit would
+    /// free after the driver detached it (on Windows that free fails with
+    /// `CUDA_ERROR_NOT_INITIALIZED`, recorded on the context for the next operation to report —
+    /// what this test caught on the CUDA lane). The model keeps decoding on another thread
+    /// afterwards.
+    #[test]
+    fn a_runner_thread_exit_leaves_the_models_context_clean() {
+        let Some((_guard, device, dev)) = device() else {
+            return;
+        };
+        let (w, cfg) = crate::models::llama::tests::tiny_qwen3(64, false, &device);
+        let model = crate::models::CausalLm::from_weights(&w, "", cfg).unwrap();
+        let prompt = [1i32, 7, 3, 42, 9];
+        let config = greedy(12);
+        dev.cuda_stream().context().check_err().unwrap();
+        let (graphs, tally) = std::thread::scope(|s| {
+            s.spawn(|| {
+                let runner = GraphRunner::new(&model);
+                let (out, record) = generate_step(
+                    &runner,
+                    &prompt,
+                    &config,
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                    None,
+                )
+                .unwrap();
+                (out.tokens, record.cuda_graphs)
+            })
+            .join()
             .unwrap()
-            .expect("the step records");
-        eprintln!(
-            "[runner] qwen35 1-token static step census: {}",
-            census.describe()
+        });
+        assert!(tally.replayed > 0, "{}", tally.describe());
+        assert_eq!(
+            dev.cuda_stream().context().check_err(),
+            Ok(()),
+            "the runner thread's exit recorded an error on the model's context"
         );
-        assert!(census.memcpy_from_host > 0);
-        assert!(census.kernels > 0);
-        assert_eq!(census.refusal(), Some(REASON_HOST_UPLOAD_IN_CAPTURE));
-        drop(cache);
-
-        let (_cfg, hybrid) = text_model_on(&device);
-        assert_eq!(hybrid.graph_support(), Err("positions_host_scalar"));
-        let runner = GraphRunner::new(&hybrid);
-        let (_, record) = generate_step(
-            &runner,
+        let (eager, _) = generate_step(
+            &model,
             &prompt,
             &config,
             &CancelFlag::new(),
@@ -3039,34 +3483,45 @@ mod cuda_tests {
             None,
         )
         .unwrap();
-        eprintln!(
-            "[runner] qwen35 hybrid static: {}",
-            record.cuda_graphs.describe()
-        );
-        assert_eq!(
-            record.cuda_graphs.fallback_reason,
-            Some("positions_host_scalar")
-        );
-        assert!(runner.last_census().is_none(), "refused before any capture");
+        assert_eq!(eager.tokens, graphs);
+    }
 
-        // The hybrid step on the engine's cache (static KV + per-token DeltaNet ring), decode and
-        // a 4-token verify: the ring keeps the recurrent state in place, so nothing the step
-        // allocates outlives it; the layout uploads remain.
-        let mut cache = hybrid.new_cache_for(prompt.len() + 8, 3).unwrap();
+    /// The census of warmed production steps recorded as the runner records them (under the
+    /// parameter-cache guard): decode and 4-token verify steps of the hybrid on the engine's
+    /// cache hold no host copy and no escaping allocation — the ring and the static KV are
+    /// written in place at device-held indices.
+    #[test]
+    fn warmed_production_steps_record_no_host_copies() {
+        use crate::models::qwen35::tests::text_model_on;
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
+        let prompt = [1i32, 7, 3, 42, 9];
+        let (_cfg, hybrid) = text_model_on(&device);
+        let mut cache = hybrid.new_cache_for(prompt.len() + 16, 3).unwrap();
         assert_eq!(cache.graph_support(), Ok(()));
         hybrid
             .forward_step(&mut cache, StepRequest::last(&prompt))
             .unwrap();
-        hybrid
-            .forward_step(&mut cache, StepRequest::last(&[3]))
-            .unwrap();
-        hybrid
-            .forward_step(&mut cache, StepRequest::all(&[4, 5, 6, 7]))
-            .unwrap();
-        let decode = census_step(&hybrid, &mut cache, StepRequest::last(&[5]))
+        // The step tokens on the device, as the runner stages them (a host upload inside a
+        // recording is refused by the guard).
+        let one = crate::primitives::input_ids(&[3], &device).unwrap();
+        let four = crate::primitives::input_ids(&[4, 5, 6, 7], &device).unwrap();
+        // Warm each shape under the guard, as the runner's warm-up does (positions staged first).
+        for ids in [&one, &four] {
+            cache.stage_positions().unwrap();
+            let Device::Cuda(dev) = &device else {
+                unreachable!()
+            };
+            let _htod = dev.enable_cuda_graph_htod_cache();
+            hybrid
+                .forward_step(&mut cache, StepRequest::all_ids(ids))
+                .unwrap();
+        }
+        let decode = census_step(&hybrid, &mut cache, StepRequest::last_ids(&one))
             .unwrap()
             .expect("the decode step records");
-        let verify = census_step(&hybrid, &mut cache, StepRequest::all(&[4, 5, 6, 7]))
+        let verify = census_step(&hybrid, &mut cache, StepRequest::all_ids(&four))
             .unwrap()
             .expect("the verify step records");
         for (name, census) in [("1-token", decode), ("4-token", verify)] {
@@ -3074,13 +3529,114 @@ mod cuda_tests {
                 "[runner] qwen35 hybrid {name} static step census: {}",
                 census.describe()
             );
-            assert_eq!(
-                census.escaped_allocs, 0,
-                "{name}: the ring is written in place"
+            assert_eq!(census.memcpy_from_host, 0, "{name}");
+            assert_eq!(census.memcpy_to_host, 0, "{name}");
+            assert_eq!(census.escaped_allocs, 0, "{name}");
+            assert!(census.kernels > 0);
+            assert_eq!(census.refusal(), None, "{name}");
+        }
+    }
+
+    /// The vendored candle-core's parameter cache (sc-24441, #3564 + #3598): every layout-bearing
+    /// op — an embedding-style `index_select`, a transposed copy, a broadcast binary op, a
+    /// comparison, `where_cond`, a strided reduction, `gather` — gives bit-identical results with
+    /// and without the guard (eager behaviour is unchanged by the cache), and under the guard a
+    /// step built from them, warmed once, records no host upload and replays bit-exactly at new
+    /// inputs.
+    #[test]
+    fn vendored_param_cache_keeps_eager_bits_and_makes_layout_ops_capturable() {
+        let Some((_guard, device, dev)) = device() else {
+            return;
+        };
+        let (rows, n) = (4usize, 32usize);
+        let table = Tensor::arange(0f32, (64 * n) as f32, &device)
+            .unwrap()
+            .affine(0.01, -3.0)
+            .unwrap()
+            .sin()
+            .unwrap()
+            .reshape((64, n))
+            .unwrap();
+        let ids = Tensor::new(&[3u32, 17, 42, 9], &device).unwrap();
+        let gather_ids = Tensor::new(&[[0u32, 5], [7, 2], [31, 30], [1, 1]], &device).unwrap();
+        let step = |x: &Tensor| -> Result<Tensor> {
+            let e = table.index_select(&ids, 0)?; // [rows, n]
+            let t = x.t()?.contiguous()?.t()?.contiguous()?; // strided copies
+            let b = t.broadcast_add(&e.narrow(0, 0, 1)?)?;
+            let mask = b.ge(&e)?;
+            let w = mask.where_cond(&b, &e)?;
+            let r = w.t()?.sum_keepdim(1)?.t()?; // a reduction over a strided view
+            let g = w.gather(&gather_ids, 1)?.sum_keepdim(1)?;
+            Ok(w.broadcast_add(&r)?.broadcast_add(&g)?)
+        };
+        let input = |phase: f64| {
+            Tensor::arange(0f32, (rows * n) as f32, &device)
+                .unwrap()
+                .affine(0.07, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .reshape((rows, n))
+                .unwrap()
+        };
+        // Inputs are built before any guard: under it a small host upload would go through the
+        // per-thread content cache (see `guarded_request`).
+        let x = input(0.3);
+        let plain = step(&x).unwrap();
+        let guarded = {
+            let _htod = dev.enable_cuda_graph_htod_cache();
+            step(&x).unwrap()
+        };
+        assert!(
+            bit_identical(&plain, &guarded).unwrap(),
+            "eager bits unchanged"
+        );
+        let after = step(&x).unwrap();
+        assert!(
+            bit_identical(&plain, &after).unwrap(),
+            "and after the guard"
+        );
+
+        let x_stage = Tensor::zeros((rows, n), DType::F32, &device).unwrap();
+        let out_stage = Tensor::zeros((rows, n), DType::F32, &device).unwrap();
+        x_stage.slice_set(&input(0.0), 0, 0).unwrap();
+        let htod = dev.enable_cuda_graph_htod_cache();
+        let _ = step(&x_stage).unwrap(); // warm-up: fills the parameter cache
+        let (recorded, ()) = capture(&dev, || {
+            let y = step(&x_stage)?;
+            out_stage.slice_set(&y, 0, 0)?;
+            Ok(())
+        })
+        .unwrap_or_else(|Abandoned(reason)| panic!("capture abandoned: {reason}"));
+        drop(htod);
+        let census = recorded.census();
+        eprintln!("[param-cache] layout step census: {}", census.describe());
+        assert_eq!(census.memcpy_from_host, 0);
+        assert_eq!(census.refusal(), None);
+        let graph = recorded
+            .instantiate()
+            .unwrap_or_else(|Abandoned(reason)| panic!("instantiate: {reason}"));
+        for phase in [0.7f64, 2.1] {
+            let x = input(phase);
+            let eager = step(&x).unwrap();
+            x_stage.slice_set(&x, 0, 0).unwrap();
+            graph.launch().unwrap();
+            assert!(
+                bit_identical(&out_stage, &eager).unwrap(),
+                "replay at phase {phase} is not bit-identical to eager"
             );
-            assert!(census.mem_allocs > 0 && census.kernels > 0);
-            assert!(census.memcpy_from_host > 0);
-            assert_eq!(census.refusal(), Some(REASON_HOST_UPLOAD_IN_CAPTURE));
+        }
+        // An op whose layout the warm-up never saw fails the recording by name instead of
+        // recording an upload.
+        let htod = dev.enable_cuda_graph_htod_cache();
+        let missed = capture(&dev, || {
+            // A strided copy of a `[32, 9]` transposed view: a layout the warm-up never used.
+            Ok(table.narrow(0, 0, 9)?.t()?.contiguous()?)
+        });
+        drop(htod);
+        match missed {
+            Err(Abandoned(reason)) => assert_eq!(reason, REASON_HOST_UPLOAD_IN_CAPTURE),
+            Ok(_) => panic!("an uncached layout must not record"),
         }
     }
 

@@ -57,6 +57,10 @@ class PinGroup:
     manifest_deps: tuple[str, ...]
     lock_packages: tuple[str, ...]
     ref: str = "HEAD"
+    # In-tree vendored copies of this backend's crates (a root [patch] points at them). A bump of
+    # such a group cannot be mechanical: each copy is re-vendored at the new revision with its
+    # recorded deltas re-applied (its VENDORED.md), so the tool refuses instead of half-bumping.
+    vendored: tuple[str, ...] = ()
 
 
 PIN_GROUPS = {
@@ -73,6 +77,9 @@ PIN_GROUPS = {
         # manifest pin and the gate's PINNED_WORKSPACE_DEPENDENCIES both list it, so it bumps here.
         manifest_deps=("candle-core", "candle-nn", "candle-transformers", "candle-flash-attn"),
         lock_packages=("candle-core", "candle-nn", "candle-transformers", "candle-flash-attn"),
+        # sc-24441: candle-core resolves to a vendored copy carrying upstream's CUDA-graph
+        # parameter cache on top of the pinned revision.
+        vendored=("crates/media/candle-gen/vendor/candle-core",),
     ),
 }
 
@@ -135,6 +142,17 @@ def rewrite(text: str, group: PinGroup, old_rev: str, new_rev: str, *, patterns)
         if count != 1:
             raise BumpError(f"expected to update {dep!r} exactly once, updated {count}")
     return result
+
+
+def vendored_refusal(group: PinGroup) -> str | None:
+    """Why ``group`` cannot be bumped mechanically (it has vendored crates), or ``None``."""
+    if not group.vendored:
+        return None
+    copies = ", ".join(f"{path}/VENDORED.md" for path in group.vendored)
+    return (
+        f"{group.key} has vendored crates ({copies}); re-vendor them at the new revision and "
+        "re-apply their recorded deltas, then move every pin by hand"
+    )
 
 
 def parse_ls_remote(output: str) -> str:
@@ -241,6 +259,9 @@ def main(argv: list[str] | None = None) -> int:
             old_rev = read_group_rev(
                 CARGO_TOML.read_text(encoding="utf-8"), group, patterns=_dep_rev_pattern
             )
+            refusal = vendored_refusal(group)
+            if refusal is not None:
+                raise BumpError(f"{group.key}: {old_rev} -> {latest} not applied: {refusal}")
             plans.append((group, old_rev, latest))
             print(f"{group.key}: {old_rev} -> {latest}")
     except BumpError as error:

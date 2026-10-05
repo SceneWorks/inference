@@ -286,7 +286,10 @@ impl SiglipMlp {
 
     fn forward(&self, x: &Array) -> Result<Array> {
         let x = linear(x, &self.fc1_w, self.fc1_b.as_ref())?;
-        let x = gelu_tanh(&x)?;
+        let x = gelu_tanh(
+            &x,
+            crate::primitives::activation::ActivationRole::VisionEncoder,
+        )?;
         linear(&x, &self.fc2_w, self.fc2_b.as_ref())
     }
 }

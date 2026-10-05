@@ -201,7 +201,7 @@ impl StarCoder2 {
     /// [`AttnFormulation::Gqa`] (the default) or [`AttnFormulation::Expanded`] (the pre-migration
     /// arithmetic, for a labelled comparison). The static cache attends un-expanded regardless.
     pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
-        self.attn_formulation = formulation;
+        self.attn_formulation = formulation.selector();
     }
 
     /// The selected formulation (what the reference paths and a growing cache run).
@@ -473,7 +473,9 @@ impl StarCoder2Attention {
         let scale = 1.0 / (dim as f32).sqrt();
         let out = match formulation {
             // The static cache's views, un-expanded (sc-24138).
-            AttnFormulation::Gqa => sdpa_gqa_causal(&q, &k, &v, scale)?,
+            AttnFormulation::Gqa | AttnFormulation::DecodeAttention => {
+                sdpa_gqa_causal(&q, &k, &v, scale)?
+            }
             // The reference arithmetic.
             AttnFormulation::Expanded => {
                 let groups = self.cfg.heads / self.cfg.kv_heads;

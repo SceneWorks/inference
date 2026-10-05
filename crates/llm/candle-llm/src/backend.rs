@@ -17,7 +17,7 @@ use core_llm::{
 use crate::decode::graph::{
     REASON_CUDA_FEATURE_OFF, REASON_FLASH_ATTN_STREAM, REASON_LEGACY_STREAM, REASON_NOT_CUDA,
 };
-use crate::device::{select_device, CudaStreamKind, CUDA_STREAM_ENV};
+use crate::device::{select_eager_device, CudaStreamKind, CUDA_STREAM_ENV};
 
 /// This build's execution backend label (`candle-cuda`, `candle-metal`, `candle-cpu`).
 pub fn backend_label() -> &'static str {
@@ -37,7 +37,8 @@ pub fn backend_label() -> &'static str {
 /// `flash-attn` build (always the legacy stream) or `CANDLE_LLM_CUDA_STREAM=legacy`.
 ///
 /// Probed once per process (the device a load selects does not change while it runs) and cached;
-/// the probe opens the load device the way a load does and, on CUDA, builds the NVFP4 context
+/// the probe opens the load's device on the legacy stream ([`select_eager_device`]: it never
+/// captures, so it holds no stream or handles of its own) and, on CUDA, builds the NVFP4 context
 /// (a cuBLASLt handle and the fused quantizer's compile-once module, which a later NVFP4 load
 /// reuses). It never reads weights.
 pub fn backend_capabilities() -> BackendCapabilities {
@@ -47,7 +48,7 @@ pub fn backend_capabilities() -> BackendCapabilities {
     #[cfg(all(test, feature = "cuda"))]
     crate::decode::graph::hold_cuda_test_lock();
     CAPABILITIES
-        .get_or_init(|| match select_device() {
+        .get_or_init(|| match select_eager_device() {
             Ok(device) => capabilities_for_device(backend_label(), &device),
             Err(error) => no_device(backend_label(), &error.to_string()),
         })
@@ -72,16 +73,7 @@ pub fn capabilities_for_device(backend: &str, device: &Device) -> BackendCapabil
             std::env::var(CUDA_STREAM_ENV).ok().as_deref(),
         )
     } else {
-        // The same reasons the graph runner names when it refuses a step.
-        let reason = if cfg!(feature = "cuda") {
-            REASON_NOT_CUDA
-        } else {
-            REASON_CUDA_FEATURE_OFF
-        };
-        FeatureSupport::unavailable(format!(
-            "cuda_graphs: {reason}: CUDA graphs need a CUDA load device; this runtime loads on \
-             {label}"
-        ))
+        FeatureSupport::unavailable(off_cuda_refusal(&label))
     };
     BackendCapabilities {
         backend: backend.to_string(),
@@ -175,6 +167,43 @@ fn cuda_graphs_on_cuda(flash_attn: bool, stream_env: Option<&str>) -> FeatureSup
         ));
     }
     FeatureSupport::available()
+}
+
+/// The CUDA-graph refusal off a CUDA device: the graph runner's own reason (`not_cuda`, or
+/// `cuda_feature_off` in a build without CUDA) and the device a load lands on (`label`).
+fn off_cuda_refusal(label: &str) -> String {
+    let reason = if cfg!(feature = "cuda") {
+        REASON_NOT_CUDA
+    } else {
+        REASON_CUDA_FEATURE_OFF
+    };
+    format!(
+        "cuda_graphs: {reason}: CUDA graphs need a CUDA load device; this runtime loads on {label}"
+    )
+}
+
+/// Why the CUDA-graph switch a load turned on can never capture on `device` in this build, in the
+/// words [`backend_capabilities`] uses (sc-24441, E3) — the graph runner's device-and-build
+/// refusal ([`device_refusal`](crate::decode::graph::device_refusal)) leading as `cuda_graphs:
+/// <reason>: …` — or `None` when the device and build can capture (the decoder may still refuse;
+/// a load names that after this).
+pub(crate) fn cuda_graphs_device_refusal(device: &Device) -> Option<String> {
+    let reason = crate::decode::graph::device_refusal(device)?;
+    Some(match reason {
+        REASON_NOT_CUDA | REASON_CUDA_FEATURE_OFF => off_cuda_refusal(&match device.location() {
+            DeviceLocation::Cpu => "cpu".to_string(),
+            DeviceLocation::Metal { gpu_id } => format!("metal:{gpu_id}"),
+            DeviceLocation::Cuda { gpu_id } => format!("cuda:{gpu_id}"),
+        }),
+        REASON_FLASH_ATTN_STREAM | REASON_LEGACY_STREAM => format!(
+            "cuda_graphs: {reason}: the model runs on the legacy CUDA stream, which stream \
+             capture cannot record"
+        ),
+        other => format!(
+            "cuda_graphs: {other}: the CUDA context has no stream-ordered allocator, so a \
+             captured step's temporaries cannot be recorded"
+        ),
+    })
 }
 
 /// The answer when no load device could be opened: every device feature is unavailable with the

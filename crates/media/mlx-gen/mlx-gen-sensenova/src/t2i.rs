@@ -35,7 +35,7 @@ use crate::fm::{
     FmHead, TimestepEmbedder,
 };
 use crate::qwen3::{KvCache, Path, Qwen3Backbone, RopeMask};
-use crate::runtime::{argmax, Sampler};
+use crate::runtime::Sampler;
 use crate::text::{build_neo1_query, image_indexes, text_indexes, tokens, SYSTEM_MESSAGE_FOR_GEN};
 use crate::vision::NeoVisionEmbedder;
 // The shared deterministic PRNG backs the Box–Muller noise sampler; the `KvCache` trait is brought
@@ -1623,45 +1623,41 @@ impl T2iModel {
         let mut text = String::new();
         let mut images = Vec::new();
         let mut total_tokens = 0usize;
-        let mut next = argmax(&cond_logits);
+        // The condition cache's last-position row: each text segment's first draw.
+        let mut segment_logits = cond_logits;
 
         loop {
             // ---- Text generation on the condition cache ----
-            let mut gen_tokens = Vec::new();
-            let mut hit_max = false;
-            loop {
-                if cancel.is_cancelled() {
-                    return Err(Error::Canceled);
-                }
-                if next == tokens::IM_END || next == self.img_start_id {
-                    break;
-                }
-                gen_tokens.push(next);
-                total_tokens += 1;
-                // Greedy interleave decode: reduce to the argmax index on device (single-index host
-                // transfer) instead of copying the whole `[vocab]` f32 row (~600 KB/token) to host and
-                // arg-maxing there. MLX `argmax` breaks ties to the lowest index, matching the host
-                // `argmax`, so the greedy stream is bit-identical (F-095, F-140 precedent).
-                next = self.backbone.decode_argmax_budgeted(
-                    next,
-                    (t_cond + 1) as i32,
-                    &mut cache_cond,
-                    attention_plan(opts, Some(cancel)),
-                )?;
-                t_cond += 1;
-                if total_tokens >= max_new_tokens {
-                    hit_max = true;
-                    break;
-                }
-            }
+            // One segment is the shared engine's greedy token-at-a-time rollout (epic sc-24432 E8):
+            // the first token is the host argmax of the segment's row, every later one the argmax
+            // reduced on device (single-index host transfer; F-095, F-140 precedent), until
+            // `<|im_end|>` / `<img>` or the request's remaining budget. The pre-engine segment always
+            // emitted a first non-stop token before it checked the budget, hence `max(1)`; it checked
+            // `cancel` before every token, as the rollout's draw does.
+            let rollout = self.backbone.rollout_budgeted(
+                &segment_logits,
+                &mut cache_cond,
+                t_cond as i32,
+                &[tokens::IM_END, self.img_start_id],
+                max_new_tokens.saturating_sub(total_tokens).max(1),
+                Sampler::Greedy,
+                Some(cancel),
+                attention_plan(opts, Some(cancel)),
+            )?;
+            let gen_tokens = rollout.tokens;
+            total_tokens += gen_tokens.len();
+            t_cond += gen_tokens.len();
+            // A budget end ends the interleave (the pre-engine `hit_max`). The condition cache is not
+            // used again, so the engine not feeding the budget's last token changes nothing.
+            let hit_max = rollout.stop.is_none();
             if !gen_tokens.is_empty() {
                 let u32s: Vec<u32> = gen_tokens.iter().map(|&i| i as u32).collect();
                 text.push_str(&tokenizer.decode(&u32s, true)?);
             }
-            if next == tokens::IM_END || hit_max || images.len() >= max_images {
+            if rollout.stop == Some(tokens::IM_END) || hit_max || images.len() >= max_images {
                 break;
             }
-            if next != self.img_start_id {
+            if rollout.stop != Some(self.img_start_id) {
                 break;
             }
 
@@ -1736,7 +1732,7 @@ impl T2iModel {
             )?;
             t_tu = nt_tu;
             images.push(image);
-            next = argmax(&cond_next);
+            segment_logits = cond_next;
         }
 
         // F-136 residual (sc-11133): the loop above is model-driven and may emit fewer than

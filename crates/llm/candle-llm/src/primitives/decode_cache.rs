@@ -55,6 +55,18 @@ pub fn tensor_bytes(t: &Tensor) -> usize {
     t.elem_count().saturating_mul(t.dtype().size_in_bytes())
 }
 
+/// The elements of the host storage `t` keeps alive (tests, sc-24437): a view pins its whole
+/// backing buffer, so this exceeds `t.elem_count()` for a view of a larger buffer. Panics off the
+/// CPU or for a non-f32 tensor.
+#[cfg(test)]
+pub(crate) fn pinned_f32_elems(t: &Tensor) -> usize {
+    let (storage, _) = t.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Cpu(cpu) => cpu.as_slice::<f32>().unwrap().len(),
+        _ => panic!("pinned_f32_elems: a CPU tensor"),
+    }
+}
+
 /// What the decode machinery needs from a model's per-request state.
 pub trait DecodeCache {
     /// Number of sequence positions committed so far — the position of the next token.
@@ -135,6 +147,19 @@ pub trait DecodeCache {
     fn graph_identity(&self) -> usize {
         self as *const Self as *const u8 as usize
     }
+}
+
+/// Fold device-buffer addresses into a graph identity (sc-24441): the caches that back graphs
+/// start from their own address and fold in every buffer a captured step reads or writes, so a
+/// fresh cache swapped in at the same host address — with its own, freshly allocated buffers —
+/// never replays a graph recorded against the old ones.
+pub(crate) fn fold_graph_identity(
+    identity: usize,
+    addresses: impl IntoIterator<Item = (usize, usize)>,
+) -> usize {
+    addresses.into_iter().fold(identity, |id, (a, b)| {
+        id.rotate_left(7) ^ a ^ b.rotate_left(13)
+    })
 }
 
 #[cfg(test)]

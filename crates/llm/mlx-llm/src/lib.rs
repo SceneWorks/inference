@@ -16,10 +16,14 @@
 //!    into one forward step (story 7167), driven by `core_llm`'s backend-neutral scheduler policy;
 //!    [`generate_cached`] reuses a shared prompt prefix's KV across requests
 //!    (story 7168), driven by `core_llm`'s backend-neutral prefix-index policy;
-//!    [`generate_prompt_lookup`] is n-gram speculative decoding
-//!    (story 7171) and [`generate_draft_speculative`] is
-//!    draft-model speculative decoding (story 7172), both driven by `core_llm`'s backend-neutral
-//!    proposer + distribution-preserving acceptance sampler.
+//!    [`decode::engine`] is the model-agnostic speculative engine (epic sc-24432, story sc-24434):
+//!    one verify / accept / rollback loop over pluggable targets, proposers (prompt lookup
+//!    [`generate_prompt_lookup`], the Qwen3.8 MTP head), cache-rollback strategies and samplers,
+//!    which the provider runs for every text request and which reports a
+//!    [`core_llm::DecodeReport`]; [`generate_draft_speculative`] is draft-model speculative
+//!    decoding (story 7172), on the same engine with a draft model as its proposer since
+//!    sc-24436. All are driven by `core_llm`'s backend-neutral proposer +
+//!    distribution-preserving acceptance sampler.
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine
 //!    and exposes it (`mlx-llama`) for explicit runtime composition.
 //!
@@ -63,6 +67,7 @@ pub mod sc20676_evidence;
 pub mod snapshot;
 pub mod starvector_1b;
 pub mod starvector_8b;
+pub mod switches;
 
 // Self-removing temp fixtures for the crate's unit suites (sc-17768). This is the SAME file the
 // integration suites pull in as `mod common;` — included by path rather than copied, so the two
@@ -71,6 +76,10 @@ pub mod starvector_8b;
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 mod test_fixture;
+
+// Seeded synthetic checkpoints and a word tokenizer, so unit suites drive providers end to end.
+#[cfg(test)]
+mod synthetic;
 
 // Re-export the contract crate so consumers can reach it as `mlx_llm::core_llm::…`.
 pub use core_llm;
@@ -87,7 +96,10 @@ pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
 pub use residency::{EncoderResidency, StreamObservation};
-pub use snapshot::{write_hf_snapshot, write_snapshot, SnapshotReport, SnapshotTokenizer};
+pub use snapshot::{
+    write_hf_snapshot, write_hf_snapshot_without_native_mtp, write_snapshot, SnapshotReport,
+    SnapshotTokenizer,
+};
 pub use starvector_1b::StarVector1bProvider;
 pub use starvector_8b::StarVector8bProvider;
 

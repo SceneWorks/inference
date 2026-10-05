@@ -19,3 +19,8 @@ mlx-llm = { path = ".." }
 # JSON request/response (OpenAI wire format). Derive keeps the request/response types readable.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# The draft-model fixture the CLI flags' end-to-end test loads (sc-24436).
+core-llm-testkit = { workspace = true }
+tempfile = { workspace = true }
