@@ -534,9 +534,9 @@ mod tests {
         }
     }
 
-    /// AC2: zero for identical latents, positive for a perturbed one, growing with the
-    /// perturbation; differentiable in the live latent. Mutation: return `l1` minus the layer sum
-    /// in `distance` ⇒ the positive assertion reds.
+    /// AC2: zero for identical latents, positive for a perturbed one (its learned layer terms too),
+    /// growing with the perturbation; differentiable in the live latent. Mutation: subtract the
+    /// layer terms in `distance` ⇒ the distance falls below its L1 term ⇒ red.
     #[test]
     fn is_zero_for_identical_latents_and_positive_when_perturbed() {
         let n = net(4);
@@ -562,6 +562,13 @@ mod tests {
             scalar(&n.distance(&big, &x).unwrap()),
         );
         assert!(s > 0.0 && b > s, "small {s} big {b}");
+        // The learned part is itself positive: every layer term > 0, and the distance exceeds its
+        // L1 term alone.
+        let (layers, l1) = n.distance_terms(&big, &x).unwrap();
+        for (k, l) in layers.iter().enumerate() {
+            assert!(scalar(l) > 0.0, "layer {k}");
+        }
+        assert!(b > scalar(&l1), "distance {b} must exceed its L1 term");
         let g = grad(|p: &Array| -> mlx_rs::error::Result<Array> {
             n.distance(p, &x)
                 .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
@@ -622,16 +629,16 @@ mod tests {
         assert!((a - b).abs() <= 1e-6 * b.abs().max(1.0), "{a} vs {b}");
     }
 
-    /// The parameter count is the published checkpoint's size: `sdxl_latest_vgg16_tuned.pth` is
-    /// 58 969 974 bytes and holds the float tensors (plus the aliased `lins.*`, the int64
-    /// `num_batches_tracked` counters and the pickle) — within 0.2 % of `param_count · 4`.
-    /// Mutation: drop the lin heads or the BN stats from `checkpoint_tensors` ⇒ red.
+    /// The parameter count is the published checkpoints' size: both files exceed `param_count · 4`
+    /// by the same 35 446 bytes (pickle, zip headers, int64 `num_batches_tracked` counters), so the
+    /// window catches a missing lin head (5.9 KB) or BN running stat (17 KB). Mutation: drop the lin
+    /// heads or the running variances from `checkpoint_tensors` ⇒ red.
     #[test]
     fn param_count_matches_the_published_checkpoint_sizes() {
         for (c, bytes) in [(4, 58_969_974u64), (16, 58_997_622)] {
             let ours = param_count(c) * 4;
             assert!(
-                ours <= bytes && bytes - ours < bytes / 500,
+                ours <= bytes && (30_000..40_000).contains(&(bytes - ours)),
                 "{c}: {ours} vs {bytes}"
             );
         }

@@ -485,9 +485,9 @@ mod tests {
         }
     }
 
-    /// AC2: zero for identical latents, positive and growing with the perturbation, and
-    /// differentiable in the live latent through candle's autograd. Mutation: subtract the layer
-    /// terms in `distance` ⇒ red.
+    /// AC2: zero for identical latents, positive (its learned layer terms too) and growing with the
+    /// perturbation, and differentiable in the live latent through candle's autograd. Mutation:
+    /// subtract the layer terms in `distance` ⇒ the distance falls below its L1 term ⇒ red.
     #[test]
     fn is_zero_for_identical_latents_and_positive_when_perturbed() {
         let n = net(4);
@@ -501,6 +501,11 @@ mod tests {
             scalar(&n.distance(&big, &x).unwrap()),
         );
         assert!(s > 0.0 && b > s, "small {s} big {b}");
+        let (layers, l1) = n.distance_terms(&big, &x).unwrap();
+        for (k, l) in layers.iter().enumerate() {
+            assert!(scalar(l) > 0.0, "layer {k}");
+        }
+        assert!(b > scalar(&l1), "distance {b} must exceed its L1 term");
         let live = Var::from_tensor(&small).unwrap();
         let grads = n
             .distance(live.as_tensor(), &x)
@@ -564,14 +569,16 @@ mod tests {
         assert!(err.contains("E-LatentLPIPS (sdxl)"), "{err}");
     }
 
-    /// The parameter count is the published checkpoint's size (within 0.2 %). Mutation: drop the
-    /// lin heads or BN stats from `checkpoint_tensors` ⇒ red.
+    /// The parameter count is the published checkpoints' size: both files exceed `param_count · 4`
+    /// by the same 35 446 bytes (pickle, zip headers, int64 counters), so the window catches a
+    /// missing lin head (5.9 KB) or BN running stat (17 KB). Mutation: drop the lin heads or the
+    /// running variances from `checkpoint_tensors` ⇒ red.
     #[test]
     fn param_count_matches_the_published_checkpoint_sizes() {
         for (c, bytes) in [(4usize, 58_969_974u64), (16, 58_997_622)] {
             let ours = param_count(c) * 4;
             assert!(
-                ours <= bytes && bytes - ours < bytes / 500,
+                ours <= bytes && (30_000..40_000).contains(&(bytes - ours)),
                 "{c}: {ours} vs {bytes}"
             );
         }
