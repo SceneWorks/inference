@@ -439,7 +439,8 @@ def verify_record(record_path: Path, backend: str, name: str, cuda_bf16_math_pol
                 peak_row["peakBytes"] = max(peak_row["peakBytes"], sample["bytes"])
                 peak_row["samples"] += 1
         require(all(stages[stage] == global_derived.get(stage) for stage in stages_expected) and
-                measured["peakBytes"] == max(sample["bytes"] for sample in global_samples),
+                measured["peakBytes"] == max(global_derived[stage]["peakBytes"]
+                                             for stage in stages_expected),
                 "shared CUDA global stage peaks differ from retained selected-device timeline")
         derived = {}
         for sample in raw_samples:

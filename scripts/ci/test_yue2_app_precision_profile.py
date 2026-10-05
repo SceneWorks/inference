@@ -273,7 +273,17 @@ class PrecisionControlTests(unittest.TestCase):
                              ["load", "semantic", "acoustic", "decode"])
 
             global_journal = record.parent / "cuda-samples.jsonl"
-            global_lines = global_journal.read_text(encoding="utf-8").splitlines()
+            valid_global_lines = global_journal.read_text(encoding="utf-8").splitlines()
+            for out_of_stage_at in (0.5, 6):
+                out_of_stage = json.dumps({"at": out_of_stage_at,
+                                           "startedAt": out_of_stage_at - 0.01,
+                                           "bytes": 8192})
+                global_journal.write_text("\n".join([*valid_global_lines, out_of_stage]) + "\n",
+                                          encoding="utf-8")
+                self.assertEqual(control.verify_record(record, "cuda", name, M4_POLICY)
+                                 ["stage_samples"], {stage: 1 for stage in control.STAGES})
+
+            global_lines = list(valid_global_lines)
             altered = json.loads(global_lines[0])
             altered["bytes"] += 1
             global_lines[0] = json.dumps(altered)
