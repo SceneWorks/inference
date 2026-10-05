@@ -179,6 +179,9 @@ pub struct TrainingConfig {
     /// mask value `m`), and turned into the weight map
     /// `w = background_weight + (subject_weight − background_weight) · m`, which multiplies the
     /// per-element loss **before** the mean reduction (see [`subject_mask`]).
+    /// The divisor stays the full element count, so the gradient (and effective learning rate)
+    /// scales by about `background_weight + (subject_weight − background_weight) · coverage`
+    /// — with `background_weight = 0` and a small subject, proportionally lower.
     ///
     /// `None` (the default) is **off**: no mask is read and the loss is exactly the unweighted
     /// mean it was before this field existed. `Some` is refused (typed

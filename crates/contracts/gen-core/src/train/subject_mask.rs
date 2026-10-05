@@ -23,6 +23,11 @@
 //! mean), **not** `Σ(w ⊙ ℓ) / Σw`. With `background_weight = subject_weight = 1` it is exactly the
 //! unweighted loss; with `background_weight = 0` a background cell contributes zero loss and zero
 //! gradient. Every backend uses this one convention.
+//! Because the divisor stays the full element count, the overall gradient magnitude scales by
+//! about `background_weight + (subject_weight − background_weight) · coverage` (coverage = the
+//! mean mask value): with `background_weight = 0` and a subject covering 20% of the frame the
+//! gradient — and so the effective learning rate — is roughly a fifth of the unmasked run's, so
+//! raise the learning rate (or the background weight) in proportion if that is not wanted.
 //!
 //! # Missing and empty masks
 //!
