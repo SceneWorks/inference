@@ -372,16 +372,55 @@ fn ohwi(w: &Array) -> Result<Array> {
     Ok(w.transpose_axes(&[0, 2, 3, 1])?)
 }
 
+/// The key every TAESD-family checkpoint in the diffusers layout carries (the first decoder conv).
+const DECODER_PROBE_KEY: &str = "decoder.layers.0.weight";
+
 /// The file a decoder checkpoint directory is read from: the diffusers
-/// `diffusion_pytorch_model.safetensors` when present (the taesd/taesdxl repos also ship raw
-/// `taesdxl_{encoder,decoder}.safetensors` in the `taesd.py` key layout, whose keys collide with
-/// each other), otherwise every `.safetensors` in the directory (taef2 / taeqi2_1 ship one file).
+/// `diffusion_pytorch_model.safetensors` when present (taef1 / taesdxl / taesd3 — the taesd/taesdxl
+/// repos also ship raw `taesd.py`-layout `*_{encoder,decoder}.safetensors` whose keys collide);
+/// otherwise the ONE `.safetensors` in the directory that carries the diffusers-layout decoder
+/// (`decoder.layers.0.weight` — taef2 ships only `taef2.safetensors`, taeqi2_1 only
+/// `taeqi2_1.safetensors`, both in that layout per their published headers). Unrelated
+/// `.safetensors` files are skipped; none or several decoder files is a named error.
 fn read_decoder_dir(dir: &std::path::Path) -> Result<Weights> {
     let diffusers = dir.join("diffusion_pytorch_model.safetensors");
     if diffusers.is_file() {
-        Weights::from_file(diffusers)
-    } else {
-        Weights::from_dir(dir)
+        return Weights::from_file(diffusers);
+    }
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| {
+            Error::Msg(format!(
+                "tiny decoder: cannot read checkpoint directory {}: {e}",
+                dir.display()
+            ))
+        })?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+        .filter(|p| !gen_core::weightsmeta::is_hidden_file(p))
+        .collect();
+    files.sort();
+    let mut found: Vec<(std::path::PathBuf, Weights)> = Vec::new();
+    for f in files {
+        let w = Weights::from_file(&f)?;
+        if w.get(DECODER_PROBE_KEY).is_some() {
+            found.push((f, w));
+        }
+    }
+    match found.len() {
+        1 => Ok(found.pop().expect("one").1),
+        0 => Err(Error::Msg(format!(
+            "tiny decoder: no .safetensors file in {} carries a diffusers-layout decoder \
+             ({DECODER_PROBE_KEY})",
+            dir.display()
+        ))),
+        _ => Err(Error::Msg(format!(
+            "tiny decoder: several decoder checkpoints in {}: {:?}",
+            dir.display(),
+            found
+                .iter()
+                .map(|(p, _)| p.display().to_string())
+                .collect::<Vec<_>>()
+        ))),
     }
 }
 
@@ -986,5 +1025,57 @@ mod tests {
         save(&raw, "taesd_decoder.safetensors");
         assert!(Weights::from_dir(dir.path()).is_err());
         assert!(TinyDecoder::from_dir(dir.path(), cfg).is_ok());
+    }
+
+    fn save_to(dir: &std::path::Path, w: &Weights, name: &str) {
+        let pairs: Vec<(String, Array)> = w
+            .keys()
+            .map(|k| (k.to_string(), w.get(k).unwrap().clone()))
+            .collect();
+        Array::save_safetensors(
+            pairs.iter().map(|(k, v)| (k.as_str(), v)),
+            None,
+            dir.join(name),
+        )
+        .unwrap();
+    }
+
+    /// The taef2 / taeqi2_1 snapshot shape (one `<variant>.safetensors`, diffusers decoder keys plus
+    /// `encoder.*`, no diffusers file): `from_dir` picks the decoder file even with an unrelated
+    /// `.safetensors` beside it (whose keys would otherwise merge in, or collide), and refuses a
+    /// directory with no decoder file or two. Mutations: read every file (`Weights::from_dir`) ⇒ a
+    /// colliding unrelated key errors ⇒ red; accept the first file instead of the probed one ⇒
+    /// `aaa_unrelated` is picked ⇒ red.
+    #[test]
+    fn from_dir_picks_the_variant_file_among_unrelated_safetensors() {
+        let spec = TinyDecoderSpec {
+            latent_channels: 4,
+            stage_channels: [8; 4],
+            ..TinyDecoderSpec::taef2()
+        };
+        let mut w = synthetic_tiny_decoder_weights(&spec, 3).unwrap();
+        w.insert("encoder.0.weight", Array::zeros::<f32>(&[1]).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let mut unrelated = Weights::empty();
+        // Shares a key with the decoder file, so merging the directory would be a collision.
+        unrelated.insert("encoder.0.weight", Array::zeros::<f32>(&[2]).unwrap());
+        save_to(dir.path(), &unrelated, "aaa_unrelated.safetensors");
+        let only_unrelated = TinyDecoder::from_dir(dir.path(), spec.clone())
+            .err()
+            .expect("no decoder file")
+            .to_string();
+        assert!(
+            only_unrelated.contains("decoder.layers.0.weight"),
+            "{only_unrelated}"
+        );
+        save_to(dir.path(), &w, "taef2.safetensors");
+        let dec = TinyDecoder::from_dir(dir.path(), spec.clone()).unwrap();
+        assert_eq!(dec.spec(), &spec);
+        save_to(dir.path(), &w, "taef2_copy.safetensors");
+        let two = TinyDecoder::from_dir(dir.path(), spec)
+            .err()
+            .expect("ambiguous")
+            .to_string();
+        assert!(two.contains("several"), "{two}");
     }
 }
