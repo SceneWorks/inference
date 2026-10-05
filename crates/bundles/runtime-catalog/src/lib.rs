@@ -690,6 +690,8 @@ pub struct TrainerCapabilitySnapshot {
     pub max_reference_images: u32,
     /// Honors `TrainingConfig::weight_noise_sigma` (epic 2123 weight noising, sc-24826).
     pub supports_weight_noise: bool,
+    /// Honors `TrainingConfig::subject_mask_loss` (epic 2123 subject-masked loss, sc-24828).
+    pub supports_subject_mask_loss: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -705,6 +707,7 @@ impl TrainerCapabilitySnapshot {
             supports_full_finetune: descriptor.supports_full_finetune,
             max_reference_images: descriptor.max_reference_images,
             supports_weight_noise: descriptor.techniques.weight_noise,
+            supports_subject_mask_loss: descriptor.techniques.subject_mask_loss,
         }
     }
 
@@ -720,6 +723,7 @@ impl TrainerCapabilitySnapshot {
             "supports_full_finetune": self.supports_full_finetune,
             "max_reference_images": self.max_reference_images,
             "supports_weight_noise": self.supports_weight_noise,
+            "supports_subject_mask_loss": self.supports_subject_mask_loss,
         })
     }
 }
@@ -1004,6 +1008,12 @@ mod tests {
         noisy.techniques.weight_noise = true;
         let noisy_json = TrainerCapabilitySnapshot::from_descriptor(&noisy).to_json();
         assert_eq!(noisy_json["supports_weight_noise"], true);
+        // sc-24828: subject-masked loss support is advertised the same way.
+        assert_eq!(json["supports_subject_mask_loss"], false);
+        let mut masked = descriptor;
+        masked.techniques.subject_mask_loss = true;
+        let masked_json = TrainerCapabilitySnapshot::from_descriptor(&masked).to_json();
+        assert_eq!(masked_json["supports_subject_mask_loss"], true);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {

@@ -171,6 +171,7 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
     // refused for a full base fine-tune (E5). The shared `validate_training_techniques` floor
     // enforces all three; assert the trainer routes through it.
     check_weight_noise_validate(t, &ok)?;
+    check_subject_mask_validate(t, &ok)?;
 
     // Negative (sc-24161): instruction-edit datasets. A trainer that does NOT advertise
     // `max_reference_images` must refuse an edit dataset — never silently train a text-to-image
@@ -252,6 +253,61 @@ fn check_weight_noise_validate(t: &dyn Trainer, ok: &TrainingRequest) -> Result<
     Ok(())
 }
 
+/// The masked-loss probe weights (sc-24828): drop the background entirely.
+const SUBJECT_MASK_PROBE: gen_core::SubjectMaskLoss = gen_core::SubjectMaskLoss {
+    background_weight: 0.0,
+    subject_weight: 1.0,
+};
+
+/// `req` with subject-masked loss on and every item carrying a mask path (the item's own image
+/// stands in for it — `validate` only checks presence; a declaring trainer's real mask handling is
+/// covered by its own tests).
+fn subject_masked(req: &TrainingRequest) -> TrainingRequest {
+    let mut masked = req.clone();
+    masked.config.subject_mask_loss = Some(SUBJECT_MASK_PROBE);
+    for item in &mut masked.items {
+        item.subject_mask_path = Some(item.image_path.clone());
+    }
+    masked
+}
+
+/// Subject-masked-loss half of [`check_trainer_validate`] (sc-24828) — `ok` is the accepted base
+/// request. Undeclared ⇒ typed `Unsupported`; declared ⇒ accepted, but refused when an item has no
+/// mask (never trained unmasked).
+fn check_subject_mask_validate(t: &dyn Trainer, ok: &TrainingRequest) -> Result<(), String> {
+    let desc = t.descriptor();
+    let id = desc.id;
+    let masked = subject_masked(ok);
+    match (t.validate(&masked), desc.techniques.subject_mask_loss) {
+        (Ok(()), false) => Err(format!(
+            "technique-honesty[{id}]: a subject-masked-loss request was accepted by validate() \
+             despite techniques.subject_mask_loss == false — it must be refused, not silently \
+             ignored (epic 2123 E3)"
+        )),
+        (Err(Error::Unsupported(_)), false) => Ok(()),
+        (Err(other), false) => Err(format!(
+            "technique-honesty[{id}]: an unsupported subject-masked-loss request must be refused \
+             with a typed Error::Unsupported, got {other:?}"
+        )),
+        (Err(e), true) => Err(format!(
+            "technique-honesty[{id}]: a subject-masked-loss request was rejected by validate() \
+             despite techniques.subject_mask_loss == true: {e}"
+        )),
+        (Ok(()), true) => {
+            let mut missing = masked;
+            missing.items[0].subject_mask_path = None;
+            if t.validate(&missing).is_ok() {
+                return Err(format!(
+                    "technique-honesty[{id}]: a subject-masked-loss request with an item lacking \
+                     its mask was accepted by validate() — it must be refused, not trained \
+                     unmasked"
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// **Technique refusal at the `train` entry point** (epic 2123 E3, sc-24826). A caller that skips
 /// `validate` and calls `train` directly with a technique the trainer does not declare must get a
 /// typed `Err(Error::Unsupported)` **before training starts** — no `Caching`/`Training`/`Saving`
@@ -261,13 +317,31 @@ pub fn check_trainer_technique_refusal(
     make: &dyn Fn() -> Box<dyn Trainer>,
     profile: &TrainerProfile,
 ) -> Result<(), String> {
+    let techniques = make().descriptor().techniques;
+    if !techniques.weight_noise {
+        let mut req = base_request(profile);
+        req.config.weight_noise_sigma = WEIGHT_NOISE_PROBE_SIGMA;
+        check_train_refuses(make, req, "weight noise")?;
+    }
+    if !techniques.subject_mask_loss {
+        check_train_refuses(
+            make,
+            subject_masked(&base_request(profile)),
+            "subject-masked loss",
+        )?;
+    }
+    Ok(())
+}
+
+/// `train()` on a fresh trainer must refuse `req` (which turns on the undeclared `technique`) with
+/// a typed `Unsupported` before emitting any caching/training/saving progress.
+fn check_train_refuses(
+    make: &dyn Fn() -> Box<dyn Trainer>,
+    req: TrainingRequest,
+    technique: &str,
+) -> Result<(), String> {
     let mut t = make();
     let id = t.descriptor().id;
-    if t.descriptor().techniques.weight_noise {
-        return Ok(());
-    }
-    let mut req = base_request(profile);
-    req.config.weight_noise_sigma = WEIGHT_NOISE_PROBE_SIGMA;
     let mut started = false;
     let result = t.train(&req, &mut |p| {
         if matches!(
@@ -282,16 +356,16 @@ pub fn check_trainer_technique_refusal(
     match result {
         Err(Error::Unsupported(_)) if !started => Ok(()),
         Err(Error::Unsupported(_)) => Err(format!(
-            "technique-refusal[{id}]: train() refused weight noise only after training had started \
+            "technique-refusal[{id}]: train() refused {technique} only after training had started \
              (caching/training/saving progress was emitted) — refuse before any work (E3)"
         )),
         Ok(out) => Err(format!(
-            "technique-refusal[{id}]: train() ran {} steps with weight_noise_sigma > 0 despite \
-             techniques.weight_noise == false — the knob was silently ignored (E3)",
+            "technique-refusal[{id}]: train() ran {} steps with {technique} on despite the trainer \
+             not declaring it — the knob was silently ignored (E3)",
             out.steps
         )),
         Err(other) => Err(format!(
-            "technique-refusal[{id}]: train() with an unsupported weight-noise request must return \
+            "technique-refusal[{id}]: train() with an unsupported {technique} request must return \
              a typed Err(Error::Unsupported), got {other:?}"
         )),
     }

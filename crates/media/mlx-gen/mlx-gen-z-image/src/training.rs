@@ -41,7 +41,9 @@ use mlx_gen::train::lora::{
 // Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
 // unchanged (the host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
 pub use mlx_gen::train::lora::LoraTarget;
+use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::CropBox;
 use mlx_gen::{
     FlowMatchEuler, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
     TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -117,7 +119,10 @@ fn trainer_descriptor() -> TrainerDescriptor {
         max_reference_images: 0,
         // sc-24826 (epic 2123): honors `weight_noise_sigma` — `apply_weight_noise` after every
         // optimizer update.
-        techniques: gen_core::train::TrainingTechniques { weight_noise: true },
+        techniques: gen_core::train::TrainingTechniques {
+            weight_noise: true,
+            subject_mask_loss: true,
+        },
     }
 }
 
@@ -323,7 +328,9 @@ impl ZImageTurboTrainer {
         // --- prepare → load → cache: VAE-latents + prompt-embeds into memory before the loop ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len());
+        // Per item: clean latent, caption embeds, and (subject-masked loss, sc-24828) the latent
+        // loss-weight map — `None` when the technique is off.
+        let mut cache: Vec<(Array, Array, Option<Array>)> = Vec::with_capacity(req.items.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -334,6 +341,13 @@ impl ZImageTurboTrainer {
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
             let x0 = encode_init_latents(&self.vae, &img, edge, edge)?; // clean latent [16,1,h,w]
+            let mask_weight = item_subject_mask_weight(
+                "z_image_turbo trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+                CropBox::center_square,
+                x0.shape(),
+            )?;
             let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "z_image_turbo trainer: text encoder already freed (caching after train loop)"
@@ -349,7 +363,7 @@ impl ZImageTurboTrainer {
                 None,
             )?;
             eval([&x0, &cap])?;
-            cache.push((x0, cap));
+            cache.push((x0, cap, mask_weight));
         }
         if cache.is_empty() {
             // sc-4895 — disambiguate the two ways the cache ends up empty. A cancel tripped during
@@ -523,7 +537,7 @@ impl ZImageTurboTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, cap) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, cap, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
             let sigma = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -548,6 +562,7 @@ impl ZImageTurboTrainer {
                 sigma,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 checkpoint_main,
                 compute_dtype,
             )?;
@@ -852,10 +867,12 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     checkpoint_main: Option<&[Vec<String>]>,
     dtype: Dtype,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
+    let mask_weight = mask_weight.cloned();
     let x_t = x_t.as_dtype(dtype)?; // no-op in f32 mode
     let capf = cap.clone();
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
@@ -890,13 +907,9 @@ fn compute_loss_grads(
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
         let diff = subtract(&v, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -1011,6 +1024,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             checkpoint_main,
             dtype,
         )?;
@@ -1121,6 +1135,7 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 None,
                 Dtype::Float32,
             )
@@ -1274,6 +1289,7 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 ck,
                 Dtype::Float32,
             )
@@ -1337,6 +1353,7 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 None,
                 Dtype::Float32,
             )
@@ -1456,6 +1473,7 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 None,
                 dt,
             )
@@ -1613,6 +1631,7 @@ mod validate_request_tests {
                     control_image_path: None,
                     model_options: Default::default(),
                     reference_image_paths: Vec::new(),
+                    subject_mask_path: None,
                 })
                 .collect(),
             config: TrainingConfig {
@@ -1813,5 +1832,11 @@ mod weight_noise_update_tests {
     #[test]
     fn descriptor_declares_weight_noise() {
         assert!(trainer_descriptor().techniques.weight_noise);
+    }
+
+    /// sc-24828: Z-Image MLX honours subject-masked loss (cache + `reduce_loss` in the closure).
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
     }
 }

@@ -195,7 +195,12 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-24828 (epic 2123): subject-masked ε loss, wired in the shared SDXL-family
+        // `train_family` this trainer drives (same NHWC latent cache, same loss closure).
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -335,6 +340,13 @@ mod preflight_tests {
     fn projection_monotonic_and_bf16_below_f32() {
         assert!(projected_dense_peak_gb(4096.0, false) < projected_dense_peak_gb(16384.0, false));
         assert!(projected_dense_peak_gb(16384.0, true) < projected_dense_peak_gb(16384.0, false));
+    }
+
+    /// sc-24828: Kolors declares subject-masked loss — it trains through the shared SDXL-family
+    /// `train_family`, whose cache and loss closure carry the mask weight.
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(super::trainer_descriptor().techniques.subject_mask_loss);
     }
 }
 
@@ -484,6 +496,7 @@ mod first_step_repro {
             TrainTimestep::Index(500),
             &noise,
             false,
+            None,
             dtype,
             checkpoint_targets,
         )?;
@@ -590,6 +603,7 @@ mod first_step_repro {
                 TrainTimestep::Index(500),
                 &noise,
                 false,
+                None,
                 Dtype::Float32,
                 ck,
             )
@@ -643,6 +657,7 @@ mod first_step_repro {
                     TrainTimestep::Index(500),
                     &noise,
                     false,
+                    None,
                     dt,
                     None,
                 )

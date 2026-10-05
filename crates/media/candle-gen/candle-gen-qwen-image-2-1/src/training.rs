@@ -88,6 +88,7 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
+use candle_gen::gen_core::train::subject_mask::CropBox;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
     TrainingRequest,
@@ -101,8 +102,9 @@ use candle_gen::train::checkpoint::{
 };
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
-    self, apply_update, create_output_dir, effective_weight_decay, request_fingerprint,
-    sample_seed, save_adapter, validate_flow_match_request, velocity_loss,
+    self, apply_update, create_output_dir, effective_weight_decay, item_subject_mask_weight,
+    request_fingerprint, sample_seed, save_adapter, validate_flow_match_request,
+    weighted_velocity_loss,
 };
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward_with_input_grad, Segment};
 use candle_gen::train::lora::{
@@ -837,7 +839,11 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Instruction-edit datasets (sc-24162), capped at the render path's own reference limit —
         // the one constant `collect_references`/`validate_reference_count` enforce.
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // Subject-masked loss (sc-24828) on the target latent of both t2i and edit items.
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -1459,6 +1465,56 @@ fn encode_item_target(
     }
 }
 
+/// An item's subject-mask loss weight (sc-24828), aligned token-for-token with its packed target
+/// latent `x0` (`[1, h·w, C]`): `None` when subject-masked loss is off (no file read). The mask is
+/// cropped exactly as [`encode_item_target`] crops the target — a captioned item's centre square
+/// ([`CropBox::center_square`]), an edit pair's whole picture ([`CropBox::full`], the target is
+/// resized without a crop) — area-averaged onto the target's unpacked `[1, 1, h, w]` latent grid,
+/// then flattened by the target's own [`pack_latents`] to `[1, h·w, 1]` (broadcast over `C`). Only
+/// target tokens enter the loss (the DiT returns the target block), so references stay unweighted
+/// and excluded, as before.
+fn item_target_mask_weight(
+    item: &TrainingItem,
+    cfg: Option<&gen_core::SubjectMaskLoss>,
+    edge: u32,
+    x0: &Tensor,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    if cfg.is_none() {
+        return Ok(None);
+    }
+    let edit = item.is_edit_pair();
+    let (width, height) = edit_target_size(item, edge)?;
+    let grid = [
+        1,
+        1,
+        (height / VAE_SCALE_FACTOR) as usize,
+        (width / VAE_SCALE_FACTOR) as usize,
+    ];
+    let crop = move |w, h| {
+        if edit {
+            CropBox::full(w, h)
+        } else {
+            CropBox::center_square(w, h)
+        }
+    };
+    let Some(weight) = item_subject_mask_weight(LABEL, item, cfg, crop, &grid, device)? else {
+        return Ok(None);
+    };
+    let packed = pack_latents(&weight)?;
+    if packed.dim(1)? != x0.dim(1)? {
+        return Err(Error::Msg(format!(
+            "{LABEL}: subject mask grid {}x{} ({} tokens) does not match the packed target latent \
+             {:?}",
+            grid[2],
+            grid[3],
+            packed.dim(1)?,
+            x0.dims()
+        )));
+    }
+    Ok(Some(packed))
+}
+
 /// One prompt's [`JointBranch`] through the render path's own assembly — the tower's
 /// [`QwenImage21TextEncoder::encode_conditioning`] (the image-conditioned template with vision
 /// tokens when `references` is non-empty, the text-to-image template otherwise) then
@@ -1530,6 +1586,8 @@ struct Cached {
     layout: JointLayout,
     /// Packed reference latents, in reference order (empty for text-to-image).
     references: Vec<Tensor>,
+    /// Subject-mask loss weight `[1, h·w, 1]` over the target tokens (sc-24828); `None` when off.
+    mask_weight: Option<Tensor>,
 }
 
 /// `candle_core::Error` from the crate error, for the checkpoint segments' closures.
@@ -1549,6 +1607,8 @@ struct StepInputs<'a> {
     references: &'a [Tensor],
     noise: &'a Tensor,
     t: f32,
+    /// Subject-mask loss weight over the target tokens (sc-24828); `None` = unweighted.
+    mask_weight: Option<&'a Tensor>,
 }
 
 /// One micro-step's forward+backward over the trainable factors: build `x_t` at flow-match `t`,
@@ -1579,13 +1639,14 @@ fn compute_loss_grads(
         references,
         noise,
         t,
+        mask_weight,
     } = *step;
     let (x_t, target) = flow_match::build_batch(x0, noise, t as f64)?;
     let x_t = x_t.to_dtype(dit.compute_dtype())?;
     let images = joint_images(references, &x_t);
     if !checkpoint {
         let v = dit.forward_train_joint(text, &images, t, layout)?;
-        let loss = velocity_loss(&v, &target, mae)?;
+        let loss = weighted_velocity_loss(&v, &target, mask_weight, mae)?;
         let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         return Ok((value, loss.backward()?));
     }
@@ -1612,7 +1673,12 @@ fn compute_loss_grads(
         let v = dit
             .train_head(&state[0], &state[2], geometry)
             .map_err(to_core)?;
-        Ok(vec![velocity_loss(&v, target_ref, mae)?])
+        Ok(vec![weighted_velocity_loss(
+            &v,
+            target_ref,
+            mask_weight,
+            mae,
+        )?])
     }));
     let (loss, mut grads, cotangents) =
         checkpointed_backward_with_input_grad(&segments, &inputs, vars)?;
@@ -1949,12 +2015,15 @@ impl QwenImage21Trainer {
                 total,
             });
             let x0 = encode_item_target(&vae, item, edge, &device)?;
+            let mask_weight =
+                item_target_mask_weight(item, cfg.subject_mask_loss.as_ref(), edge, &x0, &device)?;
             let references = encode_item_references(&vae, vision.as_ref(), item, &device)?;
             cache.push(Cached {
                 x0,
                 text: branch.text,
                 layout: branch.layout,
                 references,
+                mask_weight,
             });
         }
         // Cancelled during caching: nothing has trained, so write nothing (and skip the DiT load).
@@ -2056,6 +2125,7 @@ impl QwenImage21Trainer {
                     references: &sample.references,
                     noise: &noise,
                     t,
+                    mask_weight: sample.mask_weight.as_ref(),
                 },
                 mae,
                 checkpointed,
@@ -3249,6 +3319,7 @@ mod tests {
                 references: &self.references,
                 noise: &self.noise,
                 t,
+                mask_weight: None,
             }
         }
     }
@@ -3308,6 +3379,7 @@ mod tests {
                 references: &[],
                 noise,
                 t,
+                mask_weight: None,
             },
             mae,
             checkpoint,
@@ -4588,6 +4660,145 @@ mod tests {
                  {losses:?}"
             );
         }
+    }
+
+    /// sc-24828: subject-masked loss reaches both backward paths for text-to-image AND edit steps.
+    /// An all-ones map is the unweighted loss; an all-zero map zeroes the loss and every adapter
+    /// gradient (dense and checkpointed — a path that dropped the weight would train on the
+    /// background); a half map is strictly between and matches across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let mut dit = dit_at(DType::F32);
+        let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
+        perturb(&set);
+        let (x0, ctx, noise) = fixed_batch(&dit);
+        let layout = t2i_layout();
+        let edit = fixed_edit_batch(&dit);
+        // The packed target weight `[1, 16, 1]` of a 4×4 latent grid, built as production does.
+        let map = |w: &[f32]| {
+            let grid =
+                flow_match::subject_mask_weight(w, 4, 4, &[1, 1, 4, 4], &Device::Cpu).unwrap();
+            pack_latents(&grid).unwrap()
+        };
+        for is_edit in [false, true] {
+            let run = |weight: Option<&Tensor>, checkpoint: bool| {
+                let step = if is_edit {
+                    StepInputs {
+                        mask_weight: weight,
+                        ..edit.step(0.4)
+                    }
+                } else {
+                    StepInputs {
+                        x0: &x0,
+                        text: &ctx,
+                        layout: &layout,
+                        references: &[],
+                        noise: &noise,
+                        t: 0.4,
+                        mask_weight: weight,
+                    }
+                };
+                compute_loss_grads(&dit, &set.vars, &step, false, checkpoint).unwrap()
+            };
+            let (plain, _) = run(None, false);
+            let ones = map(&[1.0; 16]);
+            assert!((run(Some(&ones), false).0 - plain).abs() <= 1e-6 * plain.max(1.0));
+            let zeros = map(&[0.0; 16]);
+            for checkpoint in [false, true] {
+                let (loss, grads) = run(Some(&zeros), checkpoint);
+                assert_eq!(
+                    loss, 0.0,
+                    "edit={is_edit} ckpt={checkpoint}: loss must be zero"
+                );
+                for v in &set.vars {
+                    if let Some(g) = grads.get(v.as_tensor()) {
+                        let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                        assert!(
+                            g.iter().all(|x| *x == 0.0),
+                            "edit={is_edit} ckpt={checkpoint}: nonzero adapter grad"
+                        );
+                    }
+                }
+            }
+            let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+            let half = map(&half);
+            let (dense, _) = run(Some(&half), false);
+            let (ckpt, _) = run(Some(&half), true);
+            assert!(
+                dense > 0.0 && dense < plain,
+                "edit={is_edit}: {dense} vs {plain}"
+            );
+            assert!(
+                (dense - ckpt).abs() <= 1e-5 * dense.max(1.0),
+                "edit={is_edit}: dense {dense} vs checkpoint {ckpt}"
+            );
+        }
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-24828: the cached weight lines up token-for-token with the packed target latent, cropped
+    /// the way the target is — a captioned item's centre square, an edit pair's whole (uncropped,
+    /// aspect-fit) picture on a non-square latent grid — and is `None` (no file read) when off.
+    #[test]
+    fn subject_mask_weight_is_cropped_and_packed_like_the_target() {
+        let dir = scratch("subject_mask");
+        let cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.25,
+            subject_weight: 1.0,
+        };
+        let write = |name: &str, w: u32, h: u32, subject_x: u32| {
+            let img = dir.path().join(format!("{name}.png"));
+            image::RgbImage::from_pixel(w, h, image::Rgb([90, 120, 150]))
+                .save(&img)
+                .unwrap();
+            let mask = dir.path().join(format!("{name}_mask.png"));
+            image::GrayImage::from_fn(w, h, |x, _| {
+                image::Luma([if x < subject_x { 255 } else { 0 }])
+            })
+            .save(&mask)
+            .unwrap();
+            (img, mask)
+        };
+        let values = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let close = |got: &[f32], want: &[f32]| {
+            assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 1e-5, "{got:?} vs {want:?}");
+            }
+        };
+
+        // Captioned 40×36 at edge 32: centre square x∈[2, 38) on a 2×2 grid. Subject x < 11 covers
+        // 9 of column 0's 18 px ⇒ m = 0.5 ⇒ w = 0.625 (a stretched full frame would give 0.6625).
+        let (img, mask) = write("t2i", 40, 36, 11);
+        let mut item = TrainingItem::captioned(img, "a swatch".into());
+        item.subject_mask_path = Some(mask);
+        let x0 = Tensor::zeros((1, 4, 3), DType::F32, &Device::Cpu).unwrap();
+        assert!(item_target_mask_weight(&item, None, 32, &x0, &Device::Cpu)
+            .unwrap()
+            .is_none());
+        let w = item_target_mask_weight(&item, Some(&cfg), 32, &x0, &Device::Cpu)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.dims(), &[1, 4, 1]);
+        close(&values(&w), &[0.625, 0.25, 0.625, 0.25]);
+
+        // Edit pair 64×32 at edge 64: aspect fit 96×32 ⇒ a 2×6 grid (12 tokens, row-major), the
+        // whole picture stretched. Subject x < 16: column 0 (x∈[0, 10.67)) is all subject, column 1
+        // half ⇒ 0.625; a centre-square crop (x∈[16, 48)) would hold no subject at all.
+        let (img, mask) = write("edit", 64, 32, 16);
+        let mut item = TrainingItem::edit_pair(img, "make it blue".into(), vec!["ref.png".into()]);
+        item.subject_mask_path = Some(mask);
+        assert_eq!(edit_target_size(&item, 64).unwrap(), (96, 32));
+        let x0 = Tensor::zeros((1, 12, 3), DType::F32, &Device::Cpu).unwrap();
+        let w = item_target_mask_weight(&item, Some(&cfg), 64, &x0, &Device::Cpu)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.dims(), &[1, 12, 1]);
+        let row = [1.0, 0.625, 0.25, 0.25, 0.25, 0.25];
+        close(&values(&w), &[row, row].concat());
+        // A target latent of another token count is refused rather than misaligned.
+        let wrong = Tensor::zeros((1, 16, 3), DType::F32, &Device::Cpu).unwrap();
+        assert!(item_target_mask_weight(&item, Some(&cfg), 64, &wrong, &Device::Cpu).is_err());
     }
 
     /// The gradient-checkpointed joint backward is the dense one on an **edit** layout too: same

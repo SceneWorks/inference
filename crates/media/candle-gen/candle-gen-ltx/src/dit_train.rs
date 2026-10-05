@@ -438,7 +438,7 @@ impl LoraHost for LtxDiT {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::AvConfig;
     use crate::transformer::AvDiT;
@@ -451,7 +451,7 @@ mod tests {
     use candle_gen::train::optim::TrainOptimizer;
     use std::collections::HashMap;
 
-    fn tiny_cfg() -> AvConfig {
+    pub(crate) fn tiny_cfg() -> AvConfig {
         AvConfig {
             video: TransformerConfig {
                 num_layers: 1,
@@ -550,7 +550,7 @@ mod tests {
         put_linear(map, &format!("{key}.net.2"), inner, 2 * inner, dev);
     }
 
-    fn weights(cfg: &AvConfig, dev: &Device) -> HashMap<String, Tensor> {
+    pub(crate) fn weights(cfg: &AvConfig, dev: &Device) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         let vi = cfg.video.inner_dim();
         let ai = cfg.audio_inner();

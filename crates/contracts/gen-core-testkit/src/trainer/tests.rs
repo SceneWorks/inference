@@ -221,6 +221,7 @@ fn item(name: &str) -> TrainingItem {
         control_image_path: None,
         model_options: Default::default(),
         reference_image_paths: Vec::new(),
+        subject_mask_path: None,
     }
 }
 
@@ -464,4 +465,46 @@ fn declared_but_rejected_weight_noise_fails_the_validate_check() {
         err.contains("techniques.weight_noise == true"),
         "got: {err}"
     );
+}
+
+/// sc-24828: a trainer that does not declare subject-masked loss but silently accepts it fails
+/// the validate check AND the train-entry refusal check (weight noise is declared here so the
+/// earlier weight-noise probe does not mask the subject-mask failure).
+#[test]
+fn silently_ignored_subject_mask_loss_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques.weight_noise = true;
+        stub
+    };
+    let err = check_trainer_validate(&make(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.subject_mask_loss == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(
+        &|| -> Box<dyn Trainer> { Box::new(make()) },
+        &profile(&tmp),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("subject-masked loss") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-24828: a trainer that declares subject-masked loss passes every check — it accepts a fully
+/// masked request and (through the shared floor) refuses one with an unmasked item.
+#[test]
+fn declared_subject_mask_loss_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.subject_mask_loss = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+    trainer_conformance(make, &profile(&tmp));
 }

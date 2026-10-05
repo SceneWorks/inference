@@ -197,6 +197,90 @@ pub fn velocity_loss(v: &Tensor, target: &Tensor, mae: bool) -> candle_core::Res
     }
 }
 
+/// [`velocity_loss`] with optional **subject-mask loss weighting** (epic 2123, sc-24828): with
+/// `weight = None` it IS [`velocity_loss`] (bit-identical); with a weight map `w` (broadcastable to
+/// `v`, built at cache time by [`subject_mask_weight`]) the per-element loss is multiplied by `w`
+/// **before** the mean — `mean(w ⊙ ℓ)`, the convention of
+/// [`gen_core::train::subject_mask`] shared with the MLX
+/// trainers — so an element with `w = 0` contributes zero loss and zero gradient. The same weighting
+/// serves an ε-prediction loss (the "velocity" is then the predicted noise and `target` the noise).
+pub fn weighted_velocity_loss(
+    v: &Tensor,
+    target: &Tensor,
+    weight: Option<&Tensor>,
+    mae: bool,
+) -> candle_core::Result<Tensor> {
+    let Some(weight) = weight else {
+        return velocity_loss(v, target, mae);
+    };
+    let diff = (v.to_dtype(DType::F32)? - target)?;
+    let per = if mae { diff.abs()? } else { diff.sqr()? };
+    per.broadcast_mul(weight)?.mean_all()
+}
+
+/// Turn a row-major `[grid_h, grid_w]` latent weight map (from
+/// [`subject_mask_latent_weights`](crate::gen_core::train::subject_mask::subject_mask_latent_weights))
+/// into an f32 tensor on `device` broadcast to `latent_shape`, whose **last two axes** are the latent
+/// `(H, W)` grid — the shape of the cached clean latent, so a trainer that packs its latent into
+/// tokens packs this tensor with the very same function.
+pub fn subject_mask_weight(
+    weights: &[f32],
+    grid_h: usize,
+    grid_w: usize,
+    latent_shape: &[usize],
+    device: &Device,
+) -> Result<Tensor> {
+    let n = latent_shape.len();
+    if n < 2
+        || latent_shape[n - 2] != grid_h
+        || latent_shape[n - 1] != grid_w
+        || weights.len() != grid_h * grid_w
+    {
+        return Err(CandleError::Msg(format!(
+            "subject mask weight map {grid_h}x{grid_w} ({} values) does not match latent shape \
+             {latent_shape:?}",
+            weights.len()
+        )));
+    }
+    let mut lead = vec![1usize; n - 2];
+    lead.extend([grid_h, grid_w]);
+    let w = Tensor::from_vec(weights.to_vec(), lead, &Device::Cpu)?;
+    Ok(w.broadcast_as(latent_shape)?
+        .contiguous()?
+        .to_device(device)?)
+}
+
+/// The cache-time entry point every candle trainer calls once per item (sc-24828): `None` when
+/// subject-masked loss is off (no file is read), else the item's latent weight map — its mask
+/// cropped with `crop_of(image_w, image_h)` (the trainer's own crop rule, e.g.
+/// [`CropBox::center_square`](crate::gen_core::train::subject_mask::CropBox::center_square)),
+/// area-averaged onto the last two axes of `latent_shape` and broadcast to `latent_shape` on
+/// `device` (see [`subject_mask_weight`]). Refusals (missing / mis-sized / empty mask) name the
+/// image.
+pub fn item_subject_mask_weight(
+    label: &str,
+    item: &crate::gen_core::TrainingItem,
+    cfg: Option<&crate::gen_core::SubjectMaskLoss>,
+    crop_of: impl FnOnce(u32, u32) -> crate::gen_core::train::subject_mask::CropBox,
+    latent_shape: &[usize],
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    let n = latent_shape.len();
+    if n < 2 {
+        return Err(CandleError::Msg(format!(
+            "{label}: subject mask needs a latent with a spatial grid, got shape {latent_shape:?}"
+        )));
+    }
+    let (grid_h, grid_w) = (latent_shape[n - 2], latent_shape[n - 1]);
+    let weights = crate::gen_core::train::subject_mask::subject_mask_latent_weights(
+        label, item, cfg, crop_of, grid_w, grid_h,
+    )?;
+    subject_mask_weight(&weights, grid_h, grid_w, latent_shape, device).map(Some)
+}
+
 /// Deterministic `N(0, 1)` noise of the given shape, drawn from a seeded CPU `StdRng` then moved to
 /// `device` (sc-3673 launch-portable discipline). The flow-match prior + the regression target.
 pub fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
@@ -882,6 +966,80 @@ mod tests {
         assert!((mae - 1.5).abs() < 1e-6, "mae {mae}"); // (1+2)/2
     }
 
+    /// AC (sc-24828): with background weight 0, latent elements outside the mask contribute zero
+    /// loss AND zero gradient w.r.t. the prediction (the gradient tensor is checked per element).
+    #[test]
+    fn zero_background_weight_zeroes_loss_and_gradient_outside_the_mask() {
+        let dev = Device::Cpu;
+        let (h, w) = (4usize, 4usize);
+        let shape = [2usize, h, w];
+        let weights: Vec<f32> = (0..h * w)
+            .map(|i| if i % w < 2 { 1.0 } else { 0.0 })
+            .collect();
+        let wmap = subject_mask_weight(&weights, h, w, &shape, &dev).unwrap();
+        let pred_data = sample_noise(&shape, 1, &dev).unwrap();
+        let target = sample_noise(&shape, 2, &dev).unwrap();
+        let p = pred_data.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let t = target.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for mae in [false, true] {
+            let pred = candle_core::Var::from_tensor(&pred_data).unwrap();
+            let loss = weighted_velocity_loss(pred.as_tensor(), &target, Some(&wmap), mae).unwrap();
+            let grads = loss.backward().unwrap();
+            let grad = grads
+                .get(pred.as_tensor())
+                .expect("prediction gradient")
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut expected = 0f32;
+            for (i, g) in grad.iter().enumerate() {
+                let d = p[i] - t[i];
+                if i % w >= 2 {
+                    assert_eq!(
+                        *g, 0.0,
+                        "mae={mae}: background element {i} has gradient {g}"
+                    );
+                } else {
+                    assert_ne!(*g, 0.0, "mae={mae}: subject element {i} has no gradient");
+                    expected += if mae { d.abs() } else { d * d };
+                }
+            }
+            expected /= grad.len() as f32;
+            let loss = loss.to_scalar::<f32>().unwrap();
+            assert!(
+                (loss - expected).abs() < 1e-5,
+                "mae={mae}: {loss} != {expected}"
+            );
+        }
+    }
+
+    /// Mask off ⇒ exactly `velocity_loss`; an all-ones map gives the same value.
+    #[test]
+    fn weighted_velocity_loss_without_weight_is_velocity_loss() {
+        let dev = Device::Cpu;
+        let v = sample_noise(&[3, 2, 5], 3, &dev).unwrap();
+        let target = sample_noise(&[3, 2, 5], 4, &dev).unwrap();
+        let ones = subject_mask_weight(&[1.0; 10], 2, 5, &[3, 2, 5], &dev).unwrap();
+        for mae in [false, true] {
+            let legacy = velocity_loss(&v, &target, mae)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let off = weighted_velocity_loss(&v, &target, None, mae)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert_eq!(off.to_bits(), legacy.to_bits());
+            let on = weighted_velocity_loss(&v, &target, Some(&ones), mae)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!((on - legacy).abs() < 1e-6);
+        }
+        assert!(subject_mask_weight(&[0.0; 4], 2, 2, &[3, 2, 3], &dev).is_err());
+    }
+
     /// `sample_noise` is deterministic in its seed and shaped as requested.
     #[test]
     fn sample_noise_deterministic() {
@@ -1096,6 +1254,7 @@ mod tests {
                         control_image_path: None,
                         model_options: Default::default(),
                         reference_image_paths: Vec::new(),
+                        subject_mask_path: None,
                     }
                 })
                 .collect(),

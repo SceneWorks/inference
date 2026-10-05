@@ -46,7 +46,9 @@ use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{accumulate_grads, average_grads, LoraParams};
+use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::CropBox;
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
     gen_core, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
@@ -1921,8 +1923,32 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-24828 (epic 2123): LTX-2.3 trains on decoded, centre-cropped images and honours the
+        // subject-masked loss. LTX-2.5 trains only on preprocessed latent bundles with no image
+        // aligned to the latent, so it does not declare it (refused with the reason by
+        // [`refuse_ltx25_subject_mask`]).
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: id == MODEL_ID,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
+}
+
+/// sc-24828 — LTX-2.5 cannot honour subject-masked loss: every one of its workflows trains on a
+/// preprocessed video/audio latent bundle (`model_options`), with no decodable image whose crop is
+/// aligned to the latent, so a single image mask has nothing to line up with. A typed
+/// `Unsupported` naming that reason, raised by `validate`, the start of `train` (before any
+/// caching) and the weights-free [`validate_ltx25_training_request`] preflight — ahead of the
+/// generic technique floor, so the caller sees why.
+fn refuse_ltx25_subject_mask(id: &str, req: &TrainingRequest) -> gen_core::Result<()> {
+    if id == MODEL_25_ID && req.config.subject_mask_loss.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id} trainer: subject-masked loss needs a training image aligned to the latent, but \
+             LTX-2.5 trains on preprocessed video/audio latent bundles that carry none; turn \
+             subject-masked loss off for this trainer"
+        )));
+    }
+    Ok(())
 }
 
 /// Construct the trainer from an LTX-2.3 split-weight snapshot directory (transformer / VAE /
@@ -2131,6 +2157,7 @@ fn validate_request(req: &TrainingRequest, label: &str) -> Result<()> {
 /// [`LtxTrainer::validate`], so preflight and execution cannot drift.
 pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     let descriptor = trainer_descriptor_25();
+    refuse_ltx25_subject_mask(descriptor.id, req)?;
     // The shared floors keep their typed variant across the seam (`?` maps
     // `gen_core::Error::Unsupported` 1:1): a capability gap must stay `Unsupported` for the worker,
     // never be flattened to a message (sc-24161).
@@ -2168,6 +2195,7 @@ impl Trainer for LtxTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        refuse_ltx25_subject_mask(self.descriptor.id, req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
@@ -2199,6 +2227,7 @@ impl Trainer for LtxTrainer {
     ) -> gen_core::Result<TrainingOutput> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        refuse_ltx25_subject_mask(self.descriptor.id, req)?;
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
@@ -2260,7 +2289,9 @@ impl LtxTrainer {
         // --- prepare → load → cache: normalized latents + prompt embeds (then free the TE) ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len());
+        // Per item: patchified clean latent, prompt embeds, and (subject-masked loss, sc-24828) the
+        // patchified latent loss-weight map — `None` when the technique is off.
+        let mut cache: Vec<(Array, Array, Option<Array>)> = Vec::with_capacity(req.items.len());
         // sc-5637 — preview-sample prompts, pre-encoded inside the `te`/`tok` scope below (the Gemma
         // encoder is freed before the train loop). LTX is distilled (no CFG) → one ctx per prompt.
         let mut sample_ctxs: Vec<(String, Array)> = Vec::new();
@@ -2284,10 +2315,22 @@ impl LtxTrainer {
                 let prep = preprocess_conditioning_image(&img, edge, edge)?; // (1,3,1,edge,edge)
                 let latent = self.vae.encode(&prep)?; // (1,128,1,le,le), normalized, f32
                 let clean = flatten_latent(&latent)?; // (1, S, 128)
+
+                // The mask takes the image's `center_crop_square` box, is built on the unpatchified
+                // `(1,128,1,le,le)` latent and patchified by the same `flatten_latent` → `(1,S,128)`.
+                let mask_weight = item_subject_mask_weight(
+                    "ltx_2_3 trainer",
+                    item,
+                    cfg.subject_mask_loss.as_ref(),
+                    CropBox::center_square,
+                    latent.shape(),
+                )?
+                .map(|w| flatten_latent(&w))
+                .transpose()?;
                 let (ids, mask) = tok.encode(&item.caption, MAX_PROMPT_TOKENS)?;
                 let ctx = to_dtype(&te.encode(&ids, &mask)?, Dtype::Float32)?; // (1, L, 4096)
-                eval([&clean, &ctx])?;
-                cache.push((clean, ctx));
+                eval([&clean, &ctx].into_iter().chain(mask_weight.as_ref()))?;
+                cache.push((clean, ctx, mask_weight));
             }
             // sc-5637 — pre-encode the preview-sample prompts while the encoder is still resident.
             if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !req.cancel.is_cancelled()
@@ -2410,7 +2453,7 @@ impl LtxTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (clean, ctx) = &cache[((step - 1) as usize) % cache.len()];
+            let (clean, ctx, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
             // σ ~ U(1e-3, 1-1e-3), deterministic in seed (the reference's uniform timestep).
             let sigma = {
                 let k = random::key(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64))?;
@@ -2436,6 +2479,7 @@ impl LtxTrainer {
                 sigma,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 checkpoint_block,
                 compute_dtype,
             )?;
@@ -3298,8 +3342,9 @@ fn install_train_lora(
         let b = params[&t.b_key]
             .t()
             .multiply(Array::from_slice(&[alpha / rank], &[1]))?; // [out,r] -> [r,out] · (α/r)
-                                                                  // sc-4942 — under the bf16 training cast the f32 factors must join the bf16 stream, or every
-                                                                  // adapted Linear re-promotes its block to f32 (defeating the activation saving). No-op in f32.
+
+        // sc-4942 — under the bf16 training cast the f32 factors must join the bf16 stream, or every
+        // adapted Linear re-promotes its block to f32 (defeating the activation saving). No-op in f32.
         let (a, b) = match lora_dtype {
             Some(dt) => (a.as_dtype(dt)?, b.as_dtype(dt)?),
             None => (a, b),
@@ -3362,6 +3407,7 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     checkpoint_block: Option<&[Vec<BlockLoraRef>]>,
     dtype: Dtype,
 ) -> Result<(f32, LoraParams)> {
@@ -3374,6 +3420,7 @@ fn compute_loss_grads(
     let timestep = Array::from_slice(&[sigma], &[1, 1]); // (B, 1), broadcast over tokens
     let ctx = context.clone();
     let pos = positions.clone();
+    let mask_weight = mask_weight.cloned();
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
         let v = match checkpoint_block {
@@ -3389,13 +3436,9 @@ fn compute_loss_grads(
             }
         };
         let diff = subtract(&v, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent). Dense and block-checkpointed forwards both land here.
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -3762,6 +3805,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             ck,
             dtype,
         )?;
@@ -3830,6 +3874,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             ck,
             dtype,
         )
@@ -4212,6 +4257,7 @@ mod validate_request_tests {
                     control_image_path: None,
                     model_options: serde_json::Map::new(),
                     reference_image_paths: Vec::new(),
+                    subject_mask_path: None,
                 })
                 .collect(),
             config: TrainingConfig::default(),
@@ -4238,6 +4284,70 @@ mod validate_request_tests {
         let mut r = request(1);
         r.config.optimizer = "sgd".into();
         assert!(validate_request(&r, "ltx_2_3 trainer").is_err()); // unsupported optimizer
+    }
+
+    fn masked_request() -> TrainingRequest {
+        let mut r = request(1);
+        r.items[0].subject_mask_path = Some(PathBuf::from("img0.mask.png"));
+        r.config.subject_mask_loss = Some(mlx_gen::gen_core::SubjectMaskLoss {
+            background_weight: 0.1,
+            subject_weight: 1.0,
+        });
+        r
+    }
+
+    /// sc-24828: LTX-2.3 (decoded, centre-cropped images) declares subject-masked loss; LTX-2.5
+    /// (preprocessed latent bundles only) does not, and refuses it with a typed `Unsupported` that
+    /// names the reason — from the shared refusal `validate`/`train` call and from the weights-free
+    /// preflight, before any bundle is read.
+    #[test]
+    fn subject_mask_loss_is_ltx23_only_and_ltx25_refuses_it_by_name() {
+        assert!(super::trainer_descriptor().techniques.subject_mask_loss);
+        assert!(!super::trainer_descriptor_25().techniques.subject_mask_loss);
+        let masked = masked_request();
+        assert!(super::refuse_ltx25_subject_mask(super::MODEL_ID, &masked).is_ok());
+        assert!(super::refuse_ltx25_subject_mask(super::MODEL_25_ID, &request(1)).is_ok());
+        match super::refuse_ltx25_subject_mask(super::MODEL_25_ID, &masked) {
+            Err(mlx_gen::gen_core::Error::Unsupported(message)) => {
+                assert!(message.contains("preprocessed"), "{message}")
+            }
+            other => panic!("expected a typed Unsupported, got {other:?}"),
+        }
+        match super::validate_ltx25_training_request(&masked) {
+            Err(mlx_gen::Error::Unsupported(message)) => {
+                assert!(message.contains("subject-masked loss"), "{message}")
+            }
+            other => panic!("expected a typed Unsupported, got {other:?}"),
+        }
+        // The 2.3 descriptor passes the shared technique floor with the mask on.
+        assert!(mlx_gen::gen_core::train::validate_training_techniques(
+            &super::trainer_descriptor(),
+            &masked
+        )
+        .is_ok());
+    }
+
+    /// sc-24828: the LTX-2.3 weight is built on the unpatchified `(1, C, 1, le, le)` latent and run
+    /// through the trainer's own [`super::flatten_latent`], so it lines up token-for-token with the
+    /// patchified clean latent: cell `(y, x)` (value `y·10 + x`) lands on every channel of token
+    /// `y·le_w + x`.
+    #[test]
+    fn flattened_subject_weight_lines_up_with_the_patchified_latent() {
+        let (c, h, w) = (3i32, 2usize, 3usize);
+        let values: Vec<f32> = (0..h * w).map(|i| ((i / w) * 10 + i % w) as f32).collect();
+        let shape = [1, c, 1, h as i32, w as i32];
+        let weight = mlx_gen::train::loss::subject_mask_weight(&values, h, w, &shape).unwrap();
+        let flat = super::flatten_latent(&weight).unwrap();
+        assert_eq!(flat.shape(), &[1, (h * w) as i32, c]);
+        // Row-major copy (the patchify is a strided view).
+        let flat = flat.reshape(&[-1]).unwrap();
+        let flat = flat.as_slice::<f32>();
+        for token in 0..h * w {
+            for ch in 0..c as usize {
+                let want = ((token / w) * 10 + token % w) as f32;
+                assert_eq!(flat[token * c as usize + ch], want, "token {token} ch {ch}");
+            }
+        }
     }
 
     #[test]

@@ -62,7 +62,9 @@ use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
     TrainAdapter,
 };
+use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::CropBox;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
@@ -74,7 +76,7 @@ use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
-use crate::config::{MageFlowConfig, FAMILY, LATENT_CHANNELS, VAE_DOWNSAMPLE_FACTOR};
+use crate::config::{MageFlowConfig, FAMILY, VAE_DOWNSAMPLE_FACTOR};
 use crate::latent::GsKey;
 use crate::pipeline::{denoise, encode_noise_tokens, generation_layout, mage_flow_sigmas};
 use crate::rope_embedder::{ImgShape, MsRope, PackContext, PackLayout};
@@ -123,12 +125,24 @@ fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f
 }
 
 /// A cached training sample: the clean VAE-latent tokens `[1, gh·gw, 128]`, the encoded conditioning
-/// `[1, txt_tokens, hidden]`, and its post-drop token count (native-resolution packing is per-sample,
-/// so each caption keeps its own length).
+/// `[1, txt_tokens, hidden]`, its post-drop token count (native-resolution packing is per-sample,
+/// so each caption keeps its own length), and (subject-masked loss, sc-24828) the latent loss-weight
+/// map in the same token layout as `latent_tokens` — `None` when the technique is off.
 struct CachedSample {
     latent_tokens: Array,
     txt: Array,
     txt_tokens: i32,
+    mask_weight: Option<Array>,
+}
+
+/// The Mage latent token layout: an NCHW latent grid `[1, C, gh, gw]` → `[1, gh·gw, C]` (one token
+/// per latent cell, row-major; `patch_size == 1`). Shared by the clean latent and its subject-mask
+/// weight so the two line up element-for-element.
+fn latent_grid_to_tokens(grid_nchw: &Array, grid: i32) -> Result<Array> {
+    let channels = grid_nchw.shape()[1]; // LATENT_CHANNELS in production
+    Ok(grid_nchw
+        .transpose_axes(&[0, 2, 3, 1])?
+        .reshape(&[1, grid * grid, channels])?)
 }
 
 /// One pre-encoded preview-sample prompt — `(prompt, txt embedding [1, tokens, hidden], token count)`.
@@ -178,7 +192,13 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // every DiT weight and writes a full checkpoint rather than an adapter.
         supports_full_finetune: true,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-24828 (epic 2123): honors `subject_mask_loss` on BOTH loss paths (LoRA/LoKr and the full
+        // base fine-tune); the weight is laid out in the same `[1, gh·gw, 128]` token order as the
+        // latent.
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -690,11 +710,19 @@ impl MageFlowTrainer {
             let nchw = preprocess_to_nchw(&img, edge)?;
             // Mage-VAE encode at t = 0 → posterior **mean** (`sample_posterior = false`), no latent
             // scale/shift. `[1, 128, gh, gw]` → token layout `[1, gh·gw, 128]`.
-            let latent_tokens = self
-                .vae
-                .encode_mean(&nchw)?
-                .transpose_axes(&[0, 2, 3, 1])?
-                .reshape(&[1, grid * grid, LATENT_CHANNELS])?;
+            let latent = self.vae.encode_mean(&nchw)?;
+            // The subject-mask weight is built on the UNPACKED `[1, 128, gh, gw]` grid and laid out
+            // into tokens exactly like the latent.
+            let mask_weight = item_subject_mask_weight(
+                "mage_flow_base trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+                CropBox::center_square,
+                latent.shape(),
+            )?
+            .map(|w| latent_grid_to_tokens(&w, grid))
+            .transpose()?;
+            let latent_tokens = latent_grid_to_tokens(&latent, grid)?;
             let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "mage_flow_base trainer: text encoder already freed (caching after loop)"
@@ -707,6 +735,7 @@ impl MageFlowTrainer {
                 latent_tokens,
                 txt,
                 txt_tokens,
+                mask_weight,
             });
         }
         if cache.is_empty() {
@@ -1056,6 +1085,7 @@ fn compute_full_loss_grads(
     let (x_t, target, _timestep) = build_batch(&sample.latent_tokens, noise, sigma)?;
     let sigma_arr = Array::from_slice(&[sigma], &[1]); // one entry per packed segment
     let txt = sample.txt.clone();
+    let mask_weight = sample.mask_weight.clone();
     let ctx = ctx.clone();
     let cfg = cfg.clone();
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
@@ -1070,14 +1100,10 @@ fn compute_full_loss_grads(
             .forward_train(&x_t, &txt, &sigma_arr, &ctx)
             .map_err(|e| Exception::custom(e.to_string()))?;
         let diff = subtract(&v, &target)?;
-        // `mean(None)` → 0-d scalar (grad needs a scalar cotangent). v(bf16 on the bf16 path) − target
-        // (f32) promotes to f32, so the loss/grads are f32 (master weights).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) → 0-d scalar (grad needs a scalar
+        // cotangent). v(bf16 on the bf16 path) − target (f32) promotes to f32, so the loss/grads are
+        // f32 (master weights).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -1239,6 +1265,7 @@ fn compute_loss_grads(
     let ctx = transformer.pack_context(layout)?;
     let sigma_arr = Array::from_slice(&[sigma], &[1]); // one entry per packed segment
     let txt = sample.txt.clone();
+    let mask_weight = sample.mask_weight.clone();
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
         // NEVER check the cancel flag inside this traced grad closure — it returns `MlxResult`, so an
@@ -1249,14 +1276,10 @@ fn compute_loss_grads(
             .forward_train(&x_t, &txt, &sigma_arr, &ctx)
             .map_err(|e| Exception::custom(e.to_string()))?;
         let diff = subtract(&v, &target)?;
-        // `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent). The v(bf16 on the
-        // bf16 path) − target(f32) subtract promotes to f32, so the loss/grads are f32 (master weights).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent). The v(bf16 on the bf16 path) − target(f32) subtract promotes
+        // to f32, so the loss/grads are f32 (master weights).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -1318,6 +1341,7 @@ fn render_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LATENT_CHANNELS;
     use mlx_gen::{CancelFlag, TrainingItem};
 
     fn base_request(
@@ -1486,6 +1510,7 @@ mod tests {
             latent_tokens,
             txt,
             txt_tokens,
+            mask_weight: None,
         };
         let noise = random::normal::<f32>(
             &[1, grid * grid, LATENT_CHANNELS],
@@ -1562,6 +1587,199 @@ mod tests {
         // the shared `validate_full_finetune_request` floor turns a `false` here into a typed reject of
         // every full-tune request, which would strand the capability behind its own capability flag.
         assert!(d.supports_full_finetune);
+        // sc-24828: subject-masked loss is wired into BOTH loss paths (LoRA/LoKr and full fine-tune).
+        assert!(d.techniques.subject_mask_loss);
+    }
+
+    /// sc-24828: the subject-mask weight reaches BOTH Mage loss paths — the LoRA
+    /// [`compute_loss_grads`] and the full fine-tune [`compute_full_loss_grads`] — on the checked-in
+    /// tiny `mage_flow_small` fixture DiT (no real weights). The weight is built on the unpacked
+    /// `[1, C, g, g]` grid and laid into tokens by the SAME [`latent_grid_to_tokens`] as the latent.
+    /// Per path: an all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0 and
+    /// all-zero grads; a half map lands strictly between. The half map's token layout is checked too
+    /// (token `y·g + x` carries the weight of latent cell `(y, x)` on every channel).
+    #[test]
+    fn subject_mask_weight_reaches_both_loss_paths() {
+        use mlx_gen::train::loss::subject_mask_weight;
+        let fx = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mage_flow_small.safetensors"
+        ))
+        .unwrap();
+        let mut model_w = Weights::empty();
+        for key in fx.keys().map(str::to_string).collect::<Vec<_>>() {
+            if let Some(rest) = key.strip_prefix("model.") {
+                model_w.insert(
+                    rest,
+                    fx.require(&key).unwrap().as_dtype(Dtype::Float32).unwrap(),
+                );
+            }
+        }
+        let c = fx
+            .require("config")
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()
+            .to_vec();
+        let dit_cfg = MageFlowConfig {
+            in_channels: c[0],
+            out_channels: c[1],
+            context_in_dim: c[2],
+            hidden_size: c[3],
+            num_heads: c[4],
+            depth: c[5] as usize,
+            patch_size: c[6],
+            axes_dim: c[7..10].to_vec(),
+            checkpoint: false,
+        };
+        dit_cfg.validate().unwrap();
+
+        let g = 4i32;
+        let n = (g * g) as usize;
+        let grid_shape = [1, dit_cfg.in_channels, g, g];
+        let latent =
+            random::normal::<f32>(&grid_shape, None, None, Some(&random::key(1).unwrap())).unwrap();
+        let latent_tokens = latent_grid_to_tokens(&latent, g).unwrap();
+        let txt_tokens = 3;
+        let txt = random::normal::<f32>(
+            &[1, txt_tokens, dit_cfg.context_in_dim],
+            None,
+            None,
+            Some(&random::key(2).unwrap()),
+        )
+        .unwrap();
+        let noise = random::normal::<f32>(
+            latent_tokens.shape(),
+            None,
+            None,
+            Some(&random::key(3).unwrap()),
+        )
+        .unwrap();
+        let sample_with = |v: Option<&[f32]>| CachedSample {
+            latent_tokens: latent_tokens.clone(),
+            txt: txt.clone(),
+            txt_tokens,
+            mask_weight: v.map(|v| {
+                latent_grid_to_tokens(
+                    &subject_mask_weight(v, g as usize, g as usize, &grid_shape).unwrap(),
+                    g,
+                )
+                .unwrap()
+            }),
+        };
+        let half: Vec<f32> = (0..n)
+            .map(|i| if (i as i32) % g < g / 2 { 1.0 } else { 0.0 })
+            .collect();
+        // Token layout of the half map: token `y·g + x`, every channel, = cell (y, x).
+        {
+            let w = sample_with(Some(&half)).mask_weight.unwrap();
+            assert_eq!(w.shape(), latent_tokens.shape());
+            let w = multiply(&w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = w.as_slice::<f32>();
+            let ch = dit_cfg.in_channels as usize;
+            for tok in 0..n {
+                for k in 0..ch {
+                    assert_eq!(v[tok * ch + k], half[tok], "token {tok} channel {k}");
+                }
+            }
+        }
+        let ones = vec![1.0f32; n];
+        let zeros = vec![0.0f32; n];
+
+        // Generic check of one path: `run(map) -> (loss, grads)`.
+        type Run<'a> = dyn FnMut(Option<&[f32]>) -> (f32, LoraParams) + 'a;
+        let check = |label: &str, run: &mut Run<'_>| {
+            let (plain, _) = run(None);
+            assert!(plain > 0.0, "{label}: plain loss {plain}");
+            assert!(
+                (run(Some(&ones)).0 - plain).abs() < 1e-6,
+                "{label}: all-ones map must equal the unweighted loss"
+            );
+            let (loss, grads) = run(Some(&zeros));
+            assert_eq!(
+                loss, 0.0,
+                "{label}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty());
+            for (k, gr) in &grads {
+                let m = gr.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert_eq!(m, 0.0, "{label}: nonzero grad on {k}");
+            }
+            let (h, _) = run(Some(&half));
+            assert!(h > 0.0 && h < plain, "{label}: half {h} vs plain {plain}");
+        };
+
+        // LoRA path.
+        let mut model = MageTransformer::from_weights(&model_w, dit_cfg.clone()).unwrap();
+        let tcfg = TrainingConfig {
+            rank: 4,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&model, &tcfg);
+        assert!(!target_paths.is_empty());
+        let (targets, params) = build_lora_targets(&mut model, &target_paths, 4, 7).unwrap();
+        let scale = Array::from_slice(&[0.05f32], &[1]);
+        let params: LoraParams = params
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let r = random::normal::<f32>(
+                    v.shape(),
+                    None,
+                    None,
+                    Some(&random::key(100 + i as u64).unwrap()),
+                )
+                .unwrap();
+                (k.clone(), multiply(&r, &scale).unwrap())
+            })
+            .collect();
+        let adapter = TrainAdapter::Lora { targets };
+        check("lora", &mut |v| {
+            let (l, gr) = compute_loss_grads(
+                &mut model,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &sample_with(v),
+                g,
+                0.5,
+                &noise,
+                false,
+                Dtype::Float32,
+            )
+            .unwrap();
+            eval(gr.values()).unwrap();
+            (l, gr)
+        });
+
+        // Full fine-tune path (every DiT weight a master param).
+        let master: LoraParams = model_w
+            .keys()
+            .map(|k| (Rc::from(k), model_w.require(k).unwrap().clone()))
+            .collect();
+        let rope = MsRope::from_config(&dit_cfg).unwrap();
+        let ctx = PackContext::new(
+            PackLayout::generation(vec![ImgShape::latent(g, g)], vec![txt_tokens]).unwrap(),
+            &rope,
+        )
+        .unwrap();
+        check("full", &mut |v| {
+            let (l, gr) = compute_full_loss_grads(
+                &dit_cfg,
+                &master,
+                &sample_with(v),
+                &ctx,
+                0.5,
+                &noise,
+                false,
+                Dtype::Float32,
+            )
+            .unwrap();
+            eval(gr.values()).unwrap();
+            (l, gr)
+        });
     }
 
     /// The capability claim and the acceptance must be one fact: because this trainer advertises
@@ -1765,6 +1983,7 @@ mod tests {
             latent_tokens,
             txt,
             txt_tokens,
+            mask_weight: None,
         };
 
         // A FIXED sigma + noise ⇒ a stationary objective. Build the pack context once.

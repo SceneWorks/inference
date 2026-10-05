@@ -35,14 +35,16 @@ use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
     TrainAdapter,
 };
+use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::CropBox;
 use mlx_gen::{
-    Image, NetworkType, Result, TrainOptimizer, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    Image, NetworkType, Result, TrainOptimizer, TrainingConfig, TrainingItem, TrainingOutput,
+    TrainingProgress, TrainingRequest,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::subtract;
+use mlx_rs::ops::{broadcast_to, subtract};
 use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
@@ -202,6 +204,7 @@ pub fn compute_loss_grads<H: SdxlFamilyHooks>(
     t: TrainTimestep,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     dtype: Dtype,
     checkpoint_targets: Option<Vec<String>>,
 ) -> Result<(f32, LoraParams)> {
@@ -210,6 +213,7 @@ pub fn compute_loss_grads<H: SdxlFamilyHooks>(
     let noisy = hooks.add_noise(x0, noise, t)?.as_dtype(dtype)?;
     let t_f = t.unet_time();
     let target = noise.clone(); // f32 — the loss is computed in f32 (eps promotes on subtract)
+    let mask_weight = mask_weight.cloned();
     let (cond, pooled, time_ids) = (
         cond.as_dtype(dtype)?,
         pooled.as_dtype(dtype)?,
@@ -239,13 +243,10 @@ pub fn compute_loss_grads<H: SdxlFamilyHooks>(
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
         let diff = subtract(&eps, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE on the ε residual, subject-mask weighted when on (sc-24828) — reduces to a 0-d
+        // scalar (grad requires a scalar cotangent). Both the dense and block-checkpointed forwards
+        // land here.
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -287,6 +288,38 @@ fn decode_image(path: &Path) -> Result<mlx_gen::media::Image> {
         height,
         pixels: rgb.into_raw(),
     })
+}
+
+/// The subject-masked loss weight (sc-24828) for an item whose clean latent is the family's
+/// **NHWC** `[1, h, w, 4]` (from `encode_init_latents` of the [`center_crop_square`] image): the
+/// mask is cropped with [`CropBox::center_square`], area-averaged onto the `(h, w)` grid and laid
+/// out by [`nhwc_weight`] to broadcast over the channel axis — `x0`'s exact shape. `None` when off.
+fn item_nhwc_subject_weight(
+    label: &str,
+    item: &TrainingItem,
+    cfg: &TrainingConfig,
+    x0_shape: &[i32],
+) -> Result<Option<Array>> {
+    if x0_shape.len() != 4 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "{label}: subject mask expects an NHWC latent, got shape {x0_shape:?}"
+        )));
+    }
+    item_subject_mask_weight(
+        label,
+        item,
+        cfg.subject_mask_loss.as_ref(),
+        CropBox::center_square,
+        &x0_shape[..3],
+    )?
+    .map(|w| nhwc_weight(&w, x0_shape))
+    .transpose()
+}
+
+/// A `[B, h, w]` weight map → `x0_shape` (`[B, h, w, C]`): the latent cell `(y, x)` weight on every
+/// channel of that cell.
+fn nhwc_weight(weight_bhw: &Array, x0_shape: &[i32]) -> Result<Array> {
+    Ok(broadcast_to(&weight_bhw.expand_dims(-1)?, x0_shape)?)
 }
 
 /// The shared SDXL-family LoRA/LoKr training lifecycle: prepare → load → cache (VAE-latents +
@@ -346,7 +379,9 @@ pub fn train_family<H: SdxlFamilyHooks>(
     // --- prepare → load → cache: VAE-latents + (conditioning, pooled) into memory ---
     on_progress(TrainingProgress::LoadingModel); // base already resident from load_trainer
     let total = req.items.len() as u32;
-    let mut cache: Vec<(Array, Array, Array)> = Vec::with_capacity(req.items.len());
+    // Per item: clean latent, conditioning, pooled, and (subject-masked loss, sc-24828) the latent
+    // loss-weight map — `None` when the technique is off.
+    let mut cache: Vec<(Array, Array, Array, Option<Array>)> = Vec::with_capacity(req.items.len());
     for (i, item) in req.items.iter().enumerate() {
         if req.cancel.is_cancelled() {
             break;
@@ -357,9 +392,14 @@ pub fn train_family<H: SdxlFamilyHooks>(
         });
         let img = center_crop_square(&decode_image(&item.image_path)?);
         let x0 = encode_init_latents(vae, &img, edge, edge)?; // scaled latent [1,h,w,4]
+        let mask_weight = item_nhwc_subject_weight(hooks.label(), item, cfg, x0.shape())?;
         let (cond, pooled) = hooks.encode_prompt(&item.caption)?;
-        eval([&x0, &cond, &pooled])?;
-        cache.push((x0, cond, pooled));
+        eval(
+            [&x0, &cond, &pooled]
+                .into_iter()
+                .chain(mask_weight.as_ref()),
+        )?;
+        cache.push((x0, cond, pooled, mask_weight));
     }
     if cache.is_empty() {
         // sc-4895 — a cancel tripped during caching is a genuine cancellation → typed
@@ -475,7 +515,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
         if req.cancel.is_cancelled() {
             break;
         }
-        let (x0, cond, pooled) = &cache[((step - 1) as usize) % cache.len()];
+        let (x0, cond, pooled, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
         let t =
             hooks.sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64))?;
         let noise = random::normal::<f32>(
@@ -500,6 +540,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
             t,
             &noise,
             mae,
+            mask_weight.as_ref(),
             compute_dtype,
             checkpoint_targets.clone(),
         )?;
@@ -630,4 +671,45 @@ pub fn train_family<H: SdxlFamilyHooks>(
         steps: steps_run,
         final_loss: last_loss,
     })
+}
+
+#[cfg(test)]
+mod subject_mask_tests {
+    use super::*;
+
+    /// sc-24828: the NHWC weight lines up element-for-element with the NHWC latent — cell `(y, x)`'s
+    /// value (encoded as `y·10 + x`) sits on every channel of `[0, y, x, :]`.
+    #[test]
+    fn nhwc_weight_lines_up_with_the_nhwc_latent() {
+        let (h, w, c) = (2usize, 3usize, 4i32);
+        let values: Vec<f32> = (0..h * w).map(|i| ((i / w) * 10 + i % w) as f32).collect();
+        let bhw =
+            mlx_gen::train::loss::subject_mask_weight(&values, h, w, &[1, h as i32, w as i32])
+                .unwrap();
+        let x0_shape = [1, h as i32, w as i32, c];
+        let nhwc = nhwc_weight(&bhw, &x0_shape).unwrap();
+        assert_eq!(nhwc.shape(), &x0_shape);
+        // Flatten row-major (a broadcast is a strided view; the reshape copies it out in order).
+        let flat = nhwc.reshape(&[-1]).unwrap();
+        let flat = flat.as_slice::<f32>();
+        for y in 0..h {
+            for x in 0..w {
+                for ch in 0..c as usize {
+                    let at = (y * w + x) * c as usize + ch;
+                    assert_eq!(flat[at], (y * 10 + x) as f32, "(y={y}, x={x}, c={ch})");
+                }
+            }
+        }
+    }
+
+    /// Mask off ⇒ no weight and no file read (the item names a mask path that does not exist).
+    #[test]
+    fn mask_off_builds_no_weight() {
+        let mut item = TrainingItem::captioned("/nonexistent/a.png".into(), "a".into());
+        item.subject_mask_path = Some("/nonexistent/a.mask.png".into());
+        let cfg = TrainingConfig::default();
+        assert!(item_nhwc_subject_weight("sdxl", &item, &cfg, &[1, 4, 4, 4])
+            .unwrap()
+            .is_none());
+    }
 }

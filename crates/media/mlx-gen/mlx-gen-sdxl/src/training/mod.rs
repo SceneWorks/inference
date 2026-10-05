@@ -212,7 +212,11 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-24828 (epic 2123): subject-masked ε loss, wired in the shared `train_family`.
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -367,6 +371,12 @@ mod preflight_tests {
         assert!(projected_dense_peak_gb(16384.0, true) < 18.7); // bf16 1024 fits a 32 GB box
         assert!(projected_dense_peak_gb(16384.0, false) > 18.7); // f32 1024 does not
     }
+
+    /// sc-24828: SDXL declares subject-masked loss (wired in the shared `train_family`).
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(super::trainer_descriptor().techniques.subject_mask_loss);
+    }
 }
 
 // ===========================================================================================
@@ -473,6 +483,7 @@ mod first_step_repro {
             TrainTimestep::Sigma(500.0),
             &noise,
             false,
+            None,
             dtype,
             checkpoint_targets,
         )?;
@@ -638,6 +649,7 @@ mod first_step_repro {
                 TrainTimestep::Sigma(500.0),
                 &noise,
                 false,
+                None,
                 Dtype::Float32,
                 None,
             )
@@ -688,6 +700,7 @@ mod first_step_repro {
                 TrainTimestep::Sigma(500.0),
                 &noise,
                 false,
+                None,
                 Dtype::Float32,
                 ck,
             )
@@ -742,6 +755,7 @@ mod first_step_repro {
                     TrainTimestep::Sigma(500.0),
                     &noise,
                     false,
+                    None,
                     dt,
                     None,
                 )

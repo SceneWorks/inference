@@ -44,14 +44,15 @@ use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor, Var};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::train::subject_mask::CropBox;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, CancelFlag, Image, LoadSpec, Modality, Progress, WeightsSource};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
-    self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
-    SamplePlan,
+    self, item_subject_mask_weight, run_flow_match_training, validate_flow_match_request,
+    weighted_velocity_loss, FlowMatchTrainer, SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::{CandleError, Result};
@@ -62,7 +63,7 @@ use crate::schedule::{cfg_rescale, lens_mu, lens_sigmas};
 use crate::text::{LensTokenizer, TXT_OFFSET};
 use crate::text_encoder::{Config as EncoderConfig, GptOssTextEncoder, DEFAULT_SELECTED_LAYERS};
 use crate::transformer::LensDitConfig;
-use crate::vae::{decode as vae_decode, encode as vae_encode, Flux2Vae};
+use crate::vae::{decode as vae_decode, encode as vae_encode, pack_unpacked_latent, Flux2Vae};
 use crate::{DEFAULT_DATE, MODEL_ID_BASE, VAE_SCALE_FACTOR};
 
 /// Per-cadence preview-prompt cap (the shared `SAMPLE_PROMPT_CAP` the sc-8650 contract documents) — at
@@ -100,6 +101,7 @@ fn compute_loss_grads(
     t: f64,
     noise: &Tensor,
     mae: bool,
+    mask_weight: Option<&Tensor>,
     compute_dtype: DType,
     use_checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
@@ -123,17 +125,49 @@ fn compute_loss_grads(
         let ctx_ref = &ctx;
         segs.push(Box::new(move |st: &[Tensor]| {
             let v = dit.velocity_out(&st[0], ctx_ref)?;
-            Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+            Ok(vec![weighted_velocity_loss(
+                &v,
+                &target_owned,
+                mask_weight,
+                mae,
+            )?])
         }));
         checkpointed_backward(&segs, &[hidden_d, encoder_d], lora_vars)
     } else {
         // Dense backward (tiny models / tests only — see the `use_checkpoint` note re: OOM at scale).
         let v = dit.forward(&x_t, &feats, None, timestep, 1, h, w)?;
-        let loss = velocity_loss(&v, &target, mae)?;
+        let loss = weighted_velocity_loss(&v, &target, mask_weight, mae)?;
         let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         let grads = loss.backward()?;
         Ok((loss_val, grads))
     }
+}
+
+/// The subject-mask loss weight for one item (sc-24828), `None` when the technique is off. The mask
+/// takes [`load_image_tensor`]'s centre-square crop and is area-averaged onto the **unpacked** 32-ch
+/// VAE latent grid `[1, C, 2·lat_h, 2·lat_w]` (C = 32), then packed through the very 2×2 patchify + flatten
+/// the cached latent went through ([`pack_unpacked_latent`]) — so each of the 128 packed channels
+/// carries the weight of its own 2×2 sub-position, element-for-element with `x0` `[1, S, 128]`.
+fn item_mask_weight(
+    item: &gen_core::train::TrainingItem,
+    cfg: &TrainingConfig,
+    x0: &Tensor,
+    lat_h: usize,
+    lat_w: usize,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    // `x0` is `[1, S, 4·C]` (2×2 patchify folds 4 sub-positions into each channel group).
+    let unpacked = [1usize, x0.dim(2)? / 4, 2 * lat_h, 2 * lat_w];
+    item_subject_mask_weight(
+        LABEL,
+        item,
+        cfg.subject_mask_loss.as_ref(),
+        CropBox::center_square,
+        &unpacked,
+        device,
+    )?
+    .map(|w| pack_unpacked_latent(&w).map_err(Into::into))
+    .transpose()
 }
 
 /// gpt-oss-encode `caption` → its 4 captured layers cropped at [`TXT_OFFSET`], each `[1, s, 2880]`
@@ -280,7 +314,10 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -349,8 +386,10 @@ impl Trainer for LensTrainer {
 
 impl FlowMatchTrainer for LensTrainer {
     type Dit = LensTransformerTrain;
-    /// `(x0 packed latent [1, S, 128], the 4 cached gpt-oss feature layers)`, both f32.
-    type Cached = (Tensor, Vec<Tensor>);
+    /// `(x0 packed latent [1, S, 128], the 4 cached gpt-oss feature layers, subject-mask loss
+    /// weight)`, all f32; the weight (packed exactly like `x0`) is `None` unless subject-masked loss
+    /// is on (sc-24828).
+    type Cached = (Tensor, Vec<Tensor>, Option<Tensor>);
     /// The (constant, per-resolution) latent grid `(lat_h, lat_w)`.
     type Aux = (usize, usize);
     /// Preview-sample render state: per-prompt joint CFG conditioning + resident VAE decoder + the
@@ -372,7 +411,7 @@ impl FlowMatchTrainer for LensTrainer {
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<(
-        Vec<(Tensor, Vec<Tensor>)>,
+        Vec<Self::Cached>,
         (usize, usize),
         SamplePlan<LensSampleState>,
     )> {
@@ -393,7 +432,7 @@ impl FlowMatchTrainer for LensTrainer {
         )?)?;
 
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Tensor, Vec<Tensor>)> = Vec::with_capacity(req.items.len());
+        let mut cache: Vec<Self::Cached> = Vec::with_capacity(req.items.len());
         let mut grid: Option<(usize, usize)> = None;
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
@@ -405,9 +444,10 @@ impl FlowMatchTrainer for LensTrainer {
             });
             let img = load_image_tensor(&item.image_path, edge, device)?; // [1,3,edge,edge] in [-1,1]
             let (x0, lh, lw) = vae_encode(&vae, &img)?; // [1, S, 128] packed latent (mean), f32
+            let mask_weight = item_mask_weight(item, &req.config, &x0, lh, lw, device)?;
             let feats = encode_caption(&tokenizer, &encoder, &item.caption, device)?;
             grid.get_or_insert((lh, lw));
-            cache.push((x0, feats));
+            cache.push((x0, feats, mask_weight));
         }
 
         // Preview samples (sc-8650) — while the gpt-oss encoder is STILL resident, pre-encode up to
@@ -473,13 +513,13 @@ impl FlowMatchTrainer for LensTrainer {
         &self,
         dit: &LensTransformerTrain,
         vars: &[Var],
-        cached: &(Tensor, Vec<Tensor>),
+        cached: &Self::Cached,
         aux: &(usize, usize),
         cfg: &TrainingConfig,
         step: u32,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
-        let (x0, feats) = cached;
+        let (x0, feats, mask_weight) = cached;
         let (lat_h, lat_w) = *aux;
         // Lens feeds `t` to the DiT directly (cast to f64), and the 48-block backward always uses the
         // gradient-checkpointed path.
@@ -500,6 +540,7 @@ impl FlowMatchTrainer for LensTrainer {
             t,
             &noise,
             flow_match::is_mae(cfg),
+            mask_weight.as_ref(),
             flow_match::parse_compute_dtype(&cfg.train_dtype),
             true,
         )
@@ -665,6 +706,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -711,6 +753,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -725,6 +768,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             true,
         )
@@ -753,6 +797,111 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+    }
+
+    /// sc-24828: subject-masked loss on both backward paths. The weight is built on the unpacked
+    /// `[1, 8, 4, 4]` latent grid and packed to `[1, 4, 32]` exactly like `x0`. An all-ones map is the
+    /// unweighted loss; an all-zero map zeroes the loss AND every adapter gradient (dense and
+    /// checkpointed); a half map lands between and matches across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = LensTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &dev);
+        let unpacked = [1usize, cfg.in_channels / 4, 2 * h, 2 * w];
+        let map = |m: &[f32]| {
+            let u = flow_match::subject_mask_weight(m, 2 * h, 2 * w, &unpacked, &dev).unwrap();
+            let packed = pack_unpacked_latent(&u).unwrap();
+            assert_eq!(packed.dims(), x0.dims());
+            packed
+        };
+        let run = |weight: Option<&Tensor>, ckpt: bool| {
+            compute_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                &feats,
+                h,
+                w,
+                0.5,
+                &noise,
+                false,
+                weight,
+                DType::F32,
+                ckpt,
+            )
+            .unwrap()
+        };
+        let (plain, _) = run(None, false);
+        let ones = map(&[1.0; 16]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&[0.0; 16]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            for v in &set.vars {
+                if let Some(g) = grads.get(v.as_tensor()) {
+                    let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(
+                        g.iter().all(|x| *x == 0.0),
+                        "ckpt={ckpt}: nonzero adapter grad"
+                    );
+                }
+            }
+        }
+        let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+    }
+
+    /// sc-24828: the packed weight lines up with the packed latent. A weight whose value encodes its
+    /// unpacked `(y, x)` position lands at token `(y/2)·w + x/2`, channel `c·4 + (y%2)·2 + x%2` — the
+    /// FLUX.2 2×2 patchify + flatten order `vae::encode` gives `x0`.
+    #[test]
+    fn packed_subject_mask_weight_lines_up_with_packed_latent() {
+        let dev = Device::Cpu;
+        let (h, w, c) = (2usize, 3usize, 2usize); // packed grid h×w; unpacked 4×6, c channels
+        let vals: Vec<f32> = (0..2 * h * 2 * w)
+            .map(|i| ((i / (2 * w)) * 10 + i % (2 * w)) as f32)
+            .collect();
+        let u = flow_match::subject_mask_weight(&vals, 2 * h, 2 * w, &[1, c, 2 * h, 2 * w], &dev)
+            .unwrap();
+        let p = pack_unpacked_latent(&u).unwrap();
+        assert_eq!(p.dims(), &[1, h * w, 4 * c]);
+        let p = p.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        for (tok, row) in p.iter().enumerate() {
+            let (i, j) = (tok / w, tok % w);
+            for (ch, v) in row.iter().enumerate() {
+                let (ph, pw) = ((ch % 4) / 2, ch % 2);
+                let (y, x) = (2 * i + ph, 2 * j + pw);
+                assert_eq!(*v, (y * 10 + x) as f32, "token {tok} channel {ch}");
+            }
+        }
+    }
+
+    /// The candle Lens trainer declares subject-masked loss (sc-24828).
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
     }
 
     /// A few optimizer steps on a fixed batch lower the loss — the step descends the flow-match
@@ -784,6 +933,7 @@ mod tests {
                 0.5,
                 &noise,
                 false,
+                None,
                 DType::F32,
                 false,
             )
@@ -835,6 +985,7 @@ mod tests {
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),

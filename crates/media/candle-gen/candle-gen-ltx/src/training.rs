@@ -13,6 +13,7 @@ use std::sync::Arc;
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::train::subject_mask::CropBox;
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingRequest,
@@ -23,7 +24,8 @@ use candle_gen::gen_core::{
 };
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
-    self, run_flow_match_training, velocity_loss, FlowMatchTrainer, SamplePlan,
+    self, item_subject_mask_weight, run_flow_match_training, weighted_velocity_loss,
+    FlowMatchTrainer, SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::LoraSet;
@@ -1258,7 +1260,13 @@ impl LoraHost for TrainingDiT {
 }
 
 pub enum TrainingCached {
-    Ltx23 { clean: Tensor, context: Tensor },
+    /// `mask_weight` is the subject-mask loss weight `[1, F·h·w, 1]` over the flattened latent
+    /// tokens (sc-24828); `None` when subject-masked loss is off.
+    Ltx23 {
+        clean: Tensor,
+        context: Tensor,
+        mask_weight: Option<Tensor>,
+    },
     Ltx25(Box<AvTrainingExample>),
 }
 
@@ -1303,6 +1311,10 @@ pub fn trainer_descriptor_25() -> TrainerDescriptor {
 }
 
 fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
+    // Subject-masked loss (sc-24828) is honoured on the LTX-2.3 image route only: every LTX-2.5
+    // item trains on a prepared latent bundle with no decodable image aligned to the latent
+    // (refused in `validate_ltx25_training_request` and at the top of `train`).
+    let subject_mask_loss = id == TRAINER_ID;
     TrainerDescriptor {
         id,
         family: "ltx",
@@ -1313,8 +1325,26 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
+}
+
+/// LTX-2.5 trains every item from a prepared latent bundle (`model_options.ltxPreparedBundlePath`)
+/// — there is no decodable image aligned to that latent to crop a subject mask against, so a
+/// subject-masked request is a typed refusal rather than an ignored or misaligned weight
+/// (sc-24828).
+fn refuse_ltx25_subject_mask_loss(req: &TrainingRequest) -> Result<()> {
+    if req.config.subject_mask_loss.is_some() {
+        return Err(CandleError::Unsupported(format!(
+            "{MODEL_25_ID} trainer: subject-masked loss is unsupported — every item trains on a \
+             prepared latent bundle (model_options.ltxPreparedBundlePath) with no decodable image \
+             aligned to the latent, so a subject mask cannot be applied"
+        )));
+    }
+    Ok(())
 }
 
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
@@ -1408,6 +1438,9 @@ impl Trainer for LtxTrainer {
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         if matches!(self.route, TrainingRoute::Ltx25 { .. }) {
+            // The technique floor (epic 2123 E3) guards the 2.5 route too: `validate` must refuse
+            // an undeclared technique, not leave it for `train` to catch.
+            gen_core::train::validate_training_techniques(self.descriptor(), req)?;
             return validate_ltx25_training_request(req).map_err(Into::into);
         }
         gen_core::train::validate_control_request(self.descriptor(), req)?;
@@ -1426,6 +1459,9 @@ impl Trainer for LtxTrainer {
     ) -> gen_core::Result<TrainingOutput> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        if matches!(self.route, TrainingRoute::Ltx25 { .. }) {
+            refuse_ltx25_subject_mask_loss(req)?;
+        }
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         run_flow_match_training(self, req, on_progress).map_err(Into::into)
@@ -1799,6 +1835,7 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     gen_core::train::validate_control_request(&descriptor, req)?;
     gen_core::train::validate_full_finetune_request(&descriptor, req)?;
     gen_core::train::validate_edit_request(&descriptor, req)?;
+    refuse_ltx25_subject_mask_loss(req)?;
     validate_ltx_request(req, MODEL_25_ID)?;
     if !req.config.alpha.is_finite() || req.config.alpha <= 0.0 {
         return Err(CandleError::Msg(
@@ -2464,6 +2501,33 @@ pub(crate) fn production_masked_av_lifecycle(
     )
 }
 
+/// The LTX-2.3 item's subject-mask loss weight (sc-24828), aligned token-for-token with its
+/// flattened clean latent: `None` when off (no file read). The mask is cropped like the image
+/// ([`load_image_tensor`] centre-crops a square), area-averaged onto the encoded latent's
+/// `(h, w)` grid as `[1, 1, F, h, w]` (an image mask applies to every latent frame), then flattened
+/// by the latent's own [`flatten_latent`] to `[1, F·h·w, 1]` (broadcast over the channels).
+fn ltx23_subject_mask_weight(
+    item: &candle_gen::gen_core::train::TrainingItem,
+    cfg: Option<&gen_core::SubjectMaskLoss>,
+    latent_shape: &[usize],
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    let &[_, _, frames, h, w] = latent_shape else {
+        return Err(CandleError::Msg(format!(
+            "{LABEL}: subject mask needs a [B, C, F, h, w] latent, got {latent_shape:?}"
+        )));
+    };
+    let weight = item_subject_mask_weight(
+        LABEL,
+        item,
+        cfg,
+        CropBox::center_square,
+        &[1, 1, frames, h, w],
+        device,
+    )?;
+    Ok(weight.map(|w| flatten_latent(&w)).transpose()?)
+}
+
 /// Kept byte-for-byte in the LTX-2.3 branch: introducing the AV 2.5 trainer must not change the
 /// legacy video-only loss or its optional checkpointed backward path.
 #[allow(clippy::too_many_arguments)]
@@ -2476,6 +2540,7 @@ fn compute_ltx23_loss_grads(
     sigma: f64,
     noise: &Tensor,
     mae: bool,
+    mask_weight: Option<&Tensor>,
     checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
     let (x_t, target) = flow_match::build_batch(clean, noise, sigma)?;
@@ -2486,12 +2551,17 @@ fn compute_ltx23_loss_grads(
         let ctx_ref = &ctx;
         segments.push(Box::new(move |state: &[Tensor]| {
             let velocity = dit.velocity_out(&state[0], ctx_ref)?;
-            Ok(vec![velocity_loss(&velocity, &target, mae)?])
+            Ok(vec![weighted_velocity_loss(
+                &velocity,
+                &target,
+                mask_weight,
+                mae,
+            )?])
         }));
         checkpointed_backward(&segments, &[hidden.detach()], vars)
     } else {
         let velocity = dit.forward(&x_t, sigma, context, positions)?;
-        let loss = velocity_loss(&velocity, &target, mae)?;
+        let loss = weighted_velocity_loss(&velocity, &target, mask_weight, mae)?;
         let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         Ok((value, loss.backward()?))
     }
@@ -2578,9 +2648,20 @@ impl FlowMatchTrainer for LtxTrainer {
                     });
                     let image = load_image_tensor(&item.image_path, edge, device)?;
                     let video = image.unsqueeze(2)?;
-                    let clean = flatten_latent(&vae.encode(&video)?)?.to_dtype(DType::F32)?;
+                    let latent = vae.encode(&video)?;
+                    let mask_weight = ltx23_subject_mask_weight(
+                        item,
+                        req.config.subject_mask_loss.as_ref(),
+                        latent.dims(),
+                        device,
+                    )?;
+                    let clean = flatten_latent(&latent)?.to_dtype(DType::F32)?;
                     let context = encode_context(&tokenizer, &encoder, &item.caption, device)?;
-                    cached.push(TrainingCached::Ltx23 { clean, context });
+                    cached.push(TrainingCached::Ltx23 {
+                        clean,
+                        context,
+                        mask_weight,
+                    });
                 }
                 let sample_plan =
                     if req.config.sample_every > 0 && !req.config.sample_prompts.is_empty() {
@@ -2790,7 +2871,11 @@ impl FlowMatchTrainer for LtxTrainer {
         match (dit, cached, positions) {
             (
                 TrainingDiT::Ltx23(dit),
-                TrainingCached::Ltx23 { clean, context },
+                TrainingCached::Ltx23 {
+                    clean,
+                    context,
+                    mask_weight,
+                },
                 TrainingAux::Ltx23(positions),
             ) => {
                 let noise = flow_match::sample_noise(
@@ -2807,6 +2892,7 @@ impl FlowMatchTrainer for LtxTrainer {
                     sigma,
                     &noise,
                     flow_match::is_mae(cfg),
+                    mask_weight.as_ref(),
                     cfg.gradient_checkpointing,
                 )
             }
@@ -3018,6 +3104,7 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::runtime::CancelFlag;
     use candle_gen::gen_core::train::TrainingItem;
+    use candle_gen::train::flow_match::velocity_loss;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -3296,6 +3383,104 @@ mod tests {
             .unwrap();
         assert!((mse - 8.5).abs() < 1e-6);
         assert!((mae - 2.5).abs() < 1e-6);
+    }
+
+    /// sc-24828: subject-masked loss reaches both LTX-2.3 backward paths. An all-ones map is the
+    /// unweighted loss; an all-zero map zeroes the loss AND every adapter gradient (dense and
+    /// checkpointed); a half map is strictly between and matches across paths. The weight is the
+    /// production `[1, 1, F, h, w]` grid flattened by `flatten_latent`, as the cache builds it.
+    #[test]
+    fn subject_mask_weight_reaches_both_ltx23_backward_paths() {
+        use candle_gen::candle_nn::VarBuilder;
+        use candle_gen::train::lora::build_lora_targets;
+        let dev = Device::Cpu;
+        let cfg = crate::dit_train::tests::tiny_cfg();
+        let map = crate::dit_train::tests::weights(&cfg, &dev);
+        let mut dit =
+            LtxDiT::new(VarBuilder::from_tensors(map, DType::F32, &dev), &cfg.video).unwrap();
+        let suffixes = LTX_ATTN_TARGETS.map(str::to_string);
+        let set = build_lora_targets(&mut dit, &suffixes, 2, 2.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.05f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        // A 2x2 single-frame latent grid -> 4 tokens of 8 channels.
+        let clean = Tensor::randn(0f32, 1f32, (1, 4, 8), &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, (1, 4, 8), &dev).unwrap();
+        let context = Tensor::randn(0f32, 1f32, (1, 3, 12), &dev).unwrap();
+        let positions =
+            crate::rope::create_position_grid(1, 2, 2, DEFAULT_FPS as f32, &dev).unwrap();
+        let weight = |w: &[f32]| {
+            let grid = flow_match::subject_mask_weight(w, 2, 2, &[1, 1, 1, 2, 2], &dev).unwrap();
+            flatten_latent(&grid).unwrap()
+        };
+        let run = |w: Option<&Tensor>, checkpoint: bool| {
+            compute_ltx23_loss_grads(
+                &dit, &set.vars, &clean, &context, &positions, 0.4, &noise, false, w, checkpoint,
+            )
+            .unwrap()
+        };
+        let (plain, _) = run(None, false);
+        let ones = weight(&[1.0; 4]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = weight(&[0.0; 4]);
+        for checkpoint in [false, true] {
+            let (loss, grads) = run(Some(&zeros), checkpoint);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={checkpoint}: an all-background map must zero the loss"
+            );
+            for v in &set.vars {
+                if let Some(g) = grads.get(v.as_tensor()) {
+                    let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(
+                        g.iter().all(|x| *x == 0.0),
+                        "ckpt={checkpoint}: nonzero grad"
+                    );
+                }
+            }
+        }
+        let half = weight(&[1.0, 0.0, 1.0, 0.0]);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-24828: the flattened weight lines up with `flatten_latent`'s token order: token
+    /// `f*h*w + y*w + x` carries the weight of latent cell `(f, y, x)` (an image mask repeated over
+    /// every frame).
+    #[test]
+    fn ltx23_subject_mask_weight_follows_the_latent_token_order() {
+        let dev = Device::Cpu;
+        let values: Vec<f32> = (0..6).map(|i| i as f32).collect(); // 2x3 grid, value = y*3 + x
+        let grid = flow_match::subject_mask_weight(&values, 2, 3, &[1, 1, 2, 2, 3], &dev).unwrap();
+        let flat = flatten_latent(&grid).unwrap();
+        assert_eq!(flat.dims(), &[1, 12, 1]);
+        let got = flat.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, [values.clone(), values].concat());
+    }
+
+    /// sc-24828: LTX-2.5 trains only on prepared latent bundles (no image aligned to the latent),
+    /// so a subject-masked request is a typed `Unsupported` from the public validate seam, and its
+    /// descriptor does not declare the technique.
+    #[test]
+    fn ltx25_refuses_subject_masked_loss_as_unsupported() {
+        let mut req = ltx25_request("t2v_lora");
+        req.config.subject_mask_loss = Some(gen_core::SubjectMaskLoss {
+            background_weight: 0.1,
+            subject_weight: 1.0,
+        });
+        let err = validate_ltx25_training_request(&req).unwrap_err();
+        assert!(
+            matches!(&err, CandleError::Unsupported(m) if m.contains("subject-masked loss")),
+            "{err:?}"
+        );
+        assert!(!trainer_descriptor_25().techniques.subject_mask_loss);
     }
 
     #[test]

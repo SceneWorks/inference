@@ -47,13 +47,16 @@ use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
+use candle_gen::gen_core::train::subject_mask::CropBox;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, Image, LoadSpec, Modality, NetworkType, Progress, WeightsSource};
 use candle_gen::train::checkpoint::file_stem;
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
-use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
+use candle_gen::train::flow_match::{
+    self, item_subject_mask_weight, validate_flow_match_request, weighted_velocity_loss,
+};
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::{LoraHost, LoraSet};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
@@ -158,6 +161,7 @@ fn compute_loss_grads(
     cos: &Tensor,
     sin: &Tensor,
     mae: bool,
+    mask_weight: Option<&Tensor>,
     compute_dtype: DType,
     use_checkpoint: bool,
     y_channels: usize,
@@ -192,13 +196,18 @@ fn compute_loss_grads(
         let mctx_ref = &mctx;
         segs.push(Box::new(move |st: &[Tensor]| {
             let v = dit.velocity_out(&st[0], mctx_ref)?;
-            Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+            Ok(vec![weighted_velocity_loss(
+                &v,
+                &target_owned,
+                mask_weight,
+                mae,
+            )?])
         }));
         checkpointed_backward(&segs, std::slice::from_ref(&hidden_d), lora_vars)
     } else {
         // Dense backward (tiny models / tests only — see the `use_checkpoint` note re: OOM at scale).
         let v = dit.forward(&x_t, &ctx, timestep, cos, sin)?;
-        let loss = velocity_loss(&v, &target, mae)?;
+        let loss = weighted_velocity_loss(&v, &target, mask_weight, mae)?;
         let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         let grads = loss.backward()?;
         Ok((loss_val, grads))
@@ -429,7 +438,11 @@ impl TrainVariant {
             supports_control: false,
             supports_full_finetune: false,
             max_reference_images: 0,
-            techniques: gen_core::train::TrainingTechniques::NONE,
+            // Subject-masked loss (sc-24828): every item is a still frame, weighted on both experts.
+            techniques: gen_core::train::TrainingTechniques {
+                subject_mask_loss: true,
+                ..gen_core::train::TrainingTechniques::NONE
+            },
         }
     }
 
@@ -718,7 +731,9 @@ impl WanMoeTrainer {
             crate::text_encode::build_umt5_tokenizer(&self.root, &te_cfg, "wan trainer")?;
 
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len());
+        // `(x0, caption, subject-mask loss weight)` — the weight (broadcast to the `[1, C, 1, h, w]`
+        // latent) is `None` unless subject-masked loss is on (sc-24828).
+        let mut cache: Vec<(Tensor, Tensor, Option<Tensor>)> = Vec::with_capacity(req.items.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -730,8 +745,18 @@ impl WanMoeTrainer {
             let img = load_image_tensor(&item.image_path, edge, device)?; // [1,3,edge,edge] in [-1,1]
             let video = img.unsqueeze(2)?; // [1,3,1,edge,edge] (T=1 still frame)
             let x0 = vae.encode(&video)?.to_dtype(DType::F32)?; // [1,16,1,h,w] normalized mean
+
+            // `load_image_tensor` center-crops to the largest square before resizing.
+            let mask_weight = item_subject_mask_weight(
+                LABEL,
+                item,
+                cfg.subject_mask_loss.as_ref(),
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
             let cap = encode_caption(&tokenizer, &te_cfg, &text_encoder, &item.caption, device)?;
-            cache.push((x0, cap));
+            cache.push((x0, cap, mask_weight));
         }
 
         // --- preview-sample plan (sc-8650): pre-encode prompts + load a resident decode-only VAE ---
@@ -855,9 +880,10 @@ impl WanMoeTrainer {
                 break;
             }
             let ei = expert_index(step, dual); // dual: odd → high; dense: the single expert
-                                               // Index by the expert's own visit count, not the raw step — else on an even-sized
-                                               // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
-            let (x0, cap) = &cache[expert_item_index(step, dual, cache.len())];
+
+            // Index by the expert's own visit count, not the raw step — else on an even-sized
+            // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
+            let (x0, cap, mask_weight) = &cache[expert_item_index(step, dual, cache.len())];
             let band = experts[ei].band;
             let t = sample_band_timestep(
                 &cfg.timestep_type,
@@ -880,6 +906,7 @@ impl WanMoeTrainer {
                 &cos,
                 &sin,
                 mae,
+                mask_weight.as_ref(),
                 compute_dtype,
                 use_checkpoint,
                 y_channels,
@@ -1335,6 +1362,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             0,
@@ -1391,6 +1419,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             20,
@@ -1429,6 +1458,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             0,
@@ -1444,6 +1474,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             true,
             0,
@@ -1483,6 +1514,82 @@ mod tests {
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
     }
 
+    /// sc-24828: subject-masked loss on both backward paths (the checkpointed one is what every
+    /// real expert step runs). An all-ones map is the unweighted loss; an all-zero map zeroes the loss
+    /// AND every adapter gradient (dense and checkpointed); a half map matches across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = WanTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
+        let shape = x0.dims().to_vec();
+        let map = |w: &[f32]| flow_match::subject_mask_weight(w, 4, 4, &shape, &dev).unwrap();
+        let run = |weight: Option<&Tensor>, ckpt: bool| {
+            compute_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                &umt5,
+                0.5,
+                &noise,
+                &cos,
+                &sin,
+                false,
+                weight,
+                DType::F32,
+                ckpt,
+                0,
+            )
+            .unwrap()
+        };
+        let (plain, _) = run(None, false);
+        let ones = map(&[1.0; 16]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&[0.0; 16]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            for v in &set.vars {
+                if let Some(g) = grads.get(v.as_tensor()) {
+                    let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(
+                        g.iter().all(|x| *x == 0.0),
+                        "ckpt={ckpt}: nonzero adapter grad"
+                    );
+                }
+            }
+        }
+        let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+        for d in [
+            trainer_descriptor(),
+            trainer_descriptor_i2v_14b(),
+            trainer_descriptor_ti2v_5b(),
+        ] {
+            assert!(d.techniques.subject_mask_loss, "{}", d.id);
+        }
+    }
+
     /// A few optimizer steps on a fixed batch lower the loss — the step descends the flow-match
     /// objective end to end through the harness.
     #[test]
@@ -1511,6 +1618,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             0,
@@ -1529,6 +1637,7 @@ mod tests {
                 &cos,
                 &sin,
                 false,
+                None,
                 DType::F32,
                 false,
                 0,
@@ -1546,6 +1655,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             0,
@@ -1600,6 +1710,7 @@ mod tests {
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),

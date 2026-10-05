@@ -62,7 +62,9 @@ use mlx_gen::train::lora::{
     TrainAdapter,
 };
 pub use mlx_gen::train::lora::{LokrTarget, LoraTarget};
+use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::CropBox;
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer, TrainerDescriptor,
     TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -332,7 +334,12 @@ fn trainer_descriptor_for(variant: Variant) -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-24828 (epic 2123): honors `subject_mask_loss` on its one (LoRA/LoKr, dense or
+        // block-checkpointed) loss path.
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -468,8 +475,10 @@ impl AnimaTrainer {
         // --- prepare → cache: VAE latents + (masked Qwen3 states, T5 ids) into memory ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
-        // (x0 latent, masked Qwen3 source_hidden, T5 query-token ids).
-        let mut cache: Vec<(Array, Array, Array)> = Vec::with_capacity(req.items.len());
+        // (x0 latent, masked Qwen3 source_hidden, T5 query-token ids, and — subject-masked loss,
+        // sc-24828 — the latent loss-weight map, `None` when the technique is off).
+        let mut cache: Vec<(Array, Array, Array, Option<Array>)> =
+            Vec::with_capacity(req.items.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -481,9 +490,16 @@ impl AnimaTrainer {
             let img = center_crop_square(&decode_image(&item.image_path)?);
             let nchw = mlx_gen_qwen_image::preprocess_init_image(&img, edge, edge)?; // [1,3,edge,edge]
             let x0 = self.vae.encode(&nchw)?; // [1,16,1,edge/8,edge/8], normalized
+            let mask_weight = item_subject_mask_weight(
+                "anima trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+                CropBox::center_square,
+                x0.shape(),
+            )?;
             let (source, t5_ids) = self.encode_conditioner_inputs(&item.caption)?;
             eval([&x0, &source, &t5_ids])?;
-            cache.push((x0, source, t5_ids));
+            cache.push((x0, source, t5_ids, mask_weight));
         }
         if cache.is_empty() {
             if req.cancel.is_cancelled() {
@@ -638,7 +654,7 @@ impl AnimaTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, source, t5_ids) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, source, t5_ids, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
             let sigma = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -665,6 +681,7 @@ impl AnimaTrainer {
                 sigma,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 checkpoint_blocks,
                 compute_dtype,
             )?;
@@ -1071,10 +1088,12 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     checkpoint_blocks: Option<&[Vec<String>]>,
     dtype: Dtype,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
+    let mask_weight = mask_weight.cloned();
     let x_t = x_t.as_dtype(dtype)?;
     let src = source.clone();
     let ids = t5_ids.clone();
@@ -1108,12 +1127,9 @@ fn compute_loss_grads(
         };
         let v = v.as_dtype(Dtype::Float32)?;
         let diff = subtract(&v, &target)?;
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -1135,6 +1151,7 @@ mod tests {
                     control_image_path: None,
                     model_options: Default::default(),
                     reference_image_paths: Vec::new(),
+                    subject_mask_path: None,
                 })
                 .collect(),
             config: TrainingConfig {
@@ -1171,6 +1188,14 @@ mod tests {
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.supports_lora && d.supports_lokr);
+        // sc-24828: every variant honors subject-masked loss on its one loss path.
+        for d in [
+            trainer_descriptor_base(),
+            trainer_descriptor_aesthetic(),
+            trainer_descriptor_turbo(),
+        ] {
+            assert!(d.techniques.subject_mask_loss, "{}", d.id);
+        }
     }
 
     #[test]
@@ -1481,6 +1506,7 @@ mod tests {
                     0.5,
                     &noise,
                     false,
+                    None,
                     ck,
                     Dtype::Float32,
                 )
@@ -1548,6 +1574,7 @@ mod tests {
                 0.5,
                 &noise,
                 false,
+                None,
                 ck,
                 Dtype::Float32,
             )
@@ -1603,6 +1630,7 @@ mod tests {
                 &noise,
                 false,
                 None,
+                None,
                 Dtype::Float32,
             )
             .unwrap();
@@ -1645,6 +1673,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             Some(&blocks),
             Dtype::Float32,
         )
@@ -1671,6 +1700,94 @@ mod tests {
         assert!(
             dit_bad > 1e-6,
             "captured encoder still trains the DiT — that is why the bug is silent"
+        );
+    }
+
+    /// sc-24828: the subject-mask weight reaches BOTH backward paths (dense + DiT block-checkpointed,
+    /// in the production flag combination) of [`compute_loss_grads`] on the tiny synthetic DiT +
+    /// conditioner. An all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0
+    /// and all-zero DiT AND conditioner adapter grads on both paths; a half map lands strictly
+    /// between and agrees across paths. The latent is `[1, C, 1, H, W]` (frame axis 1), so the weight
+    /// is the cached latent's shape — no packing.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        use mlx_gen::train::loss::subject_mask_weight;
+        let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
+        // Non-zero factors on both sides (lora_b inits at zero, which would zero the lora_a grads
+        // trivially).
+        let scale = Array::from_slice(&[0.05f32], &[1]);
+        let params: LoraParams = params
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let r = random::normal::<f32>(
+                    v.shape(),
+                    None,
+                    None,
+                    Some(&random::key(100 + i as u64).unwrap()),
+                )
+                .unwrap();
+                (k.clone(), multiply(&r, &scale).unwrap())
+            })
+            .collect();
+        let (x0, source, t5_ids, noise) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
+        let shape = x0.shape().to_vec();
+        let (gh, gw) = (shape[3] as usize, shape[4] as usize);
+        let map = |v: &[f32]| subject_mask_weight(v, gh, gw, &shape).unwrap();
+        let mut run = |weight: Option<&Array>, ckpt: bool| {
+            // Dense: every segment flag off. Checkpointed: the production combination (DiT
+            // whole-block ON + DiT segment OFF + conditioner segment ON).
+            dit.set_sdpa_checkpoint(false);
+            cond.set_sdpa_checkpoint(ckpt);
+            let (l, g) = compute_loss_grads(
+                &mut dit,
+                &mut cond,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &source,
+                &t5_ids,
+                0.5,
+                &noise,
+                false,
+                weight,
+                ckpt.then_some(blocks.as_slice()),
+                Dtype::Float32,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            (l, g)
+        };
+        let n = gh * gw;
+        let (plain, g_plain) = run(None, false);
+        assert!(cond_lora_b_grad(&g_plain) > 1e-6 && dit_lora_b_grad(&g_plain) > 1e-6);
+        let ones = map(&vec![1.0; n]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&vec![0.0; n]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty());
+            for (k, g) in &grads {
+                let m = g.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert_eq!(m, 0.0, "ckpt={ckpt}: nonzero adapter grad on {k}");
+            }
+        }
+        let half: Vec<f32> = (0..n)
+            .map(|i| if i % gw < gw / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
         );
     }
 
@@ -2053,6 +2170,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             ck,
             Dtype::Bfloat16,
         )

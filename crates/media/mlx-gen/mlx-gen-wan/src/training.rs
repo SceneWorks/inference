@@ -50,7 +50,9 @@ use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
     TrainAdapter,
 };
+use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates, LrSchedule};
+use mlx_gen::train::subject_mask::CropBox;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     gen_core, CancelFlag, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
@@ -251,7 +253,12 @@ fn trainer_descriptor(id: &'static str) -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-24828 (epic 2123): subject-masked loss on every expert (one cached weight per item,
+        // shared by whichever expert trains on it).
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -454,7 +461,10 @@ impl WanMoeTrainer {
         // --- prepare → load → cache: normalized latents + per-expert UMT5 context (then free the TE) ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Vec<Array>)> = Vec::with_capacity(req.items.len());
+        // Per item: clean latent, per-expert context, and (subject-masked loss, sc-24828) the latent
+        // loss-weight map `[z, 1, h, w]` — `None` when the technique is off.
+        let mut cache: Vec<(Array, Vec<Array>, Option<Array>)> =
+            Vec::with_capacity(req.items.len());
         // sc-5637 — preview-sample prompts, embedded per expert inside the `te`/`tok` scope below
         // (the UMT5 encoder is freed before the train loop).
         let mut sample_ctxs: Vec<(String, Vec<Array>)> = Vec::new();
@@ -477,6 +487,15 @@ impl WanMoeTrainer {
                 let img = center_crop_square(&decode_image(&item.image_path)?);
                 // [z,1,h,w] normalized channels-first (z16 14B / z48 5B — dispatched by the VAE kind).
                 let clean = self.vae.encode_clean(&img, edge)?;
+                // The image went through `center_crop_square` → the mask's crop is the same box; the
+                // weight is the clean latent's `[z, 1, h, w]` (one frame, every channel).
+                let mask_weight = item_subject_mask_weight(
+                    &format!("{id} trainer"),
+                    item,
+                    cfg.subject_mask_loss.as_ref(),
+                    CropBox::center_square,
+                    clean.shape(),
+                )?;
                 let t5_embed = te.encode(tok, &item.caption)?; // [L, text_dim]
                                                                // Each expert has its own text_embedding, so embed the context per expert.
                 let mut ctxs = Vec::with_capacity(n_experts);
@@ -485,8 +504,9 @@ impl WanMoeTrainer {
                 }
                 let mut to_eval: Vec<&Array> = vec![&clean];
                 to_eval.extend(ctxs.iter());
+                to_eval.extend(mask_weight.iter());
                 eval(to_eval)?;
-                cache.push((clean, ctxs));
+                cache.push((clean, ctxs, mask_weight));
             }
             // sc-5637 — pre-encode the preview-sample prompts (per expert) while the UMT5 encoder is
             // still resident. Mirrors the per-item embed above: one ctx per expert per prompt.
@@ -651,7 +671,7 @@ impl WanMoeTrainer {
             // F-016 / F-082: the item index is DECOUPLED from expert parity so both experts sweep the
             // full dataset (an even-sized set would otherwise parity-lock each expert to a disjoint
             // half for the whole run). See `expert_item_index`.
-            let (clean, ctxs) = &cache[expert_item_index(step, dual, cache.len())];
+            let (clean, ctxs, mask_weight) = &cache[expert_item_index(step, dual, cache.len())];
             let ctx = &ctxs[ei];
             let band = states[ei].band;
             let t = sample_band_timestep(
@@ -684,6 +704,7 @@ impl WanMoeTrainer {
                 t,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 y_channels,
                 checkpoint_block,
             )?;
@@ -1006,6 +1027,7 @@ fn compute_loss_grads(
     t: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     y_channels: i32,
     checkpoint_block: Option<&[Vec<BlockLoraRef>]>,
 ) -> Result<(f32, LoraParams)> {
@@ -1025,6 +1047,7 @@ fn compute_loss_grads(
     };
     let timestep = t * 1000.0;
     let ctx = context.clone();
+    let mask_weight = mask_weight.cloned();
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
         let v = match checkpoint_block {
             Some(bt) => expert
@@ -1038,13 +1061,9 @@ fn compute_loss_grads(
             }
         };
         let diff = subtract(&v, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent). Dense and block-checkpointed forwards both land here.
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -1459,6 +1478,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             y_channels,
             ck,
         )?;
@@ -1509,6 +1529,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             y_channels,
             ck,
         )
@@ -1714,6 +1735,155 @@ mod first_step_repro {
         assert!(
             ckpt_peak < dense_peak,
             "block checkpointing must reduce the first-step peak: dense {dense_peak:.2} vs ckpt {ckpt_peak:.2}"
+        );
+    }
+}
+
+// sc-24828 — subject-masked loss through the per-expert loss closure, on the checked-in 2-block tiny
+// DiT fixture (`tests/fixtures/s5_low.safetensors`, the same one `feature_cache.rs` drives): no real
+// checkpoint, CI-sized.
+#[cfg(test)]
+mod subject_mask_tests {
+    use super::*;
+    use mlx_gen::train::loss::subject_mask_weight;
+    use mlx_gen::weights::Weights;
+
+    fn tiny_cfg() -> WanModelConfig {
+        let mut c = WanModelConfig::wan21_t2v_1_3b();
+        c.dim = 128;
+        c.num_heads = 1;
+        c.num_layers = 2;
+        c.ffn_dim = 256;
+        c.freq_dim = 256;
+        c.text_dim = 32;
+        c.text_len = 8;
+        c.in_dim = 16;
+        c.out_dim = 16;
+        c.vae_z_dim = 16;
+        c
+    }
+
+    #[test]
+    fn descriptors_declare_subject_mask_loss() {
+        for d in [
+            descriptor_t2v_14b(),
+            descriptor_i2v_14b(),
+            descriptor_ti2v_5b(),
+        ] {
+            assert!(d.techniques.subject_mask_loss, "{}", d.id);
+        }
+    }
+
+    /// The weight reaches the loss on both backward paths (dense attention-checkpointed and
+    /// block-checkpointed) — the one `compute_loss_grads` every expert trains through: an all-ones
+    /// map is the plain loss, an all-background map zeroes the loss and every adapter grad, a half
+    /// map lies strictly between and agrees across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let path = format!(
+            "{}/tests/fixtures/s5_low.safetensors",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let weights = Weights::from_file(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let mut expert = WanTransformer::from_weights(&weights, &tiny_cfg()).expect("tiny DiT");
+        let ctx = expert
+            .embed_text(weights.require("ctx_cond").expect("ctx_cond"))
+            .expect("embed_text");
+        let clean = weights.require("init_noise").expect("init_noise").clone();
+        let shape = clean.shape().to_vec();
+        let (h, w) = (
+            shape[shape.len() - 2] as usize,
+            shape[shape.len() - 1] as usize,
+        );
+        let noise =
+            random::normal::<f32>(&shape, None, None, Some(&random::key(5).unwrap())).unwrap();
+        let suffixes: Vec<String> = DEFAULT_TARGET_SUFFIXES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let paths = resolve_target_paths(&expert, &suffixes);
+        assert!(!paths.is_empty());
+        let cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            ..Default::default()
+        };
+        let (adapter, params) = build_adapter(&mut expert, &paths, &cfg, 7).unwrap();
+        // Perturb every factor off its no-op init so every gradient is non-trivial.
+        let params: LoraParams = params
+            .into_iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let r = random::normal::<f32>(
+                    v.shape(),
+                    None,
+                    None,
+                    Some(&random::key(100 + i as u64).unwrap()),
+                )
+                .unwrap();
+                (k, multiply(&r, Array::from_f32(0.05)).unwrap())
+            })
+            .collect();
+        let blocks = group_block_targets(&paths, expert.num_blocks());
+        let map = |v: &[f32]| subject_mask_weight(v, h, w, &shape).unwrap();
+        let mut run = |weight: Option<&Array>, ckpt: bool| {
+            // The trainer's own pairing: attention-segment checkpointing on the dense path, off
+            // under block checkpointing.
+            expert.set_sdpa_checkpoint(!ckpt);
+            let (loss, grads) = compute_loss_grads(
+                &mut expert,
+                &adapter,
+                &params,
+                4.0,
+                4.0,
+                &clean,
+                &ctx,
+                0.5,
+                &noise,
+                false,
+                weight,
+                0,
+                ckpt.then_some(blocks.as_slice()),
+            )
+            .unwrap();
+            eval(grads.values()).unwrap();
+            (loss, grads)
+        };
+        let (plain, _) = run(None, false);
+        let ones = map(&vec![1.0; h * w]);
+        let (with_ones, _) = run(Some(&ones), false);
+        assert!(
+            (with_ones - plain).abs() <= 1e-6 * plain.abs().max(1.0),
+            "all-ones map {with_ones} vs plain {plain}"
+        );
+        let zeros = map(&vec![0.0; h * w]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty(), "ckpt={ckpt}: no adapter grads");
+            for (k, g) in &grads {
+                assert!(
+                    g.as_slice::<f32>().iter().all(|x| *x == 0.0),
+                    "ckpt={ckpt}: nonzero grad on {k}"
+                );
+            }
+        }
+        let half: Vec<f32> = (0..h * w)
+            .map(|i| if i % w < w / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(
+            dense > 0.0 && dense < plain,
+            "half {dense} vs plain {plain}"
+        );
+        assert!(
+            (dense - ckpt).abs() <= 1e-4 * dense.abs().max(1.0),
+            "dense {dense} vs checkpointed {ckpt}"
         );
     }
 }

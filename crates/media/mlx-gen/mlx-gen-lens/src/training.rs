@@ -67,7 +67,9 @@ use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
     TrainAdapter,
 };
+use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::CropBox;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Error, LoadSpec, Modality, NetworkType, Precision, Quant, Result, TrainOptimizer, Trainer,
@@ -166,7 +168,12 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-24828 (epic 2123): honors `subject_mask_loss` on its one (LoRA/LoKr, dense or
+        // block-checkpointed) loss path; the weight is packed exactly like the latent.
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -385,7 +392,11 @@ impl LensTrainer {
         // --- prepare → load → cache: VAE-latents + 4-layer caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Vec<Array>, Array)> = Vec::with_capacity(req.items.len());
+        // Per item: packed clean latent, caption features, caption mask, and (subject-masked loss,
+        // sc-24828) the packed latent loss-weight map — `None` when the technique is off.
+        #[allow(clippy::type_complexity)]
+        let mut cache: Vec<(Array, Vec<Array>, Array, Option<Array>)> =
+            Vec::with_capacity(req.items.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -396,6 +407,7 @@ impl LensTrainer {
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
             let x0 = encode_latents(&self.vae, &img, edge)?; // [1, seq, 128]
+            let mask_weight = latent_subject_mask_weight(item, cfg, &x0)?;
             let encoder = self.encoder.as_ref().ok_or_else(|| {
                 Error::Msg(
                     "lens trainer: text encoder already freed (caching after train loop)".into(),
@@ -408,7 +420,7 @@ impl LensTrainer {
             to_eval.push(&mask);
             to_eval.extend(features.iter());
             eval(to_eval)?;
-            cache.push((x0, features, mask));
+            cache.push((x0, features, mask, mask_weight));
         }
         if cache.is_empty() {
             // A cancel mid-cache is a genuine cancellation → typed `Error::Canceled`; an empty cache
@@ -564,7 +576,7 @@ impl LensTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, features, mask) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, features, mask, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
             let t = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -590,6 +602,7 @@ impl LensTrainer {
                 t,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 compute_dtype,
                 lora_dtype,
                 latent,
@@ -845,6 +858,43 @@ fn encode_latents(vae: &Flux2Vae, image: &Image, edge: u32) -> Result<Array> {
     pack_latents(&normed) // [1, latent·latent, 128]
 }
 
+/// Lay a latent-grid tensor `[1, C, H, W]` out EXACTLY like [`encode_latents`] lays out the VAE
+/// latent: 2×2 `patchify_latents` → `pack_latents`, so element `[0, tok, feat]` of the result sits
+/// over the same latent cell as `x0[0, tok, feat]`. (The bn-normalize between the two is a
+/// per-channel affine on VALUES, not a layout op, so a weight map skips it.)
+fn pack_like_latent(grid: &Array) -> Result<Array> {
+    pack_latents(&patchify_latents(grid)?)
+}
+
+/// The subject-mask loss weight (sc-24828) for one item, packed like its training latent `x0`
+/// (`[1, seq, 4·C]`, `seq = (H/2)·(W/2)` on the square bucket): the item's mask is center-cropped
+/// like the image, area-averaged onto the VAE's UNPACKED `[1, C, H, W]` latent grid, then run through
+/// [`pack_like_latent`]. `None` when the technique is off (no file is read).
+fn latent_subject_mask_weight(
+    item: &gen_core::TrainingItem,
+    cfg: &TrainingConfig,
+    x0: &Array,
+) -> Result<Option<Array>> {
+    let sh = x0.shape();
+    let (seq, feat) = (sh[1], sh[2]);
+    let side = (seq as f64).sqrt().round() as i32;
+    if sh.len() != 3 || side * side != seq || feat % 4 != 0 {
+        return Err(Error::Msg(format!(
+            "lens trainer: subject mask needs a square packed latent, got {sh:?}"
+        )));
+    }
+    let unpacked = [1, feat / 4, side * 2, side * 2];
+    item_subject_mask_weight(
+        "lens trainer",
+        item,
+        cfg.subject_mask_loss.as_ref(),
+        CropBox::center_square,
+        &unpacked,
+    )?
+    .map(|w| pack_like_latent(&w))
+    .transpose()
+}
+
 /// Encode a caption into its per-layer DiT text features (sliced at [`TXT_OFFSET`]) + the valid mask —
 /// the pipeline's positive-only `encode_one` (single-conditional training; the Python keeps the
 /// positives of `encode_prompt(neg="")`). Returns `(features, mask)`: `features` is 4 × `[1, S, 2880]`,
@@ -933,12 +983,14 @@ fn compute_loss_grads(
     t: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     dtype: Dtype,
     lora_dtype: Option<Dtype>,
     latent: usize,
     checkpoint_blocks: Option<&[Vec<String>]>,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target) = build_batch(x0, noise, t)?;
+    let mask_weight = mask_weight.cloned();
     let x_t = x_t.as_dtype(dtype)?; // no-op in f32 mode
     let timestep = Array::from_slice(&[t], &[1]);
     let feats: Vec<Array> = features
@@ -971,13 +1023,9 @@ fn compute_loss_grads(
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
         let diff = subtract(&v, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -1146,6 +1194,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             dtype,
             lora_dtype,
             latent,
@@ -1201,6 +1250,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             Dtype::Float32,
             None,
             latent,
@@ -1546,6 +1596,7 @@ mod tests {
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config,
             output_dir: PathBuf::from("/tmp/lens_unused"),
@@ -1563,6 +1614,250 @@ mod tests {
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.supports_lora && d.supports_lokr);
+        // sc-24828: the one loss path (dense + block-checkpointed) reduces through the packed
+        // subject-mask weight.
+        assert!(d.techniques.subject_mask_loss);
+    }
+
+    /// sc-24828: the subject-mask weight reaches BOTH backward paths (dense + block-checkpointed) of
+    /// [`compute_loss_grads`] on a tiny synthetic Lens DiT (seeded random weights for every tensor
+    /// `LensTransformer::from_weights` reads — the `tests/cfg_gate_equivalence.rs` geometry). The
+    /// weight is built on the unpacked `[1, C, 2·L, 2·L]` grid and packed by [`pack_like_latent`].
+    /// An all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0 and all-zero
+    /// adapter grads on both paths; a half map lands strictly between and agrees across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        use mlx_gen::train::loss::subject_mask_weight;
+        use std::collections::HashMap;
+        let dcfg = LensDitConfig {
+            patch_size: 2,
+            in_channels: 8,
+            out_channels: 2,
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 8,
+            inner_dim: 16,
+            enc_hidden_dim: 6,
+            axes_dims_rope: [2, 2, 4],
+            num_text_layers: 2,
+        };
+        let (dim, hidden) = (dcfg.inner_dim, 32);
+        let txt_in = dcfg.enc_hidden_dim * dcfg.num_text_layers as i32;
+        let out_w = dcfg.patch_size * dcfg.patch_size * dcfg.out_channels;
+        let mut shapes: Vec<(String, Vec<i32>)> = vec![
+            ("img_in.weight".into(), vec![dim, dcfg.in_channels]),
+            ("img_in.bias".into(), vec![dim]),
+            ("txt_in.weight".into(), vec![dim, txt_in]),
+            ("txt_in.bias".into(), vec![dim]),
+            (
+                "time_text_embed.timestep_embedder.linear_1.weight".into(),
+                vec![dim, 256],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_1.bias".into(),
+                vec![dim],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2.weight".into(),
+                vec![dim, dim],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2.bias".into(),
+                vec![dim],
+            ),
+            ("norm_out.linear.weight".into(), vec![2 * dim, dim]),
+            ("norm_out.linear.bias".into(), vec![2 * dim]),
+            ("proj_out.weight".into(), vec![out_w, dim]),
+            ("proj_out.bias".into(), vec![out_w]),
+        ];
+        for i in 0..dcfg.num_text_layers {
+            shapes.push((format!("txt_norm.{i}.weight"), vec![dcfg.enc_hidden_dim]));
+        }
+        for b in 0..dcfg.num_layers {
+            let p = format!("transformer_blocks.{b}");
+            for m in ["img_mod.1", "txt_mod.1"] {
+                shapes.push((format!("{p}.{m}.weight"), vec![6 * dim, dim]));
+                shapes.push((format!("{p}.{m}.bias"), vec![6 * dim]));
+            }
+            for n in ["img_norm1", "img_norm2", "txt_norm1", "txt_norm2"] {
+                shapes.push((format!("{p}.{n}.weight"), vec![dim]));
+            }
+            for n in ["img_qkv", "txt_qkv"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![3 * dim, dim]));
+                shapes.push((format!("{p}.attn.{n}.bias"), vec![3 * dim]));
+            }
+            for n in ["to_out.0", "to_add_out"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![dim, dim]));
+                shapes.push((format!("{p}.attn.{n}.bias"), vec![dim]));
+            }
+            for n in ["norm_q", "norm_k", "norm_added_q", "norm_added_k"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![dcfg.head_dim]));
+            }
+            for m in ["img_mlp", "txt_mlp"] {
+                shapes.push((format!("{p}.{m}.w1.weight"), vec![hidden, dim]));
+                shapes.push((format!("{p}.{m}.w3.weight"), vec![hidden, dim]));
+                shapes.push((format!("{p}.{m}.w2.weight"), vec![dim, hidden]));
+            }
+        }
+        let draw = |shape: &[i32], k: u64| {
+            random::normal::<f32>(shape, None, None, Some(&random::key(k).unwrap())).unwrap()
+        };
+        let map: HashMap<String, Array> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (n, sh))| (n.clone(), draw(sh, i as u64 + 1)))
+            .collect();
+        let mut dit =
+            LensTransformer::from_weights(&Weights::from_map(map), &dcfg, Dtype::Float32).unwrap();
+        let cfg = TrainingConfig {
+            rank: 4,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&dit, &cfg);
+        assert!(!target_paths.is_empty());
+        let (targets, params) = build_lora_targets(&mut dit, &target_paths, 4, 7).unwrap();
+        // Non-zero factors on both sides (lora_b inits at zero, which would zero the lora_a grads
+        // trivially).
+        let scale = Array::from_slice(&[0.05f32], &[1]);
+        let params: LoraParams = params
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                (
+                    k.clone(),
+                    multiply(draw(v.shape(), 100 + i as u64), &scale).unwrap(),
+                )
+            })
+            .collect();
+        let adapter = TrainAdapter::Lora { targets };
+        let mut locals: Vec<Vec<String>> = vec![Vec::new(); dcfg.num_layers];
+        for path in &target_paths {
+            if let Some((idx, local)) = path
+                .strip_prefix("transformer_blocks.")
+                .and_then(|rest| rest.split_once('.'))
+            {
+                if let Ok(i) = idx.parse::<usize>() {
+                    locals[i].push(local.to_string());
+                }
+            }
+        }
+        assert!(locals.iter().any(|l| !l.is_empty()));
+
+        // Packed latent `[1, L·L, 4·C]` (L = 2 patch cells, C = 2 unpacked channels).
+        let latent = 2usize;
+        let unpacked = [1i32, 2, 2 * latent as i32, 2 * latent as i32];
+        let x0 = pack_like_latent(&draw(&unpacked, 201)).unwrap();
+        let noise = draw(x0.shape(), 202);
+        let feats: Vec<Array> = (0..dcfg.num_text_layers)
+            .map(|i| draw(&[1, 3, dcfg.enc_hidden_dim], 300 + i as u64))
+            .collect();
+        let mask = Array::ones::<f32>(&[1, 3]).unwrap();
+        let side = 2 * latent;
+        let wmap = |v: &[f32]| {
+            pack_like_latent(&subject_mask_weight(v, side, side, &unpacked).unwrap()).unwrap()
+        };
+        let mut run = |weight: Option<&Array>, ckpt: bool| {
+            let (l, g) = compute_loss_grads(
+                &mut dit,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &feats,
+                &mask,
+                0.5,
+                &noise,
+                false,
+                weight,
+                Dtype::Float32,
+                None,
+                latent,
+                ckpt.then_some(locals.as_slice()),
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            (l, g)
+        };
+        let n = side * side;
+        let (plain, _) = run(None, false);
+        let ones = wmap(&vec![1.0; n]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = wmap(&vec![0.0; n]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty());
+            for (k, g) in &grads {
+                let m = g.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert_eq!(m, 0.0, "ckpt={ckpt}: nonzero adapter grad on {k}");
+            }
+        }
+        let half: Vec<f32> = (0..n)
+            .map(|i| if i % side < side / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let half = wmap(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+    }
+
+    /// sc-24828: the subject-mask weight is packed EXACTLY like the training latent. A 16×16 mask whose
+    /// 4×4 pixel blocks each carry a distinct grey level area-averages onto a 4×4 unpacked latent
+    /// grid (cell `(y, x)` = that block's level); `latent_subject_mask_weight` must then put cell
+    /// `(2i+dy, 2j+dx)` at packed token `i·2 + j`, feature `c·4 + dy·2 + dx` for every channel `c` —
+    /// the 2×2 `patchify_latents` → `pack_latents` order `encode_latents` applies to `x0`.
+    #[test]
+    fn subject_mask_weight_is_packed_like_the_latent() {
+        let level = |y: u32, x: u32| 10 + (y * 4 + x) * 15;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(16, 16, |px, py| image::Luma([level(py / 4, px / 4) as u8]))
+            .save(&path)
+            .unwrap();
+        let mut cfg = base_config();
+        cfg.subject_mask_loss = Some(gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        });
+        let mut item = req_with(base_config()).items.remove(0);
+        item.image_path = path.clone();
+        item.subject_mask_path = Some(path);
+        // Packed latent `[1, (4/2)·(4/2), 4·C]` with C = 2 unpacked channels.
+        let x0 = Array::zeros::<f32>(&[1, 4, 8]).unwrap();
+        let w = latent_subject_mask_weight(&item, &cfg, &x0)
+            .unwrap()
+            .expect("technique on ⇒ a weight");
+        assert_eq!(w.shape(), x0.shape());
+        let w = multiply(&w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+        let v = w.as_slice::<f32>();
+        for (i, j) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+            for c in 0..2u32 {
+                for (dy, dx) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+                    let tok = (i * 2 + j) as usize;
+                    let feat = (c * 4 + dy * 2 + dx) as usize;
+                    let got = v[tok * 8 + feat];
+                    let want = level(2 * i + dy, 2 * j + dx) as f32 / 255.0;
+                    assert!(
+                        (got - want).abs() < 1e-6,
+                        "token {tok} feature {feat}: {got} != cell ({}, {}) = {want}",
+                        2 * i + dy,
+                        2 * j + dx
+                    );
+                }
+            }
+        }
+        // Off ⇒ no weight (and no file read).
+        assert!(latent_subject_mask_weight(&item, &base_config(), &x0)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

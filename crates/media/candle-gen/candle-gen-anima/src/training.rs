@@ -5,12 +5,15 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::train::subject_mask::CropBox;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, LoadSpec, Modality, NetworkType, Precision, WeightsSource};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
-use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
+use candle_gen::train::flow_match::{
+    self, item_subject_mask_weight, validate_flow_match_request, weighted_velocity_loss,
+};
 use candle_gen::train::lora::{build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
 use candle_gen::train::schedule::schedule_updates;
@@ -38,7 +41,10 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -220,6 +226,16 @@ impl AnimaTrainer {
                 .encode(&image)?
                 .unsqueeze(2)?
                 .to_dtype(DType::F32)?;
+            // `load_image_tensor` centre-crops to a square, so the mask takes the same crop; the
+            // weight is built on `x0`'s `[1, 16, 1, h, w]` shape (last two axes = latent H, W).
+            let mask_weight = item_subject_mask_weight(
+                LABEL,
+                item,
+                cfg.subject_mask_loss.as_ref(),
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
             let (source, target_ids) = encode_conditioner_inputs(
                 &tokenizers,
                 &text_encoder,
@@ -227,7 +243,7 @@ impl AnimaTrainer {
                 dtype,
                 device,
             )?;
-            cache.push((x0, source, target_ids));
+            cache.push((x0, source, target_ids, mask_weight));
         }
         drop(vae_encoder);
         drop(text_encoder);
@@ -278,7 +294,7 @@ impl AnimaTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, source, target_ids) = &cache[(step as usize - 1) % cache.len()];
+            let (x0, source, target_ids, mask_weight) = &cache[(step as usize - 1) % cache.len()];
             let sigma = shifted_sigma(cfg, step);
             let noise = flow_match::sample_noise(
                 x0.dims(),
@@ -289,9 +305,10 @@ impl AnimaTrainer {
             let encoder = conditioner.forward(source, target_ids, dtype)?;
             let sigma_tensor = Tensor::new(&[sigma as f32], device)?.to_dtype(dtype)?;
             let prediction = dit.forward(&x_t.to_dtype(dtype)?, &sigma_tensor, &encoder, dtype)?;
-            let loss = velocity_loss(
+            let loss = weighted_velocity_loss(
                 &prediction.to_dtype(DType::F32)?,
                 &target,
+                mask_weight.as_ref(),
                 flow_match::is_mae(cfg),
             )?;
             last_loss = loss.to_scalar::<f32>()?;
@@ -390,6 +407,7 @@ mod tests {
         assert_eq!(descriptor.backend, "candle");
         assert!(descriptor.supports_lora && descriptor.supports_lokr);
         assert!(!descriptor.supports_control && !descriptor.supports_full_finetune);
+        assert!(descriptor.techniques.subject_mask_loss);
     }
 
     #[test]

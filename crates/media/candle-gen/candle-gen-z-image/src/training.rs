@@ -57,14 +57,15 @@ use candle_core::{DType, Device, IndexOp, Tensor, Var};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
+use candle_gen::gen_core::train::subject_mask::CropBox;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, Image, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
-    self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
-    SamplePlan,
+    self, item_subject_mask_weight, run_flow_match_training, validate_flow_match_request,
+    weighted_velocity_loss, FlowMatchTrainer, SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward_with_input_grad;
 use candle_gen::{CandleError, Result};
@@ -131,6 +132,7 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Tensor,
     mae: bool,
+    mask_weight: Option<&Tensor>,
     compute_dtype: DType,
     use_checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
@@ -153,7 +155,12 @@ fn compute_loss_grads(
         let ctx_ref = &ctx;
         segs.push(Box::new(move |st: &[Tensor]| {
             let v = dit.velocity_out(&st[0], ctx_ref)?.squeeze(2)?.neg()?;
-            Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+            Ok(vec![weighted_velocity_loss(
+                &v,
+                &target_owned,
+                mask_weight,
+                mae,
+            )?])
         }));
         // Seed the checkpointed chain with the detached `unified` boundary, recovering its cotangent.
         let unified_d = unified.detach();
@@ -189,7 +196,7 @@ fn compute_loss_grads(
             .forward(&prepared.latents, &t, &cap_feats, &prepared.cap_mask)?
             .squeeze(2)? // drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w)
             .neg()?;
-        let loss = velocity_loss(&v, &target, mae)?;
+        let loss = weighted_velocity_loss(&v, &target, mask_weight, mae)?;
         let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         let grads = loss.backward()?;
         Ok((loss_val, grads))
@@ -316,7 +323,10 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -387,8 +397,9 @@ impl Trainer for ZImageTrainer {
 
 impl FlowMatchTrainer for ZImageTrainer {
     type Dit = ZImageTransformer2DModel;
-    /// `(x0 latent [1,16,h,w], caption embed (L, 2560))`, both f32.
-    type Cached = (Tensor, Tensor);
+    /// `(x0 latent [1,16,h,w], caption embed (L, 2560), subject-mask loss weight)`, all f32; the
+    /// weight (broadcast to the latent shape) is `None` unless subject-masked loss is on (sc-24828).
+    type Cached = (Tensor, Tensor, Option<Tensor>);
     type Aux = ();
     /// Preview-sample render state (sc-8650): per-prompt `(L, 2560)` conditioning + the resident VAE
     /// decoder + the training edge. See [`ZImageSampleState`].
@@ -408,7 +419,7 @@ impl FlowMatchTrainer for ZImageTrainer {
         req: &TrainingRequest,
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<(Vec<(Tensor, Tensor)>, (), SamplePlan<ZImageSampleState>)> {
+    ) -> Result<(Vec<Self::Cached>, (), SamplePlan<ZImageSampleState>)> {
         let edge = bucket_resolution(req.config.resolution);
         let vae_cfg = VaeConfig::z_image();
         let vae_encoder = VaeEncoder::new(
@@ -425,7 +436,7 @@ impl FlowMatchTrainer for ZImageTrainer {
         )?;
 
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len());
+        let mut cache: Vec<Self::Cached> = Vec::with_capacity(req.items.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -441,8 +452,16 @@ impl FlowMatchTrainer for ZImageTrainer {
                 vae_cfg.shift_factor,
                 vae_cfg.scaling_factor,
             )?;
+            let mask_weight = item_subject_mask_weight(
+                LABEL,
+                item,
+                req.config.subject_mask_loss.as_ref(),
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
             let cap = encode_caption(&tokenizer, &text_encoder, &item.caption, device)?;
-            cache.push((x0, cap));
+            cache.push((x0, cap, mask_weight));
         }
 
         // Preview samples (sc-8650): while the text encoder is still resident, pre-encode up to
@@ -497,13 +516,13 @@ impl FlowMatchTrainer for ZImageTrainer {
         &self,
         dit: &ZImageTransformer2DModel,
         vars: &[Var],
-        cached: &(Tensor, Tensor),
+        cached: &Self::Cached,
         _aux: &(),
         cfg: &TrainingConfig,
         step: u32,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
-        let (x0, cap) = cached;
+        let (x0, cap, mask_weight) = cached;
         let sigma = flow_match::sample_unit_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
@@ -519,6 +538,7 @@ impl FlowMatchTrainer for ZImageTrainer {
             sigma,
             &noise,
             flow_match::is_mae(cfg),
+            mask_weight.as_ref(),
             flow_match::parse_compute_dtype(&cfg.train_dtype),
             cfg.gradient_checkpointing,
         )
@@ -673,6 +693,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -742,6 +763,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -754,6 +776,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             true,
         )
@@ -793,6 +816,72 @@ mod tests {
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
     }
 
+    /// sc-24828: subject-masked loss on both backward paths. An all-ones map is the unweighted loss;
+    /// an all-zero map zeroes the loss AND every adapter gradient (dense and checkpointed — a path
+    /// that dropped the weight would train on the background); a half map matches across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let (mut dit, cfg) = tiny_dit(vb);
+        let suffixes: Vec<String> = Z_IMAGE_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let shape = [1usize, cfg.in_channels, 4, 4];
+        let x0 = Tensor::randn(0f32, 1f32, &shape, &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, &shape, &dev).unwrap();
+        let map = |w: &[f32]| flow_match::subject_mask_weight(w, 4, 4, &shape, &dev).unwrap();
+        let run = |weight: Option<&Tensor>, ckpt: bool| {
+            compute_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                weight,
+                DType::F32,
+                ckpt,
+            )
+            .unwrap()
+        };
+        let (plain, _) = run(None, false);
+        let ones = map(&[1.0; 16]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&[0.0; 16]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            for v in &set.vars {
+                if let Some(g) = grads.get(v.as_tensor()) {
+                    let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(
+                        g.iter().all(|x| *x == 0.0),
+                        "ckpt={ckpt}: nonzero adapter grad"
+                    );
+                }
+            }
+        }
+        let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+    }
+
     /// One optimizer step over the tiny DiT lowers (or holds) the loss on the same fixed batch — the
     /// step actually descends the flow-match objective, end to end through the harness.
     #[test]
@@ -820,6 +909,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -837,6 +927,7 @@ mod tests {
                 0.5,
                 &noise,
                 false,
+                None,
                 DType::F32,
                 false,
             )
@@ -851,6 +942,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -894,6 +986,7 @@ mod tests {
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         };
         let base = TrainingRequest {
             items: vec![item.clone()],

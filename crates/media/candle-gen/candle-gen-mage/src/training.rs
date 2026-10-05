@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor, Var};
+use candle_gen::gen_core::train::subject_mask::CropBox;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -14,8 +15,8 @@ use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
-    self, effective_weight_decay, noise_seed, sample_noise, save_adapter,
-    validate_flow_match_request, velocity_loss,
+    self, effective_weight_decay, item_subject_mask_weight, noise_seed, sample_noise, save_adapter,
+    validate_flow_match_request, weighted_velocity_loss,
 };
 use candle_gen::train::lora::{
     build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost, LoraSet,
@@ -44,7 +45,10 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: true,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -226,6 +230,46 @@ struct CachedSample {
     latent: Tensor,
     text: Tensor,
     layout: PackLayout,
+    /// Subject-mask loss weight packed exactly like `latent` (`[1, grid², C]`); `None` unless
+    /// subject-masked loss is on (sc-24828).
+    mask_weight: Option<Tensor>,
+}
+
+/// Pack a `[1, C, grid, grid]` latent-grid tensor into Mage's `[1, grid², C]` token sequence — the
+/// layout the cached latent (and so the velocity target) uses. Shared with the subject-mask loss
+/// weight so it lines up element-for-element with the latent it multiplies.
+fn pack_latent_tokens(latent: &Tensor, grid: usize, channels: usize) -> Result<Tensor> {
+    Ok(latent
+        .permute((0, 2, 3, 1))?
+        .reshape((1, grid * grid, channels))?)
+}
+
+/// One step's flow-match loss over a cached sample: noise the packed latent at `sigma`, predict the
+/// velocity through the transformer (adapter or full surface alike), regress it toward
+/// `noise − latent`, weighted by the sample's subject-mask weight (`None` ⇒ exactly the unweighted
+/// `velocity_loss`).
+fn step_loss(
+    transformer: &MageTransformer,
+    sample: &CachedSample,
+    noise: &Tensor,
+    sigma: f64,
+    compute_dtype: DType,
+    mae: bool,
+) -> Result<Tensor> {
+    let (x_t, target) = build_training_batch(&sample.latent, noise, sigma, compute_dtype)?;
+    let sigma_tensor = Tensor::new(&[sigma as f32], noise.device())?;
+    let prediction = transformer.forward(
+        &x_t,
+        &sample.text.to_dtype(compute_dtype)?,
+        &sigma_tensor,
+        &sample.layout,
+    )?;
+    Ok(weighted_velocity_loss(
+        &prediction,
+        &target,
+        sample.mask_weight.as_ref(),
+        mae,
+    )?)
 }
 
 fn cache_samples(
@@ -250,11 +294,24 @@ fn cache_samples(
             total: req.items.len() as u32,
         });
         let image = load_image_tensor(&item.image_path, edge, device)?;
-        let latent = vae
-            .encode_sample(&image, req.config.seed.wrapping_add(index as u64))?
-            .permute((0, 2, 3, 1))?
-            .reshape((1, grid * grid, config::LATENT_CHANNELS))?
-            .detach();
+        let latent = pack_latent_tokens(
+            &vae.encode_sample(&image, req.config.seed.wrapping_add(index as u64))?,
+            grid,
+            config::LATENT_CHANNELS,
+        )?
+        .detach();
+        // `load_image_tensor` centre-crops to a square, so the mask takes the same crop. The weight
+        // is built on the unpacked `[1, C, grid, grid]` latent grid and packed like the latent.
+        let mask_weight = item_subject_mask_weight(
+            LABEL,
+            item,
+            req.config.subject_mask_loss.as_ref(),
+            CropBox::center_square,
+            &[1, config::LATENT_CHANNELS, grid, grid],
+            device,
+        )?
+        .map(|weight| pack_latent_tokens(&weight, grid, config::LATENT_CHANNELS))
+        .transpose()?;
         let text = text_encoder.encode(&item.caption)?.detach();
         let layout =
             PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![text.dim(1)?])?;
@@ -262,6 +319,7 @@ fn cache_samples(
             latent,
             text,
             layout,
+            mask_weight,
         });
     }
     if cache.is_empty() {
@@ -401,15 +459,7 @@ impl MageTrainer {
                 noise_seed(req.config.seed, step),
                 &self.device,
             )?;
-            let (x_t, target) = build_training_batch(&sample.latent, &noise, sigma, compute_dtype)?;
-            let sigma_tensor = Tensor::new(&[sigma as f32], &self.device)?;
-            let prediction = transformer.forward(
-                &x_t,
-                &sample.text.to_dtype(compute_dtype)?,
-                &sigma_tensor,
-                &sample.layout,
-            )?;
-            let loss = velocity_loss(&prediction, &target, mae)?;
+            let loss = step_loss(&transformer, sample, &noise, sigma, compute_dtype, mae)?;
             last_loss = loss.to_scalar::<f32>()?;
             let grads = loss.backward()?;
             accumulate_grads(&mut accumulated, grads, &vars)?;
@@ -712,6 +762,97 @@ mod tests {
             assert!(vars.iter().any(|var| grads.get(var.as_tensor()).is_some()));
         }
         (grads, flat)
+    }
+
+    /// A 2×2-grid cached sample for the tiny transformer, its weight built on the unpacked
+    /// `[1, 4, 2, 2]` grid and packed like the latent.
+    fn masked_sample(mask: Option<&[f32]>) -> CachedSample {
+        let (grid, channels) = (2usize, 4usize);
+        let unpacked = [1usize, channels, grid, grid];
+        let latent = Tensor::from_vec(values(16, 0.1), &unpacked, &Device::Cpu).unwrap();
+        CachedSample {
+            latent: pack_latent_tokens(&latent, grid, channels).unwrap(),
+            text: Tensor::from_vec(values(8, 0.1), (1, 1, 8), &Device::Cpu).unwrap(),
+            layout: PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![1]).unwrap(),
+            mask_weight: mask.map(|m| {
+                let w = flow_match::subject_mask_weight(m, grid, grid, &unpacked, &Device::Cpu)
+                    .unwrap();
+                pack_latent_tokens(&w, grid, channels).unwrap()
+            }),
+        }
+    }
+
+    /// sc-24828: the subject-mask weight reaches the step loss on BOTH training surfaces (adapter and
+    /// full fine-tune). An all-ones map is the unweighted loss; an all-zero map zeroes the loss AND
+    /// every trainable gradient; a half map lands between.
+    #[test]
+    fn subject_mask_weight_reaches_adapter_and_full_step_loss() {
+        let fixture = tiny_transformer_dir();
+        let cfg = tiny_config();
+        let mut adapter =
+            MageTransformer::load_dtype(fixture.path(), &cfg, DType::F32, &Device::Cpu).unwrap();
+        let set = build_adapt_lora_targets(
+            &mut adapter,
+            &["proj_out".to_string(), "to_q".to_string()],
+            2,
+            2.0,
+            7,
+            &Device::Cpu,
+        )
+        .unwrap();
+        for var in &set.vars {
+            var.set(&Tensor::randn(0f32, 0.02f32, var.as_tensor().dims(), &Device::Cpu).unwrap())
+                .unwrap();
+        }
+        let (full, named) =
+            MageTransformer::load_trainable(fixture.path(), &cfg, &Device::Cpu).unwrap();
+        let full_vars = named.iter().map(|(_, var)| var.clone()).collect::<Vec<_>>();
+        let noise = Tensor::from_vec(values(16, 0.07), (1, 4, 4), &Device::Cpu).unwrap();
+        let half: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0];
+        for (model, vars) in [(&adapter, &set.vars), (&full, &full_vars)] {
+            let loss = |mask: Option<&[f32]>| {
+                step_loss(model, &masked_sample(mask), &noise, 0.5, DType::F32, false).unwrap()
+            };
+            let plain = loss(None).to_scalar::<f32>().unwrap();
+            let ones = loss(Some(&[1.0; 4])).to_scalar::<f32>().unwrap();
+            assert!((ones - plain).abs() < 1e-6, "{ones} vs {plain}");
+            let zero = loss(Some(&[0.0; 4]));
+            assert_eq!(zero.to_scalar::<f32>().unwrap(), 0.0);
+            let grads = zero.backward().unwrap();
+            for var in vars.iter() {
+                if let Some(g) = grads.get(var.as_tensor()) {
+                    let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(g.iter().all(|x| *x == 0.0), "nonzero trainable grad");
+                }
+            }
+            let mid = loss(Some(&half)).to_scalar::<f32>().unwrap();
+            assert!(mid > 0.0 && mid < plain, "{mid} vs {plain}");
+        }
+    }
+
+    /// sc-24828: the packed weight lines up with the packed latent — a weight whose value encodes its
+    /// `(y, x)` grid cell lands at token `y·grid + x` on every channel.
+    #[test]
+    fn packed_subject_mask_weight_lines_up_with_packed_latent() {
+        let grid = 3usize;
+        let vals: Vec<f32> = (0..grid * grid)
+            .map(|i| ((i / grid) * 10 + i % grid) as f32)
+            .collect();
+        let w =
+            flow_match::subject_mask_weight(&vals, grid, grid, &[1, 4, grid, grid], &Device::Cpu)
+                .unwrap();
+        let packed = pack_latent_tokens(&w, grid, 4).unwrap();
+        assert_eq!(packed.dims(), &[1, grid * grid, 4]);
+        let rows = packed.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        for (token, row) in rows.iter().enumerate() {
+            let expected = ((token / grid) * 10 + token % grid) as f32;
+            assert!(row.iter().all(|v| *v == expected), "token {token}: {row:?}");
+        }
+    }
+
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
     }
 
     #[test]

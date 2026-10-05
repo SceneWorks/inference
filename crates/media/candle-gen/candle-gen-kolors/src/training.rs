@@ -13,13 +13,17 @@ use candle_gen::diffusion_schedule::{
     KOLORS_TRAIN_STEPS as NUM_TRAIN_TIMESTEPS,
 };
 use candle_gen::gen_core::sampling::AlphaSchedule;
+use candle_gen::gen_core::train::subject_mask::CropBox;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, LoadSpec, Modality, NetworkType, Precision, WeightsSource};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
-use candle_gen::train::flow_match::{effective_weight_decay, noise_seed, sample_noise};
+use candle_gen::train::flow_match::{
+    effective_weight_decay, item_subject_mask_weight, noise_seed, sample_noise,
+    weighted_velocity_loss,
+};
 use candle_gen::train::lora::{
     build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
     SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
@@ -54,7 +58,10 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -254,13 +261,20 @@ fn ddpm_noise(schedule: &AlphaSchedule, x0: &Tensor, noise: &Tensor, t: usize) -
     Ok(((x0 * alpha.sqrt())? + (noise * (1.0 - alpha).sqrt())?)?)
 }
 
-fn epsilon_loss(prediction: &Tensor, noise: &Tensor, mae: bool) -> Result<Tensor> {
-    let diff = (prediction.to_dtype(DType::F32)? - noise.to_dtype(DType::F32)?)?;
-    Ok(if mae {
-        diff.abs()?.mean_all()?
-    } else {
-        diff.sqr()?.mean_all()?
-    })
+/// ε-prediction loss in f32. `weight` is the item's subject-mask loss weight (sc-24828), broadcast
+/// to the latent shape: `None` is exactly `mean(ℓ)`, `Some(w)` is `mean(w ⊙ ℓ)`.
+fn epsilon_loss(
+    prediction: &Tensor,
+    noise: &Tensor,
+    weight: Option<&Tensor>,
+    mae: bool,
+) -> Result<Tensor> {
+    Ok(weighted_velocity_loss(
+        prediction,
+        &noise.to_dtype(DType::F32)?,
+        weight,
+        mae,
+    )?)
 }
 
 impl KolorsTrainer {
@@ -303,8 +317,18 @@ impl KolorsTrainer {
             });
             let image = load_image_tensor(&item.image_path, edge, device)?;
             let x0 = vae.encode_mean(&image)?.detach();
+            // `load_image_tensor` center-crops to the largest square before resizing; the weight
+            // (broadcast to the latent shape) is `None` unless subject-masked loss is on (sc-24828).
+            let mask_weight = item_subject_mask_weight(
+                LABEL,
+                item,
+                cfg.subject_mask_loss.as_ref(),
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
             let (context, pooled) = cache_caption(&caption_encoder, &item.caption)?;
-            cache.push((x0, context, pooled));
+            cache.push((x0, context, pooled, mask_weight));
         }
         drop(caption_encoder);
         drop(vae);
@@ -357,7 +381,7 @@ impl KolorsTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, context, pooled) = &cache[(step as usize - 1) % cache.len()];
+            let (x0, context, pooled, mask_weight) = &cache[(step as usize - 1) % cache.len()];
             let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(step as u64));
             let timestep = rng.random_range(0..NUM_TRAIN_TIMESTEPS);
             let noise = sample_noise(x0.dims(), noise_seed(cfg.seed, step), device)?;
@@ -372,7 +396,7 @@ impl KolorsTrainer {
                 None,
                 None,
             )?;
-            let loss = epsilon_loss(&prediction, &noise, mae)?;
+            let loss = epsilon_loss(&prediction, &noise, mask_weight.as_ref(), mae)?;
             last_loss = loss.to_scalar::<f32>()?;
             let grads = loss.backward()?;
             accumulate_grads(&mut accumulated, grads, &set.vars)?;
@@ -470,6 +494,35 @@ mod tests {
         assert!((got - expected).abs() < 1e-6);
     }
 
+    /// sc-24828: the ε loss honours the subject-mask weight — an all-ones map is the unweighted
+    /// loss, an all-zero map zeroes the loss and the prediction's gradient — and the trainer
+    /// declares the technique.
+    #[test]
+    fn epsilon_loss_applies_the_subject_mask_weight() {
+        use candle_gen::candle_core::Var;
+        let dev = Device::Cpu;
+        let shape = [1usize, 4, 2, 2];
+        let pred = Var::from_tensor(&Tensor::randn(0f32, 1f32, &shape, &dev).unwrap()).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, &shape, &dev).unwrap();
+        let map = |w: &[f32]| {
+            candle_gen::train::flow_match::subject_mask_weight(w, 2, 2, &shape, &dev).unwrap()
+        };
+        let loss = |w: Option<&Tensor>| epsilon_loss(pred.as_tensor(), &noise, w, false).unwrap();
+        let plain = loss(None).to_scalar::<f32>().unwrap();
+        let ones = loss(Some(&map(&[1.0; 4]))).to_scalar::<f32>().unwrap();
+        assert!((ones - plain).abs() < 1e-6);
+        let zero = loss(Some(&map(&[0.0; 4])));
+        assert_eq!(zero.to_scalar::<f32>().unwrap(), 0.0);
+        let g = zero.backward().unwrap();
+        let g = g.get(pred.as_tensor()).unwrap().flatten_all().unwrap();
+        assert!(g.to_vec1::<f32>().unwrap().iter().all(|x| *x == 0.0));
+        let half = loss(Some(&map(&[1.0, 0.0, 1.0, 0.0])))
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(half > 0.0 && half < plain);
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
     #[test]
     fn nondivisible_accumulation_tail_uses_its_actual_micro_count() {
         assert_eq!(accumulation_divisor(4, 4), 4);
@@ -486,6 +539,7 @@ mod tests {
                 control_image_path,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),

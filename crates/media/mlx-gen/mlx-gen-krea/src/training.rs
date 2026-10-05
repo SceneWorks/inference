@@ -61,7 +61,9 @@ use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
     TrainAdapter,
 };
+use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::CropBox;
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Error, LoadSpec, Modality, NetworkType, Precision, Progress,
     Result, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
@@ -163,7 +165,12 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-24828 (epic 2123): honors `subject_mask_loss` on its one (LoRA/LoKr, dense or
+        // block-checkpointed) loss path.
+        techniques: gen_core::train::TrainingTechniques {
+            subject_mask_loss: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -373,7 +380,9 @@ impl KreaRawTrainer {
         // --- prepare → load → cache: VAE-latents + caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len());
+        // Per item: clean latent, caption features, and (subject-masked loss, sc-24828) the latent
+        // loss-weight map — `None` when the technique is off.
+        let mut cache: Vec<(Array, Array, Option<Array>)> = Vec::with_capacity(req.items.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -384,6 +393,13 @@ impl KreaRawTrainer {
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
             let x0 = encode_latents(&self.vae, &img, edge)?; // [1, 16, edge/8, edge/8]
+            let mask_weight = item_subject_mask_weight(
+                "krea trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+                CropBox::center_square,
+                x0.shape(),
+            )?;
             let encoder = self.encoder.as_ref().ok_or_else(|| {
                 Error::Msg(
                     "krea trainer: text encoder already freed (caching after train loop)".into(),
@@ -391,7 +407,7 @@ impl KreaRawTrainer {
             })?;
             let context = encode_caption(&self.tokenizer, encoder, &item.caption)?;
             eval([&x0, &context])?;
-            cache.push((x0, context));
+            cache.push((x0, context, mask_weight));
         }
         if cache.is_empty() {
             if req.cancel.is_cancelled() {
@@ -539,7 +555,7 @@ impl KreaRawTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, context) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, context, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
             let t = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -564,6 +580,7 @@ impl KreaRawTrainer {
                 t,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 compute_dtype,
                 lora_dtype,
                 checkpoint_blocks,
@@ -866,11 +883,13 @@ fn compute_loss_grads(
     t: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     dtype: Dtype,
     lora_dtype: Option<Dtype>,
     checkpoint_blocks: Option<&[Vec<String>]>,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target) = build_batch(x0, noise, t)?;
+    let mask_weight = mask_weight.cloned();
     let x_t = x_t.as_dtype(dtype)?; // no-op in f32 mode
     let timestep = Array::from_slice(&[t], &[1]);
     let context = context.clone();
@@ -890,13 +909,9 @@ fn compute_loss_grads(
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
         let diff = subtract(&v, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -988,6 +1003,7 @@ mod tests {
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config,
             output_dir: PathBuf::from("/tmp/krea_unused"),
@@ -1005,6 +1021,9 @@ mod tests {
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.supports_lora && d.supports_lokr);
+        // sc-24828: the one loss path (dense + block-checkpointed) reduces through the subject-mask
+        // weight; the latent is unpacked `[1, 16, H, W]`, so the weight is the cached latent's shape.
+        assert!(d.techniques.subject_mask_loss);
     }
 
     #[test]
@@ -1160,6 +1179,138 @@ mod tests {
         // The bf16 base (no tokens) is ~the resident DiT weights (≥ 20 GB) — the floor the guard adds to.
         assert!(projected_dense_peak_gb(0.0, true) >= 20.0);
     }
+
+    /// sc-24828: the subject-mask weight reaches BOTH backward paths (dense + block-checkpointed) of
+    /// [`compute_loss_grads`] on the checked-in tiny `dit_golden` fixture DiT (no real weights). An
+    /// all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0 and all-zero
+    /// adapter grads on both paths; a half map lands strictly between and agrees across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        use mlx_gen::train::loss::subject_mask_weight;
+        use mlx_gen::weights::Weights;
+        let w = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/dit_golden.safetensors"
+        ))
+        .unwrap();
+        // Mirrors `tests/common::tiny_dit_config` (the fixture's dump geometry).
+        let dit_cfg = crate::config::Krea2Config {
+            in_channels: 16,
+            patch_size: 2,
+            hidden_size: 128,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            attention_head_dim: 32,
+            num_layers: 2,
+            intermediate_size: 384,
+            norm_eps: 1e-5,
+            axes_dims_rope: [8, 12, 12],
+            rope_theta: 1000.0,
+            timestep_embed_dim: 64,
+            num_text_layers: 3,
+            num_layerwise_text_blocks: 2,
+            num_refiner_text_blocks: 2,
+            text_hidden_dim: 64,
+            text_intermediate_size: 256,
+            text_num_attention_heads: 2,
+            text_num_kv_heads: 2,
+        };
+        dit_cfg.validate().unwrap();
+        let mut dit = Krea2Transformer::from_weights(&w, &dit_cfg).unwrap();
+        let cfg = TrainingConfig {
+            rank: 4,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&dit, &cfg);
+        assert!(!target_paths.is_empty());
+        let (targets, params) = build_lora_targets(&mut dit, &target_paths, 4, 7).unwrap();
+        // Non-zero factors on both sides (the up-projection inits at zero, which would zero the
+        // down-projection grads trivially).
+        let scale = Array::from_slice(&[0.02f32], &[1]);
+        let params: LoraParams = params
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let r = random::normal::<f32>(
+                    v.shape(),
+                    None,
+                    None,
+                    Some(&random::key(100 + i as u64).unwrap()),
+                )
+                .unwrap();
+                (k.clone(), multiply(&r, &scale).unwrap())
+            })
+            .collect();
+        let adapter = TrainAdapter::Lora { targets };
+        let mut locals: Vec<Vec<String>> = vec![Vec::new(); dit.num_blocks()];
+        for path in &target_paths {
+            if let Some((idx, local)) = path
+                .strip_prefix("transformer_blocks.")
+                .and_then(|rest| rest.split_once('.'))
+            {
+                if let Ok(i) = idx.parse::<usize>() {
+                    locals[i].push(local.to_string());
+                }
+            }
+        }
+        assert!(locals.iter().any(|l| !l.is_empty()));
+        let x0 = w.require("in.latent").unwrap().clone();
+        let context = w.require("in.context").unwrap().clone();
+        let shape = x0.shape().to_vec();
+        let (gh, gw) = (shape[2] as usize, shape[3] as usize);
+        let noise =
+            random::normal::<f32>(&shape, None, None, Some(&random::key(2).unwrap())).unwrap();
+        let map = |v: &[f32]| subject_mask_weight(v, gh, gw, &shape).unwrap();
+        let mut run = |weight: Option<&Array>, ckpt: bool| {
+            let (l, g) = compute_loss_grads(
+                &mut dit,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &context,
+                0.5,
+                &noise,
+                false,
+                weight,
+                Dtype::Float32,
+                None,
+                ckpt.then_some(locals.as_slice()),
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            (l, g)
+        };
+        let n = gh * gw;
+        let (plain, _) = run(None, false);
+        let ones = map(&vec![1.0; n]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&vec![0.0; n]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty());
+            for (k, g) in &grads {
+                let m = g.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert_eq!(m, 0.0, "ckpt={ckpt}: nonzero adapter grad on {k}");
+            }
+        }
+        let half: Vec<f32> = (0..n)
+            .map(|i| if i % gw < gw / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+    }
 }
 
 // ===========================================================================================
@@ -1287,6 +1438,7 @@ mod real_weight_repro {
             0.5,
             &noise,
             false,
+            None,
             Dtype::Float32,
             None,
             None,
@@ -1306,6 +1458,7 @@ mod real_weight_repro {
             0.5,
             &noise,
             false,
+            None,
             Dtype::Float32,
             None,
             Some(&locals),

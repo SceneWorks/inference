@@ -74,10 +74,24 @@ pub fn to_uint8(image: &Tensor) -> Result<Tensor> {
 /// the parity gate pins.
 pub fn encode(vae: &Flux2Vae, image: &Tensor) -> Result<(Tensor, usize, usize)> {
     let packed = vae.encode_packed(image)?; // [B, 128, h, w]
+    let (_, _, h, w) = packed.dims4()?;
+    Ok((flatten_packed(&packed)?, h, w))
+}
+
+/// Flatten a packed NCHW grid `[B, 128, h, w]` to the DiT's `[B, h·w, 128]` token sequence — the
+/// layout [`encode`] caches. Shared with the subject-mask loss weight (sc-24828) so the weight is
+/// laid out element-for-element like the latent it multiplies.
+pub fn flatten_packed(packed: &Tensor) -> Result<Tensor> {
     let (b, c, h, w) = packed.dims4()?;
-    let x0 = packed
+    packed
         .permute((0, 2, 3, 1))? // [B, h, w, 128]
         .reshape((b, h * w, c))? // [B, h·w, 128]
-        .contiguous()?;
-    Ok((x0, h, w))
+        .contiguous()
+}
+
+/// Lay a subject-mask loss weight built on the **unpacked** 32-ch latent grid `[B, 32, 2h, 2w]` out
+/// like the cached packed latent `[B, h·w, 128]`: the FLUX.2 2×2 [`patchify`](candle_gen_flux2::vae::patchify)
+/// [`Flux2Vae::encode_packed`] applies, then [`flatten_packed`] (sc-24828).
+pub fn pack_unpacked_latent(unpacked: &Tensor) -> Result<Tensor> {
+    flatten_packed(&candle_gen_flux2::vae::patchify(unpacked)?)
 }
