@@ -513,7 +513,11 @@ fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let make = || -> Box<dyn Trainer> {
         let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
-        stub.desc.techniques = gen_core::TrainingTechniques::ADAPTER_NOISE;
+        // Every probed technique but buckets is declared, so only the bucket probe can fail.
+        stub.desc.techniques = gen_core::TrainingTechniques {
+            depth_anchoring: true,
+            ..gen_core::TrainingTechniques::ADAPTER_NOISE
+        };
         Box::new(stub)
     };
     let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
@@ -562,4 +566,41 @@ fn declared_resolution_buckets_that_break_training_fail_the_bucketed_progress_ch
     };
     let err = check_trainer_bucketed_progress(&make, &profile(&tmp)).unwrap_err();
     assert!(err.contains("Training"), "got: {err}");
+}
+
+/// sc-2125: a trainer that declares both noise techniques but silently accepts an undeclared
+/// depth-anchoring request fails the validate check and the train-entry refusal check on the depth
+/// probe. Mutation: drop the depth probe from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_depth_anchoring_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques = gen_core::TrainingTechniques::ADAPTER_NOISE;
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.depth_anchoring == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("depth_anchoring") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-2125: a trainer that declares depth anchoring (and routes through the floor) passes the
+/// technique checks — depth anchoring is not adapter-only, so no full-fine-tune refusal is demanded.
+#[test]
+fn declared_depth_anchoring_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.depth_anchoring = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
 }

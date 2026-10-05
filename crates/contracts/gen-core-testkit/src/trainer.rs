@@ -224,6 +224,9 @@ struct TechniqueProbe {
     knob: &'static str,
     enable: fn(&mut TrainingRequest),
     declared: fn(&gen_core::TrainingTechniques) -> bool,
+    /// Whether the technique touches adapter factors only, so a full base fine-tune must refuse it
+    /// (E5). The noise techniques are; depth anchoring is a loss term, not adapter-only.
+    adapter_only: bool,
 }
 
 const TECHNIQUE_PROBES: &[TechniqueProbe] = &[
@@ -232,12 +235,28 @@ const TECHNIQUE_PROBES: &[TechniqueProbe] = &[
         knob: "weight_noise_sigma",
         enable: |r| r.config.weight_noise_sigma = WEIGHT_NOISE_PROBE_SIGMA,
         declared: |t| t.weight_noise,
+        adapter_only: true,
     },
     TechniqueProbe {
         name: "gradient_noise",
         knob: "gradient_noise_eta",
         enable: |r| r.config.gradient_noise_eta = GRADIENT_NOISE_PROBE_ETA,
         declared: |t| t.gradient_noise,
+        adapter_only: true,
+    },
+    TechniqueProbe {
+        name: "depth_anchoring",
+        knob: "depth_anchoring.schedule.weight",
+        enable: |r| {
+            // The upstream DA2-Small weight; the directories only need to be named — validate never
+            // loads them (sc-2125).
+            r.config.depth_anchoring.schedule.weight = 0.1;
+            r.config.depth_anchoring.model_dir =
+                Some(PathBuf::from("/conformance/depth-anything-v2"));
+            r.config.perceptual_decoder_dir = Some(PathBuf::from("/conformance/taef1"));
+        },
+        declared: |t| t.depth_anchoring,
+        adapter_only: false,
     },
 ];
 
@@ -274,6 +293,9 @@ fn check_technique_validate(t: &dyn Trainer, ok: &TrainingRequest) -> Result<(),
                      techniques.{name} == true: {e}"
                 ))
             }
+        }
+        if !probe.adapter_only {
+            continue;
         }
         let mut full = on;
         full.config.full_finetune = true;

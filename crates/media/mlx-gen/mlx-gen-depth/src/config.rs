@@ -75,6 +75,110 @@ impl DepthAnythingConfig {
         }
     }
 
+    /// `depth-anything/Depth-Anything-V2-Base-hf` (ViT-B/14): same graph, wider (verified against
+    /// the published `config.json`).
+    pub fn base() -> Self {
+        Self {
+            hidden_size: 768,
+            num_attention_heads: 12,
+            neck_hidden_sizes: [96, 192, 384, 768],
+            fusion_hidden_size: 128,
+            ..Self::small()
+        }
+    }
+
+    /// `depth-anything/Depth-Anything-V2-Large-hf` (ViT-L/14): 24 layers, captures layers
+    /// `[5, 12, 18, 24]` (verified against the published `config.json`).
+    pub fn large() -> Self {
+        Self {
+            hidden_size: 1024,
+            num_hidden_layers: 24,
+            num_attention_heads: 16,
+            out_indices: [5, 12, 18, 24],
+            neck_hidden_sizes: [256, 512, 1024, 1024],
+            fusion_hidden_size: 256,
+            ..Self::small()
+        }
+    }
+
+    /// The config for a [`mlx_gen::gen_core::train::DepthModelSize`].
+    pub fn for_size(size: mlx_gen::gen_core::train::DepthModelSize) -> Self {
+        use mlx_gen::gen_core::train::DepthModelSize;
+        match size {
+            DepthModelSize::Small => Self::small(),
+            DepthModelSize::Base => Self::base(),
+            DepthModelSize::Large => Self::large(),
+        }
+    }
+
+    /// Parameter count of the full model (backbone + neck + head) — exact for the module graph
+    /// [`crate::DepthAnythingV2::from_weights`] loads; used for the trainer memory estimate.
+    pub fn param_count(&self) -> u64 {
+        let h = self.hidden_size as u64;
+        let inter = self.intermediate_size() as u64;
+        let p = self.patch_size as u64;
+        let tokens = (self.grid() as u64).pow(2) + 1;
+        let mut n = h * 3 * p * p + h + h + tokens * h; // patch embed, cls, pos
+        let layer = 4 * h + 4 * (h * h + h) + 2 * h + (inter * h + inter) + (h * inter + h);
+        n += layer * self.num_hidden_layers as u64 + 2 * h;
+        let fh = self.fusion_hidden_size as u64;
+        for i in 0..4 {
+            let nh = self.neck_hidden_sizes[i] as u64;
+            n += nh * h + nh; // reassemble projection
+            let f = self.reassemble_factors[i];
+            if f > 1.0 {
+                let k = f as u64;
+                n += nh * nh * k * k + nh;
+            } else if f < 1.0 {
+                n += nh * nh * 9 + nh;
+            }
+            n += fh * nh * 9; // neck.convs
+            n += 4 * (fh * fh * 9 + fh) + fh * fh + fh; // fusion layer
+        }
+        let half = fh / 2;
+        let hh = self.head_hidden_size as u64;
+        n += half * fh * 9 + half + hh * half * 9 + hh + hh + 1;
+        n
+    }
+
+    /// Conservative training working set of one differentiable forward + backward at the native
+    /// square [`image_size`](Self::image_size), in bytes (f32; ×2 for the backward's cotangents).
+    /// Counts the per-layer retained attention scores/probabilities (`heads · tokens²` ×2) and
+    /// ~12 `tokens · hidden` activations per layer, plus ~12 retained maps per fusion / head stage
+    /// at their resolutions. Used by the trainer memory estimate (epic 2123 E7); not a measured
+    /// value.
+    pub fn training_working_set_bytes(&self) -> u64 {
+        let tokens = (self.grid() as u64).pow(2) + 1;
+        let h = self.hidden_size as u64;
+        let heads = self.num_attention_heads as u64;
+        let per_layer = 2 * heads * tokens * tokens + (12 + 2 * self.mlp_ratio as u64) * tokens * h;
+        let backbone = per_layer * self.num_hidden_layers as u64;
+        let g = self.grid() as u64;
+        let fh = self.fusion_hidden_size as u64;
+        // Fusion runs at grid/2·2 … up to 16·grid (each stage doubles); head at image_size².
+        let fusion: u64 = (0..4).map(|k| 12 * fh * (g * (2 << k)).pow(2)).sum();
+        let full = (self.image_size as u64).pow(2);
+        let head = 6 * (fh / 2 + self.head_hidden_size as u64) * full;
+        (backbone + fusion + head) * 4 * 2
+    }
+
+    /// The aspect-preserving model input size for an `h × w` image (upstream
+    /// `DifferentiableDepthEncoder._aspect_preserving_hw`): the long side becomes
+    /// [`image_size`](Self::image_size), the short side is scaled to match and rounded to a
+    /// multiple of the patch size (at least one patch). Square inputs map to the native square.
+    pub fn input_hw(&self, h: i32, w: i32) -> (i32, i32) {
+        let (s, p) = (self.image_size, self.patch_size);
+        let short = |short: i32, long: i32| -> i32 {
+            let scaled = (short as f64 * s as f64 / long as f64 / p as f64).round() as i32 * p;
+            scaled.max(p)
+        };
+        if h >= w {
+            (s, short(w, h))
+        } else {
+            (short(h, w), s)
+        }
+    }
+
     /// `head_dim = hidden_size / num_attention_heads`.
     pub fn head_dim(&self) -> i32 {
         self.hidden_size / self.num_attention_heads
