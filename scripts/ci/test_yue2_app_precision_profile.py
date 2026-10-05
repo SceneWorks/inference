@@ -749,6 +749,9 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("--control control --app-sha", workflow)
         self.assertLess(workflow.index("Select the app checkout's pinned Rust channel"),
                         workflow.index("uses: ./app/.github/actions/prepare-rust-runner"))
+        self.assertRegex(workflow,
+                         r"(?m)^\s+- uses: \./app/\.github/actions/prepare-rust-runner\n"
+                         r"\s+with:\n\s+workspace-directory: app$")
         self.assertIn("RUSTUP_TOOLCHAIN=", workflow)
         self.assertIn("Verify selected app Rust channel", workflow)
 

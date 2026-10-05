@@ -131,6 +131,8 @@ jobs:
           if (-not $pin) { throw 'app Rust channel is not an exact version' }
           Add-Content -Path $env:GITHUB_ENV -Value "RUSTUP_TOOLCHAIN=$($pin.Matches[0].Groups[1].Value)"
       - uses: ./app/.github/actions/prepare-rust-runner
+        with:
+          workspace-directory: app
       - name: Verify selected app Rust channel
         shell: powershell
         working-directory: app
