@@ -108,7 +108,8 @@ jobs:
               raise RuntimeError("Models mount absent or symlinked")
           fs = os.statvfs(models)
           info = plist(["/usr/sbin/diskutil", "info", "-plist", str(models)])
-          build_info = plist(["/usr/sbin/diskutil", "info", "-plist", "/Users/MTrefry/actions-runner-nax/_work/inference"])
+          internal_mount = Path("/System/Volumes/Data") if os.path.ismount("/System/Volumes/Data") else Path("/")
+          build_info = plist(["/usr/sbin/diskutil", "info", "-plist", str(internal_mount)])
           apfs = plist(["/usr/sbin/diskutil", "apfs", "list", "-plist"])
           containers = [{k: c.get(k) for k in ("ContainerReference", "CapacityCeiling", "CapacityFree")}
                         | {"physicalStores": [p.get("DeviceIdentifier") for p in c.get("PhysicalStores", [])],
@@ -120,6 +121,15 @@ jobs:
           workspace = Path("/Users/MTrefry/actions-runner-nax/_work/inference/inference")
           if Path(os.environ["GITHUB_WORKSPACE"]) != workspace or not safe(workspace.parent):
               raise RuntimeError("expected source-owned build root changed or symlinked")
+          runner_temp = Path(os.environ["RUNNER_TEMP"])
+          if not safe(runner_temp) or not runner_temp.is_dir():
+              raise RuntimeError("runner temp absent or symlinked")
+          def capacity(path):
+              fs = os.statvfs(path)
+              return {"path": str(path), "freeBytes": fs.f_bavail * fs.f_frsize,
+                      "totalBytes": fs.f_blocks * fs.f_frsize, "device": path.stat().st_dev}
+          internal_capacity = {"workspaceParent": capacity(workspace.parent),
+                               "runnerTemp": capacity(runner_temp)}
           builds = []
           # Prior exact app/quality workflow recipes create these private per-run targets.
           for path in sorted(workspace.parent.iterdir(), key=lambda p: p.name):
@@ -161,7 +171,11 @@ jobs:
                     "runner": "nax-macos-2", "modelsFreeBytes": fs.f_bavail * fs.f_frsize,
                     "modelsTotalBytes": fs.f_blocks * fs.f_frsize,
                     "volume": {k: info.get(k) for k in ("DeviceIdentifier", "MountPoint", "FilesystemType", "APFSContainerReference")},
+                    "internalCapacity": internal_capacity,
                     "privateBuildVolume": {k: build_info.get(k) for k in ("DeviceIdentifier", "MountPoint", "FilesystemType", "APFSContainerReference")},
+                    "internalVolumeProbe": {"path": str(internal_mount), "device": internal_mount.stat().st_dev,
+                                            "sameDeviceAsWorkspaceParent": internal_mount.stat().st_dev == internal_capacity["workspaceParent"]["device"],
+                                            "sameDeviceAsRunnerTemp": internal_mount.stat().st_dev == internal_capacity["runnerTemp"]["device"]},
                     "apfsContainers": containers, "privateBuildTargets": builds, "runDirectories": runs,
                     "sharedCargoTarget": {"role": "shared cache; ownership not exclusive; preserve", **shared_total},
                     "limits": {"scanSeconds": 180, "entries": 500000, "remainingEntries": remaining,
