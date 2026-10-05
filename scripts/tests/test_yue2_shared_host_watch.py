@@ -158,6 +158,36 @@ class SharedHostWatchTests(unittest.TestCase):
             self.assertEqual(retained["inventory"]["runners"]["org"][0]["id"], 2313)
             self.assertTrue((output / "0001.json").is_file())
 
+    def test_transition_retry_incomplete_snapshot_keeps_shared_gpu1_owned_job(self):
+        data, direct, binding = transition_fixture()
+        stale, _, _ = transition_fixture()
+        del stale["runs"][("SceneWorks/inference", 7)]
+        del stale["jobs"][("SceneWorks/inference", 7)]
+        incomplete = watch.InventorySnapshotError("truncated paginated inventory",
+                                                 "SceneWorks/SceneWorks:queued",
+                                                 [{"total_count": 1, "workflow_runs": []}])
+        transport = subprocess.TimeoutExpired(["gh", "api"], 45)
+        for failure in (incomplete, transport):
+            with self.subTest(error=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "watch"
+                with patch.object(watch, "bind_owned_job", return_value=binding) as auth, \
+                     patch.object(watch, "owned_run", side_effect=[direct, direct, {**direct, "status": "completed"}]), \
+                     patch.object(watch, "snapshot", side_effect=[stale, failure, failure, failure, data]) as snapshots, \
+                     patch.object(watch, "classify", wraps=watch.classify) as classify, \
+                     patch.object(watch.time, "sleep"), \
+                     patch.object(watch.subprocess, "run") as cancel:
+                    watch.watch(7, SHA, "yue2-precision-proof.yml", output, 60, 30,
+                                70, "cuda-windows", 2313, mode="shared-gpu1")
+                self.assertEqual((auth.call_count, snapshots.call_count, classify.call_count), (5, 5, 2))
+                cancel.assert_not_called()
+                self.assertTrue((output / "own-transition-0001-1.json").exists())
+                receipt = json.loads((output / "incomplete-foreign-inventory-0001.json").read_text(encoding="utf-8"))
+                self.assertFalse(receipt["inventory_complete"])
+                self.assertTrue(receipt["owned_binding_authenticated"])
+                self.assertFalse((output / "0001.json").exists())
+                self.assertTrue((output / "0002.json").exists())
+                self.assertTrue((output / "terminal.json").exists())
+
     def test_transition_retry_does_not_retry_unknown_foreign_or_cancel_terminal_run(self):
         with tempfile.TemporaryDirectory() as directory:
             stale, direct, binding = transition_fixture()

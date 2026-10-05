@@ -501,8 +501,47 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
     index = 0
     identity_drift = False
     source_checked = False
+    inventory_sequence = 0
+
+    def bounded_snapshot() -> dict | None:
+        nonlocal inventory_sequence
+        for inventory_attempt in range(1, SHARED_GPU1_INVENTORY_ATTEMPTS + 1):
+            try:
+                return snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
+            except (InventorySnapshotError, subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired, TimeoutError, json.JSONDecodeError) as error:
+                if mode != "shared-gpu1":
+                    raise
+                # A changing REST status count or transport failure never
+                # supplies a partial inventory. Retain the rejected page,
+                # then fetch a wholly new snapshot after direct own reauth.
+                inventory_sequence += 1
+                (output / f"inventory-attempt-{index:04d}-{inventory_sequence}.json").write_text(
+                    json.dumps({"errorType": type(error).__name__, "error": str(error),
+                                "source": getattr(error, "source", None),
+                                "pages": getattr(error, "pages", None)}, indent=2) + "\n",
+                    encoding="utf-8")
+                fresh = bind_owned_job(own_id, head, workflow, job_id, runner_name,
+                                       runner_id, own_job_name=own_job_name)
+                require(same_owned_binding(binding, fresh, job_id, runner_name, runner_id),
+                        "owned identity drifted during inventory retry")
+                if (inventory_attempt == SHARED_GPU1_INVENTORY_ATTEMPTS or
+                        time.monotonic() >= deadline):
+                    (output / f"incomplete-foreign-inventory-{index:04d}.json").write_text(
+                        json.dumps({"checked_at": datetime.now(timezone.utc).isoformat(),
+                                    "inventory_complete": False, "attempts": inventory_attempt,
+                                    "errorType": type(error).__name__, "error": str(error),
+                                    "owned_binding_authenticated": True,
+                                    "own_run": own_id, "own_job": job_id,
+                                    "own_head": head, "own_runner": runner_name,
+                                    "own_runner_id": runner_id, "own_start": binding["start"],
+                                    "physical_lease": False}, indent=2) + "\n", encoding="utf-8")
+                    return None
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
+
     while time.monotonic() < deadline:
         index += 1
+        inventory_sequence = 0
         data = None
         try:
             if mode == "gpu0-with-reviewed-gpu1" and not source_checked:
@@ -516,39 +555,7 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
             if direct.get("status") == "completed":
                 (output / "terminal.json").write_text(json.dumps(direct, indent=2) + "\n", encoding="utf-8")
                 return  # Final child/postflight and physical release still require independent audit.
-            for inventory_attempt in range(1, SHARED_GPU1_INVENTORY_ATTEMPTS + 1):
-                try:
-                    data = snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
-                    break
-                except (InventorySnapshotError, subprocess.CalledProcessError,
-                        subprocess.TimeoutExpired, TimeoutError, json.JSONDecodeError) as error:
-                    if mode != "shared-gpu1":
-                        raise
-                    # A changing REST status count or transport failure never
-                    # supplies a partial inventory. Retain the rejected page,
-                    # then fetch a wholly new snapshot after direct own reauth.
-                    (output / f"inventory-attempt-{index:04d}-{inventory_attempt}.json").write_text(
-                        json.dumps({"errorType": type(error).__name__, "error": str(error),
-                                    "source": getattr(error, "source", None),
-                                    "pages": getattr(error, "pages", None)}, indent=2) + "\n",
-                        encoding="utf-8")
-                    fresh = bind_owned_job(own_id, head, workflow, job_id, runner_name,
-                                           runner_id, own_job_name=own_job_name)
-                    require(same_owned_binding(binding, fresh, job_id, runner_name, runner_id),
-                            "owned identity drifted during inventory retry")
-                    if (inventory_attempt == SHARED_GPU1_INVENTORY_ATTEMPTS or
-                            time.monotonic() >= deadline):
-                        (output / f"incomplete-foreign-inventory-{index:04d}.json").write_text(
-                            json.dumps({"checked_at": datetime.now(timezone.utc).isoformat(),
-                                        "inventory_complete": False, "attempts": inventory_attempt,
-                                        "errorType": type(error).__name__, "error": str(error),
-                                        "owned_binding_authenticated": True,
-                                        "own_run": own_id, "own_job": job_id,
-                                        "own_head": head, "own_runner": runner_name,
-                                        "own_runner_id": runner_id, "own_start": binding["start"],
-                                        "physical_lease": False}, indent=2) + "\n", encoding="utf-8")
-                        break
-                    time.sleep(min(1, max(0, deadline - time.monotonic())))
+            data = bounded_snapshot()
             if data is None:
                 time.sleep(min(interval, max(0, deadline - time.monotonic())))
                 continue  # Rejected aggregate pages never reach classification or a complete receipt.
@@ -594,7 +601,12 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
                     require(same_owned_binding(binding, fresh, job_id, runner_name, runner_id),
                             "owned identity drifted during aggregate retry")
                     time.sleep(min(1, max(0, deadline - time.monotonic())))
-                    data = snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
+                    data = bounded_snapshot()
+                    if data is None:
+                        break
+            if data is None:
+                time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                continue
             observed_job = next((job for job in data["jobs"].get(("SceneWorks/inference", own_id), [])
                                  if job.get("id") == job_id), None)
             require(proof["own_job"] == job_id and proof["own_runner"] == runner_name and
