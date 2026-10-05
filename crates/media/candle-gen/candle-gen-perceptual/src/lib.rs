@@ -816,6 +816,12 @@ mod tests {
             perceptual_footprint(&vae_anchor_on(), &taef1(), g),
             perceptual_footprint_bytes(Some(dec), &[va], 3)
         );
+        // sc-24833 review: the VAE-anchor references spill to disk, so the footprint does not
+        // scale with the cached-entry count (a 50-image × 3-bucket job admits like a 1-entry one).
+        assert_eq!(
+            perceptual_footprint(&vae_anchor_on(), &taef1(), AuxGeometry::image(512, 150)),
+            perceptual_footprint(&vae_anchor_on(), &taef1(), g)
+        );
         let lp = candle_gen::train::latent_lpips::latent_lpips_footprint(
             gen_core::train::LatentLpipsFamily::Flux,
             64,

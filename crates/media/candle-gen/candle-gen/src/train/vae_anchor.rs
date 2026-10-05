@@ -9,6 +9,11 @@
 //! image's clean round trip (computed once per image, cached f16 like upstream) by the mean over
 //! positions of `1 − cos` across channels, combined `(4·L0 + 2·L1 + L2 + L3 + Lmid) / 5`.
 //!
+//! **Reference spill** (as the MLX twin): each entry's five f16 taps (~0.5 GB at 1024²) are written
+//! once to a per-job on-disk cache and only the current step's entry is loaded back; the directory
+//! is removed when the loss is dropped (job end, cancel, error, panic). The E7 footprint counts one
+//! loaded entry, not one per entry.
+//!
 //! Every op has a candle backward: GroupNorm, SiLU and softmax are composed from elementary ops
 //! (candle's fused kernels have no backward), and the stride-2 downsample crops its padded input to
 //! the extent the windows read (candle's Conv2D backward derives `output_padding` from the height
@@ -16,8 +21,10 @@
 //! `AutoencoderKLFlux2` layout (only the tapped `encoder.*` sub-graph is read).
 
 use std::any::Any;
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor, D};
 
@@ -133,8 +140,18 @@ impl VaeAnchorEncoderConfig {
         out
     }
 
+    /// Bytes of the five f16 taps of one `h × w` reference entry.
+    pub fn reference_tap_bytes(&self, h: u32, w: u32) -> u64 {
+        self.tap_shapes(h, w)
+            .iter()
+            .map(|&(c, hh, ww)| c * hh * ww * 2)
+            .sum()
+    }
+
     /// Pre-load memory figures for `h × w` training images (epic 2123 E7) — identical arithmetic to
-    /// the MLX twin.
+    /// the MLX twin: weights, one differentiable pass ×2 for cotangents, plus the one reference
+    /// entry loaded per step (f16 taps + their f32 cast); nothing resident per image (the
+    /// references live on disk).
     pub fn footprint(&self, h: u32, w: u32) -> AuxModelFootprint {
         let taps = self.tap_shapes(h, w);
         let mut floats = 3 * h as u64 * w as u64;
@@ -150,8 +167,8 @@ impl VaeAnchorEncoderConfig {
         floats += 2 * 7 * c * px + 5 * c * px + px * px;
         AuxModelFootprint {
             param_bytes: self.param_count() * 4,
-            working_set_bytes: floats * 4 * 2,
-            reference_bytes_per_image: taps.iter().map(|&(c, hh, ww)| c * hh * ww * 2).sum(),
+            working_set_bytes: floats * 4 * 2 + self.reference_tap_bytes(h, w) * 3,
+            reference_bytes_per_image: 0,
         }
     }
 }
@@ -460,15 +477,72 @@ pub fn vae_anchor_feature_loss(
     Ok(((total.expect("five levels") / 5.0)?, per_level))
 }
 
-/// The VAE-anchor auxiliary loss: the frozen encoder + cached clean taps per image.
+/// The per-job on-disk reference cache: a private directory, created on first use and removed on
+/// drop (job end, cancel, error, panic).
+struct SpillDir {
+    path: PathBuf,
+}
+
+impl SpillDir {
+    fn create(root: &Path) -> Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = root.join(format!(
+            "sceneworks-vae-anchor-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).map_err(|e| {
+            CandleError::Msg(format!(
+                "VAE anchor: cannot create the reference cache {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The VAE-anchor auxiliary loss: the frozen encoder + each entry's clean taps, spilled to a
+/// per-job on-disk cache and loaded back one entry per step.
 pub struct VaeAnchorLoss {
     encoder: VaeAnchorEncoder,
     references_built: AtomicUsize,
+    spill_root: PathBuf,
+    spill: Mutex<Option<SpillDir>>,
 }
 
-/// The per-image VAE-anchor reference: the five clean taps (NCHW), f16 as upstream caches them.
+/// The per-entry VAE-anchor reference: where its five clean f16 taps (NCHW, as upstream caches
+/// them) are spilled, and the device to load them onto. [`taps`](Self::taps) loads them.
 pub struct VaeAnchorReference {
-    pub taps: Vec<Tensor>,
+    pub path: PathBuf,
+    device: Device,
+}
+
+impl VaeAnchorReference {
+    /// Load the five taps back (f16, bit-identical to what was spilled).
+    pub fn taps(&self) -> Result<Vec<Tensor>> {
+        let mut map = candle_core::safetensors::load(&self.path, &self.device).map_err(|e| {
+            CandleError::Msg(format!(
+                "VAE anchor: cannot read the cached reference {}: {e}",
+                self.path.display()
+            ))
+        })?;
+        (0..VAE_ANCHOR_LEVELS.len())
+            .map(|i| {
+                map.remove(&format!("tap{i}")).ok_or_else(|| {
+                    CandleError::Msg(format!(
+                        "VAE anchor: cached reference {} lacks tap{i}",
+                        self.path.display()
+                    ))
+                })
+            })
+            .collect()
+    }
 }
 
 /// Decoded pixels NHWC `[0, 1]` → NCHW `[-1, 1]`.
@@ -482,12 +556,28 @@ fn to_signed_nchw(px: &Tensor) -> Result<Tensor> {
 }
 
 impl VaeAnchorLoss {
-    /// Wrap a loaded encoder.
+    /// Wrap a loaded encoder; references spill under the system temp dir.
     pub fn new(encoder: VaeAnchorEncoder) -> Self {
+        Self::with_spill_root(encoder, std::env::temp_dir())
+    }
+
+    /// Wrap a loaded encoder; references spill under `root` (a private sub-directory, created on
+    /// the first reference and removed when the loss is dropped).
+    pub fn with_spill_root(encoder: VaeAnchorEncoder, root: impl Into<PathBuf>) -> Self {
         Self {
             encoder,
             references_built: AtomicUsize::new(0),
+            spill_root: root.into(),
+            spill: Mutex::new(None),
         }
+    }
+
+    /// The per-job reference cache directory, once the first reference has been spilled.
+    pub fn spill_dir(&self) -> Option<PathBuf> {
+        self.spill
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|d| d.path.clone()))
     }
 
     /// Load the FLUX.2 VAE encoder from a diffusers `vae/` directory onto `device`.
@@ -522,14 +612,39 @@ impl PerceptualLoss for VaeAnchorLoss {
             .into_iter()
             .map(|t| -> Result<Tensor> { Ok(t.to_dtype(DType::F16)?.detach()) })
             .collect::<Result<Vec<_>>>()?;
-        self.references_built.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(Box::new(VaeAnchorReference { taps })))
+        let device = taps[0].device().clone();
+        let map: HashMap<String, Tensor> = taps
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| (format!("tap{i}"), t))
+            .collect();
+        let mut spill = self
+            .spill
+            .lock()
+            .map_err(|_| CandleError::Msg("VAE anchor: reference cache lock poisoned".into()))?;
+        if spill.is_none() {
+            *spill = Some(SpillDir::create(&self.spill_root)?);
+        }
+        let index = self.references_built.fetch_add(1, Ordering::Relaxed);
+        let path = spill
+            .as_ref()
+            .expect("created above")
+            .path
+            .join(format!("ref-{index}.safetensors"));
+        candle_core::safetensors::save(&map, &path).map_err(|e| {
+            CandleError::Msg(format!(
+                "VAE anchor: cannot write the reference cache {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Some(Box::new(VaeAnchorReference { path, device })))
     }
 
+    /// This entry's taps are loaded from the spill for this step only.
     fn loss(&self, live: &Tensor, reference: &dyn Any) -> Result<Tensor> {
         let r = reference_as::<VaeAnchorReference>(self.name(), reference)?;
         let pred = self.encoder.features(&to_signed_nchw(live)?)?;
-        Ok(vae_anchor_feature_loss(&pred, &r.taps)?.0)
+        Ok(vae_anchor_feature_loss(&pred, &r.taps()?)?.0)
     }
 }
 
@@ -669,6 +784,7 @@ mod tests {
     /// the live taps ⇒ no gradient; remove the downsample crop ⇒ backward shape error ⇒ red.
     #[test]
     fn references_are_cached_once_per_image_and_the_loss_flows_gradient() {
+        let spill = tempfile::tempdir().unwrap();
         let mut path = PerceptualPath::new(
             Some(Box::new(Identity)),
             vec![AuxLoss {
@@ -678,7 +794,7 @@ mod tests {
                     t_max: 0.5,
                     every_n: 1,
                 },
-                loss: Box::new(VaeAnchorLoss::new(encoder(32))),
+                loss: Box::new(VaeAnchorLoss::with_spill_root(encoder(32), spill.path())),
             }],
         )
         .unwrap();
@@ -713,19 +829,77 @@ mod tests {
         assert!(scalar(&g.abs().unwrap().sum_all().unwrap()) > 0.0);
     }
 
-    /// One reference encode per `reference` call, none per `loss` call; the cache is f16.
+    /// One reference encode per `reference` call, none per `loss` call; each entry spills to its
+    /// own file and loads back bit-identical (f16). Mutations: spill f32 ⇒ the dtype assertion
+    /// reds; load another entry's file ⇒ the bit-exact check reds.
     #[test]
-    fn the_loss_counts_reference_encodes() {
-        let loss = VaeAnchorLoss::new(encoder(32));
-        let x = uniform(5, (1, 8, 8, 3));
-        let r = loss.reference(&x).unwrap().unwrap();
-        assert_eq!(loss.references_built(), 1);
-        assert!(scalar(&loss.loss(&x, r.as_ref()).unwrap()).abs() < 1e-3);
-        assert_eq!(loss.references_built(), 1);
-        let taps = &reference_as::<VaeAnchorReference>("vae_anchor", r.as_ref())
+    fn references_spill_to_disk_and_load_back_bit_exact() {
+        let spill = tempfile::tempdir().unwrap();
+        let loss = VaeAnchorLoss::with_spill_root(encoder(32), spill.path());
+        let (x, y) = (uniform(5, (1, 8, 8, 3)), uniform(6, (1, 8, 8, 3)));
+        assert!(loss.spill_dir().is_none());
+        let rx = loss.reference(&x).unwrap().unwrap();
+        let ry = loss.reference(&y).unwrap().unwrap();
+        assert_eq!(loss.references_built(), 2);
+        assert!(loss.spill_dir().unwrap().starts_with(spill.path()));
+        assert!(scalar(&loss.loss(&x, rx.as_ref()).unwrap()).abs() < 1e-3);
+        assert_eq!(loss.references_built(), 2, "a loss call never re-encodes");
+        let loaded = reference_as::<VaeAnchorReference>("vae_anchor", rx.as_ref())
             .unwrap()
-            .taps;
-        assert!(taps.iter().all(|t| t.dtype() == DType::F16));
+            .taps()
+            .unwrap();
+        let fresh = loss
+            .encoder()
+            .features(&to_signed_nchw(&x).unwrap())
+            .unwrap();
+        assert_eq!(loaded.len(), 5);
+        for (l, f) in loaded.iter().zip(&fresh) {
+            assert_eq!(l.dtype(), DType::F16);
+            let bits = |t: &Tensor| -> Vec<u16> {
+                t.flatten_all()
+                    .unwrap()
+                    .to_vec1::<half::f16>()
+                    .unwrap()
+                    .iter()
+                    .map(|h| h.to_bits())
+                    .collect()
+            };
+            assert_eq!(bits(l), bits(&f.to_dtype(DType::F16).unwrap()), "bit-exact");
+        }
+        let other = reference_as::<VaeAnchorReference>("vae_anchor", ry.as_ref())
+            .unwrap()
+            .taps()
+            .unwrap();
+        assert_ne!(
+            scalar(&other[0].to_dtype(DType::F32).unwrap().sum_all().unwrap()),
+            scalar(&loaded[0].to_dtype(DType::F32).unwrap().sum_all().unwrap()),
+            "each entry has its own file"
+        );
+    }
+
+    /// The per-job cache directory is removed at job end (loss dropped) and on an error / panic
+    /// unwinding through the job. Mutation: drop `SpillDir`'s `Drop` impl ⇒ red.
+    #[test]
+    fn the_reference_cache_is_removed_at_job_end_and_on_error() {
+        let spill = tempfile::tempdir().unwrap();
+        let x = uniform(7, (1, 8, 8, 3));
+        let loss = VaeAnchorLoss::with_spill_root(encoder(32), spill.path());
+        loss.reference(&x).unwrap();
+        let dir = loss.spill_dir().unwrap();
+        assert!(dir.is_dir());
+        drop(loss);
+        assert!(!dir.exists(), "removed at job end");
+        let root = spill.path().to_path_buf();
+        let seen = Mutex::new(None);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let loss = VaeAnchorLoss::with_spill_root(encoder(32), &root);
+            loss.reference(&x).unwrap();
+            *seen.lock().unwrap() = loss.spill_dir();
+            panic!("job failed");
+        }));
+        assert!(r.is_err());
+        let dir = seen.lock().unwrap().clone().unwrap();
+        assert!(!dir.exists(), "removed on error");
     }
 
     #[test]
@@ -738,8 +912,8 @@ mod tests {
         assert!(err.contains("not a FLUX.2 VAE"), "{err}");
     }
 
-    /// E7: identical arithmetic to the MLX twin (weights + working set + f16 taps per image).
-    /// Mutation: count the taps as f32 ⇒ red.
+    /// E7: identical arithmetic to the MLX twin — weights + a working set holding one loaded
+    /// reference entry; nothing per image. Mutation: restore `reference_bytes_per_image` ⇒ red.
     #[test]
     fn footprint_counts_weights_working_set_and_f16_taps() {
         let cfg = VaeAnchorEncoderConfig::flux2();
@@ -755,7 +929,15 @@ mod tests {
         ]
         .iter()
         .sum::<u64>();
-        assert_eq!(f.reference_bytes_per_image, taps * 2);
+        assert_eq!(f.reference_bytes_per_image, 0);
+        assert_eq!(cfg.reference_tap_bytes(512, 512), taps * 2);
         assert_eq!(f.param_bytes, p * 4);
+        assert!(f.working_set_bytes > taps * 6);
+        let one = crate::train::perceptual::perceptual_footprint_bytes(None, &[f], 1);
+        let many = crate::train::perceptual::perceptual_footprint_bytes(None, &[f], 50);
+        assert_eq!(
+            one, many,
+            "the footprint no longer scales with the entry count"
+        );
     }
 }

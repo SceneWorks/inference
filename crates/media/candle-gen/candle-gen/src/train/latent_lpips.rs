@@ -312,6 +312,9 @@ pub fn resolve_checkpoint(dir: &Path, family: LatentLpipsFamily) -> Result<PathB
 }
 
 /// The E-LatentLPIPS auxiliary loss: frozen network + the clean latent as the per-image reference.
+/// The reference stays resident: it is the latent itself, at most `16 · (H/8) · (W/8)` f32 —
+/// ~1 MB per (item, bucket) entry at 1024², the size of the trainer's own cached latent — so,
+/// unlike the VAE anchor's ~0.5 GB of taps, it needs no on-disk spill.
 pub struct LatentLpipsLoss {
     net: LatentLpips,
 }
