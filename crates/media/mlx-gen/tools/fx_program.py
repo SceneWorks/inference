@@ -55,6 +55,16 @@ def _torch_pads_to_nchw(pads, ndim: int = 4) -> list[list[int]]:
     return out
 
 
+def _onnx_pads_to_nchw(pads) -> list[list[int]]:
+    """ONNX `Pad` order ([x1_begin, ..., xn_begin, x1_end, ..., xn_end]) → per-axis pairs."""
+    pads = [int(p) for p in pads]
+    n = len(pads) // 2
+    out = [[0, 0] for _ in range(4)]
+    for i in range(n):
+        out[4 - n + i] = [pads[i], pads[n + i]]
+    return out
+
+
 class _Lowerer:
     def __init__(self, gm: torch.fx.GraphModule):
         self.gm = gm
@@ -89,8 +99,9 @@ class _Lowerer:
             raise ValueError(f"operand {a.name} is not a constant")
         return a
 
-    def emit(self, op: str, node: torch.fx.Node, inputs: list[str], **attrs):
-        self.nodes.append({"op": op, "out": node.name, "inputs": inputs, **attrs})
+    def emit(self, op: str, node, inputs: list[str], **attrs):
+        out = node if isinstance(node, str) else node.name
+        self.nodes.append({"op": op, "out": out, "inputs": inputs, **attrs})
 
     # -- per-node lowering -----------------------------------------------------------------
     def lower(self):
@@ -116,21 +127,37 @@ class _Lowerer:
                 raise ValueError(f"unsupported fx node kind {node.op}")
 
     def call_module(self, node):
-        m = self.modules[node.target]
+        self.lower_module(self.modules[node.target], node.target, node.name, list(node.args))
+
+    def lower_module(self, m, target: str, out: str, args: list):
+        """Lower module `m` applied to fx `args` (a value operand may also be a plain value-name
+        string — a `Sequential`'s intermediate), producing value `out`."""
         cls = type(m).__name__
-        x = node.args[0] if node.args else None
-        if isinstance(m, torch.nn.Conv2d):
+        operand = lambda a: a if isinstance(a, str) else self.operand(a)  # noqa: E731
+        x = args[0] if args else None
+        if isinstance(m, torch.nn.Sequential):
+            # onnx2torch wraps fused blocks (e.g. a static pad + conv) in a Sequential: chain the
+            # children through intermediate values.
+            children = list(m.named_children())
+            if not children:
+                raise ValueError(f"{target}: empty Sequential")
+            cur = x
+            for i, (name, child) in enumerate(children):
+                step_out = out if i == len(children) - 1 else f"{out}__{i}"
+                self.lower_module(child, f"{target}.{name}", step_out, [cur])
+                cur = step_out
+        elif isinstance(m, torch.nn.Conv2d):
             if m.padding_mode != "zeros":
-                raise ValueError(f"{node.target}: conv padding_mode {m.padding_mode}")
+                raise ValueError(f"{target}: conv padding_mode {m.padding_mode}")
             pad = m.padding
             if isinstance(pad, str):
-                raise ValueError(f"{node.target}: string conv padding {pad!r}")
+                raise ValueError(f"{target}: string conv padding {pad!r}")
             self.emit(
                 "conv2d",
-                node,
-                [self.operand(x)],
-                weight=self.param(f"{node.target}.weight", m.weight)[6:],
-                bias=(self.param(f"{node.target}.bias", m.bias)[6:] if m.bias is not None else None),
+                out,
+                [operand(x)],
+                weight=self.param(f"{target}.weight", m.weight)[6:],
+                bias=(self.param(f"{target}.bias", m.bias)[6:] if m.bias is not None else None),
                 stride=_pair(m.stride),
                 padding=_pair(pad),
                 dilation=_pair(m.dilation),
@@ -138,58 +165,76 @@ class _Lowerer:
             )
         elif isinstance(m, torch.nn.PReLU) or "PReLU" in cls or "Prelu" in cls:
             slope = getattr(m, "weight", None)
+            if slope is None and len(args) > 1:
+                # onnx2torch `OnnxPReLU(x, slope)`: the slope is a constant operand.
+                slope = self.const_of(args[1])
             if slope is None:
                 tensors = list(m.parameters()) + list(m.buffers())
                 if len(tensors) != 1:
-                    raise ValueError(f"{node.target}: cannot find the PReLU slope ({cls})")
+                    raise ValueError(f"{target}: cannot find the PReLU slope ({cls})")
                 slope = tensors[0]
+            # Only a scalar or per-channel slope ([C], [C,1,1], [1,C,1,1]) reduces to torch `prelu`.
+            dims = [int(d) for d in slope.shape]
+            channel_axis = {1: 0, 3: 0, 4: 1}.get(len(dims))
+            per_channel = channel_axis is not None and all(
+                d == 1 for i, d in enumerate(dims) if i != channel_axis
+            )
+            if slope.nelement() != 1 and not per_channel:
+                raise ValueError(f"{target}: non-per-channel PReLU slope {tuple(dims)}")
             self.emit(
                 "prelu",
-                node,
-                [self.operand(x)],
-                slope=self.param(f"{node.target}.slope", slope.reshape(-1))[6:],
+                out,
+                [operand(x)],
+                slope=self.param(f"{target}.slope", slope.reshape(-1))[6:],
             )
         elif isinstance(m, torch.nn.ReLU):
-            self.emit("relu", node, [self.operand(x)])
+            self.emit("relu", out, [operand(x)])
         elif isinstance(m, torch.nn.Sigmoid) or cls == "OnnxSigmoid":
-            self.emit("sigmoid", node, [self.operand(x)])
+            self.emit("sigmoid", out, [operand(x)])
         elif isinstance(m, torch.nn.MaxPool2d):
-            if m.dilation not in (1, (1, 1)) or m.ceil_mode:
-                raise ValueError(f"{node.target}: unsupported maxpool dilation/ceil_mode")
+            if m.dilation not in (1, (1, 1), [1, 1]) or m.ceil_mode:
+                raise ValueError(f"{target}: unsupported maxpool dilation/ceil_mode")
             self.emit(
                 "maxpool2d",
-                node,
-                [self.operand(x)],
+                out,
+                [operand(x)],
                 kernel=_pair(m.kernel_size),
                 stride=_pair(m.stride if m.stride is not None else m.kernel_size),
                 padding=_pair(m.padding),
             )
+        elif cls == "OnnxPadDynamic":
+            # forward(x, pads, constant_value=0): `pads` is in ONNX order
+            # [x1_begin, x2_begin, ..., x1_end, x2_end, ...].
+            if getattr(m, "mode", "constant") != "constant":
+                raise ValueError(f"{target}: pad mode {m.mode}")
+            pads = [int(v) for v in self.const_of(args[1]).tolist()]
+            value = float(self.const_of(args[2])) if len(args) > 2 and args[2] is not None else 0.0
+            self.emit("pad", out, [operand(x)], pads=_onnx_pads_to_nchw(pads), value=value)
         elif "Pad" in cls:
+            # `OnnxPadStatic` / torch-style modules: `pads` already in torch `F.pad` order.
             mode = getattr(m, "mode", "constant")
             if mode != "constant":
-                raise ValueError(f"{node.target}: pad mode {mode}")
+                raise ValueError(f"{target}: pad mode {mode}")
             pads = getattr(m, "pads", None)
-            if pads is None and len(node.args) > 1:
-                pads = self.const_of(node.args[1]).tolist()
             if pads is None:
-                raise ValueError(f"{node.target}: cannot find the pads of {cls}")
+                raise ValueError(f"{target}: cannot find the pads of {cls}")
             value = float(getattr(m, "constant_value", 0.0) or 0.0)
-            self.emit("pad", node, [self.operand(x)], pads=_torch_pads_to_nchw(pads), value=value)
+            self.emit("pad", out, [operand(x)], pads=_torch_pads_to_nchw(pads), value=value)
         elif "Reshape" in cls:
-            shape = self.const_of(node.args[1])
+            shape = self.const_of(args[1])
             shape = shape.tolist() if torch.is_tensor(shape) else list(shape)
-            self.emit("reshape", node, [self.operand(x)], shape=[int(s) for s in shape])
+            self.emit("reshape", out, [operand(x)], shape=[int(s) for s in shape])
         elif "BinaryMath" in cls:
             fn = getattr(m, "math_op_function", None)
             name = getattr(fn, "__name__", str(fn))
             op = {"add": "add", "sub": "sub", "mul": "mul", "div": "div", "true_divide": "div"}.get(name)
             if op is None:
-                raise ValueError(f"{node.target}: unsupported binary op {name}")
-            self.emit(op, node, [self.operand(a) for a in node.args[:2]])
+                raise ValueError(f"{target}: unsupported binary op {name}")
+            self.emit(op, out, [operand(a) for a in args[:2]])
         elif "Concat" in cls:
-            self.emit("concat", node, [self.operand(a) for a in node.args], axis=int(m.axis))
+            self.emit("concat", out, [operand(a) for a in args], axis=int(m.axis))
         else:
-            raise ValueError(f"{node.target}: unsupported module {cls}")
+            raise ValueError(f"{target}: unsupported module {cls}")
 
     def call_function(self, node, fn):
         args = node.args

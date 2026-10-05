@@ -426,3 +426,23 @@ fn testing_checkpoints_load_through_the_real_loaders() {
         .unwrap();
     assert_eq!(out.dims(), &[478, 2]);
 }
+
+/// The REAL converted FaceMesh-v2 program reproduces the upstream torch model's output 0 on a
+/// fixed input (the Candle twin of mlx-gen-face's test; same `$FACEMESH_REAL_DIR` layout).
+#[test]
+#[ignore = "needs the converted FaceMesh-v2 checkpoint + torch I/O in $FACEMESH_REAL_DIR"]
+fn real_facemesh_program_matches_torch() {
+    let dir = PathBuf::from(std::env::var("FACEMESH_REAL_DIR").expect("FACEMESH_REAL_DIR"));
+    let program = Program::from_file(dir.join(FACEMESH_FILE), &dev()).unwrap();
+    let io = candle_gen::candle_core::safetensors::load(
+        dir.join("facemesh_torch_io.safetensors"),
+        &dev(),
+    )
+    .unwrap();
+    let got = read(&program.forward(&io["input"]).unwrap()[0]);
+    let want = read(&io["output0"]);
+    let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    let d = max_abs_diff(&got, &want);
+    println!("real FaceMesh max abs {d} (scale {scale})");
+    assert!(d <= 1e-4 * scale, "real FaceMesh drift {d} (scale {scale})");
+}

@@ -537,3 +537,26 @@ fn an_unknown_program_op_is_refused_by_name() {
     .to_string();
     assert!(err.contains("gelu"), "{err}");
 }
+
+/// The REAL converted FaceMesh-v2 program (`tools/convert_mp_facemesh_v2.py` output) reproduces the
+/// upstream torch model's output 0 on a fixed input. Needs the converted checkpoint and the torch
+/// I/O pair (`facemesh_torch_io.safetensors`: `input` NCHW, `output0`) in `$FACEMESH_REAL_DIR`.
+#[test]
+#[ignore = "needs the converted FaceMesh-v2 checkpoint + torch I/O in $FACEMESH_REAL_DIR"]
+fn real_facemesh_program_matches_torch() {
+    let _cpu = CpuDevice::new();
+    let dir = PathBuf::from(std::env::var("FACEMESH_REAL_DIR").expect("FACEMESH_REAL_DIR"));
+    let program = Program::from_file(dir.join(FACEMESH_FILE)).unwrap();
+    let io = Weights::from_file(dir.join("facemesh_torch_io.safetensors")).unwrap();
+    let x = io
+        .require("input")
+        .unwrap()
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
+    let got = read(&program.forward(&x).unwrap()[0]);
+    let want = read(io.require("output0").unwrap());
+    let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    let d = max_abs_diff(&got, &want);
+    println!("real FaceMesh max abs {d} (scale {scale})");
+    assert!(d <= 1e-4 * scale, "real FaceMesh drift {d} (scale {scale})");
+}
