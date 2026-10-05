@@ -41,6 +41,25 @@ impl Weights {
             .ok_or_else(|| CandleError::Msg(format!("missing tensor: {key}")))
     }
 
+    /// Whether the checkpoint carries `key`.
+    pub fn contains(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+
+    /// Build from an in-memory tensor map (coercing to f32, like [`Weights::from_file`]).
+    pub fn from_map(raw: HashMap<String, Tensor>) -> Result<Self> {
+        let mut map = HashMap::with_capacity(raw.len());
+        for (k, v) in raw {
+            let v = if v.dtype() == DType::F32 {
+                v
+            } else {
+                v.to_dtype(DType::F32)?
+            };
+            map.insert(k, v);
+        }
+        Ok(Self { map })
+    }
+
     /// A per-channel vector (`[C]`) reshaped to broadcast over an NCHW feature map: `[1, C, 1, 1]`.
     /// Used for the folded BN affines and PReLU slopes (the channel axis is 1 in candle, last in MLX).
     pub fn require_channel4d(&self, key: &str) -> Result<Tensor> {

@@ -2430,6 +2430,8 @@ dependencies = [
  "image",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
