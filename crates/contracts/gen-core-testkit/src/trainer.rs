@@ -294,6 +294,29 @@ const TECHNIQUE_PROBES: &[TechniqueProbe] = &[
         declared: |t| t.face_landmark_loss,
         adapter_only: false,
     },
+    TechniqueProbe {
+        name: "vae_anchor_loss",
+        knob: "vae_anchor.schedule.weight",
+        enable: |r| {
+            // The FLUX.2 VAE + the family's small x0 decoder only need to be named — validate never
+            // loads them (sc-24833). A loss term, not adapter-only.
+            r.config.vae_anchor.schedule.weight = 0.5;
+            r.config.vae_anchor.model_dir = Some(PathBuf::from("/conformance/flux2-vae"));
+            r.config.perceptual_decoder_dir = Some(PathBuf::from("/conformance/tiny-decoder"));
+        },
+        declared: |t| t.vae_anchor_loss,
+        adapter_only: false,
+    },
+    TechniqueProbe {
+        name: "latent_lpips_loss",
+        knob: "latent_lpips.schedule.weight",
+        enable: |r| {
+            r.config.latent_lpips.schedule.weight = 0.5;
+            r.config.latent_lpips.model_dir = Some(PathBuf::from("/conformance/elatentlpips"));
+        },
+        declared: |t| t.latent_lpips_loss,
+        adapter_only: false,
+    },
 ];
 
 /// The masked-loss probe weights (sc-24828): drop the background entirely.

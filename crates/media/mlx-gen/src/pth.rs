@@ -1,4 +1,6 @@
-//! Minimal torch `.pth` (zip-of-pickle) reader for the native Wan converter (sc-3237 / sc-3224).
+//! Minimal torch `.pth` (zip-of-pickle) reader — first written for the native Wan converter
+//! (sc-3237 / sc-3224), shared from mlx-gen since sc-24833 (the E-LatentLPIPS checkpoints ship as
+//! `torch.save` state dicts too, BatchNorm `num_batches_tracked` int64 counters included).
 //!
 //! Native Wan checkpoints ship the T5 encoder (`models_t5_umt5-xxl-enc-bf16.pth`) and the VAE
 //! (`Wan2.x_VAE.pth`) as PyTorch `torch.save` archives — a ZIP holding `<prefix>/data.pkl` (a
@@ -18,16 +20,18 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
-use mlx_gen::{Error, Result};
+use crate::{Error, Result};
 use mlx_rs::Array;
 
-/// Torch storage element type (the `torch.<X>Storage` global in the pickle). We only need the float
-/// storages the Wan T5/VAE use; everything is decoded to f32 (mirroring `.float()`).
+/// Torch storage element type (the `torch.<X>Storage` global in the pickle). The float storages the
+/// Wan T5/VAE use, plus `LongStorage` (BatchNorm's `num_batches_tracked` counter in any module
+/// state dict with a BatchNorm); everything is decoded to f32 (mirroring `.float()`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StorageDtype {
     Float32,
     BFloat16,
     Float16,
+    Int64,
 }
 
 impl StorageDtype {
@@ -36,8 +40,9 @@ impl StorageDtype {
             "torch FloatStorage" => Ok(StorageDtype::Float32),
             "torch BFloat16Storage" => Ok(StorageDtype::BFloat16),
             "torch HalfStorage" => Ok(StorageDtype::Float16),
+            "torch LongStorage" => Ok(StorageDtype::Int64),
             other => Err(Error::Msg(format!(
-                "unsupported torch storage type `{other}` in .pth (expected Float/BFloat16/Half)"
+                "unsupported torch storage type `{other}` in .pth (expected Float/BFloat16/Half/Long)"
             ))),
         }
     }
@@ -46,6 +51,7 @@ impl StorageDtype {
         match self {
             StorageDtype::Float32 => 4,
             StorageDtype::BFloat16 | StorageDtype::Float16 => 2,
+            StorageDtype::Int64 => 8,
         }
     }
 }
@@ -518,6 +524,10 @@ fn decode_to_f32(bytes: &[u8], dtype: StorageDtype, numel: usize) -> Result<Vec<
             .chunks_exact(2)
             .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
+        StorageDtype::Int64 => bytes[..need]
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+            .collect(),
     };
     Ok(out)
 }
@@ -954,5 +964,37 @@ mod tests {
         assert!(!is_c_contiguous(&[4, 5], &[1, 4]));
         // scalar
         assert!(is_c_contiguous(&[], &[]));
+    }
+
+    /// sc-24833: a real `torch.save`d module state dict with a BatchNorm (float tensors, the int64
+    /// `num_batches_tracked` counter, the `_metadata` attribute) — the format of the published
+    /// E-LatentLPIPS checkpoints — loads with every float tensor bit-identical to the producer's
+    /// formula values and the counter decoded. Mutation: drop the `LongStorage` arm ⇒ the load
+    /// errors ⇒ red.
+    #[test]
+    fn loads_a_torch_state_dict_with_batchnorm_counters() {
+        use crate::train::formula::{formula_values, Role};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../contracts/gen-core/tests/fixtures/latent_perceptual/tiny_bn_state_dict.pth",
+        );
+        let sd = load_pth_f32(path).unwrap();
+        assert_eq!(sd.len(), 7, "{:?}", sd.keys().collect::<Vec<_>>());
+        for (k, shape, role) in [
+            ("0.weight", vec![2, 4, 3, 3], Role::Conv),
+            ("0.bias", vec![2], Role::Bias),
+            ("1.weight", vec![2], Role::NormWeight),
+            ("1.bias", vec![2], Role::Bias),
+            ("1.running_mean", vec![2], Role::BnMean),
+            ("1.running_var", vec![2], Role::BnVar),
+        ] {
+            let a = &sd[k];
+            assert_eq!(a.shape(), shape.as_slice(), "{k}");
+            assert_eq!(
+                a.as_slice::<f32>(),
+                formula_values(k, &shape, role).as_slice(),
+                "{k}"
+            );
+        }
+        assert_eq!(sd["1.num_batches_tracked"].item::<f32>(), 7.0);
     }
 }

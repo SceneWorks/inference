@@ -875,6 +875,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Subject-masked loss (sc-24828) on the target latent of both t2i and edit items.
         // sc-24830 (epic 2123): depth anchoring through the shared perceptual path (TAEQI2.1 +
         // Depth-Anything-V2) on the target latent of t2i and edit items, dense and checkpointed.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps) through
+        // the shared aux-loss builder this trainer already drives. No E-LatentLPIPS: no published
+        // weights match this latent family, so `latent_lpips_loss` stays false (refused).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
@@ -882,6 +885,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: true,
             face_landmark_loss: true,
+            vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }

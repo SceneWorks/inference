@@ -182,6 +182,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // sc-24830 (epic 2123): depth anchoring — the shared decoded-x0 perceptual path (TAEF2
         // decode of the unpacked flow x0 estimate → Depth-Anything-V2 → cached round-trip
         // reference) on the dense and block-checkpointed forwards.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps) through
+        // the shared aux-loss builder this trainer already drives. No E-LatentLPIPS: no published
+        // weights match this latent family, so `latent_lpips_loss` stays false (refused).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
@@ -189,6 +192,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: true,
             face_landmark_loss: true,
+            vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }

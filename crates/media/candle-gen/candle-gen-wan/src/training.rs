@@ -746,6 +746,10 @@ impl TrainVariant {
             // Depth anchoring (sc-24830): on every expert, dense and checkpointed — the shared
             // decoded-x0 perceptual path through TAEHV (taew2_1 z16 / taew2_2 z48), each expert's
             // aux steps confined to its own noise band.
+            // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps, per
+            // decoded frame) through the shared aux-loss builder this trainer already drives,
+            // wherever depth anchoring is wired. No E-LatentLPIPS: no published weights match this
+            // latent family.
             techniques: gen_core::train::TrainingTechniques {
                 resolution_buckets: true,
                 subject_mask_loss: true,
@@ -753,6 +757,7 @@ impl TrainVariant {
                 // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
                 identity_loss: true,
                 face_landmark_loss: true,
+                vae_anchor_loss: true,
                 ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
             },
         }

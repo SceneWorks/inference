@@ -129,6 +129,10 @@ pub fn request_fingerprint(req: &TrainingRequest) -> crate::Result<String> {
 /// Subject-masked loss (sc-24828) changes the objective, so it appends
 /// `;subject_mask_loss=<background>,<subject>` when on and nothing when off.
 ///
+/// The auxiliary perceptual losses (depth anchoring sc-2125, VAE anchor + E-LatentLPIPS sc-24833)
+/// change the objective, so each enabled one appends `;<loss>=<weight>@<t_min>..<t_max>/<every_n>`;
+/// an off loss appends nothing.
+///
 /// The identity / face-landmark losses (sc-24831) change the objective, so each appends its
 /// schedule (and the identity loss its gate + reference mode) when on and nothing when off.
 pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
@@ -191,6 +195,18 @@ pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
             ";face_landmark_loss={:?}/{:?}-{:?}/{}",
             lm.weight, lm.t_min, lm.t_max, lm.every_n
         ));
+    }
+    for (tag, schedule) in [
+        ("depth_anchoring", &cfg.depth_anchoring.schedule),
+        ("vae_anchor", &cfg.vae_anchor.schedule),
+        ("latent_lpips", &cfg.latent_lpips.schedule),
+    ] {
+        if schedule.is_enabled() {
+            fingerprint.push_str(&format!(
+                ";{tag}={:?}@{:?}..{:?}/{}",
+                schedule.weight, schedule.t_min, schedule.t_max, schedule.every_n
+            ));
+        }
     }
     fingerprint
 }
@@ -538,6 +554,51 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("training configuration differs"), "{err}");
+        }
+    }
+
+    /// sc-24833: an enabled auxiliary perceptual loss (depth anchoring, VAE anchor, E-LatentLPIPS)
+    /// joins the config fingerprint with its whole schedule; an off loss appends nothing, so the
+    /// knobs-off fingerprint is unchanged. *Mutations that red this:* dropping a loss from the
+    /// append list; appending without the `is_enabled` gate; omitting the window or period.
+    #[test]
+    fn perceptual_losses_join_the_config_fingerprint_only_when_on() {
+        use crate::train::AuxLossSchedule;
+        let off = TrainingConfig::default();
+        let base = training_config_fingerprint(&off);
+        for tag in ["depth_anchoring", "vae_anchor", "latent_lpips"] {
+            assert!(!base.contains(tag), "{base}");
+        }
+        let on = |weight: f32, every_n: u32| AuxLossSchedule {
+            weight,
+            t_min: 0.0,
+            t_max: 0.5,
+            every_n,
+        };
+        let mut va = off.clone();
+        va.vae_anchor.schedule = on(0.5, 1);
+        let mut lp = off.clone();
+        lp.latent_lpips.schedule = on(0.5, 1);
+        let mut lp_period = off.clone();
+        lp_period.latent_lpips.schedule = on(0.5, 2);
+        let mut depth = off.clone();
+        depth.depth_anchoring.schedule = on(0.5, 1);
+        assert_eq!(
+            training_config_fingerprint(&va),
+            format!("{base};vae_anchor=0.5@0.0..0.5/1")
+        );
+        assert_eq!(
+            training_config_fingerprint(&lp),
+            format!("{base};latent_lpips=0.5@0.0..0.5/1")
+        );
+        let fps: Vec<String> = [&off, &va, &lp, &lp_period, &depth]
+            .iter()
+            .map(|c| training_config_fingerprint(c))
+            .collect();
+        for i in 0..fps.len() {
+            for j in (i + 1)..fps.len() {
+                assert_ne!(fps[i], fps[j], "configs {i} and {j}");
+            }
         }
     }
 }
