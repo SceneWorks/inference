@@ -2300,6 +2300,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -2794,7 +2795,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "unicode-normalization",
- "zip 8.6.0",
 ]
 
 [[package]]
