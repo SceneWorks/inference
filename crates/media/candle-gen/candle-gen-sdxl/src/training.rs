@@ -1821,6 +1821,8 @@ mod tests {
                 assert!(err < 1e-3, "t={t}: x0 recovery error {err}");
                 assert_eq!(timestep_at(noise_level_of(t)), t);
             }
+            // Half-way rounds to the nearer index (0.5 · (T − 1) ends in .5).
+            assert_eq!(timestep_at(0.5), 500);
         }
 
         /// (a)/(b) on both backward paths: the diffusion step has no aux term; the aux-only step has
@@ -1877,6 +1879,37 @@ mod tests {
             assert!(!a2.unwrap().diffusion());
             assert!((599..=900).contains(&t2), "aux-only step at {t2}");
             assert_eq!(plan_timestep(&StepSample::plain(0, 0), 100).unwrap().0, 100);
+        }
+
+        /// The aux term is the depth loss of THE trainer's x0 estimate: recomputed independently from
+        /// the model output with the trainer's parameterisation, it matches the step's aux bits.
+        /// Mutation: swap the parameterisation in `step_loss` (e.g. `VPrediction`) ⇒ red.
+        #[test]
+        fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
+            let f = fixture();
+            let (mut d, sched) = driver(&f);
+            let _ = d.sample(1, &sched);
+            let s2 = d.sample(2, &sched).plan(0.5).unwrap().unwrap();
+            let t = timestep_at(s2.noise_level());
+            let (l, _) = run(&f, t, false, Some(&s2));
+            let scheduler = DDIMSchedulerConfig::default()
+                .build(NUM_TRAIN_TIMESTEPS)
+                .unwrap();
+            let noisy = scheduler.add_noise(&f.x0, f.noise.clone(), t).unwrap();
+            let eps = f.unet.forward(&noisy, t as f64, &f.cond).unwrap();
+            let ab = alpha_bar_at(scheduler.as_ref(), t).unwrap() as f64;
+            let x0 = ((&noisy - (eps * (1.0 - ab).sqrt()).unwrap()).unwrap() / ab.sqrt()).unwrap();
+            let want = s2
+                .aux_loss(&x0)
+                .unwrap()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let got = l.aux.unwrap();
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "{got} vs {want}"
+            );
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 dense step (reproduced verbatim).

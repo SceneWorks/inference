@@ -1342,6 +1342,44 @@ mod tests {
             }
         }
 
+        /// The aux term is the depth loss of THE trainer's x0 estimate: recomputed independently from
+        /// the model output with the trainer's parameterisation, it matches the step's aux bits.
+        /// Mutation: swap the parameterisation in `step_loss` (e.g. `FlowX0MinusNoise`) ⇒ red.
+        #[test]
+        fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
+            let f = fixture();
+            let (mut d, sched) = driver(&f);
+            let _ = d.sample(1, &sched);
+            let s2 = d.sample(2, &sched).plan(0.5).unwrap().unwrap();
+            let sigma = s2.noise_level();
+            let (l, _) = run(&f, sigma, false, Some(&s2));
+            let (x_t, _, timestep) = build_batch(&f.x0, &f.noise, sigma).unwrap();
+            let prepared =
+                prepare_inputs(&x_t, std::slice::from_ref(&f.cap), &Device::Cpu).unwrap();
+            let t = Tensor::from_vec(vec![timestep], (1,), &Device::Cpu).unwrap();
+            let v = f
+                .dit
+                .forward(
+                    &prepared.latents,
+                    &t,
+                    &prepared.cap_feats,
+                    &prepared.cap_mask,
+                )
+                .unwrap()
+                .squeeze(2)
+                .unwrap()
+                .neg()
+                .unwrap();
+            let x0 = (&x_t - (v * sigma as f64).unwrap()).unwrap();
+            let want = s2
+                .aux_loss(&x0)
+                .unwrap()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert_eq!(l.aux.unwrap().to_bits(), want.to_bits());
+        }
+
         /// (c) Depth off is bit-identical to the pre-epic-2123 dense step (reproduced here
         /// verbatim): loss and every gradient. Mutation: route the `None` case through a scaled
         /// combine (e.g. `diffusion * 1.0000001`) ⇒ red.

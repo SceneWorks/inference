@@ -732,6 +732,7 @@ name = "candle-gen-kolors"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-gen-sdxl",
  "candle-transformers",
