@@ -27,6 +27,7 @@ pub mod error;
 pub mod execution_domains;
 pub mod exr_io;
 pub mod face;
+pub mod fx_program;
 pub mod gemma_assets;
 pub mod generator;
 pub mod guidance;

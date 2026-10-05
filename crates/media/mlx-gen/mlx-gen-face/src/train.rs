@@ -35,9 +35,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use mlx_gen::gen_core::train::{IdentityLossConfig, IdentityReferenceMode};
-use mlx_gen::train::perceptual::{
-    reference_as, AuxModelFootprint, LossReference, PerceptualLoss,
-};
+use mlx_gen::train::perceptual::{reference_as, LossReference, PerceptualLoss};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::ops::indexing::IndexOp;
@@ -49,115 +47,15 @@ use crate::iresnet::ArcFace;
 use crate::program::Program;
 use crate::scrfd::Scrfd;
 
-/// SCRFD detector checkpoint in the face-analysis stack dir (the `instantid_face_stack` bundle).
-pub const SCRFD_FILE: &str = "scrfd_10g.safetensors";
-/// ArcFace checkpoint in the face-analysis stack dir.
-pub const ARCFACE_FILE: &str = "arcface_iresnet100.safetensors";
-/// Converted FaceMesh-v2 program checkpoint (`tools/convert_mp_facemesh_v2.py`).
-pub const FACEMESH_FILE: &str = "face_landmarks_detector.safetensors";
-
-/// Upstream's face-box expansion on every side (`bw * 0.15`, `bh * 0.15`).
-pub const FACE_CROP_PAD: f64 = 0.15;
-/// ArcFace input edge.
-pub const ARCFACE_INPUT: usize = 112;
-/// FaceMesh input edge.
-pub const FACEMESH_INPUT: usize = 256;
-/// Number of FaceMesh-v2 landmarks.
-pub const FACEMESH_LANDMARKS: usize = 478;
-
-/// MediaPipe FaceMesh jaw / face-oval indices (weight 3).
-pub const FACE_OVAL: [i32; 36] = [
-    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152,
-    148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
-];
-/// Lip indices (weight 2).
-pub const LIPS: [i32; 20] = [
-    61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185,
-];
-/// Mid-face indices — left eye, right eye, nose (weight 1).
-pub const MIDFACE: [i32; 45] = [
-    33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246, 362, 382, 381,
-    380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398, 1, 2, 98, 327, 168, 6, 197,
-    195, 5, 4, 19, 94, 370,
-];
-const NOSE_TIP: i32 = 1;
-const LEFT_INNER_EYE: i32 = 133;
-const RIGHT_INNER_EYE: i32 = 362;
-
-/// A half-open integer pixel box `[x0, x1) × [y0, y1)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CropBox {
-    pub x0: usize,
-    pub y0: usize,
-    pub x1: usize,
-    pub y1: usize,
-}
-
-impl CropBox {
-    fn width(&self) -> usize {
-        self.x1 - self.x0
-    }
-    fn height(&self) -> usize {
-        self.y1 - self.y0
-    }
-}
-
-/// Upstream's face crop box for a detector `bbox` `[x1, y1, x2, y2]` on an `h × w` image: expand by
-/// [`FACE_CROP_PAD`] per side, round half-to-even (Python `round`), clamp to the image; a box that
-/// collapses falls back to the full frame (upstream's `else: crop = pixels[i:i+1]`).
-pub fn face_crop_box(bbox: [f32; 4], h: usize, w: usize) -> CropBox {
-    let [x1, y1, x2, y2] = bbox.map(|v| v as f64);
-    let (bw, bh) = (x2 - x1, y2 - y1);
-    let (pw, ph) = (bw * FACE_CROP_PAD, bh * FACE_CROP_PAD);
-    let r = |v: f64| v.round_ties_even() as i64;
-    let cx1 = r(x1 - pw).max(0);
-    let cy1 = r(y1 - ph).max(0);
-    let cx2 = r(x2 + pw).min(w as i64);
-    let cy2 = r(y2 + ph).min(h as i64);
-    if cx2 > cx1 && cy2 > cy1 {
-        CropBox {
-            x0: cx1 as usize,
-            y0: cy1 as usize,
-            x1: cx2 as usize,
-            y1: cy2 as usize,
-        }
-    } else {
-        CropBox {
-            x0: 0,
-            y0: 0,
-            x1: w,
-            y1: h,
-        }
-    }
-}
-
-/// The `[out, in]` matrix of torch's bilinear `F.interpolate(align_corners=False)` (no antialias)
-/// along one axis: source `max((o + 0.5)·in/out − 0.5, 0)`, taps `⌊s⌋` and `min(⌊s⌋+1, in−1)`.
-pub fn bilinear_matrix(out: usize, input: usize) -> Vec<f32> {
-    let mut m = vec![0f32; out * input];
-    let scale = input as f64 / out as f64;
-    for o in 0..out {
-        let src = ((o as f64 + 0.5) * scale - 0.5).max(0.0);
-        let i0 = (src.floor() as usize).min(input - 1);
-        let i1 = (i0 + 1).min(input - 1);
-        let l1 = (src - i0 as f64) as f32;
-        m[o * input + i0] += 1.0 - l1;
-        m[o * input + i1] += l1;
-    }
-    m
-}
-
-/// The resample matrix for `len` pixels placed at `offset` inside a zero-padded axis of `padded`
-/// pixels, resized to `out`: the padded axis's [`bilinear_matrix`] restricted to the real columns
-/// (the padding is zero, so its columns contribute nothing).
-fn axis_matrix(out: usize, padded: usize, offset: usize, len: usize) -> Array {
-    let full = bilinear_matrix(out, padded);
-    let mut m = Vec::with_capacity(out * len);
-    for o in 0..out {
-        m.extend_from_slice(&full[o * padded + offset..o * padded + offset + len]);
-    }
-    Array::from_slice(&m, &[out as i32, len as i32])
-}
+pub use mlx_gen::gen_core::train::face_loss::{
+    arcface_param_count, bilinear_matrix, crop_resample_matrices, face_crop_box,
+    face_landmark_loss_footprint, identity_loss_footprint, CropBox, ARCFACE_FILE, ARCFACE_INPUT,
+    FACEMESH_FILE, FACEMESH_INPUT, FACEMESH_LANDMARKS, FACEMESH_V2_PARAMS, FACE_CROP_PAD, SCRFD_10G_PARAMS,
+    SCRFD_FILE,
+};
+use mlx_gen::gen_core::train::face_loss::{
+    INNER_EYES, INTER_EYE_FLOOR, LANDMARK_EPS, LANDMARK_REGIONS, NOSE_TIP,
+};
 
 /// Cut `b` out of NHWC `[1, H, W, C]` pixels and resample it to `out × out`, differentiably (two
 /// constant matmuls). `square` zero-pads the shorter side first (centred, upstream's identity crop);
@@ -171,19 +69,9 @@ pub fn crop_resize(px: &Array, b: CropBox, square: bool, out: usize) -> Result<A
         b.x0 as i32..b.x1 as i32,
         ..,
     )); // [h, w, C]
-    let (sy, oy, sx, ox) = if square && w != h {
-        let s = w.max(h);
-        let d = s - w.min(h);
-        if w > h {
-            (s, d / 2, w, 0)
-        } else {
-            (h, 0, s, d / 2)
-        }
-    } else {
-        (h, 0, w, 0)
-    };
-    let ry = axis_matrix(out, sy, oy, h); // [out, h]
-    let rx = axis_matrix(out, sx, ox, w); // [out, w]
+    let (ry, rx) = crop_resample_matrices(b, square, out);
+    let ry = Array::from_slice(&ry, &[out as i32, h as i32]);
+    let rx = Array::from_slice(&rx, &[out as i32, w as i32]);
     let y = matmul(&ry, &crop.reshape(&[h as i32, (w as i32) * c])?)?; // [out, w·C]
     let y = y
         .reshape(&[out as i32, w as i32, c])?
@@ -418,25 +306,40 @@ pub struct LandmarkReference {
 
 /// Centre `[N, 478, 2]` landmarks on the nose tip and scale by the inner-eye distance (≥ 0.01).
 pub fn normalize_landmarks(lm: &Array) -> Result<Array> {
-    let pick = |i: i32| lm.index((.., i..i + 1, ..));
+    let pick = |i: usize| lm.index((.., i as i32..i as i32 + 1, ..));
     let centered = subtract(lm, &pick(NOSE_TIP))?;
-    let d = subtract(&pick(LEFT_INNER_EYE), &pick(RIGHT_INNER_EYE))?;
+    let d = subtract(&pick(INNER_EYES.0), &pick(INNER_EYES.1))?;
     let inter = mlx_rs::ops::sqrt(&d.square()?.sum_axes(&[-1], true)?)?;
-    Ok(divide(&centered, &maximum(&inter, Array::from_f32(0.01))?)?)
+    Ok(divide(
+        &centered,
+        &maximum(&inter, Array::from_f32(INTER_EYE_FLOOR))?,
+    )?)
 }
 
-/// Upstream's region-weighted landmark distance between `[478, 2]` sets.
+/// Upstream's region-weighted landmark distance between `[478, 2]` sets:
+/// `Σ_r w_r · mean_i sqrt(max(‖g_i − r_i‖², ε)) / Σ_r w_r` over [`LANDMARK_REGIONS`].
 pub fn landmark_distance(gen: &Array, reference: &Array) -> Result<Array> {
-    let region = |idx: &[i32]| -> Result<Array> {
-        let ix = Array::from_slice(idx, &[idx.len() as i32]);
+    let mut total: Option<Array> = None;
+    let mut weights = 0.0f32;
+    for (idx, w) in LANDMARK_REGIONS {
+        let idx: Vec<i32> = idx.iter().map(|&i| i as i32).collect();
+        let ix = Array::from_slice(&idx, &[idx.len() as i32]);
         let d = subtract(&gen.take_axis(&ix, 0)?, &reference.take_axis(&ix, 0)?)?;
-        let sq = maximum(&d.square()?.sum_axes(&[-1], false)?, Array::from_f32(1e-6))?;
-        Ok(mlx_rs::ops::sqrt(&sq)?.mean(None)?)
-    };
-    let jaw = multiply(&region(&FACE_OVAL)?, Array::from_f32(3.0))?;
-    let lips = multiply(&region(&LIPS)?, Array::from_f32(2.0))?;
-    let mid = region(&MIDFACE)?;
-    Ok(divide(&add(&add(&jaw, &lips)?, &mid)?, Array::from_f32(6.0))?)
+        let sq = maximum(
+            &d.square()?.sum_axes(&[-1], false)?,
+            Array::from_f32(LANDMARK_EPS),
+        )?;
+        let term = multiply(&mlx_rs::ops::sqrt(&sq)?.mean(None)?, Array::from_f32(w))?;
+        total = Some(match total {
+            Some(t) => add(&t, &term)?,
+            None => term,
+        });
+        weights += w;
+    }
+    Ok(divide(
+        &total.expect("three regions"),
+        Array::from_f32(weights),
+    )?)
 }
 
 /// The FaceMesh landmark loss (see the module docs).
@@ -532,148 +435,23 @@ pub fn load_face_landmark_loss(face_dir: &Path, mesh_dir: &Path) -> Result<FaceL
     ))
 }
 
-/// Published SCRFD-10g (bnkps) parameter count (insightface model zoo: 4.23 M).
-pub const SCRFD_10G_PARAMS: u64 = 4_230_000;
-/// Upper bound of the FaceMesh-v2 landmark detector's parameters: the upstream checkpoint is a
-/// 5.21 MB f32 pickle (≈ 1.30 M floats; upstream's docstring says 1.2 M).
-pub const FACEMESH_V2_PARAMS: u64 = 1_310_000;
-/// IResNet stage widths (every insightface ArcFace checkpoint).
-const IRESNET_WIDTHS: [u64; 4] = [64, 128, 256, 512];
-const IRESNET_STEM: u64 = 64;
-const ARCFACE_EMBEDDING: u64 = 512;
-
-/// Parameters of an IResNet ArcFace with per-stage block counts `layers` (analytic, from the
-/// architecture; glintr100 = `[3,13,30,3]` ⇒ ≈ 65.2 M).
-pub fn arcface_param_count(layers: [usize; 4]) -> u64 {
-    let mut n = 3 * IRESNET_STEM * 9 + 2 * IRESNET_STEM; // stem conv (+bias) + prelu
-    let mut cin = IRESNET_STEM;
-    for (&nb, &c) in layers.iter().zip(&IRESNET_WIDTHS) {
-        for b in 0..nb as u64 {
-            let bin = if b == 0 { cin } else { c };
-            n += 2 * bin + 9 * bin * c + c + c + 9 * c * c + c;
-            if b == 0 {
-                n += bin * c + c;
-            }
-        }
-        cin = c;
-    }
-    n + 2 * cin + cin * 49 * ARCFACE_EMBEDDING + ARCFACE_EMBEDDING + 2 * ARCFACE_EMBEDDING
-}
-
-/// Conservative training working set of one differentiable ArcFace forward + backward at 112²: the
-/// activations every block retains (its input, bn1, conv1, PReLU and conv2/residual outputs), f32,
-/// ×2 for the cotangents. An estimate, not a measurement.
-pub fn arcface_working_set_bytes(layers: [usize; 4]) -> u64 {
-    let mut side = ARCFACE_INPUT as u64;
-    let mut floats = 2 * IRESNET_STEM * side * side; // stem conv + prelu
-    let mut cin = IRESNET_STEM;
-    for (&nb, &c) in layers.iter().zip(&IRESNET_WIDTHS) {
-        for b in 0..nb {
-            let bin = if b == 0 { cin } else { c };
-            let out = if b == 0 { side / 2 } else { side };
-            floats += 2 * bin * side * side + 2 * c * side * side + 2 * c * out * out;
-            side = out;
-        }
-        cin = c;
-    }
-    floats * 4 * 2
-}
-
-/// The SCRFD detector each face loss loads (reference-time forward on a 640² blob, no backward):
-/// its weights plus ≈ 32 input-sized f32 maps live at the widest stage.
-fn detector_footprint() -> AuxModelFootprint {
-    AuxModelFootprint {
-        param_bytes: SCRFD_10G_PARAMS * 4,
-        working_set_bytes: 32 * 640 * 640 * 3 * 4,
-        reference_bytes_per_image: 0,
-    }
-}
-
-fn plus(a: AuxModelFootprint, b: AuxModelFootprint) -> AuxModelFootprint {
-    AuxModelFootprint {
-        param_bytes: a.param_bytes + b.param_bytes,
-        working_set_bytes: a.working_set_bytes + b.working_set_bytes,
-        reference_bytes_per_image: a.reference_bytes_per_image + b.reference_bytes_per_image,
-    }
-}
-
-/// E7 footprint of the identity loss (its SCRFD detector + an IResNet ArcFace of `layers`; the
-/// shipped face stack is glintr100, [`crate::iresnet::IRESNET100_LAYERS`]). The crop is a fixed
-/// 112², so the figure does not depend on the training resolution.
-pub fn identity_loss_footprint(layers: [usize; 4]) -> AuxModelFootprint {
-    plus(
-        detector_footprint(),
-        AuxModelFootprint {
-            param_bytes: arcface_param_count(layers) * 4,
-            working_set_bytes: arcface_working_set_bytes(layers),
-            // Unit embedding + box.
-            reference_bytes_per_image: ARCFACE_EMBEDDING * 4 + 64,
-        },
-    )
-}
-
-/// E7 footprint of the face-landmark loss (its SCRFD detector + FaceMesh-v2 on a fixed 256² crop).
-pub fn face_landmark_loss_footprint() -> AuxModelFootprint {
-    let input = (FACEMESH_INPUT * FACEMESH_INPUT * 3 * 4) as u64;
-    plus(
-        detector_footprint(),
-        AuxModelFootprint {
-            param_bytes: FACEMESH_V2_PARAMS * 4,
-            // MobileNet-class graph at 256²: ≈ 64 input-sized f32 maps retained, ×2 cotangents.
-            working_set_bytes: 64 * input * 2,
-            reference_bytes_per_image: (FACEMESH_LANDMARKS * 2 * 4) as u64 + 64,
-        },
-    )
-}
-
 /// On-disk stand-ins for the face-loss checkpoints, for tests of the builder / trainers that must
-/// never download real weights: a weightless SCRFD (scalar zeros — loads, never forwarded), a tiny
-/// synthetic IResNet ArcFace, and a tiny FaceMesh-shaped fx-program.
+/// never download real weights: a weightless SCRFD (scalar zeros — loads, never forwarded), the
+/// parity fixture's tiny synthetic IResNet ArcFace, and a tiny FaceMesh-I/O fx-program.
 pub mod testing {
     use std::collections::HashMap;
     use std::path::Path;
 
+    use mlx_gen::gen_core::fx_program::FORMAT;
+    use mlx_gen::gen_core::train::face_loss::synth::{
+        tiny_arcface_shapes, tiny_facemesh_shapes, ARCFACE_SEED, FACEMESH_SEED,
+        TINY_FACEMESH_PROGRAM,
+    };
     use mlx_gen::{Error, Result};
     use mlx_rs::Array;
 
     use super::{ARCFACE_FILE, FACEMESH_FILE, SCRFD_FILE};
     use crate::synth;
-
-    /// Key → shape of a tiny IResNet (stem 8, widths 8/16/32/64, blocks `[1,2,1,1]`, 32-d) — the
-    /// parity fixture's architecture.
-    pub fn tiny_arcface_shapes() -> Vec<(String, Vec<usize>)> {
-        let mut out = Vec::new();
-        let conv = |out: &mut Vec<(String, Vec<usize>)>, p: &str, cin, cout, k| {
-            out.push((format!("{p}.weight"), vec![cout, k, k, cin]));
-            out.push((format!("{p}.bias"), vec![cout]));
-        };
-        let aff = |out: &mut Vec<(String, Vec<usize>)>, p: &str, c| {
-            out.push((format!("{p}.scale"), vec![c]));
-            out.push((format!("{p}.shift"), vec![c]));
-        };
-        conv(&mut out, "stem.conv", 3, 8, 3);
-        out.push(("stem.prelu.weight".into(), vec![8]));
-        let mut cin = 8;
-        for (li, (nb, c)) in [1usize, 2, 1, 1].into_iter().zip([8, 16, 32, 64]).enumerate() {
-            for b in 0..nb {
-                let p = format!("layer{}.{b}", li + 1);
-                let bin = if b == 0 { cin } else { c };
-                aff(&mut out, &format!("{p}.bn1"), bin);
-                conv(&mut out, &format!("{p}.conv1"), bin, c, 3);
-                out.push((format!("{p}.prelu.weight"), vec![c]));
-                conv(&mut out, &format!("{p}.conv2"), c, c, 3);
-                if b == 0 {
-                    conv(&mut out, &format!("{p}.downsample"), bin, c, 1);
-                }
-            }
-            cin = c;
-        }
-        aff(&mut out, "bn2", cin);
-        out.push(("fc.weight".into(), vec![32, cin * 49]));
-        out.push(("fc.bias".into(), vec![32]));
-        aff(&mut out, "features", 32);
-        out
-    }
 
     fn save(
         pairs: Vec<(String, Array)>,
@@ -696,7 +474,7 @@ pub mod testing {
         let arc = tiny_arcface_shapes()
             .into_iter()
             .map(|(k, s)| {
-                let t = synth::tensor(0x24831A, &k, &s);
+                let t = synth::tensor(ARCFACE_SEED, &k, &s);
                 (k, t)
             })
             .collect();
@@ -707,25 +485,17 @@ pub mod testing {
     /// (`[N,3,256,256]` → `[N,1,1,1434]`).
     pub fn write_facemesh(dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir).map_err(|e| Error::Msg(e.to_string()))?;
-        let program = r#"{"inputs":["x"],"outputs":["y"],"nodes":[
-            {"op":"maxpool2d","out":"p","inputs":["x"],"kernel":[32,32],"stride":[32,32],"padding":[0,0]},
-            {"op":"conv2d","out":"h","inputs":["p"],"weight":"head.weight","bias":"head.bias",
-             "stride":[1,1],"padding":[0,0],"dilation":[1,1],"groups":1},
-            {"op":"reshape","out":"y","inputs":["h"],"shape":[-1,1,1,1434]}]}"#;
         let meta = HashMap::from([
-            ("format".to_string(), crate::program::FORMAT.to_string()),
-            ("program".to_string(), program.to_string()),
+            ("format".to_string(), FORMAT.to_string()),
+            ("program".to_string(), TINY_FACEMESH_PROGRAM.to_string()),
         ]);
-        let params = vec![
-            (
-                "head.weight".to_string(),
-                synth::tensor(0x24831B, "head.weight", &[1434, 3, 8, 8]),
-            ),
-            (
-                "head.bias".to_string(),
-                synth::tensor(0x24831B, "head.bias", &[1434]),
-            ),
-        ];
+        let params = tiny_facemesh_shapes()
+            .into_iter()
+            .map(|(k, s)| {
+                let t = synth::tensor(FACEMESH_SEED, &k, &s);
+                (k, t)
+            })
+            .collect();
         save(params, Some(&meta), &dir.join(FACEMESH_FILE))
     }
 }

@@ -3,9 +3,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::train::perceptual::{
-    AuxLoss, AuxLossSchedule, AuxModelFootprint, PerceptualPath, X0Decoder,
-};
+use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule, PerceptualPath, X0Decoder};
 use mlx_rs::transforms::eval;
 use serde_json::Value;
 
@@ -114,7 +112,7 @@ fn mesh_program(f: &Value) -> Program {
         w.insert(k.clone(), synth::tensor(seed, k, &shape));
     }
     Program::new(
-        crate::program::ProgramSpec::from_value(&m["program"]).unwrap(),
+        mlx_gen::gen_core::fx_program::ProgramSpec::from_value(&m["program"]).unwrap(),
         &w,
     )
     .unwrap()
@@ -426,33 +424,8 @@ fn a_live_decode_of_another_size_is_refused() {
 // Pieces
 // ---------------------------------------------------------------------------------------------
 
-/// Python `round` is half-to-even; a box edge on .5 must round to even like upstream.
-/// Mutation: `round_ties_even` → `round` ⇒ x0 becomes 3 ⇒ red.
-#[test]
-fn face_crop_box_rounds_half_to_even_and_falls_back_to_the_frame() {
-    // bw = 20 ⇒ pad 3 ⇒ x1 − pad = 2.5 ⇒ 2 (even).
-    let b = face_crop_box([5.5, 10.0, 25.5, 30.0], 64, 64);
-    assert_eq!((b.x0, b.y0, b.x1, b.y1), (2, 7, 28, 33));
-    let full = face_crop_box([70.0, 70.0, 80.0, 80.0], 64, 64);
-    assert_eq!((full.x0, full.y0, full.x1, full.y1), (0, 0, 64, 64));
-}
-
-#[test]
-fn bilinear_matrix_rows_sum_to_one_and_identity_at_equal_size() {
-    let m = bilinear_matrix(7, 13);
-    for r in m.chunks(13) {
-        assert!((r.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-    }
-    let id = bilinear_matrix(5, 5);
-    for (i, r) in id.chunks(5).enumerate() {
-        for (j, v) in r.iter().enumerate() {
-            assert_eq!(*v, if i == j { 1.0 } else { 0.0 });
-        }
-    }
-}
-
-/// `infer_layers` reads any IResNet depth; the analytic glintr100 count matches the published
-/// 65.2 M (261 MB f32 onnx). Mutation: drop the downsample term ⇒ the count leaves the band ⇒ red.
+/// `infer_layers` reads any IResNet depth (iresnet100 glintr100, iresnet50 w600k_r50). Mutation:
+/// stop counting at the first block ⇒ red.
 #[test]
 fn arcface_depth_is_read_from_the_keys_and_its_size_is_counted() {
     use crate::iresnet::{infer_layers, IRESNET100_LAYERS, IRESNET50_LAYERS};
@@ -463,29 +436,6 @@ fn arcface_depth_is_read_from_the_keys_and_its_size_is_counted() {
         assert_eq!(infer_layers(has).unwrap(), layers);
     }
     assert!(infer_layers(|_| false).is_err());
-    let r100 = arcface_param_count(IRESNET100_LAYERS);
-    assert!((65_000_000..65_400_000).contains(&r100), "{r100}");
-    let r50 = arcface_param_count(IRESNET50_LAYERS);
-    assert!((43_400_000..43_800_000).contains(&r50), "{r50}");
-}
-
-/// E7: each face loss carries its detector plus its own model — glintr100 ArcFace (≈ 261 MB f32)
-/// for identity, FaceMesh for landmarks — and a per-image reference. Mutations: drop the detector
-/// from `identity_loss_footprint` ⇒ the param floor goes red; drop the ArcFace term ⇒ red.
-#[test]
-fn face_loss_footprints_count_detector_and_model() {
-    let det = SCRFD_10G_PARAMS * 4;
-    let id = identity_loss_footprint(crate::iresnet::IRESNET100_LAYERS);
-    assert_eq!(
-        id.param_bytes,
-        det + arcface_param_count(crate::iresnet::IRESNET100_LAYERS) * 4
-    );
-    assert!(id.param_bytes > 270_000_000 && id.working_set_bytes > 0);
-    assert!(id.reference_bytes_per_image >= 512 * 4);
-    let lm = face_landmark_loss_footprint();
-    assert_eq!(lm.param_bytes, det + FACEMESH_V2_PARAMS * 4);
-    assert!(lm.reference_bytes_per_image >= (FACEMESH_LANDMARKS * 2 * 4) as u64);
-    let _: AuxModelFootprint = lm;
 }
 
 /// The on-disk test stand-ins load through the real loaders, and the tiny ArcFace they write is the
@@ -510,7 +460,9 @@ fn testing_checkpoints_load_through_the_real_loaders() {
         })
         .collect();
     let got: std::collections::BTreeMap<String, Vec<usize>> =
-        testing::tiny_arcface_shapes().into_iter().collect();
+        mlx_gen::gen_core::train::face_loss::synth::tiny_arcface_shapes()
+            .into_iter()
+            .collect();
     assert_eq!(got, want);
     let dir = tempfile::tempdir().unwrap();
     let tmp = dir.path().to_path_buf();
@@ -530,7 +482,7 @@ fn testing_checkpoints_load_through_the_real_loaders() {
 /// The executor refuses an op the converter never emits, naming it.
 #[test]
 fn an_unknown_program_op_is_refused_by_name() {
-    let err = crate::program::ProgramSpec::parse(
+    let err = mlx_gen::gen_core::fx_program::ProgramSpec::parse(
         r#"{"inputs":["x"],"outputs":["y"],"nodes":[{"op":"gelu","out":"y","inputs":["x"]}]}"#,
     )
     .unwrap_err()

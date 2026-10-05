@@ -29,11 +29,9 @@ use mlx_rs::Array;
 
 use crate::common::Conv;
 
-/// iresnet100 block counts per layer (`layer1..layer4`) — antelopev2 `glintr100`.
-pub const IRESNET100_LAYERS: [usize; 4] = [3, 13, 30, 3];
-/// iresnet50 block counts per layer — buffalo_l `w600k_r50`, the upstream ai-toolkit-perceptual
-/// identity-loss checkpoint (sc-24831).
-pub const IRESNET50_LAYERS: [usize; 4] = [3, 4, 14, 3];
+/// Per-layer block counts of glintr100 (iresnet100) and w600k_r50 (iresnet50, upstream's identity
+/// checkpoint) — one definition, in gen-core (sc-24831).
+pub use mlx_gen::gen_core::train::face_loss::{IRESNET100_LAYERS, IRESNET50_LAYERS};
 
 /// The per-layer block counts a converted checkpoint carries, read from its keys
 /// (`layer{l}.{b}.conv1.weight`), so one loader serves iresnet100 (`glintr100`), iresnet50

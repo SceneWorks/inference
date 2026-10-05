@@ -16,6 +16,7 @@
 // The pure LR-schedule policy lives here (gen-core); the MLX training kernels
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.
 pub mod aux_schedule;
+pub mod face_loss;
 pub mod resume;
 pub mod schedule;
 pub mod subject_mask;
