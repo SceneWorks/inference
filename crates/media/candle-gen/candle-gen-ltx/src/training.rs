@@ -24,12 +24,14 @@ use candle_gen::gen_core::{
 };
 use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
 use candle_gen::train::flow_match::{
-    self, prepared_subject_mask_weight, run_flow_match_training, weighted_velocity_loss,
-    FlowMatchTrainer, SamplePlan,
+    self, combine_terms, prepared_subject_mask_weight, run_flow_match_training, step_terms,
+    weighted_velocity_loss, AuxStep, FlowMatchTrainer, SamplePlan, StepLosses,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::LoraSet;
 use candle_gen::train::merge::read_adapter;
+use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
+use candle_gen::train::taehv::TaehvConfig;
 use candle_gen::{CandleError, Result};
 
 use crate::config::{
@@ -1328,6 +1330,10 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
     // geometry per run, enforced at cache time) — it never resizes an image, so there is no edge
     // a bucket could change and the shared floor keeps refusing buckets there.
     let resolution_buckets = id == TRAINER_ID;
+    // sc-24830 (epic 2123): depth anchoring on the LTX-2.3 still-image route (dense and
+    // checkpointed) through TAELTX2.3; LTX-2.5 does not declare it (refused with the reason by
+    // [`refuse_ltx25_depth_anchoring`]).
+    let depth_anchoring = id == TRAINER_ID;
     TrainerDescriptor {
         id,
         family: "ltx",
@@ -1343,6 +1349,7 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets,
             subject_mask_loss,
+            depth_anchoring,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -1447,6 +1454,23 @@ fn validate_ltx_request(req: &TrainingRequest, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// sc-24830 — LTX-2.5 does not run depth anchoring: the decoded-x0 depth loss is wired on the
+/// LTX-2.3 still-image route only, while every LTX-2.5 workflow trains on prepared video/audio
+/// latent bundles through the AV forward (several workflows audio-only). A typed `Unsupported`
+/// naming that reason, raised by the weights-free preflight (which `validate` runs) and at the top
+/// of `train`, ahead of the generic technique floor.
+fn refuse_ltx25_depth_anchoring(req: &TrainingRequest) -> Result<()> {
+    if req.config.depth_anchoring.schedule.is_enabled() {
+        return Err(CandleError::Unsupported(format!(
+            "{MODEL_25_ID} trainer: depth anchoring is wired on the LTX-2.3 still-image trainer \
+             only; LTX-2.5 trains on prepared video/audio latent bundles through its AV workflows, \
+             which do not carry the decoded-x0 depth loss; turn depth anchoring off for this \
+             trainer"
+        )));
+    }
+    Ok(())
+}
+
 impl Trainer for LtxTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
@@ -1477,6 +1501,7 @@ impl Trainer for LtxTrainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         if matches!(self.route, TrainingRoute::Ltx25 { .. }) {
             refuse_ltx25_subject_mask_loss(req)?;
+            refuse_ltx25_depth_anchoring(req)?;
         }
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
@@ -1510,6 +1535,72 @@ fn preflight_against_budget(cfg: &TrainingConfig, available_bytes: u64) -> Resul
         )));
     }
     Ok(())
+}
+
+/// LTX-2.3's latent family for the shared aux-loss builder (epic 2123 E8): the 128-channel VAE
+/// latent normalized by its per-channel statistics (`(μ − mean)/std`, the encoder's last step),
+/// decoded by TAELTX2.3 — upstream's TAEHV checkpoint for LTX-2.3, which takes exactly that
+/// normalized latent. A still image is one `T = 1` clip (8 grown frames, the last kept).
+fn ltx_decoder() -> candle_gen_perceptual::DecoderSpec {
+    candle_gen_perceptual::DecoderSpec::Taehv {
+        name: "TAELTX2.3",
+        config: TaehvConfig::taeltx2_3(),
+    }
+}
+
+/// The epic-2123 perceptual path through the shared builder: `None` when no aux loss is enabled.
+fn load_perceptual_path(cfg: &TrainingConfig, device: &Device) -> Result<Option<PerceptualPath>> {
+    candle_gen_perceptual::build_perceptual_path(
+        cfg,
+        &candle_gen_perceptual::AuxLossContext {
+            label: LABEL,
+            decoder: ltx_decoder(),
+            device,
+            latent_lpips: None,
+        },
+    )
+}
+
+/// Epic 2123 E7: refuse an LTX-2.3 depth job whose DiT projection — the dense first-step peak, or
+/// with gradient checkpointing its resident-base term (the lower bound the aux models stack on) —
+/// plus TAELTX2.3 + the losses' frozen models at the largest bucket exceeds the safe budget. No-op
+/// when no aux loss is enabled; runs on both backward paths.
+fn preflight_aux_against_budget(cfg: &TrainingConfig, available_bytes: u64) -> Result<()> {
+    let edges = bucket_edges(cfg);
+    let edge = edges.iter().copied().max().unwrap_or(0);
+    let aux = candle_gen_perceptual::perceptual_footprint(
+        cfg,
+        &ltx_decoder(),
+        candle_gen_perceptual::AuxGeometry::image(edge, edges.len()),
+    );
+    if aux == 0 {
+        return Ok(());
+    }
+    let latent_edge = edge as usize / SPATIAL_SCALE;
+    let base_gb = if cfg.gradient_checkpointing {
+        projected_dense_peak_gb(0)
+    } else {
+        projected_dense_peak_gb(latent_edge * latent_edge)
+    };
+    flow_match::check_aux_memory(
+        LABEL,
+        (base_gb * 1024f64.powi(3)) as u64,
+        aux,
+        (available_bytes as f64 * SAFE_MEMORY_FRACTION) as u64,
+    )
+}
+
+/// A cached LTX-2.3 still's flattened tokens `(1, S, C)` (`S = le²`, one frame) as the decoder's
+/// NCHW `(1, C, le, le)` — the inverse of [`flatten_latent`] for a square single-frame grid.
+fn ltx23_latent_nchw(tokens: &Tensor) -> Result<Tensor> {
+    let (_, s, _) = tokens.dims3()?;
+    let le = (s as f64).sqrt().round() as usize;
+    if le * le != s {
+        return Err(CandleError::Msg(format!(
+            "{LABEL}: a still latent of {s} tokens is not a square single-frame grid"
+        )));
+    }
+    Ok(unflatten_latent(tokens, 1, le, le)?.squeeze(2)?)
 }
 
 /// One LTX-2.3 resolution bucket's still geometry (sc-2127): the floored pixel edge the image is
@@ -1883,6 +1974,7 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     gen_core::train::validate_full_finetune_request(&descriptor, req)?;
     gen_core::train::validate_edit_request(&descriptor, req)?;
     refuse_ltx25_subject_mask_loss(req)?;
+    refuse_ltx25_depth_anchoring(req)?;
     // Epic 2123 E3: refuse an undeclared technique (weight noise, resolution buckets) here too, so
     // the public preflight matches the `train` entry floor.
     gen_core::train::validate_training_techniques(&descriptor, req)?;
@@ -2607,6 +2699,7 @@ fn ltx23_item_buckets(
 
 /// Kept byte-for-byte in the LTX-2.3 branch: introducing the AV 2.5 trainer must not change the
 /// legacy video-only loss or its optional checkpointed backward path.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn compute_ltx23_loss_grads(
     dit: &LtxDiT,
@@ -2620,27 +2713,107 @@ fn compute_ltx23_loss_grads(
     mask_weight: Option<&Tensor>,
     checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
+    let (losses, grads) = compute_ltx23_step_loss_grads(
+        dit,
+        vars,
+        clean,
+        context,
+        positions,
+        sigma,
+        noise,
+        mae,
+        mask_weight,
+        checkpoint,
+        None,
+    )?;
+    Ok((losses.total, grads))
+}
+
+/// The LTX-2.3 step's loss terms on the raw velocity (epic 2123 E8): the (subject-mask weighted)
+/// regression toward `noise − clean` when the diffusion term contributes, and on a planned step with
+/// aux losses the weighted perceptual term on the x0 estimate `x_t − σ·v`, unflattened to the
+/// decoder's NCHW and decoded by TAELTX2.3. No aux step ⇒ exactly the legacy loss tensor.
+fn ltx23_step_loss(
+    velocity: &Tensor,
+    target: &Tensor,
+    x_t: &Tensor,
+    sigma: f64,
+    mask_weight: Option<&Tensor>,
+    mae: bool,
+    aux: Option<&AuxStep<'_>>,
+) -> Result<(Tensor, StepLosses)> {
+    let (diffusion_on, aux_on) = step_terms(aux);
+    let diffusion = if diffusion_on {
+        Some(weighted_velocity_loss(velocity, target, mask_weight, mae)?)
+    } else {
+        None
+    };
+    let aux_term = match aux {
+        Some(a) if aux_on => {
+            let x0_hat = Parameterization::FlowNoiseMinusX0 {
+                sigma: sigma as f32,
+            }
+            .recover_x0(&x_t.to_dtype(DType::F32)?, &velocity.to_dtype(DType::F32)?)?;
+            a.aux_loss(&ltx23_latent_nchw(&x0_hat)?)?
+        }
+        _ => None,
+    };
+    combine_terms(diffusion, aux_term)
+}
+
+/// [`compute_ltx23_loss_grads`] with the step's planned perceptual terms (epic 2123 E8): an aux-only
+/// step does not compute the diffusion term; both the dense and the checkpointed backward (the aux
+/// term rides in the final segment, after the velocity head) carry it. `aux = None` ⇒ the legacy
+/// graph.
+#[allow(clippy::too_many_arguments)]
+fn compute_ltx23_step_loss_grads(
+    dit: &LtxDiT,
+    vars: &[Var],
+    clean: &Tensor,
+    context: &Tensor,
+    positions: &Tensor,
+    sigma: f64,
+    noise: &Tensor,
+    mae: bool,
+    mask_weight: Option<&Tensor>,
+    checkpoint: bool,
+    aux: Option<&AuxStep<'_>>,
+) -> Result<(StepLosses, GradStore)> {
     let (x_t, target) = flow_match::build_batch(clean, noise, sigma)?;
     if checkpoint {
+        // The breakdown of the final segment's last evaluation, kept for reporting.
+        let breakdown = std::cell::Cell::new(None);
         let (hidden, ctx) = dit.forward_pre_main(&x_t, sigma, context, positions)?;
         let mut segments = dit.main_block_segments(&ctx);
         let target = target.clone();
         let ctx_ref = &ctx;
+        let x_t_ref = &x_t;
+        let breakdown_ref = &breakdown;
         segments.push(Box::new(move |state: &[Tensor]| {
             let velocity = dit.velocity_out(&state[0], ctx_ref)?;
-            Ok(vec![weighted_velocity_loss(
-                &velocity,
-                &target,
-                mask_weight,
-                mae,
-            )?])
+            let (loss, losses) =
+                ltx23_step_loss(&velocity, &target, x_t_ref, sigma, mask_weight, mae, aux)
+                    .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+            breakdown_ref.set(Some(losses));
+            Ok(vec![loss])
         }));
-        checkpointed_backward(&segments, &[hidden.detach()], vars)
+        let (loss_val, grads) = checkpointed_backward(&segments, &[hidden.detach()], vars)?;
+        drop(segments);
+        let losses = breakdown.get().ok_or_else(|| {
+            CandleError::Msg(format!("{LABEL}: the final checkpoint segment never ran"))
+        })?;
+        Ok((
+            StepLosses {
+                total: loss_val,
+                ..losses
+            },
+            grads,
+        ))
     } else {
         let velocity = dit.forward(&x_t, sigma, context, positions)?;
-        let loss = weighted_velocity_loss(&velocity, &target, mask_weight, mae)?;
-        let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-        Ok((value, loss.backward()?))
+        let (loss, losses) =
+            ltx23_step_loss(&velocity, &target, &x_t, sigma, mask_weight, mae, aux)?;
+        Ok((losses, loss.backward()?))
     }
 }
 
@@ -2672,10 +2845,34 @@ impl FlowMatchTrainer for LtxTrainer {
         if !req.config.gradient_checkpointing {
             preflight_against_budget(&req.config, available_device_bytes())?;
         }
+        // Epic 2123 E7: the depth-anchoring models on BOTH paths (no-op with nothing enabled).
+        preflight_aux_against_budget(&req.config, available_device_bytes())?;
         if matches!(self.route, TrainingRoute::Ltx25 { .. }) {
             Ltx25ConditioningPlan::from_request(req)?;
         }
         Ok(())
+    }
+
+    /// Epic 2123 E8: the LTX-2.3 route's perceptual path (LTX-2.5 refuses depth before this).
+    fn perceptual_path(
+        &self,
+        req: &TrainingRequest,
+        device: &Device,
+    ) -> Result<Option<PerceptualPath>> {
+        match self.route {
+            TrainingRoute::Ltx23 { .. } => load_perceptual_path(&req.config, device),
+            TrainingRoute::Ltx25 { .. } => Ok(None),
+        }
+    }
+
+    /// A cached LTX-2.3 still's clean tokens as the decoder's NCHW latent.
+    fn reference_latent(&self, cached: &Self::Cached, _aux: &Self::Aux) -> Result<Tensor> {
+        match cached {
+            TrainingCached::Ltx23 { clean, .. } => ltx23_latent_nchw(clean),
+            TrainingCached::Ltx25(_) => Err(CandleError::Msg(format!(
+                "{MODEL_25_ID} trainer: no perceptual references on the AV route"
+            ))),
+        }
     }
 
     fn cache(
@@ -2943,10 +3140,16 @@ impl FlowMatchTrainer for LtxTrainer {
         positions: &Self::Aux,
         cfg: &TrainingConfig,
         step: u32,
-        _sample: flow_match::StepSample<'_>,
+        sample: flow_match::StepSample<'_>,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
-        let sigma = sample_ltx_sigma(cfg.seed, step);
+        let mut sigma = sample_ltx_sigma(cfg.seed, step);
+        // Epic 2123 E8 (LTX-2.3 only — the AV route has no perceptual path): an aux-only step trains
+        // at σ remapped into the loss window.
+        let aux = sample.plan(sigma as f32)?;
+        if let Some(a) = &aux {
+            sigma = a.noise_level() as f64;
+        }
         match (dit, cached, positions) {
             (
                 TrainingDiT::Ltx23(dit),
@@ -2963,7 +3166,7 @@ impl FlowMatchTrainer for LtxTrainer {
                     flow_match::noise_seed(cfg.seed, step),
                     device,
                 )?;
-                compute_ltx23_loss_grads(
+                let (losses, grads) = compute_ltx23_step_loss_grads(
                     dit,
                     vars,
                     clean,
@@ -2974,7 +3177,9 @@ impl FlowMatchTrainer for LtxTrainer {
                     flow_match::is_mae(cfg),
                     mask_weight.as_ref(),
                     cfg.gradient_checkpointing,
-                )
+                    aux.as_ref(),
+                )?;
+                Ok((losses.total, grads))
             }
             (
                 TrainingDiT::Ltx25(dit),
@@ -4288,5 +4493,324 @@ mod tests {
             }
             other => panic!("expected a typed Unsupported, got {other:?}"),
         }
+    }
+}
+
+/// sc-24830 (epic 2123 depth anchoring) — the candle LTX-2.3 step seam on the tiny video DiT
+/// (`dit_train::tests::tiny_cfg`, 8 latent channels, a 2×2 single-frame grid) with a random-init
+/// tiny-width TAEHV carrying TAELTX2.3's hyperparameters (patch 4, 8× temporal) at 8 latent channels
+/// and a random-init tiny Depth-Anything-V2, planned through the shared flow-match `AuxDriver`
+/// exactly as the driver plans `micro_step`; the LTX-2.5 refusal through its typed reason. CPU.
+#[cfg(test)]
+mod depth_anchoring_tests {
+    use super::*;
+    use candle_gen::candle_nn::VarBuilder;
+    use candle_gen::gen_core::train::{AuxLossSchedule, ResolutionBucket, TrainingItem};
+    use candle_gen::gen_core::BucketSchedule;
+    use candle_gen::train::flow_match::AuxDriver;
+    use candle_gen::train::lora::build_lora_targets;
+    use candle_gen::train::perceptual::AuxLoss;
+    use candle_gen::train::taehv::{splitmix_uniform, synthetic_taehv_weights, TaehvDecoder};
+
+    fn schedule() -> AuxLossSchedule {
+        AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        }
+    }
+
+    fn path() -> PerceptualPath {
+        let tae = TaehvConfig {
+            latent_channels: 8,
+            channels: [8, 6, 4, 4],
+            ..TaehvConfig::taeltx2_3()
+        };
+        let dec = TaehvDecoder::from_weights(
+            &synthetic_taehv_weights(&tae, 11, &Device::Cpu).unwrap(),
+            tae,
+        )
+        .unwrap();
+        let loss = candle_gen_depth::anchor::tiny_depth_anchor_loss(12, &Device::Cpu).unwrap();
+        PerceptualPath::new(
+            Some(Box::new(dec)),
+            vec![AuxLoss {
+                schedule: schedule(),
+                loss: Box::new(loss),
+            }],
+        )
+        .unwrap()
+    }
+
+    struct Fixture {
+        dit: LtxDiT,
+        set: LoraSet,
+        clean: Tensor,
+        noise: Tensor,
+        context: Tensor,
+        positions: Tensor,
+    }
+
+    fn fixture() -> Fixture {
+        let dev = Device::Cpu;
+        let cfg = crate::dit_train::tests::tiny_cfg();
+        let map = crate::dit_train::tests::weights(&cfg, &dev);
+        let mut dit =
+            LtxDiT::new(VarBuilder::from_tensors(map, DType::F32, &dev), &cfg.video).unwrap();
+        let suffixes = LTX_ATTN_TARGETS.map(str::to_string);
+        let set = build_lora_targets(&mut dit, &suffixes, 2, 2.0, 7, &dev).unwrap();
+        let clean = splitmix_uniform(&[1, 4, 8], 1, 1.0, 0.0, &dev).unwrap();
+        let noise = splitmix_uniform(&[1, 4, 8], 2, 1.0, 0.0, &dev).unwrap();
+        let context = splitmix_uniform(&[1, 3, 12], 3, 1.0, 0.0, &dev).unwrap();
+        let positions =
+            crate::rope::create_position_grid(1, 2, 2, DEFAULT_FPS as f32, &dev).unwrap();
+        Fixture {
+            dit,
+            set,
+            clean,
+            noise,
+            context,
+            positions,
+        }
+    }
+
+    fn step(
+        f: &Fixture,
+        sigma: f64,
+        ckpt: bool,
+        aux: Option<&AuxStep<'_>>,
+    ) -> (StepLosses, GradStore) {
+        compute_ltx23_step_loss_grads(
+            &f.dit,
+            &f.set.vars,
+            &f.clean,
+            &f.context,
+            &f.positions,
+            sigma,
+            &f.noise,
+            false,
+            None,
+            ckpt,
+            aux,
+        )
+        .unwrap()
+    }
+
+    fn driver(f: &Fixture) -> (AuxDriver, BucketSchedule) {
+        let sched = BucketSchedule::new(
+            1,
+            &[ResolutionBucket {
+                resolution: 64,
+                repeats: 1,
+            }],
+            7,
+        );
+        let d =
+            AuxDriver::prepare(path(), 1, |_| ltx23_latent_nchw(&f.clean), &sched, 1, 0).unwrap();
+        (d, sched)
+    }
+
+    fn grad_bits(g: &GradStore, vars: &[Var]) -> Vec<Vec<u32>> {
+        vars.iter()
+            .map(|v| {
+                g.get(v.as_tensor())
+                    .map(|t| {
+                        t.flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// AC (a)+(b), dense and checkpointed: the driver's step 2 is a depth step — no diffusion term,
+    /// total == the weighted depth term, a nonzero finite gradient on the zero-init LoRA-B factors —
+    /// and step 1 carries no depth term. Mutation: compute the diffusion term unconditionally ⇒ red.
+    #[test]
+    fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
+        let f = fixture();
+        for ckpt in [false, true] {
+            let (mut d, sched) = driver(&f);
+            let s1 = d.sample(1, &sched).plan(0.4).unwrap().unwrap();
+            let (diff, _) = step(&f, 0.4, ckpt, Some(&s1));
+            assert_eq!(diff.aux, None, "ckpt={ckpt}");
+            assert_eq!(Some(diff.total), diff.diffusion);
+            let s2 = d.sample(2, &sched).plan(0.4).unwrap().unwrap();
+            assert!(!s2.diffusion());
+            let (depth, g) = step(&f, s2.noise_level() as f64, ckpt, Some(&s2));
+            assert_eq!(depth.diffusion, None, "ckpt={ckpt}");
+            let a = depth.aux.expect("depth term");
+            assert!(a > 0.0 && a.is_finite(), "ckpt={ckpt}: {a}");
+            assert!((depth.total - a).abs() <= 1e-6 * a.abs(), "ckpt={ckpt}");
+            let gb: f32 = f
+                .set
+                .vars
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .map(|v| {
+                    g.get(v.as_tensor())
+                        .map(|t| {
+                            t.abs()
+                                .unwrap()
+                                .sum_all()
+                                .unwrap()
+                                .to_scalar::<f32>()
+                                .unwrap()
+                        })
+                        .unwrap_or(0.0)
+                })
+                .sum();
+            assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B grad {gb}");
+        }
+    }
+
+    /// AC (c): depth off ⇒ bit-identical to the legacy LTX-2.3 step (its body reproduced here), and
+    /// a diffusion-only planned step equals it too. Mutation: scale the diffusion loss (×1.0001) ⇒
+    /// red.
+    #[test]
+    fn depth_off_is_bit_identical_to_the_legacy_step() {
+        assert!(
+            load_perceptual_path(&TrainingConfig::default(), &Device::Cpu)
+                .unwrap()
+                .is_none()
+        );
+        let f = fixture();
+        for (i, v) in f.set.vars.iter().enumerate() {
+            v.set(
+                &splitmix_uniform(
+                    v.as_tensor().dims(),
+                    900 + i as u64,
+                    0.05,
+                    0.0,
+                    &Device::Cpu,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let (off, g_off) = step(&f, 0.4, false, None);
+        let (x_t, target) = flow_match::build_batch(&f.clean, &f.noise, 0.4).unwrap();
+        let velocity = f.dit.forward(&x_t, 0.4, &f.context, &f.positions).unwrap();
+        let loss = weighted_velocity_loss(&velocity, &target, None, false).unwrap();
+        let legacy = loss.to_scalar::<f32>().unwrap();
+        let g_legacy = loss.backward().unwrap();
+        assert_eq!(off.total.to_bits(), legacy.to_bits());
+        assert_eq!(
+            grad_bits(&g_off, &f.set.vars),
+            grad_bits(&g_legacy, &f.set.vars)
+        );
+        let (mut d, sched) = driver(&f);
+        let s1 = d.sample(1, &sched).plan(0.4).unwrap().unwrap();
+        let (on, g_on) = step(&f, 0.4, false, Some(&s1));
+        assert_eq!(on, off);
+        assert_eq!(
+            grad_bits(&g_on, &f.set.vars),
+            grad_bits(&g_off, &f.set.vars)
+        );
+    }
+
+    /// The flattened `(1, S, C)` cache latent unflattens to the decoder's NCHW and round-trips
+    /// `flatten_latent`; a non-square token count is a typed error.
+    #[test]
+    fn cached_tokens_map_to_the_decoder_layout() {
+        let dev = Device::Cpu;
+        let z = splitmix_uniform(&[1, 8, 1, 3, 3], 5, 1.0, 0.0, &dev).unwrap();
+        let back = ltx23_latent_nchw(&flatten_latent(&z).unwrap()).unwrap();
+        assert_eq!(back.dims(), &[1, 8, 3, 3]);
+        let a = back.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = z.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a, b);
+        let odd = splitmix_uniform(&[1, 6, 8], 6, 1.0, 0.0, &dev).unwrap();
+        assert!(ltx23_latent_nchw(&odd).is_err());
+    }
+
+    /// AC (d), E7: depth grows the guarded footprint by TAELTX2.3 + DA2 (more for Large); the aux
+    /// guard refuses at a synthetic budget between projection and projection+aux on the dense path
+    /// AND the checkpointed path (where the projection is the resident base). Mutations: compare the
+    /// base alone ⇒ red; use the dense projection under checkpointing ⇒ the checkpointed budget
+    /// refuses the plain-sized case ⇒ red.
+    #[test]
+    fn aux_memory_guard_counts_the_aux_models_on_both_paths() {
+        let mut on = TrainingConfig {
+            resolution: 512,
+            ..TrainingConfig::default()
+        };
+        on.depth_anchoring.schedule = schedule();
+        let fp = |c: &TrainingConfig| {
+            candle_gen_perceptual::perceptual_footprint(
+                c,
+                &ltx_decoder(),
+                candle_gen_perceptual::AuxGeometry::image(512, 1),
+            )
+        };
+        let small = fp(&on);
+        on.depth_anchoring.model_size = gen_core::train::DepthModelSize::Large;
+        let large = fp(&on);
+        assert!(small > 0 && large > small + (1u64 << 30), "{small} {large}");
+        let gib = 1024f64.powi(3);
+        let le = 512 / SPATIAL_SCALE;
+        for (ckpt, base_gb) in [
+            (false, projected_dense_peak_gb(le * le)),
+            (true, projected_dense_peak_gb(0)),
+        ] {
+            on.gradient_checkpointing = ckpt;
+            let budget = |extra: u64| {
+                (((base_gb * gib) as u64 + extra) as f64 / SAFE_MEMORY_FRACTION) as u64 + 1
+            };
+            assert!(
+                preflight_aux_against_budget(&on, budget(large / 2)).is_err(),
+                "ckpt={ckpt}"
+            );
+            assert!(
+                preflight_aux_against_budget(&on, budget(large + (1 << 30))).is_ok(),
+                "ckpt={ckpt}"
+            );
+        }
+        assert!(preflight_aux_against_budget(&TrainingConfig::default(), 1).is_ok());
+    }
+
+    /// AC (e): LTX-2.3 declares depth anchoring, LTX-2.5 does not and refuses it with a typed
+    /// `Unsupported` naming the reason from the weights-free preflight (which `validate` runs), and
+    /// a missing TAELTX2.3 checkpoint is a named error. Mutations: declare depth on 2.5 ⇒ red; drop
+    /// the refusal from the preflight ⇒ the generic floor message lacks the reason ⇒ red.
+    #[test]
+    fn ltx23_declares_depth_and_ltx25_refuses_it_by_name() {
+        assert!(trainer_descriptor().techniques.depth_anchoring);
+        assert!(!trainer_descriptor_25().techniques.depth_anchoring);
+        let mut req = TrainingRequest {
+            items: vec![TrainingItem::captioned(
+                PathBuf::from("image.png"),
+                "caption".into(),
+            )],
+            config: TrainingConfig::default(),
+            output_dir: PathBuf::from("out"),
+            file_name: "ltx.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        req.config.depth_anchoring.schedule = schedule();
+        req.config.depth_anchoring.model_dir = Some("/m/da2".into());
+        req.config.perceptual_decoder_dir = Some("/m/taehv".into());
+        match validate_ltx25_training_request(&req) {
+            Err(CandleError::Unsupported(m)) => assert!(m.contains("LTX-2.3 still-image"), "{m}"),
+            other => panic!("expected a typed Unsupported, got {other:?}"),
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = TrainingConfig::default();
+        c.depth_anchoring.schedule = schedule();
+        c.perceptual_decoder_dir = Some(tmp.path().join("no-taehv"));
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let err = load_perceptual_path(&c, &Device::Cpu)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("TAELTX2.3"), "{err}");
     }
 }

@@ -12,6 +12,9 @@ build = "build.rs"
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
+# The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
+# through TAELTX2.3, the LTX-2.3 VAE's tiny decoder).
+candle-gen-perceptual = { path = "../candle-gen-perceptual" }
 # sc-18770: the candle twin of `mlx-gen-ltx → mlx-llm`. LTX-2.5's text encoder is a Gemma 4 unified
 # decoder, which lives in `candle-llm` alongside every other decoder architecture rather than being
 # duplicated inside a media crate. Only `gemma4_te.rs` uses it; LTX-2.3's Gemma 3 path (`gemma.rs`)
@@ -41,8 +44,8 @@ image = { workspace = true }
 default = []
 # The LLM crate's backend features must move in lock-step with candle-gen's, or the Gemma 4 decoder
 # would be built for a different device than the rest of the pipeline.
-metal = ["candle-gen/metal", "candle-llm/metal"]
-cuda = ["candle-gen/cuda", "candle-llm/cuda"]
+metal = ["candle-gen/metal", "candle-llm/metal", "candle-gen-perceptual/metal"]
+cuda = ["candle-gen/cuda", "candle-llm/cuda", "candle-gen-perceptual/cuda"]
 # Deliberately absent from every runtime bundle/catalog. This enables only the sc-18777 terminal
 # evidence controller and its trusted nvidia-smi sampler; it is not a production admission bypass.
 terminal-quant-measurement = ["candle-gen/testkit"]
@@ -53,6 +56,8 @@ path = "examples/ltx25-quant-measure.rs"
 required-features = ["terminal-quant-measurement"]
 
 [dev-dependencies]
+# Tiny random-init Depth-Anything-V2 for the depth-anchoring step tests (sc-24830).
+candle-gen-depth = { path = "../candle-gen-depth" }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

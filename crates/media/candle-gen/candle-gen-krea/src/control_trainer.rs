@@ -74,6 +74,9 @@ pub fn control_trainer_descriptor() -> TrainerDescriptor {
         // rather than silently ignored or applied to non-adapter weights (E3/E5).
         // sc-2127 (epic 2123): multi-resolution buckets — the target AND control image are each
         // encoded once per bucket edge, and the trainer walks them through a `BucketSchedule`.
+        // sc-24830 (epic 2123): no depth anchoring — the ControlNet-branch loss path does not carry
+        // the decoded-x0 perceptual loss (it trains full branch weights, not an adapter), so the
+        // shared floor refuses a depth request rather than silently ignoring it.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             ..gen_core::train::TrainingTechniques::NONE
@@ -400,5 +403,42 @@ mod tests {
         bad(&|r| r.items.clear());
         bad(&|r| r.config.control_type = None);
         bad(&|r| r.items = vec![TrainingItem::captioned("/img.png".into(), "x".into())]);
+    }
+
+    /// sc-24830: the control trainer does not declare depth anchoring, and the shared floor refuses
+    /// a depth request from `validate` AND `train` (typed `Unsupported`, before any load). Mutation:
+    /// declare `depth_anchoring: true` ⇒ red.
+    #[test]
+    fn control_trainer_refuses_depth_anchoring() {
+        assert!(!control_trainer_descriptor().techniques.depth_anchoring);
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let mut t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(KREA_2_CONTROL_ID, &spec)
+            .unwrap();
+        let mut req = TrainingRequest {
+            items: vec![TrainingItem::with_control(
+                "/img.png".into(),
+                "x".into(),
+                "/pose.png".into(),
+            )],
+            config: TrainingConfig {
+                control_type: Some("pose".into()),
+                ..Default::default()
+            },
+            output_dir: "/out".into(),
+            file_name: "a.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        req.config.depth_anchoring.schedule.weight = 0.1;
+        req.config.depth_anchoring.model_dir = Some("/m/da2".into());
+        req.config.perceptual_decoder_dir = Some("/m/taehv".into());
+        for result in [t.validate(&req).err(), t.train(&req, &mut |_| {}).err()] {
+            match result {
+                Some(gen_core::Error::Unsupported(m)) => assert!(m.contains("depth"), "{m}"),
+                other => panic!("expected a typed Unsupported, got {other:?}"),
+            }
+        }
     }
 }
