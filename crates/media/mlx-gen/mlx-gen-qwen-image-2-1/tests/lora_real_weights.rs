@@ -116,6 +116,8 @@ const RENDER_EDGE: u32 = 768;
 const RENDER_STEPS: u32 = 8;
 const SEED: u64 = 24163;
 const TRAIN_EDGE: u32 = 512;
+/// Edit-only native targets match 768 evaluation; T2I and evaluation key remain 512.
+const EDIT_TRAIN_EDGE: u32 = edit_training_balanced64::EDGE;
 /// Learning rate of both training runs: the product presets' rate for every Qwen-Image 2.1 target
 /// (`qwen_image_2_1_lora.*` / `qwen_image_2_1_edit_lora.*` balanced = 1e-4). The first real-weight
 /// run (inference run 37122808826) trained the T2I LoRA at 1e-3 and DIVERGED within five AdamW
@@ -190,6 +192,19 @@ fn training_steps(var: &str, default: u32) -> u32 {
         "{var}: a probe requires 1–3 steps"
     );
     steps
+}
+
+#[test]
+fn edit_native768_training_keeps_t2i_and_evaluation_key_at512() {
+    assert_eq!(TRAIN_EDGE, 512);
+    assert_eq!(EDIT_TRAIN_EDGE, 768);
+    assert_eq!(RENDER_EDGE, 768);
+    let key = edit_key(TRAIN_EDGE);
+    assert_eq!(key.dimensions(), (512, 512));
+    assert_eq!(
+        format!("{:x}", Sha256::digest(key.as_raw())),
+        "9daf9ba30effd6474517bbe3be68b131e0a417bccecb9d21bfd5b6658d4408e8"
+    );
 }
 
 #[test]
@@ -1335,14 +1350,14 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
     let mut raw_rgb_audits = Vec::new();
     let items: Vec<TrainingItem> = (0..edit_training_balanced64::ITEMS)
         .map(|i| {
-            let src = image::RgbImage::from_fn(TRAIN_EDGE, TRAIN_EDGE, |x, y| {
-                image::Rgb(edit_training_balanced64::training_pixel(i, x, y, TRAIN_EDGE))
+            let src = image::RgbImage::from_fn(EDIT_TRAIN_EDGE, EDIT_TRAIN_EDGE, |x, y| {
+                image::Rgb(edit_training_balanced64::training_pixel(i, x, y, EDIT_TRAIN_EDGE))
             });
             let target = edit_transform(&src);
             let audit = edit_training_balanced64::audit(i, src.as_raw(), target.as_raw());
             raw_rgb_audits.push(json!({"index":i,"sourceRawRgbSha256":audit.source_sha256,
-                "targetRawRgbSha256":audit.target_sha256,"targetColours":64,"pixelsPerTargetColour":4096,
-                "distinctSourceBytesPerChannel":256,"pixelsPerSourceBytePerChannel":1024}));
+                "targetRawRgbSha256":audit.target_sha256,"targetColours":64,"pixelsPerTargetColour":9216,
+                "distinctSourceBytesPerChannel":256,"sourcePixelsPerValueByChannel":audit.source_channel_counts}));
             let src_path = data.join(format!("src_{i}.png"));
             let tgt_path = data.join(format!("tgt_{i}.png"));
             src.save(&src_path).unwrap();
@@ -1359,7 +1374,7 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
             learning_rate: TRAIN_LR,
             steps,
             gradient_checkpointing: true,
-            resolution: TRAIN_EDGE,
+            resolution: EDIT_TRAIN_EDGE,
             save_every: 0,
             seed: 42,
             optimizer: "adamw".into(),
@@ -1397,15 +1412,23 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
         "kind": "representative_one_reference_training_two_reference_evaluation",
         "trainingReferenceCount": 1, "evaluationReferenceCount": 2,
         "trainingCaption": TRAIN_EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
-        "trainingTargetEdge": TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
-        "evaluationTargetEdge": RENDER_EDGE, "stepsRequested": steps,
+        "trainingTargetEdge": EDIT_TRAIN_EDGE, "trainingReferenceNativeEdge": EDIT_TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
+        "evaluationTargetEdge": RENDER_EDGE, "evaluationKeyNativeEdge": TRAIN_EDGE, "stepsRequested": steps,
         "dataset": dataset_receipt(&req.items), "evaluationKeySha256": sha256_file(&key_path),
         "trainingDataRecipe": {"version":edit_training_balanced64::VERSION,"frozenPlanSha256":edit_training_balanced64::PLAN_SHA256,
             "rawRgbAudits":raw_rgb_audits,"heldoutSource99UsedForTraining":false,
             "itemExposuresAt120RoundRobinSteps":20,"targetAuthority":"unchanged edit_transform(source)",
-            "scopeLimit":"colour coverage does not remove512/768, one/two reference or denseBF16/packedQ4 gaps"},
+            "nativeCoordinateMap":"floor(2*x/3), floor(2*y/3) into the fixed logical512 layouts; physical mapping is not bijective",
+            "sourceDistribution":"red/green each2304; blue items0/1 2048..2560 and items2..5 1536..3072 pixels/value; all256values covered",
+            "referencePreprocessing":"native768 source is independently Lanczos RGBA fitted to1024 for both vision/VAE; actual fitted content differs from the historical512 source",
+            "scopeLimit":"matching target768 geometry does not remove training-texture/heldout-content, one/two reference or denseBF16/packedQ4 gaps; Q4 cause remains unproven"},
         "historicalTwoReferenceTrainingEvidence": "retained only at its original source SHA",
     });
+    assert_eq!(
+        protocol["dataset"]["sha256"].as_str().unwrap(),
+        edit_training_balanced64::DATASET_PNG_SHA256,
+        "native768 training PNG dataset must match the frozen CPU receipt before admission"
+    );
     // Persist the disclosed protocol before admission, so even an explicit refusal is attributable.
     write_json(&out, "edit-training-protocol", &protocol);
     let mut trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
