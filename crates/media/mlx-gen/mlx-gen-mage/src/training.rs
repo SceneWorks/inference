@@ -63,6 +63,10 @@ use mlx_gen::train::lora::{
     build_lora_targets, LoraParams, TrainAdapter,
 };
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
+use mlx_gen::train::perceptual::{
+    combine_step_loss, AuxAlternation, AuxModelFootprint, Parameterization, PerceptualPath,
+    StepPlan, X0Decoder,
+};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::weights::Weights;
@@ -201,6 +205,9 @@ pub struct MageFlowTrainer {
     /// encoder and VAE are shared co-requisites staged from elsewhere, so re-deriving it from the
     /// snapshot root would read the wrong (or a nonexistent) checkpoint.
     transformer_dir: PathBuf,
+    /// The **resolved** VAE directory (a co-requisite under the split-tier mirror). Depth anchoring's
+    /// full-decoder fallback ([`MageX0Decoder`]) loads its f32 decoder from here (sc-24830).
+    vae_dir: PathBuf,
 }
 
 fn trainer_descriptor() -> TrainerDescriptor {
@@ -225,12 +232,135 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // sc-24828 (epic 2123): honors `subject_mask_loss` on BOTH loss paths (LoRA/LoKr and the full
         // base fine-tune); each (item, bucket) entry's weight is laid out in the same
         // `[1, grid·grid, 128]` token order as that entry's latent.
+        // sc-24830 (epic 2123): depth anchoring on the LoRA/LoKr path through the shared
+        // perceptual builder. Mage-VAE has no tiny decoder, so x0 decodes through the full Mage-VAE
+        // decoder (gradient-checkpointed, [`MageX0Decoder`]); the full base fine-tune refuses it.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
+            depth_anchoring: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
+}
+
+/// The full Mage-VAE decoder as the perceptual path's x0 decoder (epic 2123 E8, sc-24830): Mage's
+/// 128-channel / 16× latent space has no tiny decoder, so the shared path falls back to the real
+/// one-step decoder. The decode runs inside an MLX gradient checkpoint, so its activations are not
+/// retained between the forward and the backward (the backward recomputes the decode once); its
+/// weights are captured constants (frozen). Output: NHWC pixels in `[0, 1]` (the decoder's raw
+/// `[-1, 1]` RGB mapped and clamped).
+pub struct MageX0Decoder {
+    vae: MageVae,
+}
+
+impl MageX0Decoder {
+    /// Wrap a loaded Mage-VAE (its decoder half is used).
+    pub fn new(vae: MageVae) -> Self {
+        Self { vae }
+    }
+}
+
+impl X0Decoder for MageX0Decoder {
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        let vae = &self.vae;
+        let mut ckpt =
+            mlx_rs::transforms::checkpoint(move |xs: &[Array]| -> MlxResult<Vec<Array>> {
+                let rgb = vae
+                    .decode(&xs[0])
+                    .map_err(|e| Exception::custom(e.to_string()))?
+                    .as_dtype(Dtype::Float32)?;
+                let unit = mlx_rs::ops::multiply(
+                    &mlx_rs::ops::add(&rgb, Array::from_f32(1.0))?,
+                    Array::from_f32(0.5),
+                )?;
+                let unit =
+                    mlx_rs::ops::clip(&unit, (&Array::from_f32(0.0), &Array::from_f32(1.0)))?;
+                Ok(vec![unit.transpose_axes(&[0, 2, 3, 1])?])
+            });
+        let out = ckpt(std::slice::from_ref(latents))?;
+        Ok(out.into_iter().next().expect("one output"))
+    }
+}
+
+/// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from the trainer's own resolved
+/// VAE directory only when an enabled loss decodes pixels. Mage has no separately cataloged x0
+/// decoder: `TrainingConfig::perceptual_decoder_dir` (which the shared floor requires) names the
+/// base snapshot and is not read here — the split-tier mirror can stage the VAE elsewhere, and the
+/// trainer already resolved where.
+struct MageDecoderSpec {
+    vae_dir: PathBuf,
+}
+
+impl mlx_gen_perceptual::CustomDecoder for MageDecoderSpec {
+    fn name(&self) -> &'static str {
+        "Mage-VAE decoder"
+    }
+
+    /// Conservative pre-load figures from Mage's measured inference decode curve
+    /// ([`crate::memory::vae_peak_gb`], decimal GB, bf16): f32 weights at twice the measured fixed
+    /// term, and a training working set of 3× the f32 decode peak (the checkpointed backward
+    /// recomputes the decode and holds its cotangents). Not a measured training value.
+    fn footprint(&self, h: u32, w: u32) -> AuxModelFootprint {
+        let gb = |v: f64| (v * 1e9) as u64;
+        AuxModelFootprint {
+            param_bytes: gb(2.0 * crate::memory::VAE_FIXED_GB),
+            working_set_bytes: gb(3.0 * 2.0 * crate::memory::vae_peak_gb(w, h)),
+            reference_bytes_per_image: 0,
+        }
+    }
+
+    fn load(&self, _dir: Option<&Path>) -> Result<Box<dyn X0Decoder>> {
+        Ok(Box::new(MageX0Decoder::new(crate::vae::load(
+            &self.vae_dir,
+            VaePart::Decode,
+            Dtype::Float32,
+        )?)))
+    }
+}
+
+/// Mage's latent family for the shared aux-loss builder (epic 2123 E8).
+fn aux_loss_context(vae_dir: &Path) -> mlx_gen_perceptual::AuxLossContext<'static> {
+    mlx_gen_perceptual::AuxLossContext {
+        label: "mage_flow_base trainer",
+        decoder: mlx_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
+            vae_dir: vae_dir.to_path_buf(),
+        })),
+        latent_lpips: None,
+    }
+}
+
+/// Extra training memory (decimal GB, the unit of [`crate::memory`]) the enabled aux losses add at
+/// the largest bucket `edge` over `entries` cached (item, bucket) references (epic 2123 E7). `0`
+/// when none is enabled.
+fn perceptual_footprint_gb(cfg: &TrainingConfig, edge: u32, entries: usize) -> f64 {
+    mlx_gen_perceptual::perceptual_footprint(
+        cfg,
+        &mlx_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
+            vae_dir: PathBuf::new(),
+        })),
+        mlx_gen_perceptual::AuxGeometry::image(edge, entries),
+    ) as f64
+        / 1e9
+}
+
+/// Refuse a run whose auxiliary training models do not fit (epic 2123 E7): the dense base's
+/// measured resident peak ([`crate::memory::generation_resident_gb`], a lower bound for training)
+/// plus `extra_gb` against `safe_gb` (the live safe budget in production — injected for tests).
+/// Consulted only when an aux loss is enabled, so a plain run's admission is unchanged.
+fn preflight_aux_memory(extra_gb: f64, safe_gb: f64) -> Result<()> {
+    let projected = crate::memory::generation_resident_gb(None) + extra_gb;
+    if !safe_gb.is_finite() || safe_gb <= 0.0 || projected > safe_gb {
+        return Err(format!(
+            "mage_flow_base trainer: the perceptual-loss models (~{extra_gb:.1} GB for the \
+             Mage-VAE decoder and Depth-Anything-V2) on top of the ~{base:.1} GB base need \
+             ~{projected:.1} GB, exceeding this machine's ~{safe_gb:.1} GB safe budget. Use a smaller \
+             depth model or a lower training resolution.",
+            base = crate::memory::generation_resident_gb(None)
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Construct the trainer from a diffusers snapshot directory (`text_encoder/ transformer/ vae/`). No
@@ -275,6 +405,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         descriptor: trainer_descriptor(),
         text_encoder: Some(crate::text_encoder::load_dir(&dirs.text_encoder)?),
         vae: crate::vae::load(&dirs.vae, VaePart::Both, Dtype::Bfloat16)?,
+        vae_dir: dirs.vae.clone(),
         transformer: Some(MageTransformer::load(&dirs.transformer)?),
         // The full base fine-tune path (sc-14056) re-reads this exact checkpoint to seed its f32
         // master weights, so keep the RESOLVED directory rather than re-deriving `root/transformer`
@@ -384,6 +515,19 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// The perceptual aux losses train through the LoRA/LoKr step only; the full base fine-tune path has
+/// no aux seam, so the combination is a typed refusal (never silently ignored).
+fn refuse_aux_losses_on_full_finetune(req: &TrainingRequest) -> gen_core::Result<()> {
+    if req.config.full_finetune && mlx_gen_perceptual::any_aux_loss(&req.config) {
+        return Err(gen_core::Error::Unsupported(
+            "mage_flow_base trainer: depth anchoring / perceptual aux losses train a LoRA/LoKr \
+             adapter only; they cannot be combined with a full base fine-tune"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Trainer for MageFlowTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
@@ -403,6 +547,7 @@ impl Trainer for MageFlowTrainer {
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
+        refuse_aux_losses_on_full_finetune(req)?;
         // `lora_target_modules` only scopes the LoRA/LoKr adapter; a full base fine-tune trains every
         // DiT weight, so the target-resolution guard below does not apply to it.
         if !req.config.full_finetune {
@@ -428,6 +573,7 @@ impl Trainer for MageFlowTrainer {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        refuse_aux_losses_on_full_finetune(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -481,10 +627,24 @@ impl MageFlowTrainer {
             return self.train_full_impl(req, &edges, preview_edge, compute_dtype, on_progress);
         }
 
+        // Epic 2123 E7: the auxiliary perceptual models count against the budget before anything
+        // heavy runs (one cached reference per (item, bucket) entry, sized at the largest edge).
+        let aux_gb = perceptual_footprint_gb(cfg, preview_edge, req.items.len() * edges.len());
+        if aux_gb > 0.0 {
+            preflight_aux_memory(aux_gb, crate::memory::production_safe_budget_gb()?)?;
+        }
+        // Epic 2123 E8: the shared builder loads the decoder + enabled losses before caching, so a
+        // missing checkpoint fails fast; `None` (nothing loaded) when no aux loss is enabled.
+        let mut perceptual =
+            mlx_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context(&self.vae_dir))?;
+
         self.transformer_mut()?.cast_weights(compute_dtype)?;
 
         // --- prepare → cache: VAE-latents + prompt-embeds into memory before the loop ---
         let (cache, sample_caps) = self.prepare_caches(req, &edges, on_progress)?;
+        if let Some(path) = perceptual.as_mut() {
+            prepare_perceptual_references(path, &cache)?;
+        }
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let target_paths = resolve_target_paths(self.transformer_ref()?, cfg);
@@ -551,6 +711,16 @@ impl MageFlowTrainer {
         // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: per-image, per-update alternation keyed on the real dataset item; a resumed
+        // run replays the skipped prefix so the phase matches.
+        let mut alternation = perceptual
+            .as_ref()
+            .map(|_| AuxAlternation::new(cache.len() / edges.len(), accum));
+        if let Some(alt) = alternation.as_mut() {
+            for step in 1..=start_step {
+                alt.key(step, schedule.sample((step - 1) as usize).0);
+            }
+        }
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -558,35 +728,21 @@ impl MageFlowTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[step_cache_index(&schedule, step)];
-            let sigma = sample_sigma(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            )?;
-            let noise = random::normal::<f32>(
-                sample.latent_tokens.shape(),
-                None,
-                None,
-                Some(&random::key(
-                    cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                )?),
-            )?;
-            let (loss, grads) = compute_loss_grads(
+            let (losses, grads) = run_train_step(
                 self.transformer.as_mut().ok_or_else(|| {
                     mlx_gen::Error::Msg("mage_flow_base trainer: DiT was freed".into())
                 })?,
                 &params,
                 &adapter,
-                alpha,
-                rank,
-                sample,
-                sigma,
-                &noise,
+                cfg,
+                &cache,
+                &schedule,
+                perceptual.as_mut().zip(alternation.as_mut()),
+                step,
                 mae,
                 compute_dtype,
             )?;
-            last_loss = loss;
+            last_loss = losses.total;
             steps_run = step;
             accumulate_grads(&mut accumulated, grads)?;
 
@@ -1277,6 +1433,117 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
 /// single training sample, run the DiT training forward, regress the velocity toward `noise − x0`,
 /// return `(loss, grads)`.
 #[allow(clippy::too_many_arguments)]
+/// The per-step loss breakdown [`compute_loss_grads`] returns (epic 2123 E8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepLosses {
+    /// The differentiated step loss.
+    total: f32,
+    /// The diffusion (velocity) term; `None` on an aux-only step (it contributed zero).
+    diffusion: Option<f32>,
+    /// The weighted aux term; `None` when no aux loss contributed.
+    aux: Option<f32>,
+}
+
+/// One aux step's view of the trainer's [`PerceptualPath`].
+struct AuxStep<'a> {
+    path: &'a PerceptualPath,
+    plan: &'a StepPlan,
+    /// The (item, bucket) cache entry — selects the cached reference.
+    entry: usize,
+}
+
+/// Mage latent tokens `[1, g·g, C]` → the decoder's NCHW grid `[1, C, g, g]` (inverse of
+/// [`latent_grid_to_tokens`]).
+fn tokens_to_latent_grid(tokens: &Array, grid: i32) -> Result<Array> {
+    let channels = tokens.shape()[2];
+    Ok(tokens
+        .reshape(&[1, grid, grid, channels])?
+        .transpose_axes(&[0, 3, 1, 2])?)
+}
+
+/// Every cache entry's perceptual reference, once per job (keyed per (item, bucket) entry).
+fn prepare_perceptual_references(path: &mut PerceptualPath, cache: &[CachedSample]) -> Result<()> {
+    for (i, sample) in cache.iter().enumerate() {
+        path.ensure_reference(
+            i,
+            &tokens_to_latent_grid(&sample.latent_tokens, sample.grid)?,
+        )?;
+    }
+    Ok(())
+}
+
+/// One LoRA/LoKr micro-step on the 1-based `step`: the step's (item, bucket) entry from the bucket
+/// schedule, its seeded σ + noise (exactly as before epic 2123), the perceptual plan when a path is
+/// configured (alternation keyed on the real item; an aux-only step trains at σ remapped into the
+/// loss window), then [`compute_loss_grads`]. With no path the step is bit-identical to before.
+#[allow(clippy::too_many_arguments)]
+fn run_train_step(
+    transformer: &mut MageTransformer,
+    params: &LoraParams,
+    adapter: &TrainAdapter,
+    cfg: &TrainingConfig,
+    cache: &[CachedSample],
+    schedule: &BucketSchedule,
+    perceptual: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+    step: u32,
+    mae: bool,
+    dtype: Dtype,
+) -> Result<(StepLosses, LoraParams)> {
+    let k = (step - 1) as usize;
+    let (item, _bucket) = schedule.sample(k);
+    let entry = step_cache_index(schedule, step);
+    let sample = &cache[entry];
+    let mut sigma = sample_sigma(
+        &cfg.timestep_type,
+        &cfg.timestep_bias,
+        cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
+    )?;
+    let noise = random::normal::<f32>(
+        sample.latent_tokens.shape(),
+        None,
+        None,
+        Some(&random::key(
+            cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
+        )?),
+    )?;
+    let plan;
+    let aux = match perceptual {
+        Some((path, alternation)) => {
+            path.ensure_reference(
+                entry,
+                &tokens_to_latent_grid(&sample.latent_tokens, sample.grid)?,
+            )?;
+            plan = path.plan(alternation.key(step, item), entry, sigma)?;
+            sigma = plan.noise_level;
+            let path: &PerceptualPath = path;
+            Some(AuxStep {
+                path,
+                plan: &plan,
+                entry,
+            })
+        }
+        None => None,
+    };
+    compute_loss_grads(
+        transformer,
+        params,
+        adapter,
+        cfg.alpha,
+        cfg.rank as f32,
+        sample,
+        sigma,
+        &noise,
+        mae,
+        dtype,
+        aux,
+    )
+}
+
+/// One forward+backward over the adapter factors. `aux` (epic 2123 E8) carries the step's plan: on
+/// an aux-only step the diffusion term is not computed and the loss is the weighted aux term on the
+/// x0 estimate `x_t − σ·v` (Mage regresses `noise − x0`); with `aux = None` the traced graph is the
+/// pre-epic-2123 one.
+#[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     transformer: &mut MageTransformer,
     params: &LoraParams,
@@ -1288,7 +1555,8 @@ fn compute_loss_grads(
     noise: &Array,
     mae: bool,
     dtype: Dtype,
-) -> Result<(f32, LoraParams)> {
+    aux: Option<AuxStep<'_>>,
+) -> Result<(StepLosses, LoraParams)> {
     let (x_t, target, _timestep) = build_batch(&sample.latent_tokens, noise, sigma)?;
     // One packed segment: this sample's own latent grid (its bucket) + its caption tokens.
     let ctx = transformer.pack_context(sample_layout(sample)?)?;
@@ -1296,6 +1564,11 @@ fn compute_loss_grads(
     let txt = sample.txt.clone();
     let mask_weight = sample.mask_weight.clone();
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
+    let (diffusion_on, aux_on) = match &aux {
+        Some(a) => (a.plan.diffusion, !a.plan.aux.is_empty()),
+        None => (true, false),
+    };
+    let grid = sample.grid;
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
         // NEVER check the cancel flag inside this traced grad closure — it returns `MlxResult`, so an
         // early-out would be stringified through `Exception::custom` and lose the typed `Canceled`.
@@ -1304,15 +1577,43 @@ fn compute_loss_grads(
         let v = transformer
             .forward_train(&x_t, &txt, &sigma_arr, &ctx)
             .map_err(|e| Exception::custom(e.to_string()))?;
-        let diff = subtract(&v, &target)?;
-        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
-        // requires a scalar cotangent). The v(bf16 on the bf16 path) − target(f32) subtract promotes
-        // to f32, so the loss/grads are f32 (master weights).
-        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
+        let diffusion = if diffusion_on {
+            let diff = subtract(&v, &target)?;
+            // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+            // requires a scalar cotangent). The v(bf16 on the bf16 path) − target(f32) subtract
+            // promotes to f32, so the loss/grads are f32 (master weights).
+            Some(reduce_loss(&diff, mask_weight.as_ref(), mae)?)
+        } else {
+            None
+        };
+        let aux_term = match &aux {
+            Some(a) if aux_on => {
+                let x0_hat = Parameterization::FlowNoiseMinusX0 { sigma }
+                    .recover_x0(&x_t.as_dtype(Dtype::Float32)?, &v.as_dtype(Dtype::Float32)?)
+                    .and_then(|x| tokens_to_latent_grid(&x, grid))
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                a.path
+                    .aux_loss(a.plan, a.entry, &x0_hat)
+                    .map_err(|e| Exception::custom(e.to_string()))?
+                    .map(|t| t.weighted)
+            }
+            _ => None,
+        };
+        let zero = || Array::from_f32(0.0);
+        let d_out = diffusion.clone().unwrap_or_else(zero);
+        let a_out = aux_term.clone().unwrap_or_else(zero);
+        let total =
+            combine_step_loss(diffusion, aux_term).map_err(|e| Exception::custom(e.to_string()))?;
+        Ok(vec![total, d_out, a_out])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
-    Ok((val[0].item::<f32>(), grads))
+    let losses = StepLosses {
+        total: val[0].item::<f32>(),
+        diffusion: diffusion_on.then(|| val[1].item::<f32>()),
+        aux: aux_on.then(|| val[2].item::<f32>()),
+    };
+    Ok((losses, grads))
 }
 
 /// Render one preview image from the in-progress adapter (already installed on `transformer`): a
@@ -1613,8 +1914,10 @@ mod tests {
                 &noise,
                 false,
                 Dtype::Bfloat16,
+                None,
             )
             .unwrap();
+            let loss = loss.total;
             losses.push(loss);
             opt.step(&mut params, &grads).unwrap();
             eval(params.values()).unwrap();
@@ -1811,10 +2114,11 @@ mod tests {
                 &noise,
                 false,
                 Dtype::Float32,
+                None,
             )
             .unwrap();
             eval(gr.values()).unwrap();
-            (l, gr)
+            (l.total, gr)
         });
 
         // Full fine-tune path (every DiT weight a master param).
@@ -2345,5 +2649,429 @@ mod tests {
             max_abs > 0.0 && max_abs.is_finite(),
             "a full fine-tune must move the DiT: reloaded velocity == base (max_abs {max_abs})"
         );
+    }
+}
+
+/// sc-24830 (epic 2123 depth anchoring) — the Mage LoRA step seam on the committed tiny fixtures:
+/// the 2-block `mage_flow_small` DiT, a random-init tiny TAESD-shaped decoder + tiny DA2 (the
+/// builder's `testing::tiny_depth_path`) for the step tests, and the tiny committed Mage-VAE for the
+/// full-decoder fallback. Seconds, a few MB; no weights downloaded.
+#[cfg(test)]
+mod depth_anchoring_tests {
+    use super::*;
+    use mlx_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
+
+    fn fixture_model() -> (MageTransformer, MageFlowConfig) {
+        let fx = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mage_flow_small.safetensors"
+        ))
+        .unwrap();
+        let mut model_w = Weights::empty();
+        for key in fx.keys().map(str::to_string).collect::<Vec<_>>() {
+            if let Some(rest) = key.strip_prefix("model.") {
+                model_w.insert(
+                    rest,
+                    fx.require(&key).unwrap().as_dtype(Dtype::Float32).unwrap(),
+                );
+            }
+        }
+        let c = fx
+            .require("config")
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()
+            .to_vec();
+        let dit_cfg = MageFlowConfig {
+            in_channels: c[0],
+            out_channels: c[1],
+            context_in_dim: c[2],
+            hidden_size: c[3],
+            num_heads: c[4],
+            depth: c[5] as usize,
+            patch_size: c[6],
+            axes_dim: c[7..10].to_vec(),
+            checkpoint: false,
+        };
+        (
+            MageTransformer::from_weights(&model_w, dit_cfg.clone()).unwrap(),
+            dit_cfg,
+        )
+    }
+
+    fn schedule() -> AuxLossSchedule {
+        AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        }
+    }
+
+    fn cfg() -> TrainingConfig {
+        let mut cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            train_dtype: "f32".into(),
+            ..Default::default()
+        };
+        cfg.depth_anchoring.schedule = schedule();
+        cfg
+    }
+
+    /// `n` cached samples at grid 4 (64×64 decoded by the 16×… tiny decoder upsamples 8×, so 32×32).
+    fn cache_n(dit: &MageFlowConfig, n: u64) -> Vec<CachedSample> {
+        (0..n)
+            .map(|i| {
+                let g = 4;
+                let latent = random::normal::<f32>(
+                    &[1, dit.in_channels, g, g],
+                    None,
+                    None,
+                    Some(&random::key(100 + i).unwrap()),
+                )
+                .unwrap();
+                let txt = random::normal::<f32>(
+                    &[1, 3, dit.context_in_dim],
+                    None,
+                    None,
+                    Some(&random::key(200 + i).unwrap()),
+                )
+                .unwrap();
+                let latent_tokens = latent_grid_to_tokens(&latent, g).unwrap();
+                eval([&latent_tokens, &txt]).unwrap();
+                CachedSample {
+                    latent_tokens,
+                    txt,
+                    txt_tokens: 3,
+                    grid: g,
+                    mask_weight: None,
+                }
+            })
+            .collect()
+    }
+
+    fn single_bucket(n: usize) -> BucketSchedule {
+        BucketSchedule::new(
+            n,
+            &[gen_core::train::ResolutionBucket {
+                resolution: 64,
+                repeats: 1,
+            }],
+            7,
+        )
+    }
+
+    fn adapter(dit: &mut MageTransformer, cfg: &TrainingConfig) -> (TrainAdapter, LoraParams) {
+        let paths = resolve_target_paths(dit, cfg);
+        assert!(!paths.is_empty());
+        let (targets, params) = build_lora_targets(dit, &paths, cfg.rank as i32, cfg.seed).unwrap();
+        (TrainAdapter::Lora { targets }, params)
+    }
+
+    fn prepared(cache: &[CachedSample], channels: i32) -> (PerceptualPath, AuxAlternation) {
+        let mut p = mlx_gen_perceptual::testing::tiny_depth_path(channels, schedule()).unwrap();
+        prepare_perceptual_references(&mut p, cache).unwrap();
+        (p, AuxAlternation::new(cache.len(), 1))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        dit: &mut MageTransformer,
+        params: &LoraParams,
+        adapter: &TrainAdapter,
+        cfg: &TrainingConfig,
+        cache: &[CachedSample],
+        path: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+        n: u32,
+    ) -> (StepLosses, LoraParams) {
+        let (l, g) = run_train_step(
+            dit,
+            params,
+            adapter,
+            cfg,
+            cache,
+            &single_bucket(cache.len()),
+            path,
+            n,
+            false,
+            Dtype::Float32,
+        )
+        .unwrap();
+        eval(g.values()).unwrap();
+        (l, g)
+    }
+
+    fn abs_sum(g: &LoraParams, filter: &str) -> f32 {
+        let picked: Vec<f32> = g
+            .iter()
+            .filter(|(k, _)| k.ends_with(filter))
+            .map(|(_, v)| v.abs().unwrap().sum(None).unwrap().item::<f32>())
+            .collect();
+        assert!(!picked.is_empty(), "no '{filter}' grads");
+        picked.iter().sum()
+    }
+
+    /// AC1: a depth step has no diffusion term, its total IS the weighted depth term, and the LoRA
+    /// B factors get a nonzero gradient; a diffusion step carries no depth term. Mutation: force
+    /// `diffusion_on = true` in `compute_loss_grads` ⇒ red.
+    #[test]
+    fn depth_step_trains_the_lora_through_depth_only() {
+        let (mut dit, dcfg) = fixture_model();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(&dcfg, 1);
+        let (mut p, mut alt) = prepared(&cache, dcfg.in_channels);
+        let (diff, _) = step(
+            &mut dit,
+            &params,
+            &adapter,
+            &cfg,
+            &cache,
+            Some((&mut p, &mut alt)),
+            1,
+        );
+        assert_eq!(diff.aux, None);
+        assert_eq!(Some(diff.total), diff.diffusion);
+        let (depth, g) = step(
+            &mut dit,
+            &params,
+            &adapter,
+            &cfg,
+            &cache,
+            Some((&mut p, &mut alt)),
+            2,
+        );
+        assert_eq!(
+            depth.diffusion, None,
+            "depth step computes no diffusion loss"
+        );
+        let aux = depth.aux.expect("depth term");
+        assert!(aux > 0.0 && aux.is_finite(), "depth term {aux}");
+        assert_eq!(depth.total, aux);
+        let gb = abs_sum(&g, ".lora_b");
+        assert!(gb > 0.0 && gb.is_finite(), "LoRA-B grad |Σ| = {gb}");
+    }
+
+    /// Alternation keys on the real item and references are built once per entry. Mutations: key
+    /// the plan on the global step ⇒ with 2 round-robin items each item is locked to one kind ⇒
+    /// red; drop the `contains_key` early return in `ensure_reference` ⇒ counter grows ⇒ red.
+    #[test]
+    fn every_item_alternates_and_references_are_built_once() {
+        let (mut dit, dcfg) = fixture_model();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(&dcfg, 2);
+        let (mut p, mut alt) = prepared(&cache, dcfg.in_channels);
+        let mut kinds = vec![Vec::new(), Vec::new()];
+        for n in 1..=8u32 {
+            let (l, _) = step(
+                &mut dit,
+                &params,
+                &adapter,
+                &cfg,
+                &cache,
+                Some((&mut p, &mut alt)),
+                n,
+            );
+            kinds[((n - 1) % 2) as usize].push(l.aux.is_some());
+        }
+        for k in &kinds {
+            assert_eq!(k, &vec![false, true, false, true], "{kinds:?}");
+        }
+        assert_eq!(p.reference_computations(), cache.len());
+    }
+
+    /// E1: with no aux loss nothing is built and the step is bit-identical to the pre-epic-2123
+    /// LoRA step (its loss closure reproduced verbatim). Mutation: perturb the off-path diffusion
+    /// graph (scale `diff` by 1.0001 before `reduce_loss`) ⇒ red.
+    #[test]
+    fn everything_off_is_bit_identical_to_the_legacy_step() {
+        assert!(mlx_gen_perceptual::build_perceptual_path(
+            &TrainingConfig::default(),
+            &aux_loss_context(Path::new("/nonexistent"))
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            perceptual_footprint_gb(&TrainingConfig::default(), 1024, 10),
+            0.0
+        );
+        let (mut dit, dcfg) = fixture_model();
+        let cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(&dcfg, 1);
+        let (off, g_off) = step(&mut dit, &params, &adapter, &cfg, &cache, None, 1);
+        assert_eq!(off.aux, None);
+
+        let sample = &cache[0];
+        let sigma = sample_sigma(
+            &cfg.timestep_type,
+            &cfg.timestep_bias,
+            cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),
+        )
+        .unwrap();
+        let noise = random::normal::<f32>(
+            sample.latent_tokens.shape(),
+            None,
+            None,
+            Some(&random::key(cfg.seed.wrapping_add(1).wrapping_mul(2) + 1).unwrap()),
+        )
+        .unwrap();
+        let (x_t, target, _) = build_batch(&sample.latent_tokens, &noise, sigma).unwrap();
+        let ctx = dit.pack_context(sample_layout(sample).unwrap()).unwrap();
+        let sigma_arr = Array::from_slice(&[sigma], &[1]);
+        let txt = sample.txt.clone();
+        let dit_ref = &mut dit;
+        let adapter_ref = &adapter;
+        let legacy = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+            adapter_ref.install_as(dit_ref, &p, 4.0, 4.0, None, LOKR_DTYPE)?;
+            let v = dit_ref
+                .forward_train(&x_t, &txt, &sigma_arr, &ctx)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            Ok(vec![reduce_loss(&subtract(&v, &target)?, None, false)?])
+        };
+        let (val, g_legacy) = keyed_value_and_grad(legacy)(params.clone(), 0).unwrap();
+        eval(g_legacy.values()).unwrap();
+        assert_eq!(off.total, val[0].item::<f32>());
+        let bits =
+            |a: &Array| -> Vec<u32> { a.as_slice::<f32>().iter().map(|x| x.to_bits()).collect() };
+        for (k, v) in &g_legacy {
+            assert_eq!(bits(v), bits(&g_off[k]), "{k}");
+        }
+    }
+
+    /// E7: depth grows the estimate by the decoder + DA2 (more for Large), and the guard refuses at
+    /// a synthetic budget between base and base + aux (never the host's). Mutation: drop
+    /// `+ extra_gb` in `preflight_aux_memory` ⇒ red.
+    #[test]
+    fn memory_estimate_includes_the_aux_models() {
+        let mut on = TrainingConfig::default();
+        on.depth_anchoring.schedule = schedule();
+        let small = perceptual_footprint_gb(&on, 1024, 10);
+        on.depth_anchoring.model_size = DepthModelSize::Large;
+        let large = perceptual_footprint_gb(&on, 1024, 10);
+        assert!(
+            small > 0.0 && large - small > 1.0,
+            "small {small}, large {large}"
+        );
+        let base = crate::memory::generation_resident_gb(None);
+        let between = base + large / 2.0;
+        assert!(preflight_aux_memory(0.0, between).is_ok());
+        assert!(preflight_aux_memory(large, between).is_err());
+        assert!(preflight_aux_memory(large, (base + large) * 2.0).is_ok());
+    }
+
+    /// E3: declared; the full base fine-tune refuses it (typed); a missing decoder dir is named.
+    #[test]
+    fn descriptor_and_refusals() {
+        assert!(trainer_descriptor().techniques.depth_anchoring);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut req = TrainingRequest {
+            items: vec![mlx_gen::TrainingItem::captioned("a.png".into(), "c".into())],
+            config: cfg(),
+            output_dir: tmp.path().to_path_buf(),
+            file_name: "x.safetensors".into(),
+            trigger_words: vec![],
+            cancel: mlx_gen::CancelFlag::new(),
+        };
+        assert!(refuse_aux_losses_on_full_finetune(&req).is_ok());
+        req.config.full_finetune = true;
+        assert!(matches!(
+            refuse_aux_losses_on_full_finetune(&req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        let mut c = cfg();
+        c.perceptual_decoder_dir = Some(tmp.path().join("no-vae"));
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let e = mlx_gen_perceptual::build_perceptual_path(
+            &c,
+            &aux_loss_context(&tmp.path().join("no-vae")),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("Mage-VAE decoder"), "{e}");
+    }
+
+    fn tiny_vae() -> MageVae {
+        let w = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mage_vae_tiny.safetensors"
+        ))
+        .unwrap();
+        let v: Vec<i32> = w
+            .require("fixture.shape")
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()
+            .to_vec();
+        let shape = crate::vae::denoiser::MageVaeShape {
+            patch: v[0],
+            hidden: v[1],
+            hidden_x: v[2],
+            in_channels: v[3],
+            bottleneck: v[4],
+            num_cond_blocks: v[5] as usize,
+            num_mlp_blocks: v[6] as usize,
+            max_freqs: v[7] as usize,
+            attn_tile: v[8],
+        };
+        MageVae::from_weights_with_shape(&w, Dtype::Float32, true, shape, "pipeline").unwrap()
+    }
+
+    /// The full-decoder fallback: the checkpointed Mage-VAE decode equals the plain decode mapped
+    /// to NHWC `[0, 1]`, and is differentiable in the latent. Mutations: drop the `(x+1)/2` map ⇒
+    /// values differ ⇒ red; `stop_gradient` the decode input ⇒ zero gradient ⇒ red.
+    #[test]
+    fn mage_vae_fallback_decoder_matches_the_plain_decode_and_flows_gradient() {
+        let vae = tiny_vae();
+        let bottleneck = vae.shape().bottleneck;
+        let z = random::normal::<f32>(
+            &[1, bottleneck, 2, 2],
+            None,
+            None,
+            Some(&random::key(9).unwrap()),
+        )
+        .unwrap();
+        let plain = vae.decode(&z).unwrap();
+        let expect = mlx_rs::ops::clip(
+            mlx_rs::ops::multiply(
+                mlx_rs::ops::add(&plain, Array::from_f32(1.0)).unwrap(),
+                Array::from_f32(0.5),
+            )
+            .unwrap(),
+            (&Array::from_f32(0.0), &Array::from_f32(1.0)),
+        )
+        .unwrap()
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
+        let dec = MageX0Decoder::new(vae);
+        let got = X0Decoder::decode(&dec, &z).unwrap();
+        assert_eq!(got.shape(), expect.shape());
+        let d = subtract(&got, &expect)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(d < 1e-6, "{d}");
+        let f = |x: &Array| -> MlxResult<Array> {
+            X0Decoder::decode(&dec, x)
+                .map_err(|e| Exception::custom(e.to_string()))?
+                .sum(None)
+        };
+        let g = mlx_rs::transforms::grad(f)(&z).unwrap();
+        let mag = g.abs().unwrap().sum(None).unwrap().item::<f32>();
+        assert!(mag > 0.0 && mag.is_finite(), "latent gradient {mag}");
     }
 }

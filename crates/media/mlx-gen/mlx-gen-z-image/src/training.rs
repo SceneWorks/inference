@@ -786,7 +786,7 @@ fn aux_loss_context() -> mlx_gen_perceptual::AuxLossContext<'static> {
 fn taef1_decoder() -> mlx_gen_perceptual::DecoderSpec {
     mlx_gen_perceptual::DecoderSpec::Tiny {
         name: "TAEF1",
-        config: TinyDecoderConfig::taef1(),
+        config: TinyDecoderConfig::taef1().into(),
     }
 }
 

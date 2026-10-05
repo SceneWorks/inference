@@ -31,7 +31,7 @@ use candle_gen::train::perceptual::{
     perceptual_footprint_bytes, AuxLoss, AuxModelFootprint, PerceptualInput, PerceptualPath,
     X0Decoder,
 };
-use candle_gen::train::tae::{TinyDecoder, TinyDecoderConfig};
+use candle_gen::train::tae::{TinyDecoder, TinyDecoderSpec};
 use candle_gen::{CandleError, Result};
 
 /// A decoder a trainer supplies itself (a video tiny decoder run per frame, or a full-VAE
@@ -53,7 +53,9 @@ pub enum DecoderSpec {
     Tiny {
         /// Display name for errors (e.g. `"TAEF1"`).
         name: &'static str,
-        config: TinyDecoderConfig,
+        /// The decoder structure (`TinyDecoderConfig::taef1().into()`, `TinyDecoderSpec::taef2()`,
+        /// …).
+        config: TinyDecoderSpec,
     },
     /// A trainer-built decoder.
     Custom(Box<dyn CustomDecoder>),
@@ -474,6 +476,7 @@ mod tests {
     use candle_gen::candle_core::Tensor;
     use candle_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
     use candle_gen::train::perceptual::{reference_as, LossReference, PerceptualLoss};
+    use candle_gen::train::tae::TinyDecoderConfig;
     use std::any::Any;
 
     fn on() -> TrainingConfig {
@@ -490,7 +493,7 @@ mod tests {
     fn taef1() -> DecoderSpec {
         DecoderSpec::Tiny {
             name: "TAEF1",
-            config: TinyDecoderConfig::taef1(),
+            config: TinyDecoderConfig::taef1().into(),
         }
     }
 
@@ -590,7 +593,7 @@ mod tests {
             label: "t",
             decoder: DecoderSpec::Tiny {
                 name: "TINY",
-                config: cfg4,
+                config: cfg4.into(),
             },
             latent_lpips: None,
             device: &dev,
