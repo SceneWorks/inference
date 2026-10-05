@@ -45,6 +45,25 @@ def protocol_errors(source):
                      'case["paletteDistanceGain"].as_f64().unwrap() >= PALETTE_DISTANCE_GAIN_FLOOR']:
         if fragment not in diagnostic:
             errors.append(fragment)
+    compact = ''.join(diagnostic.split()).replace(',)', ')')
+    for fragment in ['assert!(!control_path.exists(),', 'drop(guard);',
+                     '"MEMORY_SAMPLER_FAILED.txt"', '"physical-watchdog-abort.json"',
+                     'let (final_host, final_census) = host_census()',
+                     'style_protocol::validate_retired_samples(&samples, decode(&final_sample), started_unix_millis)',
+                     '"safetyChecksComplete": true', '"foregroundRetired": true', '"samplerJoined": true',
+                     '"donorSha256": style_protocol::DONOR_SHA256',
+                     '"sampleTraceSha256": sha256_file(&trace_path)', '"sampleCount": samples.len()',
+                     '("movement", "meanAbsDiff", ADAPTER_MOVES_FLOOR)',
+                     '("palette_gain", "paletteDistanceGain", PALETTE_DISTANCE_GAIN_FLOOR)',
+                     'actual.is_finite()', '.create_new(true)', '.open(control_path)', 'control_file.sync_all()']:
+        if ''.join(fragment.split()) not in compact:
+            errors.append(fragment)
+    if diagnostic.find('drop(guard);') > diagnostic.find('validate_retired_samples'):
+        errors.append('sampler audit must follow join')
+    if diagnostic.find('.open(control_path)') < diagnostic.find('validate_retired_samples'):
+        errors.append('no early continuation marker')
+    if diagnostic.find('.open(control_path)') < diagnostic.find('assert_sane(label, adapted)'):
+        errors.append('all six safety checks precede marker')
     if 'train(' in diagnostic or 'TrainingRequest' in diagnostic:
         errors.append("diagnostic must never train")
     if diagnostic.index('"style-direction"') > diagnostic.index('assert_sane(label, base)'):
@@ -66,6 +85,15 @@ class StyleProtocolTests(unittest.TestCase):
     def test_original_donor_pairs_and_diagnostic_keep_guards(self):
         self.assertEqual(protocol_errors(SOURCE.read_text(encoding="utf8")), [])
 
+    def test_marker_cannot_precede_join_or_safety_audit(self):
+        source = SOURCE.read_text(encoding="utf8")
+        marker_start = source.index('    let mut control_file =')
+        marker_end = source.index('    for ((label, _, _), case)', marker_start)
+        marker = source[marker_start:marker_end]
+        without_marker = source[:marker_start] + source[marker_end:]
+        early = without_marker.replace('    drop(guard);', marker + '    drop(guard);', 1)
+        self.assertIn('no early continuation marker', protocol_errors(early))
+
     def test_wrong_pair_provenance_and_weakened_oracles_are_rejected(self):
         source = SOURCE.read_text(encoding="utf8")
         mutations = [
@@ -82,10 +110,19 @@ class StyleProtocolTests(unittest.TestCase):
             ('case["paletteDistanceGain"].as_f64().unwrap() >= PALETTE_DISTANCE_GAIN_FLOOR', 'case["meanAbsDiff"].as_f64().unwrap() >= ADAPTER_MOVES_FLOOR'),
             ('assert_sane(label, adapted)', '// no sanity check'),
             ('let guard = Footprint::start(&out)', 'let guard = unguarded()'),
+            ('drop(guard);', '// background is still running'),
+            ('.create_new(true)', '.create(true)'),
+            ('"safetyChecksComplete": true', '"safetyChecksComplete": false'),
+            ('"donorSha256": style_protocol::DONOR_SHA256', '"donorSha256": "wrong"'),
+            ('"sampleCount": samples.len()', '"sampleCount": 0'),
+            ('"renderCount": 6', '"renderCount": 4'),
+            ('style_protocol::validate_retired_samples(&samples, decode(&final_sample), started_unix_millis)', 'Ok::<(), &str>(())'),
+            ('actual.is_finite()', 'true'),
+            ('!control_path.exists(),', 'true || !control_path.exists(),'),
         ]
         for old, new in mutations:
             with self.subTest(mutation=old):
-                self.assertIn(old, source)
+                self.assertTrue(old in source, old)
                 self.assertTrue(protocol_errors(source.replace(old, new)))
 
 

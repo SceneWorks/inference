@@ -8,6 +8,42 @@ pub const TRAINING_SOURCE: &str = "6cca130b55939e1223261a82b9eeaea876a9ba6b";
 pub const TRAINING_RUN: u64 = 37127726908;
 pub const PALETTE: [[u8; 3]; 3] = [[0, 150, 150], [240, 120, 20], [250, 220, 60]];
 
+#[derive(Clone, Copy)]
+pub struct SafetySample {
+    pub unix_millis: u64,
+    pub physical: u64,
+    pub ceiling: u64,
+    pub pressure: u64,
+    pub available: u64,
+}
+
+/// A joined trace plus a fresh foreground census cannot certify stale or unsafe samples.
+pub fn validate_retired_samples(
+    samples: &[SafetySample],
+    final_sample: SafetySample,
+    started_unix_millis: u64,
+) -> Result<(), &'static str> {
+    if samples.is_empty() || started_unix_millis == 0 {
+        return Err("missing sampler history");
+    }
+    let mut previous = started_unix_millis;
+    for sample in samples.iter().chain(std::iter::once(&final_sample)) {
+        if sample.unix_millis < previous || sample.unix_millis == 0 {
+            return Err("stale or reversed sample history");
+        }
+        if sample.physical == 0
+            || sample.ceiling == 0
+            || sample.physical > sample.ceiling
+            || sample.pressure != 1
+            || sample.available == 0
+        {
+            return Err("unsafe or incomplete physical sample");
+        }
+        previous = sample.unix_millis;
+    }
+    Ok(())
+}
+
 pub fn uses_original_style_request(adapter: &str, mode: &str) -> bool {
     adapter == DONOR_NAME && mode == "t2i"
 }
@@ -35,6 +71,69 @@ pub fn palette_distance(pixels: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_requires_complete_current_safe_sampler_history() {
+        let sample = SafetySample {
+            unix_millis: 101,
+            physical: 10,
+            ceiling: 20,
+            pressure: 1,
+            available: 30,
+        };
+        let final_sample = SafetySample {
+            unix_millis: 102,
+            ..sample
+        };
+        assert!(validate_retired_samples(&[sample], final_sample, 100).is_ok());
+        assert!(validate_retired_samples(&[], final_sample, 100).is_err());
+        for invalid in [
+            SafetySample {
+                unix_millis: 99,
+                ..sample
+            },
+            SafetySample {
+                physical: 0,
+                ..sample
+            },
+            SafetySample {
+                physical: 21,
+                ..sample
+            },
+            SafetySample {
+                ceiling: 0,
+                ..sample
+            },
+            SafetySample {
+                pressure: 2,
+                ..sample
+            },
+            SafetySample {
+                available: 0,
+                ..sample
+            },
+        ] {
+            assert!(validate_retired_samples(&[invalid], final_sample, 100).is_err());
+        }
+        assert!(validate_retired_samples(
+            &[sample],
+            SafetySample {
+                unix_millis: 100,
+                ..final_sample
+            },
+            100
+        )
+        .is_err());
+        assert!(validate_retired_samples(
+            &[sample],
+            SafetySample {
+                pressure: 0,
+                ..final_sample
+            },
+            100
+        )
+        .is_err());
+    }
 
     #[test]
     fn immutable_completed_donor_identity_is_retained() {

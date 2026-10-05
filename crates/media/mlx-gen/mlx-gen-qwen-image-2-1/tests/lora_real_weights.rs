@@ -1887,6 +1887,15 @@ fn diagnostic_reused_t2i_style_direction() {
 
     let out = out_dir().join("style-protocol");
     std::fs::create_dir_all(&out).unwrap();
+    let control_path = out.join("stage-controls.json");
+    assert!(
+        !control_path.exists(),
+        "style diagnostics require a fresh owned output directory"
+    );
+    let started_unix_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let request = original_style_request();
     let provenance = json!({"trainingSource": style_protocol::TRAINING_SOURCE,
         "trainingRun": style_protocol::TRAINING_RUN, "trainingSteps": 1000,
@@ -1939,6 +1948,85 @@ fn diagnostic_reused_t2i_style_direction() {
         assert_sane(label, base);
         assert_sane(label, adapted);
         assert_overlay_not_underpredicted(label, &case["base"], &case["adapted"]);
+    }
+    // All generators have returned pixels, dropped and cleared their unused caches in render().
+    // Dropping this guard joins the physical sampler; a sampler panic/pressure breach aborts,
+    // so neither incomplete work nor a failed guard can leave a continuation marker.
+    let physical_ceiling = guard.ceiling.load(Ordering::Relaxed);
+    drop(guard);
+    for name in [
+        "MEMORY_SAMPLER_FAILED.txt",
+        "FOOTPRINT_CEILING_EXCEEDED.txt",
+        "physical-watchdog-abort.json",
+    ] {
+        assert!(
+            !out.join(name).exists(),
+            "no continuation after a safety failure"
+        );
+    }
+    verify_original_style_donor(entry, &file);
+    let trace_path = out.join("physical-allocator-samples.jsonl");
+    let trace = std::fs::read_to_string(&trace_path).unwrap();
+    let decode = |sample: &Value| style_protocol::SafetySample {
+        unix_millis: sample["unixMillis"].as_u64().unwrap(),
+        physical: sample["physFootprintBytes"].as_u64().unwrap(),
+        ceiling: sample["physicalCeilingBytes"].as_u64().unwrap(),
+        pressure: sample["pressureLevel"].as_u64().unwrap(),
+        available: sample["reclaimableBytes"].as_u64().unwrap(),
+    };
+    let samples: Vec<_> = trace
+        .lines()
+        .map(|line| decode(&serde_json::from_str::<Value>(line).unwrap()))
+        .collect();
+    let (final_host, final_census) = host_census();
+    let final_sample = json!({
+        "unixMillis": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+        "physFootprintBytes": final_host.baseline_physical, "physicalCeilingBytes": physical_ceiling,
+        "pressureLevel": final_host.pressure, "reclaimableBytes": final_host.available,
+    });
+    style_protocol::validate_retired_samples(&samples, decode(&final_sample), started_unix_millis)
+        .expect("all joined samples and final pressure census must be safe and current");
+    let mut direction_failures = Vec::new();
+    for case in &cases {
+        for (criterion, field, floor) in [
+            ("movement", "meanAbsDiff", ADAPTER_MOVES_FLOOR),
+            (
+                "palette_gain",
+                "paletteDistanceGain",
+                PALETTE_DISTANCE_GAIN_FLOOR,
+            ),
+        ] {
+            let actual = case[field].as_f64().unwrap();
+            assert!(
+                actual.is_finite(),
+                "nonfinite metrics cannot authorize continuation"
+            );
+            if actual < floor {
+                direction_failures.push(json!({"tier": case["tier"], "criterion": criterion,
+                    "actual": actual, "floor": floor}));
+            }
+        }
+    }
+    let controls = json!({"kind": "DIAGNOSTIC_ONLY", "purpose": "DIAGNOSTIC_ONLY", "acceptanceEvidence": false,
+        "sourceCandidate": source, "githubRunId": std::env::var("GITHUB_RUN_ID").ok(),
+        "donorSha256": style_protocol::DONOR_SHA256, "renderCount": 6,
+        "safetyChecksComplete": true, "foregroundRetired": true, "samplerJoined": true,
+        "startedUnixMillis": started_unix_millis, "sampleTrace": "physical-allocator-samples.jsonl",
+        "sampleTraceSha256": sha256_file(&trace_path), "sampleCount": samples.len(),
+        "finalSafetySample": final_sample, "finalHostCensus": final_census,
+        "directionFailures": direction_failures,
+        "stageResult": if direction_failures.is_empty() { "passed" } else { "direction_failed" }});
+    use std::io::Write;
+    let mut control_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(control_path)
+        .unwrap();
+    control_file
+        .write_all(&serde_json::to_vec_pretty(&controls).unwrap())
+        .unwrap();
+    control_file.sync_all().unwrap();
+    for ((label, _, _), case) in images.iter().zip(&cases) {
         assert!(case["meanAbsDiff"].as_f64().unwrap() >= ADAPTER_MOVES_FLOOR);
         assert!(
             case["paletteDistanceGain"].as_f64().unwrap() >= PALETTE_DISTANCE_GAIN_FLOOR,
