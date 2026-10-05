@@ -2533,6 +2533,8 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-boogu",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "mlx-gen-qwen-image",
  "mlx-gen-wan",
