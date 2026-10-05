@@ -23,12 +23,13 @@
 
 use std::path::Path;
 
+use mlx_gen::gen_core;
 use mlx_gen::gen_core::train::TrainingConfig;
 use mlx_gen::train::perceptual::{
     perceptual_footprint_bytes, AuxLoss, AuxModelFootprint, PerceptualInput, PerceptualPath,
     X0Decoder,
 };
-use mlx_gen::train::tae::{TinyDecoder, TinyDecoderConfig};
+use mlx_gen::train::tae::{TinyDecoder, TinyDecoderSpec};
 use mlx_gen::{Error, Result};
 
 /// A decoder a trainer supplies itself (a video tiny decoder run per frame, or a full-VAE
@@ -50,7 +51,9 @@ pub enum DecoderSpec {
     Tiny {
         /// Display name for errors (e.g. `"TAEF1"`).
         name: &'static str,
-        config: TinyDecoderConfig,
+        /// The decoder structure (`TinyDecoderConfig::taef1().into()`, `TinyDecoderSpec::taef2()`,
+        /// …).
+        config: TinyDecoderSpec,
     },
     /// A trainer-built decoder.
     Custom(Box<dyn CustomDecoder>),
@@ -81,6 +84,9 @@ pub struct AuxLossContext<'a> {
     pub label: &'a str,
     /// The family's x0 decoder.
     pub decoder: DecoderSpec,
+    /// The family's E-LatentLPIPS weight set (`None`: no E-LatentLPIPS weights for this latent
+    /// space).
+    pub latent_lpips: Option<gen_core::train::LatentLpipsFamily>,
 }
 
 /// The training geometry a footprint is sized for.
@@ -431,6 +437,7 @@ mod tests {
     use super::*;
     use mlx_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
     use mlx_gen::train::perceptual::{reference_as, LossReference, PerceptualLoss};
+    use mlx_gen::train::tae::TinyDecoderConfig;
     use mlx_rs::Array;
     use std::any::Any;
 
@@ -448,7 +455,7 @@ mod tests {
     fn taef1() -> DecoderSpec {
         DecoderSpec::Tiny {
             name: "TAEF1",
-            config: TinyDecoderConfig::taef1(),
+            config: TinyDecoderConfig::taef1().into(),
         }
     }
 
@@ -501,6 +508,7 @@ mod tests {
         let ctx = AuxLossContext {
             label: "t",
             decoder: taef1(),
+            latent_lpips: None,
         };
         let cfg = TrainingConfig::default();
         assert!(!any_aux_loss(&cfg));
@@ -540,6 +548,7 @@ mod tests {
         let none = AuxLossContext {
             label: "fam trainer",
             decoder: DecoderSpec::None,
+            latent_lpips: None,
         };
         let e = build_perceptual_path(&on(), &none)
             .err()
@@ -549,6 +558,7 @@ mod tests {
         let tiny = AuxLossContext {
             label: "fam trainer",
             decoder: taef1(),
+            latent_lpips: None,
         };
         let e = build_perceptual_path(&on(), &tiny)
             .err()
@@ -577,8 +587,9 @@ mod tests {
             label: "t",
             decoder: DecoderSpec::Tiny {
                 name: "TINY",
-                config: cfg4,
+                config: cfg4.into(),
             },
+            latent_lpips: None,
         };
         let e = build_perceptual_path(&c, &ctx).err().unwrap().to_string();
         assert!(e.contains("Depth-Anything-V2"), "{e}");
@@ -630,6 +641,7 @@ mod tests {
         let ctx = AuxLossContext {
             label: "t",
             decoder: DecoderSpec::None,
+            latent_lpips: None,
         };
         let cfg = TrainingConfig::default();
         let mut path = build_perceptual_path_with(&arms, &cfg, &ctx)
