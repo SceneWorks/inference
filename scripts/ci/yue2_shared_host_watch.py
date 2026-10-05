@@ -3,7 +3,8 @@
 
 This does not grant a physical lease. The in-job selected GPU1 census and owned process
 cleanup remain mandatory. The shared-gpu1 route observes concurrent foreign work and
-revokes only on owned identity or inventory failure; strict shared-host retains exclusivity.
+retains incomplete foreign inventory while the owned identity stays authenticated;
+strict shared-host retains exclusivity.
 """
 from __future__ import annotations
 
@@ -531,16 +532,26 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
                                     "source": getattr(error, "source", None),
                                     "pages": getattr(error, "pages", None)}, indent=2) + "\n",
                         encoding="utf-8")
-                    if (inventory_attempt == SHARED_GPU1_INVENTORY_ATTEMPTS or
-                            time.monotonic() >= deadline):
-                        raise
                     fresh = bind_owned_job(own_id, head, workflow, job_id, runner_name,
                                            runner_id, own_job_name=own_job_name)
-                    require(fresh["run"].get("created_at") == binding["run"].get("created_at") and
-                            fresh["job"].get("id") == binding["job_id"] and
-                            fresh["job"].get("started_at") == binding["start"],
+                    require(same_owned_binding(binding, fresh, job_id, runner_name, runner_id),
                             "owned identity drifted during inventory retry")
+                    if (inventory_attempt == SHARED_GPU1_INVENTORY_ATTEMPTS or
+                            time.monotonic() >= deadline):
+                        (output / f"incomplete-foreign-inventory-{index:04d}.json").write_text(
+                            json.dumps({"checked_at": datetime.now(timezone.utc).isoformat(),
+                                        "inventory_complete": False, "attempts": inventory_attempt,
+                                        "errorType": type(error).__name__, "error": str(error),
+                                        "owned_binding_authenticated": True,
+                                        "own_run": own_id, "own_job": job_id,
+                                        "own_head": head, "own_runner": runner_name,
+                                        "own_runner_id": runner_id, "own_start": binding["start"],
+                                        "physical_lease": False}, indent=2) + "\n", encoding="utf-8")
+                        break
                     time.sleep(min(1, max(0, deadline - time.monotonic())))
+            if data is None:
+                time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                continue  # Rejected aggregate pages never reach classification or a complete receipt.
             for transition_attempt in range(1, SHARED_GPU1_INVENTORY_ATTEMPTS + 1):
                 observed_job = next((job for job in data["jobs"].get(("SceneWorks/inference", own_id), [])
                                      if job.get("id") == job_id), None)

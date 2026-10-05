@@ -328,7 +328,7 @@ class SharedHostWatchTests(unittest.TestCase):
             self.assertEqual(retained["pages"], moving)
             self.assertTrue((output / "0001.json").is_file())
 
-    def test_shared_gpu1_retries_transport_but_persistent_incomplete_inventory_refuses(self):
+    def test_shared_gpu1_retries_transport_but_strict_inventory_still_refuses(self):
         data = own_snapshot()
         data["checked_at"] = "2026-10-04T20:02:00Z"
         direct = {**data["runs"][("SceneWorks/inference", 7)],
@@ -354,21 +354,133 @@ class SharedHostWatchTests(unittest.TestCase):
             with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
                  patch.object(watch, "owned_run", return_value=direct), \
                  patch.object(watch, "snapshot", side_effect=incomplete) as snapshots, \
-                 patch.object(watch.time, "sleep"), \
-                 patch.object(watch, "cancel_bound_run") as cancel:
-                with self.assertRaisesRegex(RuntimeError, "truncated paginated inventory"):
-                    watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
-                                60, 30, 70, "cuda-windows", 2313, mode="shared-gpu1")
-            self.assertEqual((auth.call_count, snapshots.call_count), (3, 3))
-            cancel.assert_called_once()
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
-                 patch.object(watch, "owned_run", return_value=direct), \
-                 patch.object(watch, "snapshot", side_effect=incomplete) as snapshots, \
                  patch.object(watch, "cancel_bound_run") as cancel:
                 with self.assertRaisesRegex(RuntimeError, "truncated paginated inventory"):
                     watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
                                 60, 30, 70, "cuda-windows", 2313, mode="shared-host")
+            auth.assert_called_once()
+            snapshots.assert_called_once()
+            cancel.assert_called_once()
+
+    def test_shared_gpu1_repeated_capture_count_failures_resume_then_terminal(self):
+        # The rejected CUDA37328223930 pages: queued total 1/rows 0 twice,
+        # then in_progress total 5/rows 4. Repeat the whole failed poll.
+        queued = [{"total_count": 1, "workflow_runs": []}]
+        active = [{"total_count": 5, "workflow_runs": [{"id": identifier} for identifier in
+                  (37331107079, 37331106553, 37331107017, 37331106936)]}]
+        errors = []
+        for status, pages in (("queued", queued), ("queued", queued), ("in_progress", active)):
+            with self.assertRaises(watch.InventorySnapshotError) as failure:
+                watch.complete_pages(pages, "workflow_runs", f"SceneWorks/SceneWorks:{status}")
+            errors.append(failure.exception)
+        data, direct, bound = transition_fixture()
+        terminal = {**direct, "status": "completed", "conclusion": "success"}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "watch"
+            with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
+                 patch.object(watch, "owned_run", side_effect=[direct, direct, direct, terminal]), \
+                 patch.object(watch, "snapshot", side_effect=errors * 2 + [data]) as snapshots, \
+                 patch.object(watch, "classify", wraps=watch.classify) as classify, \
+                 patch.object(watch.time, "sleep"), \
+                 patch.object(watch.subprocess, "run") as cancel:
+                watch.watch(7, SHA, "yue2-precision-proof.yml", output, 60, 30,
+                            70, "cuda-windows", 2313, mode="shared-gpu1")
+            self.assertEqual((auth.call_count, snapshots.call_count), (7, 7))
+            classify.assert_called_once_with(data, 7, SHA, "yue2-precision-proof.yml",
+                                            mode="shared-gpu1", own_job_name="cuda", owned_binding=bound)
+            cancel.assert_not_called()
+            for cycle in (1, 2):
+                receipt = json.loads((output / f"incomplete-foreign-inventory-{cycle:04d}.json").read_text(encoding="utf-8"))
+                self.assertFalse(receipt["inventory_complete"])
+                self.assertTrue(receipt["owned_binding_authenticated"])
+                self.assertFalse(receipt["physical_lease"])
+                self.assertEqual(receipt["attempts"], 3)
+                self.assertFalse((output / f"{cycle:04d}.json").exists())
+                for attempt, error in enumerate(errors, 1):
+                    retained = json.loads((output / f"inventory-attempt-{cycle:04d}-{attempt}.json").read_text(encoding="utf-8"))
+                    self.assertEqual((retained["source"], retained["pages"]), (error.source, error.pages))
+            self.assertTrue((output / "0003.json").exists())
+            self.assertTrue((output / "terminal.json").exists())
+            self.assertFalse((output / "refusal.txt").exists())
+
+    def test_shared_gpu1_exhausted_transport_inventory_keeps_direct_binding(self):
+        _, direct, bound = transition_fixture()
+        transport = subprocess.TimeoutExpired(["gh", "api"], 45)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "watch"
+            with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
+                 patch.object(watch, "owned_run", side_effect=[direct, {**direct, "status": "completed"}]), \
+                 patch.object(watch, "snapshot", side_effect=transport) as snapshots, \
+                 patch.object(watch.time, "sleep"), \
+                 patch.object(watch.subprocess, "run") as cancel:
+                watch.watch(7, SHA, "yue2-precision-proof.yml", output, 60, 30,
+                            70, "cuda-windows", 2313, mode="shared-gpu1")
+            self.assertEqual((auth.call_count, snapshots.call_count), (4, 3))
+            cancel.assert_not_called()
+            self.assertTrue((output / "incomplete-foreign-inventory-0001.json").exists())
+            self.assertFalse((output / "0001.json").exists())
+
+    def test_shared_gpu1_final_reauth_rejects_actual_immutable_job_drift(self):
+        _, direct, bound = transition_fixture()
+        incomplete = watch.InventorySnapshotError("truncated paginated inventory", "queued", [])
+        for key, value in (("head_sha", "b" * 40), ("id", 71), ("runner_id", 2619),
+                           ("runner_name", "cuda-windows-2"), ("started_at", "changed")):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                job_reads = 0
+                def direct_api(path, **kwargs):
+                    nonlocal job_reads
+                    if path.endswith("/jobs/70"):
+                        job_reads += 1
+                        return {**bound["job"], **({key: value} if job_reads == 4 else {})}
+                    self.assertTrue(path.endswith("/runs/7"))
+                    return direct
+                output = Path(directory) / "watch"
+                with patch.object(watch, "api", side_effect=direct_api), \
+                     patch.object(watch, "snapshot", side_effect=incomplete) as snapshots, \
+                     patch.object(watch.time, "sleep"), \
+                     patch.object(watch.subprocess, "run") as cancel:
+                    with self.assertRaisesRegex(RuntimeError, "identity"):
+                        watch.watch(7, SHA, "yue2-precision-proof.yml", output, 60, 30,
+                                    70, "cuda-windows", 2313, mode="shared-gpu1")
+                self.assertEqual((job_reads, snapshots.call_count), (4, 3))
+                cancel.assert_not_called()  # Existing positive drift revokes cancellation authority.
+                self.assertTrue((output / "refusal.txt").exists())
+                self.assertFalse((output / "incomplete-foreign-inventory-0001.json").exists())
+
+    def test_shared_gpu1_final_reauth_unavailable_cancels_only_cached_owned_run(self):
+        _, direct, bound = transition_fixture()
+        incomplete = watch.InventorySnapshotError("truncated paginated inventory", "queued", [])
+        for unavailable in (watch.OwnedBindingUnavailable("owned binding unavailable"),
+                            subprocess.TimeoutExpired(["gh", "api"], 45)):
+            with self.subTest(error=type(unavailable).__name__), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "watch"
+                with patch.object(watch, "bind_owned_job", side_effect=[bound, bound, bound, unavailable]), \
+                     patch.object(watch, "owned_run", return_value=direct), \
+                     patch.object(watch, "api", side_effect=lambda path: bound["job"] if path.endswith("/jobs/70") else direct), \
+                     patch.object(watch, "snapshot", side_effect=incomplete), \
+                     patch.object(watch.time, "sleep"), \
+                     patch.object(watch.subprocess, "run") as cancel:
+                    with self.assertRaises(type(unavailable)):
+                        watch.watch(7, SHA, "yue2-precision-proof.yml", output, 60, 30,
+                                    70, "cuda-windows", 2313, mode="shared-gpu1")
+                cancel.assert_called_once_with(["gh", "run", "cancel", "7", "-R", "SceneWorks/inference"],
+                                               check=True, timeout=30)
+                self.assertFalse((output / "incomplete-foreign-inventory-0001.json").exists())
+
+    def test_gpu0_inventory_failure_still_refuses_without_retry(self):
+        _, direct, bound = transition_fixture()
+        bound = {**bound, "job": {**bound["job"], "runner_name": "cuda-windows-2", "runner_id": 2619}}
+        incomplete = watch.InventorySnapshotError("truncated paginated inventory", "queued", [])
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
+                 patch.object(watch, "owned_run", return_value=direct), \
+                 patch.object(watch, "api", return_value={}), \
+                 patch.object(gpu1, "source"), \
+                 patch.object(watch, "snapshot", side_effect=incomplete) as snapshots, \
+                 patch.object(watch, "cancel_bound_run") as cancel:
+                with self.assertRaisesRegex(RuntimeError, "truncated paginated inventory"):
+                    watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
+                                60, 30, 70, "cuda-windows-2", 2619, mode="gpu0-with-reviewed-gpu1")
             auth.assert_called_once()
             snapshots.assert_called_once()
             cancel.assert_called_once()
