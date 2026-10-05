@@ -574,10 +574,9 @@ impl VaeAnchorLoss {
 
     /// The per-job reference cache directory, once the first reference has been spilled.
     pub fn spill_dir(&self) -> Option<PathBuf> {
-        self.spill
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|d| d.path.clone()))
+        crate::sync::lock_recover(&self.spill)
+            .as_ref()
+            .map(|d| d.path.clone())
     }
 
     /// Load the FLUX.2 VAE encoder from a diffusers `vae/` directory onto `device`.
@@ -618,10 +617,7 @@ impl PerceptualLoss for VaeAnchorLoss {
             .enumerate()
             .map(|(i, t)| (format!("tap{i}"), t))
             .collect();
-        let mut spill = self
-            .spill
-            .lock()
-            .map_err(|_| CandleError::Msg("VAE anchor: reference cache lock poisoned".into()))?;
+        let mut spill = crate::sync::lock_recover(&self.spill);
         if spill.is_none() {
             *spill = Some(SpillDir::create(&self.spill_root)?);
         }
@@ -894,11 +890,11 @@ mod tests {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let loss = VaeAnchorLoss::with_spill_root(encoder(32), &root);
             loss.reference(&x).unwrap();
-            *seen.lock().unwrap() = loss.spill_dir();
+            *crate::sync::lock_recover(&seen) = loss.spill_dir();
             panic!("job failed");
         }));
         assert!(r.is_err());
-        let dir = seen.lock().unwrap().clone().unwrap();
+        let dir = crate::sync::lock_recover(&seen).clone().unwrap();
         assert!(!dir.exists(), "removed on error");
     }
 
