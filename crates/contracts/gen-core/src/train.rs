@@ -1088,8 +1088,16 @@ fn validate_body_losses(desc: &TrainerDescriptor, req: &TrainingRequest) -> crat
     let body = &req.config.body_losses;
     body.validate(desc.id).map_err(crate::Error::Msg)?;
     let losses = [
-        ("body proportion loss", &body.proportion, desc.techniques.body_proportion_loss),
-        ("body shape loss", &body.shape, desc.techniques.body_shape_loss),
+        (
+            "body proportion loss",
+            &body.proportion,
+            desc.techniques.body_proportion_loss,
+        ),
+        (
+            "body shape loss",
+            &body.shape,
+            desc.techniques.body_shape_loss,
+        ),
         ("normal loss", &body.normal, desc.techniques.normal_loss),
     ];
     for (name, schedule, declared) in losses {
@@ -1804,9 +1812,21 @@ mod tests {
         type Pick = fn(&mut TrainingRequest);
         type Flag = fn(&mut TrainingTechniques);
         let cases: [(&str, Pick, Flag); 3] = [
-            ("proportion", |r| r.config.body_losses.proportion.weight = 0.1, |t| t.body_proportion_loss = true),
-            ("shape", |r| r.config.body_losses.shape.weight = 0.1, |t| t.body_shape_loss = true),
-            ("normal", |r| r.config.body_losses.normal.weight = 0.1, |t| t.normal_loss = true),
+            (
+                "proportion",
+                |r| r.config.body_losses.proportion.weight = 0.1,
+                |t| t.body_proportion_loss = true,
+            ),
+            (
+                "shape",
+                |r| r.config.body_losses.shape.weight = 0.1,
+                |t| t.body_shape_loss = true,
+            ),
+            (
+                "normal",
+                |r| r.config.body_losses.normal.weight = 0.1,
+                |t| t.normal_loss = true,
+            ),
         ];
         for (name, enable, declare) in cases {
             let mut on = off.clone();
@@ -1820,18 +1840,27 @@ mod tests {
                 }
             }
             let err = validate_training_techniques(&others, &on).unwrap_err();
-            assert!(matches!(err, crate::Error::Unsupported(ref m) if m.contains(name)), "{name}: {err:?}");
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m) if m.contains(name)),
+                "{name}: {err:?}"
+            );
             let mut desc = trainer_desc(false);
             declare(&mut desc.techniques);
             validate_training_techniques(&desc, &on).unwrap_or_else(|e| panic!("{name}: {e}"));
             let mut no_pose = on.clone();
             no_pose.config.body_losses.pose_model_dir = None;
             let err = validate_training_techniques(&desc, &no_pose).unwrap_err();
-            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("ViTPose")), "{err:?}");
+            assert!(
+                matches!(err, crate::Error::Msg(ref m) if m.contains("ViTPose")),
+                "{err:?}"
+            );
             let mut no_dec = on.clone();
             no_dec.config.perceptual_decoder_dir = None;
             let err = validate_training_techniques(&desc, &no_dec).unwrap_err();
-            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")), "{err:?}");
+            assert!(
+                matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")),
+                "{err:?}"
+            );
         }
         let mut shape = off.clone();
         shape.config.body_losses.shape.weight = 0.1;
@@ -1840,7 +1869,10 @@ mod tests {
         let mut d = trainer_desc(false);
         d.techniques.body_shape_loss = true;
         let err = validate_training_techniques(&d, &shape).unwrap_err();
-        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("HybrIK")), "{err:?}");
+        assert!(
+            matches!(err, crate::Error::Msg(ref m) if m.contains("HybrIK")),
+            "{err:?}"
+        );
         let mut normal = off.clone();
         normal.config.body_losses.normal.weight = 0.1;
         full(&mut normal);
@@ -1848,17 +1880,26 @@ mod tests {
         let mut d = trainer_desc(false);
         d.techniques.normal_loss = true;
         let err = validate_training_techniques(&d, &normal).unwrap_err();
-        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("subject mask")), "{err:?}");
+        assert!(
+            matches!(err, crate::Error::Msg(ref m) if m.contains("subject mask")),
+            "{err:?}"
+        );
         normal.items[0].subject_mask_path = Some(PathBuf::from("a.mask.png"));
         assert!(validate_training_techniques(&d, &normal).is_ok());
         normal.config.body_losses.normal_model_dir = None;
         let err = validate_training_techniques(&d, &normal).unwrap_err();
-        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("Sapiens")), "{err:?}");
+        assert!(
+            matches!(err, crate::Error::Msg(ref m) if m.contains("Sapiens")),
+            "{err:?}"
+        );
         // A malformed knob is a Msg regardless of support.
         let mut bad = off.clone();
         bad.config.body_losses.shape_min_cos = f32::NAN;
         let err = validate_training_techniques(&trainer_desc(false), &bad).unwrap_err();
-        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("shape_min_cos")), "{err:?}");
+        assert!(
+            matches!(err, crate::Error::Msg(ref m) if m.contains("shape_min_cos")),
+            "{err:?}"
+        );
     }
 
     #[test]

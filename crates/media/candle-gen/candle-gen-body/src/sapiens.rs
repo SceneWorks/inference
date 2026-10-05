@@ -176,9 +176,9 @@ impl SapiensNormal {
         Ok((lb, ay, ax))
     }
 
-    /// The differentiable training entry: NHWC `[1, H, W, 3]` → letterbox → [`forward`]
-    /// (Self::forward) → bilinear resample to `normal_size²` → L2-normalized (`+ 1e-5`) normals NHWC
-    /// `[1, S, S, 3]`.
+    /// The differentiable training entry: NHWC `[1, H, W, 3]` → letterbox →
+    /// [`forward`](Self::forward) → bilinear resample to `normal_size²` → L2-normalized (`+ 1e-5`)
+    /// normals NHWC `[1, S, S, 3]`.
     pub fn forward_pixels(&self, pixels: &Tensor) -> Result<Tensor> {
         let (_, h, w, _) = pixels.dims4()?;
         let dev = pixels.device();

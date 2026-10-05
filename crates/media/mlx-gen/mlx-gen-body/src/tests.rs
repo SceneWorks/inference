@@ -349,7 +349,7 @@ fn lora_grad(path: &mut PerceptualPath, mask: Option<&Array>) -> Option<f32> {
     let plan = path.plan(0, 0, 0.5).unwrap();
     path.aux_loss(&plan, 0, &x_clean).unwrap()?;
     // The live x0: the same latent nudged (as a noisy step's prediction would be).
-    let live = add(&clean, &normal(22, &[1, 4, 4, 3], 0.2)).unwrap();
+    let live = add(&clean, normal(22, &[1, 4, 4, 3], 0.2)).unwrap();
     let f = |b: &Array| -> mlx_rs::error::Result<Array> {
         let x0 = lora
             .x0(b, &live)
@@ -462,7 +462,7 @@ fn the_subject_restricted_normal_loss_needs_and_uses_the_mask() {
     let clean = tiny_decoder().decode(&latent()).unwrap();
     assert!(restricted.reference(&clean).is_err());
     let live = tiny_decoder()
-        .decode(&add(&latent(), &normal(5, &[1, 4, 4, 3], 0.5)).unwrap())
+        .decode(&add(latent(), normal(5, &[1, 4, 4, 3], 0.5)).unwrap())
         .unwrap();
     let r_masked = restricted
         .reference_with_mask(&clean, Some(&full_mask()))

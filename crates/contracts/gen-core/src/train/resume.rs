@@ -369,15 +369,26 @@ mod tests {
     fn body_losses_join_the_config_fingerprint_only_when_on() {
         let base_cfg = TrainingConfig::default();
         let base = training_config_fingerprint(&base_cfg);
-        assert!(!base.contains("body") && !base.contains("normal="), "{base}");
+        assert!(
+            !base.contains("body") && !base.contains("normal="),
+            "{base}"
+        );
         let mut on = base_cfg.clone();
         on.body_losses.proportion.weight = 0.1;
         let p = training_config_fingerprint(&on);
-        assert_eq!(p, format!("{base};body_proportion=0.1/0.0-1.0/2,head=false"));
+        assert_eq!(
+            p,
+            format!("{base};body_proportion=0.1/0.0-1.0/2,head=false")
+        );
         on.body_losses.shape.weight = 0.2;
         on.body_losses.normal.weight = 0.3;
         let all = training_config_fingerprint(&on);
-        assert!(all.ends_with(";body_shape=0.2/0.0-1.0/2,min_cos=0.2;normal=0.3/0.0-1.0/2,subject=false"), "{all}");
+        assert!(
+            all.ends_with(
+                ";body_shape=0.2/0.0-1.0/2,min_cos=0.2;normal=0.3/0.0-1.0/2,subject=false"
+            ),
+            "{all}"
+        );
         let mut moved = on.clone();
         moved.body_losses.normal.weight = 0.4;
         assert_ne!(training_config_fingerprint(&moved), all);

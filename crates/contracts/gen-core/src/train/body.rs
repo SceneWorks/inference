@@ -119,7 +119,12 @@ impl BodyLossesConfig {
 
     /// Ratios the proportion loss compares (8, or 10 with the head ratios).
     pub fn ratio_count(&self) -> usize {
-        NUM_BODY_RATIOS + if self.include_head { NUM_HEAD_RATIOS } else { 0 }
+        NUM_BODY_RATIOS
+            + if self.include_head {
+                NUM_HEAD_RATIOS
+            } else {
+                0
+            }
     }
 
     /// Reject malformed schedules or knobs (`label` prefixes the message).
@@ -385,9 +390,15 @@ pub fn keypoint_box(
     }
     let clamp = |v: f32, hi: usize| v.clamp(0.0, hi as f32);
     let x1 = clamp(pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min), in_w);
-    let x2 = clamp(pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max), in_w);
+    let x2 = clamp(
+        pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max),
+        in_w,
+    );
     let y1 = clamp(pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min), in_h);
-    let y2 = clamp(pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max), in_h);
+    let y2 = clamp(
+        pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max),
+        in_h,
+    );
     (x2 > x1 && y2 > y1).then_some([x1, y1, x2, y2])
 }
 
@@ -582,7 +593,11 @@ impl HybrikConfig {
 /// side `max(w, h) · 1.25` around the box centre, rounded and clamped to the frame. Returns
 /// half-open `(y0, y1, x0, x1)`; a degenerate crop falls back to the whole frame (upstream's
 /// `else: crop = pixels[i:i+1]`).
-pub fn hybrik_square_crop(bbox: [f32; 4], in_h: usize, in_w: usize) -> (usize, usize, usize, usize) {
+pub fn hybrik_square_crop(
+    bbox: [f32; 4],
+    in_h: usize,
+    in_w: usize,
+) -> (usize, usize, usize, usize) {
     let [x1, y1, x2, y2] = bbox.map(|v| v as f64);
     let (cx, cy) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
     let half = (x2 - x1).max(y2 - y1) * 1.25 / 2.0;
@@ -885,15 +900,24 @@ mod tests {
         assert!((wide.scale_y * 255.0 - 400.0 / 0.75 * 1.25).abs() < 1e-1);
         // The keypoint inverse lands the heatmap centre on the frame centre.
         let (x, y) = w.keypoint_to_input(0.0, 0.0);
-        assert!((x - 192.0).abs() < 1.0 && (y - 256.0).abs() < 1.0, "{x} {y}");
+        assert!(
+            (x - 192.0).abs() < 1.0 && (y - 256.0).abs() < 1.0,
+            "{x} {y}"
+        );
     }
 
     #[test]
     fn resampling_matrices_follow_torch() {
         // Downsample 4 → 2 (half-pixel centres): rows average pairs.
-        assert_eq!(resize_weights(4, 2, false), vec![0.5, 0.5, 0., 0., 0., 0., 0.5, 0.5]);
+        assert_eq!(
+            resize_weights(4, 2, false),
+            vec![0.5, 0.5, 0., 0., 0., 0., 0.5, 0.5]
+        );
         // Identity.
-        assert_eq!(resize_weights(3, 3, false), vec![1., 0., 0., 0., 1., 0., 0., 0., 1.]);
+        assert_eq!(
+            resize_weights(3, 3, false),
+            vec![1., 0., 0., 0., 1., 0., 0., 0., 1.]
+        );
         // grid_sample zeros padding: a tap left of 0 contributes nothing.
         let m = affine_sample_weights(3, 3, 1.0, -0.5);
         assert_eq!(&m[0..3], &[0.5, 0.0, 0.0]);
@@ -913,16 +937,28 @@ mod tests {
             hybrik_square_crop([40.0, 40.0, 60.0, 80.0], 100, 100),
             (35, 85, 25, 75)
         );
-        assert_eq!(hybrik_square_crop([5.0, 5.0, 5.0, 5.0], 10, 10), (0, 10, 0, 10));
+        assert_eq!(
+            hybrik_square_crop([5.0, 5.0, 5.0, 5.0], 10, 10),
+            (0, 10, 0, 10)
+        );
         // Ties round to even like Python's `round`: cy − half = 4.5 → 4 (Rust `round` gives 5).
         // Mutation: `round` instead of `round_ties_even` ⇒ red.
-        assert_eq!(hybrik_square_crop([5.0, 8.0, 22.0, 36.0], 40, 30), (4, 40, 0, 30));
+        assert_eq!(
+            hybrik_square_crop([5.0, 8.0, 22.0, 36.0], 40, 30),
+            (4, 40, 0, 30)
+        );
         let s = SapiensConfig::normal_0_3b();
         let lb = s.letterbox(1024, 1024);
-        assert_eq!((lb.target_h, lb.target_w, lb.new_h, lb.new_w), (512, 384, 384, 384));
+        assert_eq!(
+            (lb.target_h, lb.target_w, lb.new_h, lb.new_w),
+            (512, 384, 384, 384)
+        );
         assert_eq!((lb.pad_top, lb.pad_left), (64, 0));
         let land = s.letterbox(768, 1024);
-        assert_eq!((land.target_h, land.target_w, land.new_h, land.new_w), (384, 512, 384, 512));
+        assert_eq!(
+            (land.target_h, land.target_w, land.new_h, land.new_w),
+            (384, 512, 384, 512)
+        );
         let m = Letterbox::axis_weights(4, 2, 1, 2);
         assert_eq!(m, vec![0., 0., 1., 0., 0., 1., 0., 0.]);
     }
@@ -946,9 +982,18 @@ mod tests {
         cfg.normal.weight = 0.1;
         let f = body_loss_footprints(&cfg);
         assert_eq!(f.len(), 2);
-        assert_eq!(f[0].param_bytes, VitPoseConfig::plus_base().param_count() * 4);
-        assert_eq!(f[1].param_bytes, SapiensConfig::normal_0_3b().param_count() * 4);
-        assert!(f[1].working_set_bytes > 1 << 30, "Sapiens-0.3B backward is GB-scale");
+        assert_eq!(
+            f[0].param_bytes,
+            VitPoseConfig::plus_base().param_count() * 4
+        );
+        assert_eq!(
+            f[1].param_bytes,
+            SapiensConfig::normal_0_3b().param_count() * 4
+        );
+        assert!(
+            f[1].working_set_bytes > 1 << 30,
+            "Sapiens-0.3B backward is GB-scale"
+        );
         cfg.shape.weight = 0.1;
         assert_eq!(body_loss_footprints(&cfg).len(), 3);
     }
@@ -977,8 +1022,14 @@ mod tests {
             cfg.normal.weight = n as f32;
             assert_eq!(split(&cfg), total(&cfg), "{p}{sh}{n}");
         }
-        assert_eq!(body_arm_footprint(&cfg, BodyArm::Proportion), BodyModelFootprint::default());
-        assert!(body_arm_footprint(&cfg, BodyArm::Shape).param_bytes > VitPoseConfig::plus_base().param_count() * 4);
+        assert_eq!(
+            body_arm_footprint(&cfg, BodyArm::Proportion),
+            BodyModelFootprint::default()
+        );
+        assert!(
+            body_arm_footprint(&cfg, BodyArm::Shape).param_bytes
+                > VitPoseConfig::plus_base().param_count() * 4
+        );
     }
 
     #[test]

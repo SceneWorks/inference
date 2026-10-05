@@ -6,7 +6,7 @@
 //! (kernel = stride = 16, padding 2) → `+ pos[1:] + pos[:1]` (no CLS token) → pre-norm ViT layers
 //! whose MLP is ViTPose+'s mixture of experts (a shared `fc2` slice concatenated with the selected
 //! expert's slice) → final LayerNorm → the classic decoder (2 × ConvTranspose(4, 2, 1) + BatchNorm
-//! + ReLU → 1 × 1 conv) or the simple one (ReLU → ×4 bilinear → 3 × 3 conv) → COCO heatmaps.
+//! and ReLU → 1 × 1 conv) or the simple one (ReLU → ×4 bilinear → 3 × 3 conv) → COCO heatmaps.
 //! Weight keys are the HF checkpoint's own (`backbone.*`, `head.*`).
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};

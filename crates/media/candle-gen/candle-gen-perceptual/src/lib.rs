@@ -176,20 +176,20 @@ fn build_body_proportion(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Resu
     body_arm(
         ctx,
         b.proportion,
-        candle_gen_body::proportion_loss(b, &ctx.device),
+        candle_gen_body::proportion_loss(b, ctx.device),
     )
 }
 
 /// The body-shape arm's model (HybrIK + the shared ViTPose).
 fn build_body_shape(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
     let b = &cfg.body_losses;
-    body_arm(ctx, b.shape, candle_gen_body::shape_loss(b, &ctx.device))
+    body_arm(ctx, b.shape, candle_gen_body::shape_loss(b, ctx.device))
 }
 
 /// The normal arm's model (Sapiens + the shared ViTPose).
 fn build_normal(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
     let b = &cfg.body_losses;
-    body_arm(ctx, b.normal, candle_gen_body::normal_loss(b, &ctx.device))
+    body_arm(ctx, b.normal, candle_gen_body::normal_loss(b, ctx.device))
 }
 
 /// Body-proportion pre-load footprint (frame-size independent: the models run at fixed inputs).

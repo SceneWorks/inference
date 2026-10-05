@@ -640,9 +640,15 @@ fn each_body_loss_probe_catches_a_silently_ignored_loss() {
             Box::new(stub)
         };
         let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
-        assert!(err.contains(&format!("techniques.{name} == false")), "{name}: {err}");
+        assert!(
+            err.contains(&format!("techniques.{name} == false")),
+            "{name}: {err}"
+        );
         let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
-        assert!(err.contains(name) && err.contains("silently ignored"), "{name}: {err}");
+        assert!(
+            err.contains(name) && err.contains("silently ignored"),
+            "{name}: {err}"
+        );
     }
     let tmp = tempfile::tempdir().unwrap();
     let make = || -> Box<dyn Trainer> {

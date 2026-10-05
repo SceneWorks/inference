@@ -1037,7 +1037,11 @@ mod tests {
 
         // sc-24832: each body loss is advertised from its own flag.
         for (key, set) in [
-            ("supports_body_proportion_loss", (|t: &mut gen_core::train::TrainingTechniques| t.body_proportion_loss = true) as fn(&mut _)),
+            (
+                "supports_body_proportion_loss",
+                (|t: &mut gen_core::train::TrainingTechniques| t.body_proportion_loss = true)
+                    as fn(&mut _),
+            ),
             ("supports_body_shape_loss", |t| t.body_shape_loss = true),
             ("supports_normal_loss", |t| t.normal_loss = true),
         ] {
