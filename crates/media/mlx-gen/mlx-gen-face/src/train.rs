@@ -50,8 +50,8 @@ use crate::scrfd::Scrfd;
 pub use mlx_gen::gen_core::train::face_loss::{
     arcface_param_count, bilinear_matrix, crop_resample_matrices, face_crop_box,
     face_landmark_loss_footprint, identity_loss_footprint, CropBox, ARCFACE_FILE, ARCFACE_INPUT,
-    FACEMESH_FILE, FACEMESH_INPUT, FACEMESH_LANDMARKS, FACEMESH_V2_PARAMS, FACE_CROP_PAD, SCRFD_10G_PARAMS,
-    SCRFD_FILE,
+    FACEMESH_FILE, FACEMESH_INPUT, FACEMESH_LANDMARKS, FACEMESH_V2_PARAMS, FACE_CROP_PAD,
+    SCRFD_10G_PARAMS, SCRFD_FILE,
 };
 use mlx_gen::gen_core::train::face_loss::{
     INNER_EYES, INTER_EYE_FLOOR, LANDMARK_EPS, LANDMARK_REGIONS, NOSE_TIP,
@@ -63,12 +63,7 @@ use mlx_gen::gen_core::train::face_loss::{
 pub fn crop_resize(px: &Array, b: CropBox, square: bool, out: usize) -> Result<Array> {
     let (h, w) = (b.height(), b.width());
     let c = px.shape()[3];
-    let crop = px.index((
-        0,
-        b.y0 as i32..b.y1 as i32,
-        b.x0 as i32..b.x1 as i32,
-        ..,
-    )); // [h, w, C]
+    let crop = px.index((0, b.y0 as i32..b.y1 as i32, b.x0 as i32..b.x1 as i32, ..)); // [h, w, C]
     let (ry, rx) = crop_resample_matrices(b, square, out);
     let ry = Array::from_slice(&ry, &[out as i32, h as i32]);
     let rx = Array::from_slice(&rx, &[out as i32, w as i32]);
@@ -216,7 +211,10 @@ impl IdentityLoss {
     pub fn embed(&self, px: &Array, b: CropBox) -> Result<Array> {
         let crop = crop_resize(px, b, true, ARCFACE_INPUT)?;
         // `(px·255 − 127.5) / 127.5` = `2·px − 1`.
-        let x = subtract(&multiply(&crop, Array::from_f32(2.0))?, Array::from_f32(1.0))?;
+        let x = subtract(
+            &multiply(&crop, Array::from_f32(2.0))?,
+            Array::from_f32(1.0),
+        )?;
         let emb = self.arcface.forward(&x)?; // [1, D]
         Ok(l2_normalize(&emb)?.reshape(&[-1])?)
     }

@@ -373,46 +373,15 @@ impl FaceAnalysis {
     }
 }
 
-/// Every key [`Scrfd::from_weights`] requires: stem + STAGE_BLOCKS `[3,4,2,3]` backbone (stages 2-4
-/// block 0 carry a downsample) + PAFPN neck + per-stride heads {8,16,32}. Test fixtures build
-/// weightless stand-ins from it ([`FaceAnalysis::new_for_tests`], the sc-24831 builder tests).
+/// Every key [`Scrfd::from_weights`] requires (the one enumeration lives in gen-core,
+/// [`mlx_gen::gen_core::train::face_loss::synth::scrfd_standin_shapes`], shared with the Candle
+/// loader). Test fixtures build weightless stand-ins from it ([`FaceAnalysis::new_for_tests`], the
+/// sc-24831 builder tests).
 pub fn scrfd_schema_keys() -> Vec<String> {
-    let conv = |prefix: &str| [format!("{prefix}.weight"), format!("{prefix}.bias")];
-    let mut scrfd: Vec<String> = Vec::new();
-    for p in [
-        "stem.conv0",
-        "stem.conv1",
-        "stem.conv2",
-        "neck.lateral0",
-        "neck.lateral1",
-        "neck.lateral2",
-        "neck.fpn0",
-        "neck.fpn1",
-        "neck.fpn2",
-        "neck.down0",
-        "neck.down1",
-        "neck.pafpn0",
-        "neck.pafpn1",
-    ] {
-        scrfd.extend(conv(p));
-    }
-    for (l, nb) in [(1usize, 3usize), (2, 4), (3, 2), (4, 3)] {
-        for b in 0..nb {
-            scrfd.extend(conv(&format!("stage{l}.{b}.conv1")));
-            scrfd.extend(conv(&format!("stage{l}.{b}.conv2")));
-            if b == 0 && l > 1 {
-                scrfd.extend(conv(&format!("stage{l}.{b}.downsample")));
-            }
-        }
-    }
-    for stride in [8, 16, 32] {
-        let p = format!("head{stride}");
-        scrfd.push(format!("{p}.scale"));
-        for c in ["stem0", "stem1", "stem2", "cls", "reg", "kps"] {
-            scrfd.extend(conv(&format!("{p}.{c}")));
-        }
-    }
-    scrfd
+    mlx_gen::gen_core::train::face_loss::synth::scrfd_standin_shapes()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
 }
 
 /// RGB `u8` HWC → NHWC `[1,H,W,3]` f32 in `[0,1]`.

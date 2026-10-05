@@ -364,7 +364,10 @@ mod tests {
     fn face_losses_change_the_config_fingerprint_only_when_on() {
         let base_cfg = TrainingConfig::default();
         let base = training_config_fingerprint(&base_cfg);
-        assert!(!base.contains("identity") && !base.contains("landmark"), "{base}");
+        assert!(
+            !base.contains("identity") && !base.contains("landmark"),
+            "{base}"
+        );
         let mut on = base_cfg.clone();
         on.identity_loss.schedule.weight = 0.1;
         let with = training_config_fingerprint(&on);

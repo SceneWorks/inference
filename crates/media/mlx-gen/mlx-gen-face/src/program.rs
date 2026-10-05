@@ -75,7 +75,10 @@ impl Program {
             }
         }
         let json = w.metadata("program").ok_or_else(|| {
-            Error::Msg(format!("{}: missing the 'program' metadata", path.display()))
+            Error::Msg(format!(
+                "{}: missing the 'program' metadata",
+                path.display()
+            ))
         })?;
         Self::new(ProgramSpec::parse(json)?, &w)
     }

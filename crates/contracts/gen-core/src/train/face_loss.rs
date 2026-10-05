@@ -57,7 +57,8 @@ pub const MIDFACE: [usize; 45] = [
     195, 5, 4, 19, 94, 370,
 ];
 /// `(indices, weight)` of each landmark region; the loss is `Σ w·mean_dist / Σ w` (3 + 2 + 1 = 6).
-pub const LANDMARK_REGIONS: [(&[usize], f32); 3] = [(&FACE_OVAL, 3.0), (&LIPS, 2.0), (&MIDFACE, 1.0)];
+pub const LANDMARK_REGIONS: [(&[usize], f32); 3] =
+    [(&FACE_OVAL, 3.0), (&LIPS, 2.0), (&MIDFACE, 1.0)];
 
 /// A half-open integer pixel box `[x0, x1) × [y0, y1)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,7 +335,11 @@ pub mod synth {
         conv(&mut out, "stem.conv", 3, 8, 3);
         out.push(("stem.prelu.weight".into(), vec![8]));
         let mut cin = 8;
-        for (li, (nb, c)) in [1usize, 2, 1, 1].into_iter().zip([8, 16, 32, 64]).enumerate() {
+        for (li, (nb, c)) in [1usize, 2, 1, 1]
+            .into_iter()
+            .zip([8, 16, 32, 64])
+            .enumerate()
+        {
             for b in 0..nb {
                 let p = format!("layer{}.{b}", li + 1);
                 let bin = if b == 0 { cin } else { c };
@@ -353,6 +358,62 @@ pub mod synth {
         out.push(("fc.bias".into(), vec![32]));
         aff(&mut out, "features", 32);
         out
+    }
+
+    /// Every key the native SCRFD-10g loaders (`Scrfd::from_weights`, both backends) require —
+    /// stem + `[3,4,2,3]` backbone (stages 2-4 block 0 carry a downsample) + PAFPN neck +
+    /// per-stride heads {8,16,32} — with a minimal stand-in shape (`[1,1,1,1]` kernels, `[1]`
+    /// vectors): a weightless detector that loads on either backend and is never forwarded.
+    pub fn scrfd_standin_shapes() -> Vec<(String, Vec<usize>)> {
+        let mut keys: Vec<String> = Vec::new();
+        fn conv_into(keys: &mut Vec<String>, p: &str) {
+            keys.push(format!("{p}.weight"));
+            keys.push(format!("{p}.bias"));
+        }
+        let conv = conv_into;
+        for p in [
+            "stem.conv0",
+            "stem.conv1",
+            "stem.conv2",
+            "neck.lateral0",
+            "neck.lateral1",
+            "neck.lateral2",
+            "neck.fpn0",
+            "neck.fpn1",
+            "neck.fpn2",
+            "neck.down0",
+            "neck.down1",
+            "neck.pafpn0",
+            "neck.pafpn1",
+        ] {
+            conv(&mut keys, p);
+        }
+        for (l, nb) in [(1usize, 3usize), (2, 4), (3, 2), (4, 3)] {
+            for b in 0..nb {
+                conv(&mut keys, &format!("stage{l}.{b}.conv1"));
+                conv(&mut keys, &format!("stage{l}.{b}.conv2"));
+                if b == 0 && l > 1 {
+                    conv(&mut keys, &format!("stage{l}.{b}.downsample"));
+                }
+            }
+        }
+        for stride in [8, 16, 32] {
+            let p = format!("head{stride}");
+            for c in ["stem0", "stem1", "stem2", "cls", "reg", "kps"] {
+                conv(&mut keys, &format!("{p}.{c}"));
+            }
+            keys.push(format!("{p}.scale"));
+        }
+        keys.into_iter()
+            .map(|k| {
+                let shape = if k.ends_with(".weight") {
+                    vec![1, 1, 1, 1]
+                } else {
+                    vec![1]
+                };
+                (k, shape)
+            })
+            .collect()
     }
 
     /// The tiny FaceMesh-I/O stand-in program the trainer/builder tests write (`[N,3,256,256]` →
@@ -444,6 +505,9 @@ mod tests {
     fn generator_matches_the_producer() {
         assert_eq!(synth::fnv1a64("live"), 0xbf66_95ad_6966_058f);
         let u = synth::uniform(synth::IMAGE_SEED, "live", 3);
-        assert_eq!(u, [0.17715787887573242, 0.5028018951416016, 0.6082891225814819]);
+        assert_eq!(
+            u,
+            [0.17715787887573242, 0.5028018951416016, 0.6082891225814819]
+        );
     }
 }

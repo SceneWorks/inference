@@ -20,7 +20,11 @@ pub mod face;
 pub mod iresnet;
 #[cfg(test)]
 mod parity;
+pub mod program;
 pub mod scrfd;
+pub mod synth;
+/// The decoded-x0 ArcFace identity and FaceMesh landmark losses of epic 2123 (sc-24831).
+pub mod train;
 
 use std::path::Path;
 

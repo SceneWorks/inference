@@ -47,6 +47,7 @@ impl Weights {
     }
 
     /// Build from an in-memory tensor map (coercing to f32, like [`Weights::from_file`]).
+    #[cfg(test)]
     pub fn from_map(raw: HashMap<String, Tensor>) -> Result<Self> {
         let mut map = HashMap::with_capacity(raw.len());
         for (k, v) in raw {

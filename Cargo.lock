@@ -645,6 +645,10 @@ dependencies = [
  "candle-gen",
  "candle-nn",
  "image",
+ "safetensors 0.7.0",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -854,6 +858,7 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-depth",
+ "candle-gen-face",
  "tempfile",
 ]
 

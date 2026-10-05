@@ -47,7 +47,9 @@ pub enum Op {
         groups: usize,
     },
     /// Per-channel PReLU; `slope` is `[C]`.
-    Prelu { slope: String },
+    Prelu {
+        slope: String,
+    },
     Relu,
     Sigmoid,
     Binary(BinaryOp),
@@ -58,7 +60,10 @@ pub enum Op {
         padding: (usize, usize),
     },
     /// Constant pad, `(before, after)` per N, C, H, W axis.
-    Pad { pads: [(usize, usize); 4], value: f32 },
+    Pad {
+        pads: [(usize, usize); 4],
+        value: f32,
+    },
     /// torch `reshape` (one `-1` allowed).
     Reshape(Vec<i64>),
     /// Concatenate along a torch axis.
@@ -125,7 +130,12 @@ fn operands(v: &Value, key: &str) -> Result<Vec<Operand>> {
         .and_then(Value::as_array)
         .ok_or_else(|| msg(format!("'{key}' must be a list")))?
         .iter()
-        .map(|s| operand(s.as_str().ok_or_else(|| msg(format!("'{key}' entries are strings")))?))
+        .map(|s| {
+            operand(
+                s.as_str()
+                    .ok_or_else(|| msg(format!("'{key}' entries are strings")))?,
+            )
+        })
         .collect()
 }
 
@@ -142,7 +152,11 @@ impl ProgramSpec {
         let inputs = operands(v, "inputs")?;
         let input = match inputs.as_slice() {
             [Operand::Value(n)] => n.clone(),
-            _ => return Err(msg(format!("exactly one named input is supported, got {inputs:?}"))),
+            _ => {
+                return Err(msg(format!(
+                    "exactly one named input is supported, got {inputs:?}"
+                )))
+            }
         };
         let outputs = operands(v, "outputs")?;
         let mut nodes = Vec::new();
@@ -288,7 +302,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("gelu"), "{err}");
-        assert_eq!(ProgramSpec::resolve_shape(&[-1, 1, 1, 6], 12).unwrap(), [2, 1, 1, 6]);
+        assert_eq!(
+            ProgramSpec::resolve_shape(&[-1, 1, 1, 6], 12).unwrap(),
+            [2, 1, 1, 6]
+        );
         assert!(ProgramSpec::resolve_shape(&[-1, 5], 12).is_err());
     }
 }

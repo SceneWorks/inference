@@ -79,7 +79,10 @@ fn scalar(a: &Array) -> f32 {
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 fn arcface_weights(f: &Value) -> Weights {
@@ -144,7 +147,12 @@ impl FaceBoxDetector for StubDetector {
     }
 }
 
-fn identity_loss(f: &Value, face: Option<[f32; 4]>, min_cos: f32, mode: IdentityReferenceMode) -> IdentityLoss {
+fn identity_loss(
+    f: &Value,
+    face: Option<[f32; 4]>,
+    min_cos: f32,
+    mode: IdentityReferenceMode,
+) -> IdentityLoss {
     IdentityLoss::new(
         ArcFace::from_weights(&arcface_weights(f)).unwrap(),
         Rc::new(StubDetector(face)),
@@ -180,7 +188,10 @@ fn identity_path_matches_the_torch_reference() {
     let e_ref = read(&loss.embed(&reference, crop).unwrap());
     let d_live = max_abs_diff(&e_live, &floats(&f["arcface"]["embedding"]));
     let d_ref = max_abs_diff(&e_ref, &floats(&f["arcface"]["reference_embedding"]));
-    assert!(d_live < 2e-5 && d_ref < 2e-5, "embedding drift {d_live} / {d_ref}");
+    assert!(
+        d_live < 2e-5 && d_ref < 2e-5,
+        "embedding drift {d_live} / {d_ref}"
+    );
 
     let r = IdentityReference {
         crop,
@@ -189,9 +200,17 @@ fn identity_path_matches_the_torch_reference() {
     };
     let (l, cos) = loss.loss_and_cos(&live, &r).unwrap();
     let want_cos = f["arcface"]["cos"].as_f64().unwrap() as f32;
-    assert!((scalar(&cos) - want_cos).abs() < 2e-5, "cos {} vs {want_cos}", scalar(&cos));
+    assert!(
+        (scalar(&cos) - want_cos).abs() < 2e-5,
+        "cos {} vs {want_cos}",
+        scalar(&cos)
+    );
     let want = f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
-    assert!((scalar(&l) - want).abs() < 2e-5, "loss {} vs {want}", scalar(&l));
+    assert!(
+        (scalar(&l) - want).abs() < 2e-5,
+        "loss {} vs {want}",
+        scalar(&l)
+    );
 }
 
 /// AC3 (landmarks): the fx-program executor runs the converter's lowered FaceMesh-shaped program
@@ -214,7 +233,10 @@ fn landmark_path_matches_the_torch_reference() {
     assert!(d < 1e-4 * scale, "landmark drift {d} (scale {scale})");
     let got = scalar(&landmark_distance(&l_live, &l_ref).unwrap());
     let want = f["facemesh"]["landmark_loss"].as_f64().unwrap() as f32;
-    assert!((got - want).abs() < 1e-4 * want.max(1.0), "loss {got} vs {want}");
+    assert!(
+        (got - want).abs() < 1e-4 * want.max(1.0),
+        "loss {got} vs {want}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -314,7 +336,10 @@ fn identity_loss_is_one_minus_cos_and_trains_the_lora() {
     let want = WEIGHT * f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
     assert!((value - want).abs() < 2e-5, "aux {value} vs {want}");
     let gb_norm: f32 = gb.iter().map(|g| g.abs()).sum();
-    assert!(gb_norm > 1e-6, "no gradient reached the LoRA B factor: {gb:?}");
+    assert!(
+        gb_norm > 1e-6,
+        "no gradient reached the LoRA B factor: {gb:?}"
+    );
     assert!(ga.iter().all(|g| g.is_finite()));
 }
 
@@ -352,10 +377,16 @@ fn no_face_and_low_cos_samples_contribute_zero() {
         let (value, _, gb) = aux_value_and_grads(&p, &nchw(&live), &a, &b);
         let g: f32 = gb.iter().map(|g| g.abs()).sum();
         if gated {
-            assert_eq!(value, 0.0, "min_cos {min_cos} > cos {cos} must gate the loss");
+            assert_eq!(
+                value, 0.0,
+                "min_cos {min_cos} > cos {cos} must gate the loss"
+            );
             assert_eq!(g, 0.0, "a gated step must not move the LoRA");
         } else {
-            assert!(value > 0.1 && g > 1e-6, "min_cos {min_cos} < cos {cos}: {value} / {g}");
+            assert!(
+                value > 0.1 && g > 1e-6,
+                "min_cos {min_cos} < cos {cos}: {value} / {g}"
+            );
         }
     }
 }
@@ -368,7 +399,12 @@ fn no_face_and_low_cos_samples_contribute_zero() {
 fn dataset_average_targets_the_mean_reference() {
     let (f, _cpu) = fixture();
     let (live, reference) = images(&f);
-    let loss = identity_loss(&f, Some(bbox(&f)), -1.0, IdentityReferenceMode::DatasetAverage);
+    let loss = identity_loss(
+        &f,
+        Some(bbox(&f)),
+        -1.0,
+        IdentityReferenceMode::DatasetAverage,
+    );
     let r_live = loss.reference(&live).unwrap().unwrap();
     let r_ref = loss.reference(&reference).unwrap().unwrap();
     let r_ref = reference_as::<IdentityReference>("identity", r_ref.as_ref()).unwrap();
@@ -378,10 +414,19 @@ fn dataset_average_targets_the_mean_reference() {
     let mean = l2_normalize(&add(r_live_e, &r_ref.embedding).unwrap()).unwrap();
     let want = 1.0 - scalar(&multiply(&mean, r_live_e).unwrap().sum(None).unwrap());
     let got = scalar(&loss.loss(&live, r_ref).unwrap());
-    assert!((got - want).abs() < 1e-5, "average-mode loss {got} vs {want}");
+    assert!(
+        (got - want).abs() < 1e-5,
+        "average-mode loss {got} vs {want}"
+    );
     let per_image = f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
-    assert!((got - per_image).abs() > 1e-3, "average mode used the per-image target");
-    assert!(loss.reference(&live).is_err(), "a late reference must be refused");
+    assert!(
+        (got - per_image).abs() > 1e-3,
+        "average mode used the per-image target"
+    );
+    assert!(
+        loss.reference(&live).is_err(),
+        "a late reference must be refused"
+    );
 }
 
 /// The landmark loss is differentiable into the LoRA and skips a no-face image. Mutation: wrap the
@@ -398,7 +443,10 @@ fn landmark_loss_trains_the_lora_and_skips_no_face() {
     let (a, b) = lora_init();
     let (value, _, gb) = aux_value_and_grads(&path, &nchw(&live), &a, &b);
     let want = WEIGHT * f["facemesh"]["landmark_loss"].as_f64().unwrap() as f32;
-    assert!((value - want).abs() < 1e-4 * want.max(1.0), "{value} vs {want}");
+    assert!(
+        (value - want).abs() < 1e-4 * want.max(1.0),
+        "{value} vs {want}"
+    );
     assert!(gb.iter().map(|g| g.abs()).sum::<f32>() > 1e-6);
 
     let mut skip = path_with(Box::new(FaceLandmarkLoss::new(

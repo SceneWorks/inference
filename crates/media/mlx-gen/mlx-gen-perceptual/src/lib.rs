@@ -571,9 +571,8 @@ mod tests {
         };
         let g = AuxGeometry::image(512, 3);
         let id_only = perceptual_footprint(&c, &ctx.decoder, g);
-        let id_fp = mlx_gen_face::train::identity_loss_footprint(
-            mlx_gen_face::iresnet::IRESNET100_LAYERS,
-        );
+        let id_fp =
+            mlx_gen_face::train::identity_loss_footprint(mlx_gen_face::iresnet::IRESNET100_LAYERS);
         assert_eq!(
             id_only,
             perceptual_footprint_bytes(Some(cfg4.footprint(512, 512)), &[id_fp], 3)
