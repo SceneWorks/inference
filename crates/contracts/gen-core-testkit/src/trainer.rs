@@ -258,7 +258,9 @@ fn check_weight_noise_validate(t: &dyn Trainer, ok: &TrainingRequest) -> Result<
 /// repeats plus twice that resolution at one — a real two-bucket mix that stays as cheap as the
 /// profile allows.
 fn probe_buckets(config: &TrainingConfig) -> Vec<ResolutionBucket> {
-    let base = config.resolution.max(32);
+    // On the trainers' latent stride, so the probe is a well-formed list whatever the profile.
+    let stride = gen_core::RESOLUTION_BUCKET_STRIDE;
+    let base = (config.resolution / stride * stride).max(stride);
     vec![
         ResolutionBucket {
             resolution: base,

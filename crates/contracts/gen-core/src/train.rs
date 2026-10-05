@@ -185,7 +185,8 @@ pub struct TrainingConfig {
     /// sample order. A non-empty list is refused (typed [`crate::Error::Unsupported`]) by any
     /// trainer whose [`TrainerDescriptor::techniques`] does not declare
     /// [`resolution_buckets`](TrainingTechniques::resolution_buckets); a malformed list (a zero
-    /// resolution or repeat count, a duplicate resolution, more than [`MAX_RESOLUTION_BUCKETS`]) is
+    /// resolution or repeat count, a resolution off the [`RESOLUTION_BUCKET_STRIDE`], a duplicate
+    /// resolution, more than [`MAX_RESOLUTION_BUCKETS`]) is
     /// refused by [`validate_training_techniques`]. Memory pre-flights size for
     /// [`max_training_resolution`](Self::max_training_resolution) (E7).
     pub resolution_buckets: Vec<ResolutionBucket>,
@@ -245,6 +246,12 @@ impl Default for TrainingConfig {
 /// cached latent per dataset item and one more latent size the trainer must fit, so the list is
 /// kept short; SceneWorks validates the same bound at submit time.
 pub const MAX_RESOLUTION_BUCKETS: usize = 8;
+
+/// Every [`ResolutionBucket::resolution`] must be a multiple of this (sc-2127): the trainers floor
+/// each training edge to a multiple of 32, so an off-stride bucket would silently train at another
+/// size — and two buckets that floor to the same edge (e.g. 512 and 520) would cache the same
+/// latent twice and silently double that size's weight. SceneWorks validates the same stride.
+pub const RESOLUTION_BUCKET_STRIDE: u32 = 32;
 
 /// One training resolution bucket (see [`TrainingConfig::resolution_buckets`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -635,8 +642,9 @@ impl TrainingTechniques {
 /// - `weight_noise_sigma > 0` with [`TrainingConfig::full_finetune`] ⇒ typed
 ///   [`crate::Error::Unsupported`]: weight noise perturbs adapter factors only and must never touch
 ///   base weights (E5).
-/// - `resolution_buckets` non-empty but malformed (a zero resolution or repeat count, a duplicate
-///   resolution, more than [`MAX_RESOLUTION_BUCKETS`]) ⇒ [`crate::Error::Msg`]; well formed on a
+/// - `resolution_buckets` non-empty but malformed (a zero resolution or repeat count, a resolution
+///   off the [`RESOLUTION_BUCKET_STRIDE`], a duplicate resolution, more than
+///   [`MAX_RESOLUTION_BUCKETS`]) ⇒ [`crate::Error::Msg`]; well formed on a
 ///   trainer that lacks [`resolution_buckets`](TrainingTechniques::resolution_buckets) ⇒ typed
 ///   [`crate::Error::Unsupported`].
 /// - every technique off ⇒ no-op.
@@ -691,6 +699,13 @@ fn validate_resolution_buckets(
                 "{}: resolution_buckets[{i}] needs a resolution and a repeat count >= 1, got \
                  resolution {} repeats {}",
                 desc.id, b.resolution, b.repeats
+            )));
+        }
+        if b.resolution % RESOLUTION_BUCKET_STRIDE != 0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets[{i}] resolution {} is not a multiple of \
+                 {RESOLUTION_BUCKET_STRIDE} (the trainers' latent stride)",
+                desc.id, b.resolution
             )));
         }
         if buckets[..i].iter().any(|p| p.resolution == b.resolution) {
@@ -1123,6 +1138,9 @@ mod tests {
             vec![rb(512, 0)],
             vec![rb(0, 1)],
             vec![rb(512, 1), rb(512, 2)],
+            // 520 floors to the 512 edge: it would cache 512 twice and double its weight.
+            vec![rb(512, 1), rb(520, 1)],
+            vec![rb(520, 1)],
             too_many,
         ] {
             let mut r = off.clone();

@@ -279,7 +279,7 @@ pub use ::core_llm;
 pub use train::{
     BucketSchedule, LrSchedule, NetworkType, ResolutionBucket, Trainer, TrainerDescriptor,
     TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,
-    TrainingTechniques, MAX_RESOLUTION_BUCKETS,
+    TrainingTechniques, MAX_RESOLUTION_BUCKETS, RESOLUTION_BUCKET_STRIDE,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,
