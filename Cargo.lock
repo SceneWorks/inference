@@ -537,6 +537,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-body"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+]
+
+[[package]]
 name = "candle-gen-boogu"
 version = "0.0.0"
 dependencies = [
@@ -853,6 +860,7 @@ name = "candle-gen-perceptual"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-body",
  "candle-gen-depth",
  "tempfile",
 ]

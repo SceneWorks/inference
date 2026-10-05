@@ -221,6 +221,15 @@ CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES: dict[str, str] = {}
 # Both entries are real, and both were reached by reading the crates rather than by finding the gate
 # inconvenient.
 CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS: dict[str, str] = {
+    "body": (
+        "`mlx-gen-body` / `candle-gen-body` (sc-24832) declare no geometry constant of their own: "
+        "every model hyper-parameter, input size, threshold and resampling matrix of the three body "
+        "losses lives once in the backend-neutral `gen_core::train::body` (`VitPoseConfig`, "
+        "`HybrikConfig`, `SapiensConfig`, `VIS_THRESHOLD`, `NORMAL_SIZE`, …) that both crates "
+        "consume, and both are held to one committed reference fixture "
+        "(`docs/migration/body-losses-reference/`). One declaration, nothing for a cross-backend "
+        "comparison to hold; if either crate declares its own copy, this entry goes stale."
+    ),
     "joycaption": (
         "`mlx-gen-joycaption` declares no constant at all, of any visibility: its whole surface is "
         "`mlx_gen::register_captioner! { pub(crate) const REGISTRATION = descriptor => load }` "

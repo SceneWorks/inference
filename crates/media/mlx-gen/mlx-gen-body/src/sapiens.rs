@@ -88,7 +88,12 @@ impl SapiensNormal {
         Ok(Self {
             proj_w: conv_ohwi(&g("backbone.patch_embed.projection.weight")?)?,
             proj_b: g("backbone.patch_embed.projection.bias")?,
-            pos: g("backbone.pos_embed")?.reshape(&[1, ph as i32, pw as i32, cfg.embed_dim as i32])?,
+            pos: g("backbone.pos_embed")?.reshape(&[
+                1,
+                ph as i32,
+                pw as i32,
+                cfg.embed_dim as i32,
+            ])?,
             layers,
             ln: pair("backbone.ln1")?,
             stages,

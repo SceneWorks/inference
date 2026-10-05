@@ -25,14 +25,13 @@ use std::rc::{Rc, Weak};
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{
-    abs, add, divide, ge, gt, logical_and, lt, maximum, minimum,
-    multiply, r#where, subtract,
+    abs, add, divide, ge, gt, logical_and, lt, maximum, minimum, multiply, r#where, subtract,
 };
 use mlx_rs::Array;
 
 pub use mlx_gen::gen_core::train::body::{
-    body_arm_footprint, BodyArm, TwoTap, BodyLossesConfig, BodyModelFootprint, HybrikConfig,
-    SapiensConfig, VitPoseConfig,
+    body_arm_footprint, BodyArm, BodyLossesConfig, BodyModelFootprint, HybrikConfig, SapiensConfig,
+    TwoTap, VitPoseConfig,
 };
 use mlx_gen::gen_core::train::body::{
     keypoint_box, MIN_MEAN_RATIO_VISIBILITY, MISSING_REFERENCE_VISIBILITY, NUM_BODY_RATIOS,
@@ -217,13 +216,18 @@ pub fn proportion_comparison(
     live_vis: &Array,
 ) -> Result<Array> {
     let combined = minimum(ref_vis, live_vis)?;
-    let num = multiply(&abs(&subtract(live_ratios, ref_ratios)?)?, &combined)?.sum_axes(&[-1], false)?;
+    let num =
+        multiply(&abs(&subtract(live_ratios, ref_ratios)?)?, &combined)?.sum_axes(&[-1], false)?;
     let den = maximum(&combined.sum_axes(&[-1], false)?, Array::from_f32(1e-6))?;
     let high = ge(ref_vis, Array::from_f32(MISSING_REFERENCE_VISIBILITY))?;
     let dropped = logical_and(&high, &lt(live_vis, Array::from_f32(VIS_THRESHOLD))?)?;
-    let missing = dropped.as_dtype(mlx_rs::Dtype::Float32)?.sum_axes(&[-1], false)?;
+    let missing = dropped
+        .as_dtype(mlx_rs::Dtype::Float32)?
+        .sum_axes(&[-1], false)?;
     let high_n = maximum(
-        &high.as_dtype(mlx_rs::Dtype::Float32)?.sum_axes(&[-1], false)?,
+        &high
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .sum_axes(&[-1], false)?,
         Array::from_f32(1.0),
     )?;
     Ok(add(&divide(&num, &den)?, &divide(&missing, &high_n)?)?.mean(None)?)
@@ -270,8 +274,7 @@ impl VitPose {
             .collect();
         let confidence: Vec<f32> = conf.reshape(&[-1])?.as_slice::<f32>().to_vec();
         let sh = clean.shape();
-        let Some(person_box) =
-            keypoint_box(&points, &confidence, sh[1] as usize, sh[2] as usize)
+        let Some(person_box) = keypoint_box(&points, &confidence, sh[1] as usize, sh[2] as usize)
         else {
             return Ok(None);
         };
@@ -386,7 +389,11 @@ impl PerceptualLoss for BodyShapeLoss {
 
     fn loss(&self, live: &Array, reference: &dyn Any) -> Result<Array> {
         let r = reference_as::<ShapeReference>(self.name(), reference)?;
-        shape_comparison(&r.betas, &self.hybrik.forward_crop(live, r.crop)?, self.min_cos)
+        shape_comparison(
+            &r.betas,
+            &self.hybrik.forward_crop(live, r.crop)?,
+            self.min_cos,
+        )
     }
 }
 

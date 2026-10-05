@@ -2,10 +2,10 @@
 //! through the shared perceptual path, the no-person skip, and the real-weight parity harness.
 
 use super::*;
-use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule, PerceptualPath};
 use mlx_gen::train::perceptual::X0Decoder;
-use mlx_rs::transforms::{eval, grad};
+use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule, PerceptualPath};
 use mlx_rs::ops::matmul;
+use mlx_rs::transforms::{eval, grad};
 use mlx_rs::{random, Array};
 
 const FIXTURE: &str = concat!(
@@ -117,7 +117,12 @@ fn vitpose_parity() {
     close("heatmaps", &hm_nchw, &t(&w, "vitpose.out.heatmaps_a"), 2e-4);
     let (coords, conf) = vitpose::heatmaps_to_keypoints(&hm).unwrap();
     close("coords", &coords, &t(&w, "vitpose.out.coords_a"), 1e-4);
-    close("confidence", &conf, &t(&w, "vitpose.out.confidence_a"), 2e-4);
+    close(
+        "confidence",
+        &conf,
+        &t(&w, "vitpose.out.confidence_a"),
+        2e-4,
+    );
     let (ra, va) = body_ratios(&coords, &conf, true).unwrap();
     close("ratios_a", &ra, &t(&w, "vitpose.out.ratios_a"), 1e-4);
     close("ratio_vis_a", &va, &t(&w, "vitpose.out.ratio_vis_a"), 2e-4);
@@ -128,7 +133,12 @@ fn vitpose_parity() {
     };
     let b = nhwc(&w, "input.b");
     let got = loss.loss(&b, &reference).unwrap();
-    close("proportion loss", &got, &t(&w, "vitpose.out.loss").reshape(&[]).unwrap(), 1e-4);
+    close(
+        "proportion loss",
+        &got,
+        &t(&w, "vitpose.out.loss").reshape(&[]).unwrap(),
+        1e-4,
+    );
     // The live ratios after substitution.
     let (hb, _) = loss.pose.forward_pixels(&b).unwrap();
     let (cb, fb) = vitpose::heatmaps_to_keypoints(&hb).unwrap();
@@ -163,11 +173,19 @@ fn hybrik_parity() {
     let bb = m.forward_crop(&nhwc(&w, "input.b"), crop).unwrap();
     close("betas_b", &bb, &t(&w, "hybrik.out.betas_b"), 1e-4);
     let l1 = t(&w, "hybrik.out.l1").reshape(&[]).unwrap();
-    close("shape loss", &shape_comparison(&ba, &bb, -1.0).unwrap(), &l1, 1e-5);
+    close(
+        "shape loss",
+        &shape_comparison(&ba, &bb, -1.0).unwrap(),
+        &l1,
+        1e-5,
+    );
     // The cosine gate: just above the pair's cosine ⇒ the loss is zero.
     let cos = scalar(&t(&w, "hybrik.out.cos"));
     assert!(cos > 0.5 && cos < 0.99, "fixture cosine {cos}");
-    assert_eq!(scalar(&shape_comparison(&ba, &bb, cos + 1e-3).unwrap()), 0.0);
+    assert_eq!(
+        scalar(&shape_comparison(&ba, &bb, cos + 1e-3).unwrap()),
+        0.0
+    );
     assert!(scalar(&shape_comparison(&ba, &bb, cos - 1e-3).unwrap()) > 0.0);
 }
 
@@ -189,17 +207,36 @@ fn sapiens_parity() {
     let m = sapiens(&w);
     let na = m.forward_pixels(&nhwc(&w, "input.a")).unwrap();
     let nb = m.forward_pixels(&nhwc(&w, "input.b")).unwrap();
-    let want_a = t(&w, "sapiens.out.normals_a").transpose_axes(&[0, 2, 3, 1]).unwrap();
+    let want_a = t(&w, "sapiens.out.normals_a")
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
     close("normals_a", &na, &want_a, 2e-4);
-    let want_b = t(&w, "sapiens.out.normals_b").transpose_axes(&[0, 2, 3, 1]).unwrap();
+    let want_b = t(&w, "sapiens.out.normals_b")
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
     close("normals_b", &nb, &want_b, 2e-4);
     let mask = t(&w, "input.mask").reshape(&[40, 30]).unwrap();
     let grid = m.mask_to_normal_grid(&mask).unwrap();
-    close("mask", &grid, &t(&w, "sapiens.out.mask").reshape(&[16, 16]).unwrap(), 1e-5);
+    close(
+        "mask",
+        &grid,
+        &t(&w, "sapiens.out.mask").reshape(&[16, 16]).unwrap(),
+        1e-5,
+    );
     let l = sapiens::normal_comparison(&na, &nb, None).unwrap();
-    close("normal loss", &l, &t(&w, "sapiens.out.loss").reshape(&[]).unwrap(), 1e-4);
+    close(
+        "normal loss",
+        &l,
+        &t(&w, "sapiens.out.loss").reshape(&[]).unwrap(),
+        1e-4,
+    );
     let lm = sapiens::normal_comparison(&na, &nb, Some(&grid)).unwrap();
-    close("masked normal loss", &lm, &t(&w, "sapiens.out.loss_masked").reshape(&[]).unwrap(), 1e-4);
+    close(
+        "masked normal loss",
+        &lm,
+        &t(&w, "sapiens.out.loss_masked").reshape(&[]).unwrap(),
+        1e-4,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -261,7 +298,12 @@ impl LoraModule {
         Self {
             base: add(
                 normal(11, &[4, 4], 0.1),
-                Array::from_slice(&[1.0f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.], &[4, 4]),
+                Array::from_slice(
+                    &[
+                        1.0f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+                    ],
+                    &[4, 4],
+                ),
             )
             .unwrap(),
             a: normal(12, &[2, 4], 0.5),
@@ -374,7 +416,8 @@ fn each_body_loss_trains_the_lora_through_the_shared_path() {
     ];
     for (name, loss, mask) in losses {
         let mut path = path_with(loss);
-        let g = lora_grad(&mut path, mask.as_ref()).unwrap_or_else(|| panic!("{name}: no aux term"));
+        let g =
+            lora_grad(&mut path, mask.as_ref()).unwrap_or_else(|| panic!("{name}: no aux term"));
         assert!(g > 0.0 && g.is_finite(), "{name}: LoRA gradient {g}");
     }
 }
@@ -387,9 +430,18 @@ fn each_body_loss_trains_the_lora_through_the_shared_path() {
 fn each_body_loss_is_zero_without_a_detected_person() {
     let w = fixture();
     let losses: Vec<(&str, Box<dyn PerceptualLoss>)> = vec![
-        ("proportion", Box::new(BodyProportionLoss::new(nobody_pose(), true))),
-        ("shape", Box::new(BodyShapeLoss::new(nobody_pose(), hybrik(&w), 0.2))),
-        ("normal", Box::new(NormalLoss::new(nobody_pose(), sapiens(&w), true))),
+        (
+            "proportion",
+            Box::new(BodyProportionLoss::new(nobody_pose(), true)),
+        ),
+        (
+            "shape",
+            Box::new(BodyShapeLoss::new(nobody_pose(), hybrik(&w), 0.2)),
+        ),
+        (
+            "normal",
+            Box::new(NormalLoss::new(nobody_pose(), sapiens(&w), true)),
+        ),
     ];
     for (name, loss) in losses {
         let mut path = path_with(loss);
@@ -434,7 +486,10 @@ fn arm_footprints_count_the_detector_once() {
         f.param_bytes,
         (VitPoseConfig::plus_base().param_count() + SapiensConfig::normal_0_3b().param_count()) * 4
     );
-    assert_eq!(arm_footprint(&cfg, BodyArm::Proportion), AuxModelFootprint::default());
+    assert_eq!(
+        arm_footprint(&cfg, BodyArm::Proportion),
+        AuxModelFootprint::default()
+    );
 }
 
 /// The arm builders name the missing checkpoint instead of loading nothing.
@@ -474,21 +529,39 @@ fn real_checkpoints_match_the_reference_implementation() {
     let (hm, _) = pose.forward_pixels(&img).unwrap();
     let (coords, conf) = vitpose::heatmaps_to_keypoints(&hm).unwrap();
     let (ratios, vis) = body_ratios(&coords, &conf, true).unwrap();
-    close("real heatmaps", &hm.transpose_axes(&[0, 3, 1, 2]).unwrap(), &t(&r, "vitpose.out.heatmaps_a"), 2e-3);
+    close(
+        "real heatmaps",
+        &hm.transpose_axes(&[0, 3, 1, 2]).unwrap(),
+        &t(&r, "vitpose.out.heatmaps_a"),
+        2e-3,
+    );
     close("real ratios", &ratios, &t(&r, "vitpose.out.ratios_a"), 1e-3);
-    close("real ratio vis", &vis, &t(&r, "vitpose.out.ratio_vis_a"), 2e-3);
+    close(
+        "real ratio vis",
+        &vis,
+        &t(&r, "vitpose.out.ratio_vis_a"),
+        2e-3,
+    );
     let bbox_v = t(&r, "input.person_bbox");
     eval([&bbox_v]).unwrap();
     let b = bbox_v.as_slice::<f32>();
     let sh = img.shape();
     let crop = HybrikEncoder::crop_for([b[0], b[1], b[2], b[3]], sh[1] as usize, sh[2] as usize);
     let hyb = HybrikEncoder::from_dir(root.join("hybrik"), HybrikConfig::resnet34()).unwrap();
-    close("real betas", &hyb.forward_crop(&img, crop).unwrap(), &t(&r, "hybrik.out.betas_a"), 1e-3);
+    close(
+        "real betas",
+        &hyb.forward_crop(&img, crop).unwrap(),
+        &t(&r, "hybrik.out.betas_a"),
+        1e-3,
+    );
     let sap = SapiensNormal::from_dir(root.join("sapiens"), SapiensConfig::normal_0_3b()).unwrap();
-    let want = t(&r, "sapiens.out.normals_a").transpose_axes(&[0, 2, 3, 1]).unwrap();
-    close("real normals", &sap.forward_pixels(&img).unwrap(), &want, 5e-3);
+    let want = t(&r, "sapiens.out.normals_a")
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
+    close(
+        "real normals",
+        &sap.forward_pixels(&img).unwrap(),
+        &want,
+        5e-3,
+    );
 }
-
-
-
-

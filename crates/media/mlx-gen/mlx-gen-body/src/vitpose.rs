@@ -94,10 +94,7 @@ impl VitPose {
                 fc1: pair(&format!("{p}.mlp.fc1"))?,
                 fc2: pair(&format!("{p}.mlp.fc2"))?,
                 expert: if cfg.num_experts > 1 {
-                    Some(pair(&format!(
-                        "{p}.mlp.experts.{}",
-                        cfg.expert_index
-                    ))?)
+                    Some(pair(&format!("{p}.mlp.experts.{}", cfg.expert_index))?)
                 } else {
                     None
                 },
@@ -120,7 +117,9 @@ impl VitPose {
             }
         };
         Ok(Self {
-            proj_w: conv_ohwi(&g("backbone.embeddings.patch_embeddings.projection.weight")?)?,
+            proj_w: conv_ohwi(&g(
+                "backbone.embeddings.patch_embeddings.projection.weight",
+            )?)?,
             proj_b: g("backbone.embeddings.patch_embeddings.projection.bias")?,
             pos,
             layers,
@@ -144,13 +143,16 @@ impl VitPose {
         let eps = c.layer_norm_eps;
         let h = layer_norm(x, Some(&l.ln1.0), Some(&l.ln1.1), eps)?;
         let to_heads = |t: Array| -> Result<Array> {
-            Ok(t.reshape(&[b, n, heads, hd])?.transpose_axes(&[0, 2, 1, 3])?)
+            Ok(t.reshape(&[b, n, heads, hd])?
+                .transpose_axes(&[0, 2, 1, 3])?)
         };
         let q = to_heads(linear(&h, &l.q.0, &l.q.1)?)?;
         let k = to_heads(linear(&h, &l.k.0, &l.k.1)?)?;
         let v = to_heads(linear(&h, &l.v.0, &l.v.1)?)?;
         let a = scaled_dot_product_attention(&q, &k, &v, (hd as f32).powf(-0.5), None, None)?;
-        let a = a.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, n, heads * hd])?;
+        let a = a
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, n, heads * hd])?;
         let x = add(x, &linear(&a, &l.o.0, &l.o.1)?)?;
         let h = layer_norm(&x, Some(&l.ln2.0), Some(&l.ln2.1), eps)?;
         let h = gelu_exact(&linear(&h, &l.fc1.0, &l.fc1.1)?)?;
