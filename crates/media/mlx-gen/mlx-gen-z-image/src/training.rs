@@ -1791,10 +1791,27 @@ mod weight_noise_update_tests {
         }
     }
 
-    /// AC3 (E1): with sigma 0 the update is bit-identical to the pre-sc-24826 update (clip → step →
-    /// eval, no noise call), over several updates.
+    /// Two SEPARATE Metal executions of the same seeded update graph agree only to a few ulps
+    /// (Metal reductions are not bit-deterministic across runs), so they are compared within
+    /// `1e-6 + 1e-5·max|want|`; the guarded mutations (noise in an "off" update, a drifting noise
+    /// seed) move values by orders of magnitude more.
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}");
+        let scale = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let tol = 1e-6 + 1e-5 * scale;
+        let diff = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff <= tol, "{what}: max |diff| {diff} > tolerance {tol}");
+    }
+
+    /// AC3 (E1): with sigma 0 the update is the pre-sc-24826 update (clip → step → eval, no noise
+    /// call), over several updates — within [`assert_close`], as the two runs are separate Metal
+    /// executions.
     #[test]
-    fn sigma_zero_update_matches_the_legacy_update_bit_for_bit() {
+    fn sigma_zero_update_matches_the_legacy_update() {
         let (new, _, _) = run(NetworkType::Lora, 0.0, 3);
         let (_, _, mut legacy) = setup(NetworkType::Lora);
         let mut opt = TrainOptimizer::from_config("adamw", 1e-2, 0.0).unwrap();
@@ -1809,17 +1826,17 @@ mod weight_noise_update_tests {
             eval(legacy.values()).unwrap();
         }
         for (k, v) in &legacy {
-            assert_eq!(vals(v), vals(&new[k]), "{k} differs at sigma 0");
+            assert_close(&vals(&new[k]), &vals(v), &format!("{k} at sigma 0"));
         }
     }
 
-    /// E4: two seeded noisy runs produce the same adapter.
+    /// E4: two seeded noisy runs produce the same adapter (within [`assert_close`]).
     #[test]
     fn seeded_noisy_runs_are_reproducible() {
         let (a, _, _) = run(NetworkType::Lora, 0.0125, 3);
         let (b, _, _) = run(NetworkType::Lora, 0.0125, 3);
         for (k, v) in &a {
-            assert_eq!(vals(v), vals(&b[k]), "{k} not reproducible");
+            assert_close(&vals(&b[k]), &vals(v), &format!("{k} reproducible"));
         }
     }
 

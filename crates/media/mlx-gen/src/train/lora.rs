@@ -1126,6 +1126,26 @@ mod adapter_noise_tests {
         (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
     }
 
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// Two SEPARATE Metal executions of the same seeded graph (optimizer steps, norm/rms
+    /// reductions) agree only to the last few ulps — Metal reductions are not bit-deterministic
+    /// across runs (run 37255363552 differed by 1 ulp). Compare such results within
+    /// `1e-6 + 1e-5·max|want|`; every mutation these tests guard (wrong noise index, noise before
+    /// the step, a drifted seed, noise leaking into an "off" run) moves values by ≥ 1e-4.
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        let scale = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let tol = 1e-6 + 1e-5 * scale;
+        let diff = max_abs_diff(got, want);
+        assert!(diff <= tol, "{what}: max |diff| {diff} > tolerance {tol}");
+    }
+
     /// Zero gradients over two adapter tensors (8192 elements each) — whatever `apply_gradient_noise`
     /// leaves in them IS the noise.
     fn zero_grads() -> LoraParams {
@@ -1298,9 +1318,14 @@ mod adapter_noise_tests {
         mlx_rs::transforms::eval(p.values()).unwrap();
     }
 
-    /// E1: with both techniques off the shared update is the pre-epic-2123 update bit for bit.
+    /// E1: with both techniques off the shared update is the pre-epic-2123 update (clip → step →
+    /// eval, no noise). Compared within [`assert_close`]: the two runs are separate Metal
+    /// executions.
+    ///
+    /// *Mutation that reds this:* any noise leaking into an "off" update (e.g. forcing a non-zero
+    /// eta inside `adapter_optimizer_update`).
     #[test]
-    fn techniques_off_update_matches_the_legacy_update_bit_for_bit() {
+    fn techniques_off_update_matches_the_legacy_update() {
         let cfg = TrainingConfig::default();
         let (mut new, mut old) = (params(), params());
         let mut o1 = TrainOptimizer::from_config("adamw", 1e-2, 0.0).unwrap();
@@ -1311,7 +1336,11 @@ mod adapter_noise_tests {
             legacy_update(&mut o2, &mut old, &g);
         }
         for (k, v) in &old {
-            assert_eq!(host(v), host(&new[k]), "{k} differs with techniques off");
+            assert_close(
+                &host(&new[k]),
+                &host(v),
+                &format!("{k} with techniques off"),
+            );
         }
     }
 
@@ -1336,12 +1365,16 @@ mod adapter_noise_tests {
             apply_weight_noise(&mut old, 0.0125, 42, t).unwrap();
         }
         for (k, v) in &old {
-            assert_eq!(host(v), host(&new[k]), "{k}");
+            assert_close(&host(&new[k]), &host(v), k);
         }
     }
 
     /// Gradient noise reaches the optimizer: with eta > 0 the stepped factors differ from the clean
-    /// update, and two seeded runs agree bit for bit (E4).
+    /// update by far more than run-to-run Metal jitter, and two seeded runs agree within
+    /// [`assert_close`] (E4).
+    ///
+    /// *Mutations that red this:* dropping the gradient noise (no difference from clean); an
+    /// unseeded / drifting noise stream (the two noisy runs diverge far beyond the tolerance).
     #[test]
     fn gradient_noise_changes_the_update_reproducibly() {
         let run = |eta: f32| {
@@ -1357,7 +1390,12 @@ mod adapter_noise_tests {
             }
             host(&p["blk.to_q.lora_a"])
         };
-        assert_ne!(run(0.0), run(0.05), "gradient noise must reach the step");
-        assert_eq!(run(0.05), run(0.05), "seeded gradient noise must reproduce");
+        let (clean, a, b) = (run(0.0), run(0.05), run(0.05));
+        let effect = max_abs_diff(&a, &clean);
+        assert!(
+            effect > 1e-3,
+            "gradient noise must reach the step (max |diff| {effect})"
+        );
+        assert_close(&b, &a, "seeded gradient noise must reproduce");
     }
 }
