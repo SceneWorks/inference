@@ -32,26 +32,29 @@ function Save-Snapshot([string]$Name) {
     $at = (Get-Date).ToUniversalTime().ToString('o')
     try {
         $processes = @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 15 -ErrorAction Stop)
-        $rows = @($processes | Where-Object {
-            $_.Name -match '^(?:sceneworks-(?:rust-api|api|worker)|candle[^.]*|node|python(?:3(?:\.\d+)?)?|powershell|pwsh|cmd|cargo|rustc|ffmpeg|nvidia-smi)\.exe$'
-        } | ForEach-Object {
+        $rows = @($processes | ForEach-Object {
             $created = if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }
             $command = $_.CommandLine
             $exe = $_.ExecutablePath
             $length = if ($null -eq $command) { $null } else { $command.Length }
             $digest = Hash-Text $command
             $rootMatch = Has-Old-Root $command
+            $exeRootMatch = Has-Old-Root $exe
             $workerMatch = $null -ne $command -and $command.IndexOf($env:YUE2_RELEASE_WORKER_ID, [StringComparison]::OrdinalIgnoreCase) -ge 0
-            @{ pid = $_.ProcessId; parentPid = $_.ParentProcessId; name = $_.Name;
-               createdUtc = $created; executablePath = $exe;
-               commandLineAvailable = ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command));
-               commandLineLength = $length;
-               commandLineSha256 = $digest;
-               oldRootInCommandLine = $rootMatch;
-               workerIdInCommandLine = $workerMatch }
+            $relevant = $_.Name -match '^(?:sceneworks-(?:rust-api|api|worker)|candle[^.]*|node|python(?:3(?:\.\d+)?)?|powershell|pwsh|cmd|cargo|rustc|ffmpeg|nvidia-smi)\.exe$'
+            if ($relevant -or $rootMatch -or $exeRootMatch -or $workerMatch -or $_.ProcessId -eq $PID) {
+                @{ pid = $_.ProcessId; parentPid = $_.ParentProcessId; name = $_.Name;
+                   createdUtc = $created; executablePath = $exe;
+                   commandLineAvailable = ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command));
+                   commandLineLength = $length;
+                   commandLineSha256 = $digest;
+                   oldRootInCommandLine = $rootMatch;
+                   oldRootInExecutable = $exeRootMatch;
+                   workerIdInCommandLine = $workerMatch }
+            }
         })
         $result = @{ queriedUtc = $at; completedUtc = (Get-Date).ToUniversalTime().ToString('o');
-                     complete = $true; rows = $rows }
+                     complete = $true; collectorPid = $PID; totalCimCount = $processes.Count; rows = $rows }
     } catch {
         $result = @{ queriedUtc = $at; completedUtc = (Get-Date).ToUniversalTime().ToString('o');
                      complete = $false; error = $_.Exception.Message; rows = @() }

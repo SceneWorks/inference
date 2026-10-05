@@ -68,6 +68,10 @@ def validate_snapshot(payload: object, old_root: str = OLD_RUN_ROOT,
     require(isinstance(payload, dict) and payload.get("complete") is True and
             isinstance(payload.get("rows"), list) and "error" not in payload,
             "Win32_Process snapshot incomplete")
+    collector_pid, total = payload.get("collectorPid"), payload.get("totalCimCount")
+    require(type(collector_pid) is int and collector_pid > 0 and type(total) is int and
+            total >= len(payload["rows"]) >= 1,
+            "Win32_Process enumeration has no collector/completeness witness")
     queried = utc(payload.get("queriedUtc"))
     completed = utc(payload.get("completedUtc"))
     require(queried <= completed and (completed - queried).total_seconds() <= 30,
@@ -75,9 +79,10 @@ def validate_snapshot(payload: object, old_root: str = OLD_RUN_ROOT,
     seen = set()
     old_matches = []
     preexisting = 0
+    collector = None
     for row in payload["rows"]:
-        require(isinstance(row, dict) and RELEVANT_NAME.fullmatch(str(row.get("name", ""))),
-                "unrecognized process candidate")
+        require(isinstance(row, dict) and isinstance(row.get("name"), str) and
+                bool(row["name"].strip()), "unnamed process candidate")
         pid, parent = row.get("pid"), row.get("parentPid")
         require(type(pid) is int and pid > 0 and type(parent) is int and parent >= 0 and
                 pid not in seen, "candidate PID/parent map incomplete or duplicated")
@@ -86,9 +91,14 @@ def validate_snapshot(payload: object, old_root: str = OLD_RUN_ROOT,
         require(created <= completed, "candidate creation is after snapshot")
         require("commandLine" not in row and type(row.get("commandLineAvailable")) is bool and
                 type(row.get("oldRootInCommandLine")) is bool and
+                type(row.get("oldRootInExecutable")) is bool and
                 type(row.get("workerIdInCommandLine")) is bool,
                 "raw command line leaked or ownership markers missing")
         executable = row.get("executablePath")
+        require((RELEVANT_NAME.fullmatch(row["name"]) is not None or
+                 row["oldRootInCommandLine"] or row["oldRootInExecutable"] or
+                 row["workerIdInCommandLine"] or pid == collector_pid),
+                "unreviewed nonmatching process row")
         available = row["commandLineAvailable"]
         digest, length = row.get("commandLineSha256"), row.get("commandLineLength")
         if available:
@@ -96,7 +106,7 @@ def validate_snapshot(payload: object, old_root: str = OLD_RUN_ROOT,
                     re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
                     "candidate command-line digest missing")
         matches = (isinstance(executable, str) and has_old_root(executable, old_root)) or \
-            row["oldRootInCommandLine"] or row["workerIdInCommandLine"]
+            row["oldRootInCommandLine"] or row["oldRootInExecutable"] or row["workerIdInCommandLine"]
         if matches:
             old_matches.append({"pid": pid, "createdUtc": row["createdUtc"], "name": row["name"]})
         if not (isinstance(executable, str) and PureWindowsPath(executable).is_absolute() and available):
@@ -104,9 +114,17 @@ def validate_snapshot(payload: object, old_root: str = OLD_RUN_ROOT,
                     "newer candidate executable or command line inaccessible")
             preexisting += 1
         require(worker_id == OLD_WORKER_ID, "worker identity source mismatch")
+        if pid == collector_pid:
+            require(row["name"].casefold() in ("powershell.exe", "pwsh.exe") and
+                    isinstance(executable, str) and
+                    PureWindowsPath(executable).name.casefold() == row["name"].casefold(),
+                    "collector PID is not the accessible PowerShell process")
+            collector = {"pid": pid, "name": row["name"], "createdUtc": row["createdUtc"],
+                         "executablePath": executable}
+    require(collector is not None, "collector process missing from complete CIM enumeration")
     return {"queriedUtc": payload["queriedUtc"], "completedUtc": payload["completedUtc"],
             "candidateCount": len(seen), "preexistingIncompleteCandidates": preexisting,
-            "oldOwnedMatches": old_matches}
+            "collector": collector, "totalCimCount": total, "oldOwnedMatches": old_matches}
 
 
 def validate_pair(before: object, after: object) -> dict:
@@ -114,6 +132,8 @@ def validate_pair(before: object, after: object) -> dict:
     second = validate_snapshot(after)
     separation = (utc(second["queriedUtc"]) - utc(first["completedUtc"])).total_seconds()
     require(2 <= separation <= 30, "process snapshots overlap, are too close, or are stale")
+    require(first["collector"] == second["collector"],
+            "collector PID/name/creation changed between process snapshots")
     require(not first["oldOwnedMatches"] and not second["oldOwnedMatches"],
             "old app install process or worker remains present")
     return {"before": first, "after": second, "noOldOwnedMatch": True}
@@ -200,7 +220,7 @@ def main() -> int:
         if args.evidence.is_dir():
             (args.evidence / "refusal.json").write_text(json.dumps({"releasedNow": False,
                 "reason": str(error)}, indent=2) + "\n", encoding="utf-8")
-        print("yue2-app-install-release-probe: refused; inspect private artifact", file=sys.stderr)
+        print("yue2-app-install-release-probe: refused; inspect sanitized artifact", file=sys.stderr)
         return 1
 
 

@@ -280,7 +280,7 @@ jobs:
           for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
           if not defined REVIEWED_PYTHON exit /b 1
           "%REVIEWED_PYTHON%" control\scripts\ci\yue2_app_install_release_probe.py --evidence "%RELEASE_EVIDENCE%" --app app --engine engine --control control
-      - name: Upload private read-only process and physical receipts
+      - name: Upload sanitized read-only process and physical receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

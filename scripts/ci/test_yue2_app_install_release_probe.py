@@ -22,11 +22,18 @@ def row(pid=100, name="node.exe", created="2026-10-05T05:00:00+00:00",
             "commandLineLength": len(command) if command is not None else None,
             "commandLineSha256": sha256(command.encode()).hexdigest() if command is not None else None,
             "oldRootInCommandLine": MODULE.has_old_root(command, MODULE.OLD_RUN_ROOT) if command else False,
+            "oldRootInExecutable": MODULE.has_old_root(executable, MODULE.OLD_RUN_ROOT) if executable else False,
             "workerIdInCommandLine": MODULE.OLD_WORKER_ID.casefold() in command.casefold() if command else False}
 
 
-def snapshot(rows, start="2026-10-05T06:00:00+00:00", end="2026-10-05T06:00:01+00:00"):
-    return {"complete": True, "queriedUtc": start, "completedUtc": end, "rows": rows}
+def snapshot(rows, start="2026-10-05T06:00:00+00:00", end="2026-10-05T06:00:01+00:00",
+             witness=True):
+    collector = row(pid=999, name="powershell.exe", created="2026-10-05T05:59:00+00:00",
+                    executable=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                    command=r"powershell.exe -File C:\new-release-check\collector.ps1")
+    retained = rows + ([collector] if witness else [])
+    return {"complete": True, "queriedUtc": start, "completedUtc": end,
+            "collectorPid": 999, "totalCimCount": len(retained) + 20, "rows": retained}
 
 
 class ReleaseProbeTests(unittest.TestCase):
@@ -53,6 +60,15 @@ class ReleaseProbeTests(unittest.TestCase):
         worker = snapshot([row(command='node.exe --worker-id ' + MODULE.OLD_WORKER_ID)])
         with self.assertRaisesRegex(ValueError, "old app install"):
             MODULE.validate_pair(worker, snapshot([row()], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00"))
+        arbitrary_exe = snapshot([row(name="git.exe", executable=MODULE.OLD_RUN_ROOT + r"\tools\git.exe")])
+        with self.assertRaisesRegex(ValueError, "old app install"):
+            MODULE.validate_pair(arbitrary_exe, snapshot([], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00"))
+        arbitrary_command = snapshot([row(name="git.exe", command="git.exe --work-tree " + MODULE.OLD_RUN_ROOT)])
+        with self.assertRaisesRegex(ValueError, "old app install"):
+            MODULE.validate_pair(arbitrary_command, snapshot([], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00"))
+        arbitrary_worker = snapshot([row(name="git.exe", command="git.exe --worker " + MODULE.OLD_WORKER_ID)])
+        with self.assertRaisesRegex(ValueError, "old app install"):
+            MODULE.validate_pair(arbitrary_worker, snapshot([], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00"))
 
     def test_new_candidate_with_inaccessible_identity_refuses_but_preexisting_foreign_is_allowed(self):
         unknown = row(command=None)
@@ -73,6 +89,16 @@ class ReleaseProbeTests(unittest.TestCase):
             MODULE.validate_snapshot(snapshot([broken]))
         with self.assertRaisesRegex(ValueError, "overlap"):
             MODULE.validate_pair(snapshot([row()]), snapshot([row()]))
+        with self.assertRaisesRegex(ValueError, "collector/completeness witness"):
+            MODULE.validate_snapshot(snapshot([], witness=False))
+        wrong_name = snapshot([])
+        wrong_name["rows"][-1]["name"] = "cmd.exe"
+        with self.assertRaisesRegex(ValueError, "collector PID is not"):
+            MODULE.validate_snapshot(wrong_name)
+        recycled = snapshot([row()], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00")
+        recycled["rows"][-1]["createdUtc"] = "2026-10-05T06:00:02+00:00"
+        with self.assertRaisesRegex(ValueError, "collector PID/name/creation changed"):
+            MODULE.validate_pair(snapshot([row()]), recycled)
 
     def test_workflow_is_opt_in_and_collects_no_model(self):
         workflow = (SOURCE.parents[2] / ".github/workflows/yue2-app-precision-profile.yml").read_text(encoding="utf-8")
@@ -90,6 +116,11 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertIn("Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 15", collector)
         self.assertIn("commandLineSha256 = $digest", collector)
         self.assertIn("oldRootInCommandLine = $rootMatch", collector)
+        self.assertLess(collector.index("$rootMatch = Has-Old-Root $command"),
+                        collector.index("$relevant = $_.Name -match"))
+        self.assertIn("if ($relevant -or $rootMatch -or $exeRootMatch -or $workerMatch -or $_.ProcessId -eq $PID)", collector)
+        self.assertIn("totalCimCount = $processes.Count", collector)
+        self.assertIn("collectorPid = $PID", collector)
         self.assertNotIn("commandLine = $command", collector)
         self.assertNotIn("Stop-Process", collector)
         self.assertNotIn("Set-CimInstance", collector)
