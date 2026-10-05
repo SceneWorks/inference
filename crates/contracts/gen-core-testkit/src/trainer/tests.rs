@@ -466,15 +466,54 @@ fn declared_but_rejected_weight_noise_fails_the_validate_check() {
     );
 }
 
+/// sc-24827: a trainer that declares weight noise but silently accepts an undeclared gradient-noise
+/// request fails the validate check AND the train-entry refusal check (the gradient probe runs
+/// independently of the weight-noise one).
+#[test]
+fn silently_ignored_gradient_noise_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques.weight_noise = true;
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.gradient_noise == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("gradient_noise_eta > 0") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-24827: a trainer declaring the full adapter-noise pair passes every technique check and the
+/// whole conformance suite.
+#[test]
+fn declared_adapter_noise_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques = gen_core::TrainingTechniques::ADAPTER_NOISE;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+    trainer_conformance(make, &profile(&tmp));
+}
+
 /// sc-2127: a trainer that does not declare resolution buckets but silently accepts them (it
-/// rubber-stamps every technique knob; weight noise is declared so that probe passes) fails the
+/// rubber-stamps every technique knob; both noise techniques are declared so those probes pass)
+/// fails the
 /// validate check AND the train-entry refusal check, naming the bucket flag.
 #[test]
 fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let make = || -> Box<dyn Trainer> {
         let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
-        stub.desc.techniques.weight_noise = true;
+        stub.desc.techniques = gen_core::TrainingTechniques::ADAPTER_NOISE;
         Box::new(stub)
     };
     let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();

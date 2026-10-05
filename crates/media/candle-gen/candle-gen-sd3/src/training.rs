@@ -61,10 +61,12 @@ fn descriptor_for(variant: Variant) -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -413,6 +415,7 @@ impl Sd3Trainer {
                     update_idx,
                     total_updates,
                     warmup_updates,
+                    cfg.seed,
                 )?;
                 update_idx += 1;
             }
@@ -446,6 +449,7 @@ impl Sd3Trainer {
                 update_idx,
                 total_updates,
                 warmup_updates,
+                cfg.seed,
             )?;
         }
         on_progress(TrainingProgress::Saving);

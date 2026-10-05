@@ -59,8 +59,8 @@ use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
-    TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, LoraParams, TrainAdapter,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::weights::Weights;
@@ -202,12 +202,14 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // every DiT weight and writes a full checkpoint rather than an adapter.
         supports_full_finetune: true,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per item per bucket
         // (each carrying its own latent grid), sampled by `BucketSchedule`, on both the adapter and
         // the full fine-tune paths.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -586,13 +588,8 @@ impl MageFlowTrainer {
                         .expect("an update fires only after accumulation"),
                     window,
                 )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
             }
 

@@ -212,11 +212,13 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
         // sc-2127 (epic 2123): honors `resolution_buckets` — the shared family backbone caches one
         // latent (+ its edge's `time_ids`) per bucket and walks them through a `BucketSchedule`.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }

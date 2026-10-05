@@ -68,6 +68,10 @@ pub fn control_trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 adapter noise (sc-24827) perturbs LoRA/LoKr factors and their gradients only.
+        // This trainer has no adapter: it trains a full-weight ControlNet branch (~3B params copied
+        // from the DiT blocks), so weight/gradient noise requests are refused by the shared floor
+        // rather than silently ignored or applied to non-adapter weights (E3/E5).
         // sc-2127 (epic 2123): multi-resolution buckets — the target AND control image are each
         // encoded once per bucket edge, and the trainer walks them through a `BucketSchedule`.
         techniques: gen_core::train::TrainingTechniques {

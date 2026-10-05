@@ -284,6 +284,9 @@ struct ExpertState {
     update_idx: u32,
     total_updates: u32,
     warmup_updates: u32,
+    /// Epic 2123 (sc-24827): this expert's adapter-noise RNG seed — the same per-expert seed its
+    /// factors were initialised from, so the experts draw independent weight/gradient noise.
+    noise_seed: u64,
     /// `"high_noise"` / `"low_noise"` — the saved-file suffix + the [`MoeExpert`] the inference loader
     /// merges this onto.
     suffix: &'static str,
@@ -462,11 +465,13 @@ impl TrainVariant {
             supports_control: false,
             supports_full_finetune: false,
             max_reference_images: 0,
+            // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+            // update.
             // sc-2127 (epic 2123): spatial multi-resolution buckets — one cached still latent per
             // bucket edge, per-bucket RoPE, sampled through `BucketSchedule`.
             techniques: gen_core::train::TrainingTechniques {
                 resolution_buckets: true,
-                ..gen_core::train::TrainingTechniques::NONE
+                ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
             },
         }
     }
@@ -885,6 +890,7 @@ impl WanMoeTrainer {
                 update_idx: 0,
                 total_updates,
                 warmup_updates,
+                noise_seed: seed,
                 suffix,
             });
         }
@@ -1029,9 +1035,9 @@ impl WanMoeTrainer {
     }
 }
 
-/// Fire one optimizer update for `ex`: delegates the average-clip-step to the shared
-/// [`flow_match::apply_update`] (over `ex`'s own optimizer/accumulation/schedule), then advances the
-/// expert's update counter.
+/// Fire one optimizer update for `ex`: delegates the average-clip-(noise)-step to the shared
+/// [`flow_match::apply_update`] (over `ex`'s own optimizer/accumulation/schedule and adapter-noise
+/// seed), then advances the expert's update counter.
 fn apply_update(ex: &mut ExpertState, micro_count: u32, cfg: &TrainingConfig) -> Result<()> {
     flow_match::apply_update(
         &mut ex.opt,
@@ -1042,6 +1048,7 @@ fn apply_update(ex: &mut ExpertState, micro_count: u32, cfg: &TrainingConfig) ->
         ex.update_idx,
         ex.total_updates,
         ex.warmup_updates,
+        ex.noise_seed,
     )?;
     ex.update_idx += 1;
     Ok(())

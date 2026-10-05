@@ -23,10 +23,12 @@ use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{effective_weight_decay, noise_seed, sample_noise};
 use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
-    SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
+    adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
+    AdapterKind, LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use candle_gen::train::optim::{
+    accumulate_grads, accumulation_divisor, scale_grads, TrainOptimizer,
+};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
@@ -56,10 +58,12 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -177,16 +181,6 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn accumulation_divisor(micro_step: u32, configured: u32) -> u32 {
-    let configured = configured.max(1);
-    let pending = micro_step % configured;
-    if pending == 0 {
-        configured
-    } else {
-        pending
-    }
 }
 
 fn packed_component(root: &Path, component: &str) -> Result<bool> {
@@ -412,8 +406,8 @@ impl KolorsTrainer {
                     .expect("an update has accumulated gradients");
                 let divisor = accumulation_divisor(step, accum);
                 scale_grads(&mut grads, &set.vars, 1.0 / divisor as f64)?;
-                clip_grad_norm(&mut grads, &set.vars, 1.0)?;
-                optimizer.step(&grads)?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_step(&mut optimizer, &mut grads, &set, cfg, update, cfg.seed)?;
                 update += 1;
             }
             on_progress(TrainingProgress::Training {

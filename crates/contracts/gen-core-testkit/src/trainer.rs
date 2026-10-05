@@ -166,12 +166,12 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
         }
     }
 
-    // Epic 2123 (sc-24826) technique honesty: a technique the descriptor does not declare must be
-    // refused by `validate()` with a typed `Unsupported` — never silently ignored (E3). A declared
-    // technique must be accepted on the plain adapter request, and weight noise must still be
-    // refused for a full base fine-tune (E5). The shared `validate_training_techniques` floor
-    // enforces all three; assert the trainer routes through it.
-    check_weight_noise_validate(t, &ok)?;
+    // Epic 2123 (sc-24826/sc-24827) technique honesty: a technique the descriptor does not declare
+    // must be refused by `validate()` with a typed `Unsupported` — never silently ignored (E3). A
+    // declared technique must be accepted on the plain adapter request, and weight/gradient noise
+    // must still be refused for a full base fine-tune (E5). The shared
+    // `validate_training_techniques` floor enforces all three; assert the trainer routes through it.
+    check_technique_validate(t, &ok)?;
     check_resolution_buckets_validate(t, &ok)?;
 
     // Negative (sc-24161): instruction-edit datasets. A trainer that does NOT advertise
@@ -214,42 +214,75 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
 
 /// The suggested upstream weight-noise strength, used as the "technique on" probe value.
 const WEIGHT_NOISE_PROBE_SIGMA: f32 = 0.0125;
+/// The suggested upstream gradient-noise eta (sc-24827), used as the "technique on" probe value.
+const GRADIENT_NOISE_PROBE_ETA: f32 = 0.01;
 
-/// Weight-noise half of [`check_trainer_validate`] (sc-24826) — `ok` is the accepted base request.
-fn check_weight_noise_validate(t: &dyn Trainer, ok: &TrainingRequest) -> Result<(), String> {
+/// One optional training technique the honesty / refusal checks probe (epic 2123): its display
+/// name, the config knob it turns on, and the descriptor flag that declares it.
+struct TechniqueProbe {
+    name: &'static str,
+    knob: &'static str,
+    enable: fn(&mut TrainingRequest),
+    declared: fn(&gen_core::TrainingTechniques) -> bool,
+}
+
+const TECHNIQUE_PROBES: &[TechniqueProbe] = &[
+    TechniqueProbe {
+        name: "weight_noise",
+        knob: "weight_noise_sigma",
+        enable: |r| r.config.weight_noise_sigma = WEIGHT_NOISE_PROBE_SIGMA,
+        declared: |t| t.weight_noise,
+    },
+    TechniqueProbe {
+        name: "gradient_noise",
+        knob: "gradient_noise_eta",
+        enable: |r| r.config.gradient_noise_eta = GRADIENT_NOISE_PROBE_ETA,
+        declared: |t| t.gradient_noise,
+    },
+];
+
+/// Technique half of [`check_trainer_validate`] (sc-24826 weight noise, sc-24827 gradient noise) —
+/// `ok` is the accepted base request. For each probed technique: an undeclared one must be refused
+/// by `validate()` with a typed `Unsupported`, a declared one accepted on the plain adapter request,
+/// and either one refused for a full base fine-tune (both are adapter-only, E5).
+fn check_technique_validate(t: &dyn Trainer, ok: &TrainingRequest) -> Result<(), String> {
     let desc = t.descriptor();
     let id = desc.id;
-    let mut noisy = ok.clone();
-    noisy.config.weight_noise_sigma = WEIGHT_NOISE_PROBE_SIGMA;
-    match (t.validate(&noisy), desc.techniques.weight_noise) {
-        (Ok(()), false) => {
-            return Err(format!(
-                "technique-honesty[{id}]: a weight-noise request (weight_noise_sigma > 0) was \
-                 accepted by validate() despite techniques.weight_noise == false — it must be \
-                 refused, not silently ignored (epic 2123 E3)"
-            ))
+    for probe in TECHNIQUE_PROBES {
+        let (name, knob) = (probe.name, probe.knob);
+        let declared = (probe.declared)(&desc.techniques);
+        let mut on = ok.clone();
+        (probe.enable)(&mut on);
+        match (t.validate(&on), declared) {
+            (Ok(()), false) => {
+                return Err(format!(
+                    "technique-honesty[{id}]: a {name} request ({knob} > 0) was accepted by \
+                     validate() despite techniques.{name} == false — it must be refused, not \
+                     silently ignored (epic 2123 E3)"
+                ))
+            }
+            (Err(Error::Unsupported(_)), false) | (Ok(()), true) => {}
+            (Err(other), false) => {
+                return Err(format!(
+                    "technique-honesty[{id}]: an unsupported {name} request must be refused with \
+                     a typed Error::Unsupported, got {other:?}"
+                ))
+            }
+            (Err(e), true) => {
+                return Err(format!(
+                    "technique-honesty[{id}]: a {name} request was rejected by validate() despite \
+                     techniques.{name} == true: {e}"
+                ))
+            }
         }
-        (Err(Error::Unsupported(_)), false) | (Ok(()), true) => {}
-        (Err(other), false) => {
+        let mut full = on;
+        full.config.full_finetune = true;
+        if t.validate(&full).is_ok() {
             return Err(format!(
-                "technique-honesty[{id}]: an unsupported weight-noise request must be refused with \
-                 a typed Error::Unsupported, got {other:?}"
-            ))
+                "technique-honesty[{id}]: {name} combined with a full base fine-tune was accepted \
+                 by validate() — it must touch adapter factors only (epic 2123 E5)"
+            ));
         }
-        (Err(e), true) => {
-            return Err(format!(
-            "technique-honesty[{id}]: a weight-noise request was rejected by validate() despite \
-                 techniques.weight_noise == true: {e}"
-        ))
-        }
-    }
-    let mut full = noisy;
-    full.config.full_finetune = true;
-    if t.validate(&full).is_ok() {
-        return Err(format!(
-            "technique-honesty[{id}]: weight noise combined with a full base fine-tune was \
-             accepted by validate() — weight noise must touch adapter factors only (epic 2123 E5)"
-        ));
     }
     Ok(())
 }
@@ -314,28 +347,31 @@ fn check_resolution_buckets_validate(t: &dyn Trainer, ok: &TrainingRequest) -> R
     Ok(())
 }
 
-/// **Technique refusal at the `train` entry point** (epic 2123 E3, sc-24826). A caller that skips
-/// `validate` and calls `train` directly with a technique the trainer does not declare must get a
-/// typed `Err(Error::Unsupported)` **before training starts** — no `Caching`/`Training`/`Saving`
-/// event, so nothing is loaded, cached or written. Every undeclared technique is probed on its own
-/// fresh trainer; a trainer that declares every probed technique passes vacuously (its positive
-/// path is covered by [`check_trainer_progress`] / [`check_trainer_bucketed_progress`]).
+/// **Technique refusal at the `train` entry point** (epic 2123 E3, sc-24826/sc-24827/sc-2127). A
+/// caller that skips `validate` and calls `train` directly with a technique the trainer does not
+/// declare (weight noise, gradient noise, resolution buckets) must get a typed
+/// `Err(Error::Unsupported)` **before training starts** — no `Caching`/`Training`/`Saving` event, so
+/// nothing is loaded, cached or written. Each undeclared technique is probed on a fresh trainer; a
+/// trainer that declares every probed technique passes vacuously (its positive path is covered by
+/// [`check_trainer_progress`] / [`check_trainer_bucketed_progress`]).
 pub fn check_trainer_technique_refusal(
     make: &dyn Fn() -> Box<dyn Trainer>,
     profile: &TrainerProfile,
 ) -> Result<(), String> {
-    let techniques = make().descriptor().techniques;
-    if !techniques.weight_noise {
+    for probe in TECHNIQUE_PROBES {
+        if (probe.declared)(&make().descriptor().techniques) {
+            continue;
+        }
         let mut req = base_request(profile);
-        req.config.weight_noise_sigma = WEIGHT_NOISE_PROBE_SIGMA;
+        (probe.enable)(&mut req);
         refuse_at_train(
             make,
             req,
-            "weight_noise_sigma > 0",
-            "techniques.weight_noise",
+            &format!("{} > 0", probe.knob),
+            &format!("techniques.{}", probe.name),
         )?;
     }
-    if !techniques.resolution_buckets {
+    if !make().descriptor().techniques.resolution_buckets {
         let mut req = base_request(profile);
         req.config.resolution_buckets = probe_buckets(&req.config);
         refuse_at_train(
@@ -590,8 +626,8 @@ pub fn check_trainer_registry(
 /// Run the full trainer conformance suite. `make` constructs a fresh trainer (it is invoked several
 /// times — once for the validate/registry pair, once for the progress run, once per cancellation
 /// path, once per undeclared-technique refusal probe, and once for the bucketed run of a
-/// bucket-capable trainer — because `train` is `&mut self` and several families are single-use). Panics with every
-/// failure aggregated.
+/// bucket-capable trainer — because `train` is `&mut self` and several families are single-use).
+/// Panics with every failure aggregated.
 pub fn trainer_conformance(make: impl Fn() -> Box<dyn Trainer>, profile: &TrainerProfile) {
     let mut failures: Vec<String> = Vec::new();
 

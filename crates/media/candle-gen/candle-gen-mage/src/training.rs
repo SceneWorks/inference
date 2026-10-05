@@ -20,7 +20,8 @@ use candle_gen::train::flow_match::{
     validate_flow_match_request, velocity_loss,
 };
 use candle_gen::train::lora::{
-    build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost, LoraSet,
+    adapter_optimizer_step, build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost,
+    LoraSet,
 };
 use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
@@ -46,10 +47,12 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: true,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -454,8 +457,24 @@ impl MageTrainer {
                     step % accum
                 };
                 scale_grads(&mut grads, &vars, 1.0 / window as f64)?;
-                clip_grad_norm(&mut grads, &vars, 1.0)?;
-                optimizer.step(&grads)?;
+                match &surface {
+                    // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                    TrainSurface::Adapter(set) => adapter_optimizer_step(
+                        &mut optimizer,
+                        &mut grads,
+                        set,
+                        &req.config,
+                        update,
+                        req.config.seed,
+                    )?,
+                    // A full fine-tune trains base weights: both noise techniques are refused for
+                    // it by the shared `validate_training_techniques` floor, so the plain
+                    // clip + step is the whole update.
+                    TrainSurface::Full(_) => {
+                        clip_grad_norm(&mut grads, &vars, 1.0)?;
+                        optimizer.step(&grads)?;
+                    }
+                }
                 update += 1;
             }
             on_progress(TrainingProgress::Training {

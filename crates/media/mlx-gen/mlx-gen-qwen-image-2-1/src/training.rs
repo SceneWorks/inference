@@ -75,8 +75,8 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, factorization,
-    LoraParams, TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, factorization, LoraParams, TrainAdapter,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::{
@@ -86,7 +86,6 @@ use mlx_gen::{
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
-use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -739,11 +738,13 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // Instruction-edit datasets (sc-24161), capped at the render path's own reference limit —
         // the one constant `collect_references`/`validate_reference_count` enforce.
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
         // sc-2127 (epic 2123): honors `resolution_buckets` — every item (captioned or edit pair)
         // is cached once per bucket edge and the loop walks a `BucketSchedule`.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -2144,13 +2145,8 @@ impl QwenImage21Trainer {
                         .expect("an update fires only after accumulation"),
                     window,
                 )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
             }
 
@@ -2289,6 +2285,7 @@ mod lokr_rounding;
 mod tests {
     use super::*;
     use mlx_gen::WeightsSource;
+    use mlx_rs::optimizers::clip_grad_norm;
 
     use crate::transformer::Segment;
 
@@ -4233,5 +4230,109 @@ mod tests {
                 other => panic!("an overlay must be a typed Unsupported, got {other:?}"),
             }
         }
+    }
+}
+
+/// Epic 2123 (sc-24827) MLX call-site test — the REAL `train_impl` loop on the 1 MB tiny snapshot
+/// (tiny text encoder / VAE / DiT, one 64-px image, seconds): the loop invokes the shared adapter
+/// update's noise on real optimizer updates only.
+#[cfg(test)]
+mod adapter_noise_loop_tests {
+    use super::*;
+    use mlx_gen::train::lora::apply_weight_noise;
+    use mlx_gen::WeightsSource;
+
+    fn tiny_snapshot() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot")
+    }
+
+    /// Train `steps` micro-steps at `accum` with the given noise knobs; return the saved adapter's
+    /// factors keyed like the trainer's `LoraParams` (`{path}.lora_a` / `.lora_b`).
+    fn train(weight_sigma: f32, grad_eta: f32, steps: u32, accum: u32) -> LoraParams {
+        let data = tempfile::tempdir().unwrap();
+        let img = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8])
+        });
+        let img_path = data.path().join("a.png");
+        img.save(&img_path).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut trainer =
+            QwenImage21Trainer::load(&LoadSpec::new(WeightsSource::Dir(tiny_snapshot()))).unwrap();
+        let req = TrainingRequest {
+            items: vec![TrainingItem::captioned(img_path, "a swatch".into())],
+            config: TrainingConfig {
+                rank: 4,
+                alpha: 4.0,
+                steps,
+                gradient_accumulation: accum,
+                resolution: 64,
+                seed: 11,
+                learning_rate: 1e-2,
+                weight_noise_sigma: weight_sigma,
+                gradient_noise_eta: grad_eta,
+                ..Default::default()
+            },
+            output_dir: out.path().to_path_buf(),
+            file_name: "lora.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        let result = trainer.train_impl(&req, &mut |_| {}).unwrap();
+        assert_eq!(result.steps, steps);
+        let saved = Array::load_safetensors(&result.adapter_path).unwrap();
+        let params: LoraParams = saved
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let k = k
+                    .strip_suffix(".lora_A.weight")
+                    .map(|p| format!("{p}.lora_a"))
+                    .or_else(|| {
+                        k.strip_suffix(".lora_B.weight")
+                            .map(|p| format!("{p}.lora_b"))
+                    })?;
+                Some((Rc::from(k.as_str()), v))
+            })
+            .collect();
+        assert!(!params.is_empty(), "the adapter holds LoRA factors");
+        params
+    }
+
+    fn host(a: &Array) -> Vec<f32> {
+        let a = a.as_dtype(Dtype::Float32).unwrap();
+        eval([&a]).unwrap();
+        a.as_slice::<f32>().to_vec()
+    }
+
+    /// One real update (steps = accum = 2): the weight-noised run's adapter is bit-identical to the
+    /// clean run's adapter + `apply_weight_noise(.., update 0)`. Noise on micro-step 1 (or on every
+    /// micro-step) would change micro-step 2's gradient and add a second draw; a wrong update index
+    /// draws different noise; a loop that skips the shared update leaves the adapter clean.
+    ///
+    /// *Mutation that reds this:* restoring the inline clip → step → eval at the Qwen update site
+    /// (noise dropped), or firing the update every micro-step.
+    #[test]
+    fn train_loop_applies_weight_noise_once_per_real_update() {
+        let sigma = 0.05f32;
+        let mut clean = train(0.0, 0.0, 2, 2);
+        let noisy = train(sigma, 0.0, 2, 2);
+        apply_weight_noise(&mut clean, sigma, 11, 0).unwrap();
+        assert_eq!(clean.len(), noisy.len());
+        for (k, v) in &clean {
+            assert_eq!(host(v), host(&noisy[k]), "{k}");
+        }
+    }
+
+    /// Gradient noise reaches the loop's optimizer step and reproduces under the job seed.
+    #[test]
+    fn train_loop_applies_gradient_noise_reproducibly() {
+        let clean = train(0.0, 0.0, 2, 1);
+        let a = train(0.0, 0.05, 2, 1);
+        let b = train(0.0, 0.05, 2, 1);
+        let mut differs = false;
+        for (k, v) in &a {
+            assert_eq!(host(v), host(&b[k]), "{k} not reproducible");
+            differs |= host(v) != host(&clean[k]);
+        }
+        assert!(differs, "gradient noise must reach the trained adapter");
     }
 }

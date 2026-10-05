@@ -59,10 +59,12 @@ use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
 use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
-    LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
+    adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
+    AdapterKind, LoraHost, LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use candle_gen::train::optim::{
+    accumulate_grads, accumulation_divisor, scale_grads, TrainOptimizer,
+};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 
@@ -530,10 +532,12 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -839,9 +843,13 @@ impl SdxlTrainer {
                 let mut avg = accumulated
                     .take()
                     .expect("an update fires only after accumulation");
-                scale_grads(&mut avg, &lora_set.vars, 1.0 / accum as f64)?;
-                clip_grad_norm(&mut avg, &lora_set.vars, 1.0)?;
-                opt.step(&avg)?;
+                // Average by the window's ACTUAL micro-step count (F-017): the final flush at
+                // `step == cfg.steps` with `steps % accum != 0` holds fewer than `accum` grads, and
+                // a `1/accum` scale would down-weight that tail update (and its gradient noise).
+                let divisor = accumulation_divisor(step, accum);
+                scale_grads(&mut avg, &lora_set.vars, 1.0 / divisor as f64)?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_step(&mut opt, &mut avg, &lora_set, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
             }
 
