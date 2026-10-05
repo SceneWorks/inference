@@ -30,6 +30,8 @@
 pub mod checkpoint;
 pub mod dataset;
 pub mod flow_match;
+// Deterministic formula weights for the sc-24833 latent-perceptual parity tests.
+pub mod formula;
 pub mod gradient_checkpoint;
 pub mod lora;
 /// The shared inference-side adapter-merge skeleton (sc-8998 / F-018): the format-parsing +
@@ -41,5 +43,8 @@ pub mod optim;
 // `mlx_gen::train::perceptual`.
 pub mod perceptual;
 pub mod schedule;
+// The sc-24833 latent-space perceptual losses (E-LatentLPIPS, FLUX.2 VAE anchor).
+pub mod latent_lpips;
+pub mod vae_anchor;
 // TAESD-family tiny differentiable x0 decoders for the perceptual path.
 pub mod tae;
