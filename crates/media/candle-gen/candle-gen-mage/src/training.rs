@@ -72,7 +72,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
 /// 128-channel / 16× latent space has no tiny decoder. Runs [`MageVae::decode_differentiable`]
 /// (every op has a candle backward) and maps the raw `[-1, 1]` RGB to NHWC `[0, 1]`. Candle has no
 /// activation-checkpoint primitive for a graph inside one `backward()`, so the decode's activations
-/// stay on the tape until the step's backward; [`MageDecoderSpec::footprint`] budgets for that.
+/// stay on the tape until the step's backward; the builder footprint (`MageDecoderSpec`) budgets for that.
 pub struct MageX0Decoder {
     vae: MageVae,
 }
