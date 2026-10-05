@@ -13,7 +13,7 @@ on:
         type: boolean
         required: false
         default: false
-        description: Read-only release observation for the stopped CUDA install run; no capture or model
+        description: Read-only release observation for the stopped CUDA app run; no capture or model
       cuda_scheduling_mode:
         type: choice
         required: false
@@ -273,7 +273,7 @@ jobs:
         with:
           version: "0.12.3"
           enable-cache: false
-      - name: Observe GPU1 and old install process release without model work
+      - name: Observe GPU1 and stopped app process release without model work
         shell: cmd
         run: |
           uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1

@@ -15,7 +15,7 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(MODULE)
 
 
-def row(pid=100, name="node.exe", created="2026-10-05T05:00:00+00:00",
+def row(pid=100, name="node.exe", created="2026-10-05T10:50:00+00:00",
         executable=r"C:\Program Files\nodejs\node.exe", command=r'"C:\Program Files\nodejs\node.exe" C:\foreign\run.js'):
     return {"pid": pid, "parentPid": 50, "name": name, "createdUtc": created,
             "executablePath": executable, "commandLineAvailable": command is not None,
@@ -26,9 +26,9 @@ def row(pid=100, name="node.exe", created="2026-10-05T05:00:00+00:00",
             "workerIdInCommandLine": MODULE.OLD_WORKER_ID.casefold() in command.casefold() if command else False}
 
 
-def snapshot(rows, start="2026-10-05T06:00:00+00:00", end="2026-10-05T06:00:01+00:00",
+def snapshot(rows, start="2026-10-05T11:00:00+00:00", end="2026-10-05T11:00:01+00:00",
              witness=True):
-    collector = row(pid=999, name="powershell.exe", created="2026-10-05T05:59:00+00:00",
+    collector = row(pid=999, name="powershell.exe", created="2026-10-05T10:59:00+00:00",
                     executable=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
                     command=r"powershell.exe -File C:\new-release-check\collector.ps1")
     retained = rows + ([collector] if witness else [])
@@ -37,11 +37,30 @@ def snapshot(rows, start="2026-10-05T06:00:00+00:00", end="2026-10-05T06:00:01+0
 
 
 class ReleaseProbeTests(unittest.TestCase):
+    def test_frozen_target_matches_stopped_app8_run_receipt(self):
+        self.assertEqual((MODULE.OLD_RUN_ID, MODULE.OLD_RUN_ATTEMPT, MODULE.OLD_JOB_ID),
+                         ("37295993157", "1", "111717219895"))
+        self.assertEqual((MODULE.OLD_CONTROL_SHA, MODULE.OLD_APP_SHA, MODULE.OLD_ENGINE_SHA),
+                         ("6a14bcd709f68f8ebcb6a3b2a360fe04aa5b96d8",
+                          "c1f86907ae41183fa8ddc9126a821df36cc597dd",
+                          "25bd55cdb6a56c78b07584a12150c9f5d46be439"))
+        self.assertEqual(MODULE.OLD_RUN_ROOT,
+                         r"E:\sceneworks-terminal\sc-23002-yue2-precision\37295993157-1")
+        self.assertEqual((MODULE.OLD_WORKER_ID, MODULE.OLD_RUNNER, MODULE.OLD_HOST),
+                         ("yue2-acceptance-ed59cf8e2088", "cuda-windows", "MICHAEL-TRX50"))
+        self.assertEqual(MODULE.OLD_JOB_STARTED.isoformat(), "2026-10-05T10:35:14+00:00")
+        self.assertEqual(MODULE.OLD_JOB_COMPLETED, "2026-10-05T10:59:07+00:00")
+        self.assertEqual(MODULE.OLD_METRICS_ZIP_SHA256,
+                         "e4fe7f5ad2ed80b2f3294064f49f113ac5a83a0ef734a0bcfc3d5160cfead5ad")
+        collector = SOURCE.with_name("yue2_app_install_release_processes.ps1").read_text(encoding="utf-8")
+        self.assertIn(MODULE.OLD_RUN_ROOT, collector)
+        self.assertIn(MODULE.OLD_WORKER_ID, collector)
+
     def test_foreign_and_gpu0_hosting_do_not_block_old_run_absence(self):
         foreign = row(command='node.exe --token dummy-secret C:\\foreign\\run.js')
         self.assertNotIn("dummy-secret", str(foreign))
         before = snapshot([foreign])
-        after = snapshot([foreign], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00")
+        after = snapshot([foreign], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00")
         self.assertTrue(MODULE.validate_pair(before, after)["noOldOwnedMatch"])
         self.assertFalse(MODULE.RELEVANT_NAME.fullmatch("LM Studio.exe"))
 
@@ -54,31 +73,31 @@ class ReleaseProbeTests(unittest.TestCase):
     def test_old_root_or_worker_in_either_snapshot_refuses(self):
         normal = snapshot([row()])
         old_root = snapshot([row(command='node.exe "' + MODULE.OLD_RUN_ROOT + r'\install\server.js"')],
-                            "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00")
+                            "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00")
         with self.assertRaisesRegex(ValueError, "old app install"):
             MODULE.validate_pair(normal, old_root)
         worker = snapshot([row(command='node.exe --worker-id ' + MODULE.OLD_WORKER_ID)])
         with self.assertRaisesRegex(ValueError, "old app install"):
-            MODULE.validate_pair(worker, snapshot([row()], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00"))
+            MODULE.validate_pair(worker, snapshot([row()], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00"))
         arbitrary_exe = snapshot([row(name="git.exe", executable=MODULE.OLD_RUN_ROOT + r"\tools\git.exe")])
         with self.assertRaisesRegex(ValueError, "old app install"):
-            MODULE.validate_pair(arbitrary_exe, snapshot([], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00"))
+            MODULE.validate_pair(arbitrary_exe, snapshot([], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00"))
         arbitrary_command = snapshot([row(name="git.exe", command="git.exe --work-tree " + MODULE.OLD_RUN_ROOT)])
         with self.assertRaisesRegex(ValueError, "old app install"):
-            MODULE.validate_pair(arbitrary_command, snapshot([], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00"))
+            MODULE.validate_pair(arbitrary_command, snapshot([], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00"))
         arbitrary_worker = snapshot([row(name="git.exe", command="git.exe --worker " + MODULE.OLD_WORKER_ID)])
         with self.assertRaisesRegex(ValueError, "old app install"):
-            MODULE.validate_pair(arbitrary_worker, snapshot([], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00"))
+            MODULE.validate_pair(arbitrary_worker, snapshot([], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00"))
 
     def test_new_candidate_with_inaccessible_identity_refuses_but_preexisting_foreign_is_allowed(self):
-        unknown = row(command=None)
+        unknown = row(created="2026-10-05T10:36:00+00:00", command=None)
         with self.assertRaisesRegex(ValueError, "newer candidate"):
             MODULE.validate_snapshot(snapshot([unknown]))
-        old_foreign = row(created="2026-10-05T04:00:00+00:00", command=None)
+        old_foreign = row(created="2026-10-05T10:00:00+00:00", command=None)
         self.assertEqual(MODULE.validate_snapshot(snapshot([old_foreign]))["preexistingIncompleteCandidates"], 1)
 
     def test_incomplete_stale_or_duplicate_census_refuses(self):
-        for invalid in (snapshot([row()], end="2026-10-05T05:59:59+00:00"),
+        for invalid in (snapshot([row()], end="2026-10-05T10:59:59+00:00"),
                         snapshot([row(), row()]),
                         {**snapshot([row()]), "complete": False}):
             with self.assertRaises(ValueError):
@@ -95,8 +114,8 @@ class ReleaseProbeTests(unittest.TestCase):
         wrong_name["rows"][-1]["name"] = "cmd.exe"
         with self.assertRaisesRegex(ValueError, "collector PID is not"):
             MODULE.validate_snapshot(wrong_name)
-        recycled = snapshot([row()], "2026-10-05T06:00:04+00:00", "2026-10-05T06:00:05+00:00")
-        recycled["rows"][-1]["createdUtc"] = "2026-10-05T06:00:02+00:00"
+        recycled = snapshot([row()], "2026-10-05T11:00:04+00:00", "2026-10-05T11:00:05+00:00")
+        recycled["rows"][-1]["createdUtc"] = "2026-10-05T11:00:02+00:00"
         with self.assertRaisesRegex(ValueError, "collector PID/name/creation changed"):
             MODULE.validate_pair(snapshot([row()]), recycled)
 

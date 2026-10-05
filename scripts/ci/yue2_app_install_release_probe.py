@@ -1,4 +1,4 @@
-"""Read-only process release check for the single stopped YuE2 app install run.
+"""Read-only process release check for the single stopped YuE2 app run.
 
 This establishes a fresh, bounded absence observation, not a historical proof
 that no child existed between the old job's last census and this probe.
@@ -18,19 +18,19 @@ from yue2_app_precision_profile import verify_sources
 from yue2_precision_proof import cuda_physical_census, retain_cuda_physical_evidence
 
 
-OLD_RUN_ID = "37262155543"
+OLD_RUN_ID = "37295993157"
 OLD_RUN_ATTEMPT = "1"
-OLD_JOB_ID = "111611439478"
+OLD_JOB_ID = "111717219895"
 OLD_CONTROL_SHA = "6a14bcd709f68f8ebcb6a3b2a360fe04aa5b96d8"
-OLD_APP_SHA = "5ecb88a0e3812dd9d55e6f1f5ee648eaf41c78f6"
+OLD_APP_SHA = "c1f86907ae41183fa8ddc9126a821df36cc597dd"
 OLD_ENGINE_SHA = "25bd55cdb6a56c78b07584a12150c9f5d46be439"
-OLD_RUN_ROOT = r"E:\sceneworks-terminal\sc-23002-yue2-precision\37262155543-1"
-OLD_WORKER_ID = "yue2-acceptance-12fcbd624f91"
-OLD_RUNNER = "cuda-windows-2"
+OLD_RUN_ROOT = r"E:\sceneworks-terminal\sc-23002-yue2-precision\37295993157-1"
+OLD_WORKER_ID = "yue2-acceptance-ed59cf8e2088"
+OLD_RUNNER = "cuda-windows"
 OLD_HOST = "MICHAEL-TRX50"
-OLD_JOB_STARTED = datetime.fromisoformat("2026-10-05T04:07:36+00:00")
-OLD_JOB_COMPLETED = "2026-10-05T04:23:48+00:00"
-OLD_METRICS_ZIP_SHA256 = "2ce1cec5e8bf6cf8041e370ed9274015bb0d66f648bf9cd7d40d32eade4a3251"
+OLD_JOB_STARTED = datetime.fromisoformat("2026-10-05T10:35:14+00:00")
+OLD_JOB_COMPLETED = "2026-10-05T10:59:07+00:00"
+OLD_METRICS_ZIP_SHA256 = "e4fe7f5ad2ed80b2f3294064f49f113ac5a83a0ef734a0bcfc3d5160cfead5ad"
 RELEVANT_NAME = re.compile(
     r"(?:sceneworks-(?:rust-api|api|worker)|candle[^.]*|node|python(?:3(?:\.\d+)?)?|"
     r"powershell|pwsh|cmd|cargo|rustc|ffmpeg|nvidia-smi)\.exe", re.I)

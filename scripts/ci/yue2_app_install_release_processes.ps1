@@ -1,11 +1,11 @@
-# Read-only follow-up for the one completed YuE2 app install run. The old run
+# Read-only follow-up for the one completed YuE2 app run. The stopped run
 # root and worker ID arrive through environment, never this collector's argv.
 param([Parameter(Mandatory = $true)][string]$OutputDirectory)
 
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) { throw 'evidence directory missing' }
-if ($env:YUE2_RELEASE_OLD_ROOT -cne 'E:\sceneworks-terminal\sc-23002-yue2-precision\37262155543-1' -or
-    $env:YUE2_RELEASE_WORKER_ID -cne 'yue2-acceptance-12fcbd624f91') { throw 'old run target is not the reviewed install' }
+if ($env:YUE2_RELEASE_OLD_ROOT -cne 'E:\sceneworks-terminal\sc-23002-yue2-precision\37295993157-1' -or
+    $env:YUE2_RELEASE_WORKER_ID -cne 'yue2-acceptance-ed59cf8e2088') { throw 'stopped run target is not the reviewed App8 run' }
 
 function Hash-Text([string]$Value) {
     if ($null -eq $Value) { return $null }
