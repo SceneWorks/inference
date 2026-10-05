@@ -1350,6 +1350,10 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
             resolution_buckets,
             subject_mask_loss,
             depth_anchoring,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring.
+            body_proportion_loss: depth_anchoring,
+            body_shape_loss: depth_anchoring,
+            normal_loss: depth_anchoring,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }

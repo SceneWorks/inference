@@ -1945,6 +1945,11 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
             resolution_buckets: id != MODEL_25_ID,
             subject_mask_loss: id == MODEL_ID,
             depth_anchoring: id == MODEL_ID,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring (LTX-2.3
+            // only; LTX-2.5 has no decodable image).
+            body_proportion_loss: id == MODEL_ID,
+            body_shape_loss: id == MODEL_ID,
+            normal_loss: id == MODEL_ID,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
