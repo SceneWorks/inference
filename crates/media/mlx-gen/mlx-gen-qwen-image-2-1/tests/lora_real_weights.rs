@@ -614,9 +614,12 @@ fn dataset_receipt(items: &[TrainingItem]) -> Value {
         "referenceCount": item.reference_image_paths.len(),
         "orderedReferences": item.reference_image_paths.iter().map(|path| file(path)).collect::<Vec<_>>(),
     })).collect();
-    // Hash binds item/reference order, captions and exact source bytes, independent of host paths.
+    // serde_json's preserve_order feature is unified by the workspace. Canonicalize every
+    // object's keys explicitly, while retaining item/reference array order and exact bytes.
+    let mut rows = Value::Array(rows);
+    rows.sort_all_objects();
     let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&rows).unwrap()));
-    json!({"sha256": hash, "hashSchema": "sha256(serde_json ordered rows with file byte hashes)", "items": rows})
+    json!({"sha256": hash, "hashSchema": "sha256(recursively key-sorted JSON rows; ordered item/reference arrays; file byte hashes)", "items": rows})
 }
 
 #[test]
@@ -645,6 +648,41 @@ fn dataset_hash_binds_caption_bytes_and_reference_order() {
     items[0].caption = EDIT_INSTRUCTION.into();
     std::fs::write(&paths[1], [99]).unwrap();
     assert_ne!(original["sha256"], dataset_receipt(&items)["sha256"]);
+}
+
+#[test]
+fn dataset_hash_canonicalizes_nested_objects_without_reordering_items() {
+    let guard = tempfile::tempdir().unwrap();
+    let target = guard.path().join("target.png");
+    let source = guard.path().join("source.png");
+    let key = guard.path().join("key.png");
+    std::fs::write(&target, [1]).unwrap();
+    std::fs::write(&source, [2]).unwrap();
+    std::fs::write(&key, [3]).unwrap();
+    let mut items = vec![
+        TrainingItem::edit_pair(target.clone(), "first".into(), vec![source.clone(), key]),
+        TrainingItem::edit_pair(target, "second".into(), vec![source]),
+    ];
+    let receipt = dataset_receipt(&items);
+    let mut canonical_rows = receipt["items"].clone();
+    canonical_rows.sort_all_objects();
+    assert_eq!(
+        serde_json::to_vec(&receipt["items"]).unwrap(),
+        serde_json::to_vec(&canonical_rows).unwrap(),
+        "nested file objects and item objects must serialize canonically under preserve_order"
+    );
+    assert_eq!(receipt["items"][0]["caption"], "first");
+    assert_eq!(receipt["items"][1]["caption"], "second");
+    assert_eq!(
+        receipt["items"][0]["orderedReferences"][0]["file"],
+        "source.png"
+    );
+    assert_eq!(
+        receipt["items"][0]["orderedReferences"][1]["file"],
+        "key.png"
+    );
+    items.reverse();
+    assert_ne!(receipt["sha256"], dataset_receipt(&items)["sha256"]);
 }
 
 // ── synthetic datasets (deterministic; no fetched or checked-in photographs) ─────────────────────
