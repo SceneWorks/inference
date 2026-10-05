@@ -577,8 +577,9 @@ mod tests {
             label: "t",
             decoder: DecoderSpec::Tiny {
                 name: "TINY",
-                config: cfg4.clone(),
+                config: cfg4.clone().into(),
             },
+            latent_lpips: None,
         };
         let g = AuxGeometry::image(512, 3);
         let id_only = perceptual_footprint(&c, &ctx.decoder, g);

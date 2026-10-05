@@ -608,8 +608,9 @@ mod tests {
             label: "t",
             decoder: DecoderSpec::Tiny {
                 name: "TINY",
-                config: cfg4.clone(),
+                config: cfg4.clone().into(),
             },
+            latent_lpips: None,
             device: &dev,
         };
         let g = AuxGeometry::image(512, 3);
