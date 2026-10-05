@@ -127,7 +127,7 @@ def validate_snapshot(payload: object, old_root: str = TARGET_RUN_ROOT,
                     re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
                     "candidate command-line digest missing")
         matching_generation = next((item for item in recorded_generations
-            if item.get("pid") == pid and utc(item.get("createdUtc")) == created), None)
+            if item.get("pid") == pid and utc(item.get("preciseCreatedUtc")) == created), None)
         matches = (isinstance(executable, str) and has_old_root(executable, old_root)) or \
             row["oldRootInCommandLine"] or row["oldRootInExecutable"] or \
             row["workerIdInCommandLine"] or matching_generation is not None
@@ -422,6 +422,7 @@ def _case_process_witness(record_path: Path, name: str, run_root: str) -> dict |
     require(owned.get("selectedLuid") == "luid_0x00000000_0x0001f78f",
             f"owned sampler selected device differs for {name}")
     samples = []
+    precise_birth = None
     for line in journal_path.read_text(encoding="utf-8-sig").splitlines():
         if not line.strip():
             continue
@@ -431,11 +432,23 @@ def _case_process_witness(record_path: Path, name: str, run_root: str) -> dict |
                 isinstance(sample.get("counter"), dict) and
                 sample["counter"].get("parentPid") == parent,
                 f"owned sampler row identity differs for {name}")
+        sample_birth = sample["counter"].get("createdUtc")
+        require(isinstance(sample_birth, str) and bool(sample_birth),
+                f"owned sampler precise process birth is missing for {name}")
+        sample_birth_utc = utc(sample_birth)
+        if precise_birth is None:
+            precise_birth = sample_birth_utc
+        require(sample_birth_utc == precise_birth,
+                f"owned sampler process birth changes across rows for {name}")
         samples.append(sample)
+    require(bool(samples) and precise_birth is not None and
+            precise_birth.replace(microsecond=(precise_birth.microsecond // 1000) * 1000) == utc(created),
+            f"recorded process birth is not the sampler's millisecond truncation for {name}")
     fault_bytes = faults_path.stat().st_size if faults_path.is_file() else None
     return {"caseId": record["caseId"], "name": name, "outcomeStatus": record.get("outcome", {}).get("status"),
             "pid": pid, "parentPid": parent,
-            "createdUtc": created, "executablePath": executable_path,
+            "createdUtc": created, "preciseCreatedUtc": precise_birth.isoformat(),
+            "executablePath": executable_path,
             "executableSha256": binary_sha, "journalSha256": journal_hash,
             "sampleCount": len(samples), "faultBytes": fault_bytes,
             "recordSha256": file_sha256(record_path)}

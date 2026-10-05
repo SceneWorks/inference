@@ -14,6 +14,11 @@ from zipfile import ZipFile
 
 SOURCE = Path(__file__).with_name("yue2_app_install_release_probe.py")
 TEST_WORKER_ID = "yue2-acceptance-test-worker"
+PRECISE_BIRTHS = (
+    "2026-10-05T13:30:44.4259790Z",
+    "2026-10-05T13:33:24.8993850Z",
+    "2026-10-05T13:36:04.5215930Z",
+)
 sys.path.insert(0, str(SOURCE.parent))
 SPEC = importlib.util.spec_from_file_location("yue2_app_install_release_probe", SOURCE)
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -93,8 +98,11 @@ def write_source_bound_case(metrics: Path, name: str, index: int, outcome="compl
     exe = str(MODULE.PureWindowsPath(MODULE.TARGET_RUN_ROOT) / "target" / "release" / "deps" / exe_name)
     case_bytes = (SOURCE.parent / "yue2-app-precision-cases" / f"{name}.json").read_bytes()
     (case_dir / "case.json").write_bytes(case_bytes)
+    precise_birth = PRECISE_BIRTHS[index] if index < len(PRECISE_BIRTHS) else \
+        f"2026-10-05T13:{38 + index:02d}:00.0000000Z"
+    record_birth = precise_birth[:23] + "Z"
     journal = {"pid": pid, "luid": "luid_0x00000000_0x0001f78f", "bytes": 1024,
-               "counter": {"parentPid": parent}}
+               "counter": {"parentPid": parent, "createdUtc": precise_birth}}
     journal_bytes = (json.dumps(journal) + "\n").encode()
     (case_dir / "cuda-owned-samples.jsonl").write_bytes(journal_bytes)
     (case_dir / "cuda-owned-faults.jsonl").write_bytes(faults)
@@ -104,7 +112,7 @@ def write_source_bound_case(metrics: Path, name: str, index: int, outcome="compl
              "selectedLuid": "luid_0x00000000_0x0001f78f"}
     if process_witness:
         owned["process"] = {"pid": pid, "parentPid": parent,
-            "createdUtc": "2026-10-05T13:30:00+00:00", "executablePath": exe,
+            "createdUtc": record_birth, "executablePath": exe,
             "executableSha256": f"{index + 1:064x}"}
     record = {"caseId": MODULE.case_id("cuda", name), "backend": "cuda",
               "request": {"name": case_name, "computePolicy": policy},
@@ -228,7 +236,7 @@ class ReleaseProbeTests(unittest.TestCase):
                 lambda path: expected[path])
             self.assertEqual(len(actual), 8)
             witness = binding["caseProcessWitnesses"][0]
-            row = globals()["row"](pid=witness["pid"], created=witness["createdUtc"])
+            row = globals()["row"](pid=witness["pid"], created=witness["preciseCreatedUtc"])
             row["parentPid"] = witness["parentPid"]
             snapshot_payload = snapshot([row], start="2026-10-05T13:40:00+00:00",
                 end="2026-10-05T13:40:01+00:00")
@@ -236,6 +244,38 @@ class ReleaseProbeTests(unittest.TestCase):
                 MODULE.validate_snapshot(snapshot_payload,
                 binding["target"]["runRoot"], recorded_generations=binding["caseProcessWitnesses"],
                 job_started=binding["target"]["jobStartedUtc"])
+
+    def test_precise_sampler_birth_matches_all_three_real_windows_generations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics, zip_path, run, job, artifact = self._binding_fixture(Path(directory), 3)
+            binding = MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+            witnesses = binding["caseProcessWitnesses"]
+            self.assertEqual([item["preciseCreatedUtc"] for item in witnesses], [
+                "2026-10-05T13:30:44.425979+00:00",
+                "2026-10-05T13:33:24.899385+00:00",
+                "2026-10-05T13:36:04.521593+00:00",
+            ])
+            for index, witness in enumerate(witnesses):
+                process = globals()["row"](pid=witness["pid"], created=witness["preciseCreatedUtc"])
+                process["parentPid"] = witness["parentPid"]
+                with self.assertRaisesRegex(ValueError, "old app install process"):
+                    MODULE.validate_snapshot(snapshot([process], start="2026-10-05T13:40:00+00:00",
+                        end="2026-10-05T13:40:01+00:00"), recorded_generations=witnesses,
+                        job_started=binding["target"]["jobStartedUtc"])
+
+            first = witnesses[0]
+            record_path = metrics / "partial-profile" / MODULE.NAMES[0] / "record.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["measured"]["owned"]["process"]["createdUtc"] = "2026-10-05T13:30:44.426Z"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "millisecond truncation"):
+                MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+
+            reused_pid = globals()["row"](pid=first["pid"], created="2026-10-05T13:39:00+00:00")
+            foreign = MODULE.validate_snapshot(snapshot([reused_pid], start="2026-10-05T13:40:00+00:00",
+                end="2026-10-05T13:40:01+00:00"), recorded_generations=witnesses,
+                job_started=binding["target"]["jobStartedUtc"])
+            self.assertEqual(foreign["recordedGenerationMatches"], [])
 
     def test_current_runner_route_and_device_binding_are_exact_but_allow_same_host_runner_alias(self):
         current = {"id": 9001, "head_sha": "c" * 40}
