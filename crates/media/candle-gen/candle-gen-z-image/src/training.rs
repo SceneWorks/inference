@@ -70,7 +70,7 @@ use candle_gen::train::flow_match::{
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward_with_input_grad;
 use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
-use candle_gen::train::tae::TinyDecoderConfig;
+use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
 
@@ -368,7 +368,7 @@ fn aux_loss_context(device: &Device) -> AuxLossContext<'_> {
 fn taef1_decoder() -> DecoderSpec {
     DecoderSpec::Tiny {
         name: "TAEF1",
-        config: TinyDecoderConfig::taef1(),
+        config: TinyDecoderSpec::taef1(),
     }
 }
 
