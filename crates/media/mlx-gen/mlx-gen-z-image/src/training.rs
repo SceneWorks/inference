@@ -775,6 +775,7 @@ fn aux_loss_context() -> mlx_gen_perceptual::AuxLossContext<'static> {
     mlx_gen_perceptual::AuxLossContext {
         label: "z_image_turbo trainer",
         decoder: taef1_decoder(),
+        latent_lpips: Some(gen_core::train::LatentLpipsFamily::Flux),
     }
 }
 
