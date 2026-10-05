@@ -321,6 +321,9 @@ impl PreparedSubjectMask {
     }
 }
 
+/// A trainer's image crop rule: the source box `(image_w, image_h) → CropBox` it cuts.
+pub type CropRule = fn(u32, u32) -> CropBox;
+
 /// The job's subject masks for the **decoded-x0 perceptual losses** (sc-24832: the normal loss
 /// restricted to the subject), handed to a trainer's perceptual path once
 /// (`PerceptualPath::attach_subject_masks` in either kit) so every reference it builds receives the
@@ -330,7 +333,7 @@ impl PreparedSubjectMask {
 #[derive(Clone, Debug)]
 pub struct PerceptualSubjectMasks {
     /// Per item: its mask and the trainer's crop rule for that item's image.
-    masks: Vec<(PreparedSubjectMask, fn(u32, u32) -> CropBox)>,
+    masks: Vec<(PreparedSubjectMask, CropRule)>,
     entries_per_item: usize,
 }
 
@@ -351,7 +354,7 @@ impl PerceptualSubjectMasks {
         items: &[TrainingItem],
         cfg: &TrainingConfig,
         entries_per_item: usize,
-        crop_of: fn(u32, u32) -> CropBox,
+        crop_of: CropRule,
     ) -> crate::Result<Option<Self>> {
         Self::load_with(label, items, cfg, entries_per_item, |_| crop_of)
     }
@@ -363,7 +366,7 @@ impl PerceptualSubjectMasks {
         items: &[TrainingItem],
         cfg: &TrainingConfig,
         entries_per_item: usize,
-        crop_for: impl Fn(&TrainingItem) -> fn(u32, u32) -> CropBox,
+        crop_for: impl Fn(&TrainingItem) -> CropRule,
     ) -> crate::Result<Option<Self>> {
         if !Self::needed(cfg) {
             return Ok(None);
@@ -392,7 +395,7 @@ impl PerceptualSubjectMasks {
     pub fn from_prepared(
         masks: Vec<PreparedSubjectMask>,
         entries_per_item: usize,
-        crop_of: fn(u32, u32) -> CropBox,
+        crop_of: CropRule,
     ) -> Self {
         Self {
             masks: masks.into_iter().map(|m| (m, crop_of)).collect(),

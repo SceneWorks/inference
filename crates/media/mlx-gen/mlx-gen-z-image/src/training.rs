@@ -2908,11 +2908,12 @@ mod subject_mask_reference_tests {
 
     use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule, LossReference, PerceptualLoss};
     use mlx_gen::train::subject_mask::PerceptualSubjectMasks;
-    use mlx_gen::train::TrainingItem;
     use mlx_gen::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder};
+    use mlx_gen::train::TrainingItem;
 
+    type Seen = Rc<RefCell<Vec<Option<(Vec<i32>, Vec<f32>)>>>>;
     /// Records the mask every reference receives: `(shape, values)`, or `None`.
-    struct MaskProbe(Rc<RefCell<Vec<Option<(Vec<i32>, Vec<f32>)>>>>);
+    struct MaskProbe(Seen);
     impl PerceptualLoss for MaskProbe {
         fn name(&self) -> &'static str {
             "mask-probe"

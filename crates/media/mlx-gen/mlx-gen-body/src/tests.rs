@@ -664,10 +664,7 @@ fn each_body_loss_is_weighted_by_the_noise_level() {
         let plan = path.plan(0, 0, t).unwrap();
         assert!((plan.noise_level - t).abs() < 1e-6, "{name}");
         let live = lora
-            .x0(
-                &b0,
-                &add(&latent(), &normal(22, &[1, 4, 4, 3], 0.2)).unwrap(),
-            )
+            .x0(&b0, &add(latent(), normal(22, &[1, 4, 4, 3], 0.2)).unwrap())
             .unwrap();
         let terms = path
             .aux_loss(&plan, 0, &live)

@@ -631,6 +631,8 @@ fn each_body_loss_probe_catches_a_silently_ignored_loss() {
                 depth_anchoring: true,
                 subject_mask_loss: true,
                 resolution_buckets: true,
+                identity_loss: true,
+                face_landmark_loss: true,
                 ..gen_core::TrainingTechniques::ADAPTER_NOISE
             };
             for (other, set) in flags {
