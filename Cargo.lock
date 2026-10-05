@@ -741,6 +741,7 @@ name = "candle-gen-kolors"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-gen-sdxl",
  "candle-transformers",
@@ -780,6 +781,7 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-flux2",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "image",
  "rand",
@@ -923,6 +925,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-llm",
  "candle-nn",
  "image",
@@ -982,6 +985,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-nn",
  "candle-transformers",
  "image",
@@ -1001,6 +1005,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
@@ -1083,6 +1088,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
