@@ -511,6 +511,8 @@ name = "candle-gen-anima"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-gen-qwen-image",
  "image",
  "rand",
@@ -751,6 +753,8 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-boogu",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-gen-qwen-image",
  "image",
@@ -785,6 +789,8 @@ name = "candle-gen-ltx"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-llm",
  "image",
  "rand",
@@ -1047,6 +1053,8 @@ name = "candle-gen-wan"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "image",
  "rand",
  "rand_distr",
