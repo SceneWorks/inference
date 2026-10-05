@@ -211,14 +211,14 @@ class ReleaseProbeTests(unittest.TestCase):
 
     def test_frozen_target_matches_current_app8_run_receipt(self):
         self.assertEqual((MODULE.TARGET_RUN_ID, MODULE.TARGET_ATTEMPT, MODULE.TARGET_JOB_ID),
-                         (37314391667, 1, 111777364558))
+                         (37328223930, 1, 111824325053))
         self.assertEqual((MODULE.TARGET_CONTROL_SHA, MODULE.TARGET_APP_SHA, MODULE.TARGET_ENGINE_SHA),
                          ("2c820231926094566d1ed719c085ba7a7a2284a5",
-                          "c1f86907ae41183fa8ddc9126a821df36cc597dd",
+                          "f63d173089f81a8cc591d9e905ec952eaa5cda83",
                           "25bd55cdb6a56c78b07584a12150c9f5d46be439"))
         self.assertEqual(MODULE.TARGET_RUN_ROOT,
-                         r"E:\sceneworks-terminal\sc-23002-yue2-precision\37314391667-1")
-        self.assertEqual((MODULE.TARGET_RUNNER, MODULE.TARGET_RUNNER_ID), ("cuda-windows-2", 2619))
+                         r"E:\sceneworks-terminal\sc-23002-yue2-precision\37328223930-1")
+        self.assertEqual((MODULE.TARGET_RUNNER, MODULE.TARGET_RUNNER_ID), ("cuda-windows", 2313))
         collector = SOURCE.with_name("yue2_app_install_release_processes.ps1").read_text(encoding="utf-8")
         self.assertIn("$env:YUE2_RELEASE_OLD_ROOT", collector)
         self.assertNotIn("37295993157", collector)
@@ -332,10 +332,10 @@ class ReleaseProbeTests(unittest.TestCase):
     def test_current_runner_route_and_device_binding_are_exact_but_allow_same_host_runner_alias(self):
         current = {"id": 9001, "head_sha": "c" * 40}
         jobs = {"total_count": 1, "jobs": [{"name": "cuda_release_check", "status": "in_progress",
-            "runner_name": "cuda-windows", "runner_id": 812}]}
+            "runner_name": "cuda-windows-2", "runner_id": 812}]}
         with patch.dict("os.environ", {"GITHUB_RUN_ID": "9001", "GITHUB_SHA": "c" * 40}):
             selected = MODULE.select_release_runner(jobs, current, "cuda_release_check")
-            self.assertEqual(selected["runner_name"], "cuda-windows")
+            self.assertEqual(selected["runner_name"], "cuda-windows-2")
             jobs["jobs"][0]["runner_id"] = MODULE.TARGET_RUNNER_ID
             with self.assertRaisesRegex(ValueError, "release-check job"):
                 MODULE.select_release_runner(jobs, current, "cuda_release_check")
@@ -376,6 +376,32 @@ class ReleaseProbeTests(unittest.TestCase):
                 MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
             run["head_sha"] = "f" * 40
             with self.assertRaisesRegex(ValueError, "run identity/source"):
+                MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+
+    def test_cancelled_interrupted_journal_keeps_completion_false_and_root_marker_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics, zip_path, run, job, artifact = self._binding_fixture(Path(directory), 2)
+            run["conclusion"] = job["conclusion"] = "cancelled"
+            interrupted = metrics / "partial-profile" / MODULE.NAMES[1]
+            (interrupted / "record.json").unlink()
+            binding = MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
+            self.assertEqual(binding["sourceCaseIds"], [MODULE.case_id("cuda", MODULE.NAMES[0])])
+            self.assertEqual(binding["interruptedCaseIds"], [MODULE.case_id("cuda", MODULE.NAMES[1])])
+            self.assertFalse(binding["allObservedCaseOutcomesCompleted"])
+            self.assertFalse(binding["captureRecordSetComplete"])
+            self.assertFalse(binding["captureAcceptanceEvaluated"])
+            self.assertEqual(len(binding["rawSamplerReceipts"]), 2)
+            self.assertEqual(binding["rawSamplerReceipts"][1]["sampleRows"], 1)
+            # Journal-only generations are covered by run-root markers in every CIM row.
+            process = row(pid=5233, name="unlisted-child.exe",
+                executable=MODULE.TARGET_RUN_ROOT + r"\child.exe", command="child.exe")
+            with self.assertRaisesRegex(ValueError, "old app install process"):
+                MODULE.validate_snapshot(snapshot([process], start="2026-10-05T15:30:00+00:00",
+                    end="2026-10-05T15:30:01+00:00"), binding["target"]["runRoot"],
+                    recorded_generations=binding["caseProcessWitnesses"],
+                    job_started=binding["target"]["jobStartedUtc"])
+            (interrupted / "case.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "interrupted fixed source"):
                 MODULE.derive_run_binding(metrics, run, job, artifact, zip_path)
 
     def test_binding_refuses_artifact_zip_and_source_or_executable_mutations(self):

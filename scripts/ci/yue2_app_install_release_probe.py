@@ -24,16 +24,16 @@ from yue2_app_precision_profile import CASES, CASE_SOURCE_SHA256, NAMES, case_id
 from yue2_precision_proof import cuda_physical_census, retain_cuda_physical_evidence
 
 
-TARGET_RUN_ID = 37314391667
+TARGET_RUN_ID = 37328223930
 TARGET_ATTEMPT = 1
-TARGET_JOB_ID = 111777364558
-TARGET_ARTIFACT_ID = 11348636766
+TARGET_JOB_ID = 111824325053
+TARGET_ARTIFACT_ID = 11353908098
 TARGET_CONTROL_SHA = "2c820231926094566d1ed719c085ba7a7a2284a5"
-TARGET_APP_SHA = "c1f86907ae41183fa8ddc9126a821df36cc597dd"
+TARGET_APP_SHA = "f63d173089f81a8cc591d9e905ec952eaa5cda83"
 TARGET_ENGINE_SHA = "25bd55cdb6a56c78b07584a12150c9f5d46be439"
-TARGET_RUN_ROOT = r"E:\sceneworks-terminal\sc-23002-yue2-precision\37314391667-1"
-TARGET_RUNNER = "cuda-windows-2"
-TARGET_RUNNER_ID = 2619
+TARGET_RUN_ROOT = r"E:\sceneworks-terminal\sc-23002-yue2-precision\37328223930-1"
+TARGET_RUNNER = "cuda-windows"
+TARGET_RUNNER_ID = 2313
 ALLOWED_RELEASE_RUNNERS = ("cuda-windows", "cuda-windows-2")
 TARGET_REPOSITORY = "SceneWorks/inference"
 TARGET_WORKFLOW = ".github/workflows/yue2-app-precision-profile.yml"
@@ -529,6 +529,7 @@ def derive_run_binding(metrics_root: Path, run: dict, job: dict, artifact: dict,
     if profile.exists():
         require(not profile.is_symlink(), "linked profile directory")
     observed = []
+    interrupted = []
     record_statuses = []
     sampler_receipts = []
     witnesses = []
@@ -552,6 +553,17 @@ def derive_run_binding(metrics_root: Path, run: dict, job: dict, artifact: dict,
         record_path = profile / name / "record.json"
         if not record_path.exists():
             stopped = True
+            case_directory = record_path.parent
+            if case_directory.exists():
+                require(case_directory.is_dir() and not case_directory.is_symlink(),
+                        f"invalid interrupted case directory for {name}")
+                case_path = case_directory / "case.json"
+                require(case_path.is_file() and not case_path.is_symlink() and
+                        file_sha256(case_path) == manifest_by_name[name]["source_sha256"] and
+                        read_json(case_path).get("id") == case_id("cuda", name),
+                        f"interrupted fixed source case file/hash differs for {name}")
+                interrupted.append(case_id("cuda", name))
+                sampler_receipts.append(_raw_sampler_receipt(record_path, name))
             continue
         require(not stopped, "source case records are not a contiguous capture prefix")
         require(record_path.is_file() and not record_path.is_symlink() and
@@ -602,11 +614,12 @@ def derive_run_binding(metrics_root: Path, run: dict, job: dict, artifact: dict,
                 ("physicalIndex", "cudaOrdinal", "uuid", "pci", "luid")}},
             "runConclusion": run["conclusion"], "jobConclusion": job["conclusion"],
             "sourceCaseIds": observed,
+            "interruptedCaseIds": interrupted,
             "caseOutcomeStatuses": record_statuses,
             "caseLayout": "profile" if profile == completed_profile else "partial-profile",
             "rawSamplerReceipts": sampler_receipts,
             "allObservedCaseOutcomesCompleted": bool(record_statuses) and
-                all(status == "completed" for status in record_statuses),
+                not interrupted and all(status == "completed" for status in record_statuses),
             "captureRecordSetComplete": all_ids,
             "captureAcceptanceEvaluated": False,
             "caseProcessWitnesses": witnesses,
@@ -678,7 +691,7 @@ def select_release_runner(jobs: dict, current_run: dict, github_job: str) -> dic
             type(matches[0].get("runner_id")) is int and matches[0]["runner_id"] > 0 and
             ((matches[0]["runner_name"] == TARGET_RUNNER and
               matches[0]["runner_id"] == TARGET_RUNNER_ID) or
-             (matches[0]["runner_name"] == "cuda-windows" and
+             (matches[0]["runner_name"] == "cuda-windows-2" and
               matches[0]["runner_id"] != TARGET_RUNNER_ID)) and
             current_run.get("id") == int(os.environ.get("GITHUB_RUN_ID", "0")) and
             current_run.get("head_sha") == os.environ.get("GITHUB_SHA"),
