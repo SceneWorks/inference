@@ -511,6 +511,8 @@ name = "candle-gen-anima"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-gen-qwen-image",
  "image",
  "rand",
@@ -755,6 +757,8 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-boogu",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-gen-qwen-image",
  "image",
@@ -789,6 +793,8 @@ name = "candle-gen-ltx"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-llm",
  "image",
  "rand",
@@ -1054,6 +1060,8 @@ name = "candle-gen-wan"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "image",
  "rand",
  "rand_distr",
@@ -2324,6 +2332,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-qwen-image",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
@@ -2526,6 +2536,7 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
@@ -2543,6 +2554,8 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-boogu",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "mlx-gen-qwen-image",
  "mlx-gen-wan",
@@ -2573,6 +2586,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-flux2",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
@@ -2586,6 +2600,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-llm",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
@@ -2691,6 +2707,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-z-image",
  "mlx-llm",
  "pmetal-mlx-rs",
@@ -2751,6 +2769,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-flux",
+ "mlx-gen-perceptual",
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
@@ -2766,6 +2785,7 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "regex",
@@ -2820,6 +2840,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",

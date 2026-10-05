@@ -10,6 +10,9 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+# Epic 2123 auxiliary perceptual losses (sc-24830): the shared builder every trainer calls
+# (depth anchoring today). Depends only on core + the aux-model crates (acyclic).
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
 mlx-gen = { path = ".." }
 # The Lens VAE is the Flux.2 `AutoencoderKLFlux2` (32-ch latent, 2×2 patchify, bn-stats normalize) —
 # already ported; the Lens decode path reuses `Flux2Vae` / `load_vae` (sc-3169).

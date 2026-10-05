@@ -150,6 +150,34 @@ impl SdxlFamilyHooks for KolorsHooks {
         projected_dense_peak_gb(p, bf16)
     }
 
+    /// The direct DDPM `ᾱ_t` [`add_ddpm_noise`] uses (`alphas_cumprod[t]`, no table offset).
+    fn alpha_bar(&self, t: TrainTimestep) -> Result<f32> {
+        match t {
+            TrainTimestep::Index(i) => {
+                self.schedule.alphas_cumprod.get(i).copied().ok_or_else(|| {
+                    mlx_gen::Error::Msg(format!(
+                        "kolors trainer: DDPM timestep {i} is outside the {}-step schedule",
+                        self.schedule.alphas_cumprod.len()
+                    ))
+                })
+            }
+            TrainTimestep::Sigma(_) => Err(mlx_gen::Error::Msg(
+                "kolors trainer: expected an integer DDPM timestep".into(),
+            )),
+        }
+    }
+
+    /// `t / (num_train_timesteps − 1)` (index 1099 = the noisiest train step).
+    fn noise_level(&self, t: TrainTimestep) -> f32 {
+        t.unet_time() / (self.schedule.alphas_cumprod.len() - 1) as f32
+    }
+
+    /// `round(level · (num_train_timesteps − 1))` onto the integer DDPM indices.
+    fn timestep_at(&self, level: f32) -> TrainTimestep {
+        let last = (self.schedule.alphas_cumprod.len() - 1) as f32;
+        TrainTimestep::Index((level * last).round().clamp(0.0, last) as usize)
+    }
+
     fn render_sample(
         &self,
         unet: &UNet2DConditionModel,
@@ -203,9 +231,13 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // sc-24828 (epic 2123): subject-masked ε loss, wired in the shared SDXL-family
         // `train_family` this trainer drives (same NHWC latent cache — one weight per bucket entry
         // — same loss closure).
+        // sc-24830 (epic 2123): depth anchoring, wired in the shared SDXL-family `train_family`
+        // (Kolors decodes with TAESDXL — its VAE is the SDXL VAE — and recovers x0 from ε with
+        // its own direct-DDPM `ᾱ_t`).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
+            depth_anchoring: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -796,5 +828,313 @@ mod first_step_repro {
             "bf16 must shrink the working set (the resident ChatGLM dilutes the ratio vs SDXL's 57%): \
              f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB"
         );
+    }
+}
+
+/// sc-24830 (epic 2123 depth anchoring) — the Kolors deltas of the shared SDXL-family depth path:
+/// the real [`KolorsHooks`] DDPM schedule (`ᾱ_t`, noise-level mapping) driving
+/// [`mlx_gen_sdxl::training::family::compute_step_loss_grads`] on the tiny random-init SDXL-family
+/// U-Net, a random-init tiny TAESDXL-layout decoder and a random-init tiny Depth-Anything-V2. The
+/// step seam itself (alternation, references, remapping, legacy bit-identity) is pinned by the SDXL
+/// crate's `depth_anchoring_tests`. Seconds; no weights downloaded.
+#[cfg(test)]
+mod depth_anchoring_tests {
+    use super::*;
+    use mlx_gen::train::lora::{build_lora_targets, TrainAdapter};
+    use mlx_gen::train::perceptual::{
+        AuxAlternation, AuxLossSchedule, Parameterization, PerceptualPath,
+    };
+    use mlx_gen::TrainingConfig;
+    use mlx_gen_sdxl::training::family::test_support::{
+        tiny_unet, TINY_CONTEXT_DIM, TINY_POOLED_DIM,
+    };
+    use mlx_gen_sdxl::training::family::{
+        compute_loss_grads, compute_step_loss_grads, load_perceptual_path, perceptual_footprint_gb,
+        preflight_memory_guard_with_budget, resolve_target_paths, AuxStep,
+    };
+    use mlx_rs::transforms::eval;
+
+    /// The production hooks with a one-word tokenizer (the tests never tokenize) and the real
+    /// Kolors `scaled_linear` 1100-step schedule.
+    fn hooks() -> KolorsHooks {
+        let tmp = tempfile::tempdir().unwrap();
+        let json = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &json,
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+               "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
+               "decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1},
+               "unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+        KolorsHooks {
+            tokenizer: KolorsTokenizer::from_file(&json, 8).unwrap(),
+            chatglm: None,
+            schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
+        }
+    }
+
+    fn schedule() -> AuxLossSchedule {
+        AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        }
+    }
+
+    fn path() -> PerceptualPath {
+        mlx_gen_perceptual::testing::tiny_depth_path(4, schedule()).unwrap()
+    }
+
+    fn rnd(shape: &[i32], k: u64) -> Array {
+        let a = random::normal::<f32>(shape, None, None, Some(&random::key(k).unwrap())).unwrap();
+        eval([&a]).unwrap();
+        a
+    }
+
+    /// The Kolors ε parameterization is exact: with the true noise as the "prediction", the x0
+    /// recovery inverts the direct-DDPM noising at the hook's `ᾱ_t`. Mutation: index
+    /// `alphas_cumprod[t - 1]` (the SDXL table offset) in `alpha_bar` ⇒ red.
+    #[test]
+    fn epsilon_recovery_inverts_the_kolors_noising() {
+        let h = hooks();
+        let x0 = rnd(&[1, 4, 4, 4], 1);
+        let noise = rnd(&[1, 4, 4, 4], 2);
+        for t in [1usize, 50, 550, 1099] {
+            let ts = TrainTimestep::Index(t);
+            let noisy = h.add_noise(&x0, &noise, ts).unwrap();
+            let rec = Parameterization::Epsilon {
+                alpha_bar: h.alpha_bar(ts).unwrap(),
+            }
+            .recover_x0(&noisy, &noise)
+            .unwrap();
+            let err = rec
+                .subtract(&x0)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(err < 2e-3, "t={t}: |x0_hat − x0|max = {err}");
+        }
+        assert!(h.alpha_bar(TrainTimestep::Index(1100)).is_err());
+    }
+
+    /// The unit noise level spans the 1100 DDPM indices and round-trips. Mutation: divide by
+    /// `len` instead of `len − 1` ⇒ level 1 maps past the table / round trip breaks ⇒ red.
+    #[test]
+    fn noise_level_maps_onto_the_kolors_indices() {
+        let h = hooks();
+        for t in [0usize, 1, 550, 1099] {
+            let level = h.noise_level(TrainTimestep::Index(t));
+            assert_eq!(h.timestep_at(level).unet_time(), t as f32);
+        }
+        assert_eq!(h.timestep_at(1.0).unet_time(), 1099.0);
+        assert_eq!(h.timestep_at(0.0).unet_time(), 0.0);
+    }
+
+    /// AC (a)/(b) for Kolors, dense and block-checkpointed: a depth step at the remapped DDPM
+    /// index trains the LoRA through the depth term alone (no diffusion term, total == aux,
+    /// non-zero finite LoRA-B grad); a diffusion step carries none; a diffusion-only plan is
+    /// bit-identical to the plain step. Mutation: make `KolorsHooks::alpha_bar` return 1.0 (no x0
+    /// recovery) ⇒ the depth term changes ⇒ the cross-check against an explicitly recovered x0
+    /// reds.
+    #[test]
+    fn depth_step_trains_the_lora_through_depth_only() {
+        let h = hooks();
+        for ckpt in [false, true] {
+            let mut unet = tiny_unet(3).unwrap();
+            let cfg = TrainingConfig {
+                rank: 4,
+                alpha: 4.0,
+                seed: 7,
+                ..Default::default()
+            };
+            let paths = resolve_target_paths(&unet, &cfg);
+            let (targets, params) = build_lora_targets(&mut unet, &paths, 4, 7).unwrap();
+            let adapter = TrainAdapter::Lora { targets };
+            let ck = ckpt.then(|| paths.clone());
+            let x0 = rnd(&[1, 6, 4, 4], 100);
+            let cond = rnd(&[1, 7, TINY_CONTEXT_DIM], 200);
+            let pooled = rnd(&[1, TINY_POOLED_DIM], 300);
+            let ids = kolors_train_time_ids(1, 32);
+            let noise = rnd(&[1, 6, 4, 4], 400);
+            let mut p = path();
+            p.ensure_reference(0, &x0.transpose_axes(&[0, 3, 1, 2]).unwrap())
+                .unwrap();
+            let mut alt = AuxAlternation::new(1, 1);
+            let raw = TrainTimestep::Index(321);
+            let run = |unet: &mut UNet2DConditionModel, key: u32, p: &PerceptualPath| {
+                let plan = p.plan(key, 0, h.noise_level(raw)).unwrap();
+                let t = if plan.diffusion {
+                    raw
+                } else {
+                    h.timestep_at(plan.noise_level)
+                };
+                let (l, g) = compute_step_loss_grads(
+                    &h,
+                    unet,
+                    &params,
+                    &adapter,
+                    4.0,
+                    4.0,
+                    &x0,
+                    &cond,
+                    &pooled,
+                    &ids,
+                    t,
+                    &noise,
+                    false,
+                    None,
+                    Dtype::Float32,
+                    ck.clone(),
+                    Some(AuxStep {
+                        path: p,
+                        plan: &plan,
+                        entry: 0,
+                    }),
+                )
+                .unwrap();
+                eval(g.values()).unwrap();
+                (l, g, t)
+            };
+            let (diff, g_diff, _) = run(&mut unet, alt.key(1, 0), &p);
+            assert_eq!(diff.aux, None, "ckpt={ckpt}");
+            assert_eq!(Some(diff.total), diff.diffusion);
+            let (plain, g_plain) = compute_loss_grads(
+                &h,
+                &mut unet,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &cond,
+                &pooled,
+                &ids,
+                raw,
+                &noise,
+                false,
+                None,
+                Dtype::Float32,
+                ck.clone(),
+            )
+            .unwrap();
+            eval(g_plain.values()).unwrap();
+            assert_eq!(plain.to_bits(), diff.total.to_bits(), "ckpt={ckpt}");
+            for (k, v) in &g_plain {
+                let a: Vec<u32> = v.as_slice::<f32>().iter().map(|x| x.to_bits()).collect();
+                let b: Vec<u32> = g_diff[k]
+                    .as_slice::<f32>()
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect();
+                assert_eq!(a, b, "ckpt={ckpt}: {k}");
+            }
+
+            let (depth, g, t) = run(&mut unet, alt.key(2, 0), &p);
+            assert_eq!(depth.diffusion, None, "ckpt={ckpt}");
+            let aux = depth.aux.expect("depth step carries the depth term");
+            assert!(aux > 0.0 && aux.is_finite(), "ckpt={ckpt}: {aux}");
+            assert_eq!(depth.total, aux);
+            let gb: f32 = g
+                .iter()
+                .filter(|(k, _)| k.ends_with(".lora_b"))
+                .map(|(_, v)| v.abs().unwrap().sum(None).unwrap().item::<f32>())
+                .sum();
+            assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B |Σ| = {gb}");
+
+            // Cross-check: the depth term equals the depth loss of the explicitly recovered x0.
+            if !ckpt {
+                adapter
+                    .install_as(&mut unet, &params, 4.0, 4.0, None, Dtype::Float32)
+                    .unwrap();
+                let noisy = h.add_noise(&x0, &noise, t).unwrap();
+                let eps = unet
+                    .forward(&noisy, t.unet_time(), &cond, &pooled, &ids)
+                    .unwrap();
+                let x0_hat = Parameterization::Epsilon {
+                    alpha_bar: h.schedule.alphas_cumprod[match t {
+                        TrainTimestep::Index(i) => i,
+                        _ => unreachable!(),
+                    }],
+                }
+                .recover_x0(&noisy, &eps)
+                .unwrap()
+                .transpose_axes(&[0, 3, 1, 2])
+                .unwrap();
+                let plan = p.plan(2, 0, h.noise_level(raw)).unwrap();
+                let want = p
+                    .aux_loss(&plan, 0, &x0_hat)
+                    .unwrap()
+                    .unwrap()
+                    .weighted
+                    .item::<f32>();
+                assert!(
+                    (want - aux).abs() <= 1e-5 * want.abs().max(1.0),
+                    "{want} vs {aux}"
+                );
+            }
+        }
+    }
+
+    /// E7 for Kolors' own peak curve: the TAESDXL + DA2 footprint is counted on the dense and the
+    /// checkpointed path (synthetic budgets). Mutation: drop `+ extra_gb` in the shared guard ⇒ red.
+    #[test]
+    fn memory_guard_counts_the_aux_models_on_both_paths() {
+        let mut on = TrainingConfig::default();
+        on.depth_anchoring.schedule = schedule();
+        on.depth_anchoring.model_size = mlx_gen::gen_core::train::DepthModelSize::Large;
+        let large = perceptual_footprint_gb(&on, 1024, 4);
+        assert!(large > 1.0);
+        let h = hooks();
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        for (checkpointed, base) in [
+            (false, h.peak_gb(128.0 * 128.0, true)),
+            (true, h.peak_gb(0.0, true)),
+        ] {
+            let budget = ((base + large / 2.0) / 0.85 * GIB) as usize;
+            assert!(preflight_memory_guard_with_budget(
+                &h,
+                &[1024],
+                true,
+                0.0,
+                checkpointed,
+                budget
+            )
+            .is_ok());
+            assert!(preflight_memory_guard_with_budget(
+                &h,
+                &[1024],
+                true,
+                large,
+                checkpointed,
+                budget
+            )
+            .is_err());
+        }
+    }
+
+    /// E3: Kolors declares depth anchoring.
+    #[test]
+    fn descriptor_declares_depth_anchoring() {
+        assert!(trainer_descriptor().techniques.depth_anchoring);
+    }
+
+    /// A missing decoder is a named error (TAESDXL — Kolors' VAE is the SDXL VAE).
+    #[test]
+    fn missing_aux_weights_are_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = TrainingConfig::default();
+        c.depth_anchoring.schedule = schedule();
+        c.perceptual_decoder_dir = Some(tmp.path().join("no-taesdxl"));
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let err = load_perceptual_path("kolors", &c)
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(err.contains("TAESDXL") && err.contains("kolors"), "{err}");
     }
 }

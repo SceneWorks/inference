@@ -79,8 +79,12 @@ use mlx_gen::train::lora::{
     build_lora_targets, factorization, LoraParams, TrainAdapter,
 };
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
+use mlx_gen::train::perceptual::{
+    combine_step_loss, AuxAlternation, Parameterization, PerceptualPath, StepPlan,
+};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::tae::TinyDecoderSpec;
 use mlx_gen::{
     CancelFlag, Error, Image, LoadSpec, Modality, NetworkType, Precision, Progress, Result,
     RgbaImage, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
@@ -373,6 +377,12 @@ pub struct TrainingShape {
     pub checkpointed: bool,
     /// Whether preview samples are rendered (keeps the VAE decoder resident).
     pub sampling: bool,
+    /// Epic 2123 E7: the training-time auxiliary models the enabled perceptual losses add
+    /// (the TAEQI2.1 decoder + Depth-Anything-V2 resident weights, one differentiable decode +
+    /// forward/backward each, and every cached reference — `mlx_gen_perceptual::perceptual_footprint`),
+    /// resident through the train phase on the dense and checkpointed paths alike. `0` when no
+    /// aux loss is enabled.
+    pub aux_model_bytes: u64,
 }
 
 /// The derived peak of each stage of a run, in bytes. The stages never overlap (each drops its
@@ -515,6 +525,7 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
         (0, 0)
     };
     let train_phase = facts.dit_elements * w
+        + shape.aux_model_bytes
         + decoder_resident
         + shape.trainable_params
             * (TRAINABLE_BASE_BUFFERS + shape.optimizer_state_per_param)
@@ -745,9 +756,13 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // sc-2127 (epic 2123): honors `resolution_buckets` — every item (captioned or edit pair)
         // is cached once per bucket edge and the loop walks a `BucketSchedule`.
         // sc-24828 (epic 2123): subject-masked loss on the target latent tokens, both modes.
+        // sc-24830 (epic 2123): depth anchoring — the shared decoded-x0 perceptual path (TAEQI2.1
+        // decode of the target block's flow x0 estimate → Depth-Anything-V2 → cached round-trip
+        // reference), text-to-image and edit, dense and gradient-checkpointed.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
+            depth_anchoring: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -1498,15 +1513,89 @@ struct LossSpec<'a> {
 /// onto `noise − x0`, return `(loss, grads)`. The DiT returns the target block only, so the
 /// condition tokens never enter the loss. The graph runs at `spec.dtype`; the noising math, the
 /// loss and the grads stay f32 (master weights).
+#[cfg(test)]
 fn compute_loss_grads(
     transformer: &mut QwenImage21Transformer,
     params: &LoraParams,
     spec: &LossSpec<'_>,
     step: &StepInputs<'_>,
 ) -> Result<(f32, LoraParams)> {
-    let (x_t, target) = build_batch(step.x0, step.noise, step.t)?;
+    let (losses, grads) = compute_step_loss_grads(transformer, params, spec, step, None)?;
+    Ok((losses.total, grads))
+}
+
+/// The per-step loss breakdown [`compute_step_loss_grads`] returns (epic 2123 E8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepLosses {
+    /// The differentiated step loss.
+    total: f32,
+    /// The diffusion (velocity-regression) term, `None` on an aux-only step (it contributed zero).
+    diffusion: Option<f32>,
+    /// The weighted aux-loss term, `None` when no aux loss contributed this step.
+    aux: Option<f32>,
+}
+
+/// One aux-loss step's view of the trainer's [`PerceptualPath`].
+struct AuxStep<'a> {
+    path: &'a PerceptualPath,
+    plan: &'a StepPlan,
+    /// The step's reference key — its (item, bucket) cache entry.
+    entry: usize,
+}
+
+/// The target block's latent grid `(h, w)` — the layout's last segment (validated non-empty image
+/// by the DiT; refused here otherwise).
+fn target_grid(layout: &JointLayout) -> Result<(i32, i32)> {
+    match layout.segments.last() {
+        Some(crate::transformer::Segment::Image { height, width }) => {
+            Ok((*height as i32, *width as i32))
+        }
+        _ => Err(Error::Msg(format!(
+            "{TRAINER_ID} trainer: the joint layout must end with the target image block"
+        ))),
+    }
+}
+
+/// A packed target latent `[1, h·w, z_dim]` back to the decoder's NCHW `[1, z_dim, h, w]` — the
+/// inverse of [`pack_latents`] (unpatched: one token per latent cell). The values stay in the
+/// normalised `(z − mean)/std` space: TAEQI2.1 "consumes / produces normalized latents directly"
+/// (its published diffusers wrapper sets `latents_mean = 0`, `latents_std = 1`).
+fn unpack_to_decoder_layout(packed: &Array, layout: &JointLayout) -> Result<Array> {
+    let (h, w) = target_grid(layout)?;
+    let sh = packed.shape();
+    if sh.len() != 3 || sh[1] != h * w {
+        return Err(Error::Msg(format!(
+            "{TRAINER_ID} trainer: expected a packed [B, {}, C] target latent, got {sh:?}",
+            h * w
+        )));
+    }
+    Ok(packed
+        .transpose_axes(&[0, 2, 1])?
+        .reshape(&[sh[0], sh[2], h, w])?)
+}
+
+/// [`compute_loss_grads`] with the step's perceptual plan (epic 2123 E8): on an aux-only step the
+/// diffusion term is not computed (it contributes zero) and the loss is the weighted perceptual term
+/// on the **target block's** x0 estimate `x0 = x_t − t·v` (the DiT returns the target block's
+/// velocity, regressed onto `noise − x0` with `x_t = (1−t)·x0 + t·noise`), unpacked to TAEQI2.1's
+/// `[1, 64, h, w]` layout ([`unpack_to_decoder_layout`]). The same closure serves text-to-image and
+/// edit (the reference blocks condition the forward; only the target is decoded) and the dense and
+/// gradient-checkpointed forwards. With `aux = None` (or a diffusion-only plan with no aux loss)
+/// the traced graph is exactly the pre-epic-2123 one.
+fn compute_step_loss_grads(
+    transformer: &mut QwenImage21Transformer,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+    step: &StepInputs<'_>,
+    aux: Option<AuxStep<'_>>,
+) -> Result<(StepLosses, LoraParams)> {
+    let (x_t_f32, target) = build_batch(step.x0, step.noise, step.t)?;
     let mask_weight = step.mask_weight.cloned();
-    let x_t = x_t.as_dtype(spec.dtype)?;
+    let x_t = x_t_f32.as_dtype(spec.dtype)?;
+    let (diffusion_on, aux_on) = match &aux {
+        Some(a) => (a.plan.diffusion, !a.plan.aux.is_empty()),
+        None => (true, false),
+    };
     let context = step.text.clone();
     let (t, layout, references) = (step.t, step.layout, step.references);
     let LossSpec {
@@ -1544,14 +1633,162 @@ fn compute_loss_grads(
             None => transformer.forward_joint(&context, &images, t, layout),
         }
         .map_err(|e| Exception::custom(e.to_string()))?;
-        let diff = subtract(&v, &target)?;
-        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
-        // needs a scalar cotangent).
-        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
+        let diffusion = if diffusion_on {
+            let diff = subtract(&v, &target)?;
+            // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+            // needs a scalar cotangent).
+            Some(reduce_loss(&diff, mask_weight.as_ref(), mae)?)
+        } else {
+            None
+        };
+        let aux_term = match &aux {
+            Some(a) if aux_on => {
+                // Target-block x0 estimate in f32 (x0 = x_t − t·v), unpacked for TAEQI2.1.
+                let x0_hat = Parameterization::FlowNoiseMinusX0 { sigma: t }
+                    .recover_x0(&x_t_f32, &v.as_dtype(Dtype::Float32)?)
+                    .and_then(|x| unpack_to_decoder_layout(&x, layout))
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                a.path
+                    .aux_loss(a.plan, a.entry, &x0_hat)
+                    .map_err(|e| Exception::custom(e.to_string()))?
+                    .map(|t| t.weighted)
+            }
+            _ => None,
+        };
+        // Only the first output is differentiated; the other two are reported terms.
+        let zero = || Array::from_f32(0.0);
+        let d_out = diffusion.clone().unwrap_or_else(zero);
+        let a_out = aux_term.clone().unwrap_or_else(zero);
+        let total =
+            combine_step_loss(diffusion, aux_term).map_err(|e| Exception::custom(e.to_string()))?;
+        Ok(vec![total, d_out, a_out])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
-    Ok((val[0].item::<f32>(), grads))
+    let losses = StepLosses {
+        total: val[0].item::<f32>(),
+        diffusion: diffusion_on.then(|| val[1].item::<f32>()),
+        aux: aux_on.then(|| val[2].item::<f32>()),
+    };
+    Ok((losses, grads))
+}
+
+/// Qwen-Image 2.1's x0 decoder for the shared aux-loss builder (epic 2123 E8): TAEQI2.1
+/// (`madebyollin/taeqi2_1`, the 64-channel, 16× RGBA latent API — `F16Decoder`).
+fn taeqi2_1_decoder() -> mlx_gen_perceptual::DecoderSpec {
+    mlx_gen_perceptual::DecoderSpec::Tiny {
+        name: "TAEQI2.1",
+        config: TinyDecoderSpec::taeqi2_1(),
+    }
+}
+
+/// Build the epic-2123 perceptual path through the shared builder: `None` when no aux loss is
+/// enabled (nothing loads; every step is the plain diffusion step).
+fn load_perceptual_path(cfg: &TrainingConfig) -> Result<Option<PerceptualPath>> {
+    mlx_gen_perceptual::build_perceptual_path(
+        cfg,
+        &mlx_gen_perceptual::AuxLossContext {
+            label: "qwen_image_2_1 trainer",
+            decoder: taeqi2_1_decoder(),
+            latent_lpips: None,
+        },
+    )
+}
+
+/// The aux-model bytes ([`TrainingShape::aux_model_bytes`], epic 2123 E7) of `cfg` for a run whose
+/// largest decoded target is the square `edge` or (edit) `target_tokens` latent cells, with
+/// `entries` cached references: TAEQI2.1 + every enabled loss, sized at the square of equal area.
+/// `0` when no aux loss is enabled.
+fn perceptual_footprint_bytes(
+    cfg: &TrainingConfig,
+    edge: u32,
+    target_tokens: u64,
+    entries: usize,
+) -> u64 {
+    let token_pixels = (VAE_SCALE_FACTOR * VAE_SCALE_FACTOR) as u64;
+    let pixels = (edge as u64 * edge as u64).max(target_tokens * token_pixels);
+    let side = (pixels as f64).sqrt().ceil() as u32;
+    mlx_gen_perceptual::perceptual_footprint(
+        cfg,
+        &taeqi2_1_decoder(),
+        mlx_gen_perceptual::AuxGeometry::image(side, entries),
+    )
+}
+
+/// Compute every cache entry's perceptual reference once (its clean packed target latent, unpacked
+/// to the decoder layout at the entry's own target grid), keyed per (item, bucket) entry.
+fn prepare_perceptual_references(path: &mut PerceptualPath, cache: &[CachedItem]) -> Result<()> {
+    for (i, item) in cache.iter().enumerate() {
+        path.ensure_reference(i, &unpack_to_decoder_layout(&item.x0, &item.layout)?)?;
+    }
+    Ok(())
+}
+
+/// One training micro-step on the 1-based `step`: pick the step's cached (item, bucket) entry,
+/// sample its `t` and noise (seeded, exactly as before epic 2123), plan the step's loss terms through
+/// the perceptual path (when one is configured: the alternation key comes from the item's own update
+/// count, and an aux-only step trains at `t` remapped into the loss window), and run
+/// [`compute_step_loss_grads`]. With no perceptual path every step is the plain diffusion step,
+/// bit-identical to the pre-epic-2123 loop.
+#[allow(clippy::too_many_arguments)]
+fn run_train_step(
+    transformer: &mut QwenImage21Transformer,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+    cfg: &TrainingConfig,
+    cache: &[CachedItem],
+    schedule: &BucketSchedule,
+    perceptual: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+    step: u32,
+) -> Result<(StepLosses, LoraParams)> {
+    let k = (step - 1) as usize;
+    let (item_index, _bucket) = schedule.sample(k);
+    let entry = schedule.cache_index(k);
+    let item = &cache[entry];
+    let mut t = sample_sigma(
+        &cfg.timestep_type,
+        &cfg.timestep_bias,
+        cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
+    )?;
+    let noise = random::normal::<f32>(
+        item.x0.shape(),
+        None,
+        None,
+        Some(&random::key(
+            cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
+        )?),
+    )?;
+    let plan;
+    let aux = match perceptual {
+        Some((path, alternation)) => {
+            // Normally a no-op (references were computed once, before the loop).
+            path.ensure_reference(entry, &unpack_to_decoder_layout(&item.x0, &item.layout)?)?;
+            plan = path.plan(alternation.key(step, item_index), entry, t)?;
+            t = plan.noise_level;
+            let path: &PerceptualPath = path;
+            Some(AuxStep {
+                path,
+                plan: &plan,
+                entry,
+            })
+        }
+        None => None,
+    };
+    compute_step_loss_grads(
+        transformer,
+        params,
+        spec,
+        &StepInputs {
+            x0: &item.x0,
+            text: &item.text,
+            layout: &item.layout,
+            references: &item.references,
+            noise: &noise,
+            t,
+            mask_weight: item.mask_weight.as_ref(),
+        },
+        aux,
+    )
 }
 
 /// A resume must continue the same **training mode** (sc-24161): the checkpoint written at the
@@ -1840,6 +2077,12 @@ impl QwenImage21Trainer {
             lokr_delta_elements,
             checkpointed,
             sampling: sampling_requested,
+            aux_model_bytes: perceptual_footprint_bytes(
+                cfg,
+                edge,
+                largest_target_tokens,
+                req.items.len() * edges.len(),
+            ),
         };
         let budget = self
             .memory_budget_override
@@ -2015,6 +2258,14 @@ impl QwenImage21Trainer {
         }
         vae.drop_encoder();
         let vae: Option<QwenImage21Vae> = (!sample_caps.is_empty()).then_some(vae);
+        // Epic 2123 depth anchoring: load the frozen TAEQI2.1 decoder + aux models (small — they
+        // stay resident through training; priced in the preflight's train phase) and compute each
+        // (item, bucket) entry's reference ONCE, before the loop. A missing checkpoint fails here,
+        // before the DiT loads.
+        let mut perceptual = load_perceptual_path(cfg)?;
+        if let Some(path) = perceptual.as_mut() {
+            prepare_perceptual_references(path, &cache)?;
+        }
         training_memory_trace(
             "vae_encoder_dropped_before_clear",
             None,
@@ -2114,6 +2365,17 @@ impl QwenImage21Trainer {
         // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on
+        // the real dataset item (not the (item, bucket) entry). A resumed run replays the skipped
+        // prefix so the phase matches.
+        let mut alternation = perceptual
+            .as_ref()
+            .map(|_| AuxAlternation::new(cache.len() / edges.len(), accum));
+        if let Some(alt) = alternation.as_mut() {
+            for step in 1..=start_step {
+                alt.key(step, schedule.sample((step - 1) as usize).0);
+            }
+        }
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -2122,35 +2384,17 @@ impl QwenImage21Trainer {
                 break;
             }
             training_memory_trace(&format!("step_{step}_begin"), None, Some(_pool.effective));
-            let item = &cache[schedule.cache_index((step - 1) as usize)];
-            let t = sample_sigma(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            )?;
-            let noise = random::normal::<f32>(
-                item.x0.shape(),
-                None,
-                None,
-                Some(&random::key(
-                    cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                )?),
-            )?;
-            let (loss, grads) = compute_loss_grads(
+            let (losses, grads) = run_train_step(
                 &mut transformer,
                 &params,
                 &spec,
-                &StepInputs {
-                    x0: &item.x0,
-                    text: &item.text,
-                    layout: &item.layout,
-                    references: &item.references,
-                    noise: &noise,
-                    t,
-                    mask_weight: item.mask_weight.as_ref(),
-                },
+                cfg,
+                &cache,
+                &schedule,
+                perceptual.as_mut().zip(alternation.as_mut()),
+                step,
             )?;
-            last_loss = loss;
+            last_loss = losses.total;
             training_memory_trace(
                 &format!("step_{step}_gradients_returned"),
                 None,
@@ -2576,6 +2820,7 @@ mod tests {
             lokr_delta_elements: 0,
             checkpointed,
             sampling: false,
+            aux_model_bytes: 0,
         }
     }
 
@@ -4598,5 +4843,622 @@ mod adapter_noise_loop_tests {
             effect > 1e-3,
             "gradient noise must reach the trained adapter (max |diff| {effect})"
         );
+    }
+}
+
+/// sc-24830 (epic 2123 depth anchoring) — the Qwen-Image 2.1 step seam ([`run_train_step`] /
+/// [`compute_step_loss_grads`]) on the tiny-snapshot DiT (2 blocks, 8 latent channels), text-to-image
+/// and edit, dense and gradient-checkpointed, with a random-init **tiny `F16Decoder`** (the TAEQI2.1
+/// structure: pixel-shuffle head, RGBA → RGB, 16×) and a random-init tiny Depth-Anything-V2. Seconds;
+/// no weights downloaded.
+#[cfg(test)]
+mod depth_anchoring_tests {
+    use super::*;
+    use crate::transformer::Segment;
+    use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule};
+    use mlx_gen::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder};
+    use mlx_gen_depth::anchor::{synthetic_weights, tiny_config, DepthAnchorLoss};
+    use mlx_gen_depth::DepthAnythingV2;
+
+    fn tiny_snapshot() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot")
+    }
+
+    fn tiny_dit() -> QwenImage21Transformer {
+        loader::load_transformer(&tiny_snapshot()).unwrap()
+    }
+
+    fn aux_sched() -> AuxLossSchedule {
+        AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        }
+    }
+
+    /// A tiny TAEQI2.1-structured decoder (`F16Decoder`: widening stages, RGBA head, 2×2 pixel
+    /// shuffle) for the tiny DiT's 8 latent channels, + a tiny DA2.
+    fn path_with(schedule: AuxLossSchedule) -> PerceptualPath {
+        let spec = TinyDecoderSpec {
+            latent_channels: 8,
+            stage_channels: [16, 8, 8, 8],
+            ..TinyDecoderSpec::taeqi2_1()
+        };
+        let decoder =
+            TinyDecoder::from_weights(&synthetic_tiny_decoder_weights(&spec, 11).unwrap(), spec)
+                .unwrap();
+        let da2 = tiny_config();
+        PerceptualPath::new(
+            Some(Box::new(decoder)),
+            vec![AuxLoss {
+                schedule,
+                loss: Box::new(DepthAnchorLoss::new(
+                    DepthAnythingV2::from_weights(&synthetic_weights(&da2, 12).unwrap(), da2)
+                        .unwrap(),
+                )),
+            }],
+        )
+        .unwrap()
+    }
+
+    fn cfg() -> TrainingConfig {
+        let mut cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            ..Default::default()
+        };
+        cfg.depth_anchoring.schedule = aux_sched();
+        cfg
+    }
+
+    fn randn(shape: &[i32], seed: u64) -> Array {
+        let a =
+            random::normal::<f32>(shape, None, None, Some(&random::key(seed).unwrap())).unwrap();
+        eval([&a]).unwrap();
+        a
+    }
+
+    /// A text-to-image cache entry: a packed `[1, h·w, 8]` target, 5 caption rows.
+    fn t2i_entry(h: usize, w: usize, k: u64) -> CachedItem {
+        CachedItem {
+            x0: randn(&[1, (h * w) as i32, 8], k),
+            mask_weight: None,
+            text: randn(&[1, 5, 32], 100 + k),
+            layout: JointLayout::text_to_image(5, h, w),
+            references: Vec::new(),
+        }
+    }
+
+    /// An edit cache entry: two references (2×2, 2×4) interleaved with text, the 4×4 target last.
+    fn edit_entry(k: u64) -> CachedItem {
+        CachedItem {
+            x0: randn(&[1, 16, 8], k),
+            mask_weight: None,
+            text: randn(&[1, 8, 32], 100 + k),
+            layout: JointLayout {
+                segments: vec![
+                    Segment::Text { len: 3 },
+                    Segment::Image {
+                        height: 2,
+                        width: 2,
+                    },
+                    Segment::Text { len: 1 },
+                    Segment::Image {
+                        height: 2,
+                        width: 4,
+                    },
+                    Segment::Text { len: 4 },
+                    Segment::Image {
+                        height: 4,
+                        width: 4,
+                    },
+                ],
+            },
+            references: vec![randn(&[1, 4, 8], 200 + k), randn(&[1, 8, 8], 300 + k)],
+        }
+    }
+
+    struct Fixture {
+        dit: QwenImage21Transformer,
+        adapter: TrainAdapter,
+        params: LoraParams,
+        blocks: Vec<BlockTrainables>,
+    }
+
+    fn fixture(cfg: &TrainingConfig) -> Fixture {
+        let mut dit = tiny_dit();
+        let paths = resolve_target_paths(&dit, cfg);
+        let (targets, params) =
+            build_lora_targets(&mut dit, &paths, cfg.rank as i32, cfg.seed).unwrap();
+        let blocks = block_trainables(&mut dit, &paths, &params, cfg).unwrap();
+        Fixture {
+            dit,
+            adapter: TrainAdapter::Lora { targets },
+            params,
+            blocks,
+        }
+    }
+
+    fn single_bucket(n: usize) -> BucketSchedule {
+        BucketSchedule::new(
+            n,
+            &[gen_core::ResolutionBucket {
+                resolution: 64,
+                repeats: 1,
+            }],
+            7,
+        )
+    }
+
+    fn step(
+        f: &mut Fixture,
+        cfg: &TrainingConfig,
+        cache: &[CachedItem],
+        schedule: &BucketSchedule,
+        path: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+        n: u32,
+        ckpt: bool,
+    ) -> (StepLosses, LoraParams) {
+        let spec = LossSpec {
+            adapter: &f.adapter,
+            alpha: cfg.alpha,
+            rank: cfg.rank as f32,
+            mae: false,
+            dtype: Dtype::Float32,
+            lora_dtype: None,
+            checkpoint: ckpt.then_some(f.blocks.as_slice()),
+        };
+        let (l, g) =
+            run_train_step(&mut f.dit, &f.params, &spec, cfg, cache, schedule, path, n).unwrap();
+        eval(g.values()).unwrap();
+        (l, g)
+    }
+
+    fn lora_b_sum(g: &LoraParams) -> f32 {
+        let v: Vec<f32> = g
+            .iter()
+            .filter(|(k, _)| k.ends_with(".lora_b"))
+            .map(|(_, v)| v.abs().unwrap().sum(None).unwrap().item::<f32>())
+            .collect();
+        assert!(!v.is_empty());
+        v.iter().sum()
+    }
+
+    /// `unpack_to_decoder_layout` inverts `pack_latents` at the layout's (non-square) target grid.
+    /// Mutation: reshape to `[B, C, w, h]` ⇒ red.
+    #[test]
+    fn unpack_inverts_the_target_packing() {
+        let grid = randn(&[1, 8, 4, 2], 9);
+        let packed = pack_latents(&grid).unwrap();
+        let back = unpack_to_decoder_layout(&packed, &JointLayout::text_to_image(5, 4, 2)).unwrap();
+        assert_eq!(back.shape(), grid.shape());
+        let err = back
+            .subtract(&grid)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert_eq!(err, 0.0);
+        assert!(unpack_to_decoder_layout(&packed, &JointLayout::text_to_image(5, 4, 4)).is_err());
+    }
+
+    /// AC (a)/(b) on every loss path the trainer runs while depth is on — text-to-image and edit,
+    /// dense and gradient-checkpointed: a depth step trains the LoRA through the depth term alone
+    /// (no diffusion term, total == aux, non-zero finite LoRA-B grad); a diffusion step has no depth
+    /// term. Mutation: force `diffusion_on = true` ⇒ red.
+    #[test]
+    fn depth_step_trains_the_lora_on_every_path() {
+        for edit in [false, true] {
+            for ckpt in [false, true] {
+                let cfg = cfg();
+                let mut f = fixture(&cfg);
+                let cache = vec![if edit {
+                    edit_entry(1)
+                } else {
+                    t2i_entry(4, 4, 1)
+                }];
+                let schedule = single_bucket(1);
+                let mut p = path_with(aux_sched());
+                prepare_perceptual_references(&mut p, &cache).unwrap();
+                let mut alt = AuxAlternation::new(1, 1);
+                let tag = format!("edit={edit} ckpt={ckpt}");
+                let (diff, _) = step(
+                    &mut f,
+                    &cfg,
+                    &cache,
+                    &schedule,
+                    Some((&mut p, &mut alt)),
+                    1,
+                    ckpt,
+                );
+                assert_eq!(diff.aux, None, "{tag}");
+                assert_eq!(Some(diff.total), diff.diffusion, "{tag}");
+                let (depth, g) = step(
+                    &mut f,
+                    &cfg,
+                    &cache,
+                    &schedule,
+                    Some((&mut p, &mut alt)),
+                    2,
+                    ckpt,
+                );
+                assert_eq!(depth.diffusion, None, "{tag}");
+                let aux = depth.aux.expect("depth term");
+                assert!(aux > 0.0 && aux.is_finite(), "{tag}: {aux}");
+                assert_eq!(depth.total, aux, "{tag}");
+                let gb = lora_b_sum(&g);
+                assert!(gb > 0.0 && gb.is_finite(), "{tag}: LoRA-B |Σ| = {gb}");
+            }
+        }
+    }
+
+    /// The aux step trains at `t` remapped into `[0.6, 0.8]`, and its depth term is the depth loss
+    /// of the explicitly recovered target-block `x_t − t·v`, unpacked (edit layout: the references
+    /// condition the forward, only the target is decoded). Mutations: keep the sampled `t` ⇒ red;
+    /// recover with the opposite flow sign ⇒ red.
+    #[test]
+    fn aux_step_trains_at_the_remapped_noise_level() {
+        let mut cfg = cfg();
+        let window = AuxLossSchedule {
+            t_min: 0.6,
+            t_max: 0.8,
+            ..aux_sched()
+        };
+        cfg.depth_anchoring.schedule = window;
+        let mut f = fixture(&cfg);
+        let cache = vec![edit_entry(1)];
+        let schedule = single_bucket(1);
+        let mut p = path_with(window);
+        prepare_perceptual_references(&mut p, &cache).unwrap();
+        let mut alt = AuxAlternation::new(1, 1);
+        step(
+            &mut f,
+            &cfg,
+            &cache,
+            &schedule,
+            Some((&mut p, &mut alt)),
+            1,
+            false,
+        );
+        let (depth, _) = step(
+            &mut f,
+            &cfg,
+            &cache,
+            &schedule,
+            Some((&mut p, &mut alt)),
+            2,
+            false,
+        );
+        let raw = sample_sigma(
+            &cfg.timestep_type,
+            &cfg.timestep_bias,
+            cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(2),
+        )
+        .unwrap();
+        let plan = p.plan(2, 0, raw).unwrap();
+        let t = plan.noise_level;
+        assert!((0.6..=0.8).contains(&t) && t != raw, "{t} vs {raw}");
+        let item = &cache[0];
+        let noise = random::normal::<f32>(
+            item.x0.shape(),
+            None,
+            None,
+            Some(&random::key(cfg.seed.wrapping_add(2).wrapping_mul(2) + 1).unwrap()),
+        )
+        .unwrap();
+        f.adapter
+            .install_as(&mut f.dit, &f.params, 4.0, 4.0, None, LOKR_DTYPE)
+            .unwrap();
+        let (x_t, _) = build_batch(&item.x0, &noise, t).unwrap();
+        let v = f
+            .dit
+            .forward_joint(
+                &item.text,
+                &joint_images(&item.references, &x_t),
+                t,
+                &item.layout,
+            )
+            .unwrap();
+        let x0_hat = subtract(&x_t, multiply(&v, Array::from_f32(t)).unwrap()).unwrap();
+        let want = p
+            .aux_loss(
+                &plan,
+                0,
+                &unpack_to_decoder_layout(&x0_hat, &item.layout).unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+            .weighted
+            .item::<f32>();
+        let got = depth.aux.expect("depth step");
+        assert!(
+            (want - got).abs() <= 1e-5 * want.abs().max(1.0),
+            "{want} vs {got}"
+        );
+    }
+
+    /// Per-image alternation (round-robin N = 2) and per-entry references across two buckets with
+    /// different target grids (every step recomputed against its SCHEDULED entry). Mutations: key
+    /// the plan on the global step ⇒ red; pass the item as the `AuxStep` entry ⇒ red.
+    #[test]
+    fn alternation_is_per_image_with_per_entry_references() {
+        let cfg = cfg();
+        let mut f = fixture(&cfg);
+        let cache = vec![t2i_entry(4, 4, 1), t2i_entry(4, 4, 2)];
+        let schedule = single_bucket(2);
+        let mut p = path_with(aux_sched());
+        prepare_perceptual_references(&mut p, &cache).unwrap();
+        let mut alt = AuxAlternation::new(2, 1);
+        let kinds: Vec<(usize, bool)> = (1..=4)
+            .map(|n| {
+                let (l, _) = step(
+                    &mut f,
+                    &cfg,
+                    &cache,
+                    &schedule,
+                    Some((&mut p, &mut alt)),
+                    n,
+                    false,
+                );
+                (schedule.sample((n - 1) as usize).0, l.aux.is_some())
+            })
+            .collect();
+        for image in 0..2 {
+            let mine: Vec<bool> = kinds.iter().filter(|k| k.0 == image).map(|k| k.1).collect();
+            assert!(mine.contains(&true) && mine.contains(&false), "{kinds:?}");
+        }
+
+        // Two buckets, item-major: 4×4 and 2×4 target grids.
+        let cache = vec![
+            t2i_entry(4, 4, 10),
+            t2i_entry(2, 4, 11),
+            t2i_entry(4, 4, 12),
+            t2i_entry(2, 4, 13),
+        ];
+        let schedule = BucketSchedule::new(
+            2,
+            &[
+                gen_core::ResolutionBucket {
+                    resolution: 64,
+                    repeats: 1,
+                },
+                gen_core::ResolutionBucket {
+                    resolution: 32,
+                    repeats: 1,
+                },
+            ],
+            7,
+        );
+        let mut p = path_with(aux_sched());
+        prepare_perceptual_references(&mut p, &cache).unwrap();
+        let mut alt = AuxAlternation::new(2, 1);
+        let mut replay = AuxAlternation::new(2, 1);
+        let mut depth_off_item = false;
+        for n in 1..=2 * schedule.epoch_len() as u32 {
+            let (l, _) = step(
+                &mut f,
+                &cfg,
+                &cache,
+                &schedule,
+                Some((&mut p, &mut alt)),
+                n,
+                false,
+            );
+            let k = (n - 1) as usize;
+            let (item, entry) = (schedule.sample(k).0, schedule.cache_index(k));
+            let raw = sample_sigma(
+                &cfg.timestep_type,
+                &cfg.timestep_bias,
+                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
+            )
+            .unwrap();
+            let plan = p.plan(replay.key(n, item), entry, raw).unwrap();
+            let c = &cache[entry];
+            let noise = random::normal::<f32>(
+                c.x0.shape(),
+                None,
+                None,
+                Some(&random::key(cfg.seed.wrapping_add(n as u64).wrapping_mul(2) + 1).unwrap()),
+            )
+            .unwrap();
+            let spec = LossSpec {
+                adapter: &f.adapter,
+                alpha: cfg.alpha,
+                rank: cfg.rank as f32,
+                mae: false,
+                dtype: Dtype::Float32,
+                lora_dtype: None,
+                checkpoint: None,
+            };
+            let (expected, _) = compute_step_loss_grads(
+                &mut f.dit,
+                &f.params,
+                &spec,
+                &StepInputs {
+                    x0: &c.x0,
+                    text: &c.text,
+                    layout: &c.layout,
+                    references: &c.references,
+                    noise: &noise,
+                    t: plan.noise_level,
+                    mask_weight: None,
+                },
+                Some(AuxStep {
+                    path: &p,
+                    plan: &plan,
+                    entry,
+                }),
+            )
+            .unwrap();
+            assert_eq!(l, expected, "step {n} (item {item}, entry {entry})");
+            depth_off_item |= l.aux.is_some() && entry != item;
+        }
+        assert!(depth_off_item, "no depth step on an entry != its item");
+        assert_eq!(p.reference_computations(), cache.len());
+    }
+
+    /// E1: depth off ⇒ nothing loaded, no aux bytes, and the step is bit-identical to the
+    /// pre-epic-2123 closure (reproduced verbatim); a diffusion-only step of an enabled path is
+    /// bit-identical too. Mutation: flip MAE/MSE in the diffusion term ⇒ red.
+    #[test]
+    fn everything_off_is_bit_identical_to_the_legacy_step() {
+        assert!(load_perceptual_path(&TrainingConfig::default())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            perceptual_footprint_bytes(&TrainingConfig::default(), 1024, 0, 10),
+            0
+        );
+        let off_cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let mut f = fixture(&off_cfg);
+        let cache = vec![edit_entry(1), edit_entry(2)];
+        let schedule = single_bucket(2);
+        let (off, g_off) = step(&mut f, &off_cfg, &cache, &schedule, None, 1, false);
+        assert_eq!(off.aux, None);
+        let item = &cache[0];
+        let t = sample_sigma(
+            &off_cfg.timestep_type,
+            &off_cfg.timestep_bias,
+            off_cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),
+        )
+        .unwrap();
+        let noise = random::normal::<f32>(
+            item.x0.shape(),
+            None,
+            None,
+            Some(&random::key(off_cfg.seed.wrapping_add(1).wrapping_mul(2) + 1).unwrap()),
+        )
+        .unwrap();
+        let (x_t, target) = build_batch(&item.x0, &noise, t).unwrap();
+        let (text, layout, references) = (item.text.clone(), &item.layout, &item.references);
+        let dit = &mut f.dit;
+        let adapter = &f.adapter;
+        let legacy = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+            adapter.install_as(dit, &p, 4.0, 4.0, None, LOKR_DTYPE)?;
+            let images = joint_images(references, &x_t);
+            let v = dit
+                .forward_joint(&text, &images, t, layout)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            Ok(vec![reduce_loss(&subtract(&v, &target)?, None, false)?])
+        };
+        let (val, g_legacy) = keyed_value_and_grad(legacy)(f.params.clone(), 0).unwrap();
+        eval(g_legacy.values()).unwrap();
+        assert_eq!(off.total, val[0].item::<f32>());
+        let bits =
+            |a: &Array| -> Vec<u32> { a.as_slice::<f32>().iter().map(|x| x.to_bits()).collect() };
+        for (k, v) in &g_legacy {
+            assert_eq!(bits(v), bits(&g_off[k]), "{k}");
+        }
+        let on_cfg = cfg();
+        let mut f2 = fixture(&on_cfg);
+        let mut p = path_with(aux_sched());
+        prepare_perceptual_references(&mut p, &cache).unwrap();
+        let mut alt = AuxAlternation::new(2, 1);
+        let (on1, g_on1) = step(
+            &mut f2,
+            &on_cfg,
+            &cache,
+            &schedule,
+            Some((&mut p, &mut alt)),
+            1,
+            false,
+        );
+        let mut f3 = fixture(&on_cfg);
+        let (none1, g_none1) = step(&mut f3, &on_cfg, &cache, &schedule, None, 1, false);
+        assert_eq!(on1, none1);
+        for (k, v) in &g_none1 {
+            assert_eq!(bits(v), bits(&g_on1[k]), "{k}");
+        }
+    }
+
+    /// E7: the aux bytes (TAEQI2.1 + DA2, more for Large, sized at the largest target) land in the
+    /// estimator's train phase on the dense AND checkpointed shapes, and the preflight refuses at a
+    /// synthetic budget between the base peak and base + aux. Mutations: drop
+    /// `+ shape.aux_model_bytes` from `train_phase` ⇒ red; price the edit target at `edge` only
+    /// (ignore `target_tokens`) ⇒ the wide-target figure stops growing ⇒ red.
+    #[test]
+    fn memory_estimate_includes_the_aux_models() {
+        let mut on = TrainingConfig::default();
+        on.depth_anchoring.schedule = aux_sched();
+        let small = perceptual_footprint_bytes(&on, 1024, 0, 10);
+        on.depth_anchoring.model_size = gen_core::train::DepthModelSize::Large;
+        let large = perceptual_footprint_bytes(&on, 1024, 0, 10);
+        assert!(
+            small > 0 && large > small + 1_000_000_000,
+            "{small} / {large}"
+        );
+        // An edit target wider than the square edge (more latent cells) prices a larger decode.
+        assert!(perceptual_footprint_bytes(&on, 1024, 4 * 64 * 64, 10) > large);
+
+        let facts = FootprintFacts::from_snapshot(&tiny_snapshot()).unwrap();
+        for checkpointed in [false, true] {
+            let base = TrainingShape {
+                edge: 64, // the train phase (with aux) is the peak
+                target_tokens: 0,
+                target_cache_tokens: 0,
+                caption_tokens: 64,
+                reference_tokens: 0,
+                largest_reference_tokens: 0,
+                reference_cache_tokens: 0,
+                prefix_scores: 0,
+                largest_prefix_call: 0,
+                items: 4,
+                compute_width: 2,
+                trainable_params: 1_000_000,
+                optimizer_state_per_param: 2,
+                lokr_delta_elements: 0,
+                checkpointed,
+                sampling: false,
+                aux_model_bytes: 0,
+            };
+            let with_aux = TrainingShape {
+                aux_model_bytes: large,
+                ..base
+            };
+            let (fp0, fp1) = (
+                training_footprint(&facts, &base),
+                training_footprint(&facts, &with_aux),
+            );
+            assert_eq!(
+                fp1.train_phase - fp0.train_phase,
+                large,
+                "checkpointed={checkpointed}"
+            );
+            let between = fp0.peak() + large / 2;
+            assert!(check_training_footprint(&facts, &base, between).is_ok());
+            assert!(
+                check_training_footprint(&facts, &with_aux, between).is_err(),
+                "checkpointed={checkpointed}"
+            );
+        }
+    }
+
+    /// E3: Qwen-Image 2.1 declares depth anchoring.
+    #[test]
+    fn descriptor_declares_depth_anchoring() {
+        assert!(trainer_descriptor().techniques.depth_anchoring);
+    }
+
+    /// A missing decoder is a named error (TAEQI2.1).
+    #[test]
+    fn missing_aux_weights_are_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.perceptual_decoder_dir = Some(tmp.path().join("no-taeqi2_1"));
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let err = load_perceptual_path(&c)
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(err.contains("TAEQI2.1"), "{err}");
     }
 }
