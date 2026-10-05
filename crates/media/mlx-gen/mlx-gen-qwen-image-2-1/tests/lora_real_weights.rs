@@ -307,6 +307,21 @@ pub(crate) struct Footprint {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+struct MlxCacheAllocator;
+
+impl physical_watchdog::CacheAllocator for MlxCacheAllocator {
+    fn set_cache_limit(&self, limit: usize) -> usize {
+        mlx_rs::memory::set_cache_limit(limit)
+    }
+
+    fn clear_cache(&self) {
+        // MLX's cache is process-local. This releases only freed buffers owned by
+        // this native evidence process before any large weight load begins.
+        mlx_rs::memory::clear_cache();
+    }
+}
+
 impl Footprint {
     pub(crate) fn start(out: &Path) -> Self {
         use std::io::Write;
@@ -410,25 +425,78 @@ impl Footprint {
         }
     }
 
-    fn admit_training(&self, preflight: &Value) {
+    fn admit_training(
+        &self,
+        preflight: &Value,
+    ) -> physical_watchdog::ScopedCacheGrant<MlxCacheAllocator> {
         let (mut host, census) = host_census();
-        host.cache_limit = host
-            .cache_limit
-            .min(preflight["requestedCacheLimitBytes"].as_u64().unwrap());
+        let requested_cache = preflight["requestedCacheLimitBytes"].as_u64().unwrap();
+        let previous_cache = host.cache_limit;
+        host.cache_limit = previous_cache.min(requested_cache);
         let envelope = preflight["peakBytes"].as_u64().unwrap();
         let result = physical_watchdog::admit(host, envelope, self.explicit_cap);
+        let grant = match result {
+            Ok(grant) => grant,
+            Err(error) => {
+                let receipt = json!({"host": census, "preflight": preflight,
+                    "requestedCacheLimitBytes": requested_cache,
+                    "previousCacheLimitBytes": previous_cache,
+                    "refusal": error,
+                    "policy": "checked_preflight_plus_measured_overhead_plus_scoped_cache_grant_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
+                std::fs::write(
+                    self.out.join("physical-admission.json"),
+                    serde_json::to_vec_pretty(&receipt).unwrap(),
+                )
+                .unwrap();
+                panic!("selected training case cannot safely fit; see physical-admission.json");
+            }
+        };
+        let cache = physical_watchdog::ScopedCacheGrant::enter(MlxCacheAllocator, grant)
+        .unwrap_or_else(|error| {
+            let receipt = json!({"host": census.clone(), "preflight": preflight,
+                "requestedCacheLimitBytes": requested_cache,
+                "admissionGrant": format!("{grant:?}"), "refusal": error,
+                "policy": "checked_preflight_plus_measured_overhead_plus_scoped_cache_grant_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
+            std::fs::write(
+                self.out.join("physical-admission.json"),
+                serde_json::to_vec_pretty(&receipt).unwrap(),
+            )
+            .unwrap();
+            panic!("allocator cache grant could not be installed; see physical-admission.json");
+        });
+        let effective_cache_bytes =
+            u64::try_from(cache.effective()).expect("allocator cache limit fits receipt u64");
+        let full_envelope = envelope
+            .checked_add(grant.nonallocator_overhead)
+            .and_then(|bytes| bytes.checked_add(effective_cache_bytes))
+            .expect("admitted full envelope stays representable");
+        assert!(
+            full_envelope <= grant.physical_ceiling,
+            "installed cache grant exceeds admitted physical ceiling"
+        );
         let receipt = json!({"host": census, "preflight": preflight,
-            "requestedPoolBoundBytes": host.cache_limit, "physicalCeilingBytes": result.as_ref().ok(),
-            "refusal": result.as_ref().err(), "policy": "preflight_plus_measured_overhead_and_cache_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
+            "requestedCacheLimitBytes": requested_cache,
+            "previousCacheLimitBytes": cache.previous(),
+            "effectiveCacheLimitBytes": effective_cache_bytes,
+            "nonallocatorOverheadBytes": grant.nonallocator_overhead,
+            "activeEnvelopeBytes": grant.active_envelope,
+            "fullEnvelopeBytes": full_envelope,
+            "physicalCeilingBytes": grant.physical_ceiling,
+            "refusal": Value::Null,
+            "policy": "checked_preflight_plus_measured_overhead_plus_scoped_cache_grant_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
         std::fs::write(
             self.out.join("physical-admission.json"),
             serde_json::to_vec_pretty(&receipt).unwrap(),
         )
         .unwrap();
-        let ceiling =
-            result.expect("selected training case cannot safely fit; see physical-admission.json");
-        self.ceiling.store(ceiling, Ordering::Relaxed);
-        eprintln!("admitted training: preflight={envelope} physicalCeiling={ceiling} bytes");
+        self.ceiling
+            .store(grant.physical_ceiling, Ordering::Relaxed);
+        eprintln!(
+            "admitted training: preflight={envelope} requestedCache={requested_cache} \
+             effectiveCache={} fullEnvelope={full_envelope} physicalCeiling={} bytes",
+            effective_cache_bytes, grant.physical_ceiling
+        );
+        cache
     }
 
     #[allow(dead_code)] // Used only by the cfg(test) library diagnostic, not this integration binary.
@@ -904,7 +972,9 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let predicted_peak_bytes = preflight["peakBytes"]
         .as_u64()
         .expect("exact envelope bytes");
-    guard.admit_training(&preflight);
+    // The returned task-owned guard is installed before the first large weight load and retained
+    // through `Trainer::train`; its Drop restores the caller's allocator policy on every exit.
+    let cache_grant = guard.admit_training(&preflight);
     let predicted_peak_gib = predicted_message
         .split("derived peak memory is ~")
         .nth(1)
@@ -996,6 +1066,9 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let remaining_steps = guard.end();
     drop(trainer);
     mlx_rs::memory::clear_cache();
+    let installed_cache_limit =
+        u64::try_from(cache_grant.effective()).expect("allocator cache limit fits u64");
+    drop(cache_grant);
     let (caching_peak, caching_footprint) = caching_peaks.unwrap_or((0, 0));
     let (train_peak, train_footprint) = training_peaks::aggregate_training_peaks(
         (caching_peak, caching_footprint),
@@ -1004,11 +1077,12 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let resident = resident_after_first_step.unwrap_or(0);
     eprintln!(
         "trained in {seconds:.0}s: conservative cache/step peak {:.2} GiB (resident after step 1 {:.2} + \
-         high-water excess {:.2}) vs preflight train ~{} GiB",
+         high-water excess {:.2}) vs preflight train ~{} GiB; scoped cache grant {:.2} GiB restored",
         gib(train_peak),
         gib(resident),
         gib(train_peak.saturating_sub(resident)),
-        predicted_train_gib.map_or("?".into(), |g| format!("{g:.1}"))
+        predicted_train_gib.map_or("?".into(), |g| format!("{g:.1}")),
+        gib(installed_cache_limit),
     );
 
     if output.adapter_path != canonical {
