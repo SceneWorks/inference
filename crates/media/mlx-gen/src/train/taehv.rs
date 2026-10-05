@@ -315,9 +315,10 @@ fn pixel_shuffle(x: &Array, p: i32) -> Result<Array> {
 }
 
 impl TaehvDecoder {
-    /// Load from a checkpoint file, or from a directory holding `<name>.safetensors` (directly or
-    /// under `safetensors/`, the upstream repo layout) or exactly one `.safetensors` file. A
-    /// missing checkpoint is an error naming the decoder.
+    /// Load from a checkpoint file, or from a directory holding `<name>.safetensors` directly, under
+    /// `vae/` (the `Kijai/LTX2.3_comfy` mirror layout) or under `safetensors/` (the upstream
+    /// `madebyollin/taehv` repo layout). The file is picked by name only — never "the only
+    /// safetensors in the dir". A missing checkpoint is an error naming the decoder.
     pub fn from_path(path: impl AsRef<Path>, cfg: TaehvConfig) -> Result<Self> {
         let path = path.as_ref();
         let missing = || {
@@ -330,26 +331,14 @@ impl TaehvDecoder {
         };
         let file = if path.is_file() {
             path.to_path_buf()
-        } else if path.is_dir() {
-            let direct = path.join(cfg.file_name());
-            let nested = path.join("safetensors").join(cfg.file_name());
-            if direct.is_file() {
-                direct
-            } else if nested.is_file() {
-                nested
-            } else {
-                let files: Vec<_> = std::fs::read_dir(path)?
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
-                    .filter(|p| !gen_core::weightsmeta::is_hidden_file(p))
-                    .collect();
-                match files.as_slice() {
-                    [one] => one.clone(),
-                    _ => return Err(missing()),
-                }
-            }
         } else {
-            return Err(missing());
+            // By NAME only: a snapshot root (e.g. a multi-component mirror repo) can hold other
+            // safetensors, so "the only/first safetensors in the dir" would load the wrong file.
+            ["", "vae", "safetensors"]
+                .iter()
+                .map(|sub| path.join(sub).join(cfg.file_name()))
+                .find(|p| p.is_file())
+                .ok_or_else(missing)?
         };
         let w = Weights::from_file(&file)
             .map_err(|e| Error::Msg(format!("{}: {e}", cfg.display_name())))?;
@@ -763,6 +752,41 @@ mod tests {
             err.contains("TAELTX2.3") && err.contains("taeltx2_3.safetensors"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn checkpoint_is_picked_by_name_never_by_being_the_only_file() {
+        let cfg = tiny(TaehvConfig::taew2_1());
+        let w = synthetic_taehv_weights(&cfg, 2).unwrap();
+        let pairs: Vec<(String, Array)> = w
+            .keys()
+            .map(|k| (k.to_string(), w.require(k).unwrap().clone()))
+            .collect();
+        let refs: Vec<(&str, &Array)> = pairs.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        let dir = tempfile::tempdir().unwrap();
+        // A mirror snapshot root holding an unrelated component: not taken as the decoder.
+        Array::save_safetensors(
+            vec![("x", &Array::zeros::<f32>(&[1]).unwrap())],
+            None,
+            dir.path().join("other_model.safetensors"),
+        )
+        .unwrap();
+        let err = TaehvDecoder::from_path(dir.path(), cfg.clone())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("taew2_1.safetensors"), "{err}");
+        for sub in ["", "vae", "safetensors"] {
+            let d = dir.path().join(format!("layout{sub}"));
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+            Array::save_safetensors(refs.clone(), None, d.join(sub).join("taew2_1.safetensors"))
+                .unwrap();
+            let dec = TaehvDecoder::from_path(&d, cfg.clone()).unwrap();
+            assert_eq!(dec.param_bytes(), cfg.param_count() * 4, "layout {sub:?}");
+        }
+        // The file path itself.
+        let f = dir.path().join("layout/taew2_1.safetensors");
+        assert!(TaehvDecoder::from_path(&f, cfg).is_ok());
     }
 
     #[test]

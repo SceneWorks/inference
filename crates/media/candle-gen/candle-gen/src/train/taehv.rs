@@ -274,9 +274,10 @@ pub struct TaehvDecoder {
 }
 
 impl TaehvDecoder {
-    /// Load from a checkpoint file, or from a directory holding `<name>.safetensors` (directly or
-    /// under `safetensors/`, the upstream repo layout) or exactly one `.safetensors` file. A
-    /// missing checkpoint is an error naming the decoder.
+    /// Load from a checkpoint file, or from a directory holding `<name>.safetensors` directly, under
+    /// `vae/` (the `Kijai/LTX2.3_comfy` mirror layout) or under `safetensors/` (the upstream
+    /// `madebyollin/taehv` repo layout). The file is picked by name only — never "the only
+    /// safetensors in the dir". A missing checkpoint is an error naming the decoder.
     pub fn from_path(path: impl AsRef<Path>, cfg: TaehvConfig, device: &Device) -> Result<Self> {
         let path = path.as_ref();
         let missing = || {
@@ -289,26 +290,14 @@ impl TaehvDecoder {
         };
         let file = if path.is_file() {
             path.to_path_buf()
-        } else if path.is_dir() {
-            let direct = path.join(cfg.file_name());
-            let nested = path.join("safetensors").join(cfg.file_name());
-            if direct.is_file() {
-                direct
-            } else if nested.is_file() {
-                nested
-            } else {
-                let files: Vec<_> = std::fs::read_dir(path)?
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
-                    .filter(|p| !gen_core::weightsmeta::is_hidden_file(p))
-                    .collect();
-                match files.as_slice() {
-                    [one] => one.clone(),
-                    _ => return Err(missing()),
-                }
-            }
         } else {
-            return Err(missing());
+            // By NAME only: a snapshot root (e.g. a multi-component mirror repo) can hold other
+            // safetensors, so "the only/first safetensors in the dir" would load the wrong file.
+            ["", "vae", "safetensors"]
+                .iter()
+                .map(|sub| path.join(sub).join(cfg.file_name()))
+                .find(|p| p.is_file())
+                .ok_or_else(missing)?
         };
         let w = candle_core::safetensors::load(&file, device)
             .map_err(|e| Error::Msg(format!("{}: {e}", cfg.display_name())))?;
@@ -717,15 +706,31 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_file_round_trips_through_from_path() {
+    fn checkpoint_is_picked_by_name_never_by_being_the_only_file() {
         let cfg = tiny(TaehvConfig::taew2_1());
         let w = synthetic_taehv_weights(&cfg, 2, &Device::Cpu).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("safetensors")).unwrap();
-        candle_core::safetensors::save(&w, dir.path().join("safetensors/taew2_1.safetensors"))
-            .unwrap();
-        let dec = TaehvDecoder::from_path(dir.path(), cfg.clone(), &Device::Cpu).unwrap();
-        assert_eq!(dec.param_bytes(), cfg.param_count() * 4);
+        // A mirror snapshot root holding an unrelated component: not taken as the decoder.
+        let other: HashMap<String, Tensor> = [(
+            "x".to_string(),
+            Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap(),
+        )]
+        .into();
+        candle_core::safetensors::save(&other, dir.path().join("other_model.safetensors")).unwrap();
+        let err = TaehvDecoder::from_path(dir.path(), cfg.clone(), &Device::Cpu)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("taew2_1.safetensors"), "{err}");
+        for sub in ["", "vae", "safetensors"] {
+            let d = dir.path().join(format!("layout{sub}"));
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+            candle_core::safetensors::save(&w, d.join(sub).join("taew2_1.safetensors")).unwrap();
+            let dec = TaehvDecoder::from_path(&d, cfg.clone(), &Device::Cpu).unwrap();
+            assert_eq!(dec.param_bytes(), cfg.param_count() * 4, "layout {sub:?}");
+        }
+        let f = dir.path().join("layout/taew2_1.safetensors");
+        assert!(TaehvDecoder::from_path(&f, cfg, &Device::Cpu).is_ok());
     }
 
     #[test]
