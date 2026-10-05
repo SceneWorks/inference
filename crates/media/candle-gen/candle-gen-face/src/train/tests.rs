@@ -138,23 +138,48 @@ impl FaceBoxDetector for StubDetector {
     }
 }
 
+/// The scorer over the fixture's synthetic ArcFace (its noise mean computed at construction, as at
+/// load).
+fn scorer(f: &Value, min_cos: f32, mode: IdentityReferenceMode) -> Arc<IdentityScorer> {
+    Arc::new(IdentityScorer::new(arcface(f), min_cos, mode, &dev()).unwrap())
+}
+
 fn identity_loss(
     f: &Value,
     face: Option<[f32; 4]>,
     min_cos: f32,
     mode: IdentityReferenceMode,
 ) -> IdentityLoss {
-    IdentityLoss::new(arcface(f), Arc::new(StubDetector(face)), min_cos, mode)
+    IdentityLoss::new(scorer(f, min_cos, mode), Arc::new(StubDetector(face)))
 }
 
-/// AC3: the Candle identity path reproduces the torch reference embedding, cosine and loss (the
+fn crop_of(f: &Value) -> CropBox {
+    face_crop_box(bbox(f), 72, 88)
+}
+
+fn expect(v: &Value) -> f32 {
+    v.as_f64().unwrap() as f32
+}
+
+fn noise_px(key: &str, h: usize, w: usize) -> Tensor {
+    Tensor::from_vec(
+        candle_gen::gen_core::train::face_loss::synth::noise_image(IDENTITY_NOISE_SEED, key, h, w),
+        (1, h, w, 3),
+        &dev(),
+    )
+    .unwrap()
+}
+
+/// AC3: the Candle identity path reproduces the torch reference embedding, the bias direction
+/// (mean embedding of the 200 counter-based noise images) and the bias-centred cosine / loss (the
 /// same numbers the MLX twin asserts). Mutations: transpose `rx` wrongly (use `rx` without `.t()`)
-/// ⇒ shape/values red; drop the `2·px − 1` normalization ⇒ embedding red.
+/// ⇒ shape/values red; drop the `2·px − 1` normalization ⇒ embedding red; skip the bias centring
+/// ⇒ cos red.
 #[test]
 fn identity_path_matches_the_torch_reference() {
     let f = fixture();
     let (live, reference) = images(&f);
-    let crop = face_crop_box(bbox(&f), 72, 88);
+    let crop = crop_of(&f);
     let want_box: Vec<usize> = f["crop_box"]
         .as_array()
         .unwrap()
@@ -163,8 +188,19 @@ fn identity_path_matches_the_torch_reference() {
         .collect();
     assert_eq!([crop.x0, crop.y0, crop.x1, crop.y1].to_vec(), want_box);
     let loss = identity_loss(&f, None, -1.0, IdentityReferenceMode::PerImage);
-    let e_live = read(&loss.embed(&live, crop).unwrap());
-    let e_ref = read(&loss.embed(&reference, crop).unwrap());
+    let s = loss.scorer();
+    assert_eq!(
+        f["arcface"]["noise_seed"].as_u64().unwrap(),
+        IDENTITY_NOISE_SEED
+    );
+    assert_eq!(
+        f["arcface"]["noise_samples"].as_u64().unwrap() as usize,
+        IDENTITY_NOISE_SAMPLES
+    );
+    let d_mean = max_abs_diff(&read(s.noise_mean()), &floats(&f["arcface"]["noise_mean"]));
+    assert!(d_mean < 2e-5, "noise-mean drift {d_mean}");
+    let e_live = read(&s.embed(&live, crop).unwrap());
+    let e_ref = read(&s.embed(&reference, crop).unwrap());
     let d_live = max_abs_diff(&e_live, &floats(&f["arcface"]["embedding"]));
     let d_ref = max_abs_diff(&e_ref, &floats(&f["arcface"]["reference_embedding"]));
     assert!(
@@ -177,14 +213,48 @@ fn identity_path_matches_the_torch_reference() {
         Tensor::from_vec(e_ref.clone(), e_ref.len(), &dev()).unwrap(),
     );
     let (l, cos) = loss.loss_and_cos(&live, &r).unwrap();
-    let want_cos = f["arcface"]["cos"].as_f64().unwrap() as f32;
-    assert!((scalar(&cos) - want_cos).abs() < 2e-5);
-    let want = f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
+    let want_cos = expect(&f["arcface"]["cos"]);
+    assert!(
+        (scalar(&cos) - want_cos).abs() < 2e-5,
+        "cos {} vs {want_cos}",
+        scalar(&cos)
+    );
+    let want = expect(&f["arcface"]["identity_loss"]);
     assert!(
         (scalar(&l) - want).abs() < 2e-5,
         "loss {} vs {want}",
         scalar(&l)
     );
+}
+
+/// Bias centring takes a non-face toward 0: 112² noise images score below upstream's 0.2 gate
+/// against the synthetic reference, matching torch. Mutation: score the raw (uncentred) cosine ⇒
+/// values drift from the fixture ⇒ red.
+#[test]
+fn noise_scores_below_the_gate_against_the_reference() {
+    let f = fixture();
+    let (_, reference) = images(&f);
+    let s = scorer(&f, -1.0, IdentityReferenceMode::PerImage);
+    let e_ref = s
+        .center(&s.embed(&reference, crop_of(&f)).unwrap())
+        .unwrap();
+    let keys = f["arcface"]["noise_probe_keys"].as_array().unwrap();
+    let want = floats(&f["arcface"]["noise_probe_cos"]);
+    assert_eq!(keys.len(), want.len());
+    assert!(!keys.is_empty());
+    let full = CropBox {
+        x0: 0,
+        y0: 0,
+        x1: ARCFACE_INPUT,
+        y1: ARCFACE_INPUT,
+    };
+    for (key, want) in keys.iter().zip(want) {
+        let probe = noise_px(key.as_str().unwrap(), ARCFACE_INPUT, ARCFACE_INPUT);
+        let c = s.center(&s.embed(&probe, full).unwrap()).unwrap();
+        let cos = scalar(&(&c * &e_ref).unwrap().sum_all().unwrap());
+        assert!((cos - want).abs() < 2e-5, "{key}: cos {cos} vs {want}");
+        assert!(cos < 0.2, "{key}: noise scored {cos}");
+    }
 }
 
 /// AC3 (landmarks): the Candle fx-program executor + landmark path reproduce torch's normalized
@@ -194,8 +264,8 @@ fn identity_path_matches_the_torch_reference() {
 fn landmark_path_matches_the_torch_reference() {
     let f = fixture();
     let (live, reference) = images(&f);
-    let crop = face_crop_box(bbox(&f), 72, 88);
-    let loss = FaceLandmarkLoss::new(mesh_program(&f), Arc::new(StubDetector(None)));
+    let crop = crop_of(&f);
+    let loss = FaceLandmarkLoss::new(mesh_program(&f), Arc::new(StubDetector(None)), None);
     let l_live = loss.landmarks(&live, crop).unwrap();
     let l_ref = loss.landmarks(&reference, crop).unwrap();
     let want = floats(&f["facemesh"]["landmarks"]);
@@ -203,7 +273,7 @@ fn landmark_path_matches_the_torch_reference() {
     let d = max_abs_diff(&read(&l_live), &want);
     assert!(d < 1e-4 * scale, "landmark drift {d} (scale {scale})");
     let got = scalar(&landmark_distance(&l_live, &l_ref).unwrap());
-    let want = f["facemesh"]["landmark_loss"].as_f64().unwrap() as f32;
+    let want = expect(&f["facemesh"]["landmark_loss"]);
     assert!(
         (got - want).abs() < 1e-4 * want.max(1.0),
         "loss {got} vs {want}"
@@ -251,8 +321,8 @@ fn lora_x0(z: &Tensor, a: &Tensor, b: &Tensor) -> Tensor {
         .unwrap()
 }
 
-/// `(aux value, |dL/dA|₁, |dL/dB|₁)` of one aux step through the path.
-fn aux_value_and_grads(path: &PerceptualPath, z: &Tensor) -> (f32, f32, f32) {
+/// `(aux value, |dL/dA|₁, |dL/dB|₁, noise level)` of one aux step through the path.
+fn aux_value_and_grads(path: &PerceptualPath, z: &Tensor) -> (f32, f32, f32, f32) {
     let plan = path.plan(0, 0, 0.5).unwrap();
     assert!(plan.aux == vec![0], "{plan:?}");
     // Standard LoRA init: A random, B zero ⇒ x0 == z at step 0, gradient lands on B.
@@ -274,27 +344,31 @@ fn aux_value_and_grads(path: &PerceptualPath, z: &Tensor) -> (f32, f32, f32) {
             })
             .unwrap_or(0.0)
     };
-    (scalar(&terms.weighted), norm(&a), norm(&b))
+    (
+        scalar(&terms.weighted),
+        norm(&a),
+        norm(&b),
+        plan.noise_level,
+    )
 }
 
-/// AC1: with identity weight > 0 the aux term is `weight · (1 − cos(embed(x0_face), ref))` — equal
-/// to the torch fixture's `1 − cos` — and back-propagates a nonzero gradient into the LoRA.
-/// Mutations: return `cos` instead of `1 − cos` ⇒ value red; `detach()` the live embedding ⇒ zero
-/// LoRA gradient ⇒ red.
+/// AC1: with identity weight > 0 the aux term is `weight · t · (1 − cos)` — `cos` the bias-centred
+/// cosine, equal to the torch fixture's, `t` the step's noise level (upstream's `t_ratio`) — and
+/// back-propagates a nonzero gradient into the LoRA. Mutations: return `cos` instead of `1 − cos`
+/// ⇒ value red; `detach()` the live embedding ⇒ zero LoRA gradient ⇒ red; `timestep_weight` → 1
+/// ⇒ value red.
 #[test]
 fn identity_loss_is_one_minus_cos_and_trains_the_lora() {
     let f = fixture();
     let (live, reference) = images(&f);
-    let mut path = path_with(Box::new(identity_loss(
-        &f,
-        Some(bbox(&f)),
-        -1.0,
-        IdentityReferenceMode::PerImage,
-    )));
+    let loss = identity_loss(&f, Some(bbox(&f)), -1.0, IdentityReferenceMode::PerImage);
+    assert_eq!(loss.timestep_weight(0.3), 0.3);
+    let mut path = path_with(Box::new(loss));
     path.ensure_reference(0, &nchw(&reference)).unwrap();
     assert!(path.is_usable(0, 0).unwrap());
-    let (value, _, gb) = aux_value_and_grads(&path, &nchw(&live));
-    let want = WEIGHT * f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
+    let (value, _, gb, t) = aux_value_and_grads(&path, &nchw(&live));
+    assert!(t > 0.05 && t < 0.95, "noise level {t}");
+    let want = WEIGHT * t * expect(&f["arcface"]["identity_loss"]);
     assert!((value - want).abs() < 2e-5, "aux {value} vs {want}");
     assert!(gb > 1e-6, "no gradient reached the LoRA B factor: {gb}");
 }
@@ -306,7 +380,7 @@ fn identity_loss_is_one_minus_cos_and_trains_the_lora() {
 fn no_face_and_low_cos_samples_contribute_zero() {
     let f = fixture();
     let (live, reference) = images(&f);
-    let cos = f["arcface"]["cos"].as_f64().unwrap() as f32;
+    let cos = expect(&f["arcface"]["cos"]);
     let mut no_face = path_with(Box::new(identity_loss(
         &f,
         None,
@@ -326,7 +400,7 @@ fn no_face_and_low_cos_samples_contribute_zero() {
             IdentityReferenceMode::PerImage,
         )));
         p.ensure_reference(0, &nchw(&reference)).unwrap();
-        let (value, _, gb) = aux_value_and_grads(&p, &nchw(&live));
+        let (value, _, gb, _) = aux_value_and_grads(&p, &nchw(&live));
         if gated {
             assert_eq!(
                 value, 0.0,
@@ -334,50 +408,144 @@ fn no_face_and_low_cos_samples_contribute_zero() {
             );
             assert_eq!(gb, 0.0, "a gated step must not move the LoRA");
         } else {
-            assert!(value > 0.1 && gb > 1e-6, "{value} / {gb}");
+            assert!(value > 0.05 && gb > 1e-6, "{value} / {gb}");
         }
     }
 }
 
-/// Dataset-average mode targets the normalized mean reference, frozen at the first loss; a late
-/// reference is refused. Mutation: target the per-image embedding in average mode ⇒ red.
+/// Dataset-average mode targets the normalized mean of every face-bearing reference, frozen at the
+/// first loss, and normalizes each image's loss by its own clean score — `max(0, 1 − cos / clean)`
+/// — matching torch; a late reference is refused. Mutations: target the per-image embedding ⇒ cos
+/// red; drop the clean-cos normalization ⇒ loss red.
 #[test]
 fn dataset_average_targets_the_mean_reference() {
     let f = fixture();
     let (live, reference) = images(&f);
+    let reference2 = synth::image(
+        f["image"]["seed"].as_u64().unwrap(),
+        f["arcface"]["average"]["reference2_key"].as_str().unwrap(),
+        72,
+        88,
+        &dev(),
+    )
+    .unwrap();
     let loss = identity_loss(
         &f,
         Some(bbox(&f)),
         -1.0,
         IdentityReferenceMode::DatasetAverage,
     );
-    let r_live = loss.reference(&live).unwrap().unwrap();
     let r_ref = loss.reference(&reference).unwrap().unwrap();
-    let r_ref = reference_as::<IdentityReference>("identity", r_ref.as_ref()).unwrap();
-    let first = |r: &IdentityReference| r.frames[0].as_ref().unwrap().embedding.clone();
-    let e_live = &first(reference_as::<IdentityReference>("identity", r_live.as_ref()).unwrap());
-    let mean = l2_normalize(&(e_live + &first(r_ref)).unwrap()).unwrap();
-    let want = 1.0 - scalar(&(&mean * e_live).unwrap().sum_all().unwrap());
-    let got = scalar(&loss.loss(&live, r_ref).unwrap());
-    assert!((got - want).abs() < 1e-5, "{got} vs {want}");
-    let per_image = f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
-    assert!((got - per_image).abs() > 1e-3);
+    loss.reference(&reference2).unwrap().unwrap();
+    let r = reference_as::<IdentityReference>("identity", r_ref.as_ref()).unwrap();
+    let avg = &f["arcface"]["average"];
+    let (cos, clean, _) = loss
+        .scorer()
+        .frame_score(&live, r.frames[0].as_ref().unwrap())
+        .unwrap();
+    let (cos, clean) = (scalar(&cos), scalar(&clean));
+    assert!((cos - expect(&avg["cos"])).abs() < 2e-5, "cos {cos}");
+    assert!(
+        (clean - expect(&avg["clean_cos"])).abs() < 2e-5,
+        "clean {clean}"
+    );
+    let got = scalar(&loss.loss(&live, r).unwrap());
+    let want = expect(&avg["identity_loss"]);
+    assert!((got - want).abs() < 2e-5, "{got} vs {want}");
     assert!(loss.reference(&live).is_err());
 }
 
-/// The landmark loss is differentiable into the LoRA and skips a no-face image. Mutation: `detach`
-/// the live landmarks ⇒ zero gradient ⇒ red.
+/// The multi-frame mean divides by the number of frames whose gate is OPEN (`max(Σ gate, 1)`):
+/// with one frame gated out the loss equals the passing frame's own. Mutations: divide by the
+/// face-bearing frame count ⇒ the value halves ⇒ red; drop the gate from the numerator ⇒ red.
+#[test]
+fn a_gated_frame_leaves_the_multi_frame_mean() {
+    let f = fixture();
+    let (live, reference) = images(&f);
+    let other = noise_px("gate-probe", 72, 88);
+    let clip = |a: &Tensor, b: &Tensor| Tensor::cat(&[a, b], 0).unwrap();
+    let face = Some(bbox(&f));
+    let probe = identity_loss(&f, face, -1.0, IdentityReferenceMode::PerImage);
+    let r = probe.reference(&reference).unwrap().unwrap();
+    let rf = reference_as::<IdentityReference>("identity", r.as_ref())
+        .unwrap()
+        .frames[0]
+        .as_ref()
+        .unwrap();
+    let cos_of = |px: &Tensor| scalar(&probe.scorer().frame_score(px, rf).unwrap().0);
+    let (c_live, c_other) = (cos_of(&live), cos_of(&other));
+    assert!(
+        (c_live - c_other).abs() > 0.02,
+        "{c_live} vs {c_other}: need separable frames"
+    );
+    let min_cos = (c_live + c_other) / 2.0;
+    let pass = 1.0 - c_live.max(c_other);
+    assert!(pass > 0.05);
+
+    let l = IdentityLoss::new(
+        scorer(&f, min_cos, IdentityReferenceMode::PerImage),
+        Arc::new(ScriptedDetector(std::sync::Mutex::new(vec![face, face]))),
+    );
+    let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
+    let v = scalar(&l.loss(&clip(&live, &other), r.as_ref()).unwrap());
+    assert!((v - pass).abs() < 2e-5, "{v} vs the passing frame's {pass}");
+}
+
+/// Upstream's detection retry reaches the reference: a detector that only finds the face on the
+/// gray-padded frame yields the same crop (box unpadded) and so the fixture loss. Mutation: skip
+/// the retry in `reference_boxes` ⇒ the reference is unusable ⇒ red.
+#[test]
+fn a_face_found_only_on_the_padded_retry_is_used() {
+    struct PaddedOnly([f32; 4], (usize, usize));
+    impl FaceBoxDetector for PaddedOnly {
+        fn largest_face(&self, _: &[u8], h: usize, w: usize) -> Result<Option<[f32; 4]>> {
+            Ok(((h, w) != self.1).then_some(self.0))
+        }
+    }
+    let f = fixture();
+    let (live, reference) = images(&f);
+    let pad = (88 / 4) as f32;
+    let b = bbox(&f);
+    let loss = IdentityLoss::new(
+        scorer(&f, -1.0, IdentityReferenceMode::PerImage),
+        Arc::new(PaddedOnly(
+            [b[0] + pad, b[1] + pad, b[2] + pad, b[3] + pad],
+            (72, 88),
+        )),
+    );
+    let r = loss
+        .reference(&reference)
+        .unwrap()
+        .expect("the retry finds the face");
+    let crop = reference_as::<IdentityReference>("identity", r.as_ref())
+        .unwrap()
+        .frames[0]
+        .as_ref()
+        .unwrap()
+        .crop;
+    assert_eq!(crop, crop_of(&f));
+    let v = scalar(&loss.loss(&live, r.as_ref()).unwrap());
+    let want = expect(&f["arcface"]["identity_loss"]);
+    assert!((v - want).abs() < 2e-5, "{v} vs {want}");
+}
+
+/// The landmark loss is differentiable into the LoRA, weighted by the noise level, and skips a
+/// no-face image. Mutations: `detach` the live landmarks ⇒ zero gradient ⇒ red;
+/// `timestep_weight` → 1 ⇒ value red.
 #[test]
 fn landmark_loss_trains_the_lora_and_skips_no_face() {
     let f = fixture();
     let (live, reference) = images(&f);
-    let mut path = path_with(Box::new(FaceLandmarkLoss::new(
+    let lm = FaceLandmarkLoss::new(
         mesh_program(&f),
         Arc::new(StubDetector(Some(bbox(&f)))),
-    )));
+        None,
+    );
+    assert_eq!(lm.timestep_weight(0.3), 0.3);
+    let mut path = path_with(Box::new(lm));
     path.ensure_reference(0, &nchw(&reference)).unwrap();
-    let (value, _, gb) = aux_value_and_grads(&path, &nchw(&live));
-    let want = WEIGHT * f["facemesh"]["landmark_loss"].as_f64().unwrap() as f32;
+    let (value, _, gb, t) = aux_value_and_grads(&path, &nchw(&live));
+    let want = WEIGHT * t * expect(&f["facemesh"]["landmark_loss"]);
     assert!(
         (value - want).abs() < 1e-4 * want.max(1.0),
         "{value} vs {want}"
@@ -386,45 +554,76 @@ fn landmark_loss_trains_the_lora_and_skips_no_face() {
     let mut skip = path_with(Box::new(FaceLandmarkLoss::new(
         mesh_program(&f),
         Arc::new(StubDetector(None)),
+        None,
     )));
     skip.ensure_reference(0, &nchw(&reference)).unwrap();
     assert!(skip.plan(0, 0, 0.5).unwrap().aux.is_empty());
 }
 
-/// A detector that answers per call from a script (one entry per frame, in order).
+/// With the identity loss on, the landmark loss is gated on the identity cosine: a frame at or
+/// below `min_cos` contributes zero loss and gradient, one above the ungated value. Mutation:
+/// ignore the gate in `FaceLandmarkLoss::loss` ⇒ the gated value is nonzero ⇒ red.
+#[test]
+fn landmark_loss_is_gated_on_the_identity_cosine() {
+    let f = fixture();
+    let (live, reference) = images(&f);
+    let cos = expect(&f["arcface"]["cos"]);
+    for (min_cos, gated) in [(cos + 1e-3, true), (cos - 1e-3, false)] {
+        let gate = scorer(&f, min_cos, IdentityReferenceMode::PerImage);
+        let mut p = path_with(Box::new(FaceLandmarkLoss::new(
+            mesh_program(&f),
+            Arc::new(StubDetector(Some(bbox(&f)))),
+            Some(gate),
+        )));
+        p.ensure_reference(0, &nchw(&reference)).unwrap();
+        let (value, _, gb, t) = aux_value_and_grads(&p, &nchw(&live));
+        if gated {
+            assert_eq!(value, 0.0, "min_cos {min_cos} > cos {cos}");
+            assert_eq!(gb, 0.0);
+        } else {
+            let want = WEIGHT * t * expect(&f["facemesh"]["landmark_loss"]);
+            assert!(
+                (value - want).abs() < 1e-4 * want.max(1.0),
+                "{value} vs {want}"
+            );
+            assert!(gb > 1e-6);
+        }
+    }
+}
+
+/// A detector that answers per call from a script (one entry per call, in order).
 struct ScriptedDetector(std::sync::Mutex<Vec<Option<[f32; 4]>>>);
 impl FaceBoxDetector for ScriptedDetector {
     fn largest_face(&self, _: &[u8], _: usize, _: usize) -> Result<Option<[f32; 4]>> {
-        Ok(self.0.lock().unwrap().remove(0))
+        Ok(candle_gen::lock_recover(&self.0).remove(0))
     }
 }
 
 /// A video decoder hands the loss `[F, H, W, 3]`: per-frame reference boxes, frames without a face
 /// skipped, the mean over face-bearing frames, and a clip with no face unusable (the Candle twin of
-/// mlx-gen-face's test). Mutations: average over every frame ⇒ red; score frame 0 for every frame
-/// ⇒ red.
+/// mlx-gen-face's test; a miss is retried on the padded frame, so it consumes two script entries).
+/// Mutations: average over every frame ⇒ red; score frame 0 for every frame ⇒ red.
 #[test]
 fn multi_frame_decodes_score_each_face_bearing_frame() {
     let f = fixture();
     let (live, reference) = images(&f);
     let clip = |a: &Tensor, b: &Tensor| Tensor::cat(&[a, b], 0).unwrap();
     let face = Some(bbox(&f));
+    let shared = scorer(&f, -1.0, IdentityReferenceMode::PerImage);
     let loss = |script: Vec<Option<[f32; 4]>>| {
         IdentityLoss::new(
-            arcface(&f),
+            shared.clone(),
             Arc::new(ScriptedDetector(std::sync::Mutex::new(script))),
-            -1.0,
-            IdentityReferenceMode::PerImage,
         )
     };
-    let single = f["arcface"]["identity_loss"].as_f64().unwrap() as f32;
+    let single = expect(&f["arcface"]["identity_loss"]);
     let noise = synth::image(9, "noise", 72, 88, &dev()).unwrap();
 
-    let l = loss(vec![face, None]);
+    let l = loss(vec![face, None, None]);
     let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
     let v = scalar(&l.loss(&clip(&live, &noise), r.as_ref()).unwrap());
     assert!((v - single).abs() < 2e-5, "{v} vs {single}");
-    let l = loss(vec![None, face]);
+    let l = loss(vec![None, None, face]);
     let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
     let v = scalar(&l.loss(&clip(&noise, &live), r.as_ref()).unwrap());
     assert!((v - single).abs() < 2e-5, "{v} vs {single}");
@@ -432,7 +631,7 @@ fn multi_frame_decodes_score_each_face_bearing_frame() {
     let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
     let v = scalar(&l.loss(&clip(&live, &live), r.as_ref()).unwrap());
     assert!((v - single).abs() < 2e-5, "{v} vs {single}");
-    assert!(loss(vec![None, None])
+    assert!(loss(vec![None, None, None, None])
         .reference(&clip(&reference, &reference))
         .unwrap()
         .is_none());
@@ -451,7 +650,9 @@ fn a_live_decode_of_another_size_is_refused() {
 }
 
 /// The on-disk stand-ins load through the real loaders; the tiny ArcFace is the fixture's
-/// architecture; the FaceMesh stand-in honours the real I/O contract.
+/// architecture; the FaceMesh stand-in honours the real I/O contract. With the identity loss on,
+/// the landmark loss's gate IS the identity loss's scorer; off, it is ungated. Mutation: build a
+/// fresh scorer per loader (skip the `SCORERS` lookup) ⇒ `ptr_eq` red.
 #[test]
 fn testing_checkpoints_load_through_the_real_loaders() {
     let f = fixture();
@@ -465,13 +666,36 @@ fn testing_checkpoints_load_through_the_real_loaders() {
     let tmp = tempfile::tempdir().unwrap();
     testing::write_face_stack(tmp.path()).unwrap();
     testing::write_facemesh(tmp.path()).unwrap();
-    load_identity_loss(tmp.path(), &IdentityLossConfig::default(), &dev()).unwrap();
-    let lm = load_face_landmark_loss(tmp.path(), tmp.path(), &dev()).unwrap();
+    let cfg = IdentityLossConfig::default();
+    let id = load_identity_loss(tmp.path(), &cfg, &dev()).unwrap();
+    let lm = load_face_landmark_loss(tmp.path(), tmp.path(), Some(&cfg), &dev()).unwrap();
+    assert!(Arc::ptr_eq(id.scorer(), lm.gate.as_ref().unwrap()));
+    assert!(
+        load_face_landmark_loss(tmp.path(), tmp.path(), None, &dev())
+            .unwrap()
+            .gate
+            .is_none()
+    );
     let (live, _) = images(&f);
     let out = lm
         .landmarks(&live, face_crop_box(bbox(&f), 72, 88))
         .unwrap();
     assert_eq!(out.dims(), &[478, 2]);
+}
+
+/// A max-pool kernel larger than its (padded) input is an error, never an underflow panic.
+/// Mutation: drop the size check in `max_pool` ⇒ the subtraction underflows ⇒ panic ⇒ red.
+#[test]
+fn a_max_pool_kernel_larger_than_its_input_is_refused() {
+    let spec = candle_gen::gen_core::fx_program::ProgramSpec::parse(
+        r#"{"inputs":["x"],"outputs":["y"],"nodes":[{"op":"maxpool2d","out":"y","inputs":["x"],
+            "kernel":[9,9],"stride":[1,1],"padding":[1,1]}]}"#,
+    )
+    .unwrap();
+    let program = Program::new(spec, std::collections::HashMap::new(), &dev()).unwrap();
+    let x = Tensor::zeros((1, 3, 4, 4), candle_gen::candle_core::DType::F32, &dev()).unwrap();
+    let err = program.forward(&x).unwrap_err().to_string();
+    assert!(err.contains("exceeds"), "{err}");
 }
 
 /// The REAL converted FaceMesh-v2 program reproduces the upstream torch model's output 0 on a

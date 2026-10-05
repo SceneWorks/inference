@@ -6,16 +6,20 @@
 //! and budget identically; the committed torch fixture (`crates/media/face_loss_fixtures/`) pins
 //! both against upstream.
 //!
-//! - identity: `loss = 1 − cos(normalize(ArcFace(x0_face)), target)`, gated to zero when the live
-//!   cosine is `<= min_cos`; `target` is the image's own reference embedding or the normalized
-//!   dataset mean.
+//! - identity: bias-centred cosine `center(ArcFace(x0_face)) · center(target)` (`center(e) =
+//!   normalize(e − noise_mean)`), loss `max(0, 1 − cos / clean)` gated by `cos > min_cos` and averaged
+//!   over the open frames; `target` is the image's own reference embedding or the normalized dataset
+//!   mean (with the image's clean-cos normalizer).
 //! - landmarks: FaceMesh `out[0] → [478, 3][..., :2]`, nose-centred and inner-eye-scaled; loss is the
-//!   region-weighted mean landmark distance.
+//!   region-weighted mean landmark distance, gated by the shared identity scorer when the identity
+//!   loss is on.
+//! - both are scaled by the step's noise level (upstream's `t_ratio`); a missed reference face is
+//!   retried on a gray-padded copy.
 //! - no face on the reference round trip ⇒ `reference() == None` ⇒ the shared path skips the image.
 
 use std::any::Any;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 pub use candle_gen::gen_core::train::face_loss::{
@@ -24,7 +28,9 @@ pub use candle_gen::gen_core::train::face_loss::{
     FACEMESH_LANDMARKS, SCRFD_FILE,
 };
 use candle_gen::gen_core::train::face_loss::{
-    INNER_EYES, INTER_EYE_FLOOR, LANDMARK_EPS, LANDMARK_REGIONS, NOSE_TIP,
+    detect_with_retry, face_loss_timestep_weight, synth, IDENTITY_CLEAN_COS_FLOOR,
+    IDENTITY_NOISE_SAMPLES, IDENTITY_NOISE_SEED, INNER_EYES, INTER_EYE_FLOOR, LANDMARK_EPS,
+    LANDMARK_REGIONS, NOSE_TIP,
 };
 use candle_gen::gen_core::train::{IdentityLossConfig, IdentityReferenceMode};
 use candle_gen::train::perceptual::{reference_as, LossReference, PerceptualLoss};
@@ -130,15 +136,17 @@ impl FaceBoxDetector for ScrfdDetector {
     }
 }
 
-/// Detect the reference face on every frame of the decoded round trip.
+/// Detect the reference face on every frame of the decoded round trip, with upstream's gray-pad
+/// retry on a miss ([`detect_with_retry`]).
 fn reference_boxes(detector: &dyn FaceBoxDetector, clean: &Tensor) -> Result<Vec<Option<CropBox>>> {
     let (frames, h, w) = to_rgb_u8_frames(clean)?;
     frames
         .iter()
         .map(|rgb| {
-            Ok(detector
-                .largest_face(rgb, h, w)?
-                .map(|bbox| face_crop_box(bbox, h, w)))
+            Ok(
+                detect_with_retry(rgb, h, w, |img, ih, iw| detector.largest_face(img, ih, iw))?
+                    .map(|bbox| face_crop_box(bbox, h, w)),
+            )
         })
         .collect()
 }
@@ -155,15 +163,30 @@ fn check_live(name: &str, live: &Tensor, frames: usize, image_hw: (usize, usize)
     Ok(())
 }
 
-/// The mean of per-frame terms over the frames that carry a reference.
-fn mean_over(terms: Vec<Tensor>) -> Result<Tensor> {
-    let n = terms.len();
-    let mut it = terms.into_iter();
-    let first = it
-        .next()
+/// Upstream's masked mean `Σ term·gate / max(Σ gate, 1)` (gates detached).
+fn gated_mean(terms: Vec<(Tensor, Tensor)>) -> Result<Tensor> {
+    let mut num: Option<Tensor> = None;
+    let mut den: Option<Tensor> = None;
+    for (term, gate) in terms {
+        let gate = gate.detach();
+        let t = (&term * &gate)?;
+        num = Some(match num {
+            Some(n) => (n + t)?,
+            None => t,
+        });
+        den = Some(match den {
+            Some(d) => (d + gate)?,
+            None => gate,
+        });
+    }
+    let (num, den) = num
+        .zip(den)
         .ok_or_else(|| err("face loss: no frame carries a reference"))?;
-    let sum = it.try_fold(first, |acc, t| acc + t)?;
-    Ok((sum / n as f64)?)
+    Ok(num.broadcast_div(&den.maximum(1.0)?)?)
+}
+
+fn scalar_tensor(v: f32, device: &Device) -> Result<Tensor> {
+    Ok(Tensor::new(v, device)?)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -201,29 +224,55 @@ struct DatasetMean {
     frozen: Option<Tensor>,
 }
 
-/// The ArcFace identity loss.
-pub struct IdentityLoss {
+/// The frozen ArcFace scorer behind the identity loss and the landmark loss's identity gate — the
+/// twin of `mlx-gen-face`'s `IdentityScorer` (bias centring against the mean embedding of
+/// [`IDENTITY_NOISE_SAMPLES`] counter-based noise images, dataset-average targets with the clean-cos
+/// normalizer).
+pub struct IdentityScorer {
     arcface: ArcFace,
-    detector: Arc<dyn FaceBoxDetector>,
+    noise_mean: Tensor,
     min_cos: f32,
     mode: IdentityReferenceMode,
     mean: Mutex<DatasetMean>,
 }
 
-impl IdentityLoss {
+impl IdentityScorer {
+    /// Build the scorer, averaging the unit ArcFace embeddings of the noise set on `device`, one
+    /// forward at a time.
     pub fn new(
         arcface: ArcFace,
-        detector: Arc<dyn FaceBoxDetector>,
         min_cos: f32,
         mode: IdentityReferenceMode,
-    ) -> Self {
-        Self {
+        device: &Device,
+    ) -> Result<Self> {
+        let edge = ARCFACE_INPUT;
+        let mut sum: Option<Tensor> = None;
+        for i in 0..IDENTITY_NOISE_SAMPLES {
+            let px = synth::identity_noise_image(IDENTITY_NOISE_SEED, i, edge);
+            let x = Tensor::from_vec(px, (1, edge, edge, 3), device)?
+                .permute((0, 3, 1, 2))?
+                .contiguous()?
+                .affine(2.0, -1.0)?;
+            let e = l2_normalize(&arcface.forward(&x)?)?.flatten_all()?;
+            sum = Some(match sum {
+                Some(s) => (s + e)?,
+                None => e,
+            });
+        }
+        let noise_mean =
+            (sum.expect("IDENTITY_NOISE_SAMPLES > 0") / IDENTITY_NOISE_SAMPLES as f64)?;
+        Ok(Self {
             arcface,
-            detector,
+            noise_mean,
             min_cos,
             mode,
             mean: Mutex::new(DatasetMean::default()),
-        }
+        })
+    }
+
+    /// The bias direction (`[D]`).
+    pub fn noise_mean(&self) -> &Tensor {
+        &self.noise_mean
     }
 
     /// Unit ArcFace embedding `[D]` of the face crop `b` of `px`'s first frame (differentiable in
@@ -236,45 +285,98 @@ impl IdentityLoss {
         Ok(l2_normalize(&emb)?.flatten_all()?)
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, DatasetMean>> {
-        self.mean
-            .lock()
-            .map_err(|_| err("identity loss: dataset-mean lock poisoned"))
+    /// `normalize(e − noise_mean)`.
+    pub fn center(&self, e: &Tensor) -> Result<Tensor> {
+        l2_normalize(&(e - &self.noise_mean)?)
     }
 
-    fn target(&self, f: &IdentityFrame) -> Result<Tensor> {
-        match self.mode {
-            IdentityReferenceMode::PerImage => Ok(f.embedding.clone()),
-            IdentityReferenceMode::DatasetAverage => {
-                let mut m = self.lock()?;
-                if m.frozen.is_none() {
-                    let sum = m
-                        .sum
-                        .as_ref()
-                        .ok_or_else(|| err("identity loss: dataset average of zero references"))?;
-                    let mean = l2_normalize(&(sum / m.count as f64)?)?;
-                    m.frozen = Some(mean);
-                }
-                Ok(m.frozen.clone().expect("frozen above"))
+    fn lock(&self) -> std::sync::MutexGuard<'_, DatasetMean> {
+        candle_gen::lock_recover(&self.mean)
+    }
+
+    fn reference_frame(&self, px: &Tensor, crop: CropBox, register: bool) -> Result<IdentityFrame> {
+        let embedding = self.embed(&px.detach(), crop)?.detach();
+        if register && self.mode == IdentityReferenceMode::DatasetAverage {
+            let mut m = self.lock();
+            if m.frozen.is_some() {
+                return Err(err(
+                    "identity loss: a dataset-average reference was added after training began; \
+                     every image's reference must be built before the first step",
+                ));
             }
+            m.sum = Some(match m.sum.take() {
+                Some(s) => (s + &embedding)?,
+                None => embedding.clone(),
+            });
+            m.count += 1;
         }
+        Ok(IdentityFrame { crop, embedding })
     }
 
-    /// The mean over face-bearing frames of `1 − cos`, each gated by `cos > min_cos`, plus the
-    /// frames' mean cosine for diagnostics.
+    fn dataset_mean(&self) -> Result<Tensor> {
+        let mut m = self.lock();
+        if m.frozen.is_none() {
+            let sum = m
+                .sum
+                .as_ref()
+                .ok_or_else(|| err("identity loss: dataset average of zero references"))?;
+            let mean = l2_normalize(&(sum / m.count as f64)?)?;
+            m.frozen = Some(mean);
+        }
+        Ok(m.frozen.clone().expect("frozen above"))
+    }
+
+    /// `(cos, clean, gate)` of a live frame against its reference frame (see the MLX twin).
+    pub fn frame_score(
+        &self,
+        live: &Tensor,
+        rf: &IdentityFrame,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let dev = live.device();
+        let live_c = self.center(&self.embed(live, rf.crop)?)?;
+        let (target, clean) = match self.mode {
+            IdentityReferenceMode::PerImage => (rf.embedding.clone(), scalar_tensor(1.0, dev)?),
+            IdentityReferenceMode::DatasetAverage => {
+                let avg = self.dataset_mean()?;
+                let own = (self.center(&rf.embedding)? * self.center(&avg)?)?.sum_all()?;
+                (avg, own.maximum(IDENTITY_CLEAN_COS_FLOOR as f64)?.detach())
+            }
+        };
+        let cos = (&live_c * self.center(&target)?)?.sum_all()?;
+        let gate = cos.detach().gt(self.min_cos as f64)?.to_dtype(DType::F32)?;
+        Ok((cos, clean, gate))
+    }
+}
+
+/// The ArcFace identity loss (see the MLX twin).
+pub struct IdentityLoss {
+    scorer: Arc<IdentityScorer>,
+    detector: Arc<dyn FaceBoxDetector>,
+}
+
+impl IdentityLoss {
+    pub fn new(scorer: Arc<IdentityScorer>, detector: Arc<dyn FaceBoxDetector>) -> Self {
+        Self { scorer, detector }
+    }
+
+    /// The shared scorer.
+    pub fn scorer(&self) -> &Arc<IdentityScorer> {
+        &self.scorer
+    }
+
+    /// The loss and the mean bias-centred cosine (diagnostics) of `live` against `r`.
     pub fn loss_and_cos(&self, live: &Tensor, r: &IdentityReference) -> Result<(Tensor, Tensor)> {
         check_live("identity", live, r.frames.len(), r.image_hw)?;
-        let mut losses = Vec::new();
+        let mut terms = Vec::new();
         let mut coses = Vec::new();
         for (f, rf) in r.frames.iter().enumerate() {
             let Some(rf) = rf else { continue };
-            let emb = self.embed(&frame(live, f)?, rf.crop)?;
-            let cos = (&emb * &self.target(rf)?)?.sum_all()?;
-            let gate = cos.detach().gt(self.min_cos as f64)?.to_dtype(DType::F32)?;
-            losses.push((cos.affine(-1.0, 1.0)? * gate)?);
-            coses.push(cos);
+            let (cos, clean, gate) = self.scorer.frame_score(&frame(live, f)?, rf)?;
+            let term = cos.broadcast_div(&clean)?.affine(-1.0, 1.0)?.maximum(0.0)?;
+            terms.push((term, gate));
+            coses.push((cos, scalar_tensor(1.0, live.device())?));
         }
-        Ok((mean_over(losses)?, mean_over(coses)?))
+        Ok((gated_mean(terms)?, gated_mean(coses)?))
     }
 }
 
@@ -288,31 +390,14 @@ impl PerceptualLoss for IdentityLoss {
         if boxes.iter().all(Option::is_none) {
             return Ok(None);
         }
-        let clean = clean.detach();
         let mut frames = Vec::with_capacity(boxes.len());
         for (f, crop) in boxes.into_iter().enumerate() {
-            let Some(crop) = crop else {
-                frames.push(None);
-                continue;
-            };
-            let embedding = self.embed(&frame(&clean, f)?, crop)?.detach();
-            if self.mode == IdentityReferenceMode::DatasetAverage {
-                let mut m = self.lock()?;
-                if m.frozen.is_some() {
-                    return Err(err(
-                        "identity loss: a dataset-average reference was added after training \
-                         began; every image's reference must be built before the first step",
-                    ));
-                }
-                m.sum = Some(match m.sum.take() {
-                    Some(s) => (s + &embedding)?,
-                    None => embedding.clone(),
-                });
-                m.count += 1;
-            }
-            frames.push(Some(IdentityFrame { crop, embedding }));
+            frames.push(match crop {
+                Some(crop) => Some(self.scorer.reference_frame(&frame(clean, f)?, crop, true)?),
+                None => None,
+            });
         }
-        let (_, h, w) = geometry(&clean)?;
+        let (_, h, w) = geometry(clean)?;
         Ok(Some(Box::new(IdentityReference {
             image_hw: (h, w),
             frames,
@@ -323,21 +408,26 @@ impl PerceptualLoss for IdentityLoss {
         let r = reference_as::<IdentityReference>(self.name(), reference)?;
         Ok(self.loss_and_cos(live, r)?.0)
     }
+
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        face_loss_timestep_weight(noise_level)
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
 // Landmarks
 // ------------------------------------------------------------------------------------------------
 
-/// One frame's landmark reference: its face box and that crop's normalized landmarks.
+/// One frame's landmark reference: its face box, normalized landmarks and (gated) identity
+/// reference.
 pub struct LandmarkFrame {
     pub crop: CropBox,
     /// `[478, 2]`, normalized, detached.
     pub landmarks: Tensor,
+    pub identity: Option<IdentityFrame>,
 }
 
-/// The per-image landmark reference: per decoded frame, the frame's face box + landmarks, or
-/// `None` for a frame without a face.
+/// The per-image landmark reference.
 pub struct LandmarkReference {
     pub image_hw: (usize, usize),
     pub frames: Vec<Option<LandmarkFrame>>,
@@ -380,15 +470,25 @@ pub fn landmark_distance(gen: &Tensor, reference: &Tensor) -> Result<Tensor> {
     Ok((total.expect("three regions") / weights)?)
 }
 
-/// The FaceMesh landmark loss.
+/// The FaceMesh landmark loss (see the MLX twin), gated by the shared identity scorer when the
+/// identity loss is on.
 pub struct FaceLandmarkLoss {
     mesh: Program,
     detector: Arc<dyn FaceBoxDetector>,
+    gate: Option<Arc<IdentityScorer>>,
 }
 
 impl FaceLandmarkLoss {
-    pub fn new(mesh: Program, detector: Arc<dyn FaceBoxDetector>) -> Self {
-        Self { mesh, detector }
+    pub fn new(
+        mesh: Program,
+        detector: Arc<dyn FaceBoxDetector>,
+        gate: Option<Arc<IdentityScorer>>,
+    ) -> Self {
+        Self {
+            mesh,
+            detector,
+            gate,
+        }
     }
 
     /// Normalized `[478, 2]` landmarks of the face crop `b` of `px`'s first frame (differentiable
@@ -428,10 +528,18 @@ impl PerceptualLoss for FaceLandmarkLoss {
         let mut frames = Vec::with_capacity(boxes.len());
         for (f, crop) in boxes.into_iter().enumerate() {
             frames.push(match crop {
-                Some(crop) => Some(LandmarkFrame {
-                    crop,
-                    landmarks: self.landmarks(&frame(&clean, f)?, crop)?.detach(),
-                }),
+                Some(crop) => {
+                    let px = frame(&clean, f)?;
+                    let identity = match &self.gate {
+                        Some(s) => Some(s.reference_frame(&px, crop, false)?),
+                        None => None,
+                    };
+                    Some(LandmarkFrame {
+                        crop,
+                        landmarks: self.landmarks(&px, crop)?.detach(),
+                        identity,
+                    })
+                }
                 None => None,
             });
         }
@@ -448,12 +556,26 @@ impl PerceptualLoss for FaceLandmarkLoss {
         let mut terms = Vec::new();
         for (f, rf) in r.frames.iter().enumerate() {
             let Some(rf) = rf else { continue };
-            terms.push(landmark_distance(
-                &self.landmarks(&frame(live, f)?, rf.crop)?,
-                &rf.landmarks,
-            )?);
+            let px = frame(live, f)?;
+            let gate = match (&self.gate, &rf.identity) {
+                (Some(s), Some(id)) => s.frame_score(&px, id)?.2,
+                (Some(_), None) => {
+                    return Err(err(
+                        "face-landmark loss: gated loss with an ungated reference",
+                    ))
+                }
+                (None, _) => scalar_tensor(1.0, live.device())?,
+            };
+            terms.push((
+                landmark_distance(&self.landmarks(&px, rf.crop)?, &rf.landmarks)?,
+                gate,
+            ));
         }
-        mean_over(terms)
+        gated_mean(terms)
+    }
+
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        face_loss_timestep_weight(noise_level)
     }
 }
 
@@ -476,6 +598,46 @@ fn load_detector(face_dir: &Path, device: &Device) -> Result<Arc<dyn FaceBoxDete
     }))
 }
 
+type ScorerKey = (PathBuf, u32, IdentityReferenceMode, String);
+
+/// Live identity scorers by (face dir, min_cos, mode, device): the identity loss and the landmark
+/// loss's gate, built by separate builder arms of one job, share ONE scorer. Weak, so a finished
+/// job's scorer is freed.
+static SCORERS: Mutex<Vec<(ScorerKey, Weak<IdentityScorer>)>> = Mutex::new(Vec::new());
+
+/// The identity scorer for `face_dir/`[`ARCFACE_FILE`] and `cfg`'s gate + mode on `device`, shared
+/// with any live scorer of the same key.
+pub fn shared_identity_scorer(
+    face_dir: &Path,
+    cfg: &IdentityLossConfig,
+    device: &Device,
+) -> Result<Arc<IdentityScorer>> {
+    let key: ScorerKey = (
+        face_dir.to_path_buf(),
+        cfg.min_cos.to_bits(),
+        cfg.reference_mode,
+        format!("{device:?}"),
+    );
+    let mut scorers = candle_gen::lock_recover(&SCORERS);
+    scorers.retain(|(_, w)| w.strong_count() > 0);
+    if let Some(s) = scorers
+        .iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, w)| w.upgrade())
+    {
+        return Ok(s);
+    }
+    let arcface = ArcFace::from_weights(&load_weights(&face_dir.join(ARCFACE_FILE), device)?)?;
+    let scorer = Arc::new(IdentityScorer::new(
+        arcface,
+        cfg.min_cos,
+        cfg.reference_mode,
+        device,
+    )?);
+    scorers.push((key, Arc::downgrade(&scorer)));
+    Ok(scorer)
+}
+
 /// Load the identity loss from the face-analysis stack dir (`face_dir/`[`SCRFD_FILE`] +
 /// `face_dir/`[`ARCFACE_FILE`]) with `cfg`'s gate and reference mode, onto `device`.
 pub fn load_identity_loss(
@@ -483,25 +645,28 @@ pub fn load_identity_loss(
     cfg: &IdentityLossConfig,
     device: &Device,
 ) -> Result<IdentityLoss> {
-    let arcface = ArcFace::from_weights(&load_weights(&face_dir.join(ARCFACE_FILE), device)?)?;
     Ok(IdentityLoss::new(
-        arcface,
+        shared_identity_scorer(face_dir, cfg, device)?,
         load_detector(face_dir, device)?,
-        cfg.min_cos,
-        cfg.reference_mode,
     ))
 }
 
 /// Load the face-landmark loss: SCRFD from `face_dir/`[`SCRFD_FILE`], FaceMesh from
-/// `mesh_dir/`[`FACEMESH_FILE`], onto `device`.
+/// `mesh_dir/`[`FACEMESH_FILE`], onto `device`; `identity` (the identity loss's config, when it is
+/// enabled) gates it on the shared identity scorer.
 pub fn load_face_landmark_loss(
     face_dir: &Path,
     mesh_dir: &Path,
+    identity: Option<&IdentityLossConfig>,
     device: &Device,
 ) -> Result<FaceLandmarkLoss> {
+    let gate = identity
+        .map(|cfg| shared_identity_scorer(face_dir, cfg, device))
+        .transpose()?;
     Ok(FaceLandmarkLoss::new(
         Program::from_file(mesh_dir.join(FACEMESH_FILE), device)?,
         load_detector(face_dir, device)?,
+        gate,
     ))
 }
 

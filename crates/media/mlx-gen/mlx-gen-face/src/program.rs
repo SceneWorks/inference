@@ -284,6 +284,12 @@ fn max_pool_nhwc(
         x.clone()
     };
     let s = x.shape();
+    if s[1] < kernel.0 || s[2] < kernel.1 {
+        return Err(Error::Msg(format!(
+            "fx-program: max-pool kernel {kernel:?} exceeds the padded input {}×{}",
+            s[1], s[2]
+        )));
+    }
     let oh = (s[1] - kernel.0) / stride.0 + 1;
     let ow = (s[2] - kernel.1) / stride.1 + 1;
     let mut out: Option<Array> = None;

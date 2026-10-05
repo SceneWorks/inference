@@ -33,7 +33,7 @@ use std::path::Path;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core;
-use candle_gen::gen_core::train::TrainingConfig;
+use candle_gen::gen_core::train::{IdentityLossConfig, TrainingConfig};
 use candle_gen::train::perceptual::{
     perceptual_footprint_bytes, AuxLoss, AuxModelFootprint, PerceptualInput, PerceptualPath,
     X0Decoder,
@@ -207,6 +207,15 @@ fn identity_footprint(_cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootpr
     )
 }
 
+/// The identity loss's config when it is enabled: upstream gates the landmark loss on the identity
+/// cosine only then (the two arms share one identity scorer).
+fn identity_gate(cfg: &TrainingConfig) -> Option<&IdentityLossConfig> {
+    cfg.identity_loss
+        .schedule
+        .is_enabled()
+        .then_some(&cfg.identity_loss)
+}
+
 /// FaceMesh landmark loss (sc-24831): SCRFD box at reference time, FaceMesh-v2 on the x0 crop.
 fn build_landmark(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
     let dir = face_dir(cfg, ctx, "face-landmark loss")?;
@@ -217,8 +226,9 @@ fn build_landmark(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxL
             ctx.label
         ))
     })?;
-    let loss = candle_gen_face::train::load_face_landmark_loss(dir, mesh, ctx.device)
-        .map_err(|e| CandleError::Msg(format!("{}: {e}", ctx.label)))?;
+    let loss =
+        candle_gen_face::train::load_face_landmark_loss(dir, mesh, identity_gate(cfg), ctx.device)
+            .map_err(|e| CandleError::Msg(format!("{}: {e}", ctx.label)))?;
     Ok(AuxLoss {
         schedule: cfg.face_landmark_loss.schedule,
         loss: Box::new(loss),

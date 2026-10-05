@@ -254,9 +254,12 @@ pub struct TrainingConfig {
     /// **ArcFace identity loss** (epic 2123, sc-24831) — an auxiliary perceptual loss on the shared
     /// decoded-x0 path: the face of the decoded x0 prediction (cropped with the box SCRFD found on
     /// the image's own encode→decode round trip, once per image) is embedded by a frozen ArcFace and
-    /// pulled toward the image's reference embedding, `loss = 1 − cos(embed(x0_face), reference)`.
-    /// An image with no detected face is skipped; a step whose live cosine is at or below
-    /// [`IdentityLossConfig::min_cos`] contributes zero (no push on a hallucinated non-face). Off by
+    /// pulled toward the image's reference embedding (or the dataset mean): upstream's bias-centred
+    /// cosine (both embeddings minus the mean embedding of 200 noise images, re-normalized),
+    /// `loss = max(0, 1 − cos / clean)` (`clean` = 1 per-image, the image's own clean score in
+    /// dataset-average mode), scaled by the step's noise level. An image with no detected face is
+    /// skipped; a step whose live cosine is at or below [`IdentityLossConfig::min_cos`]
+    /// contributes zero (no push on a hallucinated non-face). Off by
     /// default ([`AuxLossSchedule::weight`] `0`); refused (typed [`crate::Error::Unsupported`]) by a
     /// trainer whose [`TrainerDescriptor::techniques`] does not declare
     /// [`identity_loss`](TrainingTechniques::identity_loss).
@@ -265,7 +268,9 @@ pub struct TrainingConfig {
     /// decoded-x0 path: a frozen MediaPipe FaceMesh-v2 predicts the 478 landmarks of the decoded x0
     /// face crop (same reference-time SCRFD box as the identity loss) and the region-weighted
     /// (jaw ×3, lips ×2, eyes+nose ×1) mean landmark distance to the reference's normalized
-    /// landmarks is the loss. Off by default; refused by a trainer that does not declare
+    /// landmarks is the loss, scaled by the step's noise level and — when the identity loss is on
+    /// — gated by its cosine (a frame at or below `min_cos` contributes zero). Off by default;
+    /// refused by a trainer that does not declare
     /// [`face_landmark_loss`](TrainingTechniques::face_landmark_loss).
     pub face_landmark_loss: FaceLandmarkLossConfig,
     /// Directory holding the **face-analysis stack** both face losses detect with —

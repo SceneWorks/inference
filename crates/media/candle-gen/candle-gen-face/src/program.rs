@@ -272,6 +272,11 @@ fn max_pool(
     let x = pad_axis(x, 2, padding.0, padding.0, f32::NEG_INFINITY)?;
     let x = pad_axis(&x, 3, padding.1, padding.1, f32::NEG_INFINITY)?;
     let (_, _, h, w) = x.dims4()?;
+    if h < kernel.0 || w < kernel.1 {
+        return Err(err(format!(
+            "max-pool kernel {kernel:?} exceeds the padded input {h}×{w}"
+        )));
+    }
     let oh = (h - kernel.0) / stride.0 + 1;
     let ow = (w - kernel.1) / stride.1 + 1;
     let idx = |off: usize, n: usize, s: usize| -> Result<Tensor> {
