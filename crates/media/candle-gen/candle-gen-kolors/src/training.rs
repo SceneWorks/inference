@@ -24,7 +24,9 @@ use candle_gen::train::lora::{
     adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
     AdapterKind, LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
-use candle_gen::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
+use candle_gen::train::optim::{
+    accumulate_grads, accumulation_divisor, scale_grads, TrainOptimizer,
+};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
@@ -163,16 +165,6 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn accumulation_divisor(micro_step: u32, configured: u32) -> u32 {
-    let configured = configured.max(1);
-    let pending = micro_step % configured;
-    if pending == 0 {
-        configured
-    } else {
-        pending
-    }
 }
 
 fn packed_component(root: &Path, component: &str) -> Result<bool> {

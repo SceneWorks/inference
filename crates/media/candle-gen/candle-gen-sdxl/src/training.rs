@@ -62,7 +62,9 @@ use candle_gen::train::lora::{
     adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
     AdapterKind, LoraHost, LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
-use candle_gen::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
+use candle_gen::train::optim::{
+    accumulate_grads, accumulation_divisor, scale_grads, TrainOptimizer,
+};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 
@@ -818,7 +820,11 @@ impl SdxlTrainer {
                 let mut avg = accumulated
                     .take()
                     .expect("an update fires only after accumulation");
-                scale_grads(&mut avg, &lora_set.vars, 1.0 / accum as f64)?;
+                // Average by the window's ACTUAL micro-step count (F-017): the final flush at
+                // `step == cfg.steps` with `steps % accum != 0` holds fewer than `accum` grads, and
+                // a `1/accum` scale would down-weight that tail update (and its gradient noise).
+                let divisor = accumulation_divisor(step, accum);
+                scale_grads(&mut avg, &lora_set.vars, 1.0 / divisor as f64)?;
                 // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
                 adapter_optimizer_step(&mut opt, &mut avg, &lora_set, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
