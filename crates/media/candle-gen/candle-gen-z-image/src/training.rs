@@ -12,7 +12,7 @@
 //! ## The Z-Image realities that shape the hooks (flow-match, not DDPM ε-prediction)
 //!
 //!  1. **Cache** — for each captioned image: decode/crop/resize to a VAE-input tensor
-//!     ([`load_image_tensor`]), encode the **deterministic latent mean** (the stock z_image
+//!     ([`decode_square`] + [`square_image_tensor`]), encode the **deterministic latent mean** (the stock z_image
 //!     [`Encoder`](VaeEncoder) → `(mean − shift)·scale`; the `reg` sampling is skipped so caching is
 //!     reproducible), and encode the caption through the Qwen3 text encoder with the *exact* gen-core
 //!     [`TokenizerConfig`](candle_gen::gen_core::tokenizer::TokenizerConfig) inference uses → `(L, 2560)`. The VAE + text encoder are dropped after
@@ -61,7 +61,7 @@ use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, Image, LoadSpec, Modality, WeightsSource};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
     self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
     SamplePlan,
@@ -238,8 +238,9 @@ fn encode_caption(
 ///    [`encode_caption`] returns and `prepare_inputs` consumes), 1:1 with [`SamplePlan::prompts`].
 ///  * `vae` — the resident `AutoEncoderKL` **decoder** (`Arc` as inference holds it); the cache pass
 ///    loads only the VAE `Encoder`, so the full VAE is loaded here for the preview decode path.
-///  * `edge` — the square training-resolution edge (`bucket_resolution(cfg.resolution)`, the same edge
-///    the cached latents use) the seeded preview noise + the `mu` shift are shaped at.
+///  * `edge` — the square preview edge: the largest training-bucket edge
+///    ([`bucket_edges`], just `bucket_resolution(cfg.resolution)` with buckets off — the edge the
+///    cached latents use) the seeded preview noise + the `mu` shift are shaped at.
 pub struct ZImageSampleState {
     caps: Vec<Tensor>,
     vae: Arc<AutoEncoderKL>,
@@ -318,7 +319,12 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         max_reference_images: 0,
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
-        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per bucket edge, walked
+        // by the shared driver's `BucketSchedule`.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
@@ -411,7 +417,10 @@ impl FlowMatchTrainer for ZImageTrainer {
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<(Vec<(Tensor, Tensor)>, (), SamplePlan<ZImageSampleState>)> {
-        let edge = bucket_resolution(req.config.resolution);
+        // sc-2127: one training edge per resolution bucket (just `[resolution]` when buckets are off);
+        // previews render at the largest (epic 2123 E7).
+        let edges = bucket_edges(&req.config);
+        let edge = edges.iter().copied().max().unwrap_or(0);
         let vae_cfg = VaeConfig::z_image();
         let vae_encoder = VaeEncoder::new(
             &vae_cfg,
@@ -427,7 +436,9 @@ impl FlowMatchTrainer for ZImageTrainer {
         )?;
 
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len());
+        // Item-major over the bucket edges: `cache[item * edges.len() + bucket]` — the layout the
+        // driver's `BucketSchedule` indexes (sc-2127).
+        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -436,15 +447,18 @@ impl FlowMatchTrainer for ZImageTrainer {
                 current: i as u32 + 1,
                 total,
             });
-            let img = load_image_tensor(&item.image_path, edge, device)?;
-            let x0 = vae_encode_mean(
-                &vae_encoder,
-                &img,
-                vae_cfg.shift_factor,
-                vae_cfg.scaling_factor,
-            )?;
             let cap = encode_caption(&tokenizer, &text_encoder, &item.caption, device)?;
-            cache.push((x0, cap));
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            for &edge in &edges {
+                let img = square_image_tensor(&square, edge, device)?;
+                let x0 = vae_encode_mean(
+                    &vae_encoder,
+                    &img,
+                    vae_cfg.shift_factor,
+                    vae_cfg.scaling_factor,
+                )?;
+                cache.push((x0, cap.clone()));
+            }
         }
 
         // Preview samples (sc-8650): while the text encoder is still resident, pre-encode up to
@@ -876,6 +890,7 @@ mod tests {
         assert_eq!(t.descriptor().backend, "candle");
         assert!(t.descriptor().supports_lora);
         assert!(t.descriptor().supports_lokr);
+        assert!(t.descriptor().techniques.resolution_buckets);
     }
 
     /// `validate` rejects an empty dataset, zero rank/steps, an unsupported optimizer, and an

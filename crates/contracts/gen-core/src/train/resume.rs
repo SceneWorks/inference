@@ -116,6 +116,10 @@ pub fn request_fingerprint(req: &TrainingRequest) -> crate::Result<String> {
 /// `weight_noise_sigma` appends `;weight_noise=<sigma>` and a non-zero `gradient_noise_eta` appends
 /// `;gradient_noise=<eta>/<gamma>` (gamma only matters while eta is on). With both off nothing is
 /// appended, so every pre-noise resume bundle keeps the fingerprint it was written with.
+///
+/// Resolution buckets (sc-2127) change the cache layout and the sample order, so a non-empty
+/// bucket list is appended (`;buckets=<res>x<repeats>,…`); an empty list appends nothing, so every
+/// pre-bucket resume bundle keeps the fingerprint it was written with.
 pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
     let mut fingerprint = format!(
         "steps={};accum={};scheduler={:?};warmup={};rank={};alpha={};seed={};resolution={};loss={};dtype={};\
@@ -142,6 +146,14 @@ pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
             ";gradient_noise={:?}/{:?}",
             cfg.gradient_noise_eta, cfg.gradient_noise_gamma
         ));
+    }
+    if !cfg.resolution_buckets.is_empty() {
+        let buckets: Vec<String> = cfg
+            .resolution_buckets
+            .iter()
+            .map(|b| format!("{}x{}", b.resolution, b.repeats))
+            .collect();
+        fingerprint.push_str(&format!(";buckets={}", buckets.join(",")));
     }
     fingerprint
 }
@@ -394,5 +406,45 @@ mod tests {
         ]);
         check_resume_fingerprints(&meta, &weight, "fp").unwrap();
         assert!(check_resume_fingerprints(&meta, &off, "fp").is_err());
+    }
+
+    /// sc-2127: buckets are part of the resume config identity — a bundle written with one bucket
+    /// list refuses a resume under another (or under none) — while a bucket-free config keeps its
+    /// pre-bucket fingerprint byte for byte.
+    #[test]
+    fn resolution_buckets_are_part_of_the_resume_config_fingerprint() {
+        use crate::train::ResolutionBucket;
+        let plain = TrainingConfig::default();
+        assert!(!training_config_fingerprint(&plain).contains("buckets"));
+        let bucketed = TrainingConfig {
+            resolution_buckets: vec![
+                ResolutionBucket {
+                    resolution: 512,
+                    repeats: 16,
+                },
+                ResolutionBucket {
+                    resolution: 1024,
+                    repeats: 1,
+                },
+            ],
+            ..plain.clone()
+        };
+        assert!(training_config_fingerprint(&bucketed).ends_with(";buckets=512x16,1024x1"));
+        let meta = HashMap::from([
+            (
+                TRAINING_CONFIG_KEY.to_string(),
+                training_config_fingerprint(&bucketed),
+            ),
+            (REQUEST_FINGERPRINT_KEY.to_string(), "fp".to_string()),
+        ]);
+        check_resume_fingerprints(&meta, &bucketed, "fp").unwrap();
+        let mut remixed = bucketed.clone();
+        remixed.resolution_buckets[0].repeats = 4;
+        for other in [plain, remixed] {
+            let err = check_resume_fingerprints(&meta, &other, "fp")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("training configuration differs"), "{err}");
+        }
     }
 }

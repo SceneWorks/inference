@@ -8,8 +8,10 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, NetworkType, Precision, WeightsSource};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::gen_core::{
+    self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
+};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
 use candle_gen::train::lora::{build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
@@ -40,7 +42,11 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         max_reference_images: 0,
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
-        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
@@ -206,9 +212,11 @@ impl AnimaTrainer {
         drop(vae);
         let root = resolve_split_files(&self.source)?;
         let vae_encoder = load_vae_encoder(root.join(VAE_FILE), device)?;
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
+        let edges = bucket_edges(cfg);
         let total = req.items.len() as u32;
-        let mut cache = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+        let mut cache = Vec::with_capacity(req.items.len() * edges.len());
         for (index, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -217,11 +225,6 @@ impl AnimaTrainer {
                 current: index as u32 + 1,
                 total,
             });
-            let image = load_image_tensor(&item.image_path, edge, device)?;
-            let x0 = vae_encoder
-                .encode(&image)?
-                .unsqueeze(2)?
-                .to_dtype(DType::F32)?;
             let (source, target_ids) = encode_conditioner_inputs(
                 &tokenizers,
                 &text_encoder,
@@ -229,7 +232,15 @@ impl AnimaTrainer {
                 dtype,
                 device,
             )?;
-            cache.push((x0, source, target_ids));
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            for &edge in &edges {
+                let image = square_image_tensor(&square, edge, device)?;
+                let x0 = vae_encoder
+                    .encode(&image)?
+                    .unsqueeze(2)?
+                    .to_dtype(DType::F32)?;
+                cache.push((x0, source.clone(), target_ids.clone()));
+            }
         }
         drop(vae_encoder);
         drop(text_encoder);
@@ -276,11 +287,15 @@ impl AnimaTrainer {
         let mut update_idx = 0;
         let mut last_loss = 0.0;
         let mut steps_run = 0;
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         for step in 1..=cfg.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, source, target_ids) = &cache[(step as usize - 1) % cache.len()];
+            let (x0, source, target_ids) = &cache[schedule.cache_index(step as usize - 1)];
             let sigma = shifted_sigma(cfg, step);
             let noise = flow_match::sample_noise(
                 x0.dims(),
@@ -394,6 +409,7 @@ mod tests {
         assert_eq!(descriptor.backend, "candle");
         assert!(descriptor.supports_lora && descriptor.supports_lokr);
         assert!(!descriptor.supports_control && !descriptor.supports_full_finetune);
+        assert!(descriptor.techniques.resolution_buckets, "sc-2127");
     }
 
     #[test]

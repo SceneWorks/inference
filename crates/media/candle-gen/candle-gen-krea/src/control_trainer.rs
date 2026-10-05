@@ -23,7 +23,7 @@ use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match;
 use candle_gen::{CandleError, Result};
 
@@ -72,7 +72,12 @@ pub fn control_trainer_descriptor() -> TrainerDescriptor {
         // This trainer has no adapter: it trains a full-weight ControlNet branch (~3B params copied
         // from the DiT blocks), so weight/gradient noise requests are refused by the shared floor
         // rather than silently ignored or applied to non-adapter weights (E3/E5).
-        techniques: gen_core::train::TrainingTechniques::NONE,
+        // sc-2127 (epic 2123): multi-resolution buckets — the target AND control image are each
+        // encoded once per bucket edge, and the trainer walks them through a `BucketSchedule`.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::NONE
+        },
     }
 }
 
@@ -144,7 +149,10 @@ impl KreaControlTrainer {
         on_progress(TrainingProgress::Preparing);
         let device = &self.device;
         let cpu = Device::Cpu;
-        let edge = bucket_resolution(req.config.resolution);
+        // sc-2127: one training edge per resolution bucket (just `[resolution]` when buckets are off);
+        // the checkpoint meta records the largest (epic 2123 E7).
+        let edges = bucket_edges(&req.config);
+        let edge = edges.iter().copied().max().unwrap_or(0);
         let compute_dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
 
         // ── encode (target, control, caption) → CPU-resident ControlSamples ──
@@ -165,7 +173,8 @@ impl KreaControlTrainer {
             KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
 
         let total = req.items.len() as u32;
-        let mut samples: Vec<ControlSample> = Vec::with_capacity(req.items.len());
+        // Item-major over the bucket edges: `samples[item * edges.len() + bucket]` (sc-2127).
+        let mut samples: Vec<ControlSample> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -178,16 +187,27 @@ impl KreaControlTrainer {
                 .control_image_path
                 .as_ref()
                 .expect("validate_inner ensured every item has a control image");
-            let target = load_image_tensor(&item.image_path, edge, device)?;
-            let control = load_image_tensor(control_path, edge, device)?;
-            // Latents stay f32 (the flow-match mix runs f32); the caption stack is stored bf16 (the
-            // DiT casts it to bf16 at forward anyway — identical values, half the RAM).
-            let x0 = vae_encoder.encode(&target)?.to_device(&cpu)?;
-            let ctrl = vae_encoder.encode(&control)?.to_device(&cpu)?;
+            // The caption stack is stored bf16 (the DiT casts it to bf16 at forward anyway —
+            // identical values, half the RAM) and shared by every bucket of this item.
             let cap = encode_caption(&tokenizer, &text_encoder, &item.caption)?
                 .to_dtype(DType::BF16)?
                 .to_device(&cpu)?;
-            samples.push(ControlSample { x0, ctrl, cap });
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            let control_square = decode_square(control_path)?;
+            for &edge in &edges {
+                // Target and control at the SAME bucket edge, so the control latent stays
+                // pixel-aligned with the target latent. Latents stay f32 (the flow-match mix runs
+                // f32).
+                let target = square_image_tensor(&square, edge, device)?;
+                let control = square_image_tensor(&control_square, edge, device)?;
+                let x0 = vae_encoder.encode(&target)?.to_device(&cpu)?;
+                let ctrl = vae_encoder.encode(&control)?.to_device(&cpu)?;
+                samples.push(ControlSample {
+                    x0,
+                    ctrl,
+                    cap: cap.clone(),
+                });
+            }
         }
         drop(text_encoder);
         drop(vae_encoder);
@@ -241,7 +261,8 @@ impl KreaControlTrainer {
             req.output_dir.clone(),
             0,
             device.clone(),
-        )?;
+        )?
+        .with_resolution_buckets(&req.config.training_buckets())?;
 
         // ── train: drive the loop via the public single-step API so we own cancel + progress mapping
         //    (the neutral ControlTrainer stays gen_core-agnostic). ──
@@ -338,6 +359,7 @@ mod tests {
             "control trainer is not a LoRA trainer"
         );
         assert!(!t.descriptor().supports_lokr);
+        assert!(t.descriptor().techniques.resolution_buckets);
     }
 
     /// `validate` enforces the control-specific preconditions the LoRA path lacks: a non-empty

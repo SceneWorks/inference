@@ -693,6 +693,8 @@ pub struct TrainerCapabilitySnapshot {
     /// Honors `TrainingConfig::gradient_noise_eta` / `gradient_noise_gamma` (epic 2123 annealed
     /// gradient noise, sc-24827).
     pub supports_gradient_noise: bool,
+    /// Honors `TrainingConfig::resolution_buckets` (epic 2123 multi-resolution buckets, sc-2127).
+    pub supports_resolution_buckets: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -709,6 +711,7 @@ impl TrainerCapabilitySnapshot {
             max_reference_images: descriptor.max_reference_images,
             supports_weight_noise: descriptor.techniques.weight_noise,
             supports_gradient_noise: descriptor.techniques.gradient_noise,
+            supports_resolution_buckets: descriptor.techniques.resolution_buckets,
         }
     }
 
@@ -725,6 +728,7 @@ impl TrainerCapabilitySnapshot {
             "max_reference_images": self.max_reference_images,
             "supports_weight_noise": self.supports_weight_noise,
             "supports_gradient_noise": self.supports_gradient_noise,
+            "supports_resolution_buckets": self.supports_resolution_buckets,
         })
     }
 }
@@ -1016,6 +1020,11 @@ mod tests {
         grad.techniques.gradient_noise = true;
         let grad_json = TrainerCapabilitySnapshot::from_descriptor(&grad).to_json();
         assert_eq!(grad_json["supports_gradient_noise"], true);
+        assert_eq!(json["supports_resolution_buckets"], false);
+        let mut bucketed = descriptor;
+        bucketed.techniques.resolution_buckets = true;
+        let bucketed_json = TrainerCapabilitySnapshot::from_descriptor(&bucketed).to_json();
+        assert_eq!(bucketed_json["supports_resolution_buckets"], true);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {

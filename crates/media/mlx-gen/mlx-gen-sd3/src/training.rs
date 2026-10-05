@@ -59,11 +59,11 @@
 use std::path::Path;
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core;
+use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -214,7 +214,12 @@ fn trainer_descriptor_for(variant: Sd3Variant) -> TrainerDescriptor {
         max_reference_images: 0,
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
-        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
+        // sc-2127 (epic 2123): honors `resolution_buckets` — one cached latent per item per bucket
+        // edge, walked through a `BucketSchedule`; the pre-flight guard sizes for the largest edge.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
@@ -441,7 +446,10 @@ impl Sd3LoraTrainer {
         let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
 
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). The pre-flight guard sizes for the largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
+        let edge = preflight_edge(&edges);
 
         // T2 — fail-fast pre-flight memory guard (the Krea/z-image analog). The dense
         // (non-block-checkpointed) first step materializes the whole forward graph in one MLX `eval`;
@@ -466,7 +474,9 @@ impl Sd3LoraTrainer {
         // --- prepare → load → cache: VAE-latents + triple-TE conditioning into memory ---
         on_progress(TrainingProgress::LoadingModel); // base is already resident from load_trainer
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Sd3Conditioning)> = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+        let mut cache: Vec<(Array, Sd3Conditioning)> =
+            Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -476,7 +486,6 @@ impl Sd3LoraTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
-            let x0 = encode_init_latents(&self.vae, &img, edge)?; // [1, 16, edge/8, edge/8]
             let encoders = self.encoders.as_ref().ok_or_else(|| {
                 Error::Msg(
                     "sd3 trainer: text encoders already freed (caching after train loop)".into(),
@@ -489,8 +498,18 @@ impl Sd3LoraTrainer {
                 &self.t5_tokenizer,
                 &item.caption,
             )?;
-            eval([&x0, &cond.context, &cond.pooled])?;
-            cache.push((x0, cond));
+            eval([&cond.context, &cond.pooled])?;
+            // The caption conditioning is resolution-independent: encode it once, then one latent per
+            // bucket edge (the MMDiT derives its patch grid from the latent's own shape).
+            for &edge in &edges {
+                let x0 = encode_init_latents(&self.vae, &img, edge)?; // [1, 16, edge/8, edge/8]
+                eval([&x0])?;
+                let cond = Sd3Conditioning {
+                    context: cond.context.clone(),
+                    pooled: cond.pooled.clone(),
+                };
+                cache.push((x0, cond));
+            }
         }
         if cache.is_empty() {
             if req.cancel.is_cancelled() {
@@ -598,6 +617,10 @@ impl Sd3LoraTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items for
+        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -605,7 +628,7 @@ impl Sd3LoraTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, cond) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, cond) = &cache[schedule.cache_index((step - 1) as usize)];
             let t = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -733,6 +756,13 @@ fn projected_dense_peak_gb(s: f64, bf16: bool, variant: Sd3Variant) -> f64 {
     };
     let c = if bf16 { bf16_c } else { f32_c };
     c.0 + c.1 * s + c.2 * s * s
+}
+
+/// The edge the pre-flight guard sizes for: the LARGEST bucket edge (epic 2123 E7) — the dense first
+/// step's working set is set by the biggest latent the run will ever train on, whichever bucket the
+/// schedule happens to draw first.
+fn preflight_edge(edges: &[u32]) -> u32 {
+    edges.iter().copied().max().unwrap_or(0)
 }
 
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
@@ -1262,6 +1292,38 @@ mod tests {
         // A 128 GB-class budget (safe ≈ 108 GB) comfortably fits dense 1024 in both dtypes.
         assert!(check_preflight_budget(1024, true, 128.0, Sd3Variant::Large).is_ok());
         assert!(check_preflight_budget(1024, false, 128.0, Sd3Variant::Large).is_ok());
+    }
+
+    #[test]
+    fn both_descriptors_declare_resolution_buckets() {
+        // sc-2127: the shared technique floor only lets `resolution_buckets` through when declared.
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        assert!(medium_trainer_descriptor().techniques.resolution_buckets);
+    }
+
+    #[test]
+    fn preflight_sizes_for_the_largest_bucket_edge() {
+        let rb = |resolution, repeats| gen_core::ResolutionBucket {
+            resolution,
+            repeats,
+        };
+        // Buckets off: the guard edge is the single legacy edge.
+        let mut cfg = TrainingConfig {
+            resolution: 512,
+            ..base_config()
+        };
+        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 512);
+        // Buckets [512, 1024] with `resolution` 512: the guard must size for 1024 (epic 2123 E7).
+        cfg.resolution_buckets = vec![rb(512, 16), rb(1024, 1)];
+        let edges = bucket_edges(&cfg);
+        assert_eq!(edges, vec![512, 1024]);
+        assert_eq!(preflight_edge(&edges), 1024);
+        // A 40 GB-class budget (safe 34 GB): dense bf16 Large fits 512 (~24 GB) but not 1024
+        // (~48 GB) — so the bucketed run is refused even though `resolution` alone would pass.
+        assert!(check_preflight_budget(512, true, 40.0, Sd3Variant::Large).is_ok());
+        assert!(
+            check_preflight_budget(preflight_edge(&edges), true, 40.0, Sd3Variant::Large).is_err()
+        );
     }
 
     #[test]

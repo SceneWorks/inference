@@ -24,7 +24,7 @@
 //!     **timestep fed to the DiT is the raw σ** (broadcast over tokens), σ ~ U(1e-3, 1-1e-3). MSE.
 //!   * **2.3 latent layout.** A still image VAE-encodes (single frame T=1) to a normalized latent
 //!     `(1,128,1,h,w)`, flattened to the patchified `(1, S, 128)` the DiT consumes; the position
-//!     grid is built once for the fixed latent resolution. The 24 GB Gemma text encoder is freed
+//!     grid is built once per resolution bucket (sc-2127; one grid when buckets are off). The 24 GB Gemma text encoder is freed
 //!     after the one-time prompt-embed cache (mirroring the reference), before the train loop.
 //!     2.5 instead consumes schema-checked prepared video/audio safetensors and caches Gemma-4 AV
 //!     contexts before freeing the encoder.
@@ -44,7 +44,7 @@ use std::rc::Rc;
 
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{accumulate_grads, adapter_optimizer_update, average_grads, LoraParams};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::weights::{to_dtype, Weights};
@@ -72,6 +72,7 @@ use crate::tokenizer::{Ltx25Tokenizer, LtxTokenizer};
 use crate::transformer::{AvDiT, AvPerturbation, BlockLoraRef, LtxAdaptable, LtxDiT, Precision};
 use crate::vae::LtxVideoVae;
 use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
+use mlx_gen::gen_core::BucketSchedule;
 
 /// Gemma prompt token budget for caption encoding (the captions are short; padding tokens are
 /// attended with `mask=None`, matching the reference `Modality(context_mask=None)`).
@@ -1922,7 +1923,15 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         max_reference_images: 0,
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
-        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
+        // sc-2127 (epic 2123): multi-resolution buckets on the 2.3 still-image path only (one cached
+        // latent + RoPE grid per spatial edge). 2.5 trains on externally prepared latent packs
+        // (`ltxPreparedBundlePath`) whose `videoShape`/`audioShape`, condition masks and token plan
+        // are fixed by the pack — there are no pixels to re-encode at another edge and
+        // `cfg.resolution` is unused — so it keeps `NONE` and the shared floor refuses buckets.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: id != MODEL_25_ID,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
@@ -2137,6 +2146,7 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     // never be flattened to a message (sc-24161).
     gen_core::train::validate_control_request(&descriptor, req)?;
     gen_core::train::validate_full_finetune_request(&descriptor, req)?;
+    gen_core::train::validate_training_techniques(&descriptor, req)?;
     gen_core::train::validate_edit_request(&descriptor, req)?;
     validate_request(req, "ltx_2_5 trainer")?;
     validate_ltx25_adapter_scale(req.config.alpha)?;
@@ -2230,8 +2240,12 @@ impl LtxTrainer {
         };
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution); // pixel edge, multiple of 32
-        let latent_edge = (edge / SPATIAL_SCALE as u32).max(1) as usize; // latent tokens per side
+        // sc-2127 — one pixel edge (multiple of 32) per resolution bucket (just `[resolution]` when
+        // buckets are off), and its latent tokens per side. The memory guard and previews size for
+        // the largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
+        let latent_edges: Vec<usize> = edges.iter().map(|&e| latent_edge_of(e)).collect();
+        let latent_edge = guard_latent_edge(&edges);
 
         // sc-4942 — LTX trains in **f32 activations** (× the Q-packed base), NOT bf16, even though the
         // SceneWorks worker passes `train_dtype=bf16` (sc-4881). MEASURED on real weights (the
@@ -2261,7 +2275,8 @@ impl LtxTrainer {
         // --- prepare → load → cache: normalized latents + prompt embeds (then free the TE) ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len() * edges.len());
         // sc-5637 — preview-sample prompts, pre-encoded inside the `te`/`tok` scope below (the Gemma
         // encoder is freed before the train loop). LTX is distilled (no CFG) → one ctx per prompt.
         let mut sample_ctxs: Vec<(String, Array)> = Vec::new();
@@ -2282,13 +2297,16 @@ impl LtxTrainer {
                     total,
                 });
                 let img = center_crop_square(&decode_image(&item.image_path)?);
-                let prep = preprocess_conditioning_image(&img, edge, edge)?; // (1,3,1,edge,edge)
-                let latent = self.vae.encode(&prep)?; // (1,128,1,le,le), normalized, f32
-                let clean = flatten_latent(&latent)?; // (1, S, 128)
                 let (ids, mask) = tok.encode(&item.caption, MAX_PROMPT_TOKENS)?;
                 let ctx = to_dtype(&te.encode(&ids, &mask)?, Dtype::Float32)?; // (1, L, 4096)
-                eval([&clean, &ctx])?;
-                cache.push((clean, ctx));
+                eval([&ctx])?;
+                for &edge in &edges {
+                    let prep = preprocess_conditioning_image(&img, edge, edge)?; // (1,3,1,edge,edge)
+                    let latent = self.vae.encode(&prep)?; // (1,128,1,le,le), normalized, f32
+                    let clean = flatten_latent(&latent)?; // (1, S, 128)
+                    eval([&clean])?;
+                    cache.push((clean, ctx.clone()));
+                }
             }
             // sc-5637 — pre-encode the preview-sample prompts while the encoder is still resident.
             if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !req.cancel.is_cancelled()
@@ -2318,8 +2336,13 @@ impl LtxTrainer {
         let sampling_enabled = !sample_ctxs.is_empty();
 
         // The RoPE position grid is identical across items at a fixed latent resolution (single
-        // frame) — build it once. Reused for preview-sample rendering (sc-5637).
-        let positions = create_position_grid(1, 1, latent_edge, latent_edge);
+        // frame) — build it once per bucket (sc-2127: each step uses its sampled bucket's grid).
+        // Preview-sample rendering (sc-5637) uses the largest bucket's grid at `latent_edge`.
+        let bucket_positions: Vec<Array> = latent_edges
+            .iter()
+            .map(|&le| create_position_grid(1, 1, le, le))
+            .collect();
+        let preview_positions = &bucket_positions[largest_bucket(&latent_edges)];
 
         // --- adapter targets + trainable factors ---
         let suffixes: Vec<String> = if cfg.lora_target_modules.is_empty() {
@@ -2404,6 +2427,10 @@ impl LtxTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -2411,7 +2438,9 @@ impl LtxTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (clean, ctx) = &cache[((step - 1) as usize) % cache.len()];
+            let (entry, bucket) = step_entry(&schedule, step);
+            let (clean, ctx) = &cache[entry];
+            let positions = &bucket_positions[bucket];
             // σ ~ U(1e-3, 1-1e-3), deterministic in seed (the reference's uniform timestep).
             let sigma = {
                 let k = random::key(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64))?;
@@ -2433,7 +2462,7 @@ impl LtxTrainer {
                 rank,
                 clean,
                 ctx,
-                &positions,
+                positions,
                 sigma,
                 &noise,
                 mae,
@@ -2502,7 +2531,7 @@ impl LtxTrainer {
                         transformer,
                         &self.vae,
                         ctx,
-                        &positions,
+                        preview_positions,
                         sample_seed,
                         latent_edge,
                         compute_dtype,
@@ -3526,12 +3555,40 @@ fn projected_dense_peak_gb(s: f64) -> f64 {
     16.9 + 0.0251 * s
 }
 
+/// Latent tokens per side for a bucketed pixel `edge` (the VAE's ×32 spatial stride, floor 1).
+fn latent_edge_of(edge: u32) -> usize {
+    (edge / SPATIAL_SCALE as u32).max(1) as usize
+}
+
+/// The latent edge the pre-flight guard and previews size for: the largest bucket's (epic 2123 E7).
+fn guard_latent_edge(edges: &[u32]) -> usize {
+    edges.iter().map(|&e| latent_edge_of(e)).max().unwrap_or(1)
+}
+
+/// The item-major cache entry and its bucket (whose RoPE grid the step uses) for 1-based `step`
+/// (sc-2127). With one bucket the entry is the pre-bucket `(step-1) % n_items` and the bucket is 0.
+fn step_entry(schedule: &BucketSchedule, step: u32) -> (usize, usize) {
+    let entry = schedule.cache_index((step - 1) as usize);
+    (entry, entry % schedule.n_buckets())
+}
+
+/// The bucket index of the largest edge in `edges` (the first on a tie; `0` for an empty list) —
+/// the bucket training previews render at (sc-2127).
+fn largest_bucket(edges: &[usize]) -> usize {
+    edges
+        .iter()
+        .enumerate()
+        .fold(0, |best, (i, &e)| if e > edges[best] { i } else { best })
+}
+
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
 /// SIGKILLed), returning a catchable, actionable error instead (sc-4942 — the sc-4874 mechanism).
 /// `latent_edge` is the latent tokens per side (`edge/32`); the token count is `latent_edge²` (the
 /// trainer trains single-frame still latents). The budget is MLX's reported memory limit (≈ the
 /// device's recommended working set) × 0.85 for worker/host headroom. Only consulted when gradient
-/// checkpointing is OFF.
+/// checkpointing is OFF. With resolution buckets the caller passes the LARGEST bucket's latent edge
+/// (sc-2127 / epic 2123 E7): the per-step working set peaks at the biggest latent, and the cached
+/// still latents (KBs–MBs per item) are not part of the projection.
 fn preflight_memory_guard(latent_edge: usize) -> Result<()> {
     let s = (latent_edge * latent_edge) as f64;
     let projected = projected_dense_peak_gb(s);
@@ -4149,6 +4206,118 @@ mod first_step_repro {
             ckpt_peak < dense_peak,
             "block checkpointing must reduce the first-step peak: dense {dense_peak:.2} vs ckpt {ckpt_peak:.2}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::{
+        flatten_latent, guard_latent_edge, largest_bucket, latent_edge_of, projected_dense_peak_gb,
+        step_entry, trainer_descriptor, trainer_descriptor_25,
+    };
+    use crate::positions::create_position_grid;
+    use mlx_gen::gen_core::{BucketSchedule, ResolutionBucket, TrainingConfig};
+    use mlx_gen::train::dataset::bucket_edges;
+    use mlx_rs::Array;
+
+    fn rb(resolution: u32, repeats: u32) -> ResolutionBucket {
+        ResolutionBucket {
+            resolution,
+            repeats,
+        }
+    }
+
+    fn edges_of(buckets: &[ResolutionBucket]) -> Vec<u32> {
+        bucket_edges(&TrainingConfig {
+            resolution_buckets: buckets.to_vec(),
+            ..TrainingConfig::default()
+        })
+    }
+
+    /// sc-2127: 2.3 declares buckets; 2.5 (prepared latent packs) does not.
+    #[test]
+    fn only_the_2_3_descriptor_declares_resolution_buckets() {
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        assert!(!trainer_descriptor_25().techniques.resolution_buckets);
+    }
+
+    /// sc-2127 / epic 2123 E7: the guard sizes for the LARGEST bucket — [512, 1024] gives exactly
+    /// the 1024-only latent edge (and projection), more than the 512-only one.
+    #[test]
+    fn guard_sizes_for_the_largest_bucket() {
+        let both = guard_latent_edge(&edges_of(&[rb(512, 1), rb(1024, 1)]));
+        let big = guard_latent_edge(&edges_of(&[rb(1024, 1)]));
+        let small = guard_latent_edge(&edges_of(&[rb(512, 1)]));
+        assert_eq!(both, big);
+        assert_eq!(both, 32);
+        let p = |le: usize| projected_dense_peak_gb((le * le) as f64);
+        assert_eq!(p(both), p(big));
+        assert!(p(both) > p(small));
+        // Buckets off: the legacy single edge.
+        assert_eq!(
+            guard_latent_edge(&bucket_edges(&TrainingConfig::default())),
+            latent_edge_of(bucket_edges(&TrainingConfig::default())[0])
+        );
+    }
+
+    /// sc-2127: one bucket walks the pre-bucket `(step-1) % n` order on bucket 0.
+    #[test]
+    fn one_bucket_step_entry_is_the_pre_bucket_order() {
+        let n = 5usize;
+        let schedule = BucketSchedule::new(n, &[rb(768, 1)], 3);
+        for step in 1..=60u32 {
+            assert_eq!(step_entry(&schedule, step), (((step - 1) as usize) % n, 0));
+        }
+    }
+
+    /// sc-2127: over a multi-bucket schedule every step's RoPE grid (picked by `step_entry`'s bucket)
+    /// matches the token count of the cached latent it trains on — tiny synthetic latents, no
+    /// weights. Also checks the 4:1 per-item mix and that previews take the largest grid.
+    #[test]
+    fn per_step_positions_match_the_cached_latent() {
+        let edges = edges_of(&[rb(64, 4), rb(128, 1)]);
+        let latent_edges: Vec<usize> = edges.iter().map(|&e| latent_edge_of(e)).collect();
+        assert_eq!(latent_edges, vec![2, 4]);
+        assert_eq!(largest_bucket(&latent_edges), 1);
+        let n_items = 2usize;
+        // Item-major cache of flattened (1, S, 128) latents.
+        let mut cache = Vec::new();
+        for _ in 0..n_items {
+            for &le in &latent_edges {
+                let latent = Array::zeros::<f32>(&[1, 128, 1, le as i32, le as i32]).unwrap();
+                cache.push(flatten_latent(&latent).unwrap());
+            }
+        }
+        let positions: Vec<Array> = latent_edges
+            .iter()
+            .map(|&le| create_position_grid(1, 1, le, le))
+            .collect();
+        let schedule = BucketSchedule::new(n_items, &[rb(64, 4), rb(128, 1)], 9);
+        let mut counts = vec![[0u32; 2]; n_items];
+        for step in 1..=(2 * schedule.epoch_len()) as u32 {
+            let (entry, bucket) = step_entry(&schedule, step);
+            let tokens = cache[entry].shape()[1];
+            // Position grid is `[B, 3, S, 2]`.
+            assert_eq!(positions[bucket].shape()[2], tokens, "step {step}");
+            counts[entry / 2][bucket] += 1;
+        }
+        for c in counts {
+            assert_eq!(c, [8, 2]);
+        }
+    }
+
+    /// sc-2127: the 2.5 weights-free preflight refuses buckets with the typed `Unsupported` (the
+    /// same floor the trainer's `validate` applies), before touching any prepared pack.
+    #[test]
+    fn ltx25_preflight_refuses_resolution_buckets() {
+        let mut req = super::validate_request_tests::request(1);
+        req.config.resolution_buckets = vec![rb(512, 1), rb(1024, 1)];
+        match super::validate_ltx25_training_request(&req) {
+            Err(mlx_gen::Error::Unsupported(message)) => {
+                assert!(message.contains("resolution_buckets"), "{message}")
+            }
+            other => panic!("expected a typed Unsupported, got {other:?}"),
+        }
     }
 }
 

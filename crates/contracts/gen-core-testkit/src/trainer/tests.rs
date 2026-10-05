@@ -503,3 +503,63 @@ fn declared_adapter_noise_passes_the_technique_checks() {
     check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
     trainer_conformance(make, &profile(&tmp));
 }
+
+/// sc-2127: a trainer that does not declare resolution buckets but silently accepts them (it
+/// rubber-stamps every technique knob; both noise techniques are declared so those probes pass)
+/// fails the
+/// validate check AND the train-entry refusal check, naming the bucket flag.
+#[test]
+fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques = gen_core::TrainingTechniques::ADAPTER_NOISE;
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.resolution_buckets == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("resolution_buckets set") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-2127: a trainer that declares resolution buckets passes the technique checks and the
+/// bucketed progress run.
+#[test]
+fn declared_resolution_buckets_pass_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.resolution_buckets = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+    check_trainer_bucketed_progress(&make, &profile(&tmp)).unwrap();
+    trainer_conformance(make, &profile(&tmp));
+}
+
+/// sc-2127: a bucket-capable trainer whose bucketed run does not stream training progress is caught
+/// by the bucketed progress check (the positive path is a real run, not just a validate stamp).
+#[test]
+fn declared_resolution_buckets_that_break_training_fail_the_bucketed_progress_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(
+            STUB_ID,
+            Behavior {
+                emit_progress: false,
+                ..Behavior::good()
+            },
+        );
+        stub.desc.techniques.resolution_buckets = true;
+        Box::new(stub)
+    };
+    let err = check_trainer_bucketed_progress(&make, &profile(&tmp)).unwrap_err();
+    assert!(err.contains("Training"), "got: {err}");
+}

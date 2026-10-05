@@ -54,10 +54,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core;
+use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -122,13 +122,37 @@ fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f
     Ok((x_t, target, sigma))
 }
 
-/// A cached training sample: the clean VAE-latent tokens `[1, gh·gw, 128]`, the encoded conditioning
-/// `[1, txt_tokens, hidden]`, and its post-drop token count (native-resolution packing is per-sample,
-/// so each caption keeps its own length).
+/// A cached training sample: the clean VAE-latent tokens `[1, grid·grid, 128]`, the encoded
+/// conditioning `[1, txt_tokens, hidden]`, its post-drop token count, and the square latent `grid`
+/// the tokens were encoded at (native-resolution packing is per-sample, so each caption keeps its
+/// own length and — with resolution buckets, sc-2127 — each sample its own grid).
 struct CachedSample {
     latent_tokens: Array,
     txt: Array,
     txt_tokens: i32,
+    grid: i32,
+}
+
+/// The square latent grid side for a training `edge` (`patch_size == 1`, so this is also the image
+/// token side).
+fn latent_grid(edge: u32) -> i32 {
+    (edge / VAE_DOWNSAMPLE_FACTOR) as i32
+}
+
+/// The one-segment pack layout of a cached sample: its own latent grid + its caption tokens. Shared
+/// by the adapter and full fine-tune steps so a bucketed sample is always packed at the grid it was
+/// cached at (sc-2127).
+fn sample_layout(sample: &CachedSample) -> Result<PackLayout> {
+    PackLayout::generation(
+        vec![ImgShape::latent(sample.grid, sample.grid)],
+        vec![sample.txt_tokens],
+    )
+}
+
+/// The cache entry the 1-based training `step` reads (sc-2127). One bucket ⇒ `(step - 1) % items`,
+/// the pre-bucket round-robin.
+fn step_cache_index(schedule: &BucketSchedule, step: u32) -> usize {
+    schedule.cache_index((step - 1) as usize)
 }
 
 /// One pre-encoded preview-sample prompt — `(prompt, txt embedding [1, tokens, hidden], token count)`.
@@ -180,7 +204,13 @@ fn trainer_descriptor() -> TrainerDescriptor {
         max_reference_images: 0,
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
-        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per item per bucket
+        // (each carrying its own latent grid), sampled by `BucketSchedule`, on both the adapter and
+        // the full fine-tune paths.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
@@ -416,11 +446,12 @@ impl MageFlowTrainer {
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);
 
-        // Training resolution → square latent grid. `bucket_resolution` floors to a multiple of 32
-        // (a subset of Mage's 16× stride, so the latent tiles cleanly). `patch_size == 1`, so the
-        // token count is exactly the latent grid.
-        let edge = bucket_resolution(cfg.resolution);
-        let grid = (edge / VAE_DOWNSAMPLE_FACTOR) as i32;
+        // Training resolutions → square latent grids, one edge per resolution bucket (sc-2127; just
+        // `[resolution]` when buckets are off). `bucket_edges` floors each to a multiple of 32 (a
+        // subset of Mage's 16× stride, so the latent tiles cleanly). `patch_size == 1`, so each
+        // sample's token count is exactly its latent grid. Previews render at the largest edge.
+        let edges = bucket_edges(cfg);
+        let preview_edge = edges.iter().copied().max().unwrap_or(0);
 
         let compute_dtype = resolve_compute_dtype(&cfg.train_dtype);
 
@@ -428,13 +459,13 @@ impl MageFlowTrainer {
         // below (which casts the frozen base and builds adapter factors). The full path seeds its own
         // f32 master weights from the raw checkpoint instead of freezing `self.transformer`.
         if cfg.full_finetune {
-            return self.train_full_impl(req, edge, grid, compute_dtype, on_progress);
+            return self.train_full_impl(req, &edges, preview_edge, compute_dtype, on_progress);
         }
 
         self.transformer_mut()?.cast_weights(compute_dtype)?;
 
         // --- prepare → cache: VAE-latents + prompt-embeds into memory before the loop ---
-        let (cache, sample_caps) = self.prepare_caches(req, edge, grid, on_progress)?;
+        let (cache, sample_caps) = self.prepare_caches(req, &edges, on_progress)?;
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let target_paths = resolve_target_paths(self.transformer_ref()?, cfg);
@@ -497,6 +528,10 @@ impl MageFlowTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) sample each step trains on (round-robin over items for
+        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -504,7 +539,7 @@ impl MageFlowTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[((step - 1) as usize) % cache.len()];
+            let sample = &cache[step_cache_index(&schedule, step)];
             let sigma = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -527,7 +562,6 @@ impl MageFlowTrainer {
                 alpha,
                 rank,
                 sample,
-                grid,
                 sigma,
                 &noise,
                 mae,
@@ -611,7 +645,7 @@ impl MageFlowTrainer {
                         &self.vae,
                         txt,
                         *txt_tokens,
-                        edge,
+                        preview_edge,
                         cfg.sample_steps.max(1) as usize,
                         cfg.sample_guidance_scale,
                         sample_seed as i64,
@@ -663,18 +697,19 @@ impl MageFlowTrainer {
     /// Cache the whole dataset (Mage-VAE latents + Qwen3-VL prompt embeddings) into memory, pre-encode
     /// the preview-sample prompts, then **drop the Qwen encoder** before the memory-heavy train loop —
     /// the prepare→cache lifecycle shared by the LoRA/LoKr and full base fine-tune paths (sc-14056).
-    /// Returns the per-sample cache and the pre-encoded preview prompts (empty when sampling is off).
+    /// Returns the per-sample cache — item-major, one entry per `edges` bucket
+    /// (`cache[item * edges.len() + bucket]`, sc-2127) — and the pre-encoded preview prompts (empty
+    /// when sampling is off).
     fn prepare_caches(
         &mut self,
         req: &TrainingRequest,
-        edge: u32,
-        grid: i32,
+        edges: &[u32],
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<(Vec<CachedSample>, Vec<SamplePrompt>)> {
         let cfg = &req.config;
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
-        let mut cache: Vec<CachedSample> = Vec::with_capacity(req.items.len());
+        let mut cache: Vec<CachedSample> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -684,27 +719,33 @@ impl MageFlowTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
-            let nchw = preprocess_to_nchw(&img, edge)?;
-            // Mage-VAE encode at t = 0 → posterior **mean** (`sample_posterior = false`), no latent
-            // scale/shift. `[1, 128, gh, gw]` → token layout `[1, gh·gw, 128]`.
-            let latent_tokens = self
-                .vae
-                .encode_mean(&nchw)?
-                .transpose_axes(&[0, 2, 3, 1])?
-                .reshape(&[1, grid * grid, LATENT_CHANNELS])?;
             let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "mage_flow_base trainer: text encoder already freed (caching after loop)"
                         .into(),
                 )
             })?;
+            // The caption is encoded once per item and shared (refcounted) by every bucket entry.
             let (txt, txt_tokens) = encode_caption(text_encoder, &item.caption)?;
-            eval([&latent_tokens, &txt])?;
-            cache.push(CachedSample {
-                latent_tokens,
-                txt,
-                txt_tokens,
-            });
+            eval([&txt])?;
+            for &edge in edges {
+                let grid = latent_grid(edge);
+                let nchw = preprocess_to_nchw(&img, edge)?;
+                // Mage-VAE encode at t = 0 → posterior **mean** (`sample_posterior = false`), no
+                // latent scale/shift. `[1, 128, gh, gw]` → token layout `[1, gh·gw, 128]`.
+                let latent_tokens = self
+                    .vae
+                    .encode_mean(&nchw)?
+                    .transpose_axes(&[0, 2, 3, 1])?
+                    .reshape(&[1, grid * grid, LATENT_CHANNELS])?;
+                eval([&latent_tokens])?;
+                cache.push(CachedSample {
+                    latent_tokens,
+                    txt: txt.clone(),
+                    txt_tokens,
+                    grid,
+                });
+            }
         }
         if cache.is_empty() {
             // Disambiguate cancel-during-caching (typed `Canceled`) from a genuinely unusable dataset.
@@ -762,8 +803,8 @@ impl MageFlowTrainer {
     fn train_full_impl(
         &mut self,
         req: &TrainingRequest,
-        edge: u32,
-        grid: i32,
+        edges: &[u32],
+        preview_edge: u32,
         compute_dtype: Dtype,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<TrainingOutput> {
@@ -791,7 +832,7 @@ impl MageFlowTrainer {
         let rope = MsRope::from_config(&dit_cfg)?;
 
         // Cache the dataset + drop the text encoder (shared with the LoRA path).
-        let (cache, sample_caps) = self.prepare_caches(req, edge, grid, on_progress)?;
+        let (cache, sample_caps) = self.prepare_caches(req, edges, on_progress)?;
 
         let mae = {
             let lt = normalize_cfg(&cfg.loss_type);
@@ -830,6 +871,9 @@ impl MageFlowTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: the same bucket schedule as the adapter path.
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -837,7 +881,7 @@ impl MageFlowTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[((step - 1) as usize) % cache.len()];
+            let sample = &cache[step_cache_index(&schedule, step)];
             let sigma = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -851,12 +895,9 @@ impl MageFlowTrainer {
                     cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
                 )?),
             )?;
-            // One packed segment: this image's latent grid + its caption tokens (native-res per-sample).
-            let layout = PackLayout::generation(
-                vec![ImgShape::latent(grid, grid)],
-                vec![sample.txt_tokens],
-            )?;
-            let ctx = PackContext::new(layout, &rope)?;
+            // One packed segment: this sample's own latent grid + its caption tokens (native-res
+            // per-sample; the grid is the sample's bucket, sc-2127).
+            let ctx = PackContext::new(sample_layout(sample)?, &rope)?;
             let (loss, grads) = compute_full_loss_grads(
                 &dit_cfg,
                 &params,
@@ -933,7 +974,7 @@ impl MageFlowTrainer {
                                 &self.vae,
                                 txt,
                                 *txt_tokens,
-                                edge,
+                                preview_edge,
                                 cfg.sample_steps.max(1) as usize,
                                 cfg.sample_guidance_scale,
                                 sample_seed as i64,
@@ -1223,17 +1264,14 @@ fn compute_loss_grads(
     alpha: f32,
     rank: f32,
     sample: &CachedSample,
-    grid: i32,
     sigma: f32,
     noise: &Array,
     mae: bool,
     dtype: Dtype,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target, _timestep) = build_batch(&sample.latent_tokens, noise, sigma)?;
-    // One packed segment: this image's latent grid + its caption tokens.
-    let layout =
-        PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![sample.txt_tokens])?;
-    let ctx = transformer.pack_context(layout)?;
+    // One packed segment: this sample's own latent grid (its bucket) + its caption tokens.
+    let ctx = transformer.pack_context(sample_layout(sample)?)?;
     let sigma_arr = Array::from_slice(&[sigma], &[1]); // one entry per packed segment
     let txt = sample.txt.clone();
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
@@ -1275,7 +1313,7 @@ fn render_sample(
     guidance: f32,
     seed: i64,
 ) -> Result<Image> {
-    let grid = (edge / VAE_DOWNSAMPLE_FACTOR) as i32;
+    let grid = latent_grid(edge);
     let key = GsKey::default();
     let tokens = encode_noise_tokens(grid, grid, seed, &key, Dtype::Bfloat16)?;
     let cond = cond_txt.as_dtype(Dtype::Bfloat16)?;
@@ -1483,6 +1521,7 @@ mod tests {
             latent_tokens,
             txt,
             txt_tokens,
+            grid,
         };
         let noise = random::normal::<f32>(
             &[1, grid * grid, LATENT_CHANNELS],
@@ -1519,7 +1558,6 @@ mod tests {
                 8.0,
                 8.0,
                 &sample,
-                grid,
                 sigma,
                 &noise,
                 false,
@@ -1559,6 +1597,66 @@ mod tests {
         // the shared `validate_full_finetune_request` floor turns a `false` here into a typed reject of
         // every full-tune request, which would strand the capability behind its own capability flag.
         assert!(d.supports_full_finetune);
+        // sc-2127: multi-resolution buckets are honored (adapter + full paths share the cache).
+        assert!(d.techniques.resolution_buckets);
+    }
+
+    fn rb(resolution: u32, repeats: u32) -> gen_core::ResolutionBucket {
+        gen_core::ResolutionBucket {
+            resolution,
+            repeats,
+        }
+    }
+
+    /// sc-2127: with buckets off the step → cache index is exactly the pre-bucket
+    /// `(step - 1) % items`; with buckets [512×16, 1024×1] every epoch visits each item 16:1.
+    #[test]
+    fn step_cache_index_matches_legacy_round_robin_and_mixes_buckets() {
+        let off = TrainingConfig {
+            resolution: 768,
+            ..Default::default()
+        };
+        let one = BucketSchedule::new(5, &off.training_buckets(), 7);
+        for step in 1..=200u32 {
+            assert_eq!(step_cache_index(&one, step), ((step - 1) as usize) % 5);
+        }
+        let on = TrainingConfig {
+            resolution_buckets: vec![rb(512, 16), rb(1024, 1)],
+            ..Default::default()
+        };
+        let sched = BucketSchedule::new(3, &on.training_buckets(), 7);
+        let epoch = sched.epoch_len();
+        assert_eq!(epoch, 3 * 17);
+        let mut counts = [[0u32; 2]; 3];
+        for step in 1..=epoch as u32 {
+            let idx = step_cache_index(&sched, step);
+            counts[idx / 2][idx % 2] += 1;
+        }
+        assert_eq!(counts, [[16, 1]; 3]);
+    }
+
+    /// sc-2127: each bucket edge gets its own latent grid, and a cached sample is packed at the grid
+    /// it carries (not a run-wide one) — so a 512 and a 1024 entry pack 32² vs 64² image tokens.
+    #[test]
+    fn bucketed_samples_pack_at_their_own_grid() {
+        let cfg = TrainingConfig {
+            resolution_buckets: vec![rb(512, 1), rb(1024, 1)],
+            ..Default::default()
+        };
+        let grids: Vec<i32> = bucket_edges(&cfg).into_iter().map(latent_grid).collect();
+        assert_eq!(grids, vec![32, 64]);
+        for g in grids {
+            let sample = CachedSample {
+                latent_tokens: Array::zeros::<f32>(&[1, g * g, LATENT_CHANNELS]).unwrap(),
+                txt: Array::zeros::<f32>(&[1, 7, 8]).unwrap(),
+                txt_tokens: 7,
+                grid: g,
+            };
+            assert_eq!(
+                sample_layout(&sample).unwrap(),
+                PackLayout::generation(vec![ImgShape::latent(g, g)], vec![7]).unwrap()
+            );
+        }
     }
 
     /// The capability claim and the acceptance must be one fact: because this trainer advertises
@@ -1762,14 +1860,12 @@ mod tests {
             latent_tokens,
             txt,
             txt_tokens,
+            grid,
         };
 
         // A FIXED sigma + noise ⇒ a stationary objective. Build the pack context once.
         let rope = MsRope::from_config(&dit_cfg).unwrap();
-        let layout =
-            PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![sample.txt_tokens])
-                .unwrap();
-        let ctx = PackContext::new(layout, &rope).unwrap();
+        let ctx = PackContext::new(sample_layout(&sample).unwrap(), &rope).unwrap();
         let noise = random::normal::<f32>(
             &[1, grid * grid, LATENT_CHANNELS],
             None,

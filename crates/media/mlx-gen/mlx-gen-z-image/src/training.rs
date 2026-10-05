@@ -29,11 +29,11 @@
 use std::path::Path;
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core;
+use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -116,7 +116,12 @@ fn trainer_descriptor() -> TrainerDescriptor {
         max_reference_images: 0,
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the shared adapter optimizer
         // update (`adapter_optimizer_update`).
-        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
+        // sc-24826 (epic 2123): honors `weight_noise_sigma` — `apply_weight_noise` after every
+        // optimizer update.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
@@ -281,7 +286,10 @@ impl ZImageTurboTrainer {
         self.validate(req)?;
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). Memory guards and previews size for the largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
+        let edge = preflight_edge(&edges);
 
         // sc-4887 — training compute dtype. bf16 halves the activation working set (and the resident
         // base) and is the ecosystem-standard mixed precision; the trainable factors / loss / grads /
@@ -322,7 +330,8 @@ impl ZImageTurboTrainer {
         // --- prepare → load → cache: VAE-latents + prompt-embeds into memory before the loop ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -332,7 +341,6 @@ impl ZImageTurboTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
-            let x0 = encode_init_latents(&self.vae, &img, edge, edge)?; // clean latent [16,1,h,w]
             let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "z_image_turbo trainer: text encoder already freed (caching after train loop)"
@@ -347,8 +355,12 @@ impl ZImageTurboTrainer {
                 // Trainers never select a memory rung: the resident encoder is the training path.
                 None,
             )?;
-            eval([&x0, &cap])?;
-            cache.push((x0, cap));
+            eval([&cap])?;
+            for &edge in &edges {
+                let x0 = encode_init_latents(&self.vae, &img, edge, edge)?; // clean latent [16,1,h,w]
+                eval([&x0])?;
+                cache.push((x0, cap.clone()));
+            }
         }
         if cache.is_empty() {
             // sc-4895 — disambiguate the two ways the cache ends up empty. A cancel tripped during
@@ -515,6 +527,10 @@ impl ZImageTurboTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -522,7 +538,7 @@ impl ZImageTurboTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, cap) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, cap) = &cache[schedule.cache_index((step - 1) as usize)];
             let sigma = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -728,6 +744,12 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
 /// caption block. The budget is MLX's own reported memory limit (≈ the device's recommended working
 /// set), scaled by 0.85 to leave headroom for the worker/host — exceeding it is the regime where the
 /// dense run was observed to die. Only consulted when gradient checkpointing is OFF.
+/// The edge the memory pre-flight (and the preview render) sizes for: the largest bucket edge
+/// (epic 2123 E7, sc-2127) — a bucketed run's peak is its largest latent.
+fn preflight_edge(edges: &[u32]) -> u32 {
+    edges.iter().copied().max().unwrap_or(0)
+}
+
 fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
     let tokens_per_side = (edge as f64 / 16.0).ceil();
     // The padded caption block can reach the model's max prompt length (~512 tokens), not just the
@@ -1805,5 +1827,29 @@ mod weight_noise_update_tests {
     #[test]
     fn descriptor_declares_weight_noise() {
         assert!(trainer_descriptor().techniques.weight_noise);
+    }
+
+    /// sc-2127: the descriptor declares resolution buckets, and the memory pre-flight sizes a
+    /// bucketed run for its largest edge (the legacy single edge when buckets are off).
+    #[test]
+    fn buckets_are_declared_and_preflight_sizes_for_the_largest_edge() {
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        let mut cfg = TrainingConfig {
+            resolution: 768,
+            ..Default::default()
+        };
+        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 768);
+        cfg.resolution_buckets = vec![
+            gen_core::ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+            gen_core::ResolutionBucket {
+                resolution: 512,
+                repeats: 16,
+            },
+        ];
+        assert_eq!(bucket_edges(&cfg), vec![1024, 512]);
+        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 1024);
     }
 }

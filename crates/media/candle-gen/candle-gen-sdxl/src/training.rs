@@ -54,9 +54,9 @@ use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
+use candle_gen::gen_core::{self, BucketSchedule, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
 use candle_gen::train::lora::{
     adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
@@ -534,8 +534,21 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         max_reference_images: 0,
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
-        techniques: gen_core::train::TrainingTechniques::ADAPTER_NOISE,
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
+}
+
+/// The bucket index of the largest training edge (the first one on a tie) — previews denoise at
+/// this bucket's cached latent grid (epic 2123 E7: run-wide sizing follows the largest edge).
+fn largest_bucket(edges: &[u32]) -> usize {
+    edges
+        .iter()
+        .enumerate()
+        .fold(0, |best, (i, &e)| if e > edges[best] { i } else { best })
 }
 
 /// A loaded candle SDXL trainer. Loading is **lazy** (no file I/O — mirrors [`crate::SdxlGenerator`]):
@@ -638,7 +651,8 @@ impl SdxlTrainer {
         let cfg = &req.config;
         let device = &self.device;
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
+        let edges = bucket_edges(cfg);
         let compute_dtype = parse_compute_dtype(&cfg.train_dtype);
 
         // --- load + cache: VAE latents (.mean × scale) + dual-CLIP conditioning ---
@@ -659,7 +673,8 @@ impl SdxlTrainer {
         )?;
 
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -668,10 +683,13 @@ impl SdxlTrainer {
                 current: i as u32 + 1,
                 total,
             });
-            let img = load_image_tensor(&item.image_path, edge, device)?;
-            let x0 = cache_frozen_encoder_output(vae.encode_mean(&img)?);
             let cond = cache_frozen_encoder_output(clip.encode(&item.caption)?);
-            cache.push((x0, cond));
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            for &edge in &edges {
+                let img = square_image_tensor(&square, edge, device)?;
+                let x0 = cache_frozen_encoder_output(vae.encode_mean(&img)?);
+                cache.push((x0, cond.clone()));
+            }
         }
 
         // --- preview samples (sc-8650): pre-encode the prompts + load a resident VAE decoder ---
@@ -777,11 +795,16 @@ impl SdxlTrainer {
         // --- train loop ---
         // Preview latent grid (sc-8650): the cached `x0`'s spatial dims are the exact /8 latent grid the
         // dataset was encoded at, so a preview denoises at the training resolution (parity with the
-        // bucketed `edge` the cache loop used). Read once from the first cache entry.
+        // bucketed `edge` the cache loop used). Read once from the first item's entry at the LARGEST
+        // bucket (sc-2127; item-major cache, so that is `cache[largest_bucket]`).
         let (lat_h, lat_w) = {
-            let (_, _, h, w) = cache[0].0.dims4()?;
+            let (_, _, h, w) = cache[largest_bucket(&edges)].0.dims4()?;
             (h, w)
         };
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<GradStore> = None;
         let mut update_idx = 0u32;
         let mut last_loss = 0.0f32;
@@ -790,7 +813,7 @@ impl SdxlTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, cond) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, cond) = &cache[schedule.cache_index((step - 1) as usize)];
             let t = sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64));
             let noise = sample_noise(
                 x0.dims(),
@@ -1179,6 +1202,16 @@ mod tests {
         assert_eq!(t.descriptor().backend, "candle");
         assert!(t.descriptor().supports_lora);
         assert!(t.descriptor().supports_lokr);
+    }
+
+    /// sc-2127: the trainer declares resolution buckets, and previews size for the cache slot of
+    /// the largest bucket edge (the first on a tie; slot 0 when buckets are off).
+    #[test]
+    fn descriptor_declares_buckets_and_previews_use_the_largest_edge() {
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        assert_eq!(largest_bucket(&[512]), 0);
+        assert_eq!(largest_bucket(&[512, 1024, 768]), 1);
+        assert_eq!(largest_bucket(&[1024, 512, 1024]), 0);
     }
 
     /// epic 13657 (sc-13663): the trainer takes the SAME three components as the registered generator
