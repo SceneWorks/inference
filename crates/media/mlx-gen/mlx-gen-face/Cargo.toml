@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # The face-loss parity fixture pins its producer script's sha256 (sc-24831).
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 # `face_cosine` example (epic 10871 P4.2 identity scoring) loads PNG/JPG inputs.
 image = { workspace = true }
 

@@ -500,48 +500,36 @@ impl PerceptualLoss for FaceLandmarkLoss {
 // Loading + memory (E7)
 // ------------------------------------------------------------------------------------------------
 
-/// The enabled face losses, sharing one SCRFD detector: `identity` loads ArcFace from
-/// `face_dir/`[`ARCFACE_FILE`]; `landmark_dir` (when `Some`) loads FaceMesh from
-/// `landmark_dir/`[`FACEMESH_FILE`]. Both detect with `face_dir/`[`SCRFD_FILE`]. Returned in order
-/// `(identity, landmark)`.
-pub fn load_face_losses(
-    face_dir: &Path,
-    identity: Option<&IdentityLossConfig>,
-    landmark_dir: Option<&Path>,
-) -> Result<(Option<IdentityLoss>, Option<FaceLandmarkLoss>)> {
-    if identity.is_none() && landmark_dir.is_none() {
-        return Ok((None, None));
-    }
-    let load = |p: &Path| {
-        Weights::from_file(p).map_err(|e| {
-            Error::Msg(format!(
-                "face loss: could not load {}: {e}",
-                p.display()
-            ))
-        })
-    };
-    let detector: Rc<dyn FaceBoxDetector> =
-        Rc::new(ScrfdDetector::from_weights(&load(&face_dir.join(SCRFD_FILE))?)?);
-    let id = identity
-        .map(|cfg| -> Result<IdentityLoss> {
-            let arcface = ArcFace::from_weights(&load(&face_dir.join(ARCFACE_FILE))?)?;
-            Ok(IdentityLoss::new(
-                arcface,
-                detector.clone(),
-                cfg.min_cos,
-                cfg.reference_mode,
-            ))
-        })
-        .transpose()?;
-    let lm = landmark_dir
-        .map(|dir| -> Result<FaceLandmarkLoss> {
-            Ok(FaceLandmarkLoss::new(
-                Program::from_file(dir.join(FACEMESH_FILE))?,
-                detector.clone(),
-            ))
-        })
-        .transpose()?;
-    Ok((id, lm))
+fn load_weights(p: &Path) -> Result<Weights> {
+    Weights::from_file(p)
+        .map_err(|e| Error::Msg(format!("face loss: could not load {}: {e}", p.display())))
+}
+
+fn load_detector(face_dir: &Path) -> Result<Rc<dyn FaceBoxDetector>> {
+    Ok(Rc::new(ScrfdDetector::from_weights(&load_weights(
+        &face_dir.join(SCRFD_FILE),
+    )?)?))
+}
+
+/// Load the identity loss from the face-analysis stack dir (`face_dir/`[`SCRFD_FILE`] +
+/// `face_dir/`[`ARCFACE_FILE`]) with `cfg`'s gate and reference mode.
+pub fn load_identity_loss(face_dir: &Path, cfg: &IdentityLossConfig) -> Result<IdentityLoss> {
+    let arcface = ArcFace::from_weights(&load_weights(&face_dir.join(ARCFACE_FILE))?)?;
+    Ok(IdentityLoss::new(
+        arcface,
+        load_detector(face_dir)?,
+        cfg.min_cos,
+        cfg.reference_mode,
+    ))
+}
+
+/// Load the face-landmark loss: SCRFD from `face_dir/`[`SCRFD_FILE`], FaceMesh from
+/// `mesh_dir/`[`FACEMESH_FILE`].
+pub fn load_face_landmark_loss(face_dir: &Path, mesh_dir: &Path) -> Result<FaceLandmarkLoss> {
+    Ok(FaceLandmarkLoss::new(
+        Program::from_file(mesh_dir.join(FACEMESH_FILE))?,
+        load_detector(face_dir)?,
+    ))
 }
 
 /// Published SCRFD-10g (bnkps) parameter count (insightface model zoo: 4.23 M).
@@ -591,42 +579,155 @@ pub fn arcface_working_set_bytes(layers: [usize; 4]) -> u64 {
     floats * 4 * 2
 }
 
-/// The face losses' E7 footprints for training images of `image_h × image_w`: the shared SCRFD
-/// detector (reference-time forward on a 640² blob, no backward), ArcFace when `identity_layers` is
-/// `Some`, and FaceMesh when `landmark` is set. Empty when neither loss is enabled. Feed them to
-/// [`mlx_gen::train::perceptual::perceptual_footprint_bytes`].
-pub fn face_loss_footprints(
-    identity_layers: Option<[usize; 4]>,
-    landmark: bool,
-) -> Vec<AuxModelFootprint> {
-    if identity_layers.is_none() && !landmark {
-        return Vec::new();
-    }
-    let det = 640u64 * 640 * 3 * 4;
-    let mut out = vec![AuxModelFootprint {
+/// The SCRFD detector each face loss loads (reference-time forward on a 640² blob, no backward):
+/// its weights plus ≈ 32 input-sized f32 maps live at the widest stage.
+fn detector_footprint() -> AuxModelFootprint {
+    AuxModelFootprint {
         param_bytes: SCRFD_10G_PARAMS * 4,
-        // Inference-only forward at 640²: ≈ 32 input-sized f32 maps live at the widest stage.
-        working_set_bytes: 32 * det,
+        working_set_bytes: 32 * 640 * 640 * 3 * 4,
         reference_bytes_per_image: 0,
-    }];
-    if let Some(layers) = identity_layers {
-        out.push(AuxModelFootprint {
+    }
+}
+
+fn plus(a: AuxModelFootprint, b: AuxModelFootprint) -> AuxModelFootprint {
+    AuxModelFootprint {
+        param_bytes: a.param_bytes + b.param_bytes,
+        working_set_bytes: a.working_set_bytes + b.working_set_bytes,
+        reference_bytes_per_image: a.reference_bytes_per_image + b.reference_bytes_per_image,
+    }
+}
+
+/// E7 footprint of the identity loss (its SCRFD detector + an IResNet ArcFace of `layers`; the
+/// shipped face stack is glintr100, [`crate::iresnet::IRESNET100_LAYERS`]). The crop is a fixed
+/// 112², so the figure does not depend on the training resolution.
+pub fn identity_loss_footprint(layers: [usize; 4]) -> AuxModelFootprint {
+    plus(
+        detector_footprint(),
+        AuxModelFootprint {
             param_bytes: arcface_param_count(layers) * 4,
             working_set_bytes: arcface_working_set_bytes(layers),
             // Unit embedding + box.
             reference_bytes_per_image: ARCFACE_EMBEDDING * 4 + 64,
-        });
-    }
-    if landmark {
-        let input = (FACEMESH_INPUT * FACEMESH_INPUT * 3 * 4) as u64;
-        out.push(AuxModelFootprint {
+        },
+    )
+}
+
+/// E7 footprint of the face-landmark loss (its SCRFD detector + FaceMesh-v2 on a fixed 256² crop).
+pub fn face_landmark_loss_footprint() -> AuxModelFootprint {
+    let input = (FACEMESH_INPUT * FACEMESH_INPUT * 3 * 4) as u64;
+    plus(
+        detector_footprint(),
+        AuxModelFootprint {
             param_bytes: FACEMESH_V2_PARAMS * 4,
             // MobileNet-class graph at 256²: ≈ 64 input-sized f32 maps retained, ×2 cotangents.
             working_set_bytes: 64 * input * 2,
             reference_bytes_per_image: (FACEMESH_LANDMARKS * 2 * 4) as u64 + 64,
-        });
+        },
+    )
+}
+
+/// On-disk stand-ins for the face-loss checkpoints, for tests of the builder / trainers that must
+/// never download real weights: a weightless SCRFD (scalar zeros — loads, never forwarded), a tiny
+/// synthetic IResNet ArcFace, and a tiny FaceMesh-shaped fx-program.
+pub mod testing {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use mlx_gen::{Error, Result};
+    use mlx_rs::Array;
+
+    use super::{ARCFACE_FILE, FACEMESH_FILE, SCRFD_FILE};
+    use crate::synth;
+
+    /// Key → shape of a tiny IResNet (stem 8, widths 8/16/32/64, blocks `[1,2,1,1]`, 32-d) — the
+    /// parity fixture's architecture.
+    pub fn tiny_arcface_shapes() -> Vec<(String, Vec<usize>)> {
+        let mut out = Vec::new();
+        let conv = |out: &mut Vec<(String, Vec<usize>)>, p: &str, cin, cout, k| {
+            out.push((format!("{p}.weight"), vec![cout, k, k, cin]));
+            out.push((format!("{p}.bias"), vec![cout]));
+        };
+        let aff = |out: &mut Vec<(String, Vec<usize>)>, p: &str, c| {
+            out.push((format!("{p}.scale"), vec![c]));
+            out.push((format!("{p}.shift"), vec![c]));
+        };
+        conv(&mut out, "stem.conv", 3, 8, 3);
+        out.push(("stem.prelu.weight".into(), vec![8]));
+        let mut cin = 8;
+        for (li, (nb, c)) in [1usize, 2, 1, 1].into_iter().zip([8, 16, 32, 64]).enumerate() {
+            for b in 0..nb {
+                let p = format!("layer{}.{b}", li + 1);
+                let bin = if b == 0 { cin } else { c };
+                aff(&mut out, &format!("{p}.bn1"), bin);
+                conv(&mut out, &format!("{p}.conv1"), bin, c, 3);
+                out.push((format!("{p}.prelu.weight"), vec![c]));
+                conv(&mut out, &format!("{p}.conv2"), c, c, 3);
+                if b == 0 {
+                    conv(&mut out, &format!("{p}.downsample"), bin, c, 1);
+                }
+            }
+            cin = c;
+        }
+        aff(&mut out, "bn2", cin);
+        out.push(("fc.weight".into(), vec![32, cin * 49]));
+        out.push(("fc.bias".into(), vec![32]));
+        aff(&mut out, "features", 32);
+        out
     }
-    out
+
+    fn save(
+        pairs: Vec<(String, Array)>,
+        meta: Option<&HashMap<String, String>>,
+        path: &Path,
+    ) -> Result<()> {
+        Array::save_safetensors(pairs.iter().map(|(k, a)| (k.as_str(), a)), meta, path)
+            .map_err(|e| Error::Msg(format!("write {}: {e}", path.display())))
+    }
+
+    /// Write `dir/scrfd_10g.safetensors` (weightless) + `dir/arcface_iresnet100.safetensors`
+    /// (tiny synthetic IResNet).
+    pub fn write_face_stack(dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Msg(e.to_string()))?;
+        let scrfd = crate::face::scrfd_schema_keys()
+            .into_iter()
+            .map(|k| (k, Array::from_f32(0.0)))
+            .collect();
+        save(scrfd, None, &dir.join(SCRFD_FILE))?;
+        let arc = tiny_arcface_shapes()
+            .into_iter()
+            .map(|(k, s)| {
+                let t = synth::tensor(0x24831A, &k, &s);
+                (k, t)
+            })
+            .collect();
+        save(arc, None, &dir.join(ARCFACE_FILE))
+    }
+
+    /// Write `dir/face_landmarks_detector.safetensors`: a tiny program with FaceMesh's I/O contract
+    /// (`[N,3,256,256]` → `[N,1,1,1434]`).
+    pub fn write_facemesh(dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Msg(e.to_string()))?;
+        let program = r#"{"inputs":["x"],"outputs":["y"],"nodes":[
+            {"op":"maxpool2d","out":"p","inputs":["x"],"kernel":[32,32],"stride":[32,32],"padding":[0,0]},
+            {"op":"conv2d","out":"h","inputs":["p"],"weight":"head.weight","bias":"head.bias",
+             "stride":[1,1],"padding":[0,0],"dilation":[1,1],"groups":1},
+            {"op":"reshape","out":"y","inputs":["h"],"shape":[-1,1,1,1434]}]}"#;
+        let meta = HashMap::from([
+            ("format".to_string(), crate::program::FORMAT.to_string()),
+            ("program".to_string(), program.to_string()),
+        ]);
+        let params = vec![
+            (
+                "head.weight".to_string(),
+                synth::tensor(0x24831B, "head.weight", &[1434, 3, 8, 8]),
+            ),
+            (
+                "head.bias".to_string(),
+                synth::tensor(0x24831B, "head.bias", &[1434]),
+            ),
+        ];
+        save(params, Some(&meta), &dir.join(FACEMESH_FILE))
+    }
 }
 
 #[cfg(test)]

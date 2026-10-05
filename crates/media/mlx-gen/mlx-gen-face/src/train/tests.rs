@@ -469,24 +469,62 @@ fn arcface_depth_is_read_from_the_keys_and_its_size_is_counted() {
     assert!((43_400_000..43_800_000).contains(&r50), "{r50}");
 }
 
-/// E7: off ⇒ no footprint; the shared detector is counted once whichever losses are on, and each
-/// enabled loss adds its model. Mutation: push the detector per loss ⇒ 4 entries ⇒ red.
+/// E7: each face loss carries its detector plus its own model — glintr100 ArcFace (≈ 261 MB f32)
+/// for identity, FaceMesh for landmarks — and a per-image reference. Mutations: drop the detector
+/// from `identity_loss_footprint` ⇒ the param floor goes red; drop the ArcFace term ⇒ red.
 #[test]
-fn face_loss_footprints_count_each_model_once() {
-    assert!(face_loss_footprints(None, false).is_empty());
-    let both = face_loss_footprints(Some(crate::iresnet::IRESNET100_LAYERS), true);
-    assert_eq!(both.len(), 3);
-    assert_eq!(both[0].param_bytes, SCRFD_10G_PARAMS * 4);
-    assert!(both[1].param_bytes > 250_000_000 && both[1].working_set_bytes > 0);
-    assert_eq!(face_loss_footprints(None, true).len(), 2);
-    let total: u64 = mlx_gen::train::perceptual::perceptual_footprint_bytes(None, &both, 10);
-    let sum: u64 = both
+fn face_loss_footprints_count_detector_and_model() {
+    let det = SCRFD_10G_PARAMS * 4;
+    let id = identity_loss_footprint(crate::iresnet::IRESNET100_LAYERS);
+    assert_eq!(
+        id.param_bytes,
+        det + arcface_param_count(crate::iresnet::IRESNET100_LAYERS) * 4
+    );
+    assert!(id.param_bytes > 270_000_000 && id.working_set_bytes > 0);
+    assert!(id.reference_bytes_per_image >= 512 * 4);
+    let lm = face_landmark_loss_footprint();
+    assert_eq!(lm.param_bytes, det + FACEMESH_V2_PARAMS * 4);
+    assert!(lm.reference_bytes_per_image >= (FACEMESH_LANDMARKS * 2 * 4) as u64);
+    let _: AuxModelFootprint = lm;
+}
+
+/// The on-disk test stand-ins load through the real loaders, and the tiny ArcFace they write is the
+/// fixture's architecture (kept in lockstep with the producer). The FaceMesh stand-in honours the
+/// real I/O contract (478 landmarks).
+#[test]
+fn testing_checkpoints_load_through_the_real_loaders() {
+    let (f, _cpu) = fixture();
+    let want: std::collections::BTreeMap<String, Vec<usize>> = f["arcface"]["keys"]
+        .as_object()
+        .unwrap()
         .iter()
-        .map(|f: &AuxModelFootprint| {
-            f.param_bytes + f.working_set_bytes + 10 * f.reference_bytes_per_image
+        .map(|(k, s)| {
+            (
+                k.clone(),
+                s.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| d.as_u64().unwrap() as usize)
+                    .collect(),
+            )
         })
-        .sum();
-    assert_eq!(total, sum);
+        .collect();
+    let got: std::collections::BTreeMap<String, Vec<usize>> =
+        testing::tiny_arcface_shapes().into_iter().collect();
+    assert_eq!(got, want);
+    let dir = tempfile::tempdir().unwrap();
+    let tmp = dir.path().to_path_buf();
+    testing::write_face_stack(&tmp).unwrap();
+    testing::write_facemesh(&tmp).unwrap();
+    let cfg = IdentityLossConfig::default();
+    let id = load_identity_loss(&tmp, &cfg).unwrap();
+    assert_eq!(id.arcface.layers(), [1, 2, 1, 1]);
+    let lm = load_face_landmark_loss(&tmp, &tmp).unwrap();
+    let (live, _) = images(&f);
+    let out = lm
+        .landmarks(&live, face_crop_box(bbox(&f), 72, 88))
+        .unwrap();
+    assert_eq!(out.shape(), &[478, 2]);
 }
 
 /// The executor refuses an op the converter never emits, naming it.

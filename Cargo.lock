@@ -2441,6 +2441,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2634,6 +2635,7 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen",
  "mlx-gen-depth",
+ "mlx-gen-face",
  "pmetal-mlx-rs",
  "tempfile",
 ]
