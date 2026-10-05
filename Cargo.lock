@@ -968,6 +968,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-nn",
  "candle-transformers",
  "image",
