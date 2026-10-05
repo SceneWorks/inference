@@ -1145,27 +1145,14 @@ fn validate_body_losses(desc: &TrainerDescriptor, req: &TrainingRequest) -> crat
         return missing("the family's small x0 decoder (perceptual_decoder_dir is unset)");
     }
     if body.normal.is_enabled() && body.normal_restrict_to_subject {
-        let lacking: Vec<String> = req
-            .items
-            .iter()
-            .filter(|i| i.subject_mask_path.is_none())
-            .map(|i| {
-                i.image_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| i.image_path.display().to_string())
-            })
-            .collect();
-        if !lacking.is_empty() {
-            return Err(crate::Error::Msg(format!(
-                "{}: the normal loss restricted to the subject needs a subject mask for every \
-                 dataset image; {} of {} have none: {}",
-                desc.id,
-                lacking.len(),
-                req.items.len(),
-                subject_mask::name_list(&lacking)
-            )));
-        }
+        // The loss and the perceptual path take a per-image subject mask
+        // (`ensure_reference_with_mask`), but no trainer's reference preparation feeds one yet, so
+        // a restricted request would fail after the models load. Refuse it up front, typed.
+        return Err(crate::Error::Unsupported(format!(
+            "{}: the normal loss restricted to the subject (body_losses.normal_restrict_to_subject) \
+             is not supported yet — no trainer hands its subject masks to the perceptual path",
+            desc.id
+        )));
     }
     Ok(())
 }
@@ -1888,16 +1875,19 @@ mod tests {
         let mut normal = off.clone();
         normal.config.body_losses.normal.weight = 0.1;
         full(&mut normal);
-        normal.config.body_losses.normal_restrict_to_subject = true;
         let mut d = trainer_desc(false);
         d.techniques.normal_loss = true;
-        let err = validate_training_techniques(&d, &normal).unwrap_err();
+        assert!(validate_training_techniques(&d, &normal).is_ok());
+        // Subject-restricted normals: refused typed (no trainer feeds masks to the path yet), even
+        // with every item masked. Mutation: drop the refusal ⇒ the masked request passes ⇒ red.
+        let mut restricted = normal.clone();
+        restricted.config.body_losses.normal_restrict_to_subject = true;
+        restricted.items[0].subject_mask_path = Some(PathBuf::from("a.mask.png"));
+        let err = validate_training_techniques(&d, &restricted).unwrap_err();
         assert!(
-            matches!(err, crate::Error::Msg(ref m) if m.contains("subject mask")),
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("normal_restrict_to_subject")),
             "{err:?}"
         );
-        normal.items[0].subject_mask_path = Some(PathBuf::from("a.mask.png"));
-        assert!(validate_training_techniques(&d, &normal).is_ok());
         normal.config.body_losses.normal_model_dir = None;
         let err = validate_training_techniques(&d, &normal).unwrap_err();
         assert!(

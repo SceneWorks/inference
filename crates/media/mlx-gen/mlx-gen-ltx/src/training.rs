@@ -2144,7 +2144,10 @@ fn refuse_ltx25_subject_mask(id: &str, req: &TrainingRequest) -> gen_core::Resul
 /// — ahead of the generic technique floor, so the caller sees why. Also validates the
 /// [`DEPTH_ANCHORING_FRAMES_KEY`] knob.
 fn refuse_ltx25_depth_anchoring(id: &str, req: &TrainingRequest) -> gen_core::Result<()> {
-    if id != MODEL_25_ID || !req.config.depth_anchoring.schedule.is_enabled() {
+    // sc-24832: the body losses decode the same generated video stream.
+    let decodes =
+        req.config.depth_anchoring.schedule.is_enabled() || req.config.body_losses.any_enabled();
+    if id != MODEL_25_ID || !decodes {
         return Ok(());
     }
     depth_anchoring_frames(&req.config)?;
@@ -7142,6 +7145,16 @@ mod ltx25_depth_anchoring_tests {
             // Depth off: never refused.
             req.config.depth_anchoring.schedule = AuxLossSchedule::OFF;
             assert!(refuse_ltx25_depth_anchoring(MODEL_25_ID, &req).is_ok());
+            // sc-24832: a body loss decodes the same video stream, so it is refused alike.
+            // Mutation: check only depth in `refuse_ltx25_depth_anchoring` ⇒ red.
+            req.config.body_losses.normal = schedule();
+            assert_eq!(
+                refuse_ltx25_depth_anchoring(MODEL_25_ID, &req).is_err(),
+                refused.contains(&workflow.id()),
+                "{} (body loss)",
+                workflow.id()
+            );
+            req.config.body_losses.normal = AuxLossSchedule::OFF;
         }
         let mut req = super::validate_request_tests::request(1);
         req.config
