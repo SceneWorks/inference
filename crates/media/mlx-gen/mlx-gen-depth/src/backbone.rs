@@ -19,6 +19,7 @@
 //! the preprocessor never produces).
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
+use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply};
 use mlx_rs::Array;
 
@@ -154,7 +155,30 @@ impl Dinov2Backbone {
         &self.cfg
     }
 
-    /// `pixel_values`: NHWC `[B, H, W, 3]` (H=W=image_size, ImageNet-normalized) → the four
+    /// The absolute position embedding for a `gh × gw` patch grid: the shipped table as-is at the
+    /// native square grid, otherwise its patch part resampled to `gh × gw` (DINOv2's
+    /// `interpolate_pos_encoding`, here bilinear with half-pixel centers rather than bicubic — the
+    /// depth-anchoring loss compares two maps produced by this same path, so the choice only has to
+    /// be consistent) with the CLS slot carried over.
+    fn position_embedding(&self, gh: i32, gw: i32) -> Result<Array> {
+        let g = self.cfg.grid();
+        if gh == g && gw == g {
+            return Ok(self.pos_embed.clone());
+        }
+        let embed = self.cfg.hidden_size;
+        let cls = self.pos_embed.index((.., ..1, ..));
+        let patches = self
+            .pos_embed
+            .index((.., 1.., ..))
+            .reshape(&[1, g, g, embed])?;
+        let resized = crate::util::bilinear_resize(&patches, gh, gw, false)?;
+        Ok(concatenate_axis(
+            &[&cls, &resized.reshape(&[1, gh * gw, embed])?],
+            1,
+        )?)
+    }
+
+    /// `pixel_values`: NHWC `[B, H, W, 3]` (multiples of the patch size, ImageNet-normalized) → the four
     /// captured hidden states (outputs of the `out_indices` layers), each `[B, grid²+1, hidden]`
     /// **including** the CLS token. The final `layernorm` is applied to the captured states (the
     /// DPT reassemble stage in `transformers` consumes the normalized hidden states for DA-V2).
@@ -171,13 +195,13 @@ impl Dinov2Backbone {
             self.cfg.patch_size,
             0,
         )?;
-        let g = y.shape()[1];
-        let mut x = y.reshape(&[b, g * g, embed])?;
+        let (gh, gw) = (y.shape()[1], y.shape()[2]);
+        let mut x = y.reshape(&[b, gh * gw, embed])?;
 
-        // Prepend CLS, add absolute position embedding.
+        // Prepend CLS, add absolute position embedding (resampled to a non-native grid).
         let cls = broadcast_to(&self.cls_token, &[b, 1, embed])?;
         x = concatenate_axis(&[&cls, &x], 1)?;
-        x = add(&x, &self.pos_embed)?;
+        x = add(&x, &self.position_embedding(gh, gw)?)?;
 
         let capture = self.cfg.capture_layers();
         let mut out = Vec::with_capacity(4);

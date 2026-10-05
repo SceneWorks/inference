@@ -8,6 +8,8 @@ pub mod dataset;
 pub mod lora;
 pub mod loss;
 pub mod optim;
+pub mod perceptual;
+pub mod tae;
 
 /// The pure LR-schedule policy (`LrSchedule`, `lr_multiplier`, `schedule_updates`) moved to
 /// gen-core; re-exported here so `mlx_gen::train::schedule::…` keeps resolving for the family

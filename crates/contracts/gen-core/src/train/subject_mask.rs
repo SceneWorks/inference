@@ -221,40 +221,89 @@ pub fn subject_mask_latent_weights(
     grid_w: usize,
     grid_h: usize,
 ) -> crate::Result<Vec<f32>> {
-    let name = display_name(&item.image_path);
-    let mask_path = item.subject_mask_path.as_deref().ok_or_else(|| {
-        crate::Error::Msg(format!(
-            "{label}: subject-masked loss is on but image {name} has no subject mask"
-        ))
-    })?;
-    let (iw, ih) = image::image_dimensions(&item.image_path).map_err(|e| {
-        crate::Error::Msg(format!(
-            "{label}: read image size of {}: {e}",
-            item.image_path.display()
-        ))
-    })?;
-    let mask = SubjectMask::load(mask_path)?;
-    if (mask.width, mask.height) != (iw, ih) {
-        return Err(crate::Error::Msg(format!(
-            "{label}: subject mask for image {name} is {}x{} but the image is {iw}x{ih}; \
-             regenerate the dataset's subject masks",
-            mask.width, mask.height
-        )));
+    PreparedSubjectMask::load(label, item, cfg)?.latent_weights(label, crop_of, grid_w, grid_h)
+}
+
+/// One item's subject mask, decoded and checked **once** (sc-24828) so a trainer that caches the
+/// item at several resolution buckets (sc-2127) resamples it per bucket without re-reading the
+/// file: [`load`](Self::load) refuses a missing, mis-sized or empty mask;
+/// [`latent_weights`](Self::latent_weights) crops it with the bucket's crop box and area-averages
+/// it onto that bucket's latent grid.
+#[derive(Clone, Debug)]
+pub struct PreparedSubjectMask {
+    name: String,
+    image_dims: (u32, u32),
+    mask: SubjectMask,
+    cfg: SubjectMaskLoss,
+}
+
+impl PreparedSubjectMask {
+    /// Decode and check `item`'s mask against its image (see [`subject_mask_latent_weights`]).
+    pub fn load(label: &str, item: &TrainingItem, cfg: &SubjectMaskLoss) -> crate::Result<Self> {
+        let name = display_name(&item.image_path);
+        let mask_path = item.subject_mask_path.as_deref().ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "{label}: subject-masked loss is on but image {name} has no subject mask"
+            ))
+        })?;
+        let (iw, ih) = image::image_dimensions(&item.image_path).map_err(|e| {
+            crate::Error::Msg(format!(
+                "{label}: read image size of {}: {e}",
+                item.image_path.display()
+            ))
+        })?;
+        let mask = SubjectMask::load(mask_path)?;
+        if (mask.width, mask.height) != (iw, ih) {
+            return Err(crate::Error::Msg(format!(
+                "{label}: subject mask for image {name} is {}x{} but the image is {iw}x{ih}; \
+                 regenerate the dataset's subject masks",
+                mask.width, mask.height
+            )));
+        }
+        if mask.is_empty() {
+            return Err(crate::Error::Msg(format!(
+                "{label}: subject mask for image {name} is empty (no subject was found); fix or \
+                 replace the mask, or remove the image"
+            )));
+        }
+        Ok(Self {
+            name,
+            image_dims: (iw, ih),
+            mask,
+            cfg: *cfg,
+        })
     }
-    if mask.is_empty() {
-        return Err(crate::Error::Msg(format!(
-            "{label}: subject mask for image {name} is empty (no subject was found); fix or \
-             replace the mask, or remove the image"
-        )));
+
+    /// `None` when masked loss is off (`cfg` is `None`; no file is read), else [`load`](Self::load).
+    pub fn load_if_enabled(
+        label: &str,
+        item: &TrainingItem,
+        cfg: Option<&SubjectMaskLoss>,
+    ) -> crate::Result<Option<Self>> {
+        cfg.map(|cfg| Self::load(label, item, cfg)).transpose()
     }
-    let m = mask.area_resample(crop_of(iw, ih), grid_w, grid_h);
-    if cfg.background_weight == 0.0 && m.iter().all(|&v| v == 0.0) {
-        return Err(crate::Error::Msg(format!(
-            "{label}: the subject in image {name}'s mask lies entirely outside the training crop, \
-             so with background_weight 0 the image would contribute no loss"
-        )));
+
+    /// The row-major `[grid_h, grid_w]` loss-weight map for one cached latent: the mask cropped
+    /// with `crop_of(image_w, image_h)`, area-averaged onto the latent grid, mapped through the
+    /// weights. Refuses (when `background_weight == 0`) a crop the subject lies entirely outside.
+    pub fn latent_weights(
+        &self,
+        label: &str,
+        crop_of: impl FnOnce(u32, u32) -> CropBox,
+        grid_w: usize,
+        grid_h: usize,
+    ) -> crate::Result<Vec<f32>> {
+        let (iw, ih) = self.image_dims;
+        let m = self.mask.area_resample(crop_of(iw, ih), grid_w, grid_h);
+        if self.cfg.background_weight == 0.0 && m.iter().all(|&v| v == 0.0) {
+            return Err(crate::Error::Msg(format!(
+                "{label}: the subject in image {}'s mask lies entirely outside the training crop, \
+                 so with background_weight 0 the image would contribute no loss",
+                self.name
+            )));
+        }
+        Ok(m.into_iter().map(|v| self.cfg.weight(v)).collect())
     }
-    Ok(m.into_iter().map(|v| cfg.weight(v)).collect())
 }
 
 #[cfg(test)]

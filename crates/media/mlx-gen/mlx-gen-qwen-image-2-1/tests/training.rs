@@ -123,6 +123,95 @@ fn trainer_conformance_on_the_tiny_snapshot() {
     trainer_conformance(trainer, &TrainerProfile::cheap(items, out));
 }
 
+/// sc-2127: multi-resolution buckets train end to end — a captioned dataset and an edit-pair
+/// dataset alike. Every step's cached entry (target latent, joint layout, text rows) agrees on its
+/// bucket's grid, so the 32 px and the 64 px bucket both reach the DiT; caching still reports ONE
+/// `Caching` event per item; and the extra bucket changes the trained factors versus the
+/// single-bucket run at the smaller edge.
+///
+/// *Mutations that red this:* `item_branches` building every layout at the first edge (a 64 px
+/// latent then meets a 32 px layout and the step errors); the run caching/scheduling only the
+/// first edge (the adapter equals the single-bucket run's).
+#[test]
+fn a_bucketed_run_trains_every_bucket_for_captioned_and_edit_datasets() {
+    use mlx_gen::gen_core::ResolutionBucket;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (ref_a, _) = reference(dir, "ref_a.png", 64, 64, 11);
+    let edit_items = vec![
+        TrainingItem::edit_pair(
+            write_image(dir, "target_1.png", 0),
+            "swap the colours".into(),
+            vec![ref_a.clone()],
+        ),
+        TrainingItem::edit_pair(
+            write_image(dir, "target_2.png", 40),
+            "darken it".into(),
+            vec![ref_a],
+        ),
+    ];
+    let buckets = vec![
+        ResolutionBucket {
+            resolution: 32,
+            repeats: 2,
+        },
+        ResolutionBucket {
+            resolution: 64,
+            repeats: 1,
+        },
+    ];
+    for (label, items) in [("captioned", dataset(dir)), ("edit", edit_items)] {
+        let bucketed_cfg = TrainingConfig {
+            resolution: 32,
+            resolution_buckets: buckets.clone(),
+            ..config(6)
+        };
+        let out = dir.join(format!("{label}_bucketed"));
+        let req = request(items.clone(), bucketed_cfg.clone(), &out);
+        let mut t = trainer();
+        t.validate(&req).expect("buckets validate on this trainer");
+        let mut caching = Vec::new();
+        let output = t
+            .train(&req, &mut |p| {
+                if let TrainingProgress::Caching { current, total } = p {
+                    caching.push((current, total));
+                }
+            })
+            .unwrap_or_else(|e| panic!("{label}: bucketed training failed: {e}"));
+        assert_eq!(output.steps, 6, "{label}");
+        assert_eq!(
+            caching,
+            [(1, 2), (2, 2)],
+            "{label}: one Caching event per item"
+        );
+
+        let single_out = dir.join(format!("{label}_single"));
+        let single_req = request(
+            items,
+            TrainingConfig {
+                resolution_buckets: Vec::new(),
+                ..bucketed_cfg
+            },
+            &single_out,
+        );
+        let (_, single) = run(trainer().as_mut(), &single_req, |_| {});
+        let single = single.unwrap();
+        let a = Array::load_safetensors(output.adapter_path.as_path()).unwrap();
+        let b = Array::load_safetensors(single.adapter_path.as_path()).unwrap();
+        assert_eq!(a.len(), b.len());
+        // Two identical Metal runs can differ by reduction-order noise (~1e-8 here), so "changed"
+        // means well above that.
+        let moved = a
+            .iter()
+            .fold(0f32, |m, (key, got)| m.max(errors(got, &b[key]).0));
+        eprintln!("[sc-2127] {label}: bucketed vs single adapter Δ max {moved:.3e}");
+        assert!(
+            moved > 1e-5,
+            "{label}: the 64 px bucket must change the trained factors (Δ {moved:.3e})"
+        );
+    }
+}
+
 /// The velocity of `dit` on a fixed 4×4 latent grid conditioned on 5 fixed text rows.
 fn velocity(dit: &QwenImage21Transformer) -> Array {
     let c = dit.config();

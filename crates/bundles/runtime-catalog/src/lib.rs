@@ -690,6 +690,13 @@ pub struct TrainerCapabilitySnapshot {
     pub max_reference_images: u32,
     /// Honors `TrainingConfig::weight_noise_sigma` (epic 2123 weight noising, sc-24826).
     pub supports_weight_noise: bool,
+    /// Honors `TrainingConfig::depth_anchoring` (epic 2123 depth anchoring, sc-2125).
+    pub supports_depth_anchoring: bool,
+    /// Honors `TrainingConfig::gradient_noise_eta` / `gradient_noise_gamma` (epic 2123 annealed
+    /// gradient noise, sc-24827).
+    pub supports_gradient_noise: bool,
+    /// Honors `TrainingConfig::resolution_buckets` (epic 2123 multi-resolution buckets, sc-2127).
+    pub supports_resolution_buckets: bool,
     /// Honors `TrainingConfig::subject_mask_loss` (epic 2123 subject-masked loss, sc-24828).
     pub supports_subject_mask_loss: bool,
 }
@@ -707,6 +714,9 @@ impl TrainerCapabilitySnapshot {
             supports_full_finetune: descriptor.supports_full_finetune,
             max_reference_images: descriptor.max_reference_images,
             supports_weight_noise: descriptor.techniques.weight_noise,
+            supports_depth_anchoring: descriptor.techniques.depth_anchoring,
+            supports_gradient_noise: descriptor.techniques.gradient_noise,
+            supports_resolution_buckets: descriptor.techniques.resolution_buckets,
             supports_subject_mask_loss: descriptor.techniques.subject_mask_loss,
         }
     }
@@ -723,6 +733,9 @@ impl TrainerCapabilitySnapshot {
             "supports_full_finetune": self.supports_full_finetune,
             "max_reference_images": self.max_reference_images,
             "supports_weight_noise": self.supports_weight_noise,
+            "supports_depth_anchoring": self.supports_depth_anchoring,
+            "supports_gradient_noise": self.supports_gradient_noise,
+            "supports_resolution_buckets": self.supports_resolution_buckets,
             "supports_subject_mask_loss": self.supports_subject_mask_loss,
         })
     }
@@ -1008,6 +1021,27 @@ mod tests {
         noisy.techniques.weight_noise = true;
         let noisy_json = TrainerCapabilitySnapshot::from_descriptor(&noisy).to_json();
         assert_eq!(noisy_json["supports_weight_noise"], true);
+        assert_eq!(noisy_json["supports_depth_anchoring"], false);
+
+        // sc-2125: depth anchoring is advertised from its own flag.
+        assert_eq!(json["supports_depth_anchoring"], false);
+        let mut depth = descriptor;
+        depth.techniques.depth_anchoring = true;
+        let depth_json = TrainerCapabilitySnapshot::from_descriptor(&depth).to_json();
+        assert_eq!(depth_json["supports_depth_anchoring"], true);
+        assert_eq!(depth_json["supports_weight_noise"], false);
+        // sc-24827: gradient noise is advertised independently of weight noise.
+        assert_eq!(json["supports_gradient_noise"], false);
+        assert_eq!(noisy_json["supports_gradient_noise"], false);
+        let mut grad = noisy;
+        grad.techniques.gradient_noise = true;
+        let grad_json = TrainerCapabilitySnapshot::from_descriptor(&grad).to_json();
+        assert_eq!(grad_json["supports_gradient_noise"], true);
+        assert_eq!(json["supports_resolution_buckets"], false);
+        let mut bucketed = descriptor;
+        bucketed.techniques.resolution_buckets = true;
+        let bucketed_json = TrainerCapabilitySnapshot::from_descriptor(&bucketed).to_json();
+        assert_eq!(bucketed_json["supports_resolution_buckets"], true);
         // sc-24828: subject-masked loss support is advertised the same way.
         assert_eq!(json["supports_subject_mask_loss"], false);
         let mut masked = descriptor;

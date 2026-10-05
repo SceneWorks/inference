@@ -59,17 +59,17 @@
 use std::path::Path;
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core;
+use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
-    TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, LoraParams, TrainAdapter,
 };
-use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
-use mlx_gen::train::subject_mask::CropBox;
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Error, LoadSpec, Modality, NetworkType, Precision, Quant, Result, TrainOptimizer, Trainer,
@@ -79,7 +79,6 @@ use mlx_gen::{
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{add, multiply, ones, split_sections, subtract};
-use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -168,11 +167,18 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): honors `resolution_buckets` — one cached latent (+ its own latent
+        // grid) per item per bucket edge, walked through a `BucketSchedule`; the pre-flight guard
+        // and the preview render size for the largest edge.
         // sc-24828 (epic 2123): honors `subject_mask_loss` on its one (LoRA/LoKr, dense or
-        // block-checkpointed) loss path; the weight is packed exactly like the latent.
+        // block-checkpointed) loss path; each (item, bucket) entry's weight is packed exactly like
+        // that entry's latent.
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -370,10 +376,11 @@ impl LensTrainer {
         let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
 
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
-        // Lens latent grid: a cell maps to a 16×16 pixel tile (Flux.2 8× VAE ∘ 2× DiT patchify). The
-        // ÷32 bucket guarantees the VAE-encoded `edge/8` is even, so the 2×2 patchify divides cleanly.
-        let latent = (edge / VAE_SCALE_FACTOR) as usize; // latent_h == latent_w (square)
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). The pre-flight guard and the preview render use the largest (epic 2123 E7); each
+        // cached latent carries its OWN grid (see `latent_grid`) for the DiT's img ids.
+        let edges = bucket_edges(cfg);
+        let edge = preflight_edge(&edges);
 
         // sc-5170 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
         // materializes the whole forward graph in one MLX `eval`; at high resolution that working set
@@ -392,11 +399,8 @@ impl LensTrainer {
         // --- prepare → load → cache: VAE-latents + 4-layer caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        // Per item: packed clean latent, caption features, caption mask, and (subject-masked loss,
-        // sc-24828) the packed latent loss-weight map — `None` when the technique is off.
-        #[allow(clippy::type_complexity)]
-        let mut cache: Vec<(Array, Vec<Array>, Array, Option<Array>)> =
-            Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). See [`CacheEntry`].
+        let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -406,8 +410,12 @@ impl LensTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
-            let x0 = encode_latents(&self.vae, &img, edge)?; // [1, seq, 128]
-            let mask_weight = latent_subject_mask_weight(item, cfg, &x0)?;
+            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
+            let subject_mask = PreparedSubjectMask::load_if_enabled(
+                "lens trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
             let encoder = self.encoder.as_ref().ok_or_else(|| {
                 Error::Msg(
                     "lens trainer: text encoder already freed (caching after train loop)".into(),
@@ -415,12 +423,26 @@ impl LensTrainer {
             })?;
             let (features, mask) =
                 encode_caption(&self.tokenizer, encoder, &item.caption, compute_dtype)?;
-            let mut to_eval: Vec<&Array> = Vec::with_capacity(features.len() + 2);
-            to_eval.push(&x0);
+            let mut to_eval: Vec<&Array> = Vec::with_capacity(features.len() + 1);
             to_eval.push(&mask);
             to_eval.extend(features.iter());
             eval(to_eval)?;
-            cache.push((x0, features, mask, mask_weight));
+            // The caption features + mask are resolution-independent: encode them once, then one
+            // latent per bucket edge, each tagged with its own grid side and (sc-24828) paired with
+            // its own packed subject-mask weight.
+            for (&edge, (x0, mask_weight)) in edges.iter().zip(encode_buckets(
+                &edges,
+                subject_mask.as_ref(),
+                |edge| encode_latents(&self.vae, &img, edge), // [1, seq, 128]
+            )?) {
+                cache.push((
+                    x0,
+                    features.clone(),
+                    mask.clone(),
+                    latent_grid(edge),
+                    mask_weight,
+                ));
+            }
         }
         if cache.is_empty() {
             // A cancel mid-cache is a genuine cancellation → typed `Error::Canceled`; an empty cache
@@ -569,6 +591,10 @@ impl LensTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items for
+        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -576,7 +602,8 @@ impl LensTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, features, mask, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, features, mask, latent, mask_weight) =
+                &cache[schedule.cache_index((step - 1) as usize)];
             let t = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -605,7 +632,7 @@ impl LensTrainer {
                 mask_weight.as_ref(),
                 compute_dtype,
                 lora_dtype,
-                latent,
+                *latent,
                 checkpoint_blocks,
             )?;
             last_loss = loss;
@@ -630,13 +657,8 @@ impl LensTrainer {
                         .expect("an update fires only after accumulation"),
                     window,
                 )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
             }
 
@@ -774,6 +796,22 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
 const PREFLIGHT_F32: (f64, f64, f64) = (15.43, 6.618e-3, 1.308e-7);
 const PREFLIGHT_BF16: (f64, f64, f64) = (7.875, 3.266e-3, 7.666e-8);
 
+/// The edge the pre-flight guard (and the preview render) sizes for: the LARGEST bucket edge (epic
+/// 2123 E7) — the dense first step's working set is set by the biggest latent the run will ever train
+/// on, whichever bucket the schedule happens to draw first.
+fn preflight_edge(edges: &[u32]) -> u32 {
+    edges.iter().copied().max().unwrap_or(0)
+}
+
+/// The Lens latent grid side for a training `edge`: a cell maps to a 16×16 pixel tile (Flux.2 8× VAE ∘
+/// 2× DiT patchify), so an `edge`-square image packs to `[1, grid², 128]` and the DiT's img ids span a
+/// `grid × grid` lattice. The ÷32 bucket guarantees the VAE-encoded `edge/8` is even, so the 2×2
+/// patchify divides cleanly. Per bucket (sc-2127): every cached latent carries the grid of the edge
+/// it was encoded at.
+fn latent_grid(edge: u32) -> usize {
+    (edge / VAE_SCALE_FACTOR) as usize // latent_h == latent_w (square)
+}
+
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
 /// SIGKILLed), returning a catchable, actionable error instead. The budget is MLX's own reported
 /// memory limit (≈ the device's recommended working set); the rest is [`check_preflight_budget`].
@@ -866,13 +904,12 @@ fn pack_like_latent(grid: &Array) -> Result<Array> {
     pack_latents(&patchify_latents(grid)?)
 }
 
-/// The subject-mask loss weight (sc-24828) for one item, packed like its training latent `x0`
-/// (`[1, seq, 4·C]`, `seq = (H/2)·(W/2)` on the square bucket): the item's mask is center-cropped
-/// like the image, area-averaged onto the VAE's UNPACKED `[1, C, H, W]` latent grid, then run through
-/// [`pack_like_latent`]. `None` when the technique is off (no file is read).
+/// The subject-mask loss weight (sc-24828) for one cached (item, bucket) latent `x0`, packed like it
+/// (`[1, seq, 4·C]`, `seq = (H/2)·(W/2)` on the square bucket): the item's already-loaded mask is
+/// center-cropped like the image, area-averaged onto THIS bucket's UNPACKED `[1, C, H, W]` latent
+/// grid, then run through [`pack_like_latent`]. `None` when the technique is off.
 fn latent_subject_mask_weight(
-    item: &gen_core::TrainingItem,
-    cfg: &TrainingConfig,
+    mask: Option<&PreparedSubjectMask>,
     x0: &Array,
 ) -> Result<Option<Array>> {
     let sh = x0.shape();
@@ -884,15 +921,9 @@ fn latent_subject_mask_weight(
         )));
     }
     let unpacked = [1, feat / 4, side * 2, side * 2];
-    item_subject_mask_weight(
-        "lens trainer",
-        item,
-        cfg.subject_mask_loss.as_ref(),
-        CropBox::center_square,
-        &unpacked,
-    )?
-    .map(|w| pack_like_latent(&w))
-    .transpose()
+    prepared_subject_mask_weight("lens trainer", mask, CropBox::center_square, &unpacked)?
+        .map(|w| pack_like_latent(&w))
+        .transpose()
 }
 
 /// Encode a caption into its per-layer DiT text features (sliced at [`TXT_OFFSET`]) + the valid mask —
@@ -1045,6 +1076,32 @@ fn compute_loss_grads(
 //   cargo test -p mlx-gen-lens --release --lib first_step -- --ignored --nocapture
 //   cargo test -p mlx-gen-lens --release --lib grads_match -- --ignored --nocapture
 // ===========================================================================================
+/// One `train_impl` cache entry (item-major, `cache[item * n_buckets + bucket]`, sc-2127): packed
+/// clean latent, caption features, caption mask, that latent's grid side, and — subject-masked loss
+/// on (sc-24828) — that bucket's packed latent loss-weight map (`None` when off).
+type CacheEntry = (Array, Vec<Array>, Array, usize, Option<Array>);
+
+/// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
+/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
+/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
+/// and laid out like that latent. Packed like the latent by
+/// [`latent_subject_mask_weight`]. `None` weights when masked loss is off.
+fn encode_buckets(
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    mut encode: impl FnMut(u32) -> Result<Array>,
+) -> Result<Vec<(Array, Option<Array>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(edge)?;
+            let mask_weight = latent_subject_mask_weight(mask, &x0)?;
+            eval([&x0])?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod first_step_repro {
     use super::*;
@@ -1580,6 +1637,62 @@ mod tests {
     use mlx_gen::CancelFlag;
     use std::path::PathBuf;
 
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
+    /// bucket's latent shape, and the background (right half of the center-square crop, with
+    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
+    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
+    /// Packed latent `[1, (g/2)², 4·C]`, C = 2: cell `(y, x)` sits at token
+    /// `(y/2)·(g/2) + x/2`, feature `c·4 + (y%2)·2 + x%2`.
+    #[test]
+    fn subject_mask_weight_is_computed_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (iw, ih) = (48u32, 32u32);
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::new(iw, ih).save(&image_path).unwrap();
+        let mask_path = tmp.path().join("a_mask.png");
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = gen_core::TrainingItem {
+            image_path,
+            caption: "a".into(),
+            subject_mask_path: Some(mask_path),
+            ..Default::default()
+        };
+        let mask_cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask =
+            mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
+        let entries = encode_buckets(&[32, 48], Some(&mask), |edge| {
+            let g = (edge / 8) as i32;
+            Ok(Array::zeros::<f32>(&[1, (g / 2) * (g / 2), 8])?)
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), g) in entries.iter().zip([4usize, 6]) {
+            let w = w.as_ref().expect("mask loss on ⇒ a weight map");
+            assert_eq!(
+                w.shape(),
+                x0.shape(),
+                "weight must match its own bucket's latent"
+            );
+            let dense = mlx_rs::ops::multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = dense.as_slice::<f32>();
+            for y in 0..g {
+                for x in 0..g {
+                    let val = v[((y / 2) * (g / 2) + x / 2) * 8 + (y % 2) * 2 + x % 2];
+                    if x < g / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                    } else {
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                    }
+                }
+            }
+        }
+    }
+
     fn base_config() -> TrainingConfig {
         TrainingConfig {
             rank: 8,
@@ -1832,7 +1945,10 @@ mod tests {
         item.subject_mask_path = Some(path);
         // Packed latent `[1, (4/2)·(4/2), 4·C]` with C = 2 unpacked channels.
         let x0 = Array::zeros::<f32>(&[1, 4, 8]).unwrap();
-        let w = latent_subject_mask_weight(&item, &cfg, &x0)
+        let prepared =
+            PreparedSubjectMask::load_if_enabled("t", &item, cfg.subject_mask_loss.as_ref())
+                .unwrap();
+        let w = latent_subject_mask_weight(prepared.as_ref(), &x0)
             .unwrap()
             .expect("technique on ⇒ a weight");
         assert_eq!(w.shape(), x0.shape());
@@ -1855,9 +1971,65 @@ mod tests {
             }
         }
         // Off ⇒ no weight (and no file read).
-        assert!(latent_subject_mask_weight(&item, &base_config(), &x0)
+        let off = PreparedSubjectMask::load_if_enabled(
+            "t",
+            &item,
+            base_config().subject_mask_loss.as_ref(),
+        )
+        .unwrap();
+        assert!(off.is_none());
+        assert!(latent_subject_mask_weight(off.as_ref(), &x0)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn descriptor_declares_resolution_buckets() {
+        // sc-2127: the shared technique floor only lets `resolution_buckets` through when declared.
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+    }
+
+    #[test]
+    fn preflight_sizes_for_the_largest_bucket_edge() {
+        let rb = |resolution, repeats| gen_core::ResolutionBucket {
+            resolution,
+            repeats,
+        };
+        // Buckets off: the guard edge is the single legacy edge.
+        let mut cfg = TrainingConfig {
+            resolution: 512,
+            ..base_config()
+        };
+        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 512);
+        // Buckets [512, 1024] with `resolution` 512: the guard must size for 1024 (epic 2123 E7).
+        cfg.resolution_buckets = vec![rb(512, 16), rb(1024, 1)];
+        let edges = bucket_edges(&cfg);
+        assert_eq!(edges, vec![512, 1024]);
+        assert_eq!(preflight_edge(&edges), 1024);
+        // A 24 GB-class budget (safe ≈ 20.4 GB): dense bf16 fits 512 (~11.5 GB) but not 1024
+        // (~22.8 GB) — so the bucketed run is refused even though `resolution` alone would pass.
+        assert!(check_preflight_budget(512, true, 24.0).is_ok());
+        assert!(check_preflight_budget(preflight_edge(&edges), true, 24.0).is_err());
+    }
+
+    #[test]
+    fn latent_grid_is_per_bucket_edge() {
+        // sc-2127: each cached latent carries the grid of ITS edge — the DiT's img ids span
+        // `grid × grid`, and `grid²` must equal the packed latent's token count `(edge/16)²`.
+        let rb = |resolution, repeats| gen_core::ResolutionBucket {
+            resolution,
+            repeats,
+        };
+        let cfg = TrainingConfig {
+            resolution_buckets: vec![rb(512, 16), rb(770, 4), rb(1024, 1)],
+            ..base_config()
+        };
+        let grids: Vec<usize> = bucket_edges(&cfg).into_iter().map(latent_grid).collect();
+        assert_eq!(grids, vec![32, 48, 64]);
+        for edge in bucket_edges(&cfg) {
+            let tokens = (edge as usize / 16).pow(2);
+            assert_eq!(latent_grid(edge).pow(2), tokens, "edge {edge}");
+        }
     }
 
     #[test]

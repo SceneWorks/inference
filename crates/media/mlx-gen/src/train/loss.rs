@@ -82,6 +82,32 @@ pub fn item_subject_mask_weight(
     subject_mask_weight(&weights, grid_h, grid_w, latent_shape).map(Some)
 }
 
+/// Per-bucket entry point (sc-24828 × sc-2127): the weight map of one cached latent from an item's
+/// already-loaded [`PreparedSubjectMask`](crate::train::subject_mask::PreparedSubjectMask) — load
+/// it once per item with
+/// [`PreparedSubjectMask::load_if_enabled`](crate::train::subject_mask::PreparedSubjectMask::load_if_enabled),
+/// then call this once per resolution bucket with that bucket's crop rule and clean-latent shape
+/// (last two axes = the latent grid). `None` in, `None` out.
+pub fn prepared_subject_mask_weight(
+    label: &str,
+    mask: Option<&crate::train::subject_mask::PreparedSubjectMask>,
+    crop_of: impl FnOnce(u32, u32) -> crate::train::subject_mask::CropBox,
+    latent_shape: &[i32],
+) -> crate::Result<Option<Array>> {
+    let Some(mask) = mask else {
+        return Ok(None);
+    };
+    let n = latent_shape.len();
+    if n < 2 {
+        return Err(crate::Error::Msg(format!(
+            "{label}: subject mask needs a latent with a spatial grid, got shape {latent_shape:?}"
+        )));
+    }
+    let (grid_h, grid_w) = (latent_shape[n - 2] as usize, latent_shape[n - 1] as usize);
+    let weights = mask.latent_weights(label, crop_of, grid_w, grid_h)?;
+    subject_mask_weight(&weights, grid_h, grid_w, latent_shape).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

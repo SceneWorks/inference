@@ -42,17 +42,18 @@
 use std::path::Path;
 
 use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::gen_core::BucketSchedule;
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint;
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
-    TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, LoraParams, TrainAdapter,
 };
-use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates, LrSchedule};
-use mlx_gen::train::subject_mask::CropBox;
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
+use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     gen_core, CancelFlag, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
@@ -62,7 +63,6 @@ use mlx_gen::{
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
-use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -221,6 +221,9 @@ struct ExpertState {
     accumulated: Option<LoraParams>,
     micro: u32,      // micro-steps routed to this expert so far (drives accumulation)
     update_idx: u32, // optimizer updates applied (drives the LR schedule)
+    /// Epic 2123 (sc-24827): this expert's adapter-noise RNG seed — the same per-expert seed its
+    /// factors were initialised from, so the two experts draw independent weight/gradient noise.
+    noise_seed: u64,
     total_updates: u32,
     warmup_updates: u32,
 }
@@ -253,11 +256,16 @@ fn trainer_descriptor(id: &'static str) -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        // sc-24828 (epic 2123): subject-masked loss on every expert (one cached weight per item,
-        // shared by whichever expert trains on it).
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached still latent per item per
+        // spatial edge (the trainer is single-frame `T = 1`, so buckets touch no frame logic).
+        // sc-24828 (epic 2123): subject-masked loss on every expert (one cached weight per
+        // (item, bucket) latent, shared by whichever expert trains on it).
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -445,7 +453,9 @@ impl WanMoeTrainer {
         // The forward gets a zero `y` of this width appended to the noisy latent (sc-3279).
         let y_channels = self.cfg.in_dim as i32 - self.cfg.vae_z_dim as i32;
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). The memory guard sizes for the largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
 
         // sc-4942 — fail-fast pre-flight memory guard (the sc-4874 mechanism). The dense (non-block-
         // checkpointed) first step materializes the whole forward graph in one MLX `eval`; at high
@@ -455,16 +465,17 @@ impl WanMoeTrainer {
         // checkpointed runs recompute per block, so they are not subject to the dense peak.)
         let will_checkpoint = cfg.gradient_checkpointing && cfg.network_type == NetworkType::Lora;
         if !will_checkpoint {
-            preflight_memory_guard(&self.cfg, edge, n_experts, id)?;
+            preflight_memory_guard(&self.cfg, &edges, n_experts, id)?;
         }
 
         // --- prepare → load → cache: normalized latents + per-expert UMT5 context (then free the TE) ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
-        // Per item: clean latent, per-expert context, and (subject-masked loss, sc-24828) the latent
-        // loss-weight map `[z, 1, h, w]` — `None` when the technique is off.
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Per entry: clean latent,
+        // per-expert context, and (subject-masked loss, sc-24828) that latent's loss-weight map
+        // `[z, 1, h, w]` — `None` when the technique is off.
         let mut cache: Vec<(Array, Vec<Array>, Option<Array>)> =
-            Vec::with_capacity(req.items.len());
+            Vec::with_capacity(req.items.len() * edges.len());
         // sc-5637 — preview-sample prompts, embedded per expert inside the `te`/`tok` scope below
         // (the UMT5 encoder is freed before the train loop).
         let mut sample_ctxs: Vec<(String, Vec<Array>)> = Vec::new();
@@ -485,16 +496,12 @@ impl WanMoeTrainer {
                     total,
                 });
                 let img = center_crop_square(&decode_image(&item.image_path)?);
-                // [z,1,h,w] normalized channels-first (z16 14B / z48 5B — dispatched by the VAE kind).
-                let clean = self.vae.encode_clean(&img, edge)?;
-                // The image went through `center_crop_square` → the mask's crop is the same box; the
-                // weight is the clean latent's `[z, 1, h, w]` (one frame, every channel).
-                let mask_weight = item_subject_mask_weight(
-                    &format!("{id} trainer"),
+                // sc-24828: the item's mask is read and checked once, resampled per bucket below.
+                let label = format!("{id} trainer");
+                let mask = PreparedSubjectMask::load_if_enabled(
+                    &label,
                     item,
                     cfg.subject_mask_loss.as_ref(),
-                    CropBox::center_square,
-                    clean.shape(),
                 )?;
                 let t5_embed = te.encode(tok, &item.caption)?; // [L, text_dim]
                                                                // Each expert has its own text_embedding, so embed the context per expert.
@@ -502,11 +509,18 @@ impl WanMoeTrainer {
                 for e in &self.experts {
                     ctxs.push(e.embed_text(&t5_embed)?); // [1, text_len, dim]
                 }
-                let mut to_eval: Vec<&Array> = vec![&clean];
-                to_eval.extend(ctxs.iter());
-                to_eval.extend(mask_weight.iter());
+                let to_eval: Vec<&Array> = ctxs.iter().collect();
                 eval(to_eval)?;
-                cache.push((clean, ctxs, mask_weight));
+                // [z,1,h,w] normalized channels-first (z16 14B / z48 5B — dispatched by the VAE
+                // kind), one per bucket edge, each with its own subject-mask weight; the per-expert
+                // contexts are shared (refcounted).
+                for (clean, mask_weight) in encode_bucket_latents(
+                    &edges,
+                    |edge| self.vae.encode_clean(&img, edge),
+                    |shape| still_subject_weight(&label, mask.as_ref(), shape),
+                )? {
+                    cache.push((clean, ctxs.clone(), mask_weight));
+                }
             }
             // sc-5637 — pre-encode the preview-sample prompts (per expert) while the UMT5 encoder is
             // still resident. Mirrors the per-item embed above: one ctx per expert per prompt.
@@ -539,9 +553,10 @@ impl WanMoeTrainer {
 
         // sc-5637 — preview-sample geometry: a cached clean latent's exact `[z, 1, h, w]` shape (so the
         // preview's init noise matches the VAE's latent geometry without re-deriving the per-family
-        // spatial stride). Cache is non-empty here (checked above).
+        // spatial stride). Cache is non-empty here (checked above). sc-2127: previews render at the
+        // largest bucket edge — item 0's entry for that bucket.
         let sampling_enabled = !sample_ctxs.is_empty();
-        let sample_latent_shape: Vec<i32> = cache[0].0.shape().to_vec();
+        let sample_latent_shape: Vec<i32> = cache[largest_bucket(&edges)].0.shape().to_vec();
 
         // --- per-expert adapter targets + factors + optimizer + schedule ---
         let suffixes: Vec<String> = if cfg.lora_target_modules.is_empty() {
@@ -618,6 +633,7 @@ impl WanMoeTrainer {
                 accumulated: None,
                 micro: 0,
                 update_idx: 0,
+                noise_seed: seed,
                 total_updates,
                 warmup_updates,
             });
@@ -660,6 +676,10 @@ impl WanMoeTrainer {
         }
 
         // --- train loop: alternate experts (high on odd steps, low on even — the reference's step%2) ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (the pre-bucket expert-
+        // decoupled round-robin for a single bucket; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
         for step in start_step + 1..=cfg.steps {
@@ -671,7 +691,7 @@ impl WanMoeTrainer {
             // F-016 / F-082: the item index is DECOUPLED from expert parity so both experts sweep the
             // full dataset (an even-sized set would otherwise parity-lock each expert to a disjoint
             // half for the whole run). See `expert_item_index`.
-            let (clean, ctxs, mask_weight) = &cache[expert_item_index(step, dual, cache.len())];
+            let (clean, ctxs, mask_weight) = &cache[expert_item_index(step, dual, &schedule)];
             let ctx = &ctxs[ei];
             let band = states[ei].band;
             let t = sample_band_timestep(
@@ -720,7 +740,7 @@ impl WanMoeTrainer {
                 // flush is usually a partial window (cfg.steps % accum != 0); dividing by `accum`
                 // down-scaled that update (halved effective LR on the tail). Mirrors the z-image/lens
                 // F-069 fix. (z-image/lens port of sc-9097's shared floor.)
-                flush_expert_update(st, cfg.lr_scheduler, accum_window(st.micro, accum))?;
+                flush_expert_update(st, cfg, accum_window(st.micro, accum))?;
             }
 
             on_progress(TrainingProgress::Training {
@@ -817,7 +837,7 @@ impl WanMoeTrainer {
         // (the run only saves below when `steps_run > 0`).
         for st in &mut states {
             if st.accumulated.is_some() {
-                flush_expert_update(st, cfg.lr_scheduler, accum_window(st.micro, accum))?;
+                flush_expert_update(st, cfg, accum_window(st.micro, accum))?;
             }
         }
 
@@ -882,22 +902,39 @@ fn expert_index(step: u32, dual: bool) -> usize {
     }
 }
 
-/// Which dataset item `step` consumes, **decoupled from expert parity** (F-016 / F-082 lockstep with
-/// candle-gen's `expert_item_index`). The item index advances by one per `n_experts` steps, so each
-/// expert independently sweeps the FULL dataset (`0,1,2,… mod len`). The old parity-locked
-/// `(step-1) % len` gave each expert a disjoint half of any even-sized set for the whole run. Pure;
-/// pinned by the `experts_each_cover_the_whole_dataset` / `even_dataset_expert_is_not_parity_locked`
+/// Which cache entry `step` consumes, **decoupled from expert parity** (F-016 / F-082 lockstep with
+/// candle-gen's `expert_item_index`). The sample counter advances by one per `n_experts` steps, so each
+/// expert independently sweeps the FULL dataset; with a single resolution bucket the entry is
+/// `((step-1)/n_experts) % len` (`0,1,2,… mod len`). The old parity-locked `(step-1) % len` gave each
+/// expert a disjoint half of any even-sized set for the whole run. sc-2127: the counter is fed to the
+/// [`BucketSchedule`], so with several buckets every expert walks the same seeded `(item, bucket)`
+/// mix. Pure; pinned by the `experts_each_cover_the_whole_dataset` /
+/// `even_dataset_expert_is_not_parity_locked` / `one_bucket_schedule_keeps_the_pre_bucket_order`
 /// tests.
-fn expert_item_index(step: u32, dual: bool, len: usize) -> usize {
+fn expert_item_index(step: u32, dual: bool, schedule: &BucketSchedule) -> usize {
     let n_experts: usize = if dual { 2 } else { 1 };
-    (((step - 1) as usize) / n_experts) % len
+    schedule.cache_index(((step - 1) as usize) / n_experts)
+}
+
+/// The bucket index of the largest edge in `edges` (the first on a tie; `0` for an empty list) —
+/// the bucket training previews render at (sc-2127).
+fn largest_bucket(edges: &[u32]) -> usize {
+    edges
+        .iter()
+        .enumerate()
+        .fold(0, |best, (i, &e)| if e > edges[best] { i } else { best })
 }
 
 /// One optimizer update from `st`'s pending grad accumulator, averaged by `window` (the actual
 /// in-window micro-step count, F-017). Shared by the in-loop window/final-step flush and the
 /// loop-exit tail flush so both fire the identical update sequence.
-fn flush_expert_update(st: &mut ExpertState, schedule: LrSchedule, window: u32) -> Result<()> {
-    let mult = lr_multiplier(schedule, st.update_idx, st.total_updates, st.warmup_updates);
+fn flush_expert_update(st: &mut ExpertState, cfg: &TrainingConfig, window: u32) -> Result<()> {
+    let mult = lr_multiplier(
+        cfg.lr_scheduler,
+        st.update_idx,
+        st.total_updates,
+        st.warmup_updates,
+    );
     st.opt.set_lr_scaled(mult);
     let avg = average_grads(
         st.accumulated
@@ -905,13 +942,15 @@ fn flush_expert_update(st: &mut ExpertState, schedule: LrSchedule, window: u32) 
             .expect("an update fires only after accumulation"),
         window,
     )?;
-    let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-    let clipped: LoraParams = clipped
-        .into_iter()
-        .map(|(k, v)| (k, v.into_owned()))
-        .collect();
-    st.opt.step(&mut st.params, &clipped)?;
-    eval(st.params.values())?;
+    // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise, on this expert's stream.
+    adapter_optimizer_update(
+        &mut st.opt,
+        &mut st.params,
+        &avg,
+        cfg,
+        st.update_idx,
+        st.noise_seed,
+    )?;
     st.update_idx += 1;
     Ok(())
 }
@@ -1180,15 +1219,15 @@ fn training_tokens(cfg: &WanModelConfig, edge: u32) -> f64 {
 /// to Wan). The budget is MLX's reported memory limit × 0.85 for worker/host headroom. Only consulted
 /// when gradient checkpointing is OFF. `n_experts` resident is the MoE floor (both stay loaded across
 /// the alternation), which is itself most of the cost — so on a tier that can't hold the experts, the
-/// guard correctly recommends the dense TI2V-5B or a lower resolution.
+/// guard correctly recommends the dense TI2V-5B or a lower resolution. sc-2127: sized for the
+/// LARGEST bucket edge (epic 2123 E7) — see [`preflight_projection`].
 fn preflight_memory_guard(
     cfg: &WanModelConfig,
-    edge: u32,
+    edges: &[u32],
     n_experts: usize,
     id: &str,
 ) -> Result<()> {
-    let tokens = training_tokens(cfg, edge);
-    let projected = projected_dense_peak_gb(tokens, cfg.dim, cfg.num_layers, n_experts);
+    let (edge, projected) = preflight_projection(cfg, edges, n_experts);
     let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
     if projected > safe {
@@ -1205,6 +1244,19 @@ fn preflight_memory_guard(
     Ok(())
 }
 
+/// The edge the pre-flight guard sizes for — the largest of the resolution-bucket `edges` (epic 2123
+/// E7; the per-step working set peaks at the biggest latent) — and its projected dense first-step
+/// peak in GB. The latent cache is not modelled (a few MB of still latents per item next to tens of
+/// GB of resident experts), so the bucket count does not enter the projection.
+fn preflight_projection(cfg: &WanModelConfig, edges: &[u32], n_experts: usize) -> (u32, f64) {
+    let edge = edges.iter().copied().max().unwrap_or(0);
+    let tokens = training_tokens(cfg, edge);
+    (
+        edge,
+        projected_dense_peak_gb(tokens, cfg.dim, cfg.num_layers, n_experts),
+    )
+}
+
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
     let dynimg = image::open(path)
@@ -1218,9 +1270,59 @@ fn decode_image(path: &Path) -> Result<Image> {
     })
 }
 
+/// One item's cached latents, one per bucket edge in `edges` order (the item-major layout
+/// [`BucketSchedule::cache_index`] indexes, sc-2127): `encode(edge)` the clean latent, then
+/// `mask_weight(latent.shape())` — the item's subject mask resampled onto **that** latent's grid
+/// (sc-24828) — each pair evaluated so it survives the encoder's drop.
+fn encode_bucket_latents(
+    edges: &[u32],
+    mut encode: impl FnMut(u32) -> Result<Array>,
+    mut mask_weight: impl FnMut(&[i32]) -> Result<Option<Array>>,
+) -> Result<Vec<(Array, Option<Array>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let clean = encode(edge)?;
+            let weight = mask_weight(clean.shape())?;
+            eval(std::iter::once(&clean).chain(weight.as_ref()))?;
+            Ok((clean, weight))
+        })
+        .collect()
+}
+
+/// The subject-masked loss weight (sc-24828) of one cached still latent `[z, 1, h, w]`: the image
+/// went through `center_crop_square`, so the mask's crop is [`CropBox::center_square`],
+/// area-averaged onto the latent's `(h, w)` grid and broadcast over every channel of the one
+/// frame — the latent's exact shape. `None` when off.
+fn still_subject_weight(
+    label: &str,
+    mask: Option<&PreparedSubjectMask>,
+    clean_shape: &[i32],
+) -> Result<Option<Array>> {
+    prepared_subject_mask_weight(label, mask, CropBox::center_square, clean_shape)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{accum_window, expert_index, expert_item_index};
+    use super::{
+        accum_window, descriptor_i2v_14b, descriptor_t2v_14b, descriptor_ti2v_5b, expert_index,
+        expert_item_index, largest_bucket, preflight_projection,
+    };
+    use crate::config::WanModelConfig;
+    use mlx_gen::gen_core::{BucketSchedule, ResolutionBucket, TrainingConfig};
+    use mlx_gen::train::dataset::bucket_edges;
+
+    /// The pre-bucket single-resolution walk: one bucket at the legacy resolution.
+    fn one_bucket(n: usize) -> BucketSchedule {
+        BucketSchedule::new(
+            n,
+            &[ResolutionBucket {
+                resolution: 512,
+                repeats: 1,
+            }],
+            7,
+        )
+    }
 
     /// F-082 lockstep with candle-gen: on the dual MoE **every expert sweeps the whole dataset** —
     /// the two experts alternate by step parity, and the item index is decoupled from that parity so
@@ -1235,7 +1337,7 @@ mod tests {
             // Enough steps for each expert to make N visits (2 experts ⇒ 2·N steps).
             for step in 1..=(2 * n as u32) {
                 let ei = expert_index(step, true);
-                let item = expert_item_index(step, true, n);
+                let item = expert_item_index(step, true, &one_bucket(n));
                 if ei == 1 {
                     seen_high[item] = true;
                 } else {
@@ -1261,7 +1363,7 @@ mod tests {
         let n = 10usize;
         let high_reaches_odd = (1..=(2 * n as u32))
             .filter(|&step| expert_index(step, true) == 1)
-            .any(|step| expert_item_index(step, true, n) % 2 == 1);
+            .any(|step| expert_item_index(step, true, &one_bucket(n)) % 2 == 1);
         assert!(
             high_reaches_odd,
             "high-noise expert never reached an odd item — parity lock regressed"
@@ -1274,7 +1376,112 @@ mod tests {
         let n = 5usize;
         for step in 1..=12u32 {
             assert_eq!(expert_index(step, false), 0);
-            assert_eq!(expert_item_index(step, false, n), ((step - 1) as usize) % n);
+            assert_eq!(
+                expert_item_index(step, false, &one_bucket(n)),
+                ((step - 1) as usize) % n
+            );
+        }
+    }
+
+    /// sc-2127: a single bucket reproduces the pre-bucket expert-decoupled index
+    /// `((step-1)/n_experts) % len` exactly, for both the dual MoE and the dense path, over many
+    /// epochs — the everything-off path is bit-identical.
+    #[test]
+    fn one_bucket_schedule_keeps_the_pre_bucket_order() {
+        for n in [1usize, 2, 5, 8] {
+            let schedule = one_bucket(n);
+            for dual in [true, false] {
+                let n_experts = if dual { 2 } else { 1 };
+                for step in 1..=200u32 {
+                    let old = (((step - 1) as usize) / n_experts) % n;
+                    assert_eq!(
+                        expert_item_index(step, dual, &schedule),
+                        old,
+                        "n={n} dual={dual}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// sc-2127: with buckets {256×16, 512×4, 1024×1} every expert sees each item at the 16:4:1 mix
+    /// over whole epochs (both experts consume the same schedule counter, so each walks it fully).
+    #[test]
+    fn multi_bucket_schedule_gives_each_expert_the_repeat_mix() {
+        let n = 3usize;
+        let buckets = [
+            ResolutionBucket {
+                resolution: 256,
+                repeats: 16,
+            },
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 4,
+            },
+            ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+        ];
+        let schedule = BucketSchedule::new(n, &buckets, 42);
+        let epochs = 2usize;
+        let steps = (2 * epochs * schedule.epoch_len()) as u32;
+        // counts[expert][item][bucket]
+        let mut counts = [[[0u32; 3]; 3]; 2];
+        for step in 1..=steps {
+            let idx = expert_item_index(step, true, &schedule);
+            counts[expert_index(step, true)][idx / 3][idx % 3] += 1;
+        }
+        for (e, per_item) in counts.iter().enumerate() {
+            for (item, c) in per_item.iter().enumerate() {
+                assert_eq!(*c, [32, 8, 2], "expert {e} item {item}");
+            }
+        }
+    }
+
+    /// sc-2127: previews render at the largest bucket edge (first on a tie).
+    #[test]
+    fn largest_bucket_picks_the_biggest_edge() {
+        assert_eq!(largest_bucket(&[512]), 0);
+        assert_eq!(largest_bucket(&[256, 1024, 512]), 1);
+        assert_eq!(largest_bucket(&[1024, 512, 1024]), 0);
+    }
+
+    /// sc-2127 / epic 2123 E7: the pre-flight guard sizes for the LARGEST bucket — buckets
+    /// [512, 1024] project exactly the 1024-only peak, and more than the 512-only one.
+    #[test]
+    fn preflight_sizes_for_the_largest_bucket() {
+        let wan = WanModelConfig::wan22_t2v_14b();
+        let edges_of = |res: &[u32]| {
+            let cfg = TrainingConfig {
+                resolution_buckets: res
+                    .iter()
+                    .map(|&r| ResolutionBucket {
+                        resolution: r,
+                        repeats: 1,
+                    })
+                    .collect(),
+                ..TrainingConfig::default()
+            };
+            bucket_edges(&cfg)
+        };
+        let both = preflight_projection(&wan, &edges_of(&[512, 1024]), 2);
+        let big = preflight_projection(&wan, &edges_of(&[1024]), 2);
+        let small = preflight_projection(&wan, &edges_of(&[512]), 2);
+        assert_eq!(both, big);
+        assert_eq!(both.0, 1024);
+        assert!(both.1 > small.1);
+    }
+
+    /// sc-2127: every Wan registration declares resolution buckets.
+    #[test]
+    fn descriptors_declare_resolution_buckets() {
+        for d in [
+            descriptor_t2v_14b(),
+            descriptor_i2v_14b(),
+            descriptor_ti2v_5b(),
+        ] {
+            assert!(d.techniques.resolution_buckets, "{}", d.id);
         }
     }
 
@@ -1771,6 +1978,62 @@ mod subject_mask_tests {
             descriptor_ti2v_5b(),
         ] {
             assert!(d.techniques.subject_mask_loss, "{}", d.id);
+        }
+    }
+
+    /// sc-24828 × sc-2127: with subject-masked loss on and two buckets, each bucket's cached weight
+    /// is the item's mask resampled onto **that bucket's** `[z, 1, h, w]` latent (centre-square
+    /// crop of a non-square image) — the latent's exact shape — with the masked-out
+    /// (right-half-of-crop) cells zero and the subject cells at the subject weight.
+    ///
+    /// *Mutation that reds this:* `encode_bucket_latents` resampling the mask once at the first
+    /// bucket's latent shape and reusing it for every bucket.
+    #[test]
+    fn subject_mask_weight_is_resampled_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 96×64 image: the centre square is x ∈ [16, 80); the subject is x < 48 — exactly the
+        // crop's left half.
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::from_pixel(96, 64, image::Rgb([90, 120, 150]))
+            .save(&image_path)
+            .unwrap();
+        let mask_path = tmp.path().join("a.mask.png");
+        image::GrayImage::from_fn(96, 64, |x, _| image::Luma([if x < 48 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let mut item = mlx_gen::TrainingItem::captioned(image_path, "a".into());
+        item.subject_mask_path = Some(mask_path);
+        let cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load_if_enabled("wan", &item, Some(&cfg)).unwrap();
+        assert!(mask.is_some());
+        let edges = [256u32, 512];
+        let z = 16;
+        let entries = encode_bucket_latents(
+            &edges,
+            |edge| {
+                let side = (edge / 16) as i32;
+                Ok(mlx_rs::ops::zeros::<f32>(&[z, 1, side, side])?)
+            },
+            |shape| still_subject_weight("wan", mask.as_ref(), shape),
+        )
+        .unwrap();
+        assert_eq!(entries.len(), edges.len());
+        for (b, (clean, weight)) in entries.iter().enumerate() {
+            let weight = weight.as_ref().expect("mask loss on ⇒ a weight");
+            assert_eq!(weight.shape(), clean.shape(), "bucket {b} weight shape");
+            let side = clean.shape()[3] as usize;
+            let flat = weight.reshape(&[-1]).unwrap();
+            for (i, &v) in flat.as_slice::<f32>().iter().enumerate() {
+                let x = i % side;
+                let want = if x < side / 2 { 1.0 } else { 0.0 };
+                assert!(
+                    (v - want).abs() < 1e-5,
+                    "bucket {b} elem {i}: {v} want {want}"
+                );
+            }
         }
     }
 

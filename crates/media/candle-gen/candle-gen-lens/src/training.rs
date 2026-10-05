@@ -44,14 +44,14 @@ use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor, Var};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::train::subject_mask::CropBox;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, CancelFlag, Image, LoadSpec, Modality, Progress, WeightsSource};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
-    self, item_subject_mask_weight, run_flow_match_training, validate_flow_match_request,
+    self, prepared_subject_mask_weight, run_flow_match_training, validate_flow_match_request,
     weighted_velocity_loss, FlowMatchTrainer, SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
@@ -80,7 +80,7 @@ const ENC_DTYPE: DType = DType::BF16;
 
 /// One micro-step's forward+backward over the installed adapter `Var`s: build the noised latent at `t`,
 /// predict the **raw** velocity through the (LoRA-adapted) DiT, regress it toward `noise − x0`, and
-/// return `(loss, grads)` keyed by `lora_vars`. `(h, w)` is the (constant, per-resolution) latent grid;
+/// return `(loss, grads)` keyed by `lora_vars`. `(h, w)` is the sample's latent grid (per bucket edge);
 /// `text_feats` are the cached, frozen gpt-oss features (any dtype — cast to `compute_dtype` here). A
 /// free function so the tests can drive it against a tiny DiT.
 ///
@@ -143,14 +143,14 @@ fn compute_loss_grads(
     }
 }
 
-/// The subject-mask loss weight for one item (sc-24828), `None` when the technique is off. The mask
-/// takes [`load_image_tensor`]'s centre-square crop and is area-averaged onto the **unpacked** 32-ch
+/// The subject-mask loss weight for one cached bucket latent (sc-24828 × sc-2127), `None` when the
+/// technique is off. The item's mask (loaded once) takes [`decode_square`]'s centre-square crop and
+/// is area-averaged onto this bucket's **unpacked** 32-ch
 /// VAE latent grid `[1, C, 2·lat_h, 2·lat_w]` (C = 32), then packed through the very 2×2 patchify + flatten
 /// the cached latent went through ([`pack_unpacked_latent`]) — so each of the 128 packed channels
 /// carries the weight of its own 2×2 sub-position, element-for-element with `x0` `[1, S, 128]`.
-fn item_mask_weight(
-    item: &gen_core::train::TrainingItem,
-    cfg: &TrainingConfig,
+fn bucket_mask_weight(
+    mask: Option<&PreparedSubjectMask>,
     x0: &Tensor,
     lat_h: usize,
     lat_w: usize,
@@ -158,16 +158,9 @@ fn item_mask_weight(
 ) -> Result<Option<Tensor>> {
     // `x0` is `[1, S, 4·C]` (2×2 patchify folds 4 sub-positions into each channel group).
     let unpacked = [1usize, x0.dim(2)? / 4, 2 * lat_h, 2 * lat_w];
-    item_subject_mask_weight(
-        LABEL,
-        item,
-        cfg.subject_mask_loss.as_ref(),
-        CropBox::center_square,
-        &unpacked,
-        device,
-    )?
-    .map(|w| pack_unpacked_latent(&w).map_err(Into::into))
-    .transpose()
+    prepared_subject_mask_weight(LABEL, mask, CropBox::center_square, &unpacked, device)?
+        .map(|w| pack_unpacked_latent(&w).map_err(Into::into))
+        .transpose()
 }
 
 /// gpt-oss-encode `caption` → its 4 captured layers cropped at [`TXT_OFFSET`], each `[1, s, 2880]`
@@ -226,8 +219,8 @@ struct LensPromptCond {
 ///  * `vae` — the resident [`Flux2Vae`] **decoder** (`Arc` as inference holds it); the cache pass loads
 ///    only the encoder, so the decoder is loaded here for the preview path.
 ///  * `latent_h` / `latent_w` — the packed latent grid (`edge / 16`) the seeded preview noise + the DiT
-///    forward are shaped at — the same square `bucket_resolution(cfg.resolution)` edge the cached
-///    latents use.
+///    forward are shaped at — the largest training-bucket edge ([`bucket_edges`], just
+///    `bucket_resolution(cfg.resolution)` with buckets off — the edge the cached latents use).
 pub struct LensSampleState {
     conds: Vec<LensPromptCond>,
     vae: Arc<Flux2Vae>,
@@ -314,9 +307,16 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent (+ its own latent grid)
+        // per bucket edge, walked by the shared driver's `BucketSchedule`.
+        // sc-24828 (epic 2123): subject-masked loss — a per-bucket weight map, packed like that
+        // bucket's latent, cached next to it.
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -386,12 +386,13 @@ impl Trainer for LensTrainer {
 
 impl FlowMatchTrainer for LensTrainer {
     type Dit = LensTransformerTrain;
-    /// `(x0 packed latent [1, S, 128], the 4 cached gpt-oss feature layers, subject-mask loss
-    /// weight)`, all f32; the weight (packed exactly like `x0`) is `None` unless subject-masked loss
-    /// is on (sc-24828).
-    type Cached = (Tensor, Vec<Tensor>, Option<Tensor>);
-    /// The (constant, per-resolution) latent grid `(lat_h, lat_w)`.
-    type Aux = (usize, usize);
+    /// `(x0 packed latent [1, S, 128], the 4 cached gpt-oss feature layers, its latent grid
+    /// (lat_h, lat_w), subject-mask loss weight)`, tensors f32. The grid is per entry: with
+    /// resolution buckets (sc-2127) each cached latent carries the grid of the bucket edge it was
+    /// encoded at. The weight (packed exactly like that entry's `x0`) is `None` unless
+    /// subject-masked loss is on (sc-24828).
+    type Cached = (Tensor, Vec<Tensor>, (usize, usize), Option<Tensor>);
+    type Aux = ();
     /// Preview-sample render state: per-prompt joint CFG conditioning + resident VAE decoder + the
     /// preview latent grid (sc-8650).
     type SampleState = LensSampleState;
@@ -410,12 +411,11 @@ impl FlowMatchTrainer for LensTrainer {
         req: &TrainingRequest,
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<(
-        Vec<Self::Cached>,
-        (usize, usize),
-        SamplePlan<LensSampleState>,
-    )> {
-        let edge = bucket_resolution(req.config.resolution);
+    ) -> Result<(Vec<Self::Cached>, (), SamplePlan<LensSampleState>)> {
+        // sc-2127: one training edge per resolution bucket (just `[resolution]` when buckets are off);
+        // previews render at the largest (epic 2123 E7).
+        let edges = bucket_edges(&req.config);
+        let edge = edges.iter().copied().max().unwrap_or(0);
         let tokenizer =
             LensTokenizer::from_file(self.root.join("tokenizer").join("tokenizer.json"))?;
         // gpt-oss is the caching workhorse (dense bf16, ~40 GB transient) — built then dropped.
@@ -432,8 +432,9 @@ impl FlowMatchTrainer for LensTrainer {
         )?)?;
 
         let total = req.items.len() as u32;
-        let mut cache: Vec<Self::Cached> = Vec::with_capacity(req.items.len());
-        let mut grid: Option<(usize, usize)> = None;
+        // Item-major over the bucket edges: `cache[item * edges.len() + bucket]` — the layout the
+        // driver's `BucketSchedule` indexes (sc-2127).
+        let mut cache: Vec<Self::Cached> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -442,20 +443,29 @@ impl FlowMatchTrainer for LensTrainer {
                 current: i as u32 + 1,
                 total,
             });
-            let img = load_image_tensor(&item.image_path, edge, device)?; // [1,3,edge,edge] in [-1,1]
-            let (x0, lh, lw) = vae_encode(&vae, &img)?; // [1, S, 128] packed latent (mean), f32
-            let mask_weight = item_mask_weight(item, &req.config, &x0, lh, lw, device)?;
             let feats = encode_caption(&tokenizer, &encoder, &item.caption, device)?;
-            grid.get_or_insert((lh, lw));
-            cache.push((x0, feats, mask_weight));
+            // sc-24828: the item's subject mask is read + checked once, then resampled per bucket
+            // onto that bucket's latent grid (`None` when masked loss is off).
+            let mask = PreparedSubjectMask::load_if_enabled(
+                LABEL,
+                item,
+                req.config.subject_mask_loss.as_ref(),
+            )?;
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            for &edge in &edges {
+                let img = square_image_tensor(&square, edge, device)?; // [1,3,edge,edge] in [-1,1]
+                let (x0, lh, lw) = vae_encode(&vae, &img)?; // [1, S, 128] packed latent (mean), f32
+                let mask_weight = bucket_mask_weight(mask.as_ref(), &x0, lh, lw, device)?;
+                cache.push((x0, feats.clone(), (lh, lw), mask_weight));
+            }
         }
 
         // Preview samples (sc-8650) — while the gpt-oss encoder is STILL resident, pre-encode up to
         // `SAMPLE_PROMPT_CAP` of the configured prompts into the joint CFG batch (positive + the shared
         // empty-negative unconditional branch), using the same `encode_caption` the cache loop uses
         // (train/infer conditioning parity), and load a resident `Flux2Vae` *decoder* (the cache pass
-        // built an encoder-only VAE). The previews render at the same square `bucket_resolution`
-        // edge the cached latents use (`edge / 16` packed grid). The driver renders these from the
+        // built an encoder-only VAE). The previews render at the largest bucket edge (`edge / 16`
+        // packed grid; the single cached edge when buckets are off). The driver renders these from the
         // in-progress adapter each cadence.
         let sample_plan = if req.config.sample_every > 0 && !req.config.sample_prompts.is_empty() {
             let lat = (edge / VAE_SCALE_FACTOR) as usize;
@@ -496,9 +506,7 @@ impl FlowMatchTrainer for LensTrainer {
         // (working set) loads. The resident VAE *decoder* lives on in the sample plan's state.
         drop(encoder);
         drop(vae);
-        // The grid is set on the first cached item; `(0, 0)` is a placeholder for an empty cache (the
-        // driver maps that to `Canceled`/error before any step reads the aux).
-        Ok((cache, grid.unwrap_or((0, 0)), sample_plan))
+        Ok((cache, (), sample_plan))
     }
 
     fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<LensTransformerTrain> {
@@ -514,13 +522,14 @@ impl FlowMatchTrainer for LensTrainer {
         dit: &LensTransformerTrain,
         vars: &[Var],
         cached: &Self::Cached,
-        aux: &(usize, usize),
+        _aux: &(),
         cfg: &TrainingConfig,
         step: u32,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
-        let (x0, feats, mask_weight) = cached;
-        let (lat_h, lat_w) = *aux;
+        // The grid of the bucket this entry was encoded at (sc-2127).
+        let (x0, feats, (lat_h, lat_w), mask_weight) = cached;
+        let (lat_h, lat_w) = (*lat_h, *lat_w);
         // Lens feeds `t` to the DiT directly (cast to f64), and the 48-block backward always uses the
         // gradient-checkpointed path.
         let t = flow_match::sample_unit_timestep(
@@ -898,6 +907,53 @@ mod tests {
         }
     }
 
+    /// sc-24828 × sc-2127: with two resolution buckets and masked loss on, the item's mask (loaded
+    /// once) yields a weight per bucket that is packed exactly like that bucket's latent — same
+    /// `[1, S, 4·C]` shape — and the masked-out region (the right half of the centre crop) is zero.
+    #[test]
+    fn bucket_mask_weight_follows_each_bucket_latent() {
+        use candle_gen::gen_core::train::TrainingItem;
+        let dev = Device::Cpu;
+        let dir = tempfile::tempdir().unwrap();
+        // A 48x32 landscape image: centre crop x in [8, 40); subject = crop's left half [8, 24).
+        let img = dir.path().join("img.png");
+        image::RgbImage::new(48, 32).save(&img).unwrap();
+        let mask_path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(48, 32, |x, _| {
+            image::Luma([if (8..24).contains(&x) { 255 } else { 0 }])
+        })
+        .save(&mask_path)
+        .unwrap();
+        let mut item = TrainingItem::captioned(img, "c".into());
+        item.subject_mask_path = Some(mask_path);
+        let on = candle_gen::gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load_if_enabled(LABEL, &item, Some(&on))
+            .unwrap()
+            .expect("masked loss on");
+        let c = 2usize; // unpacked channels; packed = 4·c
+        for (lh, lw) in [(2usize, 2usize), (4, 4)] {
+            let x0 = Tensor::zeros((1, lh * lw, 4 * c), DType::F32, &dev).unwrap();
+            let w = bucket_mask_weight(Some(&mask), &x0, lh, lw, &dev)
+                .unwrap()
+                .expect("weight");
+            assert_eq!(w.dims(), x0.dims(), "bucket {lh}x{lw}");
+            let rows = w.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+            for (tok, row) in rows.iter().enumerate() {
+                let j = tok % lw;
+                for (ch, v) in row.iter().enumerate() {
+                    let x = 2 * j + ch % 2; // unpacked column of this packed element
+                    let expected = if x < lw { 1.0 } else { 0.0 };
+                    assert_eq!(*v, expected, "bucket {lh}x{lw} token {tok} channel {ch}");
+                }
+            }
+        }
+        let x0 = Tensor::zeros((1, 4, 4 * c), DType::F32, &dev).unwrap();
+        assert!(bucket_mask_weight(None, &x0, 2, 2, &dev).unwrap().is_none());
+    }
+
     /// The candle Lens trainer declares subject-masked loss (sc-24828).
     #[test]
     fn descriptor_declares_subject_mask_loss() {
@@ -965,6 +1021,50 @@ mod tests {
         assert_eq!(t.descriptor().backend, "candle");
         assert_eq!(t.descriptor().modality, Modality::Image);
         assert!(t.descriptor().supports_lora && t.descriptor().supports_lokr);
+        assert!(t.descriptor().techniques.resolution_buckets);
+    }
+
+    /// sc-2127: the micro-step reads each cached entry's OWN latent grid, so one run trains across
+    /// bucket entries of different grids (here a 2×2 and a 4×2 packed grid) through the same DiT.
+    #[test]
+    fn micro_step_uses_each_entrys_grid() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = LensTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        let trainer = LensTrainer {
+            descriptor: trainer_descriptor(),
+            root: "/nonexistent".into(),
+            device: dev.clone(),
+        };
+        let feat = Tensor::randn(0f32, 1f32, (1, 3, cfg.enc_hidden_dim), &dev).unwrap();
+        let train_cfg = TrainingConfig {
+            train_dtype: "f32".into(),
+            ..TrainingConfig::default()
+        };
+        for (step, (h, w)) in [(2usize, 2usize), (4, 2)].into_iter().enumerate() {
+            let x0 = Tensor::randn(0f32, 1f32, (1, h * w, cfg.in_channels), &dev).unwrap();
+            let cached = (x0, vec![feat.clone()], (h, w), None);
+            let (loss, _) = trainer
+                .micro_step(
+                    &dit,
+                    &set.vars,
+                    &cached,
+                    &(),
+                    &train_cfg,
+                    step as u32 + 1,
+                    &dev,
+                )
+                .unwrap();
+            assert!(
+                loss.is_finite(),
+                "grid {h}x{w}: loss must be finite, got {loss}"
+            );
+        }
     }
 
     /// `validate` rejects an empty dataset, zero rank/steps, an unsupported optimizer, and unrecognized

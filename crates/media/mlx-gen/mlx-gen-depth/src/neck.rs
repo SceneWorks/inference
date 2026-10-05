@@ -71,11 +71,11 @@ impl ReassembleLayer {
     }
 
     /// `hidden`: a captured backbone state `[B, grid²+1, hidden]` → an NHWC feature map.
-    fn forward(&self, hidden: &Array, grid: i32, hidden_dim: i32) -> Result<Array> {
+    fn forward(&self, hidden: &Array, grid: (i32, i32), hidden_dim: i32) -> Result<Array> {
         // Drop CLS (index 0), reshape patch tokens to [B, grid, grid, hidden] (NHWC).
         let b = hidden.shape()[0];
         let patches = hidden.index((.., 1..));
-        let map = patches.reshape(&[b, grid, grid, hidden_dim])?;
+        let map = patches.reshape(&[b, grid.0, grid.1, hidden_dim])?;
         // 1×1 projection.
         let map = conv2d(&map, &self.proj_w, Some(&self.proj_b), 1, 0)?;
         match &self.resize {
@@ -195,7 +195,12 @@ impl DptNeck {
 
     /// `hidden_states`: the four captured backbone states (shallow→deep), each `[B, grid²+1, hidden]`.
     /// Returns the fused NHWC feature map the head consumes.
-    pub fn forward(&self, hidden_states: &[Array], grid: i32, hidden_dim: i32) -> Result<Array> {
+    pub fn forward(
+        &self,
+        hidden_states: &[Array],
+        grid: (i32, i32),
+        hidden_dim: i32,
+    ) -> Result<Array> {
         // Reassemble + project each level (shallow→deep order).
         let mut feats = Vec::with_capacity(4);
         for (i, hs) in hidden_states.iter().enumerate() {

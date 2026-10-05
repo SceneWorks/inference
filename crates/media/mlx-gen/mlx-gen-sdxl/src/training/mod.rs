@@ -212,10 +212,16 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
-        // sc-24828 (epic 2123): subject-masked ε loss, wired in the shared `train_family`.
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): honors `resolution_buckets` — the shared family backbone caches one
+        // latent (+ its edge's `time_ids`) per bucket and walks them through a `BucketSchedule`.
+        // sc-24828 (epic 2123): subject-masked ε loss, wired in the shared `train_family` (the
+        // weight is resampled per bucket next to each latent).
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -376,6 +382,26 @@ mod preflight_tests {
     #[test]
     fn descriptor_declares_subject_mask_loss() {
         assert!(super::trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-2127 / epic 2123 E7: with buckets `[512, 1024]` the pre-flight guard projects the 1024
+    /// bucket's peak — equal to a 1024-only run and above a 512-only run.
+    #[test]
+    fn guard_projection_sizes_for_the_largest_bucket() {
+        use super::family::dense_peak_for_edges;
+        for bf16 in [false, true] {
+            let mixed = dense_peak_for_edges(projected_dense_peak_gb, &[512, 1024], bf16);
+            let at_1024 = dense_peak_for_edges(projected_dense_peak_gb, &[1024], bf16);
+            let at_512 = dense_peak_for_edges(projected_dense_peak_gb, &[512], bf16);
+            assert_eq!(mixed, at_1024);
+            assert!(mixed.1 > at_512.1);
+        }
+    }
+
+    /// sc-2127: the SDXL trainer declares multi-resolution bucket support.
+    #[test]
+    fn descriptor_declares_resolution_buckets() {
+        assert!(super::trainer_descriptor().techniques.resolution_buckets);
     }
 }
 

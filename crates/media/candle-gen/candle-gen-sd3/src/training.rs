@@ -6,14 +6,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::train::subject_mask::CropBox;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, NetworkType, Precision, WeightsSource};
+use candle_gen::gen_core::{
+    self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
+};
 use candle_gen::quant::AdaptLinear;
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
-use candle_gen::train::flow_match::{self, item_subject_mask_weight, weighted_velocity_loss};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::flow_match::{self, prepared_subject_mask_weight, weighted_velocity_loss};
 use candle_gen::train::lora::{build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
 use candle_gen::train::schedule::schedule_updates;
@@ -60,9 +62,15 @@ fn descriptor_for(variant: Variant) -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        // sc-24828 (epic 2123): subject-masked loss — a per-bucket weight map cached next to each
+        // latent.
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -336,10 +344,14 @@ impl Sd3Trainer {
         let mut encoders = pipe.load_training_encoders()?;
         let vae_encoder = pipe.load_vae_encoder()?;
         let model_cfg = self.variant.config();
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
+        let edges = bucket_edges(cfg);
         let total = req.items.len() as u32;
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127) of `(x0, conditioning,
+        // subject-mask loss weight)`; the weight (broadcast to that bucket's latent shape) is `None`
+        // unless subject-masked loss is on (sc-24828).
         let mut cache: Vec<(Tensor, Sd3Conditioning, Option<Tensor>)> =
-            Vec::with_capacity(req.items.len());
+            Vec::with_capacity(req.items.len() * edges.len());
         for (index, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -348,19 +360,25 @@ impl Sd3Trainer {
                 current: index as u32 + 1,
                 total,
             });
-            let image = load_image_tensor(&item.image_path, edge, device)?;
-            let x0 = encode_mean(&vae_encoder, &image, DType::F32)?;
-            // `load_image_tensor` centre-crops to a square, so the mask takes the same crop.
-            let mask_weight = item_subject_mask_weight(
-                LABEL,
-                item,
-                cfg.subject_mask_loss.as_ref(),
-                CropBox::center_square,
-                x0.dims(),
-                device,
-            )?;
             let conditioning = aggregate(&model_cfg, &encoders.encode(&item.caption)?)?;
-            cache.push((x0, conditioning, mask_weight));
+            // sc-24828: the item's subject mask is read + checked once, then resampled per bucket
+            // onto that bucket's latent grid (`None` when masked loss is off).
+            let mask =
+                PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            for &edge in &edges {
+                let image = square_image_tensor(&square, edge, device)?;
+                let x0 = encode_mean(&vae_encoder, &image, DType::F32)?;
+                // `decode_square` centre-crops to a square, so the mask takes the same crop.
+                let mask_weight = prepared_subject_mask_weight(
+                    LABEL,
+                    mask.as_ref(),
+                    CropBox::center_square,
+                    x0.dims(),
+                    device,
+                )?;
+                cache.push((x0, conditioning.clone(), mask_weight));
+            }
         }
         drop(vae_encoder);
         drop(encoders);
@@ -406,11 +424,15 @@ impl Sd3Trainer {
         let mut update_idx = 0;
         let mut last_loss = 0.0;
         let mut steps_run = 0;
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         for step in 1..=cfg.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, conditioning, mask_weight) = &cache[(step as usize - 1) % cache.len()];
+            let (x0, conditioning, mask_weight) = &cache[schedule.cache_index(step as usize - 1)];
             let sigma = sample_sigma(req, step);
             let noise = flow_match::sample_noise(
                 x0.dims(),
@@ -440,6 +462,7 @@ impl Sd3Trainer {
                     update_idx,
                     total_updates,
                     warmup_updates,
+                    cfg.seed,
                 )?;
                 update_idx += 1;
             }
@@ -473,6 +496,7 @@ impl Sd3Trainer {
                 update_idx,
                 total_updates,
                 warmup_updates,
+                cfg.seed,
             )?;
         }
         on_progress(TrainingProgress::Saving);
@@ -556,6 +580,47 @@ mod tests {
             assert_eq!(descriptor.backend, "candle");
             assert!(descriptor.supports_lora && descriptor.supports_lokr);
             assert!(!descriptor.supports_control && !descriptor.supports_full_finetune);
+            assert!(descriptor.techniques.resolution_buckets, "sc-2127");
+        }
+    }
+
+    /// sc-2127: one installed adapter set trains on latents of two bucket sizes through the real
+    /// MMDiT (the positional table is cropped per forward, so no size is baked in at load).
+    #[test]
+    fn one_adapter_set_trains_on_two_bucket_sizes() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut transformer = Sd3Transformer::new(&cfg, vb).unwrap();
+        let targets = vec!["attn2.to_out.0".to_string()];
+        let set = build_adapt_lora_targets(&mut transformer, &targets, 2, 2.0, 7, &dev).unwrap();
+        let context = Tensor::randn(
+            0f32,
+            1f32,
+            (1, cfg.context_seq_len(), cfg.joint_attention_dim),
+            &dev,
+        )
+        .unwrap();
+        let pooled = Tensor::randn(0f32, 1f32, (1, cfg.pooled_dim), &dev).unwrap();
+        let timestep = Tensor::full(500f32, 1, &dev).unwrap();
+        for side in [8usize, 16] {
+            let latent = Tensor::randn(0f32, 1f32, (1, 16, side, side), &dev).unwrap();
+            let prediction = transformer
+                .forward(&latent, &context, &pooled, &timestep)
+                .unwrap();
+            assert_eq!(prediction.dims(), latent.dims(), "side {side}");
+            let grads = prediction
+                .sqr()
+                .unwrap()
+                .mean_all()
+                .unwrap()
+                .backward()
+                .unwrap();
+            assert!(
+                grads.get(set.vars[1].as_tensor()).is_some(),
+                "side {side}: the bucket's step must reach the shared adapter"
+            );
         }
     }
 

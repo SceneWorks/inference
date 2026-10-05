@@ -13,22 +13,26 @@ use candle_gen::diffusion_schedule::{
     KOLORS_TRAIN_STEPS as NUM_TRAIN_TIMESTEPS,
 };
 use candle_gen::gen_core::sampling::AlphaSchedule;
-use candle_gen::gen_core::train::subject_mask::CropBox;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, NetworkType, Precision, WeightsSource};
+use candle_gen::gen_core::{
+    self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
+};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
 use candle_gen::train::flow_match::{
-    effective_weight_decay, item_subject_mask_weight, noise_seed, sample_noise,
+    effective_weight_decay, noise_seed, prepared_subject_mask_weight, sample_noise,
     weighted_velocity_loss,
 };
 use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
-    SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
+    adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
+    AdapterKind, LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use candle_gen::train::optim::{
+    accumulate_grads, accumulation_divisor, scale_grads, TrainOptimizer,
+};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
@@ -58,11 +62,53 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        // sc-24828 (epic 2123): subject-masked loss.
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
+}
+
+/// One item's item-major cache entries (sc-2127 × sc-24828): the decoded `square` encoded at each
+/// bucket edge by `encode` (`[1, 3, edge, edge]` → clean latent), each paired with its subject-mask
+/// loss weight on THAT bucket's latent grid (`None` when masked loss is off). `decode_square`
+/// center-crops, so the mask is cropped with [`CropBox::center_square`].
+fn encode_item_buckets(
+    square: &SquareImage,
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    device: &Device,
+    mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
+) -> Result<Vec<(Tensor, Option<Tensor>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(&square_image_tensor(square, edge, device)?)?;
+            let mask_weight = prepared_subject_mask_weight(
+                LABEL,
+                mask,
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
+}
+
+/// One SDXL-style `time_ids` row (`[h, w, 0, 0, h, w]`) per bucket edge, in bucket order, at
+/// `dtype` (sc-2127). A step selects the row of the bucket its cached latent was encoded at, so the
+/// micro-conditioning always names the size the latent really has.
+fn bucket_time_ids(device: &Device, edges: &[u32], dtype: DType) -> Result<Vec<Tensor>> {
+    edges
+        .iter()
+        .map(|&edge| Ok(build_time_ids(device, 1, edge, edge)?.to_dtype(dtype)?))
+        .collect()
 }
 
 pub struct KolorsTrainer {
@@ -168,16 +214,6 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn accumulation_divisor(micro_step: u32, configured: u32) -> u32 {
-    let configured = configured.max(1);
-    let pending = micro_step % configured;
-    if pending == 0 {
-        configured
-    } else {
-        pending
-    }
 }
 
 fn packed_component(root: &Path, component: &str) -> Result<bool> {
@@ -286,7 +322,8 @@ impl KolorsTrainer {
         let cfg = &req.config;
         let device = &self.device;
         let dtype = compute_dtype(&cfg.train_dtype);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
+        let edges = bucket_edges(cfg);
         on_progress(TrainingProgress::Preparing);
         on_progress(TrainingProgress::LoadingModel);
 
@@ -306,7 +343,8 @@ impl KolorsTrainer {
                 )?,
             )?,
         };
-        let mut cache = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+        let mut cache = Vec::with_capacity(req.items.len() * edges.len());
         for (index, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -315,20 +353,18 @@ impl KolorsTrainer {
                 current: index as u32 + 1,
                 total: req.items.len() as u32,
             });
-            let image = load_image_tensor(&item.image_path, edge, device)?;
-            let x0 = vae.encode_mean(&image)?.detach();
-            // `load_image_tensor` center-crops to the largest square before resizing; the weight
-            // (broadcast to the latent shape) is `None` unless subject-masked loss is on (sc-24828).
-            let mask_weight = item_subject_mask_weight(
-                LABEL,
-                item,
-                cfg.subject_mask_loss.as_ref(),
-                CropBox::center_square,
-                x0.dims(),
-                device,
-            )?;
             let (context, pooled) = cache_caption(&caption_encoder, &item.caption)?;
-            cache.push((x0, context, pooled, mask_weight));
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+                                                           // The item's subject mask, read + checked once (None when masked loss is off); each
+                                                           // bucket's weight (sc-24828) is broadcast to that bucket's latent shape.
+            let mask =
+                PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
+            let buckets = encode_item_buckets(&square, &edges, mask.as_ref(), device, |image| {
+                Ok(vae.encode_mean(image)?.detach())
+            })?;
+            for (x0, mask_weight) in buckets {
+                cache.push((x0, context.clone(), pooled.clone(), mask_weight));
+            }
         }
         drop(caption_encoder);
         drop(vae);
@@ -373,7 +409,11 @@ impl KolorsTrainer {
         let mut update = 0;
         let mut steps_run = 0;
         let mut last_loss = 0.0;
-        let time_ids = build_time_ids(device, 1, edge, edge)?.to_dtype(dtype)?;
+        let time_ids = bucket_time_ids(device, &edges, dtype)?;
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let sample_order =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mae = matches!(cfg.loss_type.to_ascii_lowercase().as_str(), "mae" | "l1");
         let stem = file_stem(&req.file_name).to_string();
 
@@ -381,7 +421,9 @@ impl KolorsTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, context, pooled, mask_weight) = &cache[(step as usize - 1) % cache.len()];
+            let index = sample_order.cache_index(step as usize - 1);
+            let (x0, context, pooled, mask_weight) = &cache[index];
+            let step_time_ids = &time_ids[index % edges.len()];
             let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(step as u64));
             let timestep = rng.random_range(0..NUM_TRAIN_TIMESTEPS);
             let noise = sample_noise(x0.dims(), noise_seed(cfg.seed, step), device)?;
@@ -392,7 +434,7 @@ impl KolorsTrainer {
                 timestep as f64,
                 &projected,
                 &pooled.to_dtype(dtype)?,
-                &time_ids,
+                step_time_ids,
                 None,
                 None,
             )?;
@@ -409,8 +451,8 @@ impl KolorsTrainer {
                     .expect("an update has accumulated gradients");
                 let divisor = accumulation_divisor(step, accum);
                 scale_grads(&mut grads, &set.vars, 1.0 / divisor as f64)?;
-                clip_grad_norm(&mut grads, &set.vars, 1.0)?;
-                optimizer.step(&grads)?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_step(&mut optimizer, &mut grads, &set, cfg, update, cfg.seed)?;
                 update += 1;
             }
             on_progress(TrainingProgress::Training {
@@ -521,6 +563,94 @@ mod tests {
             .unwrap();
         assert!(half > 0.0 && half < plain);
         assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-2127: the trainer declares buckets, every bucket gets the `time_ids` of its own edge, and
+    /// the item-major cache index a step samples maps (`index % n_buckets`) to the bucket the
+    /// schedule chose — so the micro-conditioning never names a size the latent does not have.
+    #[test]
+    fn each_bucket_conditions_on_its_own_edge() {
+        use candle_gen::gen_core::ResolutionBucket;
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        let edges = [512u32, 1024];
+        let rows = bucket_time_ids(&Device::Cpu, &edges, DType::F32).unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, edge) in rows.iter().zip(edges) {
+            let e = edge as f32;
+            assert_eq!(
+                row.to_vec2::<f32>().unwrap(),
+                vec![vec![e, e, 0.0, 0.0, e, e]]
+            );
+        }
+        let buckets = [
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 4,
+            },
+            ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+        ];
+        let order = BucketSchedule::new(3, &buckets, 9);
+        for k in 0..60 {
+            assert_eq!(
+                order.cache_index(k) % edges.len(),
+                order.sample(k).1,
+                "k {k}"
+            );
+        }
+    }
+
+    /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached latent carries a weight
+    /// of ITS OWN shape (built on that bucket's grid), and the masked-out region is zero.
+    #[test]
+    fn subject_mask_weight_follows_each_buckets_latent() {
+        use candle_gen::candle_core::IndexOp;
+        use candle_gen::gen_core::SubjectMaskLoss;
+        let dir = tempfile::tempdir().unwrap();
+        // 48×32 image → center square x ∈ [8, 40); the subject is that square's left half (x < 24).
+        let image_path = dir.path().join("img.png");
+        image::RgbImage::from_pixel(48, 32, image::Rgb([128, 64, 32]))
+            .save(&image_path)
+            .unwrap();
+        let mask_path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(48, 32, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = TrainingItem {
+            image_path,
+            caption: String::new(),
+            control_image_path: None,
+            model_options: Default::default(),
+            reference_image_paths: Vec::new(),
+            subject_mask_path: Some(mask_path),
+        };
+        let cfg = SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
+        let square = decode_square(&item.image_path).unwrap();
+        let dev = Device::Cpu;
+        // A stand-in /8 encoder: `[1, 3, edge, edge]` → `[1, 3, edge/8, edge/8]`.
+        let encode = |img: &Tensor| Ok(img.avg_pool2d(8)?);
+        let entries = encode_item_buckets(&square, &[32, 64], Some(&mask), &dev, encode).unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), grid) in entries.iter().zip([4usize, 8]) {
+            assert_eq!(x0.dims(), &[1, 3, grid, grid]);
+            let w = w.as_ref().expect("masked loss is on");
+            assert_eq!(w.dims(), x0.dims(), "bucket {grid}: weight shape");
+            let rows = w.i((0, 0)).unwrap().to_vec2::<f32>().unwrap();
+            for row in rows {
+                for (x, v) in row.into_iter().enumerate() {
+                    let want = if x < grid / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "bucket {grid}: column {x}");
+                }
+            }
+        }
+        let off = encode_item_buckets(&square, &[32, 64], None, &dev, encode).unwrap();
+        assert!(off.iter().all(|(_, w)| w.is_none()));
     }
 
     #[test]

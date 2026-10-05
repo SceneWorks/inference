@@ -13,7 +13,7 @@ use std::sync::Arc;
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::train::subject_mask::CropBox;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingRequest,
@@ -22,9 +22,9 @@ use candle_gen::gen_core::{
     self, safetensors_file_metadata, safetensors_path_tensor_headers, CancelFlag, Image, LoadSpec,
     Modality, Progress, SafetensorsTensorHeader, WeightsSource,
 };
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
 use candle_gen::train::flow_match::{
-    self, item_subject_mask_weight, run_flow_match_training, weighted_velocity_loss,
+    self, prepared_subject_mask_weight, run_flow_match_training, weighted_velocity_loss,
     FlowMatchTrainer, SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
@@ -1218,6 +1218,8 @@ pub struct LtxSampleState {
     contexts: Vec<SampleContext>,
     vae: Arc<LtxVideoVae>,
     aux: TrainingAux,
+    /// LTX-2.3 preview latent edge: the largest training bucket's (sc-2127); `0` for LTX-2.5, whose
+    /// previews take their geometry from the validation plan.
     latent_edge: usize,
 }
 
@@ -1239,9 +1241,12 @@ pub struct AvTrainingPositions {
     audio: Option<Tensor>,
 }
 
+/// Run-wide state the driver threads into every micro-step. LTX-2.3 carries nothing run-wide: its
+/// RoPE position grid depends on the sample's resolution bucket, so it lives in each
+/// [`TrainingCached::Ltx23`] entry (sc-2127).
 #[derive(Clone)]
 pub enum TrainingAux {
-    Ltx23(Tensor),
+    Ltx23,
     Ltx25(AvTrainingPositions),
 }
 
@@ -1260,11 +1265,14 @@ impl LoraHost for TrainingDiT {
 }
 
 pub enum TrainingCached {
-    /// `mask_weight` is the subject-mask loss weight `[1, F·h·w, 1]` over the flattened latent
-    /// tokens (sc-24828); `None` when subject-masked loss is off.
+    /// One `(item, bucket)` still: clean latent tokens, caption context, the bucket's RoPE
+    /// position grid (shared across items by refcounted clone), and `mask_weight`, the
+    /// subject-mask loss weight `[1, F·h·w, 1]` over that bucket's flattened latent tokens
+    /// (sc-24828); `None` when subject-masked loss is off.
     Ltx23 {
         clean: Tensor,
         context: Tensor,
+        positions: Tensor,
         mask_weight: Option<Tensor>,
     },
     Ltx25(Box<AvTrainingExample>),
@@ -1315,6 +1323,11 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
     // item trains on a prepared latent bundle with no decodable image aligned to the latent
     // (refused in `validate_ltx25_training_request` and at the top of `train`).
     let subject_mask_loss = id == TRAINER_ID;
+    // sc-2127 (epic 2123): LTX-2.3 encodes stills at each bucket's spatial edge. LTX-2.5 trains on
+    // pre-encoded prepared AV latents whose geometry is fixed by the prepared bundle (one shared
+    // geometry per run, enforced at cache time) — it never resizes an image, so there is no edge
+    // a bucket could change and the shared floor keeps refusing buckets there.
+    let resolution_buckets = id == TRAINER_ID;
     TrainerDescriptor {
         id,
         family: "ltx",
@@ -1325,9 +1338,12 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets,
             subject_mask_loss,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -1475,8 +1491,13 @@ pub fn projected_dense_peak_gb(latent_tokens: usize) -> f64 {
     16.9 + 0.0251 * latent_tokens as f64
 }
 
-fn preflight_against_budget(resolution: u32, available_bytes: u64) -> Result<()> {
-    let edge = bucket_resolution(resolution);
+/// Refuse a dense (non-checkpointed) run whose first step projects past the safe budget, sized at the
+/// LARGEST training bucket edge (sc-2127 / epic 2123 E7 — just the floored `resolution` when buckets
+/// are off). The projection models the per-step activation peak, which only the sampled bucket's
+/// token count drives; the in-memory latent cache (one small latent per item per bucket) is not part
+/// of it.
+fn preflight_against_budget(cfg: &TrainingConfig, available_bytes: u64) -> Result<()> {
+    let edge = bucket_edges(cfg).into_iter().max().unwrap_or(0);
     let latent_edge = edge as usize / SPATIAL_SCALE;
     let projected = projected_dense_peak_gb(latent_edge * latent_edge);
     let available_gb = available_bytes as f64 / 1024f64.powi(3);
@@ -1489,6 +1510,32 @@ fn preflight_against_budget(resolution: u32, available_bytes: u64) -> Result<()>
         )));
     }
     Ok(())
+}
+
+/// One LTX-2.3 resolution bucket's still geometry (sc-2127): the floored pixel edge the image is
+/// resized to, its latent edge, and the matching single-frame RoPE position grid.
+struct Ltx23BucketGrid {
+    edge: u32,
+    latent_edge: usize,
+    positions: Tensor,
+}
+
+/// The per-bucket still geometry of `cfg`, in [`TrainingConfig::training_buckets`] order (exactly the
+/// one legacy `bucket_resolution(cfg.resolution)` grid when buckets are off).
+fn ltx23_bucket_grids(cfg: &TrainingConfig, device: &Device) -> Result<Vec<Ltx23BucketGrid>> {
+    bucket_edges(cfg)
+        .into_iter()
+        .map(|edge| {
+            let latent_edge = edge as usize / SPATIAL_SCALE;
+            let positions =
+                create_position_grid(1, latent_edge, latent_edge, DEFAULT_FPS as f32, device)?;
+            Ok(Ltx23BucketGrid {
+                edge,
+                latent_edge,
+                positions,
+            })
+        })
+        .collect()
 }
 
 fn available_device_bytes() -> u64 {
@@ -1836,6 +1883,9 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     gen_core::train::validate_full_finetune_request(&descriptor, req)?;
     gen_core::train::validate_edit_request(&descriptor, req)?;
     refuse_ltx25_subject_mask_loss(req)?;
+    // Epic 2123 E3: refuse an undeclared technique (weight noise, resolution buckets) here too, so
+    // the public preflight matches the `train` entry floor.
+    gen_core::train::validate_training_techniques(&descriptor, req)?;
     validate_ltx_request(req, MODEL_25_ID)?;
     if !req.config.alpha.is_finite() || req.config.alpha <= 0.0 {
         return Err(CandleError::Msg(
@@ -2501,14 +2551,14 @@ pub(crate) fn production_masked_av_lifecycle(
     )
 }
 
-/// The LTX-2.3 item's subject-mask loss weight (sc-24828), aligned token-for-token with its
-/// flattened clean latent: `None` when off (no file read). The mask is cropped like the image
-/// ([`load_image_tensor`] centre-crops a square), area-averaged onto the encoded latent's
-/// `(h, w)` grid as `[1, 1, F, h, w]` (an image mask applies to every latent frame), then flattened
-/// by the latent's own [`flatten_latent`] to `[1, F·h·w, 1]` (broadcast over the channels).
+/// One bucket's LTX-2.3 subject-mask loss weight (sc-24828), from the item's already-loaded `mask`
+/// ([`PreparedSubjectMask::load_if_enabled`]), aligned token-for-token with that bucket's flattened
+/// clean latent: `None` when off. The mask is cropped like the image ([`decode_square`] centre-crops
+/// a square), area-averaged onto the encoded latent's `(h, w)` grid as `[1, 1, F, h, w]` (an image
+/// mask applies to every latent frame), then flattened by the latent's own [`flatten_latent`] to
+/// `[1, F·h·w, 1]` (broadcast over the channels).
 fn ltx23_subject_mask_weight(
-    item: &candle_gen::gen_core::train::TrainingItem,
-    cfg: Option<&gen_core::SubjectMaskLoss>,
+    mask: Option<&PreparedSubjectMask>,
     latent_shape: &[usize],
     device: &Device,
 ) -> Result<Option<Tensor>> {
@@ -2517,15 +2567,42 @@ fn ltx23_subject_mask_weight(
             "{LABEL}: subject mask needs a [B, C, F, h, w] latent, got {latent_shape:?}"
         )));
     };
-    let weight = item_subject_mask_weight(
+    let weight = prepared_subject_mask_weight(
         LABEL,
-        item,
-        cfg,
+        mask,
         CropBox::center_square,
         &[1, 1, frames, h, w],
         device,
     )?;
     Ok(weight.map(|w| flatten_latent(&w)).transpose()?)
+}
+
+/// One item's item-major LTX-2.3 cache entries (sc-2127 × sc-24828): the decoded `square` resized to
+/// each bucket grid's edge and encoded by `encode` (`[1, 3, 1, edge, edge]` still → `[1, C, F, h, w]`
+/// latent), flattened to tokens, paired with the caption `context`, that bucket's RoPE positions and
+/// the subject-mask weight on THAT bucket's latent grid.
+fn ltx23_item_buckets(
+    square: &SquareImage,
+    grids: &[Ltx23BucketGrid],
+    mask: Option<&PreparedSubjectMask>,
+    context: &Tensor,
+    device: &Device,
+    mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
+) -> Result<Vec<TrainingCached>> {
+    grids
+        .iter()
+        .map(|grid| {
+            let video = square_image_tensor(square, grid.edge, device)?.unsqueeze(2)?;
+            let latent = encode(&video)?;
+            let mask_weight = ltx23_subject_mask_weight(mask, latent.dims(), device)?;
+            Ok(TrainingCached::Ltx23 {
+                clean: flatten_latent(&latent)?.to_dtype(DType::F32)?,
+                context: context.clone(),
+                positions: grid.positions.clone(),
+                mask_weight,
+            })
+        })
+        .collect()
 }
 
 /// Kept byte-for-byte in the LTX-2.3 branch: introducing the AV 2.5 trainer must not change the
@@ -2593,7 +2670,7 @@ impl FlowMatchTrainer for LtxTrainer {
             )));
         }
         if !req.config.gradient_checkpointing {
-            preflight_against_budget(req.config.resolution, available_device_bytes())?;
+            preflight_against_budget(&req.config, available_device_bytes())?;
         }
         if matches!(self.route, TrainingRoute::Ltx25 { .. }) {
             Ltx25ConditioningPlan::from_request(req)?;
@@ -2633,11 +2710,12 @@ impl FlowMatchTrainer for LtxTrainer {
                 )?;
                 let tokenizer = TrainingTokenizer::Gemma3(tokenizer);
                 let encoder = TrainingTextEncoder::Gemma3(Box::new(encoder));
-                let edge = bucket_resolution(req.config.resolution);
-                let latent_edge = edge as usize / SPATIAL_SCALE;
-                let positions =
-                    create_position_grid(1, latent_edge, latent_edge, DEFAULT_FPS as f32, device)?;
-                let mut cached = Vec::with_capacity(req.items.len());
+                // sc-2127 — one spatial edge (+ its RoPE grid) per resolution bucket; stills, so the
+                // frame axis stays 1. Previews render at the largest bucket.
+                let grids = ltx23_bucket_grids(&req.config, device)?;
+                let latent_edge = grids.iter().map(|g| g.latent_edge).max().unwrap_or(0);
+                // Item-major: `cached[item * grids.len() + bucket]`.
+                let mut cached = Vec::with_capacity(req.items.len() * grids.len());
                 for (i, item) in req.items.iter().enumerate() {
                     if req.cancel.is_cancelled() {
                         break;
@@ -2646,22 +2724,22 @@ impl FlowMatchTrainer for LtxTrainer {
                         current: i as u32 + 1,
                         total: req.items.len() as u32,
                     });
-                    let image = load_image_tensor(&item.image_path, edge, device)?;
-                    let video = image.unsqueeze(2)?;
-                    let latent = vae.encode(&video)?;
-                    let mask_weight = ltx23_subject_mask_weight(
+                    let context = encode_context(&tokenizer, &encoder, &item.caption, device)?;
+                    let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+                                                                   // The item's subject mask, read + checked once (None when masked loss is off).
+                    let mask = PreparedSubjectMask::load_if_enabled(
+                        LABEL,
                         item,
                         req.config.subject_mask_loss.as_ref(),
-                        latent.dims(),
-                        device,
                     )?;
-                    let clean = flatten_latent(&latent)?.to_dtype(DType::F32)?;
-                    let context = encode_context(&tokenizer, &encoder, &item.caption, device)?;
-                    cached.push(TrainingCached::Ltx23 {
-                        clean,
-                        context,
-                        mask_weight,
-                    });
+                    cached.extend(ltx23_item_buckets(
+                        &square,
+                        &grids,
+                        mask.as_ref(),
+                        &context,
+                        device,
+                        |video| Ok(vae.encode(video)?),
+                    )?);
                 }
                 let sample_plan =
                     if req.config.sample_every > 0 && !req.config.sample_prompts.is_empty() {
@@ -2686,14 +2764,14 @@ impl FlowMatchTrainer for LtxTrainer {
                             state: Some(LtxSampleState {
                                 contexts,
                                 vae: Arc::new(vae),
-                                aux: TrainingAux::Ltx23(positions.clone()),
+                                aux: TrainingAux::Ltx23,
                                 latent_edge,
                             }),
                         }
                     } else {
                         SamplePlan::disabled()
                     };
-                Ok((cached, TrainingAux::Ltx23(positions), sample_plan))
+                Ok((cached, TrainingAux::Ltx23, sample_plan))
             }
             TrainingRoute::Ltx25 { bundle, tier, .. } => {
                 // A packed tier is a complete release unit: even though this trainer consumes
@@ -2874,9 +2952,10 @@ impl FlowMatchTrainer for LtxTrainer {
                 TrainingCached::Ltx23 {
                     clean,
                     context,
+                    positions,
                     mask_weight,
                 },
-                TrainingAux::Ltx23(positions),
+                TrainingAux::Ltx23,
             ) => {
                 let noise = flow_match::sample_noise(
                     clean.dims(),
@@ -2957,12 +3036,10 @@ impl FlowMatchTrainer for LtxTrainer {
         seed: u64,
     ) -> Result<Image> {
         match (dit, &state.contexts[index], &state.aux) {
-            (
-                TrainingDiT::Ltx23(dit),
-                SampleContext::Ltx23(context),
-                TrainingAux::Ltx23(positions),
-            ) => {
+            (TrainingDiT::Ltx23(dit), SampleContext::Ltx23(context), TrainingAux::Ltx23) => {
                 let edge = state.latent_edge;
+                let positions =
+                    &create_position_grid(1, edge, edge, DEFAULT_FPS as f32, &self.device)?;
                 let latent = crate::pipeline::create_noise(seed, 1, edge, edge, &self.device)?;
                 let noise = flatten_latent(&latent)?;
                 let cancel = CancelFlag::new();
@@ -3506,11 +3583,136 @@ mod tests {
     #[test]
     fn memory_projection_and_guard_are_testable_before_cache() {
         assert!((projected_dense_peak_gb(1024) - 42.6024).abs() < 1e-4);
-        preflight_against_budget(512, 64 * 1024 * 1024 * 1024).unwrap();
-        let err = preflight_against_budget(2048, 16 * 1024 * 1024 * 1024)
+        let at = |resolution: u32| TrainingConfig {
+            resolution,
+            ..TrainingConfig::default()
+        };
+        preflight_against_budget(&at(512), 64 * 1024 * 1024 * 1024).unwrap();
+        let err = preflight_against_budget(&at(2048), 16 * 1024 * 1024 * 1024)
             .unwrap_err()
             .to_string();
         assert!(err.contains("gradient checkpointing"), "{err}");
+    }
+
+    fn bucketed(resolution: u32, edges: &[u32]) -> TrainingConfig {
+        TrainingConfig {
+            resolution,
+            resolution_buckets: edges
+                .iter()
+                .map(|&resolution| gen_core::ResolutionBucket {
+                    resolution,
+                    repeats: 1,
+                })
+                .collect(),
+            ..TrainingConfig::default()
+        }
+    }
+
+    /// sc-2127 / E7: the dense-step guard sizes for the LARGEST bucket, not `resolution` or the
+    /// first bucket — `[512, 2048]` at 32 GiB refuses exactly like a 2048 run although 512 alone
+    /// passes. (Mutation: sizing from `cfg.resolution` or `bucket_edges(cfg)[0]` makes it pass.)
+    #[test]
+    fn memory_guard_sizes_for_the_largest_bucket() {
+        let budget = 32 * 1024 * 1024 * 1024;
+        preflight_against_budget(&bucketed(512, &[]), budget).unwrap();
+        preflight_against_budget(&bucketed(2048, &[512]), budget).unwrap();
+        let err = preflight_against_budget(&bucketed(512, &[512, 2048]), budget)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2048px"), "{err}");
+    }
+
+    /// sc-2127: one still grid per bucket, in bucket order — floored edge, latent edge and a RoPE
+    /// grid with that bucket's token count (one frame); buckets off ⇒ the single legacy grid.
+    /// (Mutation: building every grid from the max edge makes the 512 grid the wrong size.)
+    #[test]
+    fn ltx23_bucket_grids_follow_each_bucket_edge() {
+        let dev = Device::Cpu;
+        let legacy = ltx23_bucket_grids(&bucketed(1000, &[]), &dev).unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].edge, 992);
+        let grids = ltx23_bucket_grids(&bucketed(1000, &[512, 1024]), &dev).unwrap();
+        assert_eq!(
+            grids.iter().map(|g| g.edge).collect::<Vec<_>>(),
+            [512, 1024]
+        );
+        for g in &grids {
+            assert_eq!(g.latent_edge, g.edge as usize / SPATIAL_SCALE);
+            let expected =
+                create_position_grid(1, g.latent_edge, g.latent_edge, DEFAULT_FPS as f32, &dev)
+                    .unwrap();
+            assert_eq!(g.positions.dims(), expected.dims(), "edge {}", g.edge);
+        }
+        assert_ne!(grids[0].positions.dims(), grids[1].positions.dims());
+    }
+
+    /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached still carries a weight
+    /// lined up with ITS OWN flattened latent tokens (and positions), and the masked-out region is
+    /// zero. (Mutation: weighting every bucket on the first bucket's grid misaligns bucket 2.)
+    #[test]
+    fn subject_mask_weight_follows_each_buckets_latent_tokens() {
+        let dev = Device::Cpu;
+        let dir = tempfile::tempdir().unwrap();
+        // 96×64 image → center square x ∈ [16, 80); the subject is that square's left half (x < 48).
+        let image_path = dir.path().join("img.png");
+        image::RgbImage::from_pixel(96, 64, image::Rgb([128, 64, 32]))
+            .save(&image_path)
+            .unwrap();
+        let mask_path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(96, 64, |x, _| image::Luma([if x < 48 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = candle_gen::gen_core::train::TrainingItem {
+            image_path,
+            caption: String::new(),
+            control_image_path: None,
+            model_options: Default::default(),
+            reference_image_paths: Vec::new(),
+            subject_mask_path: Some(mask_path),
+        };
+        let cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load(LABEL, &item, &cfg).unwrap();
+        let square = decode_square(&item.image_path).unwrap();
+        let grids = ltx23_bucket_grids(&bucketed(64, &[64, 128]), &dev).unwrap();
+        let context = Tensor::zeros((1, 3, 8), DType::F32, &dev).unwrap();
+        // A stand-in /32 still encoder: `[1, 3, 1, e, e]` → `[1, 3, 1, e/32, e/32]`.
+        let encode =
+            |video: &Tensor| Ok(video.squeeze(2)?.avg_pool2d(SPATIAL_SCALE)?.unsqueeze(2)?);
+        let entries =
+            ltx23_item_buckets(&square, &grids, Some(&mask), &context, &dev, encode).unwrap();
+        assert_eq!(entries.len(), 2);
+        for (entry, grid) in entries.iter().zip(&grids) {
+            let TrainingCached::Ltx23 {
+                clean,
+                positions,
+                mask_weight,
+                ..
+            } = entry
+            else {
+                panic!("an LTX-2.3 entry");
+            };
+            let side = grid.latent_edge;
+            assert_eq!(clean.dim(1).unwrap(), side * side);
+            assert_eq!(positions.dims(), grid.positions.dims());
+            let w = mask_weight.as_ref().expect("masked loss is on");
+            assert_eq!(w.dims(), &[1, side * side, 1], "edge {}", grid.edge);
+            let values = w.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (i, v) in values.into_iter().enumerate() {
+                let want = if i % side < side / 2 { 1.0 } else { 0.0 };
+                assert_eq!(v, want, "edge {}: token {i}", grid.edge);
+            }
+        }
+        let off = ltx23_item_buckets(&square, &grids, None, &context, &dev, encode).unwrap();
+        assert!(off.iter().all(|e| matches!(
+            e,
+            TrainingCached::Ltx23 {
+                mask_weight: None,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -3518,6 +3720,8 @@ mod tests {
         let d = trainer_descriptor();
         assert_eq!(d.id, TRAINER_ID);
         assert_eq!(d.backend, "candle");
+        assert!(d.techniques.resolution_buckets);
+        assert!(!trainer_descriptor_25().techniques.resolution_buckets);
         assert!(d.supports_lora);
         assert!(!d.supports_lokr);
         assert_eq!(LTX_ATTN_TARGETS, ["to_q", "to_k", "to_v", "to_out.0"]);
@@ -4065,6 +4269,21 @@ mod tests {
         match validate_ltx25_training_request(&req) {
             Err(CandleError::Unsupported(message)) => {
                 assert!(message.contains("instruction-edit"), "{message}")
+            }
+            other => panic!("expected a typed Unsupported, got {other:?}"),
+        }
+    }
+
+    /// sc-2127: LTX-2.5 (prepared fixed-geometry latents) does not declare resolution buckets, and
+    /// its public preflight refuses them typed — not only the `train` entry floor. (Mutation:
+    /// dropping the `validate_training_techniques` call from `validate_ltx25_training_request`.)
+    #[test]
+    fn ltx25_preflight_refuses_resolution_buckets_typed() {
+        let mut req = request();
+        req.config.resolution_buckets = bucketed(512, &[512, 1024]).resolution_buckets;
+        match validate_ltx25_training_request(&req) {
+            Err(CandleError::Unsupported(message)) => {
+                assert!(message.contains("bucket"), "{message}")
             }
             other => panic!("expected a typed Unsupported, got {other:?}"),
         }

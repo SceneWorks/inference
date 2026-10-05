@@ -50,21 +50,23 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{
     schedule_sigmas, DiscreteModelSampling, Scheduler as SamplingScheduler,
 };
-use candle_gen::gen_core::train::subject_mask::CropBox;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
+use candle_gen::gen_core::{self, BucketSchedule, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
-use candle_gen::train::flow_match::{item_subject_mask_weight, weighted_velocity_loss};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
+use candle_gen::train::flow_match::{prepared_subject_mask_weight, weighted_velocity_loss};
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
 use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
-    LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
+    adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
+    AdapterKind, LoraHost, LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use candle_gen::train::optim::{
+    accumulate_grads, accumulation_divisor, scale_grads, TrainOptimizer,
+};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 
@@ -535,11 +537,52 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        // sc-24828 (epic 2123): subject-masked loss.
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
+}
+
+/// One item's item-major cache entries (sc-2127 × sc-24828): the decoded `square` encoded at each
+/// bucket edge by `encode` (`[1, 3, edge, edge]` → clean latent), each paired with its subject-mask
+/// loss weight on THAT bucket's latent grid (`None` when masked loss is off). `decode_square`
+/// center-crops, so the mask is cropped with [`CropBox::center_square`].
+fn encode_item_buckets(
+    square: &SquareImage,
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    device: &Device,
+    mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
+) -> Result<Vec<(Tensor, Option<Tensor>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(&square_image_tensor(square, edge, device)?)?;
+            let mask_weight = prepared_subject_mask_weight(
+                "sdxl trainer",
+                mask,
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
+}
+
+/// The bucket index of the largest training edge (the first one on a tie) — previews denoise at
+/// this bucket's cached latent grid (epic 2123 E7: run-wide sizing follows the largest edge).
+fn largest_bucket(edges: &[u32]) -> usize {
+    edges
+        .iter()
+        .enumerate()
+        .fold(0, |best, (i, &e)| if e > edges[best] { i } else { best })
 }
 
 /// A loaded candle SDXL trainer. Loading is **lazy** (no file I/O — mirrors [`crate::SdxlGenerator`]):
@@ -642,7 +685,8 @@ impl SdxlTrainer {
         let cfg = &req.config;
         let device = &self.device;
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
+        let edges = bucket_edges(cfg);
         let compute_dtype = parse_compute_dtype(&cfg.train_dtype);
 
         // --- load + cache: VAE latents (.mean × scale) + dual-CLIP conditioning ---
@@ -663,9 +707,11 @@ impl SdxlTrainer {
         )?;
 
         let total = req.items.len() as u32;
-        // `(x0 latent, conditioning, subject-mask loss weight)` — the weight (broadcast to the latent
-        // shape) is `None` unless subject-masked loss is on (sc-24828).
-        let mut cache: Vec<(Tensor, Tensor, Option<Tensor>)> = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127) of `(x0 latent, conditioning,
+        // subject-mask loss weight)` — the weight (broadcast to that bucket's latent shape) is `None`
+        // unless subject-masked loss is on (sc-24828).
+        let mut cache: Vec<(Tensor, Tensor, Option<Tensor>)> =
+            Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -674,19 +720,20 @@ impl SdxlTrainer {
                 current: i as u32 + 1,
                 total,
             });
-            let img = load_image_tensor(&item.image_path, edge, device)?;
-            let x0 = cache_frozen_encoder_output(vae.encode_mean(&img)?);
-            // `load_image_tensor` center-crops to the largest square before resizing.
-            let mask_weight = item_subject_mask_weight(
+            let cond = cache_frozen_encoder_output(clip.encode(&item.caption)?);
+            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+                                                           // The item's subject mask, read + checked once (None when masked loss is off).
+            let mask = PreparedSubjectMask::load_if_enabled(
                 "sdxl trainer",
                 item,
                 cfg.subject_mask_loss.as_ref(),
-                CropBox::center_square,
-                x0.dims(),
-                device,
             )?;
-            let cond = cache_frozen_encoder_output(clip.encode(&item.caption)?);
-            cache.push((x0, cond, mask_weight));
+            let buckets = encode_item_buckets(&square, &edges, mask.as_ref(), device, |img| {
+                Ok(cache_frozen_encoder_output(vae.encode_mean(img)?))
+            })?;
+            for (x0, mask_weight) in buckets {
+                cache.push((x0, cond.clone(), mask_weight));
+            }
         }
 
         // --- preview samples (sc-8650): pre-encode the prompts + load a resident VAE decoder ---
@@ -792,11 +839,16 @@ impl SdxlTrainer {
         // --- train loop ---
         // Preview latent grid (sc-8650): the cached `x0`'s spatial dims are the exact /8 latent grid the
         // dataset was encoded at, so a preview denoises at the training resolution (parity with the
-        // bucketed `edge` the cache loop used). Read once from the first cache entry.
+        // bucketed `edge` the cache loop used). Read once from the first item's entry at the LARGEST
+        // bucket (sc-2127; item-major cache, so that is `cache[largest_bucket]`).
         let (lat_h, lat_w) = {
-            let (_, _, h, w) = cache[0].0.dims4()?;
+            let (_, _, h, w) = cache[largest_bucket(&edges)].0.dims4()?;
             (h, w)
         };
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<GradStore> = None;
         let mut update_idx = 0u32;
         let mut last_loss = 0.0f32;
@@ -805,7 +857,7 @@ impl SdxlTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, cond, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, cond, mask_weight) = &cache[schedule.cache_index((step - 1) as usize)];
             let t = sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64));
             let noise = sample_noise(
                 x0.dims(),
@@ -836,9 +888,13 @@ impl SdxlTrainer {
                 let mut avg = accumulated
                     .take()
                     .expect("an update fires only after accumulation");
-                scale_grads(&mut avg, &lora_set.vars, 1.0 / accum as f64)?;
-                clip_grad_norm(&mut avg, &lora_set.vars, 1.0)?;
-                opt.step(&avg)?;
+                // Average by the window's ACTUAL micro-step count (F-017): the final flush at
+                // `step == cfg.steps` with `steps % accum != 0` holds fewer than `accum` grads, and
+                // a `1/accum` scale would down-weight that tail update (and its gradient noise).
+                let divisor = accumulation_divisor(step, accum);
+                scale_grads(&mut avg, &lora_set.vars, 1.0 / divisor as f64)?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_step(&mut opt, &mut avg, &lora_set, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
             }
 
@@ -1176,6 +1232,58 @@ mod tests {
         assert!(trainer_descriptor().techniques.subject_mask_loss);
     }
 
+    /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached latent carries a weight
+    /// of ITS OWN shape (built on that bucket's grid), and the masked-out region is zero.
+    #[test]
+    fn subject_mask_weight_follows_each_buckets_latent() {
+        use candle_core::IndexOp;
+        use candle_gen::gen_core::train::TrainingItem;
+        use candle_gen::gen_core::SubjectMaskLoss;
+        let dir = tempfile::tempdir().unwrap();
+        // 48×32 image → center square x ∈ [8, 40); the subject is that square's left half (x < 24).
+        let image_path = dir.path().join("img.png");
+        image::RgbImage::from_pixel(48, 32, image::Rgb([128, 64, 32]))
+            .save(&image_path)
+            .unwrap();
+        let mask_path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(48, 32, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = TrainingItem {
+            image_path,
+            caption: String::new(),
+            control_image_path: None,
+            model_options: Default::default(),
+            reference_image_paths: Vec::new(),
+            subject_mask_path: Some(mask_path),
+        };
+        let cfg = SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
+        let square = decode_square(&item.image_path).unwrap();
+        let dev = Device::Cpu;
+        // A stand-in /8 encoder: `[1, 3, edge, edge]` → `[1, 3, edge/8, edge/8]`.
+        let encode = |img: &Tensor| Ok(img.avg_pool2d(8)?);
+        let entries = encode_item_buckets(&square, &[32, 64], Some(&mask), &dev, encode).unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), grid) in entries.iter().zip([4usize, 8]) {
+            assert_eq!(x0.dims(), &[1, 3, grid, grid]);
+            let w = w.as_ref().expect("masked loss is on");
+            assert_eq!(w.dims(), x0.dims(), "bucket {grid}: weight shape");
+            let rows = w.i((0, 0)).unwrap().to_vec2::<f32>().unwrap();
+            for row in rows {
+                for (x, v) in row.into_iter().enumerate() {
+                    let want = if x < grid / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "bucket {grid}: column {x}");
+                }
+            }
+        }
+        let off = encode_item_buckets(&square, &[32, 64], None, &dev, encode).unwrap();
+        assert!(off.iter().all(|(_, w)| w.is_none()));
+    }
+
     /// F-083 / sc-11173: the trainer preview drives the SAME curated sampler SDXL inference uses, not
     /// the native candle-transformers `DDIMScheduler` loop that sc-10826 diagnosed as rendering a
     /// ghosted double-exposure. Two guards:
@@ -1273,6 +1381,16 @@ mod tests {
         assert_eq!(t.descriptor().backend, "candle");
         assert!(t.descriptor().supports_lora);
         assert!(t.descriptor().supports_lokr);
+    }
+
+    /// sc-2127: the trainer declares resolution buckets, and previews size for the cache slot of
+    /// the largest bucket edge (the first on a tie; slot 0 when buckets are off).
+    #[test]
+    fn descriptor_declares_buckets_and_previews_use_the_largest_edge() {
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        assert_eq!(largest_bucket(&[512]), 0);
+        assert_eq!(largest_bucket(&[512, 1024, 768]), 1);
+        assert_eq!(largest_bucket(&[1024, 512, 1024]), 0);
     }
 
     /// epic 13657 (sc-13663): the trainer takes the SAME three components as the registered generator

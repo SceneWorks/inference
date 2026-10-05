@@ -116,8 +116,20 @@ pub fn request_fingerprint(req: &TrainingRequest) -> crate::Result<String> {
 }
 
 /// The training-config knobs a resume must continue unchanged, as one comparable string.
+///
+/// Adapter noise (epic 2123, sc-24826/sc-24827) changes the trained trajectory, so a non-zero
+/// `weight_noise_sigma` appends `;weight_noise=<sigma>` and a non-zero `gradient_noise_eta` appends
+/// `;gradient_noise=<eta>/<gamma>` (gamma only matters while eta is on). With both off nothing is
+/// appended, so every pre-noise resume bundle keeps the fingerprint it was written with.
+///
+/// Resolution buckets (sc-2127) change the cache layout and the sample order, so a non-empty
+/// bucket list is appended (`;buckets=<res>x<repeats>,…`); an empty list appends nothing, so every
+/// pre-bucket resume bundle keeps the fingerprint it was written with.
+///
+/// Subject-masked loss (sc-24828) changes the objective, so it appends
+/// `;subject_mask_loss=<background>,<subject>` when on and nothing when off.
 pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
-    let base = format!(
+    let mut fingerprint = format!(
         "steps={};accum={};scheduler={:?};warmup={};rank={};alpha={};seed={};resolution={};loss={};dtype={};\
          checkpoint={};timestep_type={};timestep_bias={}",
         cfg.steps,
@@ -134,15 +146,30 @@ pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
         cfg.timestep_type,
         cfg.timestep_bias
     );
-    // Subject-masked loss (sc-24828) changes the objective, so a resume must keep it — appended
-    // only when on, so every unmasked config keeps the fingerprint its bundles recorded.
-    match &cfg.subject_mask_loss {
-        Some(m) => format!(
-            "{base};subject_mask_loss={},{}",
-            m.background_weight, m.subject_weight
-        ),
-        None => base,
+    if cfg.weight_noise_sigma != 0.0 {
+        fingerprint.push_str(&format!(";weight_noise={:?}", cfg.weight_noise_sigma));
     }
+    if cfg.gradient_noise_eta != 0.0 {
+        fingerprint.push_str(&format!(
+            ";gradient_noise={:?}/{:?}",
+            cfg.gradient_noise_eta, cfg.gradient_noise_gamma
+        ));
+    }
+    if !cfg.resolution_buckets.is_empty() {
+        let buckets: Vec<String> = cfg
+            .resolution_buckets
+            .iter()
+            .map(|b| format!("{}x{}", b.resolution, b.repeats))
+            .collect();
+        fingerprint.push_str(&format!(";buckets={}", buckets.join(",")));
+    }
+    if let Some(m) = &cfg.subject_mask_loss {
+        fingerprint.push_str(&format!(
+            ";subject_mask_loss={:?},{:?}",
+            m.background_weight, m.subject_weight
+        ));
+    }
+    fingerprint
 }
 
 /// Refuse a resume bundle (by its safetensors `meta`) whose recorded training config or dataset
@@ -304,7 +331,7 @@ mod tests {
         let base = training_config_fingerprint(&off);
         assert!(!base.contains("subject_mask"), "{base}");
         let with = training_config_fingerprint(&on);
-        assert_eq!(with, format!("{base};subject_mask_loss=0,1"));
+        assert_eq!(with, format!("{base};subject_mask_loss=0.0,1.0"));
     }
 
     #[test]
@@ -345,5 +372,121 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing training_config"), "{err}");
+    }
+
+    /// sc-24827: the adapter-noise knobs are part of the resume config fingerprint — changing any
+    /// of them refuses the resume — while a knobs-off config keeps the exact pre-noise string, so
+    /// existing resume bundles still match. The expected string is the literal pre-change format
+    /// for `TrainingConfig::default()`.
+    ///
+    /// *Mutations that red this:* dropping either append; appending unconditionally (the knobs-off
+    /// string changes); omitting gamma from the gradient-noise append.
+    #[test]
+    fn adapter_noise_knobs_join_the_config_fingerprint_without_moving_the_off_value() {
+        let off = TrainingConfig::default();
+        let pre_change = format!(
+            "steps={};accum={};scheduler={:?};warmup={};rank={};alpha={};seed={};resolution={};\
+             loss={};dtype={};checkpoint={};timestep_type={};timestep_bias={}",
+            off.steps,
+            off.gradient_accumulation.max(1),
+            off.lr_scheduler,
+            off.lr_warmup_steps,
+            off.rank,
+            off.alpha,
+            off.seed,
+            off.resolution,
+            off.loss_type,
+            off.train_dtype,
+            off.gradient_checkpointing,
+            off.timestep_type,
+            off.timestep_bias
+        );
+        assert_eq!(training_config_fingerprint(&off), pre_change);
+        // Gamma alone (eta off) trains identically, so it must not strand a bundle either.
+        let gamma_only = TrainingConfig {
+            gradient_noise_gamma: 0.9,
+            ..off.clone()
+        };
+        assert_eq!(training_config_fingerprint(&gamma_only), pre_change);
+
+        let weight = TrainingConfig {
+            weight_noise_sigma: 0.0125,
+            ..off.clone()
+        };
+        let weight2 = TrainingConfig {
+            weight_noise_sigma: 0.02,
+            ..off.clone()
+        };
+        let grad = TrainingConfig {
+            gradient_noise_eta: 0.01,
+            ..off.clone()
+        };
+        let grad_eta2 = TrainingConfig {
+            gradient_noise_eta: 0.02,
+            ..off.clone()
+        };
+        let grad_gamma2 = TrainingConfig {
+            gradient_noise_gamma: 0.9,
+            ..grad.clone()
+        };
+        let fps: Vec<String> = [&off, &weight, &weight2, &grad, &grad_eta2, &grad_gamma2]
+            .iter()
+            .map(|c| training_config_fingerprint(c))
+            .collect();
+        for i in 0..fps.len() {
+            for j in (i + 1)..fps.len() {
+                assert_ne!(
+                    fps[i], fps[j],
+                    "configs {i} and {j} must fingerprint differently"
+                );
+            }
+        }
+        // ...and the resume check refuses a changed knob.
+        let meta = HashMap::from([
+            (TRAINING_CONFIG_KEY.to_owned(), fps[1].clone()),
+            (REQUEST_FINGERPRINT_KEY.to_owned(), "fp".to_owned()),
+        ]);
+        check_resume_fingerprints(&meta, &weight, "fp").unwrap();
+        assert!(check_resume_fingerprints(&meta, &off, "fp").is_err());
+    }
+
+    /// sc-2127: buckets are part of the resume config identity — a bundle written with one bucket
+    /// list refuses a resume under another (or under none) — while a bucket-free config keeps its
+    /// pre-bucket fingerprint byte for byte.
+    #[test]
+    fn resolution_buckets_are_part_of_the_resume_config_fingerprint() {
+        use crate::train::ResolutionBucket;
+        let plain = TrainingConfig::default();
+        assert!(!training_config_fingerprint(&plain).contains("buckets"));
+        let bucketed = TrainingConfig {
+            resolution_buckets: vec![
+                ResolutionBucket {
+                    resolution: 512,
+                    repeats: 16,
+                },
+                ResolutionBucket {
+                    resolution: 1024,
+                    repeats: 1,
+                },
+            ],
+            ..plain.clone()
+        };
+        assert!(training_config_fingerprint(&bucketed).ends_with(";buckets=512x16,1024x1"));
+        let meta = HashMap::from([
+            (
+                TRAINING_CONFIG_KEY.to_string(),
+                training_config_fingerprint(&bucketed),
+            ),
+            (REQUEST_FINGERPRINT_KEY.to_string(), "fp".to_string()),
+        ]);
+        check_resume_fingerprints(&meta, &bucketed, "fp").unwrap();
+        let mut remixed = bucketed.clone();
+        remixed.resolution_buckets[0].repeats = 4;
+        for other in [plain, remixed] {
+            let err = check_resume_fingerprints(&meta, &other, "fp")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("training configuration differs"), "{err}");
+        }
     }
 }

@@ -6,20 +6,23 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor, Var};
-use candle_gen::gen_core::train::subject_mask::CropBox;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, NetworkType, Precision, WeightsSource};
+use candle_gen::gen_core::{
+    self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
+};
 use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
-    self, effective_weight_decay, item_subject_mask_weight, noise_seed, sample_noise, save_adapter,
-    validate_flow_match_request, weighted_velocity_loss,
+    self, effective_weight_decay, noise_seed, prepared_subject_mask_weight, sample_noise,
+    save_adapter, validate_flow_match_request, weighted_velocity_loss,
 };
 use candle_gen::train::lora::{
-    build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost, LoraSet,
+    adapter_optimizer_step, build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost,
+    LoraSet,
 };
 use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
@@ -45,9 +48,15 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         supports_control: false,
         supports_full_finetune: true,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        // sc-24828 (epic 2123): subject-masked loss — a per-bucket weight map, packed like that
+        // bucket's latent, cached next to it.
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -244,6 +253,26 @@ fn pack_latent_tokens(latent: &Tensor, grid: usize, channels: usize) -> Result<T
         .reshape((1, grid * grid, channels))?)
 }
 
+/// The subject-mask loss weight for one bucket's cached latent (sc-24828 × sc-2127), `None` when
+/// masked loss is off. The item's mask (loaded once) takes [`decode_square`]'s centre-square crop,
+/// is area-averaged onto this bucket's unpacked `[1, C, grid, grid]` latent grid, and is packed with
+/// [`pack_latent_tokens`] exactly like that bucket's latent.
+fn bucket_mask_weight(
+    mask: Option<&PreparedSubjectMask>,
+    grid: usize,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    prepared_subject_mask_weight(
+        LABEL,
+        mask,
+        CropBox::center_square,
+        &[1, config::LATENT_CHANNELS, grid, grid],
+        device,
+    )?
+    .map(|weight| pack_latent_tokens(&weight, grid, config::LATENT_CHANNELS))
+    .transpose()
+}
+
 /// One step's flow-match loss over a cached sample: noise the packed latent at `sigma`, predict the
 /// velocity through the transformer (adapter or full surface alike), regress it toward
 /// `noise − latent`, weighted by the sample's subject-mask weight (`None` ⇒ exactly the unweighted
@@ -272,6 +301,15 @@ fn step_loss(
     )?)
 }
 
+/// The packed latent grid side and the single-image generation layout for one bucket `edge` and a
+/// `text_len`-token caption (sc-2127): every bucket's cached latent carries the layout of its own
+/// grid, so the MSRoPE table built per step always matches the token count it is applied to.
+fn bucket_layout(edge: u32, text_len: usize) -> Result<(usize, PackLayout)> {
+    let grid = edge as usize / VAE_DOWNSAMPLE;
+    let layout = PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![text_len])?;
+    Ok((grid, layout))
+}
+
 fn cache_samples(
     dirs: &MageComponentDirs,
     req: &TrainingRequest,
@@ -282,9 +320,11 @@ fn cache_samples(
     let text_encoder =
         MageTextEncoder::load_component_with_quant(&dirs.text_encoder, false, None, device)?;
     let vae = MageVae::load_full(&dirs.vae, device)?;
-    let edge = bucket_resolution(req.config.resolution);
-    let grid = edge as usize / VAE_DOWNSAMPLE;
-    let mut cache = Vec::with_capacity(req.items.len());
+    // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off);
+    // each bucket packs its own latent grid.
+    let edges = bucket_edges(&req.config);
+    // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+    let mut cache = Vec::with_capacity(req.items.len() * edges.len());
     for (index, item) in req.items.iter().enumerate() {
         if req.cancel.is_cancelled() {
             break;
@@ -293,34 +333,32 @@ fn cache_samples(
             current: index as u32 + 1,
             total: req.items.len() as u32,
         });
-        let image = load_image_tensor(&item.image_path, edge, device)?;
-        let latent = pack_latent_tokens(
-            &vae.encode_sample(&image, req.config.seed.wrapping_add(index as u64))?,
-            grid,
-            config::LATENT_CHANNELS,
-        )?
-        .detach();
-        // `load_image_tensor` centre-crops to a square, so the mask takes the same crop. The weight
-        // is built on the unpacked `[1, C, grid, grid]` latent grid and packed like the latent.
-        let mask_weight = item_subject_mask_weight(
+        let text = text_encoder.encode(&item.caption)?.detach();
+        // sc-24828: the item's subject mask is read + checked once, then resampled per bucket onto
+        // that bucket's latent grid (`None` when masked loss is off).
+        let mask = PreparedSubjectMask::load_if_enabled(
             LABEL,
             item,
             req.config.subject_mask_loss.as_ref(),
-            CropBox::center_square,
-            &[1, config::LATENT_CHANNELS, grid, grid],
-            device,
-        )?
-        .map(|weight| pack_latent_tokens(&weight, grid, config::LATENT_CHANNELS))
-        .transpose()?;
-        let text = text_encoder.encode(&item.caption)?.detach();
-        let layout =
-            PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![text.dim(1)?])?;
-        cache.push(CachedSample {
-            latent,
-            text,
-            layout,
-            mask_weight,
-        });
+        )?;
+        let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+        for &edge in &edges {
+            let (grid, layout) = bucket_layout(edge, text.dim(1)?)?;
+            let image = square_image_tensor(&square, edge, device)?;
+            let latent = pack_latent_tokens(
+                &vae.encode_sample(&image, req.config.seed.wrapping_add(index as u64))?,
+                grid,
+                config::LATENT_CHANNELS,
+            )?
+            .detach();
+            let mask_weight = bucket_mask_weight(mask.as_ref(), grid, device)?;
+            cache.push(CachedSample {
+                latent,
+                text: text.clone(),
+                layout,
+                mask_weight,
+            });
+        }
     }
     if cache.is_empty() {
         return Err(if req.cancel.is_cancelled() {
@@ -443,12 +481,17 @@ impl MageTrainer {
         let mut update = 0;
         let mut steps_run = 0;
         let mut last_loss = 0.0;
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise). The
+        // adapter and full fine-tune surfaces share this cache and schedule.
+        let buckets = req.config.training_buckets();
+        let schedule = BucketSchedule::new(cache.len() / buckets.len(), &buckets, req.config.seed);
 
         for step in 1..=req.config.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[(step as usize - 1) % cache.len()];
+            let sample = &cache[schedule.cache_index(step as usize - 1)];
             let sigma = flow_match::sample_unit_timestep(
                 &req.config.timestep_type,
                 &req.config.timestep_bias,
@@ -480,8 +523,24 @@ impl MageTrainer {
                     step % accum
                 };
                 scale_grads(&mut grads, &vars, 1.0 / window as f64)?;
-                clip_grad_norm(&mut grads, &vars, 1.0)?;
-                optimizer.step(&grads)?;
+                match &surface {
+                    // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                    TrainSurface::Adapter(set) => adapter_optimizer_step(
+                        &mut optimizer,
+                        &mut grads,
+                        set,
+                        &req.config,
+                        update,
+                        req.config.seed,
+                    )?,
+                    // A full fine-tune trains base weights: both noise techniques are refused for
+                    // it by the shared `validate_training_techniques` floor, so the plain
+                    // clip + step is the whole update.
+                    TrainSurface::Full(_) => {
+                        clip_grad_norm(&mut grads, &vars, 1.0)?;
+                        optimizer.step(&grads)?;
+                    }
+                }
                 update += 1;
             }
             on_progress(TrainingProgress::Training {
@@ -850,9 +909,81 @@ mod tests {
         }
     }
 
+    /// sc-24828 × sc-2127: with two resolution buckets and masked loss on, the item's mask (loaded
+    /// once) yields a weight per bucket packed exactly like that bucket's latent (`[1, grid², C]`),
+    /// and the masked-out region (the right half of the centre crop) is zero.
+    #[test]
+    fn bucket_mask_weight_follows_each_bucket_latent() {
+        let dir = tempfile::tempdir().unwrap();
+        // A 48x32 landscape image: centre crop x in [8, 40); subject = crop's left half [8, 24).
+        let img = dir.path().join("img.png");
+        image::RgbImage::new(48, 32).save(&img).unwrap();
+        let mask_path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(48, 32, |x, _| {
+            image::Luma([if (8..24).contains(&x) { 255 } else { 0 }])
+        })
+        .save(&mask_path)
+        .unwrap();
+        let mut item = gen_core::TrainingItem::captioned(img, "c".into());
+        item.subject_mask_path = Some(mask_path);
+        let on = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load_if_enabled(LABEL, &item, Some(&on))
+            .unwrap()
+            .expect("masked loss on");
+        for edge in [4 * VAE_DOWNSAMPLE as u32, 8 * VAE_DOWNSAMPLE as u32] {
+            let (grid, _) = bucket_layout(edge, 1).unwrap();
+            let latent_shape = [1usize, grid * grid, config::LATENT_CHANNELS];
+            let w = bucket_mask_weight(Some(&mask), grid, &Device::Cpu)
+                .unwrap()
+                .expect("weight");
+            assert_eq!(w.dims(), &latent_shape, "edge {edge}");
+            let rows = w.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+            for (token, row) in rows.iter().enumerate() {
+                let expected = if token % grid < grid / 2 { 1.0 } else { 0.0 };
+                assert!(
+                    row.iter().all(|v| *v == expected),
+                    "edge {edge} token {token}: {row:?}"
+                );
+            }
+        }
+        assert!(bucket_mask_weight(None, 4, &Device::Cpu).unwrap().is_none());
+    }
+
     #[test]
     fn descriptor_declares_subject_mask_loss() {
         assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-2127: the trainer declares buckets, each bucket edge packs its own grid, and the real
+    /// transformer accepts a cached sample of each bucket's size with that bucket's layout.
+    #[test]
+    fn each_bucket_packs_its_own_grid_and_forwards() {
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        for (edge, grid) in [(512u32, 32usize), (1024, 64)] {
+            let (g, layout) = bucket_layout(edge, 7).unwrap();
+            assert_eq!(g, grid, "edge {edge}");
+            assert_eq!(layout.image_tokens(), grid * grid, "edge {edge}");
+            assert_eq!(layout.text_tokens(), 7);
+        }
+        let fixture = tiny_transformer_dir();
+        let model =
+            MageTransformer::load_dtype(fixture.path(), &tiny_config(), DType::F32, &Device::Cpu)
+                .unwrap();
+        let (_, text, sigma, _) = tiny_inputs();
+        for edge in [VAE_DOWNSAMPLE as u32, 2 * VAE_DOWNSAMPLE as u32] {
+            let (grid, layout) = bucket_layout(edge, text.dim(1).unwrap()).unwrap();
+            let latent = Tensor::from_vec(
+                values(grid * grid * 4, 0.1),
+                (1, grid * grid, 4),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let output = model.forward(&latent, &text, &sigma, &layout).unwrap();
+            assert_eq!(output.dims(), latent.dims(), "edge {edge}");
+        }
     }
 
     #[test]

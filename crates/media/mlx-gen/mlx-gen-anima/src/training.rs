@@ -53,18 +53,18 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost};
-use mlx_gen::gen_core;
+use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint;
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, save_lokr, LoraParams,
-    TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, save_lokr, LoraParams, TrainAdapter,
 };
 pub use mlx_gen::train::lora::{LokrTarget, LoraTarget};
-use mlx_gen::train::loss::{item_subject_mask_weight, reduce_loss};
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
-use mlx_gen::train::subject_mask::CropBox;
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer, TrainerDescriptor,
     TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -72,7 +72,6 @@ use mlx_gen::{
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{multiply, subtract};
-use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -334,11 +333,16 @@ fn trainer_descriptor_for(variant: Variant) -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per item per bucket,
+        // sampled by `BucketSchedule`; the memory pre-flight sizes for the largest bucket.
         // sc-24828 (epic 2123): honors `subject_mask_loss` on its one (LoRA/LoKr, dense or
-        // block-checkpointed) loss path.
+        // block-checkpointed) loss path, with a weight map per (item, bucket) entry.
         techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
             subject_mask_loss: true,
-            ..gen_core::train::TrainingTechniques::NONE
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
 }
@@ -452,7 +456,10 @@ impl AnimaTrainer {
         self.validate(req)?;
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). The memory pre-flight and previews size for the largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
+        let preview_edge = edges.iter().copied().max().unwrap_or(0);
 
         // Anima's base is bf16 on disk (there is no dense-f32 cast path), so training runs bf16
         // mixed-precision: the frozen base + activation stream are bf16, and the trainable factors /
@@ -469,16 +476,18 @@ impl AnimaTrainer {
         let will_checkpoint =
             matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
         if !will_checkpoint {
-            preflight_memory_guard(edge, compute_dtype == Dtype::Bfloat16)?;
+            preflight_memory_guard(&edges, compute_dtype == Dtype::Bfloat16)?;
         }
 
         // --- prepare → cache: VAE latents + (masked Qwen3 states, T5 ids) into memory ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
         // (x0 latent, masked Qwen3 source_hidden, T5 query-token ids, and — subject-masked loss,
-        // sc-24828 — the latent loss-weight map, `None` when the technique is off).
+        // sc-24828 — that bucket's latent loss-weight map, `None` when the technique is off),
+        // item-major: `cache[item * edges.len() + bucket]` (sc-2127). The conditioner inputs are
+        // encoded once per item and shared (refcounted) by every bucket entry.
         let mut cache: Vec<(Array, Array, Array, Option<Array>)> =
-            Vec::with_capacity(req.items.len());
+            Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -488,18 +497,20 @@ impl AnimaTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
-            let nchw = mlx_gen_qwen_image::preprocess_init_image(&img, edge, edge)?; // [1,3,edge,edge]
-            let x0 = self.vae.encode(&nchw)?; // [1,16,1,edge/8,edge/8], normalized
-            let mask_weight = item_subject_mask_weight(
+            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
+            let mask = PreparedSubjectMask::load_if_enabled(
                 "anima trainer",
                 item,
                 cfg.subject_mask_loss.as_ref(),
-                CropBox::center_square,
-                x0.shape(),
             )?;
             let (source, t5_ids) = self.encode_conditioner_inputs(&item.caption)?;
-            eval([&x0, &source, &t5_ids])?;
-            cache.push((x0, source, t5_ids, mask_weight));
+            eval([&source, &t5_ids])?;
+            for (x0, mask_weight) in encode_buckets(&edges, mask.as_ref(), |edge| {
+                let nchw = mlx_gen_qwen_image::preprocess_init_image(&img, edge, edge)?; // [1,3,edge,edge]
+                self.vae.encode(&nchw) // [1,16,1,edge/8,edge/8], normalized
+            })? {
+                cache.push((x0, source.clone(), t5_ids.clone(), mask_weight));
+            }
         }
         if cache.is_empty() {
             if req.cancel.is_cancelled() {
@@ -647,6 +658,10 @@ impl AnimaTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -654,7 +669,7 @@ impl AnimaTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, source, t5_ids, mask_weight) = &cache[((step - 1) as usize) % cache.len()];
+            let (x0, source, t5_ids, mask_weight) = &cache[step_cache_index(&schedule, step)];
             let sigma = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -706,13 +721,8 @@ impl AnimaTrainer {
                         .expect("an update fires only after accumulation"),
                     window,
                 )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
             }
 
@@ -775,7 +785,7 @@ impl AnimaTrainer {
                         uncond_inputs.as_ref(),
                         cfg.sample_steps.max(1) as usize,
                         guidance,
-                        edge,
+                        preview_edge,
                         sample_seed,
                         compute_dtype,
                         &req.cancel,
@@ -973,6 +983,12 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
     Ok(shifted.clamp(1e-3, 1.0 - 1e-3))
 }
 
+/// The cache entry the 1-based training `step` reads (sc-2127). One bucket ⇒ `(step - 1) % items`,
+/// the pre-bucket round-robin.
+fn step_cache_index(schedule: &BucketSchedule, step: u32) -> usize {
+    schedule.cache_index((step - 1) as usize)
+}
+
 /// Image tokens the DiT self-attends at a square training `edge`: VAE /8 then patch /2 ⇒ `edge/16`
 /// per side, squared. The `+512` is the conditioner's fixed padded text length (cross-attended, not
 /// self-attended) — folded in so `s` is the "total token" proxy the projection is fit against.
@@ -1022,10 +1038,20 @@ const ANIMA_PEAK_QUAD_BF16: f64 = 3.946e-7;
 /// memory limit (≈ the device's recommended working set), scaled by 0.85 for worker/host headroom —
 /// exceeding it is the regime where the dense run dies. Only consulted when whole-block gradient
 /// checkpointing is OFF.
-fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
+///
+/// `edges` are the run's resolution-bucket training edges (sc-2127); the guard sizes for the largest,
+/// since any step may sample it (epic 2123 E7). The extra per-bucket latents are not modelled — a
+/// 1024² latent is ~1 MB, a rounding error next to the dense first-step working set.
+fn preflight_memory_guard(edges: &[u32], bf16: bool) -> Result<()> {
+    let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
+    check_dense_budget(edges, bf16, budget_gb)
+}
+
+/// The pure verdict behind [`preflight_memory_guard`] for an explicit MLX `budget_gb`.
+fn check_dense_budget(edges: &[u32], bf16: bool, budget_gb: f64) -> Result<()> {
+    let edge = edges.iter().copied().max().unwrap_or(0);
     let s = unified_tokens(edge);
     let projected = projected_dense_peak_gb(s, bf16);
-    let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
     if projected > safe {
         return Err(format!(
@@ -1136,11 +1162,90 @@ fn compute_loss_grads(
     Ok((val[0].item::<f32>(), grads))
 }
 
+/// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
+/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
+/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
+/// and laid out like that latent. `None` weights when masked loss is off.
+fn encode_buckets(
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    mut encode: impl FnMut(u32) -> Result<Array>,
+) -> Result<Vec<(Array, Option<Array>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(edge)?;
+            let mask_weight = prepared_subject_mask_weight(
+                "anima trainer",
+                mask,
+                CropBox::center_square,
+                x0.shape(),
+            )?;
+            eval([&x0])?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_gen::{TrainingItem, TrainingRequest};
     use std::path::PathBuf;
+
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
+    /// bucket's latent shape, and the background (right half of the center-square crop, with
+    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
+    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
+    #[test]
+    fn subject_mask_weight_is_computed_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (iw, ih) = (48u32, 32u32);
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::new(iw, ih).save(&image_path).unwrap();
+        let mask_path = tmp.path().join("a_mask.png");
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = gen_core::TrainingItem {
+            image_path,
+            caption: "a".into(),
+            subject_mask_path: Some(mask_path),
+            ..Default::default()
+        };
+        let mask_cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask =
+            mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
+        let entries = encode_buckets(&[32, 48], Some(&mask), |edge| {
+            let g = (edge / 8) as i32;
+            Ok(Array::zeros::<f32>(&[1, 16, 1, g, g])?)
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), g) in entries.iter().zip([4usize, 6]) {
+            let w = w.as_ref().expect("mask loss on ⇒ a weight map");
+            assert_eq!(
+                w.shape(),
+                x0.shape(),
+                "weight must match its own bucket's latent"
+            );
+            let dense = mlx_rs::ops::multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = dense.as_slice::<f32>();
+            for y in 0..g {
+                for x in 0..g {
+                    let val = v[y * g + x];
+                    if x < g / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                    } else {
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                    }
+                }
+            }
+        }
+    }
 
     fn request(items: usize, steps: u32, rank: u32) -> TrainingRequest {
         TrainingRequest {
@@ -1188,14 +1293,64 @@ mod tests {
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.supports_lora && d.supports_lokr);
-        // sc-24828: every variant honors subject-masked loss on its one loss path.
+        // sc-2127 / sc-24828: every variant honors multi-resolution buckets and subject-masked
+        // loss on its one loss path.
         for d in [
             trainer_descriptor_base(),
             trainer_descriptor_aesthetic(),
             trainer_descriptor_turbo(),
         ] {
+            assert!(d.techniques.resolution_buckets, "{}", d.id);
             assert!(d.techniques.subject_mask_loss, "{}", d.id);
         }
+    }
+
+    fn rb(resolution: u32, repeats: u32) -> gen_core::ResolutionBucket {
+        gen_core::ResolutionBucket {
+            resolution,
+            repeats,
+        }
+    }
+
+    /// sc-2127: with buckets off the step → cache index is exactly the pre-bucket
+    /// `(step - 1) % items`; with buckets [512×16, 768×4, 1024×1] every epoch visits each item 16:4:1.
+    #[test]
+    fn step_cache_index_matches_legacy_round_robin_and_mixes_buckets() {
+        let off = TrainingConfig {
+            resolution: 1024,
+            ..Default::default()
+        };
+        let one = BucketSchedule::new(4, &off.training_buckets(), 3);
+        for step in 1..=200u32 {
+            assert_eq!(step_cache_index(&one, step), ((step - 1) as usize) % 4);
+        }
+        let on = TrainingConfig {
+            resolution_buckets: vec![rb(512, 16), rb(768, 4), rb(1024, 1)],
+            ..Default::default()
+        };
+        let sched = BucketSchedule::new(2, &on.training_buckets(), 3);
+        let epoch = sched.epoch_len();
+        assert_eq!(epoch, 2 * 21);
+        let mut counts = [[0u32; 3]; 2];
+        for step in 1..=epoch as u32 {
+            let idx = step_cache_index(&sched, step);
+            counts[idx / 3][idx % 3] += 1;
+        }
+        assert_eq!(counts, [[16, 4, 1]; 2]);
+    }
+
+    /// sc-2127 / epic 2123 E7: the pre-flight sizes for the LARGEST bucket edge — a [512, 1536] run
+    /// is refused under a budget that admits a 512-only run, exactly like a 1536-only run.
+    #[test]
+    fn preflight_guard_sizes_for_the_largest_bucket() {
+        // 45 GB budget → safe ~38 GB: 512² (~21 GB projected) fits, 1536² (~113 GB) does not.
+        let small = check_dense_budget(&[512], true, 45.0);
+        let mixed = check_dense_budget(&[512, 1536], true, 45.0);
+        let mixed_rev = check_dense_budget(&[1536, 512], true, 45.0);
+        assert!(small.is_ok(), "512-only must pass: {small:?}");
+        let err = mixed.unwrap_err().to_string();
+        assert!(err.contains("1536"), "must name the largest edge: {err}");
+        assert!(mixed_rev.is_err(), "bucket order must not matter");
     }
 
     #[test]
@@ -1877,9 +2032,9 @@ mod tests {
     fn preflight_guard_refuses_over_budget() {
         use mlx_rs::memory::set_memory_limit;
         let prev = set_memory_limit(8 * 1024 * 1024 * 1024); // 8 GB budget → safe ~6.8 GB
-        let over = preflight_memory_guard(1536, true);
+        let over = preflight_memory_guard(&[1536], true);
         set_memory_limit(256 * 1024 * 1024 * 1024); // 256 GB budget → safe ~217 GB
-        let under = preflight_memory_guard(512, true);
+        let under = preflight_memory_guard(&[512], true);
         set_memory_limit(prev); // restore
         let err = over.unwrap_err().to_string();
         assert!(
@@ -2224,7 +2379,7 @@ mod tests {
         // (2) The 1536² criterion: checkpointed fits, dense is over the safe budget → guard refuses.
         let (ck_peak, ck_loss) = measure_first_step(&mut dit, &mut cond, 1536, true);
         let dense_proj = projected_dense_peak_gb(unified_tokens(1536), true);
-        let refused = preflight_memory_guard(1536, true).is_err();
+        let refused = preflight_memory_guard(&[1536], true).is_err();
         eprintln!(
             "[sc-10576] edge 1536 CHECKPOINTED peak {ck_peak:.2} GB loss {ck_loss:.4} | budget {budget:.0} GB | dense projected {dense_proj:.1} GB | preflight-refuses {refused}"
         );
