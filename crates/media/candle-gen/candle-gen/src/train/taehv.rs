@@ -28,6 +28,8 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Error, Result, Tensor};
 
+use super::perceptual::{AuxModelFootprint, X0Decoder};
+
 /// TAEHV decoder hyperparameters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaehvConfig {
@@ -147,6 +149,16 @@ impl TaehvConfig {
             n += conv3(c, nf[s + 1], false);
         }
         n + conv3(nf[3], 3 * self.patch_size * self.patch_size, true)
+    }
+
+    /// Pre-load memory figures for decoding ONE latent frame to an `out_h × out_w` image (resident
+    /// f32 weights + one differentiable per-frame decode).
+    pub fn footprint(&self, out_h: u32, out_w: u32) -> AuxModelFootprint {
+        AuxModelFootprint {
+            param_bytes: self.param_count() * 4,
+            working_set_bytes: self.training_working_set_bytes(out_h, out_w),
+            reference_bytes_per_image: 0,
+        }
     }
 
     /// Conservative upper bound on the training working set of one per-frame
@@ -507,6 +519,12 @@ impl TaehvDecoder {
     }
 }
 
+impl X0Decoder for TaehvDecoder {
+    fn decode(&self, latents: &Tensor) -> crate::Result<Tensor> {
+        Ok(self.decode_frames(latents)?)
+    }
+}
+
 /// splitmix64(`seed`·2³² + j) → uniform [−1, 1) (top 53 bits), times `scale·√3` (unit-variance
 /// uniform · `scale`) plus `offset`, computed in f64 — deterministic on every host and backend.
 pub fn splitmix_uniform(
@@ -779,7 +797,10 @@ mod tests {
             &splitmix_uniform(&[2, cfg.latent_channels, 2, 2], 13, 1.0, 0.0, &Device::Cpu).unwrap(),
         )
         .unwrap();
-        let loss = dec.decode_frames(z.as_tensor()).unwrap().sum_all().unwrap();
+        let loss = X0Decoder::decode(&dec, z.as_tensor())
+            .unwrap()
+            .sum_all()
+            .unwrap();
         let grads = loss.backward().unwrap();
         let g = grads
             .get(z.as_tensor())
