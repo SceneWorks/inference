@@ -207,14 +207,16 @@ def posix_shell() -> str | None:
 
 
 def bash_syntax_check(shell: str, script: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    result = subprocess.run(
         [shell, "-n"],
-        input=script,
-        text=True,
-        encoding="utf-8",
+        # Windows text-mode stdin translates LF to CRLF before Bash reads it.
+        input=script.encode("utf-8"),
+        text=False,
         capture_output=True,
         check=False,
     )
+    return subprocess.CompletedProcess(result.args, result.returncode,
+        result.stdout.decode("utf-8"), result.stderr.decode("utf-8"))
 
 
 def chroma_packed_build_script() -> str:
@@ -1469,6 +1471,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         result = bash_syntax_check(self.require_posix_shell(), script)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_bash_syntax_check_preserves_lf_under_windows_stdin_translation(self) -> None:
+        from unittest.mock import patch
+        shell = self.require_posix_shell()
+        native_run = subprocess.run
+        script = "for bits in 4 8; do\n  :\ndone\n"
+        def windows_stdin(command, **kwargs):
+            payload = kwargs["input"]
+            if isinstance(payload, str):
+                payload = payload.replace("\n", "\r\n").encode("utf-8")
+            return native_run(command, input=payload, text=False, capture_output=True, check=False)
+        with patch.object(subprocess, "run", side_effect=windows_stdin):
+            actual = bash_syntax_check(shell, script)
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            # The previous text-mode implementation must fail the same discriminator.
+            mutant = subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
+                                    capture_output=True, check=False)
+            self.assertNotEqual(mutant.returncode, 0, "text stdin mutation escaped Windows-equivalent gate")
 
     def test_bash_syntax_check_rejects_a_malformed_build_script(self) -> None:
         # The positive case alone cannot tell "the script parses" from "the checker never fails".
