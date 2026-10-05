@@ -2580,6 +2580,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-llm",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
