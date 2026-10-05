@@ -789,7 +789,7 @@ def collect(evidence: Path, app: Path, engine: Path, control: Path) -> dict:
             "oldRun": target, "targetSha256": file_sha256(evidence / "target.json"),
             "caseBindingSha256": file_sha256(evidence / "case-binding.json"),
             "artifactProof": artifact_proof,
-            "captureRecordsComplete": binding["captureRecordsComplete"],
+            "captureRecordsComplete": binding["allObservedCaseOutcomesCompleted"],
             "captureRecordSetComplete": binding["captureRecordSetComplete"],
             "captureAcceptanceEvaluated": binding["captureAcceptanceEvaluated"],
             "releaseScope": binding["releaseScope"],

@@ -4,9 +4,11 @@ import importlib.util
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
@@ -221,6 +223,56 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertIn("$env:YUE2_RELEASE_OLD_ROOT", collector)
         self.assertNotIn("37295993157", collector)
         self.assertNotIn("yue2-acceptance-ed59cf8e2088", collector)
+
+    def test_collect_assembles_valid_partial_outcomes_without_claiming_full_capture(self):
+        target = {"runId": MODULE.TARGET_RUN_ID, "attempt": MODULE.TARGET_ATTEMPT,
+            "jobId": MODULE.TARGET_JOB_ID, "runner": MODULE.TARGET_RUNNER,
+            "runnerId": MODULE.TARGET_RUNNER_ID, "runRoot": MODULE.TARGET_RUN_ROOT,
+            "workerId": None, "hostname": "MICHAEL-TRX50",
+            "selectedDevice": {"physicalIndex": 1, "cudaOrdinal": 0,
+                "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+                "pci": "00000000:C1:00.0", "luid": "luid_0x00000000_0x0001f78f"}}
+        binding = {"target": target, "runConclusion": "failure", "jobConclusion": "failure",
+            "allObservedCaseOutcomesCompleted": True, "captureRecordSetComplete": False,
+            "captureAcceptanceEvaluated": False, "releaseScope": "known recorded case generations",
+            "caseProcessWitnesses": [], "binaryHashTargets": []}
+        census = {"physicalMode": "shared-gpu1", "validatedDevice": target["selectedDevice"]}
+        api = {"id": MODULE.TARGET_RUN_ID}
+        release_job = {"runner_name": MODULE.TARGET_RUNNER, "runner_id": MODULE.TARGET_RUNNER_ID}
+
+        class Collector:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(MODULE, "os",
+             SimpleNamespace(name="nt", environ=os.environ)), \
+             patch.dict("os.environ", {"GITHUB_REPOSITORY": "SceneWorks/inference",
+                "GITHUB_JOB": "cuda_release_check", "GITHUB_RUN_ATTEMPT": "1",
+                "RUNNER_NAME": MODULE.TARGET_RUNNER, "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                "CUDA_VISIBLE_DEVICES": "1", "EXPECTED_APP_SHA": MODULE.TARGET_APP_SHA,
+                "EXPECTED_ENGINE_SHA": MODULE.TARGET_ENGINE_SHA,
+                "EXPECTED_CONTROL_SHA": MODULE.TARGET_CONTROL_SHA,
+                "GITHUB_RUN_ID": "9001", "GITHUB_SHA": "c" * 40,
+                "COMPUTERNAME": "MICHAEL-TRX50"}), \
+             patch.object(MODULE, "verify_sources", return_value={"control_sha": MODULE.TARGET_CONTROL_SHA}), \
+             patch.object(MODULE, "fetch_authenticated_target",
+                return_value=(api, api, api, release_job, Path(directory) / "metrics.zip")), \
+             patch.object(MODULE, "safe_extract_metrics", return_value={"extractedRoot": directory}), \
+             patch.object(MODULE, "derive_run_binding", return_value=binding), \
+             patch.object(MODULE, "rehash_recorded_binaries", return_value=[]), \
+             patch.object(MODULE, "cuda_physical_census", return_value=(json.dumps(census), [])), \
+             patch.object(MODULE, "retain_cuda_physical_evidence", return_value=[]), \
+             patch.object(MODULE, "PowerShellSnapshotCollector", Collector), \
+             patch.object(MODULE, "validate_release_pairs", return_value={
+                 "processFiles": [], "refusalFiles": [], "before": {}, "after": {}}):
+            result = MODULE.collect(Path(directory) / "result", Path(directory) / "app",
+                Path(directory) / "engine", Path(directory) / "control")
+            saved_binding = json.loads((Path(directory) / "result" / "case-binding.json").read_text())
+        self.assertTrue(result["captureRecordsComplete"])
+        self.assertFalse(result["captureRecordSetComplete"])
+        self.assertFalse(result["captureAcceptanceEvaluated"])
+        self.assertEqual(saved_binding["runConclusion"], "failure")
+        self.assertEqual(saved_binding["jobConclusion"], "failure")
 
     def test_run_binding_uses_exact_eight_verified_case_generations_and_binary_hashes(self):
         with tempfile.TemporaryDirectory() as directory:
