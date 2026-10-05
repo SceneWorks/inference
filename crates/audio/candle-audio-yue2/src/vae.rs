@@ -1374,7 +1374,10 @@ pub(crate) mod tests {
     fn bf16_cuda_both_vae_variants_decode_full_tiled_and_encode() {
         let device = Device::new_cuda(0).unwrap();
         let base = latent_bct();
-        let z = Tensor::cat(&[&base, &base, &base], 2).unwrap();
+        let z = Tensor::cat(&[&base, &base, &base], 2)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
         for variant in [VaeVariant::Standard, VaeVariant::Legacy] {
             let dir = fixture_dir().join("vae_tiny").join(variant_name(variant));
             let identity = DecoderIdentity {
