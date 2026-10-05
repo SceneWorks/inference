@@ -23,6 +23,8 @@ mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Depth anchoring (epic 2123, sc-2125): the frozen Depth-Anything-V2 perceptor the trainer's
 # decoded-x0 depth loss runs. Depends only on core (acyclic).
 mlx-gen-depth = { path = "../mlx-gen-depth" }
+# The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath.
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
 # Decode training-dataset images (LoRA training, sc-3044). PNG + JPEG cover the SceneWorks dataset
 # formats; the trainer center-crops + hands the Image to the VAE preprocess.
 image = { workspace = true }

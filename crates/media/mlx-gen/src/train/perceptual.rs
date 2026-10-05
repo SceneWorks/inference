@@ -54,7 +54,10 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{abs, add, divide, maximum, multiply, subtract};
 use mlx_rs::Array;
 
-pub use gen_core::train::aux_schedule::{combine_step_terms, plan_step, AuxAlternation, StepPlan};
+pub use gen_core::train::aux_schedule::{
+    combine_step_terms, perceptual_footprint_bytes, plan_step, AuxAlternation, AuxModelFootprint,
+    StepPlan,
+};
 pub use gen_core::train::AuxLossSchedule;
 
 use super::tae::TinyDecoder;
@@ -190,32 +193,6 @@ pub fn combine_step_loss(diffusion: Option<Array>, aux: Option<Array>) -> Result
             )
         },
     )
-}
-
-/// Pre-load memory figures of one auxiliary model (epic 2123 E7), computed from its config.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AuxModelFootprint {
-    /// Resident frozen weights.
-    pub param_bytes: u64,
-    /// One differentiable forward + backward at the training resolution.
-    pub working_set_bytes: u64,
-    /// The cached per-image reference.
-    pub reference_bytes_per_image: u64,
-}
-
-/// The extra training memory the perceptual path adds, in bytes: the decoder (when any loss
-/// decodes) plus every enabled loss — weights, working sets (summed: one traced backward holds the
-/// step's aux terms together) and `images` cached references each.
-pub fn perceptual_footprint_bytes(
-    decoder: Option<AuxModelFootprint>,
-    losses: &[AuxModelFootprint],
-    images: usize,
-) -> u64 {
-    decoder
-        .iter()
-        .chain(losses.iter())
-        .map(|f| f.param_bytes + f.working_set_bytes + f.reference_bytes_per_image * images as u64)
-        .sum()
 }
 
 /// The trainer-owned perceptual path: decoder + scheduled losses + the per-image reference cache.
@@ -669,27 +646,6 @@ mod tests {
         }
         assert_eq!(path.reference_computations(), 2);
         assert!(combine_step_loss(None, None).is_err());
-    }
-
-    /// E7: the shared pre-load estimator sums weights, working sets and per-image references.
-    /// Mutation: drop the `× images` term ⇒ red.
-    #[test]
-    fn footprint_sums_models_and_references() {
-        let dec = AuxModelFootprint {
-            param_bytes: 10,
-            working_set_bytes: 100,
-            reference_bytes_per_image: 0,
-        };
-        let loss = AuxModelFootprint {
-            param_bytes: 1_000,
-            working_set_bytes: 10_000,
-            reference_bytes_per_image: 7,
-        };
-        assert_eq!(
-            perceptual_footprint_bytes(Some(dec), &[loss], 3),
-            11_110 + 21
-        );
-        assert_eq!(perceptual_footprint_bytes(None, &[], 3), 0);
     }
 
     /// AC3: the SSI loss (and the full depth loss) is invariant to scale and shift of the
