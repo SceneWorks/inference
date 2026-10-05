@@ -2591,6 +2591,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-boogu",
+ "mlx-gen-perceptual",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
