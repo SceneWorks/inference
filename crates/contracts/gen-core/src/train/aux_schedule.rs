@@ -160,9 +160,58 @@ pub fn combine_step_terms<T, E>(
     }
 }
 
+/// Pre-load memory figures of one auxiliary training-time model (epic 2123 E7) — an x0 decoder or
+/// a frozen perceptual model — computed from its config before anything loads. Backend-neutral:
+/// the MLX and Candle perceptual kits and every trainer's preflight share this one definition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuxModelFootprint {
+    /// Resident frozen weights.
+    pub param_bytes: u64,
+    /// One differentiable forward + backward at the training resolution.
+    pub working_set_bytes: u64,
+    /// The cached per-image reference.
+    pub reference_bytes_per_image: u64,
+}
+
+/// The extra training memory the perceptual path adds, in bytes: the decoder (when any loss
+/// decodes) plus every enabled loss — weights, working sets (summed: one traced backward holds the
+/// step's aux terms together) and `images` cached references each.
+pub fn perceptual_footprint_bytes(
+    decoder: Option<AuxModelFootprint>,
+    losses: &[AuxModelFootprint],
+    images: usize,
+) -> u64 {
+    decoder
+        .iter()
+        .chain(losses.iter())
+        .map(|f| f.param_bytes + f.working_set_bytes + f.reference_bytes_per_image * images as u64)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E7: the shared pre-load estimator sums weights, working sets and per-image references.
+    /// Mutation: drop the `× images` term ⇒ red.
+    #[test]
+    fn footprint_sums_models_and_references() {
+        let dec = AuxModelFootprint {
+            param_bytes: 10,
+            working_set_bytes: 100,
+            reference_bytes_per_image: 0,
+        };
+        let loss = AuxModelFootprint {
+            param_bytes: 1_000,
+            working_set_bytes: 10_000,
+            reference_bytes_per_image: 7,
+        };
+        assert_eq!(
+            perceptual_footprint_bytes(Some(dec), &[loss], 3),
+            11_110 + 21
+        );
+        assert_eq!(perceptual_footprint_bytes(None, &[], 3), 0);
+    }
 
     fn sched(weight: f32, t_min: f32, t_max: f32, every_n: u32) -> AuxLossSchedule {
         AuxLossSchedule {

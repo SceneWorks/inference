@@ -22,7 +22,10 @@ pub mod subject_mask;
 
 use std::path::PathBuf;
 
-pub use aux_schedule::{combine_step_terms, plan_step, AuxAlternation, StepPlan};
+pub use aux_schedule::{
+    combine_step_terms, perceptual_footprint_bytes, plan_step, AuxAlternation, AuxModelFootprint,
+    StepPlan,
+};
 pub use schedule::LrSchedule;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
