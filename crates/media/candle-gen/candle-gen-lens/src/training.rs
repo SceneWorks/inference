@@ -525,6 +525,7 @@ impl FlowMatchTrainer for LensTrainer {
         _aux: &(),
         cfg: &TrainingConfig,
         step: u32,
+        _sample: flow_match::StepSample<'_>,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
         // The grid of the bucket this entry was encoded at (sc-2127).
@@ -1057,6 +1058,7 @@ mod tests {
                     &(),
                     &train_cfg,
                     step as u32 + 1,
+                    flow_match::StepSample::plain(0, 0),
                     &dev,
                 )
                 .unwrap();

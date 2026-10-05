@@ -2943,6 +2943,7 @@ impl FlowMatchTrainer for LtxTrainer {
         positions: &Self::Aux,
         cfg: &TrainingConfig,
         step: u32,
+        _sample: flow_match::StepSample<'_>,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
         let sigma = sample_ltx_sigma(cfg.seed, step);
