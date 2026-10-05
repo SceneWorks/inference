@@ -911,7 +911,7 @@ fn checkpointed_baseline_gb(bf16: bool) -> f64 {
     projected_dense_peak_gb(0.0, bf16)
 }
 
-/// [`check_preflight_budget`] with the auxiliary models' `extra_gb` on top of the DiT projection
+/// The preflight verdict with the auxiliary models' `extra_gb` on top of the DiT projection
 /// — the dense projection, or the checkpointed baseline when `checkpointed`.
 fn check_preflight_budget_with(
     edge: u32,

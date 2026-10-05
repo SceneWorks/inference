@@ -2317,6 +2317,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-qwen-image",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
