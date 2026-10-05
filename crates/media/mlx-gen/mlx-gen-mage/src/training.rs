@@ -205,6 +205,9 @@ pub struct MageFlowTrainer {
     /// encoder and VAE are shared co-requisites staged from elsewhere, so re-deriving it from the
     /// snapshot root would read the wrong (or a nonexistent) checkpoint.
     transformer_dir: PathBuf,
+    /// The **resolved** VAE directory (a co-requisite under the split-tier mirror). Depth anchoring's
+    /// full-decoder fallback ([`MageX0Decoder`]) loads its f32 decoder from here (sc-24830).
+    vae_dir: PathBuf,
 }
 
 fn trainer_descriptor() -> TrainerDescriptor {
@@ -280,10 +283,14 @@ impl X0Decoder for MageX0Decoder {
     }
 }
 
-/// [`MageX0Decoder`] for the shared aux-loss builder: loaded from
-/// `TrainingConfig::perceptual_decoder_dir` (the Mage snapshot or its `vae/` folder) only when an
-/// enabled loss decodes pixels.
-struct MageDecoderSpec;
+/// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from the trainer's own resolved
+/// VAE directory only when an enabled loss decodes pixels. Mage has no separately cataloged x0
+/// decoder: `TrainingConfig::perceptual_decoder_dir` (which the shared floor requires) names the
+/// base snapshot and is not read here — the split-tier mirror can stage the VAE elsewhere, and the
+/// trainer already resolved where.
+struct MageDecoderSpec {
+    vae_dir: PathBuf,
+}
 
 impl mlx_gen_perceptual::CustomDecoder for MageDecoderSpec {
     fn name(&self) -> &'static str {
@@ -303,14 +310,9 @@ impl mlx_gen_perceptual::CustomDecoder for MageDecoderSpec {
         }
     }
 
-    fn load(&self, dir: Option<&Path>) -> Result<Box<dyn X0Decoder>> {
-        let dir = dir.ok_or_else(|| {
-            mlx_gen::Error::Msg(
-                "the Mage-VAE decoder directory (perceptual_decoder_dir) is unset".into(),
-            )
-        })?;
+    fn load(&self, _dir: Option<&Path>) -> Result<Box<dyn X0Decoder>> {
         Ok(Box::new(MageX0Decoder::new(crate::vae::load(
-            dir,
+            &self.vae_dir,
             VaePart::Decode,
             Dtype::Float32,
         )?)))
@@ -318,10 +320,12 @@ impl mlx_gen_perceptual::CustomDecoder for MageDecoderSpec {
 }
 
 /// Mage's latent family for the shared aux-loss builder (epic 2123 E8).
-fn aux_loss_context() -> mlx_gen_perceptual::AuxLossContext<'static> {
+fn aux_loss_context(vae_dir: &Path) -> mlx_gen_perceptual::AuxLossContext<'static> {
     mlx_gen_perceptual::AuxLossContext {
         label: "mage_flow_base trainer",
-        decoder: mlx_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec)),
+        decoder: mlx_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
+            vae_dir: vae_dir.to_path_buf(),
+        })),
         latent_lpips: None,
     }
 }
@@ -332,7 +336,9 @@ fn aux_loss_context() -> mlx_gen_perceptual::AuxLossContext<'static> {
 fn perceptual_footprint_gb(cfg: &TrainingConfig, edge: u32, entries: usize) -> f64 {
     mlx_gen_perceptual::perceptual_footprint(
         cfg,
-        &mlx_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec)),
+        &mlx_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
+            vae_dir: PathBuf::new(),
+        })),
         mlx_gen_perceptual::AuxGeometry::image(edge, entries),
     ) as f64
         / 1e9
@@ -399,6 +405,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         descriptor: trainer_descriptor(),
         text_encoder: Some(crate::text_encoder::load_dir(&dirs.text_encoder)?),
         vae: crate::vae::load(&dirs.vae, VaePart::Both, Dtype::Bfloat16)?,
+        vae_dir: dirs.vae.clone(),
         transformer: Some(MageTransformer::load(&dirs.transformer)?),
         // The full base fine-tune path (sc-14056) re-reads this exact checkpoint to seed its f32
         // master weights, so keep the RESOLVED directory rather than re-deriving `root/transformer`
@@ -628,7 +635,8 @@ impl MageFlowTrainer {
         }
         // Epic 2123 E8: the shared builder loads the decoder + enabled losses before caching, so a
         // missing checkpoint fails fast; `None` (nothing loaded) when no aux loss is enabled.
-        let mut perceptual = mlx_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context())?;
+        let mut perceptual =
+            mlx_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context(&self.vae_dir))?;
 
         self.transformer_mut()?.cast_weights(compute_dtype)?;
 
@@ -2883,7 +2891,7 @@ mod depth_anchoring_tests {
     fn everything_off_is_bit_identical_to_the_legacy_step() {
         assert!(mlx_gen_perceptual::build_perceptual_path(
             &TrainingConfig::default(),
-            &aux_loss_context()
+            &aux_loss_context(Path::new("/nonexistent"))
         )
         .unwrap()
         .is_none());
@@ -2983,10 +2991,13 @@ mod depth_anchoring_tests {
         let mut c = cfg();
         c.perceptual_decoder_dir = Some(tmp.path().join("no-vae"));
         c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
-        let e = mlx_gen_perceptual::build_perceptual_path(&c, &aux_loss_context())
-            .err()
-            .unwrap()
-            .to_string();
+        let e = mlx_gen_perceptual::build_perceptual_path(
+            &c,
+            &aux_loss_context(&tmp.path().join("no-vae")),
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(e.contains("Mage-VAE decoder"), "{e}");
     }
 

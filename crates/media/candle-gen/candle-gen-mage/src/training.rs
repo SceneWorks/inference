@@ -104,10 +104,14 @@ fn mage_vae_peak_gb(h: u32, w: u32) -> f64 {
     0.267 + 2.039 * (h as f64 * w as f64 / 1e6)
 }
 
-/// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from
-/// `TrainingConfig::perceptual_decoder_dir` (the Mage snapshot's `vae/` folder or the snapshot) only
-/// when an enabled loss decodes pixels.
-struct MageDecoderSpec;
+/// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from the trainer's own resolved
+/// VAE directory only when an enabled loss decodes pixels. Mage has no separately cataloged x0
+/// decoder: `TrainingConfig::perceptual_decoder_dir` (which the shared floor requires) names the
+/// base snapshot and is not read here — the split-tier mirror can stage the VAE elsewhere, and the
+/// trainer already resolved where.
+struct MageDecoderSpec {
+    vae_dir: PathBuf,
+}
 
 impl candle_gen_perceptual::CustomDecoder for MageDecoderSpec {
     fn name(&self) -> &'static str {
@@ -127,19 +131,9 @@ impl candle_gen_perceptual::CustomDecoder for MageDecoderSpec {
         }
     }
 
-    fn load(&self, dir: Option<&Path>, device: &Device) -> Result<Box<dyn X0Decoder>> {
-        let dir = dir.ok_or_else(|| {
-            CandleError::Msg(
-                "the Mage-VAE decoder directory (perceptual_decoder_dir) is unset".into(),
-            )
-        })?;
-        let vae_dir = if dir.join("vae").is_dir() {
-            dir.join("vae")
-        } else {
-            dir.to_path_buf()
-        };
+    fn load(&self, _dir: Option<&Path>, device: &Device) -> Result<Box<dyn X0Decoder>> {
         Ok(Box::new(MageX0Decoder::new(MageVae::load_full_dtype(
-            &vae_dir,
+            &self.vae_dir,
             device,
             DType::F32,
         )?)))
@@ -147,10 +141,15 @@ impl candle_gen_perceptual::CustomDecoder for MageDecoderSpec {
 }
 
 /// Mage's latent family for the shared aux-loss builder (epic 2123 E8).
-fn aux_loss_context(device: &Device) -> candle_gen_perceptual::AuxLossContext<'_> {
+fn aux_loss_context<'a>(
+    device: &'a Device,
+    vae_dir: &Path,
+) -> candle_gen_perceptual::AuxLossContext<'a> {
     candle_gen_perceptual::AuxLossContext {
         label: LABEL,
-        decoder: candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec)),
+        decoder: candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
+            vae_dir: vae_dir.to_path_buf(),
+        })),
         device,
         latent_lpips: None,
     }
@@ -165,7 +164,9 @@ fn perceptual_footprint_bytes(
 ) -> u64 {
     candle_gen_perceptual::perceptual_footprint(
         cfg,
-        &candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec)),
+        &candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
+            vae_dir: PathBuf::new(),
+        })),
         candle_gen_perceptual::AuxGeometry::image(edge, entries),
     )
 }
@@ -646,7 +647,7 @@ impl MageTrainer {
         // missing checkpoint fails fast); `None` — nothing loaded — when no aux loss is enabled.
         let perceptual = candle_gen_perceptual::build_perceptual_path(
             &req.config,
-            &aux_loss_context(&self.device),
+            &aux_loss_context(&self.device, &self.dirs.vae),
         )?;
         let cache = cache_samples(&self.dirs, req, &self.device, on_progress)?;
         let cfg_text = std::fs::read_to_string(self.dirs.transformer.join(TRANSFORMER_CONFIG))
@@ -1541,7 +1542,7 @@ mod tests {
             };
             assert!(candle_gen_perceptual::build_perceptual_path(
                 &c,
-                &aux_loss_context(&Device::Cpu)
+                &aux_loss_context(&Device::Cpu, Path::new("/nonexistent"))
             )
             .unwrap()
             .is_none());
@@ -1606,7 +1607,10 @@ mod tests {
             let small = perceptual_footprint_bytes(&on, 1024, 10);
             let da2 =
                 candle_gen_depth::anchor::depth_anchor_footprint(DepthModelSize::Small, 1024, 1024);
-            let decoder = MageDecoderSpec.footprint_for_test(1024);
+            let decoder = MageDecoderSpec {
+                vae_dir: PathBuf::new(),
+            }
+            .footprint_for_test(1024);
             assert_eq!(
                 small,
                 candle_gen::train::perceptual::perceptual_footprint_bytes(
@@ -1639,11 +1643,13 @@ mod tests {
             let mut c = cfg();
             c.perceptual_decoder_dir = Some(tmp.path().join("no-vae"));
             c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
-            let e =
-                candle_gen_perceptual::build_perceptual_path(&c, &aux_loss_context(&Device::Cpu))
-                    .err()
-                    .unwrap()
-                    .to_string();
+            let e = candle_gen_perceptual::build_perceptual_path(
+                &c,
+                &aux_loss_context(&Device::Cpu, &tmp.path().join("no-vae")),
+            )
+            .err()
+            .unwrap()
+            .to_string();
             assert!(e.contains("Mage-VAE decoder"), "{e}");
         }
 
