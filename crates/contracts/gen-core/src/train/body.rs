@@ -91,9 +91,9 @@ pub struct BodyLossesConfig {
     /// Sapiens surface-normal loss. Off by default.
     pub normal: AuxLossSchedule,
     /// Average the normal loss over the item's subject mask only (upstream
-    /// `perceptual_restrict_to_body`). The loss supports it (its reference takes the mask through
-    /// `ensure_reference_with_mask`), but no trainer feeds subject masks to the perceptual path yet,
-    /// so the shared floor refuses it (typed `Unsupported`).
+    /// `perceptual_restrict_to_body`). Needs every item's
+    /// [`subject_mask_path`](super::TrainingItem::subject_mask_path); the trainer hands each
+    /// reference its item's mask ([`super::subject_mask::PerceptualSubjectMasks`]).
     pub normal_restrict_to_subject: bool,
     /// The ViTPose+ base checkpoint (`usyd-community/vitpose-plus-base`, `model.safetensors`).
     /// Required whenever **any** body loss is on: it is the proportion encoder and the

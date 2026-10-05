@@ -2269,6 +2269,23 @@ impl QwenImage21Trainer {
         // before the DiT loads.
         let mut perceptual = load_perceptual_path(cfg)?;
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image (an edit pair's whole frame, else the centre square).
+            path.attach_subject_masks(
+                mlx_gen::train::subject_mask::PerceptualSubjectMasks::load_with(
+                    &format!("{TRAINER_ID} trainer"),
+                    &req.items,
+                    cfg,
+                    edges.len(),
+                    |item| {
+                        if item.is_edit_pair() {
+                            CropBox::full
+                        } else {
+                            CropBox::center_square
+                        }
+                    },
+                )?,
+            );
             prepare_perceptual_references(path, &cache)?;
         }
         training_memory_trace(

@@ -792,6 +792,20 @@ impl MageTrainer {
         let buckets = req.config.training_buckets();
         let schedule = BucketSchedule::new(cache.len() / buckets.len(), &buckets, req.config.seed);
         // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the item.
+        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+        // cropped like the image and resampled onto its decoded size.
+        let mut perceptual = perceptual;
+        if let Some(path) = perceptual.as_mut() {
+            path.attach_subject_masks(
+                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
+                    "mage_flow_base trainer",
+                    &req.items,
+                    &req.config,
+                    edges.len(),
+                    CropBox::center_square,
+                )?,
+            );
+        }
         let mut aux = perceptual
             .map(|path| {
                 AuxDriver::prepare(

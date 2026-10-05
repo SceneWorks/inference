@@ -410,6 +410,15 @@ impl ZImageTurboTrainer {
         // Epic 2123 E8: each image's perceptual reference (TAEF1 decode of its cached clean latent →
         // DA2 depth) is computed exactly once per job, here, before the loop.
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "z_image_turbo trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache)?;
         }
 

@@ -202,6 +202,9 @@ pub struct PerceptualPath {
     /// image index → one reference per loss (same order as `losses`; `None` = unusable ⇒ skipped).
     references: HashMap<usize, Vec<Option<LossReference>>>,
     reference_computations: usize,
+    /// The job's subject masks for the losses that read one (sc-24832), see
+    /// [`attach_subject_masks`](Self::attach_subject_masks).
+    subject_masks: Option<gen_core::train::subject_mask::PerceptualSubjectMasks>,
 }
 
 impl PerceptualPath {
@@ -223,6 +226,7 @@ impl PerceptualPath {
             losses,
             references: HashMap::new(),
             reference_computations: 0,
+            subject_masks: None,
         })
     }
 
@@ -268,6 +272,19 @@ impl PerceptualPath {
         self.ensure_reference_with_mask(image, clean_latents, None)
     }
 
+    /// Hand the path the job's subject masks (sc-24832): from then on every
+    /// [`ensure_reference`](Self::ensure_reference) passes its reference key's item mask — cropped
+    /// with the trainer's crop rule and area-averaged onto that reference's decoded pixel grid — to
+    /// each loss's [`PerceptualLoss::reference_with_mask`]. `None` (no loss reads masks) is a no-op.
+    /// Every trainer calls this once with [`PerceptualSubjectMasks::load`](gen_core::train::subject_mask::PerceptualSubjectMasks::load)
+    /// before preparing references.
+    pub fn attach_subject_masks(
+        &mut self,
+        masks: Option<gen_core::train::subject_mask::PerceptualSubjectMasks>,
+    ) {
+        self.subject_masks = masks;
+    }
+
     /// [`ensure_reference`](Self::ensure_reference) with the image's subject mask (`[H, W]` f32 at
     /// the decoded pixel size), handed to every loss's
     /// [`PerceptualLoss::reference_with_mask`] (sc-24832).
@@ -288,6 +305,20 @@ impl PerceptualPath {
         } else {
             None
         };
+        // An explicit mask wins; else the attached job masks (sc-24832), resampled onto this
+        // reference's decoded pixel grid.
+        let attached = match (subject_mask, &self.subject_masks, &pixels) {
+            (None, Some(masks), Some(px)) => {
+                let sh = px.shape();
+                let (h, w) = (sh[1] as usize, sh[2] as usize);
+                let v = masks
+                    .pixel_mask(image, w, h)
+                    .map_err(|e| Error::Msg(e.to_string()))?;
+                Some(Array::from_slice(&v, &[h as i32, w as i32]))
+            }
+            _ => None,
+        };
+        let subject_mask = subject_mask.or(attached.as_ref());
         let mut refs = Vec::with_capacity(self.losses.len());
         for l in &self.losses {
             let input = match l.loss.input() {

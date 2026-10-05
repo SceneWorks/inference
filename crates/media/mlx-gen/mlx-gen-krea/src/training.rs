@@ -492,6 +492,15 @@ impl KreaRawTrainer {
         // cached clean latent → DA2 depth) is computed exactly once per job, here — after the text
         // encoder is freed, so the decoder + DA2 never share residency with it.
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "krea trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache)?;
         }
 

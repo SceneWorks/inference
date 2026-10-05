@@ -1378,7 +1378,44 @@ fn refuse_ltx25_subject_mask_loss(req: &TrainingRequest) -> Result<()> {
              aligned to the latent, so a subject mask cannot be applied"
         )));
     }
+    // sc-24832: the subject-restricted normal loss reads the same (absent) aligned mask.
+    if candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::needed(&req.config) {
+        return Err(CandleError::Unsupported(format!(
+            "{MODEL_25_ID} trainer: the normal loss restricted to the subject is unsupported — every \
+             item trains on a prepared latent bundle with no decodable image aligned to the latent, \
+             so body_losses.normal_restrict_to_subject cannot be applied"
+        )));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod ltx25_restricted_normal_tests {
+    use super::*;
+
+    /// sc-24832: LTX-2.5 refuses the subject-restricted normal loss and still admits the
+    /// unrestricted one. Mutation: drop the `PerceptualSubjectMasks::needed` refusal ⇒ red.
+    #[test]
+    fn ltx25_refuses_subject_restricted_normals() {
+        let mut req = TrainingRequest {
+            items: vec![candle_gen::gen_core::train::TrainingItem::captioned(
+                PathBuf::from("x.png"),
+                "c".into(),
+            )],
+            config: TrainingConfig::default(),
+            output_dir: PathBuf::from("out"),
+            file_name: "a.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        req.config.body_losses.normal.weight = 0.1;
+        assert!(refuse_ltx25_subject_mask_loss(&req).is_ok());
+        req.config.body_losses.normal_restrict_to_subject = true;
+        match refuse_ltx25_subject_mask_loss(&req) {
+            Err(CandleError::Unsupported(m)) => assert!(m.contains("normal_restrict_to_subject")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
 }
 
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {

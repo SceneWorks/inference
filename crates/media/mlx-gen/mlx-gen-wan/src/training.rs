@@ -577,6 +577,15 @@ impl WanMoeTrainer {
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEHV decode of its
         // cached clean latent → DA2 depth) is computed exactly once per job, here.
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "wan trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache)?;
         }
         // Free the UMT5 encoder + tokenizer (~11 GB) before training (the reference frees it post-cache).

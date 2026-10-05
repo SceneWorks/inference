@@ -672,6 +672,15 @@ impl MageFlowTrainer {
         // --- prepare → cache: VAE-latents + prompt-embeds into memory before the loop ---
         let (cache, sample_caps) = self.prepare_caches(req, &edges, on_progress)?;
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "mage_flow_base trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache)?;
         }
 

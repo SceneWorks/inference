@@ -1156,6 +1156,17 @@ impl WanMoeTrainer {
         // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the real item
         // with one window per update of every expert (the trainer has no resume, so no replay).
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(
+                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
+                    "wan trainer",
+                    &req.items,
+                    cfg,
+                    edges.len(),
+                    CropBox::center_square,
+                )?,
+            );
             for (entry, (x0, _, _)) in cache.iter().enumerate() {
                 path.ensure_reference(entry, &latent_frames_nchw(x0)?)?;
             }

@@ -2133,7 +2133,43 @@ fn refuse_ltx25_subject_mask(id: &str, req: &TrainingRequest) -> gen_core::Resul
              subject-masked loss off for this trainer"
         )));
     }
+    // sc-24832: the subject-restricted normal loss reads the same (absent) aligned mask.
+    if id == MODEL_25_ID
+        && mlx_gen::train::subject_mask::PerceptualSubjectMasks::needed(&req.config)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id} trainer: the normal loss restricted to the subject needs a training image aligned \
+             to the latent, but LTX-2.5 trains on preprocessed latent bundles that carry none; turn \
+             body_losses.normal_restrict_to_subject off for this trainer"
+        )));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod ltx25_restricted_normal_tests {
+    use super::*;
+
+    /// sc-24832: LTX-2.5 refuses the subject-restricted normal loss (no image aligned to its
+    /// latent bundles) and still admits the unrestricted one. Mutation: drop the
+    /// `PerceptualSubjectMasks::needed` refusal ⇒ red.
+    #[test]
+    fn ltx25_refuses_subject_restricted_normals() {
+        let mut req = super::validate_request_tests::request(1);
+        req.config.body_losses.normal.weight = 0.1;
+        assert!(refuse_ltx25_subject_mask(MODEL_25_ID, &req).is_ok());
+        req.config.body_losses.normal_restrict_to_subject = true;
+        match refuse_ltx25_subject_mask(MODEL_25_ID, &req) {
+            Err(gen_core::Error::Unsupported(m)) => {
+                assert!(m.contains("normal_restrict_to_subject"))
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(
+            refuse_ltx25_subject_mask(MODEL_ID, &req).is_ok(),
+            "LTX-2.3 has aligned images"
+        );
+    }
 }
 
 /// sc-24830 — LTX-2.5 runs depth anchoring on its generated video stream, so it refuses it for the
@@ -2677,6 +2713,15 @@ impl LtxTrainer {
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAELTX2.3 decode of its
         // cached clean latent → DA2 depth) is computed exactly once per job, here.
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "ltx trainer",
+                &req.items,
+                cfg,
+                latent_edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache, &latent_edges)?;
         }
 

@@ -222,7 +222,12 @@ pub fn normal_comparison(reference: &Array, live: &Array, mask: Option<&Array>) 
     let l1 = subtract(reference, live)?.abs()?.mean_axes(&[3], false)?;
     let (cos_m, l1_m) = match mask {
         Some(m) => {
-            let m = m.reshape(&[1, m.shape()[0], m.shape()[1]])?;
+            // One image mask for every frame of the batch: broadcast it first so the divisor
+            // counts each frame's subject pixels (a video reference decodes several frames).
+            let m = mlx_rs::ops::broadcast_to(
+                m.reshape(&[1, m.shape()[0], m.shape()[1]])?,
+                cos.shape(),
+            )?;
             let denom = mlx_rs::ops::maximum(&m.sum(None)?, Array::from_f32(1.0))?;
             (
                 divide(&multiply(&cos, &m)?.sum(None)?, &denom)?,

@@ -2329,6 +2329,26 @@ impl QwenImage21Trainer {
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         // Epic 2123 E8: each (item, bucket) entry's reference once (its packed target unpacked to
         // the decoder grid), alternation keyed on the real item, the resumed prefix replayed.
+        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+        // cropped like the image and resampled onto its decoded size.
+        let mut perceptual = perceptual;
+        if let Some(path) = perceptual.as_mut() {
+            path.attach_subject_masks(
+                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load_with(
+                    "qwen_image_2_1 trainer",
+                    &req.items,
+                    cfg,
+                    edges.len(),
+                    |item| {
+                        if item.is_edit_pair() {
+                            CropBox::full
+                        } else {
+                            CropBox::center_square
+                        }
+                    },
+                )?,
+            );
+        }
         let mut aux_driver = match perceptual {
             Some(path) => Some(AuxDriver::prepare(
                 path,

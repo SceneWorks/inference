@@ -222,7 +222,9 @@ pub fn normal_comparison(
     let l1 = (reference - live)?.abs()?.mean(D::Minus1)?;
     let (cos_m, l1_m) = match mask {
         Some(m) => {
-            let m = m.unsqueeze(0)?;
+            // One image mask for every frame of the batch: broadcast it first so the divisor
+            // counts each frame's subject pixels (a video reference decodes several frames).
+            let m = m.unsqueeze(0)?.broadcast_as(cos.shape())?.contiguous()?;
             let denom = m.sum_all()?.clamp(1f32, f32::MAX)?;
             (
                 (cos * &m)?.sum_all()?.div(&denom)?,

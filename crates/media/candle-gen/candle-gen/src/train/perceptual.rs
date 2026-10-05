@@ -173,6 +173,9 @@ pub struct PerceptualPath {
     losses: Vec<AuxLoss>,
     references: HashMap<usize, Vec<Option<LossReference>>>,
     reference_computations: usize,
+    /// The job's subject masks for the losses that read one (sc-24832), see
+    /// [`attach_subject_masks`](Self::attach_subject_masks).
+    subject_masks: Option<crate::gen_core::train::subject_mask::PerceptualSubjectMasks>,
 }
 
 impl PerceptualPath {
@@ -194,6 +197,7 @@ impl PerceptualPath {
             losses,
             references: HashMap::new(),
             reference_computations: 0,
+            subject_masks: None,
         })
     }
 
@@ -237,6 +241,18 @@ impl PerceptualPath {
         self.ensure_reference_with_mask(image, clean_latents, None)
     }
 
+    /// Hand the path the job's subject masks (sc-24832): from then on every
+    /// [`ensure_reference`](Self::ensure_reference) passes its reference key's item mask — cropped
+    /// with the trainer's crop rule and area-averaged onto that reference's decoded pixel grid — to
+    /// each loss's [`PerceptualLoss::reference_with_mask`]. `None` is a no-op. Every trainer calls
+    /// this once with `PerceptualSubjectMasks::load` before preparing references.
+    pub fn attach_subject_masks(
+        &mut self,
+        masks: Option<crate::gen_core::train::subject_mask::PerceptualSubjectMasks>,
+    ) {
+        self.subject_masks = masks;
+    }
+
     /// [`ensure_reference`](Self::ensure_reference) with the image's subject mask (`[H, W]` f32 at
     /// the decoded pixel size), handed to every loss's
     /// [`PerceptualLoss::reference_with_mask`] (sc-24832).
@@ -256,6 +272,19 @@ impl PerceptualPath {
         } else {
             None
         };
+        // An explicit mask wins; else the attached job masks (sc-24832), resampled onto this
+        // reference's decoded pixel grid.
+        let attached = match (subject_mask, &self.subject_masks, &pixels) {
+            (None, Some(masks), Some(px)) => {
+                let (_, h, w, _) = px.dims4()?;
+                let v = masks
+                    .pixel_mask(image, w, h)
+                    .map_err(|e| CandleError::Msg(e.to_string()))?;
+                Some(Tensor::from_vec(v, (h, w), px.device())?)
+            }
+            _ => None,
+        };
+        let subject_mask = subject_mask.or(attached.as_ref());
         let mut refs = Vec::with_capacity(self.losses.len());
         for l in &self.losses {
             let input = match l.loss.input() {
