@@ -1991,7 +1991,7 @@ mod tests {
         on.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
         assert!(validate_training_techniques(&face_desc, &on).is_ok());
         for (identity, name) in [(true, "identity loss"), (false, "face-landmark loss")] {
-            let mut d = face_desc.clone();
+            let mut d = face_desc;
             if identity {
                 d.techniques.identity_loss = false;
             } else {

@@ -279,8 +279,8 @@ fn lora_x0(z: &Array, a: &Array, b: &Array) -> Array {
     let s = z.shape();
     let (h, w) = (s[2], s[3]);
     let eye = Array::from_slice(&[1.0f32, 0., 0., 0., 1., 0., 0., 0., 1.], &[3, 3]);
-    let m = add(&eye, &matmul(b, a).unwrap()).unwrap();
-    matmul(&m, &z.reshape(&[3, h * w]).unwrap())
+    let m = add(&eye, matmul(b, a).unwrap()).unwrap();
+    matmul(&m, z.reshape(&[3, h * w]).unwrap())
         .unwrap()
         .reshape(&[1, 3, h, w])
         .unwrap()

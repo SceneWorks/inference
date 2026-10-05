@@ -1052,7 +1052,7 @@ mod tests {
         assert_eq!(bucketed_json["supports_resolution_buckets"], true);
         // sc-24828: subject-masked loss support is advertised the same way.
         assert_eq!(json["supports_subject_mask_loss"], false);
-        let mut masked = descriptor.clone();
+        let mut masked = descriptor;
         masked.techniques.subject_mask_loss = true;
         let masked_json = TrainerCapabilitySnapshot::from_descriptor(&masked).to_json();
         assert_eq!(masked_json["supports_subject_mask_loss"], true);

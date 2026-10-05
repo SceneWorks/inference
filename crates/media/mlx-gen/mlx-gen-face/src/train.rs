@@ -305,8 +305,8 @@ pub struct LandmarkReference {
 /// Centre `[N, 478, 2]` landmarks on the nose tip and scale by the inner-eye distance (≥ 0.01).
 pub fn normalize_landmarks(lm: &Array) -> Result<Array> {
     let pick = |i: usize| lm.index((.., i as i32..i as i32 + 1, ..));
-    let centered = subtract(lm, &pick(NOSE_TIP))?;
-    let d = subtract(&pick(INNER_EYES.0), &pick(INNER_EYES.1))?;
+    let centered = subtract(lm, pick(NOSE_TIP))?;
+    let d = subtract(pick(INNER_EYES.0), pick(INNER_EYES.1))?;
     let inter = mlx_rs::ops::sqrt(&d.square()?.sum_axes(&[-1], true)?)?;
     Ok(divide(
         &centered,
@@ -335,7 +335,7 @@ pub fn landmark_distance(gen: &Array, reference: &Array) -> Result<Array> {
         weights += w;
     }
     Ok(divide(
-        &total.expect("three regions"),
+        total.expect("three regions"),
         Array::from_f32(weights),
     )?)
 }

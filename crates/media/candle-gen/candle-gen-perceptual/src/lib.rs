@@ -599,9 +599,11 @@ mod tests {
             t_max: 1.0,
             every_n: 2,
         };
-        let mut c = TrainingConfig::default();
-        c.perceptual_decoder_dir = Some(dec_dir);
-        c.face_analysis_dir = Some(face);
+        let mut c = TrainingConfig {
+            perceptual_decoder_dir: Some(dec_dir),
+            face_analysis_dir: Some(face),
+            ..TrainingConfig::default()
+        };
         c.identity_loss.schedule = sched;
         let dev = Device::Cpu;
         let ctx = AuxLossContext {

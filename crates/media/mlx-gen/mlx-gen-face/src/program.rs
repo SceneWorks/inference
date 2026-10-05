@@ -1,7 +1,7 @@
 //! MLX executor for **SceneWorks fx-program** checkpoints (`sceneworks-fx-program/1`, epic 2123
 //! sc-24831) — the MediaPipe FaceMesh-v2 landmark detector the face-landmark loss runs, lowered from
 //! upstream's onnx2torch `GraphModule` by `tools/convert_mp_facemesh_v2.py`. The program structure
-//! is parsed once, backend-neutrally, by [`gen_core::fx_program`] (shared with `candle-gen-face`);
+//! is parsed once, backend-neutrally, by [`mlx_gen::gen_core::fx_program`] (shared with `candle-gen-face`);
 //! this interpreter runs it with MLX ops, **differentiable in the input** (the parameters are
 //! captured constants, so autograd only ever yields input/adapter gradients).
 //!
