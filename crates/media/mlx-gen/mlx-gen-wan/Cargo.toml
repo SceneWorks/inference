@@ -20,7 +20,6 @@ serde_json = { workspace = true }
 # `ftfy.fix_character_width` transform that maps the Chinese negative prompt's fullwidth commas
 # to ASCII — load-bearing for correct tokenization). See `text_encoder::clean_text`.
 unicode-normalization = "0.1"
-zip = { version = "8.6.0", default-features = false }
 # Decode training-dataset images (LoRA/LoKr training, sc-3046). PNG + JPEG cover the SceneWorks
 # dataset formats; the trainer center-crops + hands the Image to the VAE preprocess.
 image = { workspace = true }

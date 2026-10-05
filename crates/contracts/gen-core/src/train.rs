@@ -291,6 +291,28 @@ pub struct TrainingConfig {
     /// typed refusal otherwise) whenever [`identity_loss`](Self::identity_loss) or
     /// [`face_landmark_loss`](Self::face_landmark_loss) is enabled. `None` by default.
     pub face_analysis_dir: Option<PathBuf>,
+    /// **VAE perceptual anchor** (epic 2123, sc-24833) — an auxiliary perceptual loss ported from
+    /// ai-toolkit-perceptual `toolkit/vae_anchor.py`: the model's x0 prediction is decoded with the
+    /// family's small differentiable decoder (the shared decoded-x0 path, E8), re-encoded by a
+    /// frozen **FLUX.2 VAE encoder**, and its multi-scale encoder features (the output of each of
+    /// the four resolution levels' last resnet and of the mid block's second resnet) are compared
+    /// with a per-level `1 - cosine` against the same features of the training image's clean round
+    /// trip, cached once per image. Off by default ([`AuxLossSchedule::weight`] `0`); refused
+    /// (typed [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`vae_anchor_loss`](TrainingTechniques::vae_anchor_loss) — see
+    /// [`validate_training_techniques`].
+    pub vae_anchor: VaeAnchorConfig,
+    /// **E-LatentLPIPS** (epic 2123, sc-24833) — the learned latent-space perceptual metric of
+    /// Kang et al. (ECCV 2024, `mingukkang/elatentlpips`) between the model's x0 prediction and the
+    /// training image's clean latent, ported from ai-toolkit-perceptual's
+    /// `latent_perceptual_loss_weight`. It runs on the latent directly (no decode) with the weights
+    /// calibrated for the trainer's latent family ([`LatentLpipsFamily`]). Off by default; refused
+    /// (typed [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss) — which no trainer whose latent
+    /// family has no published E-LatentLPIPS weights declares.
+    pub latent_lpips: LatentLpipsConfig,
 }
 
 /// Where [`IdentityLossConfig`]'s per-image target embedding comes from.
@@ -539,6 +561,100 @@ pub struct DepthAnchoringConfig {
     pub model_dir: Option<PathBuf>,
 }
 
+/// The upstream (ai-toolkit-perceptual) default schedule of the two latent-space perceptual losses
+/// (sc-24833) once given a weight: window `[0, 0.5]` (`*_loss_min_t` / `*_loss_max_t`) and
+/// **additive** (`every_n = 1`) — upstream adds both terms to the diffusion loss on every in-window
+/// step rather than alternating. Weight `0` ⇒ off.
+pub const LATENT_PERCEPTUAL_SCHEDULE: AuxLossSchedule = AuxLossSchedule {
+    weight: 0.0,
+    t_min: 0.0,
+    t_max: 0.5,
+    every_n: 1,
+};
+
+/// [`TrainingConfig::vae_anchor`] — the VAE-anchor loss schedule plus the frozen FLUX.2 VAE whose
+/// encoder it runs (sc-24833).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaeAnchorConfig {
+    /// Weight / window / alternation. Off by default ([`LATENT_PERCEPTUAL_SCHEDULE`]).
+    pub schedule: AuxLossSchedule,
+    /// Directory holding the FLUX.2 VAE in the diffusers layout
+    /// (`diffusion_pytorch_model.safetensors`; only `encoder.*` tensors are read). Required (a
+    /// typed refusal otherwise) when the loss is enabled.
+    pub model_dir: Option<PathBuf>,
+}
+
+impl Default for VaeAnchorConfig {
+    fn default() -> Self {
+        Self {
+            schedule: LATENT_PERCEPTUAL_SCHEDULE,
+            model_dir: None,
+        }
+    }
+}
+
+/// [`TrainingConfig::latent_lpips`] — the E-LatentLPIPS loss schedule plus the directory holding the
+/// published weights (sc-24833). The trainer picks the file for its own [`LatentLpipsFamily`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LatentLpipsConfig {
+    /// Weight / window / alternation. Off by default ([`LATENT_PERCEPTUAL_SCHEDULE`]).
+    pub schedule: AuxLossSchedule,
+    /// Directory holding the E-LatentLPIPS checkpoints (a `Mingguksky/elatentlpips` snapshot — see
+    /// [`LatentLpipsFamily::checkpoint_file`]). Required (a typed refusal otherwise) when the loss
+    /// is enabled.
+    pub model_dir: Option<PathBuf>,
+}
+
+impl Default for LatentLpipsConfig {
+    fn default() -> Self {
+        Self {
+            schedule: LATENT_PERCEPTUAL_SCHEDULE,
+            model_dir: None,
+        }
+    }
+}
+
+/// [`LatentLpipsFamily`] — the latent spaces E-LatentLPIPS publishes calibrated weights for (`Mingguksky/elatentlpips`,
+/// sc-24833). A trainer whose VAE latent space is none of these (FLUX.2, Qwen-Image / Wan, LTX
+/// latents) has no matching weights and does not declare
+/// [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss), so the floor refuses the loss.
+///
+/// | family | latent | model-space latent | trainers |
+/// |---|---|---|---|
+/// | `Sd15` | SD 1.x VAE, 4 ch | `z * 0.18215` | none |
+/// | `Sd21` | SD 2.x VAE, 4 ch | `z * 0.18215` | none |
+/// | `Sdxl` | SDXL VAE, 4 ch | `z * 0.13025` | SDXL / Illustrious, Kolors |
+/// | `Sd3` | SD3 VAE, 16 ch | `(z - 0.0609) * 1.5305` | SD3.5 |
+/// | `Flux` | FLUX.1 VAE, 16 ch | `(z - 0.1159) * 0.3611` | Z-Image |
+///
+/// The network consumes the **model-space** latent the diffusion model trains on (upstream calls it
+/// with `normalize=False` on exactly those latents).
+impl LatentLpipsFamily {
+    /// The upstream encoder name (`sd15` / `sd21` / `sdxl` / `sd3` / `flux`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sd15 => "sd15",
+            Self::Sd21 => "sd21",
+            Self::Sdxl => "sdxl",
+            Self::Sd3 => "sd3",
+            Self::Flux => "flux",
+        }
+    }
+
+    /// Latent channels the network's first convolution consumes.
+    pub fn latent_channels(self) -> usize {
+        match self {
+            Self::Sd15 | Self::Sd21 | Self::Sdxl => 4,
+            Self::Sd3 | Self::Flux => 16,
+        }
+    }
+
+    /// The published checkpoint's path relative to [`LatentLpipsConfig::model_dir`].
+    pub fn checkpoint_file(self) -> String {
+        format!("elatentlpips_ckpt/{}_latest_vgg16_tuned.pth", self.as_str())
+    }
+}
+
 impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
@@ -602,6 +718,9 @@ impl Default for TrainingConfig {
             face_analysis_dir: None,
             // Body losses are OFF by default (epic 2123 E1): all three weights 0, no model loaded.
             body_losses: BodyLossesConfig::default(),
+            // The latent-space perceptual losses are OFF by default (epic 2123 E1, sc-24833).
+            vae_anchor: VaeAnchorConfig::default(),
+            latent_lpips: LatentLpipsConfig::default(),
         }
     }
 }
@@ -1013,6 +1132,11 @@ pub struct TrainingTechniques {
     pub body_shape_loss: bool,
     /// Honors [`BodyLossesConfig::normal`] (Sapiens surface-normal loss, sc-24832).
     pub normal_loss: bool,
+    /// Honors [`TrainingConfig::vae_anchor`] (decoded-x0 FLUX.2-VAE-encoder anchor loss, sc-24833).
+    pub vae_anchor_loss: bool,
+    /// Honors [`TrainingConfig::latent_lpips`] (E-LatentLPIPS on the x0 latent, sc-24833) — only a
+    /// trainer whose latent family has published weights ([`LatentLpipsFamily`]) declares it.
+    pub latent_lpips_loss: bool,
 }
 
 impl TrainingTechniques {
@@ -1028,6 +1152,8 @@ impl TrainingTechniques {
         body_proportion_loss: false,
         body_shape_loss: false,
         normal_loss: false,
+        vae_anchor_loss: false,
+        latent_lpips_loss: false,
     };
 
     /// The adapter-noise pair every LoRA/LoKr trainer implements at its optimizer step (epic 2123
@@ -1043,6 +1169,8 @@ impl TrainingTechniques {
         body_proportion_loss: false,
         body_shape_loss: false,
         normal_loss: false,
+        vae_anchor_loss: false,
+        latent_lpips_loss: false,
     };
 }
 
@@ -1119,6 +1247,12 @@ pub fn technique_noise_key(seed: u64, salt: u64, update_idx: u32, tensor_idx: us
 ///   [`face_landmark_loss`](TrainingTechniques::face_landmark_loss) ⇒ typed
 ///   [`crate::Error::Unsupported`]; enabled without [`TrainingConfig::face_analysis_dir`], the
 ///   x0 decoder, or (landmarks) [`FaceLandmarkLossConfig::model_dir`] ⇒ [`crate::Error::Msg`].
+/// - a malformed [`TrainingConfig::vae_anchor`] / [`TrainingConfig::latent_lpips`] schedule ⇒
+///   [`crate::Error::Msg`]; either loss enabled on a trainer lacking
+///   [`vae_anchor_loss`](TrainingTechniques::vae_anchor_loss) /
+///   [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss) ⇒ typed
+///   [`crate::Error::Unsupported`]; enabled without its model directory (or, for the VAE anchor,
+///   without [`TrainingConfig::perceptual_decoder_dir`]) ⇒ [`crate::Error::Msg`].
 /// - every technique off ⇒ no-op.
 pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
@@ -1198,6 +1332,7 @@ pub fn validate_training_techniques(
         }
     }
     validate_face_losses(desc, &req.config)?;
+    validate_latent_perceptual_losses(desc, req)?;
     if let Some(mask_loss) = &req.config.subject_mask_loss {
         mask_loss.validate(desc.id)?;
         if !desc.techniques.subject_mask_loss {
@@ -1352,6 +1487,62 @@ fn validate_face_losses(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> crate
              (face_landmark_loss.model_dir is unset)",
             desc.id
         )));
+    }
+    Ok(())
+}
+
+/// Latent-perceptual half of [`validate_training_techniques`] (sc-24833): each loss's schedule must
+/// be well formed (`Msg`), and when enabled the trainer must declare it (`Unsupported`) and its
+/// frozen model (plus, for the decoded-x0 VAE anchor, the family's small decoder) must be named
+/// (`Msg`).
+fn validate_latent_perceptual_losses(
+    desc: &TrainerDescriptor,
+    req: &TrainingRequest,
+) -> crate::Result<()> {
+    let cfg = &req.config;
+    let va = &cfg.vae_anchor;
+    va.schedule
+        .validate("VAE anchor")
+        .map_err(|m| crate::Error::Msg(format!("{}: {m}", desc.id)))?;
+    if va.schedule.is_enabled() {
+        if !desc.techniques.vae_anchor_loss {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: the VAE anchor loss (weight {}) is not supported by this trainer",
+                desc.id, va.schedule.weight
+            )));
+        }
+        if va.model_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: the VAE anchor loss needs the FLUX.2 VAE (vae_anchor.model_dir is unset)",
+                desc.id
+            )));
+        }
+        if cfg.perceptual_decoder_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: the VAE anchor loss needs the family's small x0 decoder \
+                 (perceptual_decoder_dir is unset)",
+                desc.id
+            )));
+        }
+    }
+    let lp = &cfg.latent_lpips;
+    lp.schedule
+        .validate("E-LatentLPIPS")
+        .map_err(|m| crate::Error::Msg(format!("{}: {m}", desc.id)))?;
+    if lp.schedule.is_enabled() {
+        if !desc.techniques.latent_lpips_loss {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: the E-LatentLPIPS loss (weight {}) is not supported by this trainer (no \
+                 E-LatentLPIPS weights match its latent family)",
+                desc.id, lp.schedule.weight
+            )));
+        }
+        if lp.model_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: the E-LatentLPIPS loss needs its weights (latent_lpips.model_dir is unset)",
+                desc.id
+            )));
+        }
     }
     Ok(())
 }
@@ -2261,6 +2452,118 @@ mod tests {
             Some(IdentityReferenceMode::PerImage)
         );
         assert_eq!(IdentityReferenceMode::parse("mean"), None);
+    }
+
+    #[test]
+    fn validate_training_techniques_latent_perceptual_floor() {
+        // sc-24833 (epic 2123 E3): the VAE anchor and E-LatentLPIPS are each refused unless the
+        // descriptor declares them, need their models named, and a malformed schedule is refused.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let off = train_req(None, items);
+        assert_eq!(off.config.vae_anchor.schedule, LATENT_PERCEPTUAL_SCHEDULE);
+        assert_eq!(off.config.latent_lpips.schedule, LATENT_PERCEPTUAL_SCHEDULE);
+        assert!(!off.config.vae_anchor.schedule.is_enabled());
+        assert!(!off.config.latent_lpips.schedule.is_enabled());
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        // VAE anchor.
+        let mut va_desc = trainer_desc(false);
+        va_desc.techniques.vae_anchor_loss = true;
+        let mut va = off.clone();
+        va.config.vae_anchor.schedule.weight = 0.5;
+        va.config.vae_anchor.model_dir = Some(PathBuf::from("/m/flux2-vae"));
+        va.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
+        let err = validate_training_techniques(&plain, &va).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("VAE anchor")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&va_desc, &va).is_ok());
+        let mut no_vae = va.clone();
+        no_vae.config.vae_anchor.model_dir = None;
+        let err = validate_training_techniques(&va_desc, &no_vae).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("FLUX.2 VAE")));
+        let mut no_dec = va.clone();
+        no_dec.config.perceptual_decoder_dir = None;
+        let err = validate_training_techniques(&va_desc, &no_dec).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")));
+        // The VAE-anchor flag does not license E-LatentLPIPS.
+        let mut lp = off.clone();
+        lp.config.latent_lpips.schedule.weight = 0.5;
+        lp.config.latent_lpips.model_dir = Some(PathBuf::from("/m/elatentlpips"));
+        let err = validate_training_techniques(&va_desc, &lp).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("E-LatentLPIPS")),
+            "{err:?}"
+        );
+
+        // E-LatentLPIPS (no decoder needed: it runs on the latent).
+        let mut lp_desc = trainer_desc(false);
+        lp_desc.techniques.latent_lpips_loss = true;
+        assert!(validate_training_techniques(&lp_desc, &lp).is_ok());
+        let mut no_w = lp.clone();
+        no_w.config.latent_lpips.model_dir = None;
+        let err = validate_training_techniques(&lp_desc, &no_w).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("weights")));
+        assert!(validate_training_techniques(&lp_desc, &va).is_err());
+
+        // Malformed schedules ⇒ Msg even on a declaring trainer.
+        for bad in [
+            AuxLossSchedule {
+                weight: -1.0,
+                ..LATENT_PERCEPTUAL_SCHEDULE
+            },
+            AuxLossSchedule {
+                weight: 0.5,
+                t_min: 0.6,
+                t_max: 0.4,
+                every_n: 1,
+            },
+            AuxLossSchedule {
+                weight: 0.5,
+                every_n: 0,
+                ..LATENT_PERCEPTUAL_SCHEDULE
+            },
+        ] {
+            let mut r = lp.clone();
+            r.config.latent_lpips.schedule = bad;
+            let err = validate_training_techniques(&lp_desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad:?}: {err:?}");
+            let mut r = va.clone();
+            r.config.vae_anchor.schedule = bad;
+            let err = validate_training_techniques(&va_desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn latent_lpips_family_table() {
+        use LatentLpipsFamily::*;
+        let rows: Vec<_> = [Sd15, Sd21, Sdxl, Sd3, Flux]
+            .iter()
+            .map(|f| (f.as_str(), f.latent_channels(), f.checkpoint_file()))
+            .collect();
+        assert_eq!(
+            rows[2],
+            (
+                "sdxl",
+                4,
+                "elatentlpips_ckpt/sdxl_latest_vgg16_tuned.pth".into()
+            )
+        );
+        assert_eq!(rows[3].1, 16);
+        assert_eq!(
+            rows[4],
+            (
+                "flux",
+                16,
+                "elatentlpips_ckpt/flux_latest_vgg16_tuned.pth".into()
+            )
+        );
     }
 
     #[test]

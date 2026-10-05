@@ -271,6 +271,10 @@ fn trainer_descriptor(id: &'static str) -> TrainerDescriptor {
         // the shared decoded-x0 perceptual path through the TAEHV tiny video decoder (taew2_1 for
         // the z16 14B experts, taew2_2 for the z48 TI2V-5B), each expert's aux steps confined to
         // its own noise band.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps, per
+        // decoded frame) through the shared aux-loss builder this trainer already drives, wherever
+        // depth anchoring is wired. No E-LatentLPIPS: no published weights match this latent
+        // family.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
@@ -283,6 +287,7 @@ fn trainer_descriptor(id: &'static str) -> TrainerDescriptor {
             body_proportion_loss: true,
             body_shape_loss: true,
             normal_loss: true,
+            vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }

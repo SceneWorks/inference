@@ -523,6 +523,8 @@ fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
             body_proportion_loss: true,
             body_shape_loss: true,
             normal_loss: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
             ..gen_core::TrainingTechniques::ADAPTER_NOISE
         };
         Box::new(stub)
@@ -633,6 +635,9 @@ fn each_body_loss_probe_catches_a_silently_ignored_loss() {
                 resolution_buckets: true,
                 identity_loss: true,
                 face_landmark_loss: true,
+                // The sc-24833 latent-loss probes run first; declare them so the miss is the body's.
+                vae_anchor_loss: true,
+                latent_lpips_loss: true,
                 ..gen_core::TrainingTechniques::ADAPTER_NOISE
             };
             for (other, set) in flags {
@@ -789,4 +794,52 @@ fn declared_subject_mask_loss_that_ignores_missing_masks_fails_the_validate_chec
     stub.desc.techniques.subject_mask_loss = true;
     let err = check_trainer_validate(&MaskForger(stub), &profile(&tmp)).unwrap_err();
     assert!(err.contains("lacking its mask"), "got: {err}");
+}
+
+/// sc-24833: a trainer that declares every earlier probed technique but silently accepts an
+/// undeclared VAE-anchor (then E-LatentLPIPS) request fails the validate check and the train-entry
+/// refusal check on that probe. Mutation: drop the probe's row from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_latent_perceptual_losses_fail_both_technique_checks() {
+    for (declare_va, missing) in [(false, "vae_anchor_loss"), (true, "latent_lpips_loss")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = move || -> Box<dyn Trainer> {
+            let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+            stub.desc.techniques = gen_core::TrainingTechniques {
+                depth_anchoring: true,
+                subject_mask_loss: true,
+                // The sc-24831 face-loss probes run first; declare them so the miss is S12's.
+                identity_loss: true,
+                face_landmark_loss: true,
+                vae_anchor_loss: declare_va,
+                ..gen_core::TrainingTechniques::ADAPTER_NOISE
+            };
+            Box::new(stub)
+        };
+        let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(&format!("techniques.{missing} == false")),
+            "got: {err}"
+        );
+        let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(missing) && err.contains("silently ignored"),
+            "got: {err}"
+        );
+    }
+}
+
+/// sc-24833: a trainer that declares both latent-space perceptual losses (and routes through the
+/// floor) passes the technique checks — neither is adapter-only.
+#[test]
+fn declared_latent_perceptual_losses_pass_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.vae_anchor_loss = true;
+        stub.desc.techniques.latent_lpips_loss = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
 }

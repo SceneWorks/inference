@@ -290,6 +290,80 @@ fn normal_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint
     candle_gen_body::arm_footprint(&cfg.body_losses, candle_gen_body::BodyArm::Normal)
 }
 
+/// The VAE perceptual anchor (sc-24833): a frozen FLUX.2 VAE encoder's multi-scale features on the
+/// decoded x0.
+fn build_vae_anchor(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let va = &cfg.vae_anchor;
+    let dir = va.model_dir.as_ref().ok_or_else(|| {
+        CandleError::Msg(format!(
+            "{}: the VAE anchor loss needs the FLUX.2 VAE (vae_anchor.model_dir)",
+            ctx.label
+        ))
+    })?;
+    let loss =
+        candle_gen::train::vae_anchor::VaeAnchorLoss::from_dir(dir, ctx.device).map_err(|e| {
+            CandleError::Msg(format!(
+                "{}: could not load the FLUX.2 VAE encoder from {}: {e}",
+                ctx.label,
+                dir.display()
+            ))
+        })?;
+    Ok(AuxLoss {
+        schedule: va.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// E-LatentLPIPS (sc-24833) on the x0 latent, with the weights of the trainer's latent family
+/// (`ctx.latent_lpips`; `None` ⇒ no published weights match ⇒ a named error — the descriptor flag
+/// is false there too, so the floor refuses first).
+fn build_latent_lpips(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let lp = &cfg.latent_lpips;
+    let family = ctx.latent_lpips.ok_or_else(|| {
+        CandleError::Msg(format!(
+            "{}: no E-LatentLPIPS weights match this trainer's latent family",
+            ctx.label
+        ))
+    })?;
+    let dir = lp.model_dir.as_ref().ok_or_else(|| {
+        CandleError::Msg(format!(
+            "{}: the E-LatentLPIPS loss needs its weights (latent_lpips.model_dir)",
+            ctx.label
+        ))
+    })?;
+    let loss = candle_gen::train::latent_lpips::LatentLpipsLoss::from_dir(dir, family, ctx.device)
+        .map_err(|e| {
+            CandleError::Msg(format!(
+                "{}: could not load E-LatentLPIPS ({}) from {}: {e}",
+                ctx.label,
+                family.as_str(),
+                dir.display()
+            ))
+        })?;
+    Ok(AuxLoss {
+        schedule: lp.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// The VAE anchor's pre-load footprint at one `h × w` frame (the FLUX.2 encoder; the decoder that
+/// feeds it is counted by the builder).
+fn vae_anchor_footprint(_cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
+    candle_gen::train::vae_anchor::vae_anchor_footprint(h, w)
+}
+
+/// E-LatentLPIPS's pre-load footprint at one `h × w` frame: every published family has an 8×
+/// VAE, so the latent is `h/8 × w/8`; the footprint fn has no trainer context, so it is sized for
+/// the 16-channel families (an upper bound for the 4-channel ones — the trunk is identical past the
+/// first conv).
+fn latent_lpips_footprint(_cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
+    candle_gen::train::latent_lpips::latent_lpips_footprint(
+        gen_core::train::LatentLpipsFamily::Flux,
+        h.div_ceil(8),
+        w.div_ceil(8),
+    )
+}
+
 /// Every auxiliary loss, in loss-index order. **Extension point**: later stories append an arm.
 pub const ARMS: &[AuxArm] = &[
     AuxArm {
@@ -333,6 +407,20 @@ pub const ARMS: &[AuxArm] = &[
         input: PerceptualInput::DecodedPixels,
         footprint: normal_footprint,
         build: build_normal,
+    },
+    AuxArm {
+        name: "vae_anchor",
+        enabled: |cfg| cfg.vae_anchor.schedule.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: vae_anchor_footprint,
+        build: build_vae_anchor,
+    },
+    AuxArm {
+        name: "latent_lpips",
+        enabled: |cfg| cfg.latent_lpips.schedule.is_enabled(),
+        input: PerceptualInput::Latents,
+        footprint: latent_lpips_footprint,
+        build: build_latent_lpips,
     },
 ];
 
@@ -607,6 +695,12 @@ mod tests {
         cfg.body_losses.shape.weight = 0.1;
         cfg.body_losses.normal.weight = 0.1;
         assert!(any_aux_loss(&cfg));
+        // One LTX-2.5 refusal mechanism: the body arms decode x0 to pixels, so the no-video
+        // refusal names them. Mutation: declare a body arm `PerceptualInput::Latents` ⇒ red.
+        assert_eq!(
+            enabled_pixel_aux_losses(&cfg),
+            ["body-proportion", "body-shape", "normal"]
+        );
         let g = AuxGeometry::image(512, 3);
         let dec = TinyDecoderConfig::taef1().footprint(512, 512);
         let models: Vec<AuxModelFootprint> = [
@@ -871,5 +965,154 @@ mod tests {
             perceptual_footprint_with(&arms, &cfg, &taef1(), AuxGeometry::image(64, 1)),
             5
         );
+    }
+
+    fn latent_on(model_dir: Option<std::path::PathBuf>) -> TrainingConfig {
+        let mut cfg = TrainingConfig::default();
+        cfg.latent_lpips.schedule = AuxLossSchedule {
+            weight: 0.5,
+            ..gen_core::train::LATENT_PERCEPTUAL_SCHEDULE
+        };
+        cfg.latent_lpips.model_dir = model_dir;
+        cfg
+    }
+
+    fn vae_anchor_on() -> TrainingConfig {
+        let mut cfg = TrainingConfig::default();
+        cfg.vae_anchor.schedule = AuxLossSchedule {
+            weight: 0.5,
+            ..gen_core::train::LATENT_PERCEPTUAL_SCHEDULE
+        };
+        cfg
+    }
+
+    /// sc-24833: the E-LatentLPIPS arm builds on a family with NO x0 decoder (it is a latent
+    /// loss), loads the family's checkpoint from `latent_lpips.model_dir`, and trains: zero at the
+    /// clean latent, positive off it. A context naming no family is a named error. Mutations: give
+    /// the arm `PerceptualInput::DecodedPixels` ⇒ the `DecoderSpec::None` build errors ⇒ red; ignore
+    /// `ctx.latent_lpips` ⇒ the no-family build succeeds ⇒ red.
+    #[test]
+    fn the_latent_lpips_arm_runs_without_a_decoder_on_its_family_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_lpips_checkpoint(&tmp.path().join("sdxl_latest_vgg16_tuned.safetensors"));
+        let cfg = latent_on(Some(tmp.path().to_path_buf()));
+        assert!(any_aux_loss(&cfg));
+        let dev = Device::Cpu;
+        let ctx = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::None,
+            device: &dev,
+            latent_lpips: Some(gen_core::train::LatentLpipsFamily::Sdxl),
+        };
+        let mut path = build_perceptual_path(&cfg, &ctx).unwrap().unwrap();
+        assert_eq!(path.losses()[0].loss.name(), "latent_lpips");
+        let clean = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap();
+        path.ensure_reference(0, &clean).unwrap();
+        let plan = path.plan(1, 0, 0.25).unwrap();
+        assert!(plan.diffusion && plan.aux == vec![0], "{plan:?}");
+        assert_eq!(
+            candle_scalar(path.aux_loss(&plan, 0, &clean).unwrap().unwrap().weighted),
+            0.0
+        );
+        let off = (&clean + 0.2).unwrap();
+        assert!(candle_scalar(path.aux_loss(&plan, 0, &off).unwrap().unwrap().weighted) > 0.0);
+        let none_dev = Device::Cpu;
+        let none = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::None,
+            device: &none_dev,
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&cfg, &none)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("no E-LatentLPIPS weights match"), "{e}");
+        let e = build_perceptual_path(&latent_on(None), &ctx)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("latent_lpips.model_dir"), "{e}");
+    }
+
+    /// sc-24833: the VAE anchor is a decoded-x0 loss — a family with no decoder gets a typed error
+    /// naming it, and a missing FLUX.2 VAE dir is named (after the decoder loads). E7: enabling it
+    /// adds the decoder + the FLUX.2 encoder footprint; E-LatentLPIPS adds its own and no decoder.
+    /// Mutations: drop the arm's `footprint` term ⇒ red; mark it `Latents` ⇒ the no-decoder build
+    /// succeeds ⇒ red.
+    #[test]
+    fn the_vae_anchor_arm_is_a_pixel_loss_with_its_own_footprint() {
+        let none_dev = Device::Cpu;
+        let none = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::None,
+            device: &none_dev,
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&vae_anchor_on(), &none)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("vae_anchor") && e.contains("no x0 decoder"),
+            "{e}"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dec_dir = tmp.path().join("tae");
+        let cfg4 = testing::tiny_decoder_config(4);
+        testing::write_tiny_decoder(&dec_dir, &cfg4, 1).unwrap();
+        let mut c = vae_anchor_on();
+        c.perceptual_decoder_dir = Some(dec_dir);
+        let tiny_dev = Device::Cpu;
+        let tiny = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::Tiny {
+                name: "TINY",
+                config: cfg4.into(),
+            },
+            device: &tiny_dev,
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&c, &tiny).err().unwrap().to_string();
+        assert!(e.contains("FLUX.2 VAE"), "{e}");
+        c.vae_anchor.model_dir = Some(tmp.path().join("no-vae"));
+        let e = build_perceptual_path(&c, &tiny).err().unwrap().to_string();
+        assert!(e.contains("FLUX.2 VAE encoder"), "{e}");
+
+        let g = AuxGeometry::image(512, 3);
+        let dec = TinyDecoderConfig::taef1().footprint(512, 512);
+        let va = candle_gen::train::vae_anchor::vae_anchor_footprint(512, 512);
+        assert_eq!(
+            perceptual_footprint(&vae_anchor_on(), &taef1(), g),
+            perceptual_footprint_bytes(Some(dec), &[va], 3)
+        );
+        // sc-24833 review: the VAE-anchor references spill to disk, so the footprint does not
+        // scale with the cached-entry count (a 50-image × 3-bucket job admits like a 1-entry one).
+        assert_eq!(
+            perceptual_footprint(&vae_anchor_on(), &taef1(), AuxGeometry::image(512, 150)),
+            perceptual_footprint(&vae_anchor_on(), &taef1(), g)
+        );
+        let lp = candle_gen::train::latent_lpips::latent_lpips_footprint(
+            gen_core::train::LatentLpipsFamily::Flux,
+            64,
+            64,
+        );
+        assert_eq!(
+            perceptual_footprint(&latent_on(None), &taef1(), g),
+            perceptual_footprint_bytes(None, &[lp], 3)
+        );
+    }
+
+    fn candle_scalar(t: Tensor) -> f32 {
+        t.to_scalar::<f32>().unwrap()
+    }
+
+    fn write_lpips_checkpoint(path: &std::path::Path) {
+        let w = candle_gen::train::latent_lpips::formula_weights(4, &Device::Cpu).unwrap();
+        let map: std::collections::HashMap<String, Tensor> = w
+            .keys()
+            .map(|k| (k.clone(), w.require(k).unwrap()))
+            .collect();
+        candle_gen::candle_core::safetensors::save(&map, path).unwrap();
     }
 }

@@ -127,6 +127,8 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // a per-(item, bucket) weight map cached next to each latent, applied by `reduce_loss`),
         // and the body losses (sc-24832: ViTPose proportion, HybrIK shape, Sapiens normals) on the
         // same perceptual path through the `mlx-gen-perceptual` builder's arms.
+        // sc-24833: the VAE anchor (TAEF1 decode → FLUX.2 encoder taps) and E-LatentLPIPS (the
+        // FLUX.1 16-channel family weights) through the shared aux-loss builder.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             depth_anchoring: true,
@@ -138,6 +140,8 @@ fn trainer_descriptor() -> TrainerDescriptor {
             body_proportion_loss: true,
             body_shape_loss: true,
             normal_loss: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -2892,6 +2896,104 @@ mod depth_anchoring_tests {
             .expect("must fail")
             .to_string();
         assert!(err.contains("TAEF1"), "{err}");
+    }
+
+    /// sc-24833 (epic 2123 E8): the two latent-space perceptual losses through Z-Image's REAL step
+    /// seam — a path holding the VAE anchor (decoded-x0, FLUX.2-encoder graph on formula weights)
+    /// and E-LatentLPIPS (latent input; 4-channel formula weights for the 4-channel fixture DiT),
+    /// both additive (`every_n = 1`). Each image's references are built once however many steps run;
+    /// every step carries the diffusion term AND the weighted aux term; and the aux term alone moves
+    /// the LoRA gradient (the same step with the losses zero-weighted differs). Mutations: drop the
+    /// `aux_term` from `combine_step_loss` in `compute_loss_grads` ⇒ the gradients match ⇒ red;
+    /// drop `PerceptualPath::ensure_reference`'s cache hit ⇒ counter 6 ⇒ red.
+    #[test]
+    fn latent_perceptual_losses_train_the_lora_through_the_step_seam() {
+        use mlx_gen::train::latent_lpips::{
+            formula_weights as lpips_w, LatentLpips, LatentLpipsLoss,
+        };
+        use mlx_gen::train::perceptual::AuxLoss;
+        use mlx_gen::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder};
+        use mlx_gen::train::vae_anchor::{
+            formula_weights as va_w, VaeAnchorEncoder, VaeAnchorEncoderConfig, VaeAnchorLoss,
+        };
+        let build = |weight: f32| {
+            let sched = AuxLossSchedule {
+                weight,
+                t_min: 0.0,
+                t_max: 1.0,
+                every_n: 1,
+            };
+            let dec_cfg = mlx_gen_perceptual::testing::tiny_decoder_config(4);
+            let dec = TinyDecoder::from_weights(
+                &synthetic_tiny_decoder_weights(&dec_cfg, 11).unwrap(),
+                dec_cfg,
+            )
+            .unwrap();
+            let va_cfg = VaeAnchorEncoderConfig::with_base(32);
+            let va =
+                VaeAnchorLoss::new(VaeAnchorEncoder::from_weights(&va_w(&va_cfg), va_cfg).unwrap());
+            let lp = LatentLpipsLoss::new(LatentLpips::from_weights(&lpips_w(4), 4).unwrap());
+            PerceptualPath::new(
+                Some(Box::new(dec)),
+                vec![
+                    AuxLoss {
+                        schedule: sched,
+                        loss: Box::new(va),
+                    },
+                    AuxLoss {
+                        schedule: sched,
+                        loss: Box::new(lp),
+                    },
+                ],
+            )
+            .unwrap()
+        };
+        let mut dit = tiny_dit();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(2);
+        let run = |dit: &mut ZImageTransformer, weight: f32, steps: u32| {
+            let mut p = build(weight);
+            prepare_perceptual_references(&mut p, &cache, None).unwrap();
+            let mut alt = AuxAlternation::new(cache.len(), 1);
+            let mut out = Vec::new();
+            for n in 1..=steps {
+                out.push(step(
+                    dit,
+                    &params,
+                    &adapter,
+                    &cfg,
+                    &cache,
+                    Some((&mut p, &mut alt)),
+                    n,
+                ));
+            }
+            (out, p.reference_computations())
+        };
+        let (steps, refs) = run(&mut dit, 0.5, 4);
+        assert_eq!(refs, 2, "references are built once per image");
+        for (n, (l, _)) in steps.iter().enumerate() {
+            let aux = l
+                .aux
+                .unwrap_or_else(|| panic!("step {n}: additive aux term missing: {l:?}"));
+            let diff = l.diffusion.expect("additive: the diffusion term stays");
+            assert!(aux > 0.0 && aux.is_finite(), "step {n}: aux {aux}");
+            assert!(
+                (l.total - (diff + aux)).abs() <= 1e-4 * l.total.abs().max(1.0),
+                "{l:?}"
+            );
+        }
+        // Same step, losses scheduled but zero-weighted vs weighted: only the aux term differs.
+        let (zero, _) = run(&mut dit, 1e-12, 1);
+        let (with, _) = run(&mut dit, 0.5, 1);
+        let (gz, gw) = (
+            abs_sum(&zero[0].1, ".lora_b"),
+            abs_sum(&with[0].1, ".lora_b"),
+        );
+        assert!(
+            (gz - gw).abs() > 1e-6 * gz.max(1e-12),
+            "the aux term must move the LoRA gradient: {gz} vs {gw}"
+        );
     }
 }
 

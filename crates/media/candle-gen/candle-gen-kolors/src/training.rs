@@ -73,6 +73,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // sc-24828 (epic 2123): subject-masked loss.
         // sc-24830 (epic 2123): depth anchoring through the shared perceptual path (TAESDXL +
         // Depth-Anything-V2) on the trainer's one (dense) loss path.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps) and
+        // E-LatentLPIPS (this latent family's published weights) through the shared aux-loss
+        // builder this trainer already drives.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
@@ -85,6 +88,8 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
             body_proportion_loss: true,
             body_shape_loss: true,
             normal_loss: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -941,20 +946,52 @@ mod tests {
                 })
                 .collect();
             assert!(!paths.is_empty());
+            // Deterministic: candle's CPU `randn` / VarMap init draw from an unseeded thread RNG, so
+            // every random-init weight is redrawn from a seeded normal (constant inits — norm
+            // scales, zero biases — are already deterministic and kept). Unseeded, the aux-only
+            // gradient assertion failed ~1 run in 15.
+            let seeded = |dims: &[usize], seed: u64, std: f32| {
+                (sample_noise(dims, seed, &dev).unwrap() * f64::from(std)).unwrap()
+            };
+            {
+                let data = candle_gen::lock_recover(vm.data());
+                let mut names: Vec<&String> = data.keys().collect();
+                names.sort();
+                for (i, name) in names.into_iter().enumerate() {
+                    let v = &data[name];
+                    let t = v.as_tensor();
+                    let flat = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    if flat.iter().all(|x| *x == flat[0]) {
+                        continue;
+                    }
+                    let dims = t.dims().to_vec();
+                    let fan_in = if dims.len() > 1 {
+                        flat.len() / dims[0]
+                    } else {
+                        flat.len()
+                    };
+                    v.set(&seeded(
+                        &dims,
+                        1000 + i as u64,
+                        (fan_in as f32).sqrt().recip(),
+                    ))
+                    .unwrap();
+                }
+            }
             let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
-            for v in &set.vars {
-                v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+            for (i, v) in set.vars.iter().enumerate() {
+                v.set(&seeded(v.as_tensor().dims(), 100 + i as u64, 0.02))
                     .unwrap();
             }
             Fixture {
                 unet,
                 vars: set.vars,
                 alphas: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
-                x0: Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap(),
-                projected: Tensor::randn(0f32, 1f32, (1, 7, 64), &dev).unwrap(),
-                pooled: Tensor::randn(0f32, 1f32, (1, 16), &dev).unwrap(),
+                x0: seeded(&[1, 4, 8, 8], 1, 1.0),
+                projected: seeded(&[1, 7, 64], 2, 1.0),
+                pooled: seeded(&[1, 16], 3, 1.0),
                 time_ids: build_time_ids(&dev, 1, 64, 64).unwrap(),
-                noise: Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap(),
+                noise: seeded(&[1, 4, 8, 8], 4, 1.0),
             }
         }
 
