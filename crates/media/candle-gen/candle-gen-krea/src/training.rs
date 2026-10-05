@@ -279,16 +279,22 @@ fn load_perceptual_path(cfg: &TrainingConfig, device: &Device) -> Result<Option<
 
 /// Epic 2123 E7: refuse a depth job whose resident DiT (`base_bytes`, the transformer's on-disk
 /// weights — the lower bound the aux models stack on) plus TAEW2.1 + the losses' frozen models at the
-/// largest bucket exceeds `budget_bytes`. No-op when no aux loss is enabled (the dense/checkpointed
-/// choice does not change the aux models' resident cost, so this runs on both paths).
-fn check_perceptual_memory(cfg: &TrainingConfig, base_bytes: u64, budget_bytes: u64) -> Result<()> {
+/// largest bucket, with one cached reference per (item, bucket) entry over `items` dataset items,
+/// exceeds `budget_bytes`. No-op when no aux loss is enabled (the dense/checkpointed choice does
+/// not change the aux models' resident cost, so this runs on both paths).
+fn check_perceptual_memory(
+    cfg: &TrainingConfig,
+    items: usize,
+    base_bytes: u64,
+    budget_bytes: u64,
+) -> Result<()> {
     let edges = bucket_edges(cfg);
     let aux = candle_gen_perceptual::perceptual_footprint(
         cfg,
         &krea_decoder(),
         candle_gen_perceptual::AuxGeometry::image(
             edges.iter().copied().max().unwrap_or(0),
-            edges.len(),
+            items * edges.len(),
         ),
     );
     if aux == 0 {
@@ -492,6 +498,7 @@ impl FlowMatchTrainer for KreaTrainer {
         let base = flow_match::component_bytes(&self.root, "transformer", LABEL)?;
         check_perceptual_memory(
             &req.config,
+            req.items.len(),
             base,
             flow_match::device_training_budget_bytes(&self.device, LABEL),
         )
@@ -1356,10 +1363,35 @@ mod depth_anchoring_tests {
         let base = 24u64 << 30;
         for ckpt in [false, true] {
             on.gradient_checkpointing = ckpt;
-            assert!(check_perceptual_memory(&TrainingConfig::default(), base, base).is_ok());
-            assert!(check_perceptual_memory(&on, base, base + large / 2).is_err());
-            assert!(check_perceptual_memory(&on, base, base + large + (1 << 30)).is_ok());
+            assert!(check_perceptual_memory(&TrainingConfig::default(), 1, base, base).is_ok());
+            assert!(check_perceptual_memory(&on, 1, base, base + large / 2).is_err());
+            assert!(check_perceptual_memory(&on, 1, base, base + large + (1 << 30)).is_ok());
         }
+    }
+
+    /// Review fix: the guard prices one cached depth reference per (item, bucket) entry, so a budget
+    /// that fits one item's references refuses a dataset whose references do not fit. Mutation:
+    /// size the entries as `edges.len()` (buckets only) ⇒ the many-item case passes ⇒ red.
+    #[test]
+    fn memory_guard_scales_references_with_items() {
+        let mut on = TrainingConfig::default();
+        on.depth_anchoring.schedule = schedule();
+        let at = |items: usize| {
+            candle_gen_perceptual::perceptual_footprint(
+                &on,
+                &krea_decoder(),
+                candle_gen_perceptual::AuxGeometry::image(
+                    bucket_edges(&on).iter().copied().max().unwrap_or(0),
+                    items * bucket_edges(&on).len(),
+                ),
+            )
+        };
+        let (one, many) = (at(1), at(10_000));
+        assert!(many > one, "{one} {many}");
+        let base = 24u64 << 30;
+        let budget = base + one + (many - one) / 2;
+        assert!(check_perceptual_memory(&on, 1, base, budget).is_ok());
+        assert!(check_perceptual_memory(&on, 10_000, base, budget).is_err());
     }
 
     /// AC (e): the descriptor declares depth anchoring; a missing TAEW2.1 checkpoint is a named

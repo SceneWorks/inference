@@ -568,16 +568,17 @@ impl AnimaTrainer {
                 None
             };
 
-        // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEW2.1 decode of its
-        // cached clean latent → DA2 depth) is computed exactly once per job, here.
-        if let Some(path) = perceptual.as_mut() {
-            prepare_perceptual_references(path, &cache)?;
-        }
-
         // Every caption is encoded into `cache`; the multi-GB Qwen3 encoder is now dead weight for
         // the rest of the run. Drop it and evict its buffers before the train loop.
         self.text_encoder = None;
         mlx_rs::memory::clear_cache();
+
+        // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEW2.1 decode of its
+        // cached clean latent → DA2 depth) is computed exactly once per job, here — after the text
+        // encoder is freed, so the decoder + DA2 never share residency with it.
+        if let Some(path) = perceptual.as_mut() {
+            prepare_perceptual_references(path, &cache)?;
+        }
 
         // --- adapter targets + trainable factors (LoRA or LoKr) + optimizer ---
         let target_paths = resolve_target_paths(&self.dit, &self.conditioner, cfg);

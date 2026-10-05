@@ -478,16 +478,17 @@ impl KreaRawTrainer {
         };
         let sampling_enabled = !sample_caps.is_empty();
 
-        // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEW2.1 decode of its
-        // cached clean latent → DA2 depth) is computed exactly once per job, here.
-        if let Some(path) = perceptual.as_mut() {
-            prepare_perceptual_references(path, &cache)?;
-        }
-
         // Every caption is cached now — free the 4 B-param encoder and evict its buffers before the
         // train loop, reclaiming that resident for the DiT working set.
         self.encoder = None;
         mlx_rs::memory::clear_cache();
+
+        // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEW2.1 decode of its
+        // cached clean latent → DA2 depth) is computed exactly once per job, here — after the text
+        // encoder is freed, so the decoder + DA2 never share residency with it.
+        if let Some(path) = perceptual.as_mut() {
+            prepare_perceptual_references(path, &cache)?;
+        }
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let rank = cfg.rank as f32;

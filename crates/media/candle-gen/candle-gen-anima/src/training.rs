@@ -304,6 +304,21 @@ fn check_perceptual_memory(
     flow_match::check_aux_memory(LABEL, base_bytes, aux, budget_bytes)
 }
 
+/// The step's training σ and plan (epic 2123 E8): only an aux-only step remaps σ into the loss
+/// window; a diffusion step keeps the exact f64 σ — the plan's f32 noise level would round it and
+/// break bit-identity with the plain step.
+fn plan_sigma<'a>(
+    sample: &flow_match::StepSample<'a>,
+    sigma: f64,
+) -> Result<(f64, Option<flow_match::AuxStep<'a>>)> {
+    let aux = sample.plan(sigma as f32)?;
+    let sigma = match aux.as_ref() {
+        Some(a) if !a.diffusion() => a.noise_level() as f64,
+        _ => sigma,
+    };
+    Ok((sigma, aux))
+}
+
 fn shifted_sigma(cfg: &candle_gen::gen_core::train::TrainingConfig, step: u32) -> f64 {
     let sigma = flow_match::sample_unit_timestep(
         &cfg.timestep_type,
@@ -468,12 +483,8 @@ impl AnimaTrainer {
             }
             let sample = step_sample(aux_driver.as_mut(), step, &schedule);
             let (x0, source, target_ids, mask_weight) = &cache[sample.entry];
-            let mut sigma = shifted_sigma(cfg, step);
             // Epic 2123 E8: an aux-only step trains at the (shifted) σ remapped into the window.
-            let aux = sample.plan(sigma as f32)?;
-            if let Some(a) = &aux {
-                sigma = a.noise_level() as f64;
-            }
+            let (sigma, aux) = plan_sigma(&sample, shifted_sigma(cfg, step))?;
             let noise = flow_match::sample_noise(
                 x0.dims(),
                 flow_match::noise_seed(cfg.seed, step),
@@ -884,6 +895,28 @@ mod depth_anchoring_tests {
         );
         let d = AuxDriver::prepare(path(), 1, |_| latent_frames_nchw(&f.x0), &sched, 1, 0).unwrap();
         (d, sched)
+    }
+
+    /// Review fix: a diffusion step keeps the exact f64 σ (an f32-rounded noise level would break
+    /// depth-on/off bit-identity); an aux-only step trains at the plan's remapped level. Mutation:
+    /// remap on every planned step (drop the `!a.diffusion()` guard) ⇒ the diffusion step's σ is
+    /// f32-rounded ⇒ red.
+    #[test]
+    fn plan_sigma_remaps_only_aux_steps() {
+        let f = fixture();
+        let (mut d, sched) = driver(&f);
+        // A σ that f32 cannot represent exactly.
+        let sigma = 0.1f64 + 1e-12;
+        assert_ne!(sigma as f32 as f64, sigma);
+        let s1 = d.sample(1, &sched);
+        let (diff_sigma, diff_plan) = plan_sigma(&s1, sigma).unwrap();
+        assert!(diff_plan.as_ref().unwrap().diffusion());
+        assert_eq!(diff_sigma.to_bits(), sigma.to_bits());
+        let s2 = d.sample(2, &sched);
+        let (aux_sigma, aux_plan) = plan_sigma(&s2, sigma).unwrap();
+        let aux_plan = aux_plan.unwrap();
+        assert!(!aux_plan.diffusion());
+        assert_eq!(aux_sigma, aux_plan.noise_level() as f64);
     }
 
     fn grad_bits(g: &GradStore, vars: &[Var]) -> Vec<Vec<u32>> {

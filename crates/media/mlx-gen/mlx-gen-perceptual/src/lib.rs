@@ -20,6 +20,13 @@
 //! config's model dir). No trainer loop changes: every trainer that calls this builder picks the new
 //! loss up; a trainer declares it by setting the technique flag in its `TrainerDescriptor` (the
 //! gen-core floor refuses it elsewhere).
+//!
+//! **Twin-crate rule.** `mlx-gen-perceptual` and `candle-gen-perceptual` are twins: add an arm (and
+//! any new [`DecoderSpec`] variant) to BOTH crates in the same PR. `scripts/check-workspace.py`'s
+//! cross-backend comparison reads same-named `pub const` items in the two crates, so it flags an
+//! `ARMS` slice whose text differs (route crate-specific calls through a same-named private fn, as
+//! `depth_footprint` does); it does not compare enums or functions, so a `DecoderSpec` variant
+//! or a builder change must be mirrored by hand.
 
 use std::path::Path;
 
