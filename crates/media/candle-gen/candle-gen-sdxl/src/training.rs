@@ -50,13 +50,15 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{
     schedule_sigmas, DiscreteModelSampling, Scheduler as SamplingScheduler,
 };
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingRequest,
 };
 use candle_gen::gen_core::{self, BucketSchedule, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
+use candle_gen::train::flow_match::{prepared_subject_mask_weight, weighted_velocity_loss};
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
 use candle_gen::train::lora::{
     adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
@@ -249,13 +251,15 @@ fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
 
 /// ε-prediction loss in f32: `mean((eps - noise)²)` (MSE) or `mean|eps - noise|` (MAE). `eps` (the
 /// UNet output, in the compute dtype) is promoted to f32 so the loss/grads stay f32 (master weights).
-fn eps_loss(eps: &Tensor, target_f32: &Tensor, mae: bool) -> candle_core::Result<Tensor> {
-    let diff = (eps.to_dtype(DType::F32)? - target_f32)?;
-    if mae {
-        diff.abs()?.mean_all()
-    } else {
-        diff.sqr()?.mean_all()
-    }
+/// `weight` is the item's subject-mask loss weight (sc-24828), broadcast to the latent shape:
+/// `None` is exactly the unweighted mean; `Some(w)` is `mean(w ⊙ ℓ)`.
+fn eps_loss(
+    eps: &Tensor,
+    target_f32: &Tensor,
+    weight: Option<&Tensor>,
+    mae: bool,
+) -> candle_core::Result<Tensor> {
+    weighted_velocity_loss(eps, target_f32, weight, mae)
 }
 
 /// The resident preview state (sc-8650) pre-built in the cache phase, before the dual CLIP is dropped:
@@ -409,6 +413,7 @@ fn compute_loss_grads(
     t: usize,
     noise: &Tensor,
     mae: bool,
+    mask_weight: Option<&Tensor>,
     compute_dtype: DType,
     use_checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
@@ -433,14 +438,14 @@ fn compute_loss_grads(
         let target_owned = target.clone();
         segs.push(Box::new(move |st: &[Tensor]| {
             let eps = unet.head_out(&st[0])?;
-            Ok(vec![eps_loss(&eps, &target_owned, mae)?])
+            Ok(vec![eps_loss(&eps, &target_owned, mask_weight, mae)?])
         }));
         // State seed: hidden = conv_in_out, res₀ = conv_in_out (the UNet's `down_block_res_xs[0]`).
         let inputs = [h0.clone(), h0];
         checkpointed_backward(&segs, &inputs, lora_vars)
     } else {
         let eps = unet.forward(&noisy, t_f64, &cond_c)?;
-        let loss = eps_loss(&eps, &target, mae)?;
+        let loss = eps_loss(&eps, &target, mask_weight, mae)?;
         let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         let grads = loss.backward()?;
         Ok((loss_val, grads))
@@ -535,11 +540,40 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        // sc-24828 (epic 2123): subject-masked loss.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
+}
+
+/// One item's item-major cache entries (sc-2127 × sc-24828): the decoded `square` encoded at each
+/// bucket edge by `encode` (`[1, 3, edge, edge]` → clean latent), each paired with its subject-mask
+/// loss weight on THAT bucket's latent grid (`None` when masked loss is off). `decode_square`
+/// center-crops, so the mask is cropped with [`CropBox::center_square`].
+fn encode_item_buckets(
+    square: &SquareImage,
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    device: &Device,
+    mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
+) -> Result<Vec<(Tensor, Option<Tensor>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(&square_image_tensor(square, edge, device)?)?;
+            let mask_weight = prepared_subject_mask_weight(
+                "sdxl trainer",
+                mask,
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
 }
 
 /// The bucket index of the largest training edge (the first one on a tie) — previews denoise at
@@ -673,8 +707,11 @@ impl SdxlTrainer {
         )?;
 
         let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
-        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len() * edges.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127) of `(x0 latent, conditioning,
+        // subject-mask loss weight)` — the weight (broadcast to that bucket's latent shape) is `None`
+        // unless subject-masked loss is on (sc-24828).
+        let mut cache: Vec<(Tensor, Tensor, Option<Tensor>)> =
+            Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -685,10 +722,17 @@ impl SdxlTrainer {
             });
             let cond = cache_frozen_encoder_output(clip.encode(&item.caption)?);
             let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
-            for &edge in &edges {
-                let img = square_image_tensor(&square, edge, device)?;
-                let x0 = cache_frozen_encoder_output(vae.encode_mean(&img)?);
-                cache.push((x0, cond.clone()));
+                                                           // The item's subject mask, read + checked once (None when masked loss is off).
+            let mask = PreparedSubjectMask::load_if_enabled(
+                "sdxl trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
+            let buckets = encode_item_buckets(&square, &edges, mask.as_ref(), device, |img| {
+                Ok(cache_frozen_encoder_output(vae.encode_mean(img)?))
+            })?;
+            for (x0, mask_weight) in buckets {
+                cache.push((x0, cond.clone(), mask_weight));
             }
         }
 
@@ -813,7 +857,7 @@ impl SdxlTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, cond) = &cache[schedule.cache_index((step - 1) as usize)];
+            let (x0, cond, mask_weight) = &cache[schedule.cache_index((step - 1) as usize)];
             let t = sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64));
             let noise = sample_noise(
                 x0.dims(),
@@ -829,6 +873,7 @@ impl SdxlTrainer {
                 t,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 compute_dtype,
                 use_checkpoint,
             )?;
@@ -1061,6 +1106,7 @@ mod tests {
             500,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -1074,6 +1120,7 @@ mod tests {
             500,
             &noise,
             false,
+            None,
             DType::F32,
             true,
         )
@@ -1103,6 +1150,138 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+    }
+
+    /// sc-24828: subject-masked loss on both backward paths. An all-ones map is the unweighted loss;
+    /// an all-zero map zeroes the loss AND every adapter gradient (dense and checkpointed — a path
+    /// that dropped the weight would train on the background); a half map matches across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut unet = tiny_unet(vb);
+        let paths: Vec<String> = unet
+            .lora_target_paths()
+            .unwrap()
+            .into_iter()
+            .filter(|p| !p.starts_with("time_embedding.") && !p.starts_with("add_embedding."))
+            .collect();
+        let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let scheduler = DDIMSchedulerConfig::default()
+            .build(NUM_TRAIN_TIMESTEPS)
+            .unwrap();
+        let shape = [1usize, 4, 16, 16];
+        let x0 = Tensor::randn(0f32, 1f32, &shape, &dev).unwrap();
+        let cond = Tensor::randn(0f32, 1f32, (1, 7, 64), &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, &shape, &dev).unwrap();
+        let map = |w: &[f32]| {
+            candle_gen::train::flow_match::subject_mask_weight(w, 16, 16, &shape, &dev).unwrap()
+        };
+        let run = |weight: Option<&Tensor>, ckpt: bool| {
+            compute_loss_grads(
+                &unet,
+                scheduler.as_ref(),
+                &set.vars,
+                &x0,
+                &cond,
+                500,
+                &noise,
+                false,
+                weight,
+                DType::F32,
+                ckpt,
+            )
+            .unwrap()
+        };
+        let (plain, _) = run(None, false);
+        let ones = map(&[1.0; 256]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&[0.0; 256]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            for v in &set.vars {
+                if let Some(g) = grads.get(v.as_tensor()) {
+                    let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(
+                        g.iter().all(|x| *x == 0.0),
+                        "ckpt={ckpt}: nonzero adapter grad"
+                    );
+                }
+            }
+        }
+        let half: Vec<f32> = (0..256)
+            .map(|i| if i % 16 < 8 { 1.0 } else { 0.0 })
+            .collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached latent carries a weight
+    /// of ITS OWN shape (built on that bucket's grid), and the masked-out region is zero.
+    #[test]
+    fn subject_mask_weight_follows_each_buckets_latent() {
+        use candle_core::IndexOp;
+        use candle_gen::gen_core::train::TrainingItem;
+        use candle_gen::gen_core::SubjectMaskLoss;
+        let dir = tempfile::tempdir().unwrap();
+        // 48×32 image → center square x ∈ [8, 40); the subject is that square's left half (x < 24).
+        let image_path = dir.path().join("img.png");
+        image::RgbImage::from_pixel(48, 32, image::Rgb([128, 64, 32]))
+            .save(&image_path)
+            .unwrap();
+        let mask_path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(48, 32, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = TrainingItem {
+            image_path,
+            caption: String::new(),
+            control_image_path: None,
+            model_options: Default::default(),
+            reference_image_paths: Vec::new(),
+            subject_mask_path: Some(mask_path),
+        };
+        let cfg = SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
+        let square = decode_square(&item.image_path).unwrap();
+        let dev = Device::Cpu;
+        // A stand-in /8 encoder: `[1, 3, edge, edge]` → `[1, 3, edge/8, edge/8]`.
+        let encode = |img: &Tensor| Ok(img.avg_pool2d(8)?);
+        let entries = encode_item_buckets(&square, &[32, 64], Some(&mask), &dev, encode).unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), grid) in entries.iter().zip([4usize, 8]) {
+            assert_eq!(x0.dims(), &[1, 3, grid, grid]);
+            let w = w.as_ref().expect("masked loss is on");
+            assert_eq!(w.dims(), x0.dims(), "bucket {grid}: weight shape");
+            let rows = w.i((0, 0)).unwrap().to_vec2::<f32>().unwrap();
+            for row in rows {
+                for (x, v) in row.into_iter().enumerate() {
+                    let want = if x < grid / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "bucket {grid}: column {x}");
+                }
+            }
+        }
+        let off = encode_item_buckets(&square, &[32, 64], None, &dev, encode).unwrap();
+        assert!(off.iter().all(|(_, w)| w.is_none()));
     }
 
     /// F-083 / sc-11173: the trainer preview drives the SAME curated sampler SDXL inference uses, not
@@ -1263,6 +1442,7 @@ mod tests {
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         };
         let base = TrainingRequest {
             items: vec![item.clone()],

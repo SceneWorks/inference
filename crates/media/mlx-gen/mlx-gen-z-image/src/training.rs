@@ -46,7 +46,9 @@ use mlx_gen::train::tae::{TinyDecoder, TinyDecoderConfig};
 // Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
 // unchanged (the host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
 pub use mlx_gen::train::lora::LoraTarget;
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::{
     FlowMatchEuler, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
     TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -120,12 +122,14 @@ fn trainer_descriptor() -> TrainerDescriptor {
         supports_full_finetune: false,
         max_reference_images: 0,
         // Epic 2123: weight + gradient noise at the shared adapter optimizer update
-        // (`adapter_optimizer_update`, sc-24826/sc-24827), multi-resolution buckets (sc-2127), and
+        // (`adapter_optimizer_update`, sc-24826/sc-24827), multi-resolution buckets (sc-2127),
         // depth anchoring (sc-2125) — the shared decoded-x0 perceptual path (TAEF1 decode →
-        // Depth-Anything-V2 → cached round-trip reference).
+        // Depth-Anything-V2 → cached round-trip reference) — and subject-masked loss (sc-24828,
+        // a per-(item, bucket) weight map cached next to each latent, applied by `reduce_loss`).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             depth_anchoring: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -345,8 +349,10 @@ impl ZImageTurboTrainer {
         // --- prepare → load → cache: VAE-latents + prompt-embeds into memory before the loop ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len() * edges.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry: clean latent,
+        // caption embeds, and (subject-masked loss, sc-24828) that bucket's latent loss-weight map
+        // — `None` when the technique is off.
+        let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -356,6 +362,12 @@ impl ZImageTurboTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
+            // sc-24828: the item's subject mask is read + checked once, then resampled per bucket.
+            let mask = PreparedSubjectMask::load_if_enabled(
+                "z_image_turbo trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
             let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "z_image_turbo trainer: text encoder already freed (caching after train loop)"
@@ -371,11 +383,14 @@ impl ZImageTurboTrainer {
                 None,
             )?;
             eval([&cap])?;
-            for &edge in &edges {
-                let x0 = encode_init_latents(&self.vae, &img, edge, edge)?; // clean latent [16,1,h,w]
-                eval([&x0])?;
-                cache.push((x0, cap.clone()));
-            }
+            // clean latent [16,1,h,w] per bucket edge
+            cache_item_buckets(
+                &edges,
+                mask.as_ref(),
+                &cap,
+                |edge| encode_init_latents(&self.vae, &img, edge, edge),
+                &mut cache,
+            )?;
         }
         if cache.is_empty() {
             // sc-4895 — disambiguate the two ways the cache ends up empty. A cancel tripped during
@@ -792,13 +807,40 @@ fn load_perceptual_path(cfg: &TrainingConfig) -> Result<Option<PerceptualPath>> 
     )?))
 }
 
+/// One `train_impl` cache entry (item-major, `cache[item * n_buckets + bucket]`, sc-2127): the
+/// clean latent, the caption embeds, and — subject-masked loss on (sc-24828) — that bucket's latent
+/// loss-weight map, the same shape as the latent.
+type CacheEntry = (Array, Array, Option<Array>);
+
+/// Append one item's cache entries, one per bucket edge (item-major, sc-2127): `encode(edge)` is
+/// the bucket's clean latent, and — sc-24828 — its loss-weight map is the item's already-loaded
+/// mask cropped with the center square `center_crop_square` cut, area-averaged onto THIS bucket's
+/// latent grid and broadcast to that latent's shape (`None` when masked loss is off).
+fn cache_item_buckets(
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    cap: &Array,
+    mut encode: impl FnMut(u32) -> Result<Array>,
+    cache: &mut Vec<CacheEntry>,
+) -> Result<()> {
+    for &edge in edges {
+        let x0 = encode(edge)?;
+        let mask_weight = prepared_subject_mask_weight(
+            "z_image_turbo trainer",
+            mask,
+            CropBox::center_square,
+            x0.shape(),
+        )?;
+        eval([&x0])?;
+        cache.push((x0, cap.clone(), mask_weight));
+    }
+    Ok(())
+}
+
 /// Compute every cached image's perceptual reference once (its clean `[C, 1, h, w]` latent,
 /// unpacked to the decoder's NCHW layout).
-fn prepare_perceptual_references(
-    path: &mut PerceptualPath,
-    cache: &[(Array, Array)],
-) -> Result<()> {
-    for (i, (x0, _)) in cache.iter().enumerate() {
+fn prepare_perceptual_references(path: &mut PerceptualPath, cache: &[CacheEntry]) -> Result<()> {
+    for (i, (x0, _, _)) in cache.iter().enumerate() {
         path.ensure_reference(i, &crate::pipeline::unpack_latents(x0)?)?;
     }
     Ok(())
@@ -837,7 +879,7 @@ fn run_train_step(
     params: &LoraParams,
     adapter: &TrainAdapter,
     cfg: &TrainingConfig,
-    cache: &[(Array, Array)],
+    cache: &[CacheEntry],
     schedule: &BucketSchedule,
     perceptual: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
     step: u32,
@@ -851,7 +893,7 @@ fn run_train_step(
     let k = (step - 1) as usize;
     let (item, _bucket) = schedule.sample(k);
     let entry = schedule.cache_index(k);
-    let (x0, cap) = &cache[entry];
+    let (x0, cap, mask_weight) = &cache[entry];
     let mut sigma = sample_sigma(
         &cfg.timestep_type,
         &cfg.timestep_bias,
@@ -892,6 +934,8 @@ fn run_train_step(
         sigma,
         &noise,
         mae,
+        // sc-24828: the weight cached in the SAME (item, bucket) slot as `x0`.
+        mask_weight.as_ref(),
         checkpoint_main,
         compute_dtype,
         aux,
@@ -1092,11 +1136,13 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     checkpoint_main: Option<&[Vec<String>]>,
     dtype: Dtype,
     aux: Option<AuxStep<'_>>,
 ) -> Result<(StepLosses, LoraParams)> {
     let (x_t_f32, target, timestep) = build_batch(x0, noise, sigma)?;
+    let mask_weight = mask_weight.cloned();
     let x_t = x_t_f32.as_dtype(dtype)?; // no-op in f32 mode
     let (diffusion_on, aux_on) = match &aux {
         Some(a) => (a.plan.diffusion, !a.plan.aux.is_empty()),
@@ -1136,12 +1182,9 @@ fn compute_loss_grads(
         };
         let diffusion = if diffusion_on {
             let diff = subtract(&v, &target)?;
-            // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-            Some(if mae {
-                diff.abs()?.mean(None)?
-            } else {
-                diff.square()?.mean(None)?
-            })
+            // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+            // requires a scalar cotangent).
+            Some(reduce_loss(&diff, mask_weight.as_ref(), mae)?)
         } else {
             None
         };
@@ -1285,6 +1328,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             checkpoint_main,
             dtype,
             None,
@@ -1397,6 +1441,7 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 None,
                 Dtype::Float32,
                 None,
@@ -1551,6 +1596,7 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 ck,
                 Dtype::Float32,
                 None,
@@ -1615,6 +1661,7 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 None,
                 Dtype::Float32,
                 None,
@@ -1735,6 +1782,7 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 None,
                 dt,
                 None,
@@ -1893,6 +1941,7 @@ mod validate_request_tests {
                     control_image_path: None,
                     model_options: Default::default(),
                     reference_image_paths: Vec::new(),
+                    subject_mask_path: None,
                 })
                 .collect(),
             config: TrainingConfig {
@@ -2113,6 +2162,76 @@ mod weight_noise_update_tests {
         assert!(trainer_descriptor().techniques.weight_noise);
     }
 
+    /// sc-24828: Z-Image MLX honours subject-masked loss (cache + `reduce_loss` in the closure).
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each cache entry's weight map has
+    /// THAT bucket's latent shape, and the background (right half of the center-square crop, with
+    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is x ∈ [8, 40);
+    /// the subject is x < 24 — the crop's left half.
+    #[test]
+    fn subject_mask_weight_is_computed_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (iw, ih) = (48u32, 32u32);
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::new(iw, ih).save(&image_path).unwrap();
+        let mask_path = tmp.path().join("a_mask.png");
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = gen_core::TrainingItem {
+            image_path,
+            caption: "a".into(),
+            subject_mask_path: Some(mask_path),
+            ..Default::default()
+        };
+        let cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
+        let cap = Array::zeros::<f32>(&[8, 32]).unwrap();
+        let edges = [32u32, 48];
+        let mut cache = Vec::new();
+        cache_item_buckets(
+            &edges,
+            Some(&mask),
+            &cap,
+            |edge| {
+                let g = (edge / 8) as i32;
+                Ok(Array::zeros::<f32>(&[16, 1, g, g])?)
+            },
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(cache.len(), 2);
+        for (x0, _, w) in &cache {
+            let w = w.as_ref().expect("mask loss on ⇒ a weight map");
+            assert_eq!(
+                w.shape(),
+                x0.shape(),
+                "weight must match its own bucket's latent"
+            );
+            let g = x0.shape()[3] as usize;
+            let dense = multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = dense.as_slice::<f32>();
+            // One [g, g] plane (all channels are the same broadcast plane).
+            for y in 0..g {
+                for x in 0..g {
+                    let val = v[y * g + x];
+                    if x < g / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                    } else {
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                    }
+                }
+            }
+        }
+    }
+
     /// sc-2127: the descriptor declares resolution buckets, and the memory pre-flight sizes a
     /// bucketed run for its largest edge (the legacy single edge when buckets are off).
     #[test]
@@ -2222,7 +2341,7 @@ mod depth_anchoring_tests {
     }
 
     /// `n` cached items: clean `[4, 1, 4, 4]` latents (32×32 decoded) + `[8, 32]` caption feats.
-    fn cache_n(n: u64) -> Vec<(Array, Array)> {
+    fn cache_n(n: u64) -> Vec<CacheEntry> {
         (0..n)
             .map(|i| {
                 let x0 = random::normal::<f32>(
@@ -2240,12 +2359,12 @@ mod depth_anchoring_tests {
                 )
                 .unwrap();
                 eval([&x0, &cap]).unwrap();
-                (x0, cap)
+                (x0, cap, None)
             })
             .collect()
     }
 
-    fn cache() -> Vec<(Array, Array)> {
+    fn cache() -> Vec<CacheEntry> {
         cache_n(3)
     }
 
@@ -2259,7 +2378,7 @@ mod depth_anchoring_tests {
     /// A prepared path (references built, as `train_impl` does) plus its alternation tracker over
     /// `items` dataset items.
     fn prepared_items(
-        cache: &[(Array, Array)],
+        cache: &[CacheEntry],
         items: usize,
         accum: u32,
     ) -> (PerceptualPath, AuxAlternation) {
@@ -2269,12 +2388,12 @@ mod depth_anchoring_tests {
     }
 
     /// [`prepared_items`] for a single-bucket cache (one entry per item).
-    fn prepared(cache: &[(Array, Array)], accum: u32) -> (PerceptualPath, AuxAlternation) {
+    fn prepared(cache: &[CacheEntry], accum: u32) -> (PerceptualPath, AuxAlternation) {
         prepared_items(cache, cache.len(), accum)
     }
 
     /// The single-bucket schedule `train_impl` builds when buckets are off (round-robin).
-    fn single_bucket(cache: &[(Array, Array)]) -> BucketSchedule {
+    fn single_bucket(cache: &[CacheEntry]) -> BucketSchedule {
         BucketSchedule::new(
             cache.len(),
             &[gen_core::train::ResolutionBucket {
@@ -2291,7 +2410,7 @@ mod depth_anchoring_tests {
         params: &LoraParams,
         adapter: &TrainAdapter,
         cfg: &TrainingConfig,
-        cache: &[(Array, Array)],
+        cache: &[CacheEntry],
         schedule: &BucketSchedule,
         path: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
         n: u32,
@@ -2319,7 +2438,7 @@ mod depth_anchoring_tests {
         params: &LoraParams,
         adapter: &TrainAdapter,
         cfg: &TrainingConfig,
-        cache: &[(Array, Array)],
+        cache: &[CacheEntry],
         path: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
         n: u32,
     ) -> (StepLosses, LoraParams) {
@@ -2330,7 +2449,7 @@ mod depth_anchoring_tests {
     /// Run micro-steps `1..=steps` through the real step seam over `schedule`; per step
     /// `(dataset item, is_depth_step)`. Returns the path too, for its reference counter.
     fn run_kinds_with(
-        cache: &[(Array, Array)],
+        cache: &[CacheEntry],
         schedule: &BucketSchedule,
         items: usize,
         accum: u32,
@@ -2363,7 +2482,7 @@ mod depth_anchoring_tests {
         (kinds, p)
     }
 
-    fn run_kinds(cache: &[(Array, Array)], accum: u32, steps: u32) -> Vec<(usize, bool)> {
+    fn run_kinds(cache: &[CacheEntry], accum: u32, steps: u32) -> Vec<(usize, bool)> {
         run_kinds_with(cache, &single_bucket(cache), cache.len(), accum, steps).0
     }
 
@@ -2492,7 +2611,7 @@ mod depth_anchoring_tests {
             },
         ];
         // Item-major: cache[item * 2 + bucket]; bucket 0 = 4×4 latents, bucket 1 = 6×6.
-        let cache: Vec<(Array, Array)> = (0..items as u64)
+        let cache: Vec<CacheEntry> = (0..items as u64)
             .flat_map(|i| {
                 [4i32, 6].into_iter().map(move |side| {
                     let x0 = random::normal::<f32>(
@@ -2510,7 +2629,7 @@ mod depth_anchoring_tests {
                     )
                     .unwrap();
                     eval([&x0, &cap]).unwrap();
-                    (x0, cap)
+                    (x0, cap, None)
                 })
             })
             .collect();
@@ -2554,7 +2673,7 @@ mod depth_anchoring_tests {
                 )
                 .unwrap();
                 let plan = p.plan(key, entry, raw).unwrap();
-                let (x0, cap) = &cache[entry];
+                let (x0, cap, _) = &cache[entry];
                 let noise = random::normal::<f32>(
                     x0.shape(),
                     None,
@@ -2575,6 +2694,7 @@ mod depth_anchoring_tests {
                     plan.noise_level,
                     &noise,
                     false,
+                    None,
                     None,
                     Dtype::Float32,
                     Some(AuxStep {
@@ -2665,7 +2785,7 @@ mod depth_anchoring_tests {
         assert_eq!(off.aux, None);
 
         // The pre-sc-2125 `compute_loss_grads` body for step 1 (same item / sigma / noise).
-        let (x0, cap) = &cache[0];
+        let (x0, cap, _) = &cache[0];
         let sigma = sample_sigma(
             &cfg.timestep_type,
             &cfg.timestep_bias,

@@ -278,8 +278,8 @@ pub use ::core_llm;
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{
     AuxLossSchedule, BucketSchedule, DepthAnchoringConfig, DepthModelSize, LrSchedule, NetworkType,
-    ResolutionBucket, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput,
-    TrainingProgress, TrainingRequest, TrainingTechniques, MAX_RESOLUTION_BUCKETS,
+    ResolutionBucket, SubjectMaskLoss, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
+    TrainingOutput, TrainingProgress, TrainingRequest, TrainingTechniques, MAX_RESOLUTION_BUCKETS,
     RESOLUTION_BUCKET_STRIDE,
 };
 pub use transcribe::{

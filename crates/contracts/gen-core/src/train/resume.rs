@@ -106,6 +106,11 @@ pub fn request_fingerprint(req: &TrainingRequest) -> crate::Result<String> {
                 file(&mut hasher, b"reference", reference, req)?;
             }
         }
+        // Subject mask (sc-24828), hashed only when present — the worker sets it only for a
+        // masked-loss run — so every unmasked request keeps its fingerprint (and resume bundles).
+        if let Some(mask) = &item.subject_mask_path {
+            file(&mut hasher, b"subject_mask", mask, req)?;
+        }
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -120,6 +125,9 @@ pub fn request_fingerprint(req: &TrainingRequest) -> crate::Result<String> {
 /// Resolution buckets (sc-2127) change the cache layout and the sample order, so a non-empty
 /// bucket list is appended (`;buckets=<res>x<repeats>,…`); an empty list appends nothing, so every
 /// pre-bucket resume bundle keeps the fingerprint it was written with.
+///
+/// Subject-masked loss (sc-24828) changes the objective, so it appends
+/// `;subject_mask_loss=<background>,<subject>` when on and nothing when off.
 pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
     let mut fingerprint = format!(
         "steps={};accum={};scheduler={:?};warmup={};rank={};alpha={};seed={};resolution={};loss={};dtype={};\
@@ -154,6 +162,12 @@ pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
             .map(|b| format!("{}x{}", b.resolution, b.repeats))
             .collect();
         fingerprint.push_str(&format!(";buckets={}", buckets.join(",")));
+    }
+    if let Some(m) = &cfg.subject_mask_loss {
+        fingerprint.push_str(&format!(
+            ";subject_mask_loss={:?},{:?}",
+            m.background_weight, m.subject_weight
+        ));
     }
     fingerprint
 }
@@ -290,6 +304,34 @@ mod tests {
         assert_eq!(edit, request_fingerprint(&req).unwrap());
         std::fs::write(&ra, b"ref a, edited").unwrap();
         assert_ne!(edit, request_fingerprint(&req).unwrap());
+    }
+
+    /// sc-24828: a subject mask (and its contents) is part of the dataset identity, and the
+    /// masked-loss weights part of the config identity — both only when present, so an unmasked
+    /// request/config keeps the digest `the_request_fingerprint_format_is_pinned` pins.
+    #[test]
+    fn subject_masks_and_mask_loss_change_the_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request(dir.path());
+        let plain = request_fingerprint(&req).unwrap();
+        let mask = dir.path().join("mask.png");
+        std::fs::write(&mask, b"mask a").unwrap();
+        req.items[0].subject_mask_path = Some(mask.clone());
+        let masked = request_fingerprint(&req).unwrap();
+        assert_ne!(plain, masked);
+        std::fs::write(&mask, b"mask a, repainted").unwrap();
+        assert_ne!(masked, request_fingerprint(&req).unwrap());
+
+        let off = TrainingConfig::default();
+        let mut on = off.clone();
+        on.subject_mask_loss = Some(crate::train::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        });
+        let base = training_config_fingerprint(&off);
+        assert!(!base.contains("subject_mask"), "{base}");
+        let with = training_config_fingerprint(&on);
+        assert_eq!(with, format!("{base};subject_mask_loss=0.0,1.0"));
     }
 
     #[test]

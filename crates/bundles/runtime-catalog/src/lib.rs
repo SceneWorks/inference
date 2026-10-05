@@ -697,6 +697,8 @@ pub struct TrainerCapabilitySnapshot {
     pub supports_gradient_noise: bool,
     /// Honors `TrainingConfig::resolution_buckets` (epic 2123 multi-resolution buckets, sc-2127).
     pub supports_resolution_buckets: bool,
+    /// Honors `TrainingConfig::subject_mask_loss` (epic 2123 subject-masked loss, sc-24828).
+    pub supports_subject_mask_loss: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -715,6 +717,7 @@ impl TrainerCapabilitySnapshot {
             supports_depth_anchoring: descriptor.techniques.depth_anchoring,
             supports_gradient_noise: descriptor.techniques.gradient_noise,
             supports_resolution_buckets: descriptor.techniques.resolution_buckets,
+            supports_subject_mask_loss: descriptor.techniques.subject_mask_loss,
         }
     }
 
@@ -733,6 +736,7 @@ impl TrainerCapabilitySnapshot {
             "supports_depth_anchoring": self.supports_depth_anchoring,
             "supports_gradient_noise": self.supports_gradient_noise,
             "supports_resolution_buckets": self.supports_resolution_buckets,
+            "supports_subject_mask_loss": self.supports_subject_mask_loss,
         })
     }
 }
@@ -1038,6 +1042,12 @@ mod tests {
         bucketed.techniques.resolution_buckets = true;
         let bucketed_json = TrainerCapabilitySnapshot::from_descriptor(&bucketed).to_json();
         assert_eq!(bucketed_json["supports_resolution_buckets"], true);
+        // sc-24828: subject-masked loss support is advertised the same way.
+        assert_eq!(json["supports_subject_mask_loss"], false);
+        let mut masked = descriptor;
+        masked.techniques.subject_mask_loss = true;
+        let masked_json = TrainerCapabilitySnapshot::from_descriptor(&masked).to_json();
+        assert_eq!(masked_json["supports_subject_mask_loss"], true);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {

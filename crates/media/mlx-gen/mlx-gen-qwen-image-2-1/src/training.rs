@@ -78,7 +78,9 @@ use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, factorization, LoraParams, TrainAdapter,
 };
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::{
     CancelFlag, Error, Image, LoadSpec, Modality, NetworkType, Precision, Progress, Result,
     RgbaImage, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
@@ -742,8 +744,10 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // update.
         // sc-2127 (epic 2123): honors `resolution_buckets` — every item (captioned or edit pair)
         // is cached once per bucket edge and the loop walks a `BucketSchedule`.
+        // sc-24828 (epic 2123): subject-masked loss on the target latent tokens, both modes.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -1311,22 +1315,35 @@ fn item_branches(
 /// An item's packed target latents, one per bucket edge in `edges` order (sc-2127), each at
 /// [`edit_target_size`] for that edge: a captioned item's centre-cropped square (unchanged), an
 /// edit pair's whole picture at its aspect-preserving fit. The image is decoded once.
+///
+/// Each latent comes with (subject-masked loss, sc-24828) its own latent loss-weight map: the
+/// item's mask is read and checked **once**, then cropped with the same rule as the image
+/// (`center_square` / `full`), area-resampled onto **that bucket's** latent grid and packed by the
+/// same [`pack_latents`], so it lines up element-for-element with that bucket's packed target.
+/// `None` when the technique is off (no file read).
 fn encode_item_targets(
     vae: &QwenImage21Vae,
     item: &TrainingItem,
     edges: &[u32],
-) -> Result<Vec<Array>> {
+    mask: Option<&gen_core::SubjectMaskLoss>,
+) -> Result<Vec<(Array, Option<Array>)>> {
+    let label = format!("{TRAINER_ID} trainer");
+    let mask = PreparedSubjectMask::load_if_enabled(&label, item, mask)?;
     let decoded = decode_image(&item.image_path)?;
-    let image = if item.is_edit_pair() {
-        decoded
+    let (image, crop): (Image, fn(u32, u32) -> CropBox) = if item.is_edit_pair() {
+        (decoded, CropBox::full)
     } else {
-        center_crop_square(&decoded)
+        (center_crop_square(&decoded), CropBox::center_square)
     };
     edges
         .iter()
         .map(|&edge| {
             let (width, height) = edit_target_size(item, edge)?;
-            encode_latents(vae, &image, width, height)
+            let z = encode_latents_unpacked(vae, &image, width, height)?;
+            let weight = prepared_subject_mask_weight(&label, mask.as_ref(), crop, z.shape())?
+                .map(|w| pack_latents(&w))
+                .transpose()?;
+            Ok((pack_latents(&z)?, weight))
         })
         .collect()
 }
@@ -1372,6 +1389,8 @@ fn encode_item_references(
 struct CachedItem {
     /// Packed target latent `[1, h·w, C]` (f32).
     x0: Array,
+    /// Packed subject-mask loss weight, the shape of `x0` (sc-24828) — `None` when off.
+    mask_weight: Option<Array>,
     /// The branch's text rows `[1, text_len, hidden]` (f32).
     text: Array,
     /// The joint layout, target block last.
@@ -1380,11 +1399,17 @@ struct CachedItem {
     references: Vec<Array>,
 }
 
-/// Encode an image into the packed denoiser-space latent the DiT trains on: resize to
+/// Encode an image into the denoiser-space latent the DiT trains on, before the pack: resize to
 /// `width × height` + `[−1, 1]` NCHW, widen to opaque RGBA (a constant `+1` alpha plane) when the
-/// VAE takes four channels, take the posterior **mode**, normalise `(z − mean)/std`, and flatten
-/// unpatched to `[1, (height/16)·(width/16), z_dim]`.
-fn encode_latents(vae: &QwenImage21Vae, image: &Image, width: u32, height: u32) -> Result<Array> {
+/// VAE takes four channels, take the posterior **mode** and normalise `(z − mean)/std` →
+/// `[1, z_dim, height/16, width/16]`. [`pack_latents`] flattens it unpatched to
+/// `[1, (height/16)·(width/16), z_dim]` (see [`encode_item_targets`]).
+fn encode_latents_unpacked(
+    vae: &QwenImage21Vae,
+    image: &Image,
+    width: u32,
+    height: u32,
+) -> Result<Array> {
     let rgb = preprocess_init_image(image, width, height)?; // [1, 3, height, width]
     let input = if vae.config().in_channels == 4 {
         let alpha = Array::ones::<f32>(&[1, 1, height as i32, width as i32])?;
@@ -1393,7 +1418,7 @@ fn encode_latents(vae: &QwenImage21Vae, image: &Image, width: u32, height: u32) 
         rgb
     };
     let mode = vae.encode_mode(&input)?;
-    pack_latents(&vae.normalize(&mode)?)
+    vae.normalize(&mode)
 }
 
 /// Tokens a caption contributes to the joint sequence (template rendered, system prefix dropped)
@@ -1451,6 +1476,8 @@ struct StepInputs<'a> {
     references: &'a [Array],
     noise: &'a Array,
     t: f32,
+    /// Subject-mask loss weight, the shape of `x0` (sc-24828) — `None` ⇒ the plain mean.
+    mask_weight: Option<&'a Array>,
 }
 
 /// The fixed install/loss parameters of a run.
@@ -1478,6 +1505,7 @@ fn compute_loss_grads(
     step: &StepInputs<'_>,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target) = build_batch(step.x0, step.noise, step.t)?;
+    let mask_weight = step.mask_weight.cloned();
     let x_t = x_t.as_dtype(spec.dtype)?;
     let context = step.text.clone();
     let (t, layout, references) = (step.t, step.layout, step.references);
@@ -1517,13 +1545,9 @@ fn compute_loss_grads(
         }
         .map_err(|e| Exception::custom(e.to_string()))?;
         let diff = subtract(&v, &target)?;
-        // `mean(None)` reduces to a 0-d scalar (grad needs a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // needs a scalar cotangent).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -1965,12 +1989,18 @@ impl QwenImage21Trainer {
                 current: i as u32 + 1,
                 total,
             });
-            let targets = encode_item_targets(&vae, item, &edges)?;
+            let targets = encode_item_targets(&vae, item, &edges, cfg.subject_mask_loss.as_ref())?;
             let references = encode_item_references(&vae, vision.as_ref(), item)?;
-            eval(targets.iter().chain(references.iter()))?;
-            for (x0, branch) in targets.into_iter().zip(per_edge) {
+            eval(
+                targets
+                    .iter()
+                    .flat_map(|(x0, w)| std::iter::once(x0).chain(w.iter()))
+                    .chain(references.iter()),
+            )?;
+            for ((x0, mask_weight), branch) in targets.into_iter().zip(per_edge) {
                 cache.push(CachedItem {
                     x0,
+                    mask_weight,
                     text: branch.text,
                     layout: branch.layout,
                     references: references.clone(),
@@ -2117,6 +2147,7 @@ impl QwenImage21Trainer {
                     references: &item.references,
                     noise: &noise,
                     t,
+                    mask_weight: item.mask_weight.as_ref(),
                 },
             )?;
             last_loss = loss;
@@ -2307,7 +2338,7 @@ mod tests {
 
     /// The single-bucket latent of [`encode_item_targets`] (the pre-bucket `encode_item_target`).
     fn encode_item_target(vae: &QwenImage21Vae, item: &TrainingItem, edge: u32) -> Result<Array> {
-        Ok(encode_item_targets(vae, item, &[edge])?.remove(0))
+        Ok(encode_item_targets(vae, item, &[edge], None)?.remove(0).0)
     }
 
     fn base_config() -> TrainingConfig {
@@ -2801,7 +2832,11 @@ mod tests {
             TrainingItem::edit_pair(wide, "widen it".into(), vec![reference]),
         ] {
             let (branches, _) = item_branches(&encoder, &tokenizer, drop, &item, &edges).unwrap();
-            let targets = encode_item_targets(&vae, &item, &edges).unwrap();
+            let targets: Vec<Array> = encode_item_targets(&vae, &item, &edges, None)
+                .unwrap()
+                .into_iter()
+                .map(|(x0, _)| x0)
+                .collect();
             assert_eq!((branches.len(), targets.len()), (2, 2));
             for (b, &edge) in edges.iter().enumerate() {
                 let (w, h) = edit_target_size(&item, edge).unwrap();
@@ -2828,6 +2863,72 @@ mod tests {
                 branches[0].layout, branches[1].layout,
                 "the two buckets train different grids"
             );
+        }
+    }
+
+    /// sc-24828 × sc-2127: with subject-masked loss on and two buckets, every bucket's packed
+    /// weight is resampled onto **that bucket's** latent grid — the shape of that bucket's packed
+    /// target — and the masked-out (right-half) tokens are zero while the subject (left-half)
+    /// tokens carry the subject weight. Covers a captioned item (centre square) and an edit pair
+    /// (whole picture).
+    ///
+    /// *Mutations that red this:* `encode_item_targets` resampling the mask once at the first
+    /// bucket's grid and reusing it for every bucket.
+    #[test]
+    fn subject_mask_weight_is_resampled_per_bucket() {
+        let root = tiny_snapshot();
+        let tmp = tempfile::tempdir().unwrap();
+        let left_half_mask = |name: &str, width: u32, height: u32| {
+            let img = image::GrayImage::from_fn(width, height, |x, _| {
+                image::Luma([if x < width / 2 { 255 } else { 0 }])
+            });
+            let path = tmp.path().join(name);
+            img.save(&path).unwrap();
+            path
+        };
+        let mut captioned = TrainingItem::captioned(
+            write_png(tmp.path(), "sq.png", 160, 160, 3),
+            "a swatch".into(),
+        );
+        captioned.subject_mask_path = Some(left_half_mask("sq_mask.png", 160, 160));
+        let mut edit = TrainingItem::edit_pair(
+            write_png(tmp.path(), "wide.png", 256, 128, 5),
+            "widen it".into(),
+            vec![write_png(tmp.path(), "ref.png", 64, 64, 9)],
+        );
+        edit.subject_mask_path = Some(left_half_mask("wide_mask.png", 256, 128));
+        let cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let vae = loader::load_vae(&root).unwrap();
+        let edges = [64u32, 128];
+        for item in [captioned, edit] {
+            let targets = encode_item_targets(&vae, &item, &edges, Some(&cfg)).unwrap();
+            assert_eq!(targets.len(), 2);
+            for (b, (&edge, (x0, weight))) in edges.iter().zip(&targets).enumerate() {
+                let weight = weight.as_ref().expect("mask loss on ⇒ a weight");
+                assert_eq!(weight.shape(), x0.shape(), "bucket {b} (edge {edge})");
+                let (w, _) = edit_target_size(&item, edge).unwrap();
+                let gw = (w / 16) as usize;
+                let channels = x0.shape()[2] as usize;
+                let flat = weight.reshape(&[-1]).unwrap();
+                let flat = flat.as_slice::<f32>();
+                for (token, cells) in flat.chunks(channels).enumerate() {
+                    let gx = token % gw;
+                    let want = if (gx + 1) * 2 <= gw {
+                        1.0
+                    } else if gx * 2 >= gw {
+                        0.0
+                    } else {
+                        continue;
+                    };
+                    assert!(
+                        cells.iter().all(|&v| (v - want).abs() < 1e-5),
+                        "bucket {b} (edge {edge}) token {token}: {cells:?} want {want}"
+                    );
+                }
+            }
         }
     }
 
@@ -3045,6 +3146,7 @@ mod tests {
                     references: &[],
                     noise: &noise,
                     t: 0.5,
+                    mask_weight: None,
                 },
             )
             .unwrap();
@@ -3113,6 +3215,7 @@ mod tests {
                 references: &[],
                 noise: &noise,
                 t: 0.4,
+                mask_weight: None,
             };
             let dense_spec = LossSpec {
                 adapter: &adapter,
@@ -3558,6 +3661,7 @@ mod tests {
                 references: &references,
                 noise: &noise,
                 t: 0.5,
+                mask_weight: None,
             },
         )
         .unwrap();
@@ -3572,6 +3676,7 @@ mod tests {
                 references: &other,
                 noise: &noise,
                 t: 0.5,
+                mask_weight: None,
             },
         )
         .unwrap();
@@ -3596,6 +3701,7 @@ mod tests {
                     references: &references,
                     noise: &noise,
                     t,
+                    mask_weight: None,
                 },
             )
             .unwrap();
@@ -3652,6 +3758,7 @@ mod tests {
             references: &references,
             noise: &noise,
             t: 0.4,
+            mask_weight: None,
         };
         let dense_spec = LossSpec {
             adapter: &adapter,
@@ -3675,6 +3782,140 @@ mod tests {
         );
         let rel = max_rel_diff(&g_dense, &g_ckpt);
         assert!(rel < 1e-3, "max rel grad diff {rel:.2e}");
+    }
+
+    /// sc-24828: the packed subject-mask weight lines up token-for-token with the packed latent —
+    /// [`pack_latents`] of a `[1, C, h, w]` weight whose value encodes `(y, x)` puts `y·10 + x` on
+    /// every channel of token `y·w + x`, exactly the token the target latent's cell lands in.
+    #[test]
+    fn packed_subject_weight_lines_up_with_packed_latent_tokens() {
+        let (c, h, w) = (3i32, 2usize, 3usize);
+        let values: Vec<f32> = (0..h * w).map(|i| ((i / w) * 10 + i % w) as f32).collect();
+        let shape = [1, c, h as i32, w as i32];
+        let weight = mlx_gen::train::loss::subject_mask_weight(&values, h, w, &shape).unwrap();
+        let packed = pack_latents(&weight).unwrap();
+        assert_eq!(packed.shape(), &[1, (h * w) as i32, c]);
+        // Flatten row-major (the pack is a strided view; the reshape copies it out in order).
+        let packed = packed.reshape(&[-1]).unwrap();
+        let packed = packed.as_slice::<f32>().to_vec();
+        for token in 0..h * w {
+            for ch in 0..c as usize {
+                let want = ((token / w) * 10 + token % w) as f32;
+                assert_eq!(
+                    packed[token * c as usize + ch],
+                    want,
+                    "token {token} ch {ch}"
+                );
+            }
+        }
+    }
+
+    /// sc-24828: the subject-mask weight reaches the loss on every backward path — text-to-image
+    /// and edit layouts, dense and gradient-checkpointed. An all-ones map is the plain loss, an
+    /// all-background map zeroes the loss and every adapter grad, a half map lies strictly between
+    /// and agrees across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let mut dit = tiny_dit();
+        let Built {
+            adapter,
+            params,
+            cfg,
+            paths,
+        } = build(&mut dit, NetworkType::Lora);
+        let params: LoraParams = params
+            .into_iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let p = multiply(randn(v.shape(), 300 + i as u64), Array::from_f32(0.05)).unwrap();
+                (k, p)
+            })
+            .collect();
+        let blocks = block_trainables(&mut dit, &paths, &params, &cfg).unwrap();
+        let channels = dit.config().in_channels as i32;
+        // The packed weight exactly as `encode_item_targets` builds it: a [1, C, 4, 4] map packed.
+        let map = |w: &[f32]| {
+            let unpacked =
+                mlx_gen::train::loss::subject_mask_weight(w, 4, 4, &[1, channels, 4, 4]).unwrap();
+            pack_latents(&unpacked).unwrap()
+        };
+        let ones = map(&[1.0; 16]);
+        let zeros = map(&[0.0; 16]);
+        let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+        let half = map(&half);
+        let dense_spec = LossSpec {
+            adapter: &adapter,
+            alpha: 4.0,
+            rank: 4.0,
+            mae: false,
+            dtype: Dtype::Float32,
+            lora_dtype: None,
+            checkpoint: None,
+        };
+        let ckpt_spec = LossSpec {
+            checkpoint: Some(blocks.as_slice()),
+            ..dense_spec
+        };
+        let (x0, ctx, noise) = fixed_batch(&dit);
+        let t2i = t2i_layout();
+        let edit = fixed_edit_batch(&dit);
+        let no_refs: Vec<Array> = Vec::new();
+        for (mode, x0, text, noise, layout, references) in [
+            ("t2i", &x0, &ctx, &noise, &t2i, &no_refs),
+            (
+                "edit",
+                &edit.x0,
+                &edit.text,
+                &edit.noise,
+                &edit.layout,
+                &edit.references,
+            ),
+        ] {
+            let mut run = |weight: Option<&Array>, spec: &LossSpec<'_>| {
+                let step = StepInputs {
+                    x0,
+                    text,
+                    layout,
+                    references,
+                    noise,
+                    t: 0.4,
+                    mask_weight: weight,
+                };
+                let (loss, grads) = compute_loss_grads(&mut dit, &params, spec, &step).unwrap();
+                eval(grads.values()).unwrap();
+                (loss, grads)
+            };
+            let (plain, _) = run(None, &dense_spec);
+            let (with_ones, _) = run(Some(&ones), &dense_spec);
+            assert!(
+                (with_ones - plain).abs() <= 1e-6 * plain.abs().max(1.0),
+                "{mode}: all-ones map {with_ones} vs plain {plain}"
+            );
+            for (path, spec) in [("dense", &dense_spec), ("checkpointed", &ckpt_spec)] {
+                let (loss, grads) = run(Some(&zeros), spec);
+                assert_eq!(
+                    loss, 0.0,
+                    "{mode}/{path}: an all-background map must zero the loss"
+                );
+                assert!(!grads.is_empty(), "{mode}/{path}: no adapter grads");
+                for (k, g) in &grads {
+                    assert!(
+                        g.as_slice::<f32>().iter().all(|x| *x == 0.0),
+                        "{mode}/{path}: nonzero grad on {k}"
+                    );
+                }
+            }
+            let (dense, _) = run(Some(&half), &dense_spec);
+            let (ckpt, _) = run(Some(&half), &ckpt_spec);
+            assert!(
+                dense > 0.0 && dense < plain,
+                "{mode}: half {dense} vs plain {plain}"
+            );
+            assert!(
+                (dense - ckpt).abs() <= 1e-5 * dense.abs().max(1.0),
+                "{mode}: dense {dense} vs checkpointed {ckpt}"
+            );
+        }
     }
 
     /// A changed render alone cannot identify a save/reload defect. Compare the *trained*
@@ -3726,6 +3967,7 @@ mod tests {
                             text: &batch.text,
                             noise: &batch.noise,
                             t: 0.5,
+                            mask_weight: None,
                             references: &batch.references,
                             layout: &batch.layout,
                         },

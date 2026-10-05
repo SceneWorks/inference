@@ -3528,6 +3528,7 @@ version = "0.1.0"
 dependencies = [
  "core-llm",
  "exr",
+ "image",
  "safetensors 0.4.5",
  "serde_json",
  "sha2",

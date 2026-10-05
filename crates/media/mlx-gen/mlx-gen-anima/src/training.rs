@@ -62,7 +62,9 @@ use mlx_gen::train::lora::{
     build_lora_targets, save_lokr, LoraParams, TrainAdapter,
 };
 pub use mlx_gen::train::lora::{LokrTarget, LoraTarget};
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer, TrainerDescriptor,
     TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -335,8 +337,11 @@ fn trainer_descriptor_for(variant: Variant) -> TrainerDescriptor {
         // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per item per bucket,
         // sampled by `BucketSchedule`; the memory pre-flight sizes for the largest bucket.
+        // sc-24828 (epic 2123): honors `subject_mask_loss` on its one (LoRA/LoKr, dense or
+        // block-checkpointed) loss path, with a weight map per (item, bucket) entry.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -477,10 +482,11 @@ impl AnimaTrainer {
         // --- prepare → cache: VAE latents + (masked Qwen3 states, T5 ids) into memory ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
-        // (x0 latent, masked Qwen3 source_hidden, T5 query-token ids), item-major:
-        // `cache[item * edges.len() + bucket]` (sc-2127). The conditioner inputs are encoded once
-        // per item and shared (refcounted) by every bucket entry.
-        let mut cache: Vec<(Array, Array, Array)> =
+        // (x0 latent, masked Qwen3 source_hidden, T5 query-token ids, and — subject-masked loss,
+        // sc-24828 — that bucket's latent loss-weight map, `None` when the technique is off),
+        // item-major: `cache[item * edges.len() + bucket]` (sc-2127). The conditioner inputs are
+        // encoded once per item and shared (refcounted) by every bucket entry.
+        let mut cache: Vec<(Array, Array, Array, Option<Array>)> =
             Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
@@ -491,13 +497,19 @@ impl AnimaTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
+            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
+            let mask = PreparedSubjectMask::load_if_enabled(
+                "anima trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
             let (source, t5_ids) = self.encode_conditioner_inputs(&item.caption)?;
             eval([&source, &t5_ids])?;
-            for &edge in &edges {
+            for (x0, mask_weight) in encode_buckets(&edges, mask.as_ref(), |edge| {
                 let nchw = mlx_gen_qwen_image::preprocess_init_image(&img, edge, edge)?; // [1,3,edge,edge]
-                let x0 = self.vae.encode(&nchw)?; // [1,16,1,edge/8,edge/8], normalized
-                eval([&x0])?;
-                cache.push((x0, source.clone(), t5_ids.clone()));
+                self.vae.encode(&nchw) // [1,16,1,edge/8,edge/8], normalized
+            })? {
+                cache.push((x0, source.clone(), t5_ids.clone(), mask_weight));
             }
         }
         if cache.is_empty() {
@@ -657,7 +669,7 @@ impl AnimaTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, source, t5_ids) = &cache[step_cache_index(&schedule, step)];
+            let (x0, source, t5_ids, mask_weight) = &cache[step_cache_index(&schedule, step)];
             let sigma = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -684,6 +696,7 @@ impl AnimaTrainer {
                 sigma,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 checkpoint_blocks,
                 compute_dtype,
             )?;
@@ -1101,10 +1114,12 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     checkpoint_blocks: Option<&[Vec<String>]>,
     dtype: Dtype,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
+    let mask_weight = mask_weight.cloned();
     let x_t = x_t.as_dtype(dtype)?;
     let src = source.clone();
     let ids = t5_ids.clone();
@@ -1138,16 +1153,38 @@ fn compute_loss_grads(
         };
         let v = v.as_dtype(Dtype::Float32)?;
         let diff = subtract(&v, &target)?;
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
     Ok((val[0].item::<f32>(), grads))
+}
+
+/// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
+/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
+/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
+/// and laid out like that latent. `None` weights when masked loss is off.
+fn encode_buckets(
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    mut encode: impl FnMut(u32) -> Result<Array>,
+) -> Result<Vec<(Array, Option<Array>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(edge)?;
+            let mask_weight = prepared_subject_mask_weight(
+                "anima trainer",
+                mask,
+                CropBox::center_square,
+                x0.shape(),
+            )?;
+            eval([&x0])?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1155,6 +1192,60 @@ mod tests {
     use super::*;
     use mlx_gen::{TrainingItem, TrainingRequest};
     use std::path::PathBuf;
+
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
+    /// bucket's latent shape, and the background (right half of the center-square crop, with
+    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
+    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
+    #[test]
+    fn subject_mask_weight_is_computed_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (iw, ih) = (48u32, 32u32);
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::new(iw, ih).save(&image_path).unwrap();
+        let mask_path = tmp.path().join("a_mask.png");
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = gen_core::TrainingItem {
+            image_path,
+            caption: "a".into(),
+            subject_mask_path: Some(mask_path),
+            ..Default::default()
+        };
+        let mask_cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask =
+            mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
+        let entries = encode_buckets(&[32, 48], Some(&mask), |edge| {
+            let g = (edge / 8) as i32;
+            Ok(Array::zeros::<f32>(&[1, 16, 1, g, g])?)
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), g) in entries.iter().zip([4usize, 6]) {
+            let w = w.as_ref().expect("mask loss on ⇒ a weight map");
+            assert_eq!(
+                w.shape(),
+                x0.shape(),
+                "weight must match its own bucket's latent"
+            );
+            let dense = mlx_rs::ops::multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = dense.as_slice::<f32>();
+            for y in 0..g {
+                for x in 0..g {
+                    let val = v[y * g + x];
+                    if x < g / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                    } else {
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                    }
+                }
+            }
+        }
+    }
 
     fn request(items: usize, steps: u32, rank: u32) -> TrainingRequest {
         TrainingRequest {
@@ -1165,6 +1256,7 @@ mod tests {
                     control_image_path: None,
                     model_options: Default::default(),
                     reference_image_paths: Vec::new(),
+                    subject_mask_path: None,
                 })
                 .collect(),
             config: TrainingConfig {
@@ -1201,13 +1293,15 @@ mod tests {
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.supports_lora && d.supports_lokr);
-        // sc-2127: every variant honors multi-resolution buckets.
+        // sc-2127 / sc-24828: every variant honors multi-resolution buckets and subject-masked
+        // loss on its one loss path.
         for d in [
             trainer_descriptor_base(),
             trainer_descriptor_aesthetic(),
             trainer_descriptor_turbo(),
         ] {
             assert!(d.techniques.resolution_buckets, "{}", d.id);
+            assert!(d.techniques.subject_mask_loss, "{}", d.id);
         }
     }
 
@@ -1567,6 +1661,7 @@ mod tests {
                     0.5,
                     &noise,
                     false,
+                    None,
                     ck,
                     Dtype::Float32,
                 )
@@ -1634,6 +1729,7 @@ mod tests {
                 0.5,
                 &noise,
                 false,
+                None,
                 ck,
                 Dtype::Float32,
             )
@@ -1689,6 +1785,7 @@ mod tests {
                 &noise,
                 false,
                 None,
+                None,
                 Dtype::Float32,
             )
             .unwrap();
@@ -1731,6 +1828,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             Some(&blocks),
             Dtype::Float32,
         )
@@ -1757,6 +1855,94 @@ mod tests {
         assert!(
             dit_bad > 1e-6,
             "captured encoder still trains the DiT — that is why the bug is silent"
+        );
+    }
+
+    /// sc-24828: the subject-mask weight reaches BOTH backward paths (dense + DiT block-checkpointed,
+    /// in the production flag combination) of [`compute_loss_grads`] on the tiny synthetic DiT +
+    /// conditioner. An all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0
+    /// and all-zero DiT AND conditioner adapter grads on both paths; a half map lands strictly
+    /// between and agrees across paths. The latent is `[1, C, 1, H, W]` (frame axis 1), so the weight
+    /// is the cached latent's shape — no packing.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        use mlx_gen::train::loss::subject_mask_weight;
+        let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
+        // Non-zero factors on both sides (lora_b inits at zero, which would zero the lora_a grads
+        // trivially).
+        let scale = Array::from_slice(&[0.05f32], &[1]);
+        let params: LoraParams = params
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let r = random::normal::<f32>(
+                    v.shape(),
+                    None,
+                    None,
+                    Some(&random::key(100 + i as u64).unwrap()),
+                )
+                .unwrap();
+                (k.clone(), multiply(&r, &scale).unwrap())
+            })
+            .collect();
+        let (x0, source, t5_ids, noise) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
+        let shape = x0.shape().to_vec();
+        let (gh, gw) = (shape[3] as usize, shape[4] as usize);
+        let map = |v: &[f32]| subject_mask_weight(v, gh, gw, &shape).unwrap();
+        let mut run = |weight: Option<&Array>, ckpt: bool| {
+            // Dense: every segment flag off. Checkpointed: the production combination (DiT
+            // whole-block ON + DiT segment OFF + conditioner segment ON).
+            dit.set_sdpa_checkpoint(false);
+            cond.set_sdpa_checkpoint(ckpt);
+            let (l, g) = compute_loss_grads(
+                &mut dit,
+                &mut cond,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &source,
+                &t5_ids,
+                0.5,
+                &noise,
+                false,
+                weight,
+                ckpt.then_some(blocks.as_slice()),
+                Dtype::Float32,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            (l, g)
+        };
+        let n = gh * gw;
+        let (plain, g_plain) = run(None, false);
+        assert!(cond_lora_b_grad(&g_plain) > 1e-6 && dit_lora_b_grad(&g_plain) > 1e-6);
+        let ones = map(&vec![1.0; n]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&vec![0.0; n]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty());
+            for (k, g) in &grads {
+                let m = g.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert_eq!(m, 0.0, "ckpt={ckpt}: nonzero adapter grad on {k}");
+            }
+        }
+        let half: Vec<f32> = (0..n)
+            .map(|i| if i % gw < gw / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
         );
     }
 
@@ -2139,6 +2325,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             ck,
             Dtype::Bfloat16,
         )

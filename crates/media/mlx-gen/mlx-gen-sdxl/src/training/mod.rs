@@ -216,8 +216,11 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // update.
         // sc-2127 (epic 2123): honors `resolution_buckets` — the shared family backbone caches one
         // latent (+ its edge's `time_ids`) per bucket and walks them through a `BucketSchedule`.
+        // sc-24828 (epic 2123): subject-masked ε loss, wired in the shared `train_family` (the
+        // weight is resampled per bucket next to each latent).
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -375,6 +378,12 @@ mod preflight_tests {
         assert!(projected_dense_peak_gb(16384.0, false) > 18.7); // f32 1024 does not
     }
 
+    /// sc-24828: SDXL declares subject-masked loss (wired in the shared `train_family`).
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(super::trainer_descriptor().techniques.subject_mask_loss);
+    }
+
     /// sc-2127 / epic 2123 E7: with buckets `[512, 1024]` the pre-flight guard projects the 1024
     /// bucket's peak — equal to a 1024-only run and above a 512-only run.
     #[test]
@@ -500,6 +509,7 @@ mod first_step_repro {
             TrainTimestep::Sigma(500.0),
             &noise,
             false,
+            None,
             dtype,
             checkpoint_targets,
         )?;
@@ -665,6 +675,7 @@ mod first_step_repro {
                 TrainTimestep::Sigma(500.0),
                 &noise,
                 false,
+                None,
                 Dtype::Float32,
                 None,
             )
@@ -715,6 +726,7 @@ mod first_step_repro {
                 TrainTimestep::Sigma(500.0),
                 &noise,
                 false,
+                None,
                 Dtype::Float32,
                 ck,
             )
@@ -769,6 +781,7 @@ mod first_step_repro {
                     TrainTimestep::Sigma(500.0),
                     &noise,
                     false,
+                    None,
                     dt,
                     None,
                 )

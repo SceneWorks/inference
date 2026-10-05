@@ -54,14 +54,15 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor, Var};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, Image, LoadSpec, Modality, Progress, WeightsSource};
 use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
-    self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
-    SamplePlan,
+    self, prepared_subject_mask_weight, run_flow_match_training, validate_flow_match_request,
+    weighted_velocity_loss, FlowMatchTrainer, SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::LoraSet;
@@ -129,6 +130,7 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Tensor,
     mae: bool,
+    mask_weight: Option<&Tensor>,
     compute_dtype: DType,
     use_checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
@@ -146,7 +148,12 @@ fn compute_loss_grads(
         let ctx_ref = &ctx;
         segs.push(Box::new(move |st: &[Tensor]| {
             let v = dit.velocity_out(&st[0], ctx_ref)?;
-            Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+            Ok(vec![weighted_velocity_loss(
+                &v,
+                &target_owned,
+                mask_weight,
+                mae,
+            )?])
         }));
         // Seed the checkpointed chain with the detached joint-sequence boundary (no adapters upstream).
         let combined_d = combined.detach();
@@ -156,7 +163,7 @@ fn compute_loss_grads(
     } else {
         // Dense backward: one monolithic `loss.backward()`. Raw DiT velocity (no negation).
         let v = dit.forward(&x_t, &t, &context)?;
-        let loss = velocity_loss(&v, &target, mae)?;
+        let loss = weighted_velocity_loss(&v, &target, mask_weight, mae)?;
         let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         let grads = loss.backward()?;
         Ok((loss_val, grads))
@@ -253,8 +260,11 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per bucket edge, walked
         // by the shared driver's `BucketSchedule`.
+        // sc-24828 (epic 2123): subject-masked loss — a per-bucket weight map cached next to each
+        // latent.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -326,8 +336,10 @@ impl Trainer for KreaTrainer {
 
 impl FlowMatchTrainer for KreaTrainer {
     type Dit = KreaTrainDit;
-    /// `(x0 latent [1,16,h,w], caption stack (L, num_text_layers, text_hidden))`, both f32.
-    type Cached = (Tensor, Tensor);
+    /// `(x0 latent [1,16,h,w], caption stack (L, num_text_layers, text_hidden), subject-mask loss
+    /// weight)`, all f32; the weight (broadcast to the latent shape) is `None` unless subject-masked
+    /// loss is on (sc-24828).
+    type Cached = (Tensor, Tensor, Option<Tensor>);
     type Aux = ();
     /// Preview-sample render state: per-prompt pre-encoded conditioning + resident VAE decoder + the
     /// training-resolution edge (sc-8650).
@@ -347,7 +359,7 @@ impl FlowMatchTrainer for KreaTrainer {
         req: &TrainingRequest,
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<(Vec<(Tensor, Tensor)>, (), SamplePlan<KreaSampleState>)> {
+    ) -> Result<(Vec<Self::Cached>, (), SamplePlan<KreaSampleState>)> {
         // sc-2127: one training edge per resolution bucket (just `[resolution]` when buckets are off);
         // previews render at the largest (epic 2123 E7).
         let edges = bucket_edges(&req.config);
@@ -368,7 +380,7 @@ impl FlowMatchTrainer for KreaTrainer {
         let total = req.items.len() as u32;
         // Item-major over the bucket edges: `cache[item * edges.len() + bucket]` — the layout the
         // driver's `BucketSchedule` indexes (sc-2127).
-        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len() * edges.len());
+        let mut cache: Vec<Self::Cached> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -378,11 +390,26 @@ impl FlowMatchTrainer for KreaTrainer {
                 total,
             });
             let cap = encode_caption(&tokenizer, &text_encoder, &item.caption)?;
+            // sc-24828: the item's subject mask is read + checked once, then resampled per bucket
+            // onto that bucket's latent grid (`None` when masked loss is off).
+            let mask = PreparedSubjectMask::load_if_enabled(
+                LABEL,
+                item,
+                req.config.subject_mask_loss.as_ref(),
+            )?;
             let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
             for &edge in &edges {
                 let img = square_image_tensor(&square, edge, device)?;
                 let x0 = vae_encoder.encode(&img)?; // (1, 16, edge/8, edge/8), already normalized
-                cache.push((x0, cap.clone()));
+                                                    // `decode_square` centre-crops to a square, so the mask takes the same crop.
+                let mask_weight = prepared_subject_mask_weight(
+                    LABEL,
+                    mask.as_ref(),
+                    CropBox::center_square,
+                    x0.dims(),
+                    device,
+                )?;
+                cache.push((x0, cap.clone(), mask_weight));
             }
         }
 
@@ -437,13 +464,13 @@ impl FlowMatchTrainer for KreaTrainer {
         &self,
         dit: &KreaTrainDit,
         vars: &[Var],
-        cached: &(Tensor, Tensor),
+        cached: &Self::Cached,
         _aux: &(),
         cfg: &TrainingConfig,
         step: u32,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
-        let (x0, cap) = cached;
+        let (x0, cap, mask_weight) = cached;
         let sigma = flow_match::sample_unit_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
@@ -459,6 +486,7 @@ impl FlowMatchTrainer for KreaTrainer {
             sigma,
             &noise,
             flow_match::is_mae(cfg),
+            mask_weight.as_ref(),
             flow_match::parse_compute_dtype(&cfg.train_dtype),
             cfg.gradient_checkpointing,
         )
@@ -587,6 +615,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -638,6 +667,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -650,6 +680,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             true,
         )
@@ -690,6 +721,76 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// sc-24828: subject-masked loss on both backward paths. An all-ones map is the unweighted loss;
+    /// an all-zero map zeroes the loss AND every adapter gradient (dense and checkpointed — a path
+    /// that dropped the weight would train on the background); a half map matches across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit(&tmp);
+        let suffixes: Vec<String> = KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let (x0, cap, noise) = tiny_batch(&c);
+        let shape = x0.dims().to_vec();
+        let map = |w: &[f32]| flow_match::subject_mask_weight(w, 4, 4, &shape, &dev).unwrap();
+        let run = |weight: Option<&Tensor>, ckpt: bool| {
+            compute_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                weight,
+                DType::F32,
+                ckpt,
+            )
+            .unwrap()
+        };
+        let (plain, _) = run(None, false);
+        let ones = map(&[1.0; 16]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&[0.0; 16]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            for v in &set.vars {
+                if let Some(g) = grads.get(v.as_tensor()) {
+                    let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(
+                        g.iter().all(|x| *x == 0.0),
+                        "ckpt={ckpt}: nonzero adapter grad"
+                    );
+                }
+            }
+        }
+        let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The candle Krea LoRA trainer declares subject-masked loss (sc-24828).
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
     /// A few optimizer steps over the tiny DiT lower the loss on the same fixed batch — the step
     /// actually descends the flow-match objective, end to end through the harness.
     #[test]
@@ -722,6 +823,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -738,6 +840,7 @@ mod tests {
                 0.5,
                 &noise,
                 false,
+                None,
                 DType::F32,
                 false,
             )
@@ -752,6 +855,7 @@ mod tests {
             0.5,
             &noise,
             false,
+            None,
             DType::F32,
             false,
         )
@@ -806,6 +910,7 @@ mod tests {
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         };
         let base = TrainingRequest {
             items: vec![item],

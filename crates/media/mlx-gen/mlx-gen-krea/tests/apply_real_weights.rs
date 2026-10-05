@@ -118,6 +118,7 @@ fn train_tiny_adapter(
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         }],
         config: TrainingConfig {
             rank: 4,
@@ -246,6 +247,7 @@ fn train_concept_lora(
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             })
             .collect(),
         config: TrainingConfig {

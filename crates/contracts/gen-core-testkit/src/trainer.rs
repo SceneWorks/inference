@@ -173,6 +173,7 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
     // `validate_training_techniques` floor enforces all three; assert the trainer routes through it.
     check_technique_validate(t, &ok)?;
     check_resolution_buckets_validate(t, &ok)?;
+    check_subject_mask_missing_refused(t, &ok)?;
 
     // Negative (sc-24161): instruction-edit datasets. A trainer that does NOT advertise
     // `max_reference_images` must refuse an edit dataset — never silently train a text-to-image
@@ -258,7 +259,51 @@ const TECHNIQUE_PROBES: &[TechniqueProbe] = &[
         declared: |t| t.depth_anchoring,
         adapter_only: false,
     },
+    TechniqueProbe {
+        name: "subject_mask_loss",
+        knob: "subject_mask_loss",
+        // Masked loss with every item carrying a mask path — the item's own image stands in for it
+        // (validate only checks presence; a declaring trainer's real mask handling is covered by
+        // its own tests) (sc-24828). A loss term, not adapter-only.
+        enable: enable_subject_mask_probe,
+        declared: |t| t.subject_mask_loss,
+        adapter_only: false,
+    },
 ];
+
+/// The masked-loss probe weights (sc-24828): drop the background entirely.
+const SUBJECT_MASK_PROBE: gen_core::SubjectMaskLoss = gen_core::SubjectMaskLoss {
+    background_weight: 0.0,
+    subject_weight: 1.0,
+};
+
+/// Turn subject-masked loss on with a mask path on every item (see the `subject_mask_loss` probe).
+fn enable_subject_mask_probe(r: &mut TrainingRequest) {
+    r.config.subject_mask_loss = Some(SUBJECT_MASK_PROBE);
+    for item in &mut r.items {
+        item.subject_mask_path = Some(item.image_path.clone());
+    }
+}
+
+/// Subject-masked-loss extra of [`check_trainer_validate`] (sc-24828): a trainer that declares the
+/// technique must still refuse a request where an item lacks its mask — never train it unmasked.
+fn check_subject_mask_missing_refused(t: &dyn Trainer, ok: &TrainingRequest) -> Result<(), String> {
+    let desc = t.descriptor();
+    if !desc.techniques.subject_mask_loss {
+        return Ok(());
+    }
+    let mut missing = ok.clone();
+    enable_subject_mask_probe(&mut missing);
+    missing.items[0].subject_mask_path = None;
+    if t.validate(&missing).is_ok() {
+        return Err(format!(
+            "technique-honesty[{}]: a subject-masked-loss request with an item lacking its mask \
+             was accepted by validate() — it must be refused, not trained unmasked",
+            desc.id
+        ));
+    }
+    Ok(())
+}
 
 /// Technique half of [`check_trainer_validate`] (sc-24826 weight noise, sc-24827 gradient noise) —
 /// `ok` is the accepted base request. For each probed technique: an undeclared one must be refused

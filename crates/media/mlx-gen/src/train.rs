@@ -6,6 +6,7 @@
 pub mod checkpoint;
 pub mod dataset;
 pub mod lora;
+pub mod loss;
 pub mod optim;
 pub mod perceptual;
 pub mod tae;

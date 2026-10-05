@@ -47,6 +47,7 @@ use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -54,8 +55,10 @@ use candle_gen::gen_core::{
     self, BucketSchedule, Image, LoadSpec, Modality, NetworkType, Progress, WeightsSource,
 };
 use candle_gen::train::checkpoint::file_stem;
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
-use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
+use candle_gen::train::flow_match::{
+    self, prepared_subject_mask_weight, validate_flow_match_request, weighted_velocity_loss,
+};
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::{LoraHost, LoraSet};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
@@ -133,7 +136,7 @@ fn expert_cache_index(step: u32, dual: bool, schedule: &BucketSchedule) -> usize
 /// geometry of the first item at each bucket (`cache[b]`; every item shares a bucket's geometry, so
 /// the table for cache entry `i` is `ropes[i % n_buckets]`). Training stills ⇒ one latent frame.
 fn bucket_rope_tables(
-    cache: &[(Tensor, Tensor)],
+    cache: &[(Tensor, Tensor, Option<Tensor>)],
     n_buckets: usize,
     dit_cfg: &TransformerConfig,
     device: &Device,
@@ -143,9 +146,36 @@ fn bucket_rope_tables(
     cache
         .iter()
         .take(n_buckets)
-        .map(|(x0, _)| {
+        .map(|(x0, _, _)| {
             let (_, _, fl, hl, wl) = x0.dims5()?;
             Ok(rope.cos_sin(fl / pt, hl / ph, wl / pw, device)?)
+        })
+        .collect()
+}
+
+/// One item's item-major cache entries (sc-2127 × sc-24828): the decoded `square` encoded at each
+/// bucket edge by `encode` (`[1, 3, edge, edge]` → clean `[1, C, 1, h, w]` latent), each paired with
+/// its subject-mask loss weight on THAT bucket's latent grid (`None` when masked loss is off).
+/// `decode_square` center-crops, so the mask is cropped with [`CropBox::center_square`].
+fn encode_item_buckets(
+    square: &SquareImage,
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    device: &Device,
+    mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
+) -> Result<Vec<(Tensor, Option<Tensor>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(&square_image_tensor(square, edge, device)?)?;
+            let mask_weight = prepared_subject_mask_weight(
+                LABEL,
+                mask,
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
+            Ok((x0, mask_weight))
         })
         .collect()
 }
@@ -190,6 +220,7 @@ fn compute_loss_grads(
     cos: &Tensor,
     sin: &Tensor,
     mae: bool,
+    mask_weight: Option<&Tensor>,
     compute_dtype: DType,
     use_checkpoint: bool,
     y_channels: usize,
@@ -224,13 +255,18 @@ fn compute_loss_grads(
         let mctx_ref = &mctx;
         segs.push(Box::new(move |st: &[Tensor]| {
             let v = dit.velocity_out(&st[0], mctx_ref)?;
-            Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+            Ok(vec![weighted_velocity_loss(
+                &v,
+                &target_owned,
+                mask_weight,
+                mae,
+            )?])
         }));
         checkpointed_backward(&segs, std::slice::from_ref(&hidden_d), lora_vars)
     } else {
         // Dense backward (tiny models / tests only — see the `use_checkpoint` note re: OOM at scale).
         let v = dit.forward(&x_t, &ctx, timestep, cos, sin)?;
-        let loss = velocity_loss(&v, &target, mae)?;
+        let loss = weighted_velocity_loss(&v, &target, mask_weight, mae)?;
         let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         let grads = loss.backward()?;
         Ok((loss_val, grads))
@@ -469,8 +505,10 @@ impl TrainVariant {
             // update.
             // sc-2127 (epic 2123): spatial multi-resolution buckets — one cached still latent per
             // bucket edge, per-bucket RoPE, sampled through `BucketSchedule`.
+            // Subject-masked loss (sc-24828): every item is a still frame, weighted on both experts.
             techniques: gen_core::train::TrainingTechniques {
                 resolution_buckets: true,
+                subject_mask_loss: true,
                 ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
             },
         }
@@ -764,8 +802,11 @@ impl WanMoeTrainer {
             crate::text_encode::build_umt5_tokenizer(&self.root, &te_cfg, "wan trainer")?;
 
         let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
-        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len() * edges.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127) of `(x0, caption, subject-mask
+        // loss weight)` — the weight (broadcast to that bucket's `[1, C, 1, h, w]` latent) is `None`
+        // unless subject-masked loss is on (sc-24828).
+        let mut cache: Vec<(Tensor, Tensor, Option<Tensor>)> =
+            Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -776,11 +817,15 @@ impl WanMoeTrainer {
             });
             let cap = encode_caption(&tokenizer, &te_cfg, &text_encoder, &item.caption, device)?;
             let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
-            for &edge in &edges {
-                let img = square_image_tensor(&square, edge, device)?; // [1,3,edge,edge] in [-1,1]
+                                                           // The item's subject mask, read + checked once (None when masked loss is off).
+            let mask =
+                PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
+            let buckets = encode_item_buckets(&square, &edges, mask.as_ref(), device, |img| {
                 let video = img.unsqueeze(2)?; // [1,3,1,edge,edge] (T=1 still frame)
-                let x0 = vae.encode(&video)?.to_dtype(DType::F32)?; // [1,16,1,h,w] normalized mean
-                cache.push((x0, cap.clone()));
+                Ok(vae.encode(&video)?.to_dtype(DType::F32)?) // [1,16,1,h,w] normalized mean
+            })?;
+            for (x0, mask_weight) in buckets {
+                cache.push((x0, cap.clone(), mask_weight));
             }
         }
 
@@ -910,7 +955,7 @@ impl WanMoeTrainer {
                                                // Index by the expert's own visit count, not the raw step — else on an even-sized
                                                // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
             let ci = expert_cache_index(step, dual, &schedule);
-            let (x0, cap) = &cache[ci];
+            let (x0, cap, mask_weight) = &cache[ci];
             let (cos, sin) = &ropes[ci % edges.len()];
             let band = experts[ei].band;
             let t = sample_band_timestep(
@@ -934,6 +979,7 @@ impl WanMoeTrainer {
                 cos,
                 sin,
                 mae,
+                mask_weight.as_ref(),
                 compute_dtype,
                 use_checkpoint,
                 y_channels,
@@ -1147,6 +1193,59 @@ mod tests {
         }
     }
 
+    /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached still latent
+    /// `[1, C, 1, h, w]` carries a weight of ITS OWN shape (built on that bucket's grid), and the
+    /// masked-out region is zero.
+    #[test]
+    fn subject_mask_weight_follows_each_buckets_latent() {
+        use candle_gen::candle_core::IndexOp;
+        use candle_gen::gen_core::train::TrainingItem;
+        use candle_gen::gen_core::SubjectMaskLoss;
+        let dir = tempfile::tempdir().unwrap();
+        // 48×32 image → center square x ∈ [8, 40); the subject is that square's left half (x < 24).
+        let image_path = dir.path().join("img.png");
+        image::RgbImage::from_pixel(48, 32, image::Rgb([128, 64, 32]))
+            .save(&image_path)
+            .unwrap();
+        let mask_path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(48, 32, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = TrainingItem {
+            image_path,
+            caption: String::new(),
+            control_image_path: None,
+            model_options: Default::default(),
+            reference_image_paths: Vec::new(),
+            subject_mask_path: Some(mask_path),
+        };
+        let cfg = SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
+        let square = decode_square(&item.image_path).unwrap();
+        let dev = Device::Cpu;
+        // A stand-in /8 still-frame encoder: `[1, 3, edge, edge]` → `[1, 3, 1, edge/8, edge/8]`.
+        let encode = |img: &Tensor| Ok(img.avg_pool2d(8)?.unsqueeze(2)?);
+        let entries = encode_item_buckets(&square, &[32, 64], Some(&mask), &dev, encode).unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), grid) in entries.iter().zip([4usize, 8]) {
+            assert_eq!(x0.dims(), &[1, 3, 1, grid, grid]);
+            let w = w.as_ref().expect("masked loss is on");
+            assert_eq!(w.dims(), x0.dims(), "bucket {grid}: weight shape");
+            let rows = w.i((0, 0, 0)).unwrap().to_vec2::<f32>().unwrap();
+            for row in rows {
+                for (x, v) in row.into_iter().enumerate() {
+                    let want = if x < grid / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "bucket {grid}: column {x}");
+                }
+            }
+        }
+        let off = encode_item_buckets(&square, &[32, 64], None, &dev, encode).unwrap();
+        assert!(off.iter().all(|(_, w)| w.is_none()));
+    }
+
     /// sc-2127: one RoPE table pair per bucket, shaped from that bucket's cached latent geometry —
     /// a 4×4 and an 8×8 latent get distinct tables equal to a direct `cos_sin` at their patch grid.
     /// (Mutation: building every table from `cache[0]` makes the 8×8 table the wrong length.)
@@ -1158,10 +1257,10 @@ mod tests {
         let latent = |hw: usize| Tensor::zeros((1, 16, 1, hw, hw), DType::F32, &dev).unwrap();
         // Two items × two buckets, item-major.
         let cache = vec![
-            (latent(4), cap.clone()),
-            (latent(8), cap.clone()),
-            (latent(4), cap.clone()),
-            (latent(8), cap.clone()),
+            (latent(4), cap.clone(), None),
+            (latent(8), cap.clone(), None),
+            (latent(4), cap.clone(), None),
+            (latent(8), cap.clone(), None),
         ];
         let ropes = bucket_rope_tables(&cache, 2, &cfg, &dev).unwrap();
         assert_eq!(ropes.len(), 2);
@@ -1481,6 +1580,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             0,
@@ -1537,6 +1637,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             20,
@@ -1575,6 +1676,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             0,
@@ -1590,6 +1692,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             true,
             0,
@@ -1629,6 +1732,82 @@ mod tests {
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
     }
 
+    /// sc-24828: subject-masked loss on both backward paths (the checkpointed one is what every
+    /// real expert step runs). An all-ones map is the unweighted loss; an all-zero map zeroes the loss
+    /// AND every adapter gradient (dense and checkpointed); a half map matches across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = WanTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
+        let shape = x0.dims().to_vec();
+        let map = |w: &[f32]| flow_match::subject_mask_weight(w, 4, 4, &shape, &dev).unwrap();
+        let run = |weight: Option<&Tensor>, ckpt: bool| {
+            compute_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                &umt5,
+                0.5,
+                &noise,
+                &cos,
+                &sin,
+                false,
+                weight,
+                DType::F32,
+                ckpt,
+                0,
+            )
+            .unwrap()
+        };
+        let (plain, _) = run(None, false);
+        let ones = map(&[1.0; 16]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&[0.0; 16]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            for v in &set.vars {
+                if let Some(g) = grads.get(v.as_tensor()) {
+                    let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(
+                        g.iter().all(|x| *x == 0.0),
+                        "ckpt={ckpt}: nonzero adapter grad"
+                    );
+                }
+            }
+        }
+        let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+        for d in [
+            trainer_descriptor(),
+            trainer_descriptor_i2v_14b(),
+            trainer_descriptor_ti2v_5b(),
+        ] {
+            assert!(d.techniques.subject_mask_loss, "{}", d.id);
+        }
+    }
+
     /// A few optimizer steps on a fixed batch lower the loss — the step descends the flow-match
     /// objective end to end through the harness.
     #[test]
@@ -1657,6 +1836,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             0,
@@ -1675,6 +1855,7 @@ mod tests {
                 &cos,
                 &sin,
                 false,
+                None,
                 DType::F32,
                 false,
                 0,
@@ -1692,6 +1873,7 @@ mod tests {
             &cos,
             &sin,
             false,
+            None,
             DType::F32,
             false,
             0,
@@ -1748,6 +1930,7 @@ mod tests {
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),

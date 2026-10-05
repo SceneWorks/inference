@@ -18,6 +18,7 @@
 pub mod aux_schedule;
 pub mod resume;
 pub mod schedule;
+pub mod subject_mask;
 
 use std::path::PathBuf;
 
@@ -229,6 +230,67 @@ pub struct TrainingConfig {
     /// path) runs the model's x0 prediction through. Required (a typed refusal otherwise) whenever
     /// such a loss is enabled; ignored when none is. `None` by default.
     pub perceptual_decoder_dir: Option<PathBuf>,
+    /// **Subject-masked loss weighting** (epic 2123, sc-24828) — weight the per-element training
+    /// loss by each item's subject mask ([`TrainingItem::subject_mask_path`]), ported from
+    /// ai-toolkit-perceptual. The mask is cropped/resized exactly like its image, area-averaged
+    /// down to the latent grid (so a latent cell straddling the subject edge gets a fractional
+    /// mask value `m`), and turned into the weight map
+    /// `w = background_weight + (subject_weight − background_weight) · m`, which multiplies the
+    /// per-element loss **before** the mean reduction (see [`subject_mask`]).
+    /// The divisor stays the full element count, so the gradient (and effective learning rate)
+    /// scales by about `background_weight + (subject_weight − background_weight) · coverage`
+    /// — with `background_weight = 0` and a small subject, proportionally lower.
+    ///
+    /// `None` (the default) is **off**: no mask is read and the loss is exactly the unweighted
+    /// mean it was before this field existed. `Some` is refused (typed
+    /// [`crate::Error::Unsupported`]) by a trainer whose [`TrainerDescriptor::techniques`] does not
+    /// declare [`subject_mask_loss`](TrainingTechniques::subject_mask_loss), and refused when any
+    /// item lacks a mask — see [`validate_training_techniques`].
+    pub subject_mask_loss: Option<SubjectMaskLoss>,
+}
+
+/// The weights of [`TrainingConfig::subject_mask_loss`] (epic 2123, sc-24828). A latent cell with
+/// mask value `m ∈ [0, 1]` (1 = subject) weighs `background_weight + (subject_weight −
+/// background_weight) · m` in the loss. `background_weight = 0` drops the background from the loss
+/// (and from the gradient) entirely; `background_weight = subject_weight = 1` is the unweighted loss.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubjectMaskLoss {
+    /// Weight of a pure-background latent cell, in `[0, 1]`.
+    pub background_weight: f32,
+    /// Weight of a pure-subject latent cell, in `(0, 1]`.
+    pub subject_weight: f32,
+}
+
+impl SubjectMaskLoss {
+    /// Inclusive bounds of [`background_weight`](Self::background_weight).
+    pub const BACKGROUND_WEIGHT_RANGE: (f32, f32) = (0.0, 1.0);
+    /// Bounds of [`subject_weight`](Self::subject_weight): exclusive lower, inclusive upper (a
+    /// zero subject weight would train on nothing but background — the inverse of the technique).
+    pub const SUBJECT_WEIGHT_RANGE: (f32, f32) = (0.0, 1.0);
+
+    /// The loss weight of a latent cell whose (area-averaged) mask value is `m`.
+    pub fn weight(&self, m: f32) -> f32 {
+        self.background_weight + (self.subject_weight - self.background_weight) * m
+    }
+
+    /// Refuse malformed weights with a message naming the field.
+    pub fn validate(&self, label: &str) -> crate::Result<()> {
+        let (bg_lo, bg_hi) = Self::BACKGROUND_WEIGHT_RANGE;
+        let bg = self.background_weight;
+        if !bg.is_finite() || bg < bg_lo || bg > bg_hi {
+            return Err(crate::Error::Msg(format!(
+                "{label}: subject_mask_loss.background_weight must be in [{bg_lo}, {bg_hi}], got {bg}"
+            )));
+        }
+        let (s_lo, s_hi) = Self::SUBJECT_WEIGHT_RANGE;
+        let s = self.subject_weight;
+        if !s.is_finite() || s <= s_lo || s > s_hi {
+            return Err(crate::Error::Msg(format!(
+                "{label}: subject_mask_loss.subject_weight must be in ({s_lo}, {s_hi}], got {s}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Schedule of one **auxiliary perceptual loss** (epic 2123 E8: depth anchoring here; the
@@ -402,6 +464,9 @@ impl Default for TrainingConfig {
             // Resolution buckets are OFF by default (epic 2123 E1): one bucket at `resolution`,
             // walked round-robin exactly as before.
             resolution_buckets: Vec::new(),
+            // Subject-masked loss is OFF by default (epic 2123 E1): no mask is read and the loss is
+            // the plain unweighted mean.
+            subject_mask_loss: None,
         }
     }
 }
@@ -619,6 +684,11 @@ pub struct TrainingItem {
     /// ([`TrainerDescriptor::max_reference_images`] `> 0`) accepts — and then only up to that cap;
     /// see [`validate_edit_request`].
     pub reference_image_paths: Vec<PathBuf>,
+    /// The item's **subject mask** (epic 2123, sc-24828): a single-channel image the same size as
+    /// [`image_path`](Self::image_path), white (255) = subject, black (0) = background, with soft
+    /// edges in between. Read only when [`TrainingConfig::subject_mask_loss`] is on — then every
+    /// item must carry one (an edit pair's mask covers its **target**); `None` otherwise.
+    pub subject_mask_path: Option<PathBuf>,
 }
 
 impl TrainingItem {
@@ -631,6 +701,7 @@ impl TrainingItem {
             control_image_path: None,
             model_options: JsonMap::new(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         }
     }
 
@@ -642,6 +713,7 @@ impl TrainingItem {
             control_image_path: Some(control_image_path),
             model_options: JsonMap::new(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         }
     }
 
@@ -659,6 +731,7 @@ impl TrainingItem {
             control_image_path: None,
             model_options: JsonMap::new(),
             reference_image_paths,
+            subject_mask_path: None,
         }
     }
 
@@ -793,12 +866,15 @@ pub struct TrainingTechniques {
     /// Honors [`TrainingConfig::resolution_buckets`] (multi-resolution buckets with per-bucket
     /// repeat counts, sc-2127).
     pub resolution_buckets: bool,
+    /// Honors [`TrainingConfig::subject_mask_loss`] (subject-masked loss weighting, sc-24828).
+    pub subject_mask_loss: bool,
 }
 
 impl TrainingTechniques {
     /// No optional technique supported — every technique knob must stay at its off value.
     pub const NONE: Self = Self {
         weight_noise: false,
+        subject_mask_loss: false,
         depth_anchoring: false,
         gradient_noise: false,
         resolution_buckets: false,
@@ -811,6 +887,7 @@ impl TrainingTechniques {
         gradient_noise: true,
         resolution_buckets: false,
         depth_anchoring: false,
+        subject_mask_loss: false,
     };
 }
 
@@ -874,6 +951,13 @@ pub fn technique_noise_key(seed: u64, salt: u64, update_idx: u32, tensor_idx: us
 ///   [`depth_anchoring`](TrainingTechniques::depth_anchoring) ⇒ typed [`crate::Error::Unsupported`].
 /// - depth anchoring enabled without a [`DepthAnchoringConfig::model_dir`] or a
 ///   [`TrainingConfig::perceptual_decoder_dir`] ⇒ [`crate::Error::Msg`] naming the missing model.
+/// - `subject_mask_loss` set with malformed weights ⇒ [`crate::Error::Msg`] naming the field.
+/// - `subject_mask_loss` set on a trainer whose [`TrainerDescriptor::techniques`] lacks
+///   [`subject_mask_loss`](TrainingTechniques::subject_mask_loss) ⇒ typed
+///   [`crate::Error::Unsupported`].
+/// - `subject_mask_loss` set while any item has no
+///   [`subject_mask_path`](TrainingItem::subject_mask_path) ⇒ [`crate::Error::Msg`] naming the
+///   images that lack one (defence in depth behind the product-layer preflight).
 /// - every technique off ⇒ no-op.
 pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
@@ -951,6 +1035,16 @@ pub fn validate_training_techniques(
                 desc.id
             )));
         }
+    }
+    if let Some(mask_loss) = &req.config.subject_mask_loss {
+        mask_loss.validate(desc.id)?;
+        if !desc.techniques.subject_mask_loss {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: subject-masked loss weighting is not supported by this trainer",
+                desc.id
+            )));
+        }
+        subject_mask::require_subject_masks(desc.id, &req.items)?;
     }
     validate_resolution_buckets(desc, &cfg.resolution_buckets)?;
     Ok(())
@@ -1695,6 +1789,59 @@ mod tests {
         );
         assert_eq!(DepthModelSize::parse("giant"), None);
         assert_eq!(DepthModelSize::default(), DepthModelSize::Small);
+    }
+
+    #[test]
+    fn validate_training_techniques_subject_mask_loss_floor() {
+        // sc-24828 (epic 2123 E3): masked loss is refused unless declared, with malformed weights,
+        // and when any item lacks a mask (naming it); off is a no-op everywhere.
+        let mut masked = TrainingItem::captioned(PathBuf::from("a.png"), "a cat".into());
+        masked.subject_mask_path = Some(PathBuf::from("masks/a.png"));
+        let bare = TrainingItem::captioned(PathBuf::from("b.png"), "a dog".into());
+        let plain = trainer_desc(false);
+        let mut desc = trainer_desc(false);
+        desc.techniques.subject_mask_loss = true;
+
+        let off = train_req(None, vec![masked.clone(), bare.clone()]);
+        assert_eq!(off.config.subject_mask_loss, None);
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+        assert!(validate_training_techniques(&desc, &off).is_ok());
+
+        let mut on = train_req(None, vec![masked.clone()]);
+        on.config.subject_mask_loss = Some(SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        });
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("subject-masked loss")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&desc, &on).is_ok());
+
+        let mut missing = on.clone();
+        missing.items.push(bare);
+        let err = validate_training_techniques(&desc, &missing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 of 2 have none: b.png"), "{err}");
+
+        for (bg, subj) in [
+            (-0.1, 1.0),
+            (1.1, 1.0),
+            (f32::NAN, 1.0),
+            (0.0, 0.0),
+            (0.0, 1.5),
+            (0.0, f32::INFINITY),
+        ] {
+            let mut r = on.clone();
+            r.config.subject_mask_loss = Some(SubjectMaskLoss {
+                background_weight: bg,
+                subject_weight: subj,
+            });
+            let err = validate_training_techniques(&desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bg}/{subj}: {err:?}");
+        }
     }
 
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {

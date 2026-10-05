@@ -61,7 +61,9 @@ use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
 };
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Error, LoadSpec, Modality, NetworkType, Precision, Progress,
     Result, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
@@ -167,8 +169,11 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // sc-2127 (epic 2123): honors `resolution_buckets` — one cached latent per item per bucket
         // edge, walked through a `BucketSchedule`; the pre-flight guard and the preview render size
         // for the largest edge.
+        // sc-24828 (epic 2123): honors `subject_mask_loss` on its one (LoRA/LoKr, dense or
+        // block-checkpointed) loss path, with a weight map per (item, bucket) entry.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -383,8 +388,11 @@ impl KreaRawTrainer {
         // --- prepare → load → cache: VAE-latents + caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len() * edges.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry: clean latent,
+        // caption features, and (subject-masked loss, sc-24828) that bucket's latent loss-weight
+        // map — `None` when the technique is off.
+        let mut cache: Vec<(Array, Array, Option<Array>)> =
+            Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -394,6 +402,12 @@ impl KreaRawTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
+            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
+            let mask = PreparedSubjectMask::load_if_enabled(
+                "krea trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
             let encoder = self.encoder.as_ref().ok_or_else(|| {
                 Error::Msg(
                     "krea trainer: text encoder already freed (caching after train loop)".into(),
@@ -403,10 +417,10 @@ impl KreaRawTrainer {
             eval([&context])?;
             // The caption context is resolution-independent: encode it once, then one latent per
             // bucket edge (the DiT derives its patch grid / RoPE from the latent's own shape).
-            for &edge in &edges {
-                let x0 = encode_latents(&self.vae, &img, edge)?; // [1, 16, edge/8, edge/8]
-                eval([&x0])?;
-                cache.push((x0, context.clone()));
+            for (x0, mask_weight) in encode_buckets(&edges, mask.as_ref(), |edge| {
+                encode_latents(&self.vae, &img, edge) // [1, 16, edge/8, edge/8]
+            })? {
+                cache.push((x0, context.clone(), mask_weight));
             }
         }
         if cache.is_empty() {
@@ -559,7 +573,7 @@ impl KreaRawTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, context) = &cache[schedule.cache_index((step - 1) as usize)];
+            let (x0, context, mask_weight) = &cache[schedule.cache_index((step - 1) as usize)];
             let t = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -584,6 +598,7 @@ impl KreaRawTrainer {
                 t,
                 &noise,
                 mae,
+                mask_weight.as_ref(),
                 compute_dtype,
                 lora_dtype,
                 checkpoint_blocks,
@@ -888,11 +903,13 @@ fn compute_loss_grads(
     t: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     dtype: Dtype,
     lora_dtype: Option<Dtype>,
     checkpoint_blocks: Option<&[Vec<String>]>,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target) = build_batch(x0, noise, t)?;
+    let mask_weight = mask_weight.cloned();
     let x_t = x_t.as_dtype(dtype)?; // no-op in f32 mode
     let timestep = Array::from_slice(&[t], &[1]);
     let context = context.clone();
@@ -912,13 +929,9 @@ fn compute_loss_grads(
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
         let diff = subtract(&v, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+        // requires a scalar cotangent).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -988,11 +1001,90 @@ fn render_sample(
     decoded_to_image(&decoded)
 }
 
+/// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
+/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
+/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
+/// and laid out like that latent. `None` weights when masked loss is off.
+fn encode_buckets(
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    mut encode: impl FnMut(u32) -> Result<Array>,
+) -> Result<Vec<(Array, Option<Array>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(edge)?;
+            let mask_weight = prepared_subject_mask_weight(
+                "krea trainer",
+                mask,
+                CropBox::center_square,
+                x0.shape(),
+            )?;
+            eval([&x0])?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_gen::CancelFlag;
     use std::path::PathBuf;
+
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
+    /// bucket's latent shape, and the background (right half of the center-square crop, with
+    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
+    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
+    #[test]
+    fn subject_mask_weight_is_computed_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (iw, ih) = (48u32, 32u32);
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::new(iw, ih).save(&image_path).unwrap();
+        let mask_path = tmp.path().join("a_mask.png");
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = gen_core::TrainingItem {
+            image_path,
+            caption: "a".into(),
+            subject_mask_path: Some(mask_path),
+            ..Default::default()
+        };
+        let mask_cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask =
+            mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
+        let entries = encode_buckets(&[32, 48], Some(&mask), |edge| {
+            let g = (edge / 8) as i32;
+            Ok(Array::zeros::<f32>(&[1, 16, g, g])?)
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), g) in entries.iter().zip([4usize, 6]) {
+            let w = w.as_ref().expect("mask loss on ⇒ a weight map");
+            assert_eq!(
+                w.shape(),
+                x0.shape(),
+                "weight must match its own bucket's latent"
+            );
+            let dense = mlx_rs::ops::multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = dense.as_slice::<f32>();
+            for y in 0..g {
+                for x in 0..g {
+                    let val = v[y * g + x];
+                    if x < g / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                    } else {
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                    }
+                }
+            }
+        }
+    }
 
     fn base_config() -> TrainingConfig {
         TrainingConfig {
@@ -1010,6 +1102,7 @@ mod tests {
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config,
             output_dir: PathBuf::from("/tmp/krea_unused"),
@@ -1027,6 +1120,9 @@ mod tests {
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.supports_lora && d.supports_lokr);
+        // sc-24828: the one loss path (dense + block-checkpointed) reduces through the subject-mask
+        // weight; the latent is unpacked `[1, 16, H, W]`, so the weight is the cached latent's shape.
+        assert!(d.techniques.subject_mask_loss);
     }
 
     #[test]
@@ -1211,6 +1307,138 @@ mod tests {
         // The bf16 base (no tokens) is ~the resident DiT weights (≥ 20 GB) — the floor the guard adds to.
         assert!(projected_dense_peak_gb(0.0, true) >= 20.0);
     }
+
+    /// sc-24828: the subject-mask weight reaches BOTH backward paths (dense + block-checkpointed) of
+    /// [`compute_loss_grads`] on the checked-in tiny `dit_golden` fixture DiT (no real weights). An
+    /// all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0 and all-zero
+    /// adapter grads on both paths; a half map lands strictly between and agrees across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        use mlx_gen::train::loss::subject_mask_weight;
+        use mlx_gen::weights::Weights;
+        let w = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/dit_golden.safetensors"
+        ))
+        .unwrap();
+        // Mirrors `tests/common::tiny_dit_config` (the fixture's dump geometry).
+        let dit_cfg = crate::config::Krea2Config {
+            in_channels: 16,
+            patch_size: 2,
+            hidden_size: 128,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            attention_head_dim: 32,
+            num_layers: 2,
+            intermediate_size: 384,
+            norm_eps: 1e-5,
+            axes_dims_rope: [8, 12, 12],
+            rope_theta: 1000.0,
+            timestep_embed_dim: 64,
+            num_text_layers: 3,
+            num_layerwise_text_blocks: 2,
+            num_refiner_text_blocks: 2,
+            text_hidden_dim: 64,
+            text_intermediate_size: 256,
+            text_num_attention_heads: 2,
+            text_num_kv_heads: 2,
+        };
+        dit_cfg.validate().unwrap();
+        let mut dit = Krea2Transformer::from_weights(&w, &dit_cfg).unwrap();
+        let cfg = TrainingConfig {
+            rank: 4,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&dit, &cfg);
+        assert!(!target_paths.is_empty());
+        let (targets, params) = build_lora_targets(&mut dit, &target_paths, 4, 7).unwrap();
+        // Non-zero factors on both sides (the up-projection inits at zero, which would zero the
+        // down-projection grads trivially).
+        let scale = Array::from_slice(&[0.02f32], &[1]);
+        let params: LoraParams = params
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let r = random::normal::<f32>(
+                    v.shape(),
+                    None,
+                    None,
+                    Some(&random::key(100 + i as u64).unwrap()),
+                )
+                .unwrap();
+                (k.clone(), multiply(&r, &scale).unwrap())
+            })
+            .collect();
+        let adapter = TrainAdapter::Lora { targets };
+        let mut locals: Vec<Vec<String>> = vec![Vec::new(); dit.num_blocks()];
+        for path in &target_paths {
+            if let Some((idx, local)) = path
+                .strip_prefix("transformer_blocks.")
+                .and_then(|rest| rest.split_once('.'))
+            {
+                if let Ok(i) = idx.parse::<usize>() {
+                    locals[i].push(local.to_string());
+                }
+            }
+        }
+        assert!(locals.iter().any(|l| !l.is_empty()));
+        let x0 = w.require("in.latent").unwrap().clone();
+        let context = w.require("in.context").unwrap().clone();
+        let shape = x0.shape().to_vec();
+        let (gh, gw) = (shape[2] as usize, shape[3] as usize);
+        let noise =
+            random::normal::<f32>(&shape, None, None, Some(&random::key(2).unwrap())).unwrap();
+        let map = |v: &[f32]| subject_mask_weight(v, gh, gw, &shape).unwrap();
+        let mut run = |weight: Option<&Array>, ckpt: bool| {
+            let (l, g) = compute_loss_grads(
+                &mut dit,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &context,
+                0.5,
+                &noise,
+                false,
+                weight,
+                Dtype::Float32,
+                None,
+                ckpt.then_some(locals.as_slice()),
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            (l, g)
+        };
+        let n = gh * gw;
+        let (plain, _) = run(None, false);
+        let ones = map(&vec![1.0; n]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = map(&vec![0.0; n]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty());
+            for (k, g) in &grads {
+                let m = g.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert_eq!(m, 0.0, "ckpt={ckpt}: nonzero adapter grad on {k}");
+            }
+        }
+        let half: Vec<f32> = (0..n)
+            .map(|i| if i % gw < gw / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let half = map(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+    }
 }
 
 // ===========================================================================================
@@ -1338,6 +1566,7 @@ mod real_weight_repro {
             0.5,
             &noise,
             false,
+            None,
             Dtype::Float32,
             None,
             None,
@@ -1357,6 +1586,7 @@ mod real_weight_repro {
             0.5,
             &noise,
             false,
+            None,
             Dtype::Float32,
             None,
             Some(&locals),

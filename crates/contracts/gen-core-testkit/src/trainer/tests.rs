@@ -221,6 +221,7 @@ fn item(name: &str) -> TrainingItem {
         control_image_path: None,
         model_options: Default::default(),
         reference_image_paths: Vec::new(),
+        subject_mask_path: None,
     }
 }
 
@@ -516,6 +517,7 @@ fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
         // Every probed technique but buckets is declared, so only the bucket probe can fail.
         stub.desc.techniques = gen_core::TrainingTechniques {
             depth_anchoring: true,
+            subject_mask_loss: true,
             ..gen_core::TrainingTechniques::ADAPTER_NOISE
         };
         Box::new(stub)
@@ -603,4 +605,80 @@ fn declared_depth_anchoring_passes_the_technique_checks() {
     };
     check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
     check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-24828: a trainer that declares every other probed technique but silently accepts an
+/// undeclared subject-masked-loss request fails the validate check and the train-entry refusal
+/// check on the masked-loss probe. Mutation: drop the probe from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_subject_mask_loss_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques = gen_core::TrainingTechniques {
+            depth_anchoring: true,
+            ..gen_core::TrainingTechniques::ADAPTER_NOISE
+        };
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.subject_mask_loss == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("subject_mask_loss") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-24828: a trainer that declares subject-masked loss passes the technique checks — accepted on
+/// a fully masked request, refused (through the shared floor) when an item has no mask, and not
+/// required to refuse a full fine-tune (a loss term, not adapter-only).
+#[test]
+fn declared_subject_mask_loss_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.subject_mask_loss = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-24828: a trainer that declares subject-masked loss but trains an item without its mask
+/// (its `validate` papers over a missing mask) fails the validate check. Mutation: drop
+/// `check_subject_mask_missing_refused` from `check_trainer_validate` ⇒ red.
+#[test]
+fn declared_subject_mask_loss_that_ignores_missing_masks_fails_the_validate_check() {
+    struct MaskForger(StubTrainer);
+    impl Trainer for MaskForger {
+        fn descriptor(&self) -> &TrainerDescriptor {
+            &self.0.desc
+        }
+        fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+            let mut forged = req.clone();
+            if forged.config.subject_mask_loss.is_some() {
+                for item in &mut forged.items {
+                    item.subject_mask_path
+                        .get_or_insert_with(|| item.image_path.clone());
+                }
+            }
+            self.0.validate(&forged)
+        }
+        fn train(
+            &mut self,
+            req: &TrainingRequest,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> gen_core::Result<TrainingOutput> {
+            self.0.train(req, on_progress)
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+    stub.desc.techniques.subject_mask_loss = true;
+    let err = check_trainer_validate(&MaskForger(stub), &profile(&tmp)).unwrap_err();
+    assert!(err.contains("lacking its mask"), "got: {err}");
 }

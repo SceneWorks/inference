@@ -13,6 +13,7 @@ use candle_gen::diffusion_schedule::{
     KOLORS_TRAIN_STEPS as NUM_TRAIN_TIMESTEPS,
 };
 use candle_gen::gen_core::sampling::AlphaSchedule;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -20,8 +21,11 @@ use candle_gen::gen_core::{
     self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
 };
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
-use candle_gen::train::flow_match::{effective_weight_decay, noise_seed, sample_noise};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
+use candle_gen::train::flow_match::{
+    effective_weight_decay, noise_seed, prepared_subject_mask_weight, sample_noise,
+    weighted_velocity_loss,
+};
 use candle_gen::train::lora::{
     adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
     AdapterKind, LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
@@ -61,11 +65,40 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        // sc-24828 (epic 2123): subject-masked loss.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
+}
+
+/// One item's item-major cache entries (sc-2127 × sc-24828): the decoded `square` encoded at each
+/// bucket edge by `encode` (`[1, 3, edge, edge]` → clean latent), each paired with its subject-mask
+/// loss weight on THAT bucket's latent grid (`None` when masked loss is off). `decode_square`
+/// center-crops, so the mask is cropped with [`CropBox::center_square`].
+fn encode_item_buckets(
+    square: &SquareImage,
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    device: &Device,
+    mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
+) -> Result<Vec<(Tensor, Option<Tensor>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(&square_image_tensor(square, edge, device)?)?;
+            let mask_weight = prepared_subject_mask_weight(
+                LABEL,
+                mask,
+                CropBox::center_square,
+                x0.dims(),
+                device,
+            )?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
 }
 
 /// One SDXL-style `time_ids` row (`[h, w, 0, 0, h, w]`) per bucket edge, in bucket order, at
@@ -264,13 +297,20 @@ fn ddpm_noise(schedule: &AlphaSchedule, x0: &Tensor, noise: &Tensor, t: usize) -
     Ok(((x0 * alpha.sqrt())? + (noise * (1.0 - alpha).sqrt())?)?)
 }
 
-fn epsilon_loss(prediction: &Tensor, noise: &Tensor, mae: bool) -> Result<Tensor> {
-    let diff = (prediction.to_dtype(DType::F32)? - noise.to_dtype(DType::F32)?)?;
-    Ok(if mae {
-        diff.abs()?.mean_all()?
-    } else {
-        diff.sqr()?.mean_all()?
-    })
+/// ε-prediction loss in f32. `weight` is the item's subject-mask loss weight (sc-24828), broadcast
+/// to the latent shape: `None` is exactly `mean(ℓ)`, `Some(w)` is `mean(w ⊙ ℓ)`.
+fn epsilon_loss(
+    prediction: &Tensor,
+    noise: &Tensor,
+    weight: Option<&Tensor>,
+    mae: bool,
+) -> Result<Tensor> {
+    Ok(weighted_velocity_loss(
+        prediction,
+        &noise.to_dtype(DType::F32)?,
+        weight,
+        mae,
+    )?)
 }
 
 impl KolorsTrainer {
@@ -315,10 +355,15 @@ impl KolorsTrainer {
             });
             let (context, pooled) = cache_caption(&caption_encoder, &item.caption)?;
             let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
-            for &edge in &edges {
-                let image = square_image_tensor(&square, edge, device)?;
-                let x0 = vae.encode_mean(&image)?.detach();
-                cache.push((x0, context.clone(), pooled.clone()));
+                                                           // The item's subject mask, read + checked once (None when masked loss is off); each
+                                                           // bucket's weight (sc-24828) is broadcast to that bucket's latent shape.
+            let mask =
+                PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
+            let buckets = encode_item_buckets(&square, &edges, mask.as_ref(), device, |image| {
+                Ok(vae.encode_mean(image)?.detach())
+            })?;
+            for (x0, mask_weight) in buckets {
+                cache.push((x0, context.clone(), pooled.clone(), mask_weight));
             }
         }
         drop(caption_encoder);
@@ -377,7 +422,7 @@ impl KolorsTrainer {
                 break;
             }
             let index = sample_order.cache_index(step as usize - 1);
-            let (x0, context, pooled) = &cache[index];
+            let (x0, context, pooled, mask_weight) = &cache[index];
             let step_time_ids = &time_ids[index % edges.len()];
             let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(step as u64));
             let timestep = rng.random_range(0..NUM_TRAIN_TIMESTEPS);
@@ -393,7 +438,7 @@ impl KolorsTrainer {
                 None,
                 None,
             )?;
-            let loss = epsilon_loss(&prediction, &noise, mae)?;
+            let loss = epsilon_loss(&prediction, &noise, mask_weight.as_ref(), mae)?;
             last_loss = loss.to_scalar::<f32>()?;
             let grads = loss.backward()?;
             accumulate_grads(&mut accumulated, grads, &set.vars)?;
@@ -491,6 +536,35 @@ mod tests {
         assert!((got - expected).abs() < 1e-6);
     }
 
+    /// sc-24828: the ε loss honours the subject-mask weight — an all-ones map is the unweighted
+    /// loss, an all-zero map zeroes the loss and the prediction's gradient — and the trainer
+    /// declares the technique.
+    #[test]
+    fn epsilon_loss_applies_the_subject_mask_weight() {
+        use candle_gen::candle_core::Var;
+        let dev = Device::Cpu;
+        let shape = [1usize, 4, 2, 2];
+        let pred = Var::from_tensor(&Tensor::randn(0f32, 1f32, &shape, &dev).unwrap()).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, &shape, &dev).unwrap();
+        let map = |w: &[f32]| {
+            candle_gen::train::flow_match::subject_mask_weight(w, 2, 2, &shape, &dev).unwrap()
+        };
+        let loss = |w: Option<&Tensor>| epsilon_loss(pred.as_tensor(), &noise, w, false).unwrap();
+        let plain = loss(None).to_scalar::<f32>().unwrap();
+        let ones = loss(Some(&map(&[1.0; 4]))).to_scalar::<f32>().unwrap();
+        assert!((ones - plain).abs() < 1e-6);
+        let zero = loss(Some(&map(&[0.0; 4])));
+        assert_eq!(zero.to_scalar::<f32>().unwrap(), 0.0);
+        let g = zero.backward().unwrap();
+        let g = g.get(pred.as_tensor()).unwrap().flatten_all().unwrap();
+        assert!(g.to_vec1::<f32>().unwrap().iter().all(|x| *x == 0.0));
+        let half = loss(Some(&map(&[1.0, 0.0, 1.0, 0.0])))
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(half > 0.0 && half < plain);
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
     /// sc-2127: the trainer declares buckets, every bucket gets the `time_ids` of its own edge, and
     /// the item-major cache index a step samples maps (`index % n_buckets`) to the bucket the
     /// schedule chose — so the micro-conditioning never names a size the latent does not have.
@@ -528,6 +602,57 @@ mod tests {
         }
     }
 
+    /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached latent carries a weight
+    /// of ITS OWN shape (built on that bucket's grid), and the masked-out region is zero.
+    #[test]
+    fn subject_mask_weight_follows_each_buckets_latent() {
+        use candle_gen::candle_core::IndexOp;
+        use candle_gen::gen_core::SubjectMaskLoss;
+        let dir = tempfile::tempdir().unwrap();
+        // 48×32 image → center square x ∈ [8, 40); the subject is that square's left half (x < 24).
+        let image_path = dir.path().join("img.png");
+        image::RgbImage::from_pixel(48, 32, image::Rgb([128, 64, 32]))
+            .save(&image_path)
+            .unwrap();
+        let mask_path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(48, 32, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = TrainingItem {
+            image_path,
+            caption: String::new(),
+            control_image_path: None,
+            model_options: Default::default(),
+            reference_image_paths: Vec::new(),
+            subject_mask_path: Some(mask_path),
+        };
+        let cfg = SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
+        let square = decode_square(&item.image_path).unwrap();
+        let dev = Device::Cpu;
+        // A stand-in /8 encoder: `[1, 3, edge, edge]` → `[1, 3, edge/8, edge/8]`.
+        let encode = |img: &Tensor| Ok(img.avg_pool2d(8)?);
+        let entries = encode_item_buckets(&square, &[32, 64], Some(&mask), &dev, encode).unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), grid) in entries.iter().zip([4usize, 8]) {
+            assert_eq!(x0.dims(), &[1, 3, grid, grid]);
+            let w = w.as_ref().expect("masked loss is on");
+            assert_eq!(w.dims(), x0.dims(), "bucket {grid}: weight shape");
+            let rows = w.i((0, 0)).unwrap().to_vec2::<f32>().unwrap();
+            for row in rows {
+                for (x, v) in row.into_iter().enumerate() {
+                    let want = if x < grid / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "bucket {grid}: column {x}");
+                }
+            }
+        }
+        let off = encode_item_buckets(&square, &[32, 64], None, &dev, encode).unwrap();
+        assert!(off.iter().all(|(_, w)| w.is_none()));
+    }
+
     #[test]
     fn nondivisible_accumulation_tail_uses_its_actual_micro_count() {
         assert_eq!(accumulation_divisor(4, 4), 4);
@@ -544,6 +669,7 @@ mod tests {
                 control_image_path,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),

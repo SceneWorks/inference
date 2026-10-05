@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -14,7 +15,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::quant::AdaptLinear;
 use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
-use candle_gen::train::flow_match::{self, velocity_loss};
+use candle_gen::train::flow_match::{self, prepared_subject_mask_weight, weighted_velocity_loss};
 use candle_gen::train::lora::{build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
 use candle_gen::train::schedule::schedule_updates;
@@ -64,8 +65,11 @@ fn descriptor_for(variant: Variant) -> TrainerDescriptor {
         // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
         // update.
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
+        // sc-24828 (epic 2123): subject-masked loss — a per-bucket weight map cached next to each
+        // latent.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
+            subject_mask_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -293,6 +297,38 @@ fn target_suffixes(req: &TrainingRequest) -> Vec<String> {
     }
 }
 
+/// One micro-step's flow-match loss: noise `x0` at `sigma`, predict the raw velocity through the
+/// (adapter-carrying) MMDiT at timestep `σ·1000`, regress it toward `noise − x0`. `mask_weight` is the
+/// optional subject-mask loss weight (sc-24828, broadcast to the latent shape; `None` ⇒ exactly the
+/// unweighted `velocity_loss`).
+#[allow(clippy::too_many_arguments)]
+fn step_loss(
+    transformer: &Sd3Transformer,
+    x0: &Tensor,
+    conditioning: &Sd3Conditioning,
+    noise: &Tensor,
+    sigma: f64,
+    dtype: DType,
+    mae: bool,
+    mask_weight: Option<&Tensor>,
+) -> Result<Tensor> {
+    let device = x0.device();
+    let (x_t, target) = flow_match::build_batch(x0, noise, sigma)?;
+    let timestep = Tensor::new(&[(sigma * 1000.0) as f32], device)?.to_dtype(dtype)?;
+    let prediction = transformer.forward(
+        &x_t.to_dtype(dtype)?,
+        &conditioning.context.to_dtype(dtype)?,
+        &conditioning.pooled.to_dtype(dtype)?,
+        &timestep,
+    )?;
+    Ok(weighted_velocity_loss(
+        &prediction.to_dtype(DType::F32)?,
+        &target,
+        mask_weight,
+        mae,
+    )?)
+}
+
 impl Sd3Trainer {
     fn train_impl(
         &mut self,
@@ -311,8 +347,10 @@ impl Sd3Trainer {
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
         let edges = bucket_edges(cfg);
         let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
-        let mut cache: Vec<(Tensor, Sd3Conditioning)> =
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127) of `(x0, conditioning,
+        // subject-mask loss weight)`; the weight (broadcast to that bucket's latent shape) is `None`
+        // unless subject-masked loss is on (sc-24828).
+        let mut cache: Vec<(Tensor, Sd3Conditioning, Option<Tensor>)> =
             Vec::with_capacity(req.items.len() * edges.len());
         for (index, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
@@ -323,11 +361,23 @@ impl Sd3Trainer {
                 total,
             });
             let conditioning = aggregate(&model_cfg, &encoders.encode(&item.caption)?)?;
+            // sc-24828: the item's subject mask is read + checked once, then resampled per bucket
+            // onto that bucket's latent grid (`None` when masked loss is off).
+            let mask =
+                PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
             let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
             for &edge in &edges {
                 let image = square_image_tensor(&square, edge, device)?;
                 let x0 = encode_mean(&vae_encoder, &image, DType::F32)?;
-                cache.push((x0, conditioning.clone()));
+                // `decode_square` centre-crops to a square, so the mask takes the same crop.
+                let mask_weight = prepared_subject_mask_weight(
+                    LABEL,
+                    mask.as_ref(),
+                    CropBox::center_square,
+                    x0.dims(),
+                    device,
+                )?;
+                cache.push((x0, conditioning.clone(), mask_weight));
             }
         }
         drop(vae_encoder);
@@ -382,25 +432,22 @@ impl Sd3Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, conditioning) = &cache[schedule.cache_index(step as usize - 1)];
+            let (x0, conditioning, mask_weight) = &cache[schedule.cache_index(step as usize - 1)];
             let sigma = sample_sigma(req, step);
             let noise = flow_match::sample_noise(
                 x0.dims(),
                 flow_match::noise_seed(cfg.seed, step),
                 device,
             )?;
-            let (x_t, target) = flow_match::build_batch(x0, &noise, sigma)?;
-            let timestep = Tensor::new(&[(sigma * 1000.0) as f32], device)?.to_dtype(self.dtype)?;
-            let prediction = transformer.forward(
-                &x_t.to_dtype(self.dtype)?,
-                &conditioning.context.to_dtype(self.dtype)?,
-                &conditioning.pooled.to_dtype(self.dtype)?,
-                &timestep,
-            )?;
-            let loss = velocity_loss(
-                &prediction.to_dtype(DType::F32)?,
-                &target,
+            let loss = step_loss(
+                &transformer,
+                x0,
+                conditioning,
+                &noise,
+                sigma,
+                self.dtype,
                 flow_match::is_mae(cfg),
+                mask_weight.as_ref(),
             )?;
             last_loss = loss.to_scalar::<f32>()?;
             let grads = loss.backward()?;
@@ -633,6 +680,71 @@ mod tests {
         assert_eq!(x_t.to_vec2::<f32>().unwrap(), vec![vec![1.75, 3.0]]);
         assert_eq!(target.to_vec2::<f32>().unwrap(), vec![vec![-1.0, -4.0]]);
         assert_eq!(0.25f32 * 1000.0, 250.0);
+    }
+
+    /// sc-24828: the subject-mask weight reaches the trainer's loss. An all-ones map is the unweighted
+    /// loss; an all-zero map zeroes the loss AND every adapter gradient; a half map lands between.
+    #[test]
+    fn subject_mask_weight_reaches_the_step_loss() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut transformer = Sd3Transformer::new(&cfg, vb).unwrap();
+        let targets = vec!["attn2.to_out.0".to_string()];
+        let set = build_adapt_lora_targets(&mut transformer, &targets, 2, 2.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let shape = [1usize, 16, 4, 4];
+        let x0 = Tensor::randn(0f32, 1f32, &shape, &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, &shape, &dev).unwrap();
+        let conditioning = Sd3Conditioning {
+            context: Tensor::randn(
+                0f32,
+                1f32,
+                (1, cfg.context_seq_len(), cfg.joint_attention_dim),
+                &dev,
+            )
+            .unwrap(),
+            pooled: Tensor::randn(0f32, 1f32, (1, cfg.pooled_dim), &dev).unwrap(),
+        };
+        let map = |w: &[f32]| flow_match::subject_mask_weight(w, 4, 4, &shape, &dev).unwrap();
+        let run = |weight: Option<&Tensor>| {
+            step_loss(
+                &transformer,
+                &x0,
+                &conditioning,
+                &noise,
+                0.5,
+                DType::F32,
+                false,
+                weight,
+            )
+            .unwrap()
+        };
+        let plain = run(None).to_scalar::<f32>().unwrap();
+        let ones = run(Some(&map(&[1.0; 16]))).to_scalar::<f32>().unwrap();
+        assert!((ones - plain).abs() < 1e-6);
+        let zero = run(Some(&map(&[0.0; 16])));
+        assert_eq!(zero.to_scalar::<f32>().unwrap(), 0.0);
+        let grads = zero.backward().unwrap();
+        for v in &set.vars {
+            if let Some(g) = grads.get(v.as_tensor()) {
+                let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert!(g.iter().all(|x| *x == 0.0), "nonzero adapter grad");
+            }
+        }
+        let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+        let half = run(Some(&map(&half))).to_scalar::<f32>().unwrap();
+        assert!(half > 0.0 && half < plain, "{half} vs {plain}");
+    }
+
+    #[test]
+    fn descriptors_declare_subject_mask_loss() {
+        assert!(large_descriptor().techniques.subject_mask_loss);
+        assert!(medium_descriptor().techniques.subject_mask_loss);
     }
 
     #[test]
