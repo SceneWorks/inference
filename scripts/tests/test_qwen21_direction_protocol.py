@@ -57,7 +57,7 @@ def training_fixture():
 
 class FailedDonorTests(unittest.TestCase):
     def test_manifest_is_exact_and_every_identity_mutant_fails(self):
-        original = json.loads((ROOT / "scripts/ci/qwen21_velocity_adapter.json").read_text())
+        original = json.loads((ROOT / "scripts/ci/qwen21_velocity_adapter.json").read_text(encoding="utf-8"))
         donor.validate_manifest(original)
         mutants = []
         for key in original:
@@ -139,7 +139,7 @@ class FailedDonorTests(unittest.TestCase):
                 patch.multiple(donor, MANIFEST=manifest, ENTRIES=entries, ADAPTER_SHA=adapter_sha, RECEIPT_SHA=entries[1]["sha256"]):
             destination = Path(directory) / "adapters"
             resolved = donor.prepare(manifest, destination, "a" * 40, fetch)
-            data = json.loads(resolved.read_text())
+            data = json.loads(resolved.read_text(encoding="utf-8"))
             self.assertEqual(data["kind"], "DIAGNOSTIC_ONLY")
             self.assertIs(data["acceptanceEvidence"], False)
             self.assertEqual(len(data["adapters"]), 1)
@@ -159,8 +159,8 @@ class DirectionPhaseTests(phases.PhaseTests):
         # The fake Python records receipt verification while Cargo records actual routing.
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.sh"
-            source = (ROOT / self.script_name()).read_text() if script is None else script
-            path.write_text('python3.12() { echo "receipt-validator:$*"; if [[ "$*" == *"--style-only"* ]]; then [[ "${@: -1}" == 0 || "${@: -1}" == 101 ]]; fi; }; export -f python3.12\n' + source)
+            source = (ROOT / self.script_name()).read_text(encoding="utf-8") if script is None else script
+            path.write_text('python3.12() { echo "receipt-validator:$*"; if [[ "$*" == *"--style-only"* ]]; then [[ "${@: -1}" == 0 || "${@: -1}" == 101 ]]; fi; }; export -f python3.12\n' + source, encoding="utf-8")
             with patch.dict(os.environ, {"FAIL_EXIT": str(fail_exit)}):
                 return self.run_phase("direction-protocol", fail=fail, zero=zero, script=shell_path(path))
 
@@ -190,7 +190,7 @@ class DirectionPhaseTests(phases.PhaseTests):
             self.assertNotIn("conditioning_velocity_diagnostic", text)
 
     def test_direction_selector_routing_mutants(self):
-        source = (ROOT / self.script_name()).read_text()
+        source = (ROOT / self.script_name()).read_text(encoding="utf-8")
         for old, new in [("conditioning_velocity_diagnostic::diagnostic_dense_q4_conditioning_velocity", "conditioning_velocity_diagnostic::wrong_test"),
                          ("--lib \\", "--test integration \\")]:
             result, names, text = self.run_direction(script=source.replace(old, new))
@@ -237,7 +237,7 @@ class ReceiptTests(unittest.TestCase):
                          "sourceCandidate": source, "trainingProvenance": evidence.STYLE_PROVENANCE,
                          "renderCount": 6, "renders": rows}
         for name in ("DIAGNOSTIC_ONLY", "style-direction"):
-            (style / f"{name}.json").write_text(json.dumps(style_receipt))
+            (style / f"{name}.json").write_text(json.dumps(style_receipt), encoding="utf-8")
         controls = {"kind": "DIAGNOSTIC_ONLY", "purpose": "DIAGNOSTIC_ONLY", "acceptanceEvidence": False, "sourceCandidate": source,
                     "renderCount": 6, "donorSha256": evidence.STYLE_SHA, "samplerJoined": True,
                     "safetyChecksComplete": True, "foregroundRetired": True,
@@ -250,8 +250,8 @@ class ReceiptTests(unittest.TestCase):
                          "startedUnixMillis": 1,
                          "sampleTraceSha256": hashlib.sha256(trace).hexdigest(), "sampleCount": 1,
                          "finalSafetySample": {**sample, "unixMillis": 2}})
-        (style / "stage-controls.json").write_text(json.dumps(controls))
-        manifest = root / "manifest.json"; manifest.write_text(json.dumps({"fixture": True}))
+        (style / "stage-controls.json").write_text(json.dumps(controls), encoding="utf-8")
+        manifest = root / "manifest.json"; manifest.write_text(json.dumps({"fixture": True}), encoding="utf-8")
         directory = root / "velocity-discriminator"; (directory / "velocities").mkdir(parents=True)
         raw = b"\0" * 589824
         vectors, states = [], []
@@ -273,8 +273,8 @@ class ReceiptTests(unittest.TestCase):
             "forwardCount": 16, "stateCount": 4, "repeatCount": 2, "adapterStrength": 1, "sigma": 0.5,
             "arithmeticBoundVerdict": "UNPROVEN_RELAXED_NAX_PRECISION", "cpuCachePeakBytes": 100,
             "vectors": vectors, "states": states}
-        (directory / "receipt.json").write_text(json.dumps(velocity))
-        (root / "direction-velocity.exit-code").write_text("0\n")
+        (directory / "receipt.json").write_text(json.dumps(velocity), encoding="utf-8")
+        (root / "direction-velocity.exit-code").write_text("0\n", encoding="utf-8")
         return source, manifest, style_receipt, controls, velocity
 
     def test_negative_velocity_gain_is_observation_not_acceptance(self):
@@ -291,7 +291,7 @@ class ReceiptTests(unittest.TestCase):
                                ("arithmeticBoundVerdict", "PASS"), ("forwardCount", 15), ("repeatCount", 1),
                                ("sigma", 0.7), ("adapterStrength", 2), ("cpuCachePeakBytes", 67108865)]:
                 mutant = copy.deepcopy(receipt); mutant[key] = value
-                (root / "velocity-discriminator/receipt.json").write_text(json.dumps(mutant))
+                (root / "velocity-discriminator/receipt.json").write_text(json.dumps(mutant), encoding="utf-8")
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     evidence.validate(root, source, manifest, 0)
             for mutation in ("duplicate", "path", "shape", "hash"):
@@ -300,7 +300,7 @@ class ReceiptTests(unittest.TestCase):
                 if mutation == "path": mutant["vectors"][0]["file"] = "../escape.f32"
                 if mutation == "shape": mutant["vectors"][0]["shape"] = [1, 3, 16]
                 if mutation == "hash": mutant["vectors"][0]["sha256"] = "0" * 64
-                (root / "velocity-discriminator/receipt.json").write_text(json.dumps(mutant))
+                (root / "velocity-discriminator/receipt.json").write_text(json.dumps(mutant), encoding="utf-8")
                 with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                     evidence.validate(root, source, manifest, 0)
 
@@ -310,14 +310,14 @@ class ReceiptTests(unittest.TestCase):
             row = receipt["renders"][2]; row["paletteDistanceGain"] = -1
             controls["stageResult"] = "direction_failed"
             controls["directionFailures"] = [{"tier": "q4", "criterion": "palette_gain", "actual": -1, "floor": 1}]
-            (root / "style-protocol/style-direction.json").write_text(json.dumps(receipt))
-            path = root / "style-protocol/stage-controls.json"; path.write_text(json.dumps(controls))
+            (root / "style-protocol/style-direction.json").write_text(json.dumps(receipt), encoding="utf-8")
+            path = root / "style-protocol/stage-controls.json"; path.write_text(json.dumps(controls), encoding="utf-8")
             self.assertEqual(evidence.validate_style(root, source, 101)["styleStageResult"], "direction_failed")
             for code in (0, 1, 137):
                 with self.subTest(code=code), self.assertRaises(ValueError):
                     evidence.validate_style(root, source, code)
             for key in ("safetyChecksComplete", "foregroundRetired", "samplerJoined"):
-                bad = dict(controls); bad[key] = False; path.write_text(json.dumps(bad))
+                bad = dict(controls); bad[key] = False; path.write_text(json.dumps(bad), encoding="utf-8")
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     evidence.validate_style(root, source, 101)
 
@@ -328,7 +328,7 @@ class ReceiptTests(unittest.TestCase):
             path = root / "velocity-discriminator" / vector["file"]
             raw = struct.pack("<f", float("nan")) + path.read_bytes()[4:]
             path.write_bytes(raw); vector["sha256"] = hashlib.sha256(raw).hexdigest()
-            (root / "velocity-discriminator/receipt.json").write_text(json.dumps(receipt))
+            (root / "velocity-discriminator/receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "finite"):
                 evidence.validate(root, source, manifest, 0)
 
@@ -337,17 +337,17 @@ class ReceiptTests(unittest.TestCase):
             root = Path(directory); source, _, _, controls, _ = self.fixture(root)
             path = root / "style-protocol/stage-controls.json"
             controls["githubRunId"] = "123"
-            path.write_text(json.dumps(controls))
+            path.write_text(json.dumps(controls), encoding="utf-8")
             with patch.dict(os.environ, {"GITHUB_RUN_ID": "123"}):
                 evidence.validate_style(root, source, 0)
             for key, value in [("sampleTraceSha256", "0" * 64), ("sampleCount", 0),
                                ("sampleTrace", "../foreign.jsonl"), ("githubRunId", "999")]:
                 mutant = copy.deepcopy(controls); mutant[key] = value
-                path.write_text(json.dumps(mutant))
+                path.write_text(json.dumps(mutant), encoding="utf-8")
                 with patch.dict(os.environ, {"GITHUB_RUN_ID": "123"}), self.subTest(key=key), self.assertRaises(ValueError):
                     evidence.validate_style(root, source, 0)
             mutant = copy.deepcopy(controls); mutant["finalSafetySample"]["pressureLevel"] = 2
-            path.write_text(json.dumps(mutant))
+            path.write_text(json.dumps(mutant), encoding="utf-8")
             with patch.dict(os.environ, {"GITHUB_RUN_ID": "123"}), self.assertRaisesRegex(ValueError, "safety"):
                 evidence.validate_style(root, source, 0)
 

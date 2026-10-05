@@ -170,7 +170,7 @@ def main():
     parser.add_argument("--destination", type=Path, required=True)
     args = parser.parse_args()
     source = os.environ.get("GITHUB_SHA", "")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    head = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
     if source != head:
         raise ValueError("executing checkout must equal GITHUB_SHA")
     print(prepare(json.loads(args.manifest.read_text(encoding="utf-8")), args.destination, source))

@@ -211,7 +211,6 @@ def bash_syntax_check(shell: str, script: str) -> subprocess.CompletedProcess:
         [shell, "-n"],
         # Windows text-mode stdin translates LF to CRLF before Bash reads it.
         input=script.encode("utf-8"),
-        text=False,
         capture_output=True,
         check=False,
     )
