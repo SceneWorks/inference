@@ -490,8 +490,9 @@ pub struct TrainingShape {
     /// Whether preview samples are rendered (keeps the VAE decoder resident).
     pub sampling: bool,
     /// Epic 2123 E7: the training-time perceptual models' bytes (TAEQI2.1 + every enabled aux
-    /// loss + the cached per-entry references — [`perceptual_footprint_bytes`]), resident through
-    /// the train phase on the checkpointed and dense paths alike. `0` when no aux loss is on.
+    /// loss + the cached per-entry references, from `candle_gen_perceptual::perceptual_footprint`),
+    /// resident through the train phase on the checkpointed and dense paths alike. `0` when no aux
+    /// loss is on.
     pub perceptual_bytes: u64,
 }
 

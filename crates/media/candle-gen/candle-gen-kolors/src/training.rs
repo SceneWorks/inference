@@ -1042,7 +1042,7 @@ mod tests {
 
         /// The aux term is the depth loss of THE trainer's x0 estimate: recomputed independently from
         /// the model output with the trainer's parameterisation, it matches the step's aux bits.
-        /// Mutation: swap the parameterisation in `step_loss` (e.g. `alphas_cumprod[timestep - 1]`) ⇒ red.
+        /// Mutation: recover with `alphas_cumprod[timestep - 1]` in `kolors_step` ⇒ red.
         #[test]
         fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
             let f = fixture();
