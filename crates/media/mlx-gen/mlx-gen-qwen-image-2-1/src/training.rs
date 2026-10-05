@@ -4545,8 +4545,27 @@ mod adapter_noise_loop_tests {
         a.as_slice::<f32>().to_vec()
     }
 
-    /// One real update (steps = accum = 2): the weight-noised run's adapter is bit-identical to the
-    /// clean run's adapter + `apply_weight_noise(.., update 0)`. Noise on micro-step 1 (or on every
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// The compared runs are SEPARATE Metal executions of the training loop, which agree only to a
+    /// few ulps (Metal reductions are not bit-deterministic across runs). Compare within
+    /// `1e-6 + 1e-5·max|want|`; the guarded mutations (noise on a micro-step, a wrong update
+    /// index, dropped or unseeded noise) move the adapter by orders of magnitude more.
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        let scale = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let tol = 1e-6 + 1e-5 * scale;
+        let diff = max_abs_diff(got, want);
+        assert!(diff <= tol, "{what}: max |diff| {diff} > tolerance {tol}");
+    }
+
+    /// One real update (steps = accum = 2): the weight-noised run's adapter equals (within
+    /// [`assert_close`]) the clean run's adapter + `apply_weight_noise(.., update 0)`. Noise on micro-step 1 (or on every
     /// micro-step) would change micro-step 2's gradient and add a second draw; a wrong update index
     /// draws different noise; a loop that skips the shared update leaves the adapter clean.
     ///
@@ -4560,7 +4579,7 @@ mod adapter_noise_loop_tests {
         apply_weight_noise(&mut clean, sigma, 11, 0).unwrap();
         assert_eq!(clean.len(), noisy.len());
         for (k, v) in &clean {
-            assert_eq!(host(v), host(&noisy[k]), "{k}");
+            assert_close(&host(&noisy[k]), &host(v), k);
         }
     }
 
@@ -4570,11 +4589,14 @@ mod adapter_noise_loop_tests {
         let clean = train(0.0, 0.0, 2, 1);
         let a = train(0.0, 0.05, 2, 1);
         let b = train(0.0, 0.05, 2, 1);
-        let mut differs = false;
+        let mut effect = 0.0f32;
         for (k, v) in &a {
-            assert_eq!(host(v), host(&b[k]), "{k} not reproducible");
-            differs |= host(v) != host(&clean[k]);
+            assert_close(&host(&b[k]), &host(v), &format!("{k} reproducible"));
+            effect = effect.max(max_abs_diff(&host(v), &host(&clean[k])));
         }
-        assert!(differs, "gradient noise must reach the trained adapter");
+        assert!(
+            effect > 1e-3,
+            "gradient noise must reach the trained adapter (max |diff| {effect})"
+        );
     }
 }
