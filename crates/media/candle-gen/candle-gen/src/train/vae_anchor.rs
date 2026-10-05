@@ -183,7 +183,9 @@ fn group_norm(x: &Tensor, gamma: &Tensor, beta: &Tensor) -> Result<Tensor> {
     let d = g.broadcast_sub(&mean)?;
     let var = d.sqr()?.mean_keepdim(2)?;
     let n = d.broadcast_div(&(var + GN_EPS)?.sqrt()?)?;
-    Ok(n.reshape((b, c, h, w))?.broadcast_mul(gamma)?.broadcast_add(beta)?)
+    Ok(n.reshape((b, c, h, w))?
+        .broadcast_mul(gamma)?
+        .broadcast_add(beta)?)
 }
 
 /// Composed SiLU `x / (1 + e^-x)` (autograd-safe).
@@ -365,7 +367,10 @@ impl VaeAnchorEncoder {
         }
         let w = Weights::from_files_filtered(&files, device, DType::F32, &["encoder."])?;
         Self::from_weights(&w, VaeAnchorEncoderConfig::flux2()).map_err(|e| {
-            CandleError::Msg(format!("VAE anchor: FLUX.2 VAE from {}: {e}", dir.display()))
+            CandleError::Msg(format!(
+                "VAE anchor: FLUX.2 VAE from {}: {e}",
+                dir.display()
+            ))
         })
     }
 
@@ -396,7 +401,10 @@ impl VaeAnchorEncoder {
                 let hp = h.pad_with_zeros(2, 0, 1)?.pad_with_zeros(3, 0, 1)?;
                 let (_, _, ph, pw) = hp.dims4()?;
                 let used = |n: usize| ((n - 3) / 2) * 2 + 3;
-                let hp = hp.narrow(2, 0, used(ph))?.narrow(3, 0, used(pw))?.contiguous()?;
+                let hp = hp
+                    .narrow(2, 0, used(ph))?
+                    .narrow(3, 0, used(pw))?
+                    .contiguous()?;
                 h = conv(&hp, cw, cb, 2, 0)?;
             }
         }
@@ -462,7 +470,12 @@ pub struct VaeAnchorReference {
 
 /// Decoded pixels NHWC `[0, 1]` → NCHW `[-1, 1]`.
 fn to_signed_nchw(px: &Tensor) -> Result<Tensor> {
-    Ok(((px.to_dtype(DType::F32)?.permute((0, 3, 1, 2))?.contiguous()? * 2.0)? - 1.0)?)
+    Ok(((px
+        .to_dtype(DType::F32)?
+        .permute((0, 3, 1, 2))?
+        .contiguous()?
+        * 2.0)?
+        - 1.0)?)
 }
 
 impl VaeAnchorLoss {
@@ -544,7 +557,11 @@ mod tests {
     }
 
     fn params(v: &serde_json::Value) -> Vec<f64> {
-        v.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect()
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect()
     }
 
     fn encoder(ch: usize) -> VaeAnchorEncoder {
@@ -583,27 +600,54 @@ mod tests {
             .map(|(a, b)| (a + b).clamp(-1.0, 1.0))
             .collect();
         let t = |v: &[f64]| {
-            Tensor::from_vec(v.iter().map(|&x| x as f32).collect::<Vec<_>>(), (1, 3, h, w), &CPU)
-                .unwrap()
+            Tensor::from_vec(
+                v.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+                (1, 3, h, w),
+                &CPU,
+            )
+            .unwrap()
         };
         let enc = encoder(ch);
         let pf = enc.features(&t(&pred_v)).unwrap();
         let rf = enc.features(&t(&ref_v)).unwrap();
         let close = |got: f32, want: f64, what: &str, rel: f64| {
             let tol = rel * want.abs().max(1e-3);
-            assert!((got as f64 - want).abs() <= tol, "{what}: {got} vs upstream {want}");
+            assert!(
+                (got as f64 - want).abs() <= tol,
+                "{what}: {got} vs upstream {want}"
+            );
         };
         for (lvl, name) in VAE_ANCHOR_LEVELS.iter().enumerate() {
             let s = &case["pred_feature_stats"][name];
-            let shape: Vec<usize> = s["shape"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
+            let shape: Vec<usize> = s["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as usize)
+                .collect();
             assert_eq!(pf[lvl].dims(), shape.as_slice(), "{name}");
-            close(scalar(&pf[lvl].abs().unwrap().mean_all().unwrap()), s["abs_mean"].as_f64().unwrap(), name, 1e-4);
+            close(
+                scalar(&pf[lvl].abs().unwrap().mean_all().unwrap()),
+                s["abs_mean"].as_f64().unwrap(),
+                name,
+                1e-4,
+            );
         }
         let (total, per) = vae_anchor_feature_loss(&pf, &rf).unwrap();
         for (lvl, name) in VAE_ANCHOR_LEVELS.iter().enumerate() {
-            close(scalar(&per[lvl]), case["per_level"][name].as_f64().unwrap(), name, 2e-3);
+            close(
+                scalar(&per[lvl]),
+                case["per_level"][name].as_f64().unwrap(),
+                name,
+                2e-3,
+            );
         }
-        close(scalar(&total), case["loss"].as_f64().unwrap(), "total", 2e-3);
+        close(
+            scalar(&total),
+            case["loss"].as_f64().unwrap(),
+            "total",
+            2e-3,
+        );
         assert!(scalar(&vae_anchor_feature_loss(&rf, &rf).unwrap().0).abs() < 1e-6);
     }
 
@@ -625,7 +669,12 @@ mod tests {
         let mut path = PerceptualPath::new(
             Some(Box::new(Identity)),
             vec![AuxLoss {
-                schedule: AuxLossSchedule { weight: 0.5, t_min: 0.0, t_max: 0.5, every_n: 1 },
+                schedule: AuxLossSchedule {
+                    weight: 0.5,
+                    t_min: 0.0,
+                    t_max: 0.5,
+                    every_n: 1,
+                },
                 loss: Box::new(VaeAnchorLoss::new(encoder(32))),
             }],
         )
@@ -642,13 +691,22 @@ mod tests {
         assert_eq!(path.reference_computations(), 2);
         let plan = path.plan(1, 0, 0.2).unwrap();
         let at_clean = scalar(&path.aux_loss(&plan, 0, &imgs[0]).unwrap().unwrap().weighted);
-        assert!(at_clean.abs() < 1e-3, "self loss (f16 cache only) {at_clean}");
+        assert!(
+            at_clean.abs() < 1e-3,
+            "self loss (f16 cache only) {at_clean}"
+        );
         let off = (&imgs[0] + 0.15).unwrap().clamp(0f32, 1f32).unwrap();
         let live = Var::from_tensor(&off).unwrap();
-        let loss = path.aux_loss(&plan, 0, live.as_tensor()).unwrap().unwrap().weighted;
+        let loss = path
+            .aux_loss(&plan, 0, live.as_tensor())
+            .unwrap()
+            .unwrap()
+            .weighted;
         assert!(scalar(&loss) > 0.0);
         let grads = loss.backward().unwrap();
-        let g = grads.get(live.as_tensor()).expect("gradient reaches the live x0");
+        let g = grads
+            .get(live.as_tensor())
+            .expect("gradient reaches the live x0");
         assert!(scalar(&g.abs().unwrap().sum_all().unwrap()) > 0.0);
     }
 
@@ -661,7 +719,9 @@ mod tests {
         assert_eq!(loss.references_built(), 1);
         assert!(scalar(&loss.loss(&x, r.as_ref()).unwrap()).abs() < 1e-3);
         assert_eq!(loss.references_built(), 1);
-        let taps = &reference_as::<VaeAnchorReference>("vae_anchor", r.as_ref()).unwrap().taps;
+        let taps = &reference_as::<VaeAnchorReference>("vae_anchor", r.as_ref())
+            .unwrap()
+            .taps;
         assert!(taps.iter().all(|t| t.dtype() == DType::F16));
     }
 
@@ -683,9 +743,15 @@ mod tests {
         let p = cfg.param_count();
         assert!((30_000_000..36_000_000).contains(&p), "{p}");
         let f = cfg.footprint(512, 512);
-        let taps: u64 = [128 * 512 * 512, 256 * 256 * 256, 512 * 128 * 128, 512 * 64 * 64, 512 * 64 * 64]
-            .iter()
-            .sum::<u64>();
+        let taps: u64 = [
+            128 * 512 * 512,
+            256 * 256 * 256,
+            512 * 128 * 128,
+            512 * 64 * 64,
+            512 * 64 * 64,
+        ]
+        .iter()
+        .sum::<u64>();
         assert_eq!(f.reference_bytes_per_image, taps * 2);
         assert_eq!(f.param_bytes, p * 4);
     }

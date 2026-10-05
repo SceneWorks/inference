@@ -103,7 +103,11 @@ fn checkpoint_tensors(latent_channels: usize) -> Vec<(String, Vec<usize>, Role)>
         }
     }
     for (k, &c) in LPIPS_CHANNELS.iter().enumerate() {
-        out.push((format!("lin{k}.model.1.weight"), vec![1, c, 1, 1], Role::Lin));
+        out.push((
+            format!("lin{k}.model.1.weight"),
+            vec![1, c, 1, 1],
+            Role::Lin,
+        ));
     }
     out
 }
@@ -183,9 +187,7 @@ impl LatentLpips {
         let lins = LPIPS_CHANNELS
             .iter()
             .enumerate()
-            .map(|(k, &c)| {
-                Ok(f32w(w, &format!("lin{k}.model.1.weight"))?.reshape((1, c, 1, 1))?)
-            })
+            .map(|(k, &c)| Ok(f32w(w, &format!("lin{k}.model.1.weight"))?.reshape((1, c, 1, 1))?))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             latent_channels,
@@ -406,8 +408,19 @@ mod tests {
         t.to_dtype(DType::F32).unwrap().to_scalar::<f32>().unwrap()
     }
 
-    fn wave(c: usize, h: usize, w: usize, spec: &serde_json::Value, base: Option<&[f64]>) -> (Tensor, Vec<f64>) {
-        let p: Vec<f64> = spec.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    fn wave(
+        c: usize,
+        h: usize,
+        w: usize,
+        spec: &serde_json::Value,
+        base: Option<&[f64]>,
+    ) -> (Tensor, Vec<f64>) {
+        let p: Vec<f64> = spec
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
         let mut v = input_wave(c * h * w, p[0], p[1], p[2]);
         if let Some(b) = base {
             for (x, y) in v.iter_mut().zip(b) {
@@ -439,20 +452,35 @@ mod tests {
         let fx = fixture();
         for case in fx["latent_lpips"].as_array().unwrap() {
             let c = case["latent_channels"].as_u64().unwrap() as usize;
-            let (h, w) = (case["h"].as_u64().unwrap() as usize, case["w"].as_u64().unwrap() as usize);
+            let (h, w) = (
+                case["h"].as_u64().unwrap() as usize,
+                case["w"].as_u64().unwrap() as usize,
+            );
             let (in0, base) = wave(c, h, w, &case["inputs"]["in0"], None);
             let (in1, _) = wave(c, h, w, &case["inputs"]["in1_delta"], Some(&base));
             let n = net(c);
             let (layers, l1) = n.distance_terms(&in0, &in1).unwrap();
             let close = |got: f32, want: f64, what: &str| {
                 let tol = 2e-4 * want.abs().max(1e-3);
-                assert!((got as f64 - want).abs() <= tol, "{} {what}: {got} vs upstream {want}", case["family"]);
+                assert!(
+                    (got as f64 - want).abs() <= tol,
+                    "{} {what}: {got} vs upstream {want}",
+                    case["family"]
+                );
             };
             for (k, l) in layers.iter().enumerate() {
-                close(scalar(l), case["per_layer"][k].as_f64().unwrap(), &format!("layer {k}"));
+                close(
+                    scalar(l),
+                    case["per_layer"][k].as_f64().unwrap(),
+                    &format!("layer {k}"),
+                );
             }
             close(scalar(&l1), case["l1"].as_f64().unwrap(), "l1");
-            close(scalar(&n.distance(&in0, &in1).unwrap()), case["value"].as_f64().unwrap(), "total");
+            close(
+                scalar(&n.distance(&in0, &in1).unwrap()),
+                case["value"].as_f64().unwrap(),
+                "total",
+            );
             assert_eq!(scalar(&n.distance(&in0, &in0).unwrap()), 0.0);
         }
     }
@@ -468,11 +496,20 @@ mod tests {
         assert_eq!(scalar(&n.distance(&x, &x).unwrap()), 0.0);
         let small = (&x + (&d * 0.05).unwrap()).unwrap();
         let big = (&x + (&d * 0.5).unwrap()).unwrap();
-        let (s, b) = (scalar(&n.distance(&small, &x).unwrap()), scalar(&n.distance(&big, &x).unwrap()));
+        let (s, b) = (
+            scalar(&n.distance(&small, &x).unwrap()),
+            scalar(&n.distance(&big, &x).unwrap()),
+        );
         assert!(s > 0.0 && b > s, "small {s} big {b}");
         let live = Var::from_tensor(&small).unwrap();
-        let grads = n.distance(live.as_tensor(), &x).unwrap().backward().unwrap();
-        let g = grads.get(live.as_tensor()).expect("gradient reaches the live latent");
+        let grads = n
+            .distance(live.as_tensor(), &x)
+            .unwrap()
+            .backward()
+            .unwrap();
+        let g = grads
+            .get(live.as_tensor())
+            .expect("gradient reaches the live latent");
         assert!(scalar(&g.abs().unwrap().sum_all().unwrap()) > 0.0);
     }
 
@@ -498,16 +535,26 @@ mod tests {
     #[test]
     fn reads_the_published_pth_layout() {
         use crate::train::formula::formula_values;
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../contracts/gen-core/tests/fixtures/latent_perceptual/tiny_bn_state_dict.pth");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../contracts/gen-core/tests/fixtures/latent_perceptual/tiny_bn_state_dict.pth",
+        );
         let tmp = tempfile::tempdir().unwrap();
         let dst = tmp.path().join(LatentLpipsFamily::Sdxl.checkpoint_file());
         std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
         std::fs::copy(&fixture, &dst).unwrap();
-        assert_eq!(resolve_checkpoint(tmp.path(), LatentLpipsFamily::Sdxl).unwrap(), dst);
-        let sd: std::collections::HashMap<_, _> =
-            candle_core::pickle::read_all(&dst).unwrap().into_iter().collect();
-        let w = sd["0.weight"].flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            resolve_checkpoint(tmp.path(), LatentLpipsFamily::Sdxl).unwrap(),
+            dst
+        );
+        let sd: std::collections::HashMap<_, _> = candle_core::pickle::read_all(&dst)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let w = sd["0.weight"]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert_eq!(w, formula_values("0.weight", &[2, 4, 3, 3], Role::Conv));
         // Not an E-LatentLPIPS checkpoint ⇒ a named load error, never a silent run.
         let err = LatentLpips::from_dir(tmp.path(), LatentLpipsFamily::Sdxl, &CPU)
@@ -523,7 +570,10 @@ mod tests {
     fn param_count_matches_the_published_checkpoint_sizes() {
         for (c, bytes) in [(4usize, 58_969_974u64), (16, 58_997_622)] {
             let ours = param_count(c) * 4;
-            assert!(ours <= bytes && bytes - ours < bytes / 500, "{c}: {ours} vs {bytes}");
+            assert!(
+                ours <= bytes && bytes - ours < bytes / 500,
+                "{c}: {ours} vs {bytes}"
+            );
         }
     }
 
@@ -534,7 +584,12 @@ mod tests {
         let mut path = PerceptualPath::new(
             None,
             vec![AuxLoss {
-                schedule: AuxLossSchedule { weight: 0.5, t_min: 0.0, t_max: 0.5, every_n: 1 },
+                schedule: AuxLossSchedule {
+                    weight: 0.5,
+                    t_min: 0.0,
+                    t_max: 0.5,
+                    every_n: 1,
+                },
                 loss: Box::new(LatentLpipsLoss::new(net(4))),
             }],
         )
@@ -543,7 +598,10 @@ mod tests {
         path.ensure_reference(0, &clean).unwrap();
         let plan = path.plan(1, 0, 0.3).unwrap();
         assert!(plan.diffusion && plan.aux == vec![0], "{plan:?}");
-        assert_eq!(scalar(&path.aux_loss(&plan, 0, &clean).unwrap().unwrap().weighted), 0.0);
+        assert_eq!(
+            scalar(&path.aux_loss(&plan, 0, &clean).unwrap().unwrap().weighted),
+            0.0
+        );
         let off = (&clean + 0.2).unwrap();
         assert!(scalar(&path.aux_loss(&plan, 0, &off).unwrap().unwrap().weighted) > 0.0);
         assert!(path.plan(1, 0, 0.8).unwrap().aux.is_empty());

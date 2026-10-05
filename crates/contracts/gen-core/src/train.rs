@@ -390,6 +390,18 @@ impl Default for AuxLossSchedule {
     }
 }
 
+/// Which E-LatentLPIPS weight set matches a trainer's latent space (epic 2123, the latent
+/// perceptual loss): the trainer names its family in the aux-loss builder context; `None` there
+/// means no E-LatentLPIPS weights exist for that latent space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatentLpipsFamily {
+    Sd15,
+    Sd21,
+    Sdxl,
+    Sd3,
+    Flux,
+}
+
 /// Which Depth-Anything-V2 checkpoint depth anchoring runs (all three share one module graph).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DepthModelSize {
@@ -489,7 +501,7 @@ impl Default for LatentLpipsConfig {
     }
 }
 
-/// The latent spaces E-LatentLPIPS publishes calibrated weights for (`Mingguksky/elatentlpips`,
+/// [`LatentLpipsFamily`] — the latent spaces E-LatentLPIPS publishes calibrated weights for (`Mingguksky/elatentlpips`,
 /// sc-24833). A trainer whose VAE latent space is none of these (FLUX.2, Qwen-Image / Wan, LTX
 /// latents) has no matching weights and does not declare
 /// [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss), so the floor refuses the loss.
@@ -504,20 +516,6 @@ impl Default for LatentLpipsConfig {
 ///
 /// The network consumes the **model-space** latent the diffusion model trains on (upstream calls it
 /// with `normalize=False` on exactly those latents).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LatentLpipsFamily {
-    /// Stable Diffusion 1.x.
-    Sd15,
-    /// Stable Diffusion 2.x.
-    Sd21,
-    /// SDXL (and the SDXL-VAE families).
-    Sdxl,
-    /// Stable Diffusion 3 / 3.5.
-    Sd3,
-    /// FLUX.1 (and the FLUX.1-VAE families).
-    Flux,
-}
-
 impl LatentLpipsFamily {
     /// The upstream encoder name (`sd15` / `sd21` / `sdxl` / `sd3` / `flux`).
     pub fn as_str(self) -> &'static str {
