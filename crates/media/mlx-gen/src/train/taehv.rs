@@ -37,6 +37,9 @@
 //! tail for that one frame only (the TGrow 1×1 conv restricted to its last `n_f[2]` output
 //! channels — the same slice the reference's `patch_tgrow_layers` takes). It is bit-for-bit the
 //! same math as [`TaehvDecoder::decode_video`] with `T = 1` (tested).
+//! [`TaehvDecoder::decode_clip_last_frames`] is the same tail on `T`-frame clips: the MemBlocks
+//! carry each clip's earlier frames and only the clip's final output frame is kept — a video
+//! trainer decodes latent frame `k > 0` with its predecessor this way (LTX-2.5).
 //!
 //! Weight keys: the reference `state_dict` layout (`decoder.{i}.…`, torch OIHW conv weights
 //! permuted to MLX OHWI at load, cast to f32). Shipped checkpoints also carry the 64 `encoder.*`
@@ -193,6 +196,15 @@ impl TaehvConfig {
     /// ([`TaehvDecoder::decode_frames`]) differentiable decode to `out_h × out_w`, in bytes: every
     /// intermediate the backward retains, f32, ×2 for the cotangents. Not a measured value.
     pub fn training_working_set_bytes(&self, out_h: u32, out_w: u32) -> u64 {
+        self.clip_training_working_set_bytes(out_h, out_w, 1)
+    }
+
+    /// [`training_working_set_bytes`](Self::training_working_set_bytes) for one
+    /// [`TaehvDecoder::decode_clip_last_frames`] clip of `clip_frames` latent frames: every frame
+    /// of the clip runs the head and the MemBlock stages (the memory crosses frames); only the
+    /// clip's final output frame runs the full-resolution tail.
+    pub fn clip_training_working_set_bytes(&self, out_h: u32, out_w: u32, clip_frames: u32) -> u64 {
+        let clip = clip_frames.max(1) as u64;
         let up = self.spatial_upscale() as u64;
         let (lh, lw) = (
             (out_h as u64).div_ceil(up).max(1),
@@ -201,8 +213,8 @@ impl TaehvConfig {
         let nf = self.channels.map(|c| c as u64);
         // Clamp + conv_in + ReLU at the latent resolution.
         let mut area = lh * lw;
-        let mut elems = 3 * area * nf[0].max(self.latent_channels as u64);
-        let mut frames = 1u64;
+        let mut elems = 3 * clip * area * nf[0].max(self.latent_channels as u64);
+        let mut frames = clip;
         for s in 0..3 {
             let c = nf[s];
             // Each MemBlock retains: concat (2C), the zero-padded past (2C: pad + slice), three conv
@@ -524,9 +536,30 @@ impl TaehvDecoder {
                 self.cfg.display_name()
             )));
         }
-        self.check_channels(sh[1], &sh)?;
-        let n = sh[0];
-        let mut x = self.head(&latents.transpose_axes(&[0, 2, 3, 1])?)?;
+        self.decode_clip_last_frames(&latents.reshape(&[sh[0], 1, sh[1], sh[2], sh[3]])?)
+    }
+
+    /// Decode `N` clips of `T` latent frames each and keep **only each clip's final output
+    /// frame** — the last of the last latent frame's `t_upscale` grown frames, i.e.
+    /// `decode_video(latents)[:, -1]`, with the MemBlocks carrying the clip's earlier frames:
+    /// NTCHW `[N, T, C, h, w]` → NHWC `[N, H, W, 3]` in `[0, 1]`. Only that frame's
+    /// full-resolution tail is computed (the last stage-2 frame through the last `n_f[2]` TGrow
+    /// output channels — no MemBlock follows the final TGrow). Pure MLX ops — differentiable in
+    /// `latents`.
+    pub fn decode_clip_last_frames(&self, latents: &Array) -> Result<Array> {
+        let sh = latents.shape().to_vec();
+        if sh.len() != 5 {
+            return Err(Error::Msg(format!(
+                "{} decode_clip_last_frames expects NTCHW latents, got shape {sh:?}",
+                self.cfg.display_name()
+            )));
+        }
+        self.check_channels(sh[2], &sh)?;
+        let (n, t, c, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
+        let x = latents
+            .reshape(&[n * t, c, h, w])?
+            .transpose_axes(&[0, 2, 3, 1])?;
+        let mut x = self.head(&x)?;
         let last = self.stages.len() - 1;
         for (s, st) in self.stages.iter().enumerate() {
             for b in &st.blocks {
@@ -844,6 +877,46 @@ mod tests {
             .unwrap();
         let last = v.index((.., 8)).reshape(&[1, 16, 16, 3]).unwrap();
         assert!(max_abs_diff(&alone, &last) > 0.1);
+    }
+
+    /// `decode_clip_last_frames` on `T = 2` clips is exactly the last frame of the reference
+    /// `decode_video` of the same clips (the last latent frame's last grown frame, decoded with its
+    /// predecessor's memory), one frame per clip. Mutations: keep the clip's first stage-2 frame
+    /// (`f - 1` → `0`) ⇒ red; cut the cross-frame memory (MemBlocks run with `clips = n·t`) ⇒ red.
+    #[test]
+    fn clip_last_frame_decode_equals_the_reference_clips_last_frame() {
+        for cfg in [tiny(TaehvConfig::taew2_1()), tiny(TaehvConfig::taeltx2_3())] {
+            let dec = load(&cfg, 8);
+            let z = latents(&[2, 2, cfg.latent_channels, 2, 2], 14);
+            let fast = dec.decode_clip_last_frames(&z).unwrap();
+            let up = cfg.spatial_upscale();
+            assert_eq!(fast.shape(), &[2, 2 * up, 2 * up, 3], "{}", cfg.name);
+            let video = dec.decode_video(&z).unwrap();
+            let vs = video.shape().to_vec();
+            assert_eq!(
+                vs[1],
+                2 * cfg.t_upscale() - cfg.frames_to_trim(),
+                "{}",
+                cfg.name
+            );
+            let last = video
+                .index((.., vs[1] - 1))
+                .reshape(&[vs[0], vs[2], vs[3], vs[4]])
+                .unwrap();
+            assert!(max_abs_diff(&fast, &last) < 1e-5, "{}", cfg.name);
+        }
+    }
+
+    /// A `T`-frame clip's working set grows with `T` (head + MemBlock stages run on every frame)
+    /// but stays under `T`× the per-frame figure (one full-resolution tail per clip). Mutation:
+    /// ignore `clip_frames` ⇒ red.
+    #[test]
+    fn clip_working_set_grows_with_the_clip_length() {
+        let cfg = TaehvConfig::taeltx2_3();
+        let one = cfg.clip_training_working_set_bytes(512, 512, 1);
+        let two = cfg.clip_training_working_set_bytes(512, 512, 2);
+        assert_eq!(one, cfg.training_working_set_bytes(512, 512));
+        assert!(two > one && two < 2 * one, "{one} {two}");
     }
 
     #[test]

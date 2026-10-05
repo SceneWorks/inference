@@ -48,11 +48,12 @@ use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{accumulate_grads, adapter_optimizer_update, average_grads, LoraParams};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, AuxAlternation, Parameterization, PerceptualPath, StepPlan,
+    combine_step_loss, AuxAlternation, AuxModelFootprint, Parameterization, PerceptualPath,
+    StepPlan, X0Decoder,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
-use mlx_gen::train::taehv::TaehvConfig;
+use mlx_gen::train::taehv::{TaehvConfig, TaehvDecoder};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
     gen_core, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
@@ -1293,18 +1294,116 @@ struct Ltx25DepthFrames {
 }
 
 impl Ltx25DepthFrames {
+    /// The latent frames [`Ltx25DepthDecoder`] decodes for the selected (ascending) frames: frame
+    /// `0` alone (a `T = 1` clip — it decodes to one pixel frame), every frame `k > 0` preceded by
+    /// `k − 1` (a `T = 2` clip, so TAEHV's MemBlocks see the frame its 8-pixel-frame group
+    /// follows). Frame 0 can only lead, so the layout is `[0]? ++ [k−1, k]*`.
+    fn decode_frames(&self) -> Result<Vec<i32>> {
+        let mut out = Vec::with_capacity(2 * self.frames.len());
+        for (i, &k) in self.frames.iter().enumerate() {
+            match k {
+                0 if i == 0 => out.push(0),
+                k if k > 0 => out.extend([k - 1, k]),
+                _ => {
+                    return Err(format!(
+                        "ltx_2_5 trainer: depth frames must be ascending and non-negative, got \
+                         {:?}",
+                        self.frames
+                    )
+                    .into())
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The selected frames of the patchified target tokens `(1, F·H·W, C)` as the decoder's NCHW
-    /// batch `(k, C, H, W)` — the model-space (normalized) latent TAELTX2.3 decodes.
+    /// batch — the model-space (normalized) latent TAELTX2.3 decodes, in the
+    /// [`decode_frames`](Self::decode_frames) layout [`Ltx25DepthDecoder`] reads back as clips (one
+    /// decoded frame per selected frame).
     fn nchw(&self, tokens: &Array) -> Result<Array> {
         let [c, f, h, w] = self.grid;
         let grid = crate::conditioning::unpatchify_grid(tokens, c, f, h, w)?;
-        let index = Array::from_slice(&self.frames, &[self.frames.len() as i32]);
-        let k = self.frames.len() as i32;
+        let decode = self.decode_frames()?;
+        let n = decode.len() as i32;
+        let index = Array::from_slice(&decode, &[n]);
         Ok(grid
             .take_axis(&index, 2)?
             .transpose_axes(&[0, 2, 1, 3, 4])?
-            .reshape(&[k, c, h, w])?)
+            .reshape(&[n, c, h, w])?)
     }
+}
+
+/// LTX-2.5's TAELTX2.3 depth decoder (sc-24830). A video latent frame `k > 0` encodes a group of
+/// 8 pixel frames that TAEHV decodes with temporal memory of frame `k − 1`; decoding it as a lone
+/// `T = 1` clip would be out of distribution. So each selected frame `k > 0` decodes together with
+/// its predecessor as a `T = 2` clip and keeps only the clip's last output frame (latent `k`'s last
+/// grown frame — the same frame a `T = 1` decode keeps), while frame 0 stays a `T = 1` clip. Input:
+/// the [`Ltx25DepthFrames::nchw`] batch `[0]? ++ [k−1, k]*` (odd length ⇔ a leading lone frame 0);
+/// output: NHWC, one frame per selected frame, in order. Applied identically to the live x0 and to
+/// the clean reference, so their shapes match.
+struct Ltx25DepthDecoder(TaehvDecoder);
+
+impl X0Decoder for Ltx25DepthDecoder {
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        use mlx_rs::ops::indexing::IndexOp;
+        let sh = latents.shape().to_vec();
+        if sh.len() != 4 {
+            return Err(format!(
+                "ltx_2_5 trainer: the depth decoder expects NCHW latents, got shape {sh:?}"
+            )
+            .into());
+        }
+        let (n, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
+        let lone = n % 2;
+        let pairs = n / 2;
+        let mut parts = Vec::with_capacity(2);
+        if lone == 1 {
+            parts.push(self.0.decode_frames(&latents.index(..1))?);
+        }
+        if pairs > 0 {
+            let clips = latents.index(lone..).reshape(&[pairs, 2, c, h, w])?;
+            parts.push(self.0.decode_clip_last_frames(&clips)?);
+        }
+        let parts: Vec<&Array> = parts.iter().collect();
+        Ok(concatenate_axis(&parts, 0)?)
+    }
+}
+
+/// The [`Ltx25DepthDecoder`] for the shared builder: TAELTX2.3 from `perceptual_decoder_dir`, and a
+/// per-selected-frame working set of one `T = 2` clip decode (an upper bound: frame 0 decodes as
+/// `T = 1`).
+struct Ltx25DepthDecoderSpec;
+
+impl mlx_gen_perceptual::CustomDecoder for Ltx25DepthDecoderSpec {
+    fn name(&self) -> &'static str {
+        "TAELTX2.3"
+    }
+
+    fn footprint(&self, h: u32, w: u32) -> AuxModelFootprint {
+        let cfg = TaehvConfig::taeltx2_3();
+        AuxModelFootprint {
+            working_set_bytes: cfg.clip_training_working_set_bytes(h, w, 2),
+            ..cfg.footprint(h, w)
+        }
+    }
+
+    fn load(&self, dir: Option<&Path>) -> Result<Box<dyn X0Decoder>> {
+        let dir = dir.ok_or_else(|| {
+            mlx_gen::Error::Msg(
+                "the perceptual losses need the TAELTX2.3 decoder (perceptual_decoder_dir)".into(),
+            )
+        })?;
+        let dec = TaehvDecoder::from_path(dir, TaehvConfig::taeltx2_3())
+            .map_err(|e| mlx_gen::Error::Msg(format!("{}: {e}", dir.display())))?;
+        Ok(Box::new(Ltx25DepthDecoder(dec)))
+    }
+}
+
+/// LTX-2.5's decoder for the shared aux-loss builder (sc-24830): TAELTX2.3 through
+/// [`Ltx25DepthDecoder`].
+fn ltx25_decoder() -> mlx_gen_perceptual::DecoderSpec {
+    mlx_gen_perceptual::DecoderSpec::Custom(Box::new(Ltx25DepthDecoderSpec))
 }
 
 fn parse_shape_metadata(weights: &Weights, key: &str, tensor: &Array) -> Result<Vec<i32>> {
@@ -2004,7 +2103,8 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
         // sc-24830 (epic 2123): depth anchoring through TAELTX2.3 (upstream's tiny decoder for
         // LTX-2.3 and LTX-2.5) — on the LTX-2.3 still-image path (dense and block-checkpointed)
         // and on every LTX-2.5 workflow that generates video (the prepared bundle's clean video
-        // latent decoded per frame; audio ignored). The 2.5 workflows with no generated video are
+        // latent's selected frames decoded, each `k > 0` with its predecessor; audio ignored). The
+        // six 2.5 workflows with no generated video are
         // refused with the reason by [`refuse_ltx25_depth_anchoring`].
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: id != MODEL_25_ID,
@@ -2032,12 +2132,13 @@ fn refuse_ltx25_subject_mask(id: &str, req: &TrainingRequest) -> gen_core::Resul
     Ok(())
 }
 
-/// sc-24830 — LTX-2.5 does not run depth anchoring: the decoded-x0 depth loss is wired on the
-/// LTX-2.3 still-image path only, while every LTX-2.5 workflow trains on preprocessed video/audio
-/// latent bundles through the flexible AV forward (fifteen workflows, several audio-only). A typed
-/// `Unsupported` naming that reason, raised by `validate`, the start of `train` (before any
-/// caching) and the weights-free [`validate_ltx25_training_request`] preflight — ahead of the
-/// generic technique floor, so the caller sees why.
+/// sc-24830 — LTX-2.5 runs depth anchoring on its generated video stream, so it refuses it for the
+/// six workflows that generate no video (`v2a_lora`, whose video is frozen conditioning, and the
+/// audio-only `t2a_lora`, `audio_extend_lora`, `audio_inpainting_lora`, `audio_suffix_lora`,
+/// `a2a_ic_lora`): a typed `Unsupported` naming the workflow, raised by `validate`, the start of
+/// `train` (before any caching) and the weights-free [`validate_ltx25_training_request`] preflight
+/// — ahead of the generic technique floor, so the caller sees why. Also validates the
+/// [`DEPTH_ANCHORING_FRAMES_KEY`] knob.
 fn refuse_ltx25_depth_anchoring(id: &str, req: &TrainingRequest) -> gen_core::Result<()> {
     if id != MODEL_25_ID || !req.config.depth_anchoring.schedule.is_enabled() {
         return Ok(());
@@ -2078,9 +2179,10 @@ fn refuse_ltx25_depth_anchoring(id: &str, req: &TrainingRequest) -> gen_core::Re
 }
 
 /// `model_options` key selecting how many latent frames of an LTX-2.5 video clip the depth loss
-/// decodes per step (sc-24830). Each selected latent frame decodes independently through
-/// TAELTX2.3 as a `T = 1` clip; the frames are evenly spaced over the clip's latent frames that
-/// carry generated (loss) tokens, fixed per example. Positive integer; default
+/// decodes per step (sc-24830). Each selected latent frame decodes through TAELTX2.3 to one pixel
+/// frame — frame 0 as a `T = 1` clip, a frame `k > 0` together with its predecessor `k − 1` as a
+/// `T = 2` clip, keeping its last output frame; the frames are evenly spaced over the clip's latent
+/// frames that carry generated (loss) tokens, fixed per example. Positive integer; default
 /// [`DEFAULT_DEPTH_ANCHORING_FRAMES`]. Bounds the per-step decode + Depth-Anything-V2 memory.
 pub const DEPTH_ANCHORING_FRAMES_KEY: &str = "depthAnchoringFrames";
 
@@ -2869,7 +2971,7 @@ impl LtxTrainer {
         } else {
             None
         };
-        let mut perceptual = load_perceptual_path_for(cfg, "ltx_2_5 trainer")?;
+        let mut perceptual = load_perceptual_path_for(cfg, "ltx_2_5 trainer", ltx25_decoder())?;
         on_progress(TrainingProgress::LoadingModel);
 
         let mut cached = Vec::with_capacity(req.items.len());
@@ -3282,16 +3384,21 @@ fn ltx_decoder() -> mlx_gen_perceptual::DecoderSpec {
 /// Build the epic-2123 perceptual path through the shared builder: `None` when no aux loss is
 /// enabled (nothing loads; every step is the plain diffusion step).
 fn load_perceptual_path(cfg: &TrainingConfig) -> Result<Option<PerceptualPath>> {
-    load_perceptual_path_for(cfg, "ltx_2_3 trainer")
+    load_perceptual_path_for(cfg, "ltx_2_3 trainer", ltx_decoder())
 }
 
-/// [`load_perceptual_path`] with an explicit error label (the LTX-2.5 route uses its own).
-fn load_perceptual_path_for(cfg: &TrainingConfig, label: &str) -> Result<Option<PerceptualPath>> {
+/// [`load_perceptual_path`] with an explicit error label and decoder (the LTX-2.5 route uses its
+/// own: [`ltx25_decoder`]).
+fn load_perceptual_path_for(
+    cfg: &TrainingConfig,
+    label: &str,
+    decoder: mlx_gen_perceptual::DecoderSpec,
+) -> Result<Option<PerceptualPath>> {
     mlx_gen_perceptual::build_perceptual_path(
         cfg,
         &mlx_gen_perceptual::AuxLossContext {
             label,
-            decoder: ltx_decoder(),
+            decoder,
             latent_lpips: None,
         },
     )
@@ -3323,12 +3430,20 @@ fn perceptual_footprint_gb(cfg: &TrainingConfig, edge: u32, entries: usize) -> f
 }
 
 /// The largest prepared video `(H, W)` latent grid and the frame count over `items` (sc-24830) —
-/// read from each bundle's `videoShape` metadata before caching, for the depth memory estimate.
+/// read from each bundle's `videoShape` header metadata alone (no tensor data) before caching, for
+/// the depth memory estimate.
 fn ltx25_video_grids(items: &[mlx_gen::TrainingItem]) -> Result<(i32, i32, i32)> {
     let mut max = (0, 0, 0);
     for item in items {
-        let weights = Weights::from_file(prepared_bundle_path(item)?)?;
-        let raw = weights.metadata("videoShape").ok_or_else(|| {
+        let path = prepared_bundle_path(item)?;
+        let metadata =
+            mlx_gen::gen_core::weightsmeta::safetensors_file_metadata(path).map_err(|error| {
+                mlx_gen::Error::Msg(format!(
+                    "ltx_2_5 trainer: could not read prepared bundle header `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+        let raw = metadata.get("videoShape").ok_or_else(|| {
             mlx_gen::Error::Msg(
                 "ltx_2_5 trainer: depth anchoring needs the prepared bundle's `videoShape`".into(),
             )
@@ -3353,8 +3468,9 @@ fn ltx25_video_grids(items: &[mlx_gen::TrainingItem]) -> Result<(i32, i32, i32)>
 }
 
 /// Extra training memory (GB) LTX-2.5 depth anchoring adds (sc-24830, epic 2123 E7): TAELTX2.3 +
-/// the losses' frozen models for `frames` decoded latent frames per step at the `(h, w)` latent
-/// grid (×32 pixels), plus `entries` cached references. `0` when nothing is enabled.
+/// the losses' frozen models for `frames` selected latent frames per step at the `(h, w)` latent
+/// grid (×32 pixels) — each frame's decode sized as a `T = 2` clip with its predecessor
+/// ([`ltx25_decoder`]) — plus `entries` cached references. `0` when nothing is enabled.
 fn ltx25_perceptual_footprint_gb(
     cfg: &TrainingConfig,
     h: i32,
@@ -3364,7 +3480,7 @@ fn ltx25_perceptual_footprint_gb(
 ) -> f64 {
     mlx_gen_perceptual::perceptual_footprint_gb(
         cfg,
-        &ltx_decoder(),
+        &ltx25_decoder(),
         mlx_gen_perceptual::AuxGeometry {
             height: (h as i64 * SPATIAL_SCALE) as u32,
             width: (w as i64 * SPATIAL_SCALE) as u32,
@@ -6473,11 +6589,10 @@ mod depth_anchoring_tests {
         assert!(err.contains("depth-anchoring"), "{err}");
     }
 
-    /// AC (e): LTX-2.3 declares depth anchoring, LTX-2.5 does not and refuses it with a typed
-    /// `Unsupported` naming the reason — from the shared refusal `validate`/`train` call and from
-    /// the weights-free preflight, before any bundle is read; a missing TAELTX2.3 checkpoint is a
-    /// named error. Mutations: declare depth on 2.5 ⇒ red; drop the refusal from the weights-free
-    /// preflight ⇒ red.
+    /// AC (e): LTX-2.3 declares depth anchoring and a missing TAELTX2.3 checkpoint is a named error
+    /// (LTX-2.5's declaration and its six video-less-workflow refusals live in
+    /// `ltx25_depth_anchoring_tests`). Mutations: undeclare depth on 2.3 ⇒ red; drop the decoder
+    /// name from the load error ⇒ red.
     #[test]
     fn ltx23_declares_depth_and_missing_decoder_is_named() {
         assert!(trainer_descriptor().techniques.depth_anchoring);
@@ -6525,20 +6640,22 @@ mod ltx25_depth_anchoring_tests {
         }
     }
 
-    fn path() -> PerceptualPath {
+    fn tiny_decoder() -> TaehvDecoder {
         let tae = TaehvConfig {
             latent_channels: 4,
             channels: [8, 6, 4, 4],
             ..TaehvConfig::taeltx2_3()
         };
-        let dec =
-            TaehvDecoder::from_weights(&synthetic_taehv_weights(&tae, 11).unwrap(), tae).unwrap();
+        TaehvDecoder::from_weights(&synthetic_taehv_weights(&tae, 11).unwrap(), tae).unwrap()
+    }
+
+    fn path() -> PerceptualPath {
         let da2 = tiny_config();
         let depth = DepthAnchorLoss::new(
             DepthAnythingV2::from_weights(&synthetic_weights(&da2, 12).unwrap(), da2).unwrap(),
         );
         PerceptualPath::new(
-            Some(Box::new(dec)),
+            Some(Box::new(Ltx25DepthDecoder(tiny_decoder()))),
             vec![AuxLoss {
                 schedule: schedule(),
                 loss: Box::new(depth),
@@ -6802,32 +6919,164 @@ mod ltx25_depth_anchoring_tests {
 
         let grid = rnd(&[1, 3, 4, 2, 2], 40);
         let tokens = crate::conditioning::patchify_grid(&grid).unwrap();
-        let sel = Ltx25DepthFrames {
-            grid: [3, 4, 2, 2],
-            frames: vec![1, 3],
-        };
-        let out = sel.nchw(&tokens).unwrap();
-        assert_eq!(out.shape(), &[2, 3, 2, 2]);
         use mlx_rs::ops::indexing::IndexOp;
-        for (i, &fr) in [1, 3].iter().enumerate() {
-            // `as_slice` reads the physical buffer: compare row-major copies.
-            let want =
-                mlx_gen::array::contiguous(&grid.index((.., .., fr)).reshape(&[3, 2, 2]).unwrap())
-                    .unwrap();
-            let got = mlx_gen::array::contiguous(&out.index(i as i32).reshape(&[3, 2, 2]).unwrap())
+        // (selected frames, the grid frame each decode-batch row must hold): each selected
+        // `k > 0` preceded by `k − 1`, frame 0 alone.
+        for (selected, decoded) in [(vec![1, 3], vec![0, 1, 2, 3]), (vec![0, 3], vec![0, 2, 3])] {
+            let sel = Ltx25DepthFrames {
+                grid: [3, 4, 2, 2],
+                frames: selected.clone(),
+            };
+            assert_eq!(sel.decode_frames().unwrap(), decoded);
+            let out = sel.nchw(&tokens).unwrap();
+            assert_eq!(
+                out.shape(),
+                &[decoded.len() as i32, 3, 2, 2],
+                "{selected:?}"
+            );
+            for (i, &fr) in decoded.iter().enumerate() {
+                // `as_slice` reads the physical buffer: compare row-major copies.
+                let want = mlx_gen::array::contiguous(
+                    &grid.index((.., .., fr)).reshape(&[3, 2, 2]).unwrap(),
+                )
                 .unwrap();
-            eval([&want, &got]).unwrap();
-            assert_eq!(bits(&want), bits(&got), "frame {fr}");
+                let got =
+                    mlx_gen::array::contiguous(&out.index(i as i32).reshape(&[3, 2, 2]).unwrap())
+                        .unwrap();
+                eval([&want, &got]).unwrap();
+                assert_eq!(
+                    bits(&want),
+                    bits(&got),
+                    "{selected:?}: row {i} = frame {fr}"
+                );
+            }
+        }
+        let bad = Ltx25DepthFrames {
+            grid: [3, 4, 2, 2],
+            frames: vec![2, 0],
+        };
+        assert!(bad.decode_frames().is_err());
+    }
+
+    /// `Ltx25DepthDecoder` decodes one pixel frame per selected frame: frame 0 exactly as a lone
+    /// `T = 1` clip, a frame `k > 0` exactly as the last output frame of the reference
+    /// `decode_video` of the clip `[k − 1, k]` (≠ decoding `k` alone, the out-of-distribution
+    /// path it replaces), and the gradient reaches both the selected frame and its predecessor.
+    /// Mutations: decode every row as an independent `T = 1` frame ⇒ red; drop the lone-frame-0
+    /// branch (treat the batch as pairs only) ⇒ red.
+    #[test]
+    fn depth_decoder_decodes_each_frame_with_its_predecessor() {
+        let _cpu = cpu_only();
+        use mlx_rs::ops::indexing::IndexOp;
+        let dec = Ltx25DepthDecoder(tiny_decoder());
+        let grid = rnd(&[1, 4, 3, 2, 2], 41);
+        let tokens = crate::conditioning::patchify_grid(&grid).unwrap();
+        let sel = Ltx25DepthFrames {
+            grid: [4, 3, 2, 2],
+            frames: vec![0, 2],
+        };
+        let input = sel.nchw(&tokens).unwrap();
+        let frame = |k: i32| grid.index((.., .., k)).reshape(&[1, 4, 2, 2]).unwrap();
+        let diff = |a: &Array, b: &Array| {
+            let d = subtract(a, b).unwrap().abs().unwrap().max(None).unwrap();
+            d.item::<f32>()
+        };
+        let px = dec.decode(&input).unwrap();
+        let up = 2 * dec.0.config().spatial_upscale();
+        assert_eq!(
+            px.shape(),
+            &[2, up, up, 3],
+            "one pixel frame per selected frame"
+        );
+        let f0 = dec.0.decode_frames(&frame(0)).unwrap();
+        assert!(diff(&px.index(..1), &f0) < 1e-6);
+        let clip = concatenate_axis(&[&frame(1), &frame(2)], 0)
+            .unwrap()
+            .reshape(&[1, 2, 4, 2, 2])
+            .unwrap();
+        let video = dec.0.decode_video(&clip).unwrap();
+        let t = video.shape()[1];
+        let last = video.index((.., t - 1)).reshape(&[1, up, up, 3]).unwrap();
+        let k2 = px.index(1..);
+        assert!(diff(&k2, &last) < 1e-5);
+        let alone = dec.0.decode_frames(&frame(2)).unwrap();
+        assert!(
+            diff(&k2, &alone) > 1e-3,
+            "the predecessor must reach frame 2's decode"
+        );
+        let g = mlx_rs::transforms::grad(|z: &Array| -> MlxResult<Array> {
+            dec.decode(z)
+                .map_err(|e| Exception::custom(e.to_string()))?
+                .sum(None)
+        })(&input)
+        .unwrap();
+        for row in 0..3 {
+            let m = g.index(row).abs().unwrap().sum(None).unwrap().item::<f32>();
+            assert!(m > 0.0 && m.is_finite(), "row {row}: {m}");
         }
     }
 
+    /// The depth memory estimate's video grid comes from each bundle's safetensors HEADER alone:
+    /// bundles whose tensor data is absent (header only, data truncated) still yield the max
+    /// `(F, H, W)` over items. Mutation: open the bundle with `Weights::from_file` (loads the
+    /// tensors) ⇒ the truncated bundles fail to load ⇒ red.
+    #[test]
+    fn video_grids_read_only_the_bundle_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = |name: &str, shape: [i32; 5]| {
+            let n: i32 = shape.iter().product();
+            let header = serde_json::json!({
+                "__metadata__": { "videoShape": serde_json::to_string(&shape).unwrap() },
+                "video_latents": {
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [0, n * 4],
+                },
+            })
+            .to_string();
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            // No tensor bytes: only a header-only reader can read this file.
+            let path = tmp.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let mut item = super::validate_request_tests::request(1).items.remove(0);
+            item.model_options.insert(
+                "ltxPreparedBundlePath".into(),
+                serde_json::json!(path.to_str().unwrap()),
+            );
+            item
+        };
+        let items = [
+            bundle("a.safetensors", [1, 4, 3, 5, 7]),
+            bundle("b.safetensors", [1, 4, 9, 2, 8]),
+        ];
+        assert_eq!(ltx25_video_grids(&items).unwrap(), (9, 5, 8));
+    }
+
     /// AC (d), E7: the LTX-2.5 depth footprint grows with the decoded frames and with the Large
-    /// DA2, and the guard refuses at a synthetic budget between base and base+aux. Mutation: drop
-    /// `+ extra_gb` from the guard ⇒ red.
+    /// DA2, sizes each selected frame's decode as a `T = 2` clip (its predecessor rides along:
+    /// exactly one extra clip-frame of TAELTX2.3 working set per selected frame over the `T = 1`
+    /// sizing), and the guard refuses at a synthetic budget between base and base+aux. Mutations:
+    /// drop `+ extra_gb` from the guard ⇒ red; size the LTX-2.5 decode as `T = 1` ⇒ red.
     #[test]
     fn memory_estimate_grows_with_frames_and_the_guard_counts_it() {
         let mut on = TrainingConfig::default();
         on.depth_anchoring.schedule = schedule();
+        let geom = mlx_gen_perceptual::AuxGeometry {
+            height: 512,
+            width: 512,
+            frames: 2,
+            entries: 2,
+        };
+        let tae = TaehvConfig::taeltx2_3();
+        let extra = tae.clip_training_working_set_bytes(512, 512, 2)
+            - tae.training_working_set_bytes(512, 512);
+        assert!(extra > 0);
+        assert_eq!(
+            mlx_gen_perceptual::perceptual_footprint(&on, &ltx25_decoder(), geom)
+                - mlx_gen_perceptual::perceptual_footprint(&on, &ltx_decoder(), geom),
+            2 * extra
+        );
         let one = ltx25_perceptual_footprint_gb(&on, 16, 16, 1, 2);
         let two = ltx25_perceptual_footprint_gb(&on, 16, 16, 2, 2);
         assert!(one > 0.0 && two > one, "{one} {two}");
