@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 import importlib.util
 import hashlib
 from io import StringIO
@@ -157,6 +157,131 @@ class PrecisionControlTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "already exists"):
                     control.prepare_cases(templates, destination, backend)
             self.assertFalse((root / "metal-cases" / "experimental-fp8-auto.json").exists())
+
+    def test_fixed_metal_five_selection_preserves_default_full_case_bytes(self):
+        expected = ("strict-fp32-standard", "strict-bf16-q8-standard", "strict-bf16-q4-standard",
+                    "strict-fp32-q8-standard", "strict-fp32-q4-standard")
+        templates = MODULE_PATH.parent / "yue2-app-precision-cases"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for backend, count in (("metal", 7), ("cuda", 8)):
+                full = control.prepare_cases(templates, root / backend, backend)
+                self.assertEqual(len(full["cases"]), count)
+                self.assertNotIn("selection", full)
+            selected = control.prepare_cases(templates, root / "five", "metal", metal_five_continuation=True)
+            self.assertEqual(tuple(row["name"] for row in selected["cases"]), expected)
+            self.assertEqual(selected["selection"], "metal-five-continuation")
+            self.assertEqual(set(path.stem for path in (root / "five").glob("*.json")), set(expected) | {"manifest"})
+            for name in expected:
+                self.assertEqual((root / "five" / f"{name}.json").read_bytes(),
+                                 (root / "metal" / f"{name}.json").read_bytes())
+            for backend, selector in (("cuda", True), ("metal", "true"), ("unknown", True)):
+                with self.subTest(backend=backend, selector=selector), self.assertRaises(ValueError):
+                    control.prepare_cases(templates, root / "refused", backend, metal_five_continuation=selector)
+                self.assertFalse((root / "refused").exists())
+
+    def test_five_capture_and_collected_verdict_scope_are_exact_and_serial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases, evidence = root / "cases", root / "evidence"
+            control.prepare_cases(MODULE_PATH.parent / "yue2-app-precision-cases", cases, "metal",
+                                  metal_five_continuation=True)
+            def record(_path, backend, name, *_args):
+                return {"case_id": control.case_id(backend, name)}
+            def audio(_path, backend, name):
+                return {"case_id": control.case_id(backend, name), "sha256": "a" * 64}
+            with patch.dict(os.environ, {"YUE2_CUDA_SCHEDULING_MODE": "shared-host"}), \
+                 patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)), \
+                 patch.object(control, "preflight") as flight, \
+                 patch.object(control.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)) as commands, \
+                 patch.object(control, "verify_record", side_effect=record) as records, \
+                 patch.object(control, "verify_audio", side_effect=audio):
+                verdict = control.run_captures(root, root, root / "data", root / "profile", evidence,
+                                               cases, "metal", metal_five_continuation=True)
+            names = list(control.METAL_FIVE_CONTINUATION)
+            self.assertEqual([call.args[2] for call in flight.call_args_list],
+                             [f"before-{name}" for name in names] + ["after-cases"])
+            self.assertEqual(commands.call_count, 15)
+            for index, name in enumerate(names):
+                dry, capture, check = [call.args[0] for call in commands.call_args_list[3 * index:3 * index + 3]]
+                self.assertEqual(dry, [*capture, "--dry-run"])
+                self.assertEqual(capture[capture.index("--case-file") + 1], str(cases / f"{name}.json"))
+                self.assertEqual(check[-1], str(cases / f"{name}.json"))
+            self.assertEqual([call.args[2] for call in records.call_args_list], names * 2)
+            self.assertEqual(verdict["status"], "completed")
+            self.assertEqual(verdict["coverage_scope"], "metal-five-continuation")
+            self.assertEqual(verdict["expected_case_names"], names)
+            self.assertEqual(verdict["expected_case_count"], 5)
+            self.assertFalse(verdict["full_backend_profile"])
+            self.assertEqual([row["case_id"] for row in verdict["cases"]],
+                             [control.case_id("metal", name) for name in names])
+            inventory = json.loads((evidence / "audio-inventory.json").read_text(encoding="utf-8"))
+            self.assertEqual(inventory["coverage_scope"], "metal-five-continuation")
+            self.assertEqual(len(inventory["cases"]), 5)
+            self.assertEqual(len(list((evidence / "profile").iterdir())), 5)
+
+    def test_five_manifest_missing_duplicate_or_wrong_selector_refuses_capture(self):
+        for change in ("missing-selector", "missing-case", "duplicate-case", "wrong-selector", "unselected"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                cases = root / "cases"
+                manifest = control.prepare_cases(MODULE_PATH.parent / "yue2-app-precision-cases", cases,
+                                                 "metal", metal_five_continuation=True)
+                if change == "missing-selector":
+                    del manifest["selection"]
+                elif change == "missing-case":
+                    manifest["cases"].pop()
+                elif change == "duplicate-case":
+                    manifest["cases"][-1] = manifest["cases"][0]
+                elif change == "wrong-selector":
+                    manifest["selection"] = "arbitrary-resume"
+                (cases / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                with patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)), \
+                     patch.object(control, "preflight") as flight, \
+                     patch.object(control.subprocess, "run") as commands:
+                    with self.assertRaisesRegex(ValueError, "manifest/selection/backend mismatch"):
+                        control.run_captures(root, root, root / "data", root / "profile", root / "evidence",
+                                             cases, "metal", metal_five_continuation=change != "unselected")
+                flight.assert_not_called()
+                commands.assert_not_called()
+                self.assertFalse((root / "evidence" / "verdict.json").exists())
+
+    def test_five_collect_requires_all_selected_records_without_refusal(self):
+        for failure in (FileNotFoundError("selected record missing"), ValueError("selected admission refused")):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                evidence = root / "evidence"
+                evidence.mkdir()
+                manifest = control.prepare_cases(MODULE_PATH.parent / "yue2-app-precision-cases", root / "cases",
+                                                 "metal", metal_five_continuation=True)
+                (evidence / "cases-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                responses = [{"case_id": control.case_id("metal", name)}
+                             for name in control.METAL_FIVE_CONTINUATION[:-1]] + [failure]
+                with patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)), \
+                     patch.object(control, "verify_record", side_effect=responses), \
+                     patch.object(control, "verify_audio", return_value={"sha256": "a" * 64}):
+                    with self.assertRaises(type(failure)):
+                        control.collect(root / "profile", evidence, "metal", root, root, metal_five_continuation=True)
+                self.assertFalse((evidence / "verdict.json").exists())
+                self.assertFalse((evidence / "audio-inventory.json").exists())
+
+    def test_five_cli_selects_fixed_cases_and_rejects_freeform_or_cuda(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = ["control", "prepare-cases", "--templates", str(MODULE_PATH.parent / "yue2-app-precision-cases"),
+                    "--destination", str(root / "cases"), "--backend", "metal", "--metal-five-continuation"]
+            with patch.object(sys, "argv", argv), redirect_stdout(StringIO()):
+                self.assertEqual(control.main(), 0)
+            manifest = json.loads((root / "cases" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(manifest["cases"]), 5)
+            argv[argv.index("--destination") + 1] = str(root / "refused")
+            argv[argv.index("--backend") + 1] = "cuda"
+            with patch.object(sys, "argv", argv), self.assertRaisesRegex(ValueError, "selector/backend"):
+                control.main()
+            self.assertFalse((root / "refused").exists())
+            with patch.object(sys, "argv", [*argv, "--case-names", "strict-bf16-standard"]), \
+                 redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                control.main()
 
     def test_changed_fixed_source_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:

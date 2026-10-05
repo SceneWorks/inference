@@ -27,6 +27,10 @@ CASES = {
 }
 NAMES = tuple(CASES)
 CUDA_ONLY_CASES = frozenset({"experimental-fp8-auto"})
+METAL_FIVE_CONTINUATION = (
+    "strict-fp32-standard", "strict-bf16-q8-standard", "strict-bf16-q4-standard",
+    "strict-fp32-q8-standard", "strict-fp32-q4-standard",
+)
 STAGES = ("load", "semantic", "acoustic", "decode")
 CASE_SOURCE_SHA256 = {
     "strict-bf16-standard": "a43f2b1c3f8c288a4963885a924a91c6449d8d654db8a0c59619fba74c7f88bc",
@@ -49,8 +53,12 @@ SUPPORTED_RUNTIME_POLICIES = {
 }
 
 
-def names_for_backend(backend: str) -> tuple[str, ...]:
+def names_for_backend(backend: str, *, metal_five_continuation: bool = False) -> tuple[str, ...]:
     require(backend in ("cuda", "metal"), "unsupported backend")
+    require(type(metal_five_continuation) is bool and
+            (not metal_five_continuation or backend == "metal"), "invalid Metal five-case selector/backend")
+    if metal_five_continuation:
+        return METAL_FIVE_CONTINUATION
     return tuple(name for name in NAMES if backend == "cuda" or name not in CUDA_ONLY_CASES)
 
 
@@ -149,8 +157,9 @@ def verified_runtime_policy(app: Path, engine: Path, evidence: Path,
     return source["engine_sha"], policy
 
 
-def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
-    names = names_for_backend(backend)
+def prepare_cases(template_dir: Path, destination: Path, backend: str,
+                  *, metal_five_continuation: bool = False) -> dict:
+    names = names_for_backend(backend, metal_five_continuation=metal_five_continuation)
     require(not destination.exists(), "run-owned case directory already exists")
     destination.mkdir(parents=True)
     rows = []
@@ -171,6 +180,8 @@ def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
         rows.append({"name": name, "case_id": body["id"], "source_sha256": sha256(source),
                      "run_case_sha256": sha256(target)})
     manifest = {"backend": backend, "cases": rows}
+    if metal_five_continuation:
+        manifest["selection"] = "metal-five-continuation"
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
 
@@ -491,11 +502,18 @@ def verify_audio(profile_dir: Path, backend: str, name: str) -> dict:
             "sha256": sha256_stream(audio)}
 
 
-def collect(profile_dir: Path, evidence: Path, backend: str, app: Path, engine: Path) -> dict:
+def collect(profile_dir: Path, evidence: Path, backend: str, app: Path, engine: Path,
+            *, metal_five_continuation: bool = False) -> dict:
+    names = names_for_backend(backend, metal_five_continuation=metal_five_continuation)
+    if metal_five_continuation:
+        manifest = json.loads((evidence / "cases-manifest.json").read_text(encoding="utf-8"))
+        require(manifest.get("backend") == backend and manifest.get("selection") == "metal-five-continuation" and
+                [row.get("name") for row in manifest.get("cases", [])] == list(names),
+                "run-owned case manifest/selection/backend mismatch")
     engine_sha, cuda_bf16_math_policy = verified_runtime_policy(app, engine, evidence)
     require(not (evidence / "profile").exists(), "profile receipts were already collected")
     rows = []
-    for name in names_for_backend(backend):
+    for name in names:
         source = profile_dir / case_id(backend, name).replace(":", "__")
         row = verify_record(source / "record.json", backend, name, cuda_bf16_math_policy,
                             evidence / f"preflight-before-{name}.json" if backend == "cuda" else None)
@@ -515,6 +533,10 @@ def collect(profile_dir: Path, evidence: Path, backend: str, app: Path, engine: 
     verdict = {"backend": backend, "cases": rows, "status": "completed",
                "engine_sha": engine_sha, "expected_cuda_bf16_vae_math_policy": cuda_bf16_math_policy,
                "listening_audio": [row["listening_audio"] for row in rows]}
+    scope = ({"coverage_scope": "metal-five-continuation", "expected_case_names": list(names),
+              "expected_case_count": len(names), "full_backend_profile": False}
+             if metal_five_continuation else {})
+    verdict.update(scope)
     scheduling = os.environ.get("YUE2_CUDA_SCHEDULING_MODE", "shared-host")
     if scheduling in {"owner-gpu0", "owner-gpu0-mac-anchor"}:
         require(backend == "cuda", "GPU0 owner scheduling cannot grade Metal")
@@ -523,16 +545,17 @@ def collect(profile_dir: Path, evidence: Path, backend: str, app: Path, engine: 
                                              else "provisional-holder-chronology")
         verdict["holder_chronology_file"] = "gpu0-holder-chronology.jsonl"
     (evidence / "audio-inventory.json").write_text(
-        json.dumps({"backend": backend, "status": "completed", "cases": verdict["listening_audio"]}, indent=2) + "\n",
+        json.dumps({"backend": backend, "status": "completed", "cases": verdict["listening_audio"], **scope}, indent=2) + "\n",
         encoding="utf-8",
     )
     (evidence / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
     return verdict
 
 
-def copy_partial(profile_dir: Path, evidence: Path, backend: str) -> None:
+def copy_partial(profile_dir: Path, evidence: Path, backend: str,
+                 *, metal_five_continuation: bool = False) -> None:
     """Retain known JSON/log receipts on a failed case, without audio or tensors."""
-    for name in names_for_backend(backend):
+    for name in names_for_backend(backend, metal_five_continuation=metal_five_continuation):
         source = profile_dir / case_id(backend, name).replace(":", "__")
         if not source.is_dir():
             continue
@@ -550,7 +573,8 @@ def copy_partial(profile_dir: Path, evidence: Path, backend: str) -> None:
 
 
 def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Path,
-                 cases: Path, backend: str) -> dict:
+                 cases: Path, backend: str, *, metal_five_continuation: bool = False) -> dict:
+    names = names_for_backend(backend, metal_five_continuation=metal_five_continuation)
     _, cuda_bf16_math_policy = verified_runtime_policy(app, engine, evidence)
     require(not output.exists(), "profile output already exists")
     output.mkdir(parents=True)
@@ -566,8 +590,9 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
     environment.pop("GITHUB_TOKEN", None)
     manifest = json.loads((cases / "manifest.json").read_text(encoding="utf-8"))
     require(manifest.get("backend") == backend and
-            [row.get("name") for row in manifest.get("cases", [])] == list(names_for_backend(backend)),
-            "run-owned case manifest/backend mismatch")
+            [row.get("name") for row in manifest.get("cases", [])] == list(names) and
+            manifest.get("selection") == ("metal-five-continuation" if metal_five_continuation else None),
+            "run-owned case manifest/selection/backend mismatch")
     shutil.copy2(cases / "manifest.json", evidence / "cases-manifest.json")
     completed_audio = []
     try:
@@ -613,9 +638,9 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                 encoding="utf-8",
             )
         preflight(backend, evidence, "after-cases")
-        return collect(output, evidence, backend, app, engine)
+        return collect(output, evidence, backend, app, engine, metal_five_continuation=metal_five_continuation)
     finally:
-        copy_partial(output, evidence, backend)
+        copy_partial(output, evidence, backend, metal_five_continuation=metal_five_continuation)
 
 
 def preflight_console_receipt(result: dict, evidence: Path) -> dict:
@@ -646,22 +671,27 @@ def main() -> int:
     captures = sub.add_parser("run-captures")
     for field in ("app", "engine", "data", "output", "evidence", "cases", "backend"):
         captures.add_argument(f"--{field}", required=True)
+    for selected in (prepare, receipts, captures):
+        selected.add_argument("--metal-five-continuation", action="store_true",
+                              help="Metal only: capture/grade the fixed five continuation cases; not full seven-case coverage")
     args = parser.parse_args()
     if args.command == "verify-sources":
         result = verify_sources(Path(args.app), Path(args.engine), Path(args.control),
                                 args.app_sha, args.engine_sha, args.control_sha)
         Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     elif args.command == "prepare-cases":
-        result = prepare_cases(Path(args.templates), Path(args.destination), args.backend)
+        result = prepare_cases(Path(args.templates), Path(args.destination), args.backend,
+                               metal_five_continuation=args.metal_five_continuation)
     elif args.command == "preflight":
         result = preflight(args.backend, Path(args.evidence), args.label)
         result = preflight_console_receipt(result, Path(args.evidence))
     elif args.command == "collect":
         result = collect(Path(args.profile), Path(args.evidence), args.backend,
-                         Path(args.app), Path(args.engine))
+                         Path(args.app), Path(args.engine), metal_five_continuation=args.metal_five_continuation)
     else:
         result = run_captures(Path(args.app), Path(args.engine), Path(args.data),
-                              Path(args.output), Path(args.evidence), Path(args.cases), args.backend)
+                              Path(args.output), Path(args.evidence), Path(args.cases), args.backend,
+                              metal_five_continuation=args.metal_five_continuation)
     print(json.dumps(result, indent=2), flush=True)
     return 0
 

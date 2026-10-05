@@ -1,7 +1,7 @@
 name: YuE2 app stage-precision admission profile
 
 # Dispatch only, once per owned CUDA or nax-macos-2 window. This runs exactly
-# eight CUDA / seven Metal off-plan app profiles; old acceptance, corpus and quality are untouched.
+# eight CUDA / seven Metal off-plan app profiles, or an explicit fixed five-case Metal continuation.
 on:
   workflow_dispatch:
     inputs:
@@ -9,6 +9,11 @@ on:
         type: choice
         required: true
         options: [cuda, metal]
+      metal_five_continuation:
+        type: boolean
+        required: false
+        default: false
+        description: Metal only; fixed five continuation cases, not full seven-case acceptance
       cuda_scheduling_mode:
         type: choice
         required: false
@@ -53,6 +58,7 @@ jobs:
     runs-on: [self-hosted, Windows, X64, cuda, real-weights]
     timeout-minutes: 480
     env:
+      METAL_FIVE_CONTINUATION: ${{ inputs.metal_five_continuation }}
       EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
       EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
       EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
@@ -74,6 +80,7 @@ jobs:
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
         run: |
+          if ($env:METAL_FIVE_CONTINUATION -eq 'true') { throw 'Metal five-case continuation cannot target CUDA' }
           $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000000
           Add-Content -Path $env:GITHUB_ENV -Value "YUE2_APP_PRECISION_JOB_STARTED_UTC_NS=$stamp"
           if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_APP_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'exact lowercase SHA inputs required' }
@@ -225,6 +232,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 480
     env:
+      METAL_FIVE_CONTINUATION: ${{ inputs.metal_five_continuation }}
       APP_RUN_ROOT: /Users/MTrefry/actions-runner-nax/_work/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}
       APP_EVIDENCE: /Users/MTrefry/actions-runner-nax/_work/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/evidence
       CARGO_TARGET_DIR: /Users/MTrefry/actions-runner-nax/_work/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/target
@@ -277,7 +285,9 @@ jobs:
           command -v cargo rustc curl zstd
           python3.12 control/scripts/ci/yue2_app_precision_profile.py verify-sources --app app --engine engine --control control --app-sha "$EXPECTED_APP_SHA" --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" --output "$APP_EVIDENCE/sources.json"
           python3.12 control/scripts/ci/yue2_app_precision_profile.py preflight --backend metal --evidence "$APP_EVIDENCE" --label initial
-          python3.12 control/scripts/ci/yue2_app_precision_profile.py prepare-cases --templates control/scripts/ci/yue2-app-precision-cases --destination "$APP_RUN_ROOT/cases" --backend metal
+          selection=()
+          if [ "$METAL_FIVE_CONTINUATION" = true ]; then selection+=(--metal-five-continuation); fi
+          python3.12 control/scripts/ci/yue2_app_precision_profile.py prepare-cases --templates control/scripts/ci/yue2-app-precision-cases --destination "$APP_RUN_ROOT/cases" --backend metal "${selection[@]}"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -324,7 +334,7 @@ jobs:
             --out "$APP_RUN_ROOT/install" --data-dir "$APP_RUN_ROOT/app-data" --hf-home "$APP_RUN_ROOT/hf-home" \
             --api-bin "$CARGO_TARGET_DIR/release/sceneworks-rust-api" --ffmpeg-bin "$YUE2_FFMPEG_BIN" \
             > "$APP_EVIDENCE/install.log" 2>&1
-      - name: Capture exactly seven Metal app precision profiles
+      - name: Capture selected Metal app precision profiles (default seven, continuation five)
         id: capture
         continue-on-error: true
         working-directory: app
@@ -333,9 +343,11 @@ jobs:
           set -euo pipefail
           unset RUSTC_WRAPPER HF_HUB_CACHE HUGGINGFACE_HUB_CACHE
           export HF_HOME="$APP_RUN_ROOT/hf-home"
+          selection=()
+          if [ "$METAL_FIVE_CONTINUATION" = true ]; then selection+=(--metal-five-continuation); fi
           python3.12 ../control/scripts/ci/yue2_app_precision_profile.py run-captures \
             --app . --engine ../engine --data "$APP_RUN_ROOT/app-data" --output "$APP_RUN_ROOT/profile" \
-            --evidence "$APP_EVIDENCE" --cases "$APP_RUN_ROOT/cases" --backend metal
+            --evidence "$APP_EVIDENCE" --cases "$APP_RUN_ROOT/cases" --backend metal "${selection[@]}"
       - name: Upload Metal JSON/log/raw-sampler receipts only
         if: always() && steps.run-root.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
