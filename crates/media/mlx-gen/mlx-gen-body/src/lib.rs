@@ -206,9 +206,9 @@ pub fn substitute_low_confidence(
     ))
 }
 
-/// Upstream's per-sample body-proportion loss (`SDTrainer` body-proportion block, without the
-/// `t` weight — the shared path's schedule owns timing): visibility-weighted mean |Δratio| +
-/// the fraction of confident reference ratios the live image dropped. Scalar (batch mean).
+/// Upstream's per-sample body-proportion loss (`SDTrainer` body-proportion block; its `t_ratio`
+/// scale is the loss's `timestep_weight`): visibility-weighted mean |Δratio| + the fraction of
+/// confident reference ratios the live image dropped. Scalar (batch mean).
 pub fn proportion_comparison(
     ref_ratios: &Array,
     ref_vis: &Array,
@@ -313,6 +313,11 @@ impl PerceptualLoss for BodyProportionLoss {
         "body-proportion"
     }
 
+    /// Upstream's `t_ratio` weighting ([`mlx_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        mlx_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+    }
+
     fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
         Ok(self.pose.detect(clean, self.include_head)?.map(|d| {
             Box::new(ProportionReference {
@@ -376,6 +381,11 @@ impl PerceptualLoss for BodyShapeLoss {
         "body-shape"
     }
 
+    /// Upstream's `t_ratio` weighting ([`mlx_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        mlx_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+    }
+
     fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
         let Some(d) = self.pose.detect(clean, false)? else {
             return Ok(None);
@@ -425,6 +435,11 @@ impl NormalLoss {
 impl PerceptualLoss for NormalLoss {
     fn name(&self) -> &'static str {
         "normal"
+    }
+
+    /// Upstream's `t_ratio` weighting ([`mlx_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        mlx_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
     }
 
     fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {

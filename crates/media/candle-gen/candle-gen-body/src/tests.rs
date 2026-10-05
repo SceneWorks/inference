@@ -502,3 +502,87 @@ fn real_sapiens_matches_the_reference_implementation() {
         5e-3,
     );
 }
+
+/// sc-24832: the subject-restricted normal comparison ignores the normal error outside the mask —
+/// zero gradient there — and keeps it inside. Mutation: ignore `mask` in `normal_comparison` ⇒ red.
+#[test]
+fn restricted_normals_ignore_error_outside_the_mask() {
+    let s = 4usize;
+    let unit = |seed: u64| {
+        let v = normal(seed, &[1, s, s, 3], 1.0);
+        let n = v
+            .sqr()
+            .unwrap()
+            .sum_keepdim(D::Minus1)
+            .unwrap()
+            .sqrt()
+            .unwrap();
+        v.broadcast_div(&n).unwrap()
+    };
+    let reference = unit(41);
+    let live = Var::from_tensor(&unit(42)).unwrap();
+    let mut m = vec![0.0f32; s * s];
+    for y in 0..2 {
+        for x in 0..s {
+            m[y * s + x] = 1.0; // top half is the subject
+        }
+    }
+    let mask = Tensor::from_vec(m, (s, s), &dev()).unwrap();
+    let l = sapiens::normal_comparison(&reference, live.as_tensor(), Some(&mask)).unwrap();
+    let grads = l.backward().unwrap();
+    let g = grads.get(live.as_tensor()).unwrap();
+    let inside = scalar(&g.narrow(1, 0, 2).unwrap().abs().unwrap().sum_all().unwrap());
+    let outside = scalar(&g.narrow(1, 2, 2).unwrap().abs().unwrap().sum_all().unwrap());
+    assert!(inside > 0.0, "inside {inside}");
+    assert_eq!(outside, 0.0, "outside gradient must be zero");
+}
+
+/// sc-24832: every body loss carries upstream's `t_ratio` weight and the shared path scales its
+/// term by it: weighted = schedule weight × t × raw. Mutation: drop the `timestep_weight` override
+/// of any body loss ⇒ red.
+#[test]
+fn each_body_loss_is_weighted_by_the_noise_level() {
+    let w = fixture();
+    let losses: Vec<(&str, Box<dyn PerceptualLoss>)> = vec![
+        (
+            "proportion",
+            Box::new(BodyProportionLoss::new(person_pose(), false)),
+        ),
+        (
+            "shape",
+            Box::new(BodyShapeLoss::new(person_pose(), hybrik(&w), -1.0)),
+        ),
+        (
+            "normal",
+            Box::new(NormalLoss::new(person_pose(), sapiens(&w), false)),
+        ),
+    ];
+    for (name, loss) in losses {
+        assert_eq!(loss.timestep_weight(0.3), 0.3, "{name}");
+        assert_eq!(loss.timestep_weight(1.7), 1.0, "{name}");
+        assert_eq!(loss.timestep_weight(-0.2), 0.0, "{name}");
+        let mut path = path_with(loss);
+        let lora = LoraModule::new();
+        let b0 = normal(13, &[4, 2], 0.3);
+        path.ensure_reference(0, &lora.x0(&b0, &latent()).unwrap())
+            .unwrap();
+        let t = 0.4f32;
+        let plan = path.plan(0, 0, t).unwrap();
+        assert!((plan.noise_level - t).abs() < 1e-6, "{name}");
+        let live = lora
+            .x0(&b0, &(latent() + normal(22, &[1, 4, 4, 3], 0.2)).unwrap())
+            .unwrap();
+        let terms = path
+            .aux_loss(&plan, 0, &live)
+            .unwrap()
+            .expect("aux planned");
+        let raw = scalar(&terms.per_loss[0].1);
+        let weighted = scalar(&terms.weighted);
+        assert!(raw > 0.0, "{name}: raw {raw}");
+        assert!(
+            (weighted - 0.5 * t * raw).abs() <= 1e-6 * raw.max(1.0),
+            "{name}: weighted {weighted} vs 0.5·t·raw {}",
+            0.5 * t * raw
+        );
+    }
+}

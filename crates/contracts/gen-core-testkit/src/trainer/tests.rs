@@ -518,6 +518,8 @@ fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
         stub.desc.techniques = gen_core::TrainingTechniques {
             depth_anchoring: true,
             subject_mask_loss: true,
+            identity_loss: true,
+            face_landmark_loss: true,
             body_proportion_loss: true,
             body_shape_loss: true,
             normal_loss: true,
@@ -672,6 +674,8 @@ fn silently_ignored_subject_mask_loss_fails_both_technique_checks() {
         let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
         stub.desc.techniques = gen_core::TrainingTechniques {
             depth_anchoring: true,
+            identity_loss: true,
+            face_landmark_loss: true,
             ..gen_core::TrainingTechniques::ADAPTER_NOISE
         };
         Box::new(stub)
@@ -697,6 +701,53 @@ fn declared_subject_mask_loss_passes_the_technique_checks() {
     let make = || -> Box<dyn Trainer> {
         let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
         stub.desc.techniques.subject_mask_loss = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-24831: a trainer that declares every other probed technique but silently accepts an
+/// undeclared identity / face-landmark request fails the validate check and the train-entry refusal
+/// check on that probe. Mutation: drop either probe from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_face_losses_fail_both_technique_checks() {
+    for (flag, declare_other) in [("identity_loss", false), ("face_landmark_loss", true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = move || -> Box<dyn Trainer> {
+            let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+            stub.desc.techniques = gen_core::TrainingTechniques {
+                depth_anchoring: true,
+                subject_mask_loss: true,
+                resolution_buckets: true,
+                identity_loss: declare_other,
+                face_landmark_loss: false,
+                ..gen_core::TrainingTechniques::ADAPTER_NOISE
+            };
+            Box::new(stub)
+        };
+        let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(&format!("techniques.{flag} == false")),
+            "{flag}: {err}"
+        );
+        let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(flag) && err.contains("silently ignored"),
+            "{flag}: {err}"
+        );
+    }
+}
+
+/// sc-24831: a trainer that declares both face losses passes the technique checks (loss terms, not
+/// adapter-only, so no full-fine-tune refusal is demanded).
+#[test]
+fn declared_face_losses_pass_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.identity_loss = true;
+        stub.desc.techniques.face_landmark_loss = true;
         Box::new(stub)
     };
     check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();

@@ -129,6 +129,8 @@ pub fn request_fingerprint(req: &TrainingRequest) -> crate::Result<String> {
 /// Subject-masked loss (sc-24828) changes the objective, so it appends
 /// `;subject_mask_loss=<background>,<subject>` when on and nothing when off.
 ///
+/// The identity / face-landmark losses (sc-24831) change the objective, so each appends its
+/// schedule (and the identity loss its gate + reference mode) when on and nothing when off.
 /// Each enabled body loss (sc-24832) appends its schedule and knob
 /// (`;body_proportion=<w>/<t_min>-<t_max>/<every_n>,head=<bool>`, `;body_shape=…,min_cos=<c>`,
 /// `;normal=…,subject=<bool>`); a disabled one appends nothing.
@@ -196,6 +198,26 @@ pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
             ";normal={},subject={}",
             sched(&body.normal),
             body.normal_restrict_to_subject
+        ));
+    }
+    let id = &cfg.identity_loss;
+    if id.schedule.is_enabled() {
+        let s = id.schedule;
+        fingerprint.push_str(&format!(
+            ";identity_loss={:?}/{:?}-{:?}/{}/{:?}/{}",
+            s.weight,
+            s.t_min,
+            s.t_max,
+            s.every_n,
+            id.min_cos,
+            id.reference_mode.as_str()
+        ));
+    }
+    let lm = cfg.face_landmark_loss.schedule;
+    if lm.is_enabled() {
+        fingerprint.push_str(&format!(
+            ";face_landmark_loss={:?}/{:?}-{:?}/{}",
+            lm.weight, lm.t_min, lm.t_max, lm.every_n
         ));
     }
     fingerprint
@@ -392,6 +414,34 @@ mod tests {
         let mut moved = on.clone();
         moved.body_losses.normal.weight = 0.4;
         assert_ne!(training_config_fingerprint(&moved), all);
+    }
+
+    /// sc-24831: the face losses join the config fingerprint only when on (an off config keeps its
+    /// pre-sc-24831 fingerprint byte for byte), and a changed gate refuses the resume.
+    /// Mutation: drop the identity append ⇒ `with` == `base` ⇒ red.
+    #[test]
+    fn face_losses_change_the_config_fingerprint_only_when_on() {
+        let base_cfg = TrainingConfig::default();
+        let base = training_config_fingerprint(&base_cfg);
+        assert!(
+            !base.contains("identity") && !base.contains("landmark"),
+            "{base}"
+        );
+        let mut on = base_cfg.clone();
+        on.identity_loss.schedule.weight = 0.1;
+        let with = training_config_fingerprint(&on);
+        assert_eq!(
+            with,
+            format!("{base};identity_loss=0.1/0.0-1.0/2/0.2/dataset_average")
+        );
+        on.face_landmark_loss.schedule.weight = 0.05;
+        assert!(training_config_fingerprint(&on).ends_with(";face_landmark_loss=0.05/0.0-1.0/2"));
+        let mut gate = on.clone();
+        gate.identity_loss.min_cos = 0.3;
+        assert_ne!(
+            training_config_fingerprint(&gate),
+            training_config_fingerprint(&on)
+        );
     }
 
     #[test]

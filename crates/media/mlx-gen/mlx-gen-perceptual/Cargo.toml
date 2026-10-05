@@ -11,6 +11,8 @@ mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 mlx-gen-depth = { path = "../mlx-gen-depth" }
+# ArcFace identity + FaceMesh landmark arms (sc-24831).
+mlx-gen-face = { path = "../mlx-gen-face" }
 mlx-gen-body = { path = "../mlx-gen-body" }
 
 [dev-dependencies]

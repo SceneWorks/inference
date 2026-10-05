@@ -298,7 +298,8 @@ pub fn substitute_low_confidence(
     ))
 }
 
-/// Upstream's per-sample body-proportion loss (no `t` weight). Scalar (batch mean).
+/// Upstream's per-sample body-proportion loss (its `t_ratio` scale is the loss's
+/// `timestep_weight`). Scalar (batch mean).
 pub fn proportion_comparison(
     ref_ratios: &Tensor,
     ref_vis: &Tensor,
@@ -392,6 +393,11 @@ impl PerceptualLoss for BodyProportionLoss {
         "body-proportion"
     }
 
+    /// Upstream's `t_ratio` weighting ([`candle_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        candle_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+    }
+
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {
         Ok(self.pose.detect(clean, self.include_head)?.map(|d| {
             Box::new(ProportionReference {
@@ -450,6 +456,11 @@ impl PerceptualLoss for BodyShapeLoss {
         "body-shape"
     }
 
+    /// Upstream's `t_ratio` weighting ([`candle_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        candle_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+    }
+
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {
         let Some(d) = self.pose.detect(clean, false)? else {
             return Ok(None);
@@ -496,6 +507,11 @@ impl NormalLoss {
 impl PerceptualLoss for NormalLoss {
     fn name(&self) -> &'static str {
         "normal"
+    }
+
+    /// Upstream's `t_ratio` weighting ([`candle_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    fn timestep_weight(&self, noise_level: f32) -> f32 {
+        candle_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
     }
 
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {

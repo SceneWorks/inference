@@ -380,6 +380,21 @@ fn compute_step_loss_grads(
 
 /// A cached `[B, C, T, h, w]` latent (`T = 1` for a still) as the decoder's NCHW batch
 /// `[B·T, C, h, w]` — each latent frame decoded independently.
+/// Build every cache entry's perceptual reference once (item-major entries, each clean `[B, C, T,
+/// h, w]` latent as the decoder's NCHW frame batch), handing the path the job's subject masks
+/// first (sc-24832) so a mask-reading loss gets each entry's item mask on its decoded grid.
+fn prepare_perceptual_references<'a>(
+    path: &mut PerceptualPath,
+    clean: impl Iterator<Item = &'a Tensor>,
+    masks: Option<candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks>,
+) -> Result<()> {
+    path.attach_subject_masks(masks);
+    for (entry, x0) in clean.enumerate() {
+        path.ensure_reference(entry, &latent_frames_nchw(x0)?)?;
+    }
+    Ok(())
+}
+
 fn latent_frames_nchw(latent: &Tensor) -> Result<Tensor> {
     let (b, c, t, h, w) = latent.dims5()?;
     Ok(latent
@@ -750,6 +765,9 @@ impl TrainVariant {
                 resolution_buckets: true,
                 subject_mask_loss: true,
                 depth_anchoring: true,
+                // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
+                identity_loss: true,
+                face_landmark_loss: true,
                 // sc-24832: the body losses ride the same builder arms as depth anchoring
                 // (decoded-x0 pixel losses through this trainer's x0 decoder).
                 body_proportion_loss: true,
@@ -1158,18 +1176,14 @@ impl WanMoeTrainer {
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
             // cropped like the image and resampled onto its decoded size.
-            path.attach_subject_masks(
-                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
-                    "wan trainer",
-                    &req.items,
-                    cfg,
-                    edges.len(),
-                    CropBox::center_square,
-                )?,
-            );
-            for (entry, (x0, _, _)) in cache.iter().enumerate() {
-                path.ensure_reference(entry, &latent_frames_nchw(x0)?)?;
-            }
+            let masks = candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
+                "wan trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?;
+            prepare_perceptual_references(path, cache.iter().map(|(x0, _, _)| x0), masks)?;
         }
         let mut alternation = perceptual.as_ref().map(|_| {
             perceptual_alternation(
@@ -2696,5 +2710,127 @@ mod depth_anchoring_tests {
             .unwrap()
             .to_string();
         assert!(err.contains("TAEW2.2"), "{err}");
+    }
+}
+
+/// sc-24832: the Candle Wan (video) reference preparation hands each cache entry its item's
+/// subject mask — cropped like the image and resampled onto that entry's decoded frame grid — to a
+/// mask-reading loss. Mutation: drop `path.attach_subject_masks(masks)` from
+/// `prepare_perceptual_references` ⇒ the probe sees no mask ⇒ red.
+#[cfg(test)]
+mod subject_mask_reference_tests {
+    use super::*;
+    use std::any::Any;
+    use std::sync::{Arc, Mutex};
+
+    use candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks;
+    use candle_gen::train::perceptual::{AuxLoss, AuxLossSchedule, LossReference, PerceptualLoss};
+    use candle_gen::train::taehv::{splitmix_uniform, synthetic_taehv_weights, TaehvDecoder};
+
+    type Seen = Arc<Mutex<Vec<Option<(Vec<usize>, Vec<f32>)>>>>;
+
+    /// Records the mask every reference receives.
+    struct MaskProbe(Seen);
+    impl PerceptualLoss for MaskProbe {
+        fn name(&self) -> &'static str {
+            "mask-probe"
+        }
+        fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {
+            self.reference_with_mask(clean, None)
+        }
+        fn reference_with_mask(
+            &self,
+            _clean: &Tensor,
+            mask: Option<&Tensor>,
+        ) -> Result<Option<LossReference>> {
+            self.0.lock().unwrap().push(mask.map(|m| {
+                (
+                    m.dims().to_vec(),
+                    m.flatten_all().unwrap().to_vec1().unwrap(),
+                )
+            }));
+            Ok(Some(Box::new(())))
+        }
+        fn loss(&self, live: &Tensor, _r: &dyn Any) -> Result<Tensor> {
+            Ok(live.mean_all()?)
+        }
+    }
+
+    fn write_png(
+        dir: &std::path::Path,
+        name: &str,
+        f: impl Fn(u32, u32) -> u8,
+    ) -> std::path::PathBuf {
+        let p = dir.join(name);
+        image::GrayImage::from_fn(12, 8, |x, y| image::Luma([f(x, y)]))
+            .save(&p)
+            .unwrap();
+        p
+    }
+
+    #[test]
+    fn the_video_reference_path_hands_each_entry_its_items_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = write_png(dir.path(), "img.png", |_, _| 128);
+        let masks = [
+            write_png(dir.path(), "right.png", |x, _| if x >= 6 { 255 } else { 0 }),
+            write_png(dir.path(), "top.png", |_, y| if y < 4 { 255 } else { 0 }),
+        ];
+        let items: Vec<candle_gen::gen_core::train::TrainingItem> = masks
+            .iter()
+            .map(|m| {
+                let mut it =
+                    candle_gen::gen_core::train::TrainingItem::captioned(img.clone(), "c".into());
+                it.subject_mask_path = Some(m.clone());
+                it
+            })
+            .collect();
+        let mut cfg = TrainingConfig::default();
+        cfg.body_losses.normal.weight = 0.1;
+        cfg.body_losses.normal_restrict_to_subject = true;
+        let tae = TaehvConfig {
+            channels: [8, 6, 4, 4],
+            ..TaehvConfig::taew2_1()
+        };
+        let dec = TaehvDecoder::from_weights(
+            &synthetic_taehv_weights(&tae, 11, &Device::Cpu).unwrap(),
+            tae,
+        )
+        .unwrap();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let mut path = PerceptualPath::new(
+            Some(Box::new(dec)),
+            vec![AuxLoss {
+                schedule: AuxLossSchedule {
+                    weight: 0.1,
+                    t_min: 0.0,
+                    t_max: 1.0,
+                    every_n: 1,
+                },
+                loss: Box::new(MaskProbe(seen.clone())),
+            }],
+        )
+        .unwrap();
+        let clean: Vec<Tensor> = (0..2u64)
+            .map(|i| splitmix_uniform(&[1, 16, 1, 4, 4], 7 + i, 1.0, 0.0, &Device::Cpu).unwrap())
+            .collect();
+        let loaded =
+            PerceptualSubjectMasks::load("t", &items, &cfg, 1, CropBox::center_square).unwrap();
+        let expected = loaded.clone().unwrap();
+        prepare_perceptual_references(&mut path, clean.iter(), loaded).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for (entry, got) in seen.iter().enumerate() {
+            let (shape, values) = got.as_ref().expect("every reference gets its mask");
+            assert_eq!(shape.len(), 2);
+            let (h, w) = (shape[0], shape[1]);
+            assert!(h > 0 && w > 0);
+            assert_eq!(
+                values,
+                &expected.pixel_mask(entry, w, h).unwrap(),
+                "entry {entry}"
+            );
+        }
+        assert_ne!(seen[0], seen[1], "each entry carries its own item's mask");
     }
 }

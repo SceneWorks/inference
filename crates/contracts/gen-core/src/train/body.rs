@@ -784,6 +784,13 @@ impl Letterbox {
     }
 }
 
+/// Upstream's body-loss timestep weighting (`bp_weight = bsh_weight = nrm_weight = t_ratio` in
+/// `SDTrainer`): each body loss's term at noise level `t ∈ [0, 1]` (flow `σ`, or `t / T`) is scaled
+/// by `t` — applied by the shared path through `PerceptualLoss::timestep_weight`.
+pub fn body_loss_timestep_weight(noise_level: f32) -> f32 {
+    noise_level.clamp(0.0, 1.0)
+}
+
 /// One of the three body losses (one builder arm each).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyArm {

@@ -699,6 +699,10 @@ pub struct TrainerCapabilitySnapshot {
     pub supports_resolution_buckets: bool,
     /// Honors `TrainingConfig::subject_mask_loss` (epic 2123 subject-masked loss, sc-24828).
     pub supports_subject_mask_loss: bool,
+    /// Honors `TrainingConfig::identity_loss` (epic 2123 ArcFace identity loss, sc-24831).
+    pub supports_identity_loss: bool,
+    /// Honors `TrainingConfig::face_landmark_loss` (epic 2123 FaceMesh landmark loss, sc-24831).
+    pub supports_face_landmark_loss: bool,
     /// Honors `BodyLossesConfig::proportion` (epic 2123 ViTPose body-proportion loss, sc-24832).
     pub supports_body_proportion_loss: bool,
     /// Honors `BodyLossesConfig::shape` (epic 2123 HybrIK body-shape loss, sc-24832).
@@ -724,6 +728,8 @@ impl TrainerCapabilitySnapshot {
             supports_gradient_noise: descriptor.techniques.gradient_noise,
             supports_resolution_buckets: descriptor.techniques.resolution_buckets,
             supports_subject_mask_loss: descriptor.techniques.subject_mask_loss,
+            supports_identity_loss: descriptor.techniques.identity_loss,
+            supports_face_landmark_loss: descriptor.techniques.face_landmark_loss,
             supports_body_proportion_loss: descriptor.techniques.body_proportion_loss,
             supports_body_shape_loss: descriptor.techniques.body_shape_loss,
             supports_normal_loss: descriptor.techniques.normal_loss,
@@ -746,6 +752,8 @@ impl TrainerCapabilitySnapshot {
             "supports_gradient_noise": self.supports_gradient_noise,
             "supports_resolution_buckets": self.supports_resolution_buckets,
             "supports_subject_mask_loss": self.supports_subject_mask_loss,
+            "supports_identity_loss": self.supports_identity_loss,
+            "supports_face_landmark_loss": self.supports_face_landmark_loss,
             "supports_body_proportion_loss": self.supports_body_proportion_loss,
             "supports_body_shape_loss": self.supports_body_shape_loss,
             "supports_normal_loss": self.supports_normal_loss,
@@ -1078,6 +1086,17 @@ mod tests {
         masked.techniques.subject_mask_loss = true;
         let masked_json = TrainerCapabilitySnapshot::from_descriptor(&masked).to_json();
         assert_eq!(masked_json["supports_subject_mask_loss"], true);
+        // sc-24831: the identity / face-landmark losses are advertised per flag.
+        assert_eq!(json["supports_identity_loss"], false);
+        assert_eq!(json["supports_face_landmark_loss"], false);
+        let mut face = descriptor;
+        face.techniques.identity_loss = true;
+        let face_json = TrainerCapabilitySnapshot::from_descriptor(&face).to_json();
+        assert_eq!(face_json["supports_identity_loss"], true);
+        assert_eq!(face_json["supports_face_landmark_loss"], false);
+        face.techniques.face_landmark_loss = true;
+        let face_json = TrainerCapabilitySnapshot::from_descriptor(&face).to_json();
+        assert_eq!(face_json["supports_face_landmark_loss"], true);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {

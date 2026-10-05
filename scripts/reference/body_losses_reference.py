@@ -23,7 +23,8 @@ Reference implementations:
   1e-6 (upstream's port uses torch's 1e-5 default).
 
 Deliberate deviations of the port, reproduced here so the fixture pins the port's behaviour:
-- the shared perceptual path applies no `t`-weighting inside a loss (its schedule window does);
+- the fixture's losses are the per-sample terms before upstream's `t_ratio` scaling, which the port
+  applies on the shared path (`PerceptualLoss::timestep_weight`, tested in the ports);
 - the normal loss's subject mask is letterboxed with the normals (upstream resizes the raw mask
   straight to the letterboxed map, misaligning it with the padding).
 
@@ -181,7 +182,7 @@ def vitpose_forward(model, pixels, input_size, ref_ratios=None, include_head=Fal
 
 
 def proportion_loss(ref_ratios, ref_vis, gen_ratios, gen_vis):
-    """Upstream SDTrainer body-proportion term for one valid sample (no t-weight)."""
+    """Upstream SDTrainer body-proportion term for one valid sample (before the t_ratio scale)."""
     combined_vis = torch.min(ref_vis, gen_vis)
     weighted_diff = (gen_ratios - ref_ratios).abs() * combined_vis
     loss = weighted_diff.sum(dim=-1) / combined_vis.sum(dim=-1).clamp(min=1e-6)
@@ -486,7 +487,7 @@ def sapiens_mask(mask, train_size=(32, 24), normal_size=16):
 
 
 def normal_loss(ref, gen, mask=None):
-    """Upstream SDTrainer normal term for one valid sample (no t-weight)."""
+    """Upstream SDTrainer normal term for one valid sample (before the t_ratio scale)."""
     cos_per_pixel = (ref * gen).sum(dim=1)
     l1_per_pixel = (ref - gen).abs().mean(dim=1)
     if mask is not None:

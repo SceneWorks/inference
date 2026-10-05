@@ -239,6 +239,10 @@ fn trainer_descriptor() -> TrainerDescriptor {
             resolution_buckets: true,
             subject_mask_loss: true,
             depth_anchoring: true,
+            // sc-24831: the ArcFace identity + FaceMesh landmark losses, picked up through the
+            // same shared perceptual builder arms (no trainer-loop change).
+            identity_loss: true,
+            face_landmark_loss: true,
             // sc-24832: the body losses ride the same builder arms as depth anchoring
             // (decoded-x0 pixel losses through this trainer's x0 decoder).
             body_proportion_loss: true,
@@ -3016,6 +3020,9 @@ mod depth_anchoring_tests {
     #[test]
     fn descriptor_and_refusals() {
         assert!(trainer_descriptor().techniques.depth_anchoring);
+        // sc-24831: the face losses ride the same builder arms.
+        assert!(trainer_descriptor().techniques.identity_loss);
+        assert!(trainer_descriptor().techniques.face_landmark_loss);
         let tmp = tempfile::tempdir().unwrap();
         let mut req = TrainingRequest {
             items: vec![mlx_gen::TrainingItem::captioned("a.png".into(), "c".into())],

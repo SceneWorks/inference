@@ -17,6 +17,7 @@
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.
 pub mod aux_schedule;
 pub mod body;
+pub mod face_loss;
 pub mod resume;
 pub mod schedule;
 pub mod subject_mask;
@@ -262,6 +263,101 @@ pub struct TrainingConfig {
     /// [`normal_loss`](TrainingTechniques::normal_loss)) — see [`validate_training_techniques`].
     /// An image with no detected person is skipped by all three.
     pub body_losses: BodyLossesConfig,
+    /// **ArcFace identity loss** (epic 2123, sc-24831) — an auxiliary perceptual loss on the shared
+    /// decoded-x0 path: the face of the decoded x0 prediction (cropped with the box SCRFD found on
+    /// the image's own encode→decode round trip, once per image) is embedded by a frozen ArcFace and
+    /// pulled toward the image's reference embedding, `loss = 1 − cos(embed(x0_face), reference)`.
+    /// An image with no detected face is skipped; a step whose live cosine is at or below
+    /// [`IdentityLossConfig::min_cos`] contributes zero (no push on a hallucinated non-face). Off by
+    /// default ([`AuxLossSchedule::weight`] `0`); refused (typed [`crate::Error::Unsupported`]) by a
+    /// trainer whose [`TrainerDescriptor::techniques`] does not declare
+    /// [`identity_loss`](TrainingTechniques::identity_loss).
+    pub identity_loss: IdentityLossConfig,
+    /// **Face-landmark loss** (epic 2123, sc-24831) — an auxiliary perceptual loss on the shared
+    /// decoded-x0 path: a frozen MediaPipe FaceMesh-v2 predicts the 478 landmarks of the decoded x0
+    /// face crop (same reference-time SCRFD box as the identity loss) and the region-weighted
+    /// (jaw ×3, lips ×2, eyes+nose ×1) mean landmark distance to the reference's normalized
+    /// landmarks is the loss. Off by default; refused by a trainer that does not declare
+    /// [`face_landmark_loss`](TrainingTechniques::face_landmark_loss).
+    pub face_landmark_loss: FaceLandmarkLossConfig,
+    /// Directory holding the **face-analysis stack** both face losses detect with —
+    /// `scrfd_10g.safetensors` (SCRFD detector) and `arcface_iresnet100.safetensors` (the ArcFace
+    /// embedder the identity loss runs), the SceneWorks `instantid_face_stack` bundle. Required (a
+    /// typed refusal otherwise) whenever [`identity_loss`](Self::identity_loss) or
+    /// [`face_landmark_loss`](Self::face_landmark_loss) is enabled. `None` by default.
+    pub face_analysis_dir: Option<PathBuf>,
+}
+
+/// Where [`IdentityLossConfig`]'s per-image target embedding comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IdentityReferenceMode {
+    /// Every image's target is the L2-normalized mean of all face-bearing images' reference
+    /// embeddings (upstream `identity_loss_use_average`, its default) — pulls each sample toward
+    /// the subject's identity rather than toward one photo's pose/lighting.
+    #[default]
+    DatasetAverage,
+    /// Every image's target is its own reference embedding.
+    PerImage,
+}
+
+impl IdentityReferenceMode {
+    /// Parse the contract string (`dataset_average`/`per_image`, case-insensitive); `None` otherwise.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "dataset_average" => Some(Self::DatasetAverage),
+            "per_image" => Some(Self::PerImage),
+            _ => None,
+        }
+    }
+
+    /// The contract string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DatasetAverage => "dataset_average",
+            Self::PerImage => "per_image",
+        }
+    }
+}
+
+/// [`TrainingConfig::identity_loss`] — the ArcFace identity loss schedule and its gate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdentityLossConfig {
+    /// Weight / window / alternation. Off by default.
+    pub schedule: AuxLossSchedule,
+    /// A step whose live cosine `cos(embed(x0_face), reference)` is `<= min_cos` contributes zero
+    /// identity loss (upstream `identity_loss_min_cos`, default `0.2`). In `[-1, 1]`.
+    pub min_cos: f32,
+    /// Per-image or dataset-average target embedding.
+    pub reference_mode: IdentityReferenceMode,
+}
+
+impl IdentityLossConfig {
+    /// Upstream `identity_loss_min_cos` default.
+    pub const DEFAULT_MIN_COS: f32 = 0.2;
+    /// Inclusive bounds of [`min_cos`](Self::min_cos).
+    pub const MIN_COS_RANGE: (f32, f32) = (-1.0, 1.0);
+}
+
+impl Default for IdentityLossConfig {
+    fn default() -> Self {
+        Self {
+            schedule: AuxLossSchedule::OFF,
+            min_cos: Self::DEFAULT_MIN_COS,
+            reference_mode: IdentityReferenceMode::default(),
+        }
+    }
+}
+
+/// [`TrainingConfig::face_landmark_loss`] — the FaceMesh landmark loss schedule plus the frozen
+/// FaceMesh-v2 checkpoint it runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FaceLandmarkLossConfig {
+    /// Weight / window / alternation. Off by default.
+    pub schedule: AuxLossSchedule,
+    /// Directory holding the converted FaceMesh-v2 program checkpoint
+    /// (`face_landmarks_detector.safetensors`). Required (a typed refusal otherwise) when the loss is
+    /// enabled.
+    pub model_dir: Option<PathBuf>,
 }
 
 /// The weights of [`TrainingConfig::subject_mask_loss`] (epic 2123, sc-24828). A latent cell with
@@ -494,6 +590,11 @@ impl Default for TrainingConfig {
             // Subject-masked loss is OFF by default (epic 2123 E1): no mask is read and the loss is
             // the plain unweighted mean.
             subject_mask_loss: None,
+            // Identity / face-landmark losses are OFF by default (epic 2123 E1): weight 0, no face
+            // model loaded.
+            identity_loss: IdentityLossConfig::default(),
+            face_landmark_loss: FaceLandmarkLossConfig::default(),
+            face_analysis_dir: None,
             // Body losses are OFF by default (epic 2123 E1): all three weights 0, no model loaded.
             body_losses: BodyLossesConfig::default(),
         }
@@ -897,6 +998,10 @@ pub struct TrainingTechniques {
     pub resolution_buckets: bool,
     /// Honors [`TrainingConfig::subject_mask_loss`] (subject-masked loss weighting, sc-24828).
     pub subject_mask_loss: bool,
+    /// Honors [`TrainingConfig::identity_loss`] (decoded-x0 ArcFace identity loss, sc-24831).
+    pub identity_loss: bool,
+    /// Honors [`TrainingConfig::face_landmark_loss`] (decoded-x0 FaceMesh landmark loss, sc-24831).
+    pub face_landmark_loss: bool,
     /// Honors [`BodyLossesConfig::proportion`] (ViTPose+ bone-length-ratio loss, sc-24832).
     pub body_proportion_loss: bool,
     /// Honors [`BodyLossesConfig::shape`] (HybrIK SMPL-beta loss, sc-24832).
@@ -913,6 +1018,8 @@ impl TrainingTechniques {
         depth_anchoring: false,
         gradient_noise: false,
         resolution_buckets: false,
+        identity_loss: false,
+        face_landmark_loss: false,
         body_proportion_loss: false,
         body_shape_loss: false,
         normal_loss: false,
@@ -926,6 +1033,8 @@ impl TrainingTechniques {
         resolution_buckets: false,
         depth_anchoring: false,
         subject_mask_loss: false,
+        identity_loss: false,
+        face_landmark_loss: false,
         body_proportion_loss: false,
         body_shape_loss: false,
         normal_loss: false,
@@ -999,6 +1108,12 @@ pub fn technique_noise_key(seed: u64, salt: u64, update_idx: u32, tensor_idx: us
 /// - `subject_mask_loss` set while any item has no
 ///   [`subject_mask_path`](TrainingItem::subject_mask_path) ⇒ [`crate::Error::Msg`] naming the
 ///   images that lack one (defence in depth behind the product-layer preflight).
+/// - a malformed identity / face-landmark schedule, or `identity_loss.min_cos` outside `[-1, 1]`
+///   ⇒ [`crate::Error::Msg`]; either loss enabled on a trainer that lacks
+///   [`identity_loss`](TrainingTechniques::identity_loss) /
+///   [`face_landmark_loss`](TrainingTechniques::face_landmark_loss) ⇒ typed
+///   [`crate::Error::Unsupported`]; enabled without [`TrainingConfig::face_analysis_dir`], the
+///   x0 decoder, or (landmarks) [`FaceLandmarkLossConfig::model_dir`] ⇒ [`crate::Error::Msg`].
 /// - every technique off ⇒ no-op.
 pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
@@ -1077,6 +1192,7 @@ pub fn validate_training_techniques(
             )));
         }
     }
+    validate_face_losses(desc, &req.config)?;
     if let Some(mask_loss) = &req.config.subject_mask_loss {
         mask_loss.validate(desc.id)?;
         if !desc.techniques.subject_mask_loss {
@@ -1166,6 +1282,71 @@ fn validate_body_losses(desc: &TrainerDescriptor, req: &TrainingRequest) -> crat
                 subject_mask::name_list(&lacking)
             )));
         }
+    }
+    Ok(())
+}
+
+/// Face-loss half of [`validate_training_techniques`] (sc-24831): malformed schedules / `min_cos`
+/// ⇒ `Msg`; an enabled loss the trainer does not declare ⇒ `Unsupported`; an enabled loss without
+/// its models (the face-analysis stack, the FaceMesh checkpoint, the x0 decoder) ⇒ `Msg` naming the
+/// missing one.
+fn validate_face_losses(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> crate::Result<()> {
+    let id = &cfg.identity_loss;
+    let lm = &cfg.face_landmark_loss;
+    let msg = |m: String| crate::Error::Msg(format!("{}: {m}", desc.id));
+    id.schedule.validate("identity loss").map_err(msg)?;
+    lm.schedule.validate("face-landmark loss").map_err(msg)?;
+    let (lo, hi) = IdentityLossConfig::MIN_COS_RANGE;
+    if !id.min_cos.is_finite() || id.min_cos < lo || id.min_cos > hi {
+        return Err(crate::Error::Msg(format!(
+            "{}: identity_loss.min_cos must be in [{lo}, {hi}], got {}",
+            desc.id, id.min_cos
+        )));
+    }
+    let checks = [
+        (
+            id.schedule.is_enabled(),
+            desc.techniques.identity_loss,
+            "the ArcFace identity loss",
+            id.schedule.weight,
+        ),
+        (
+            lm.schedule.is_enabled(),
+            desc.techniques.face_landmark_loss,
+            "the face-landmark loss",
+            lm.schedule.weight,
+        ),
+    ];
+    for (enabled, declared, name, weight) in checks {
+        if !enabled {
+            continue;
+        }
+        if !declared {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: {name} (weight {weight}) is not supported by this trainer",
+                desc.id
+            )));
+        }
+        if cfg.face_analysis_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: {name} needs the SCRFD + ArcFace face-analysis stack \
+                 (face_analysis_dir is unset)",
+                desc.id
+            )));
+        }
+        if cfg.perceptual_decoder_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: {name} needs the family's small x0 decoder (perceptual_decoder_dir is unset)",
+                desc.id
+            )));
+        }
+    }
+    if lm.schedule.is_enabled() && lm.model_dir.is_none() {
+        return Err(crate::Error::Msg(format!(
+            "{}: the face-landmark loss needs the MediaPipe FaceMesh-v2 checkpoint \
+             (face_landmark_loss.model_dir is unset)",
+            desc.id
+        )));
     }
     Ok(())
 }
@@ -1994,6 +2175,87 @@ mod tests {
             let err = validate_training_techniques(&depth_desc, &r).unwrap_err();
             assert!(matches!(err, crate::Error::Msg(_)), "{schedule:?}: {err:?}");
         }
+    }
+
+    /// sc-24831 (epic 2123 E3): the identity / face-landmark losses are refused unless declared,
+    /// need their models named, and malformed schedules / min_cos are refused outright.
+    /// Mutations: skip `validate_face_losses` ⇒ the Unsupported/Msg asserts go red; drop the
+    /// `min_cos` range check ⇒ the bad-gate loop goes red.
+    #[test]
+    fn validate_training_techniques_face_loss_floor() {
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut face_desc = trainer_desc(false);
+        face_desc.techniques.identity_loss = true;
+        face_desc.techniques.face_landmark_loss = true;
+
+        let off = train_req(None, items);
+        assert_eq!(off.config.identity_loss.schedule, AuxLossSchedule::OFF);
+        assert_eq!(off.config.face_landmark_loss.schedule, AuxLossSchedule::OFF);
+        assert_eq!(off.config.identity_loss.min_cos, 0.2);
+        assert_eq!(
+            off.config.identity_loss.reference_mode,
+            IdentityReferenceMode::DatasetAverage
+        );
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.identity_loss.schedule.weight = 0.1;
+        on.config.face_landmark_loss.schedule.weight = 0.05;
+        on.config.face_landmark_loss.model_dir = Some(PathBuf::from("/m/facemesh"));
+        on.config.face_analysis_dir = Some(PathBuf::from("/m/face"));
+        on.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
+        assert!(validate_training_techniques(&face_desc, &on).is_ok());
+        for (identity, name) in [(true, "identity loss"), (false, "face-landmark loss")] {
+            let mut d = face_desc;
+            if identity {
+                d.techniques.identity_loss = false;
+            } else {
+                d.techniques.face_landmark_loss = false;
+            }
+            let err = validate_training_techniques(&d, &on).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m) if m.contains(name)),
+                "{name}: {err:?}"
+            );
+        }
+
+        let mut no_face = on.clone();
+        no_face.config.face_analysis_dir = None;
+        let err = validate_training_techniques(&face_desc, &no_face).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("face_analysis_dir")));
+        let mut no_dec = on.clone();
+        no_dec.config.perceptual_decoder_dir = None;
+        let err = validate_training_techniques(&face_desc, &no_dec).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")));
+        let mut no_mesh = on.clone();
+        no_mesh.config.face_landmark_loss.model_dir = None;
+        let err = validate_training_techniques(&face_desc, &no_mesh).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("FaceMesh")));
+
+        for bad in [f32::NAN, -1.01, 1.5] {
+            let mut r = on.clone();
+            r.config.identity_loss.min_cos = bad;
+            let err = validate_training_techniques(&face_desc, &r).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Msg(ref m) if m.contains("min_cos")),
+                "{bad}"
+            );
+        }
+        let mut bad_sched = on.clone();
+        bad_sched.config.face_landmark_loss.schedule.every_n = 0;
+        assert!(matches!(
+            validate_training_techniques(&face_desc, &bad_sched).unwrap_err(),
+            crate::Error::Msg(_)
+        ));
+        assert_eq!(
+            IdentityReferenceMode::parse("Per_Image"),
+            Some(IdentityReferenceMode::PerImage)
+        );
+        assert_eq!(IdentityReferenceMode::parse("mean"), None);
     }
 
     #[test]
