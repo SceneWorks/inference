@@ -50,7 +50,25 @@ def measured_scope(backend: str) -> dict:
 
 def write_record(record: Path, body: dict) -> None:
     record.parent.mkdir(parents=True, exist_ok=True)
+    case_name = next(name for name in control.names_for_backend(body["backend"])
+                     if control.case_id(body["backend"], name) == body["caseId"])
+    fixture = json.loads((MODULE_PATH.with_name("yue2-app-precision-cases") /
+                          f"{case_name}.json").read_text(encoding="utf-8"))
+    fixture["id"] = body["caseId"]
+    (record.parent / "case.json").write_text(json.dumps(fixture), encoding="utf-8")
+    body.setdefault("request", {}).setdefault("planning", fixture["request"]["planning"])
     if body.get("backend") == "cuda":
+        measured = body.get("measured", {})
+        global_lines = []
+        for index, stage in enumerate(control.STAGES):
+            summary = measured.get("stages", {}).get(stage, {"peakBytes": 1, "samples": 1})
+            count = summary.get("samples", 1)
+            for sample_index in range(count):
+                at = index + 1 + (sample_index + 1) / (count + 1)
+                global_lines.append(json.dumps({"at": at, "startedAt": at - 0.01,
+                                                "bytes": summary.get("peakBytes", 1)}))
+        (record.parent / "cuda-samples.jsonl").write_text("\n".join(global_lines) + "\n",
+                                                          encoding="utf-8")
         owned = body.get("measured", {}).get("owned")
         if isinstance(owned, dict):
             (record.parent / "stages.jsonl").write_text("".join(
@@ -233,6 +251,61 @@ class PrecisionControlTests(unittest.TestCase):
             write_record(record, body)
             with self.assertRaisesRegex(ValueError, "decoder identity"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy", M4_POLICY)
+
+    def test_off_planning_receipt_uses_four_exact_source_bound_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            name = "strict-bf16-standard"
+            body = {
+                "caseId": control.case_id("cuda", name), "backend": "cuda",
+                "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae"}},
+                "request": {"name": name, "computePolicy": "bf16"},
+                "admission": {"outcome": "admitted", "estimate": {"stages": estimated_stages()}},
+                "outcome": {"status": "completed", "engineComputePolicy": "bf16",
+                            "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16",
+                            "engineVaeCudaBf16MathPolicy": M4_POLICY},
+                "measured": {"peakBytes": 1024, "stages": {
+                    stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES},
+                    **measured_scope("cuda")},
+            }
+            write_record(record, body)
+            self.assertEqual(list(control.verify_record(record, "cuda", name, M4_POLICY)["stage_samples"]),
+                             ["load", "semantic", "acoustic", "decode"])
+
+            global_journal = record.parent / "cuda-samples.jsonl"
+            global_lines = global_journal.read_text(encoding="utf-8").splitlines()
+            altered = json.loads(global_lines[0])
+            altered["bytes"] += 1
+            global_lines[0] = json.dumps(altered)
+            global_journal.write_text("\n".join(global_lines) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "global stage peaks differ"):
+                control.verify_record(record, "cuda", name, M4_POLICY)
+            write_record(record, body)
+
+            marks = record.parent / "stages.jsonl"
+            valid_marks = marks.read_text(encoding="utf-8")
+            for mutated in (
+                valid_marks.replace('"stage": "semantic"', '"stage": "plan"', 1),
+                valid_marks.replace('"stage": "semantic"', '"stage": "load"', 1),
+                valid_marks.replace('"stage": "semantic"', '"stage": "acoustic"', 1),
+            ):
+                marks.write_text(mutated, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "stage marks are incomplete or unordered"):
+                    control.verify_record(record, "cuda", name, M4_POLICY)
+            marks.write_text(valid_marks, encoding="utf-8")
+
+            body["request"]["planning"] = "full"
+            write_record(record, body)
+            with self.assertRaisesRegex(ValueError, "record planning mode"):
+                control.verify_record(record, "cuda", name, M4_POLICY)
+            body["request"]["planning"] = "off"
+            write_record(record, body)
+            case_path = record.parent / "case.json"
+            case = json.loads(case_path.read_text(encoding="utf-8"))
+            case["request"]["planning"] = "full"
+            case_path.write_text(json.dumps(case), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "captured case differs"):
+                control.verify_record(record, "cuda", name, M4_POLICY)
 
     def test_effective_cuda_bf16_vae_math_policy_is_required_only_for_cuda_bf16(self):
         with tempfile.TemporaryDirectory() as directory:
