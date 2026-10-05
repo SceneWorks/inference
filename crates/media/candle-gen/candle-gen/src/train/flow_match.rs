@@ -59,6 +59,7 @@ use crate::train::lora::{
     AdapterKind, LoraHost, LoraSet,
 };
 use crate::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
+use crate::train::perceptual::{combine_step_loss, AuxAlternation, PerceptualPath, StepPlan};
 use crate::train::schedule::{lr_multiplier, schedule_updates};
 use crate::{CandleError, Result};
 
@@ -517,6 +518,244 @@ pub fn sample_seed(base: u64, step: u32, index: usize) -> u64 {
         .wrapping_add(index as u64)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Epic 2123 E8 — the step-level glue between a trainer loop and its `PerceptualPath`. Used by the
+// driver below AND by the trainers with their own loop (SDXL, Kolors, SD3, Qwen-Image 2.1), so
+// every Candle trainer drives the shared path the same way.
+// ---------------------------------------------------------------------------------------------
+
+/// A trainer's perceptual path plus its per-item alternation, ready for the loop: every cache
+/// entry's reference is built, and on resume the skipped prefix's alternation keys are replayed.
+pub struct AuxDriver {
+    path: PerceptualPath,
+    alternation: AuxAlternation,
+}
+
+impl AuxDriver {
+    /// Build each of the `n_entries` item-major cache entries' references from `clean(entry)` (the
+    /// entry's clean latent in the path's NCHW model-space layout, once per entry, before the loop),
+    /// key the alternation on the `schedule`'s items with `accum` micro-steps per update, and replay
+    /// micro-steps `1..=start_step` so a resumed run continues the same phase.
+    pub fn prepare(
+        mut path: PerceptualPath,
+        n_entries: usize,
+        mut clean: impl FnMut(usize) -> Result<Tensor>,
+        schedule: &BucketSchedule,
+        accum: u32,
+        start_step: u32,
+    ) -> Result<Self> {
+        for entry in 0..n_entries {
+            path.ensure_reference(entry, &clean(entry)?)?;
+        }
+        let mut alternation = AuxAlternation::new(n_entries / schedule.n_buckets().max(1), accum);
+        for step in 1..=start_step {
+            alternation.key(step, schedule.sample((step - 1) as usize).0);
+        }
+        Ok(Self { path, alternation })
+    }
+
+    /// The shared path.
+    pub fn path(&self) -> &PerceptualPath {
+        &self.path
+    }
+
+    /// Feed micro-step `step` (1-based) to the alternation and return its [`StepSample`] — call for
+    /// every micro-step, in order.
+    pub fn sample(&mut self, step: u32, schedule: &BucketSchedule) -> StepSample<'_> {
+        let k = (step - 1) as usize;
+        let (item, _) = schedule.sample(k);
+        let key = self.alternation.key(step, item);
+        StepSample {
+            item,
+            entry: schedule.cache_index(k),
+            perceptual: Some((&self.path, key)),
+        }
+    }
+}
+
+/// Micro-step `step`'s sample: its [`AuxDriver::sample`] when the trainer has a perceptual path,
+/// else the plain (item, entry) of the bucket schedule.
+pub fn step_sample<'a>(
+    aux: Option<&'a mut AuxDriver>,
+    step: u32,
+    schedule: &BucketSchedule,
+) -> StepSample<'a> {
+    match aux {
+        Some(a) => a.sample(step, schedule),
+        None => {
+            let k = (step - 1) as usize;
+            StepSample::plain(schedule.sample(k).0, schedule.cache_index(k))
+        }
+    }
+}
+
+/// What one micro-step trains on: the real dataset item (alternation key), the item-major cache
+/// entry (reference key), and — perceptual losses on — the shared path with the step's
+/// alternation key.
+#[derive(Clone, Copy)]
+pub struct StepSample<'a> {
+    /// The real dataset item index (`schedule.sample(k).0`).
+    pub item: usize,
+    /// The cache entry (`schedule.cache_index(k)`).
+    pub entry: usize,
+    perceptual: Option<(&'a PerceptualPath, u32)>,
+}
+
+impl<'a> StepSample<'a> {
+    /// A sample with no perceptual path: every step is the plain diffusion step.
+    pub fn plain(item: usize, entry: usize) -> Self {
+        Self {
+            item,
+            entry,
+            perceptual: None,
+        }
+    }
+
+    /// Plan the step at the sampled noise level `raw_t` (the trainer's `σ`/`t ∈ [0, 1]`, `1` =
+    /// pure noise). `None` without a perceptual path — the trainer then runs its legacy step.
+    pub fn plan(&self, raw_t: f32) -> Result<Option<AuxStep<'a>>> {
+        let Some((path, key)) = self.perceptual else {
+            return Ok(None);
+        };
+        Ok(Some(AuxStep {
+            path,
+            plan: path.plan(key, self.entry, raw_t)?,
+            entry: self.entry,
+        }))
+    }
+}
+
+/// One planned perceptual step: the [`StepPlan`] and the path to evaluate its aux term on.
+pub struct AuxStep<'a> {
+    path: &'a PerceptualPath,
+    /// The step's plan (aux-only steps carry the remapped noise level).
+    pub plan: StepPlan,
+    entry: usize,
+}
+
+impl AuxStep<'_> {
+    /// Whether the diffusion term contributes (`false` ⇒ aux-only step: do not compute it).
+    pub fn diffusion(&self) -> bool {
+        self.plan.diffusion
+    }
+
+    /// Whether any aux loss contributes.
+    pub fn has_aux(&self) -> bool {
+        !self.plan.aux.is_empty()
+    }
+
+    /// The noise level the step trains at, in the same `[0, 1]` convention as `raw_t`.
+    pub fn noise_level(&self) -> f32 {
+        self.plan.noise_level
+    }
+
+    /// The weighted aux term on the live x0 latent (NCHW, model space, f32), differentiable in
+    /// `x0`; `None` when the plan has no aux loss.
+    pub fn aux_loss(&self, x0: &Tensor) -> Result<Option<Tensor>> {
+        Ok(self
+            .path
+            .aux_loss(&self.plan, self.entry, x0)?
+            .map(|t| t.weighted))
+    }
+}
+
+/// `(diffusion term contributes, aux term contributes)` for an optional planned step — `(true,
+/// false)` without one (the legacy step).
+pub fn step_terms(aux: Option<&AuxStep<'_>>) -> (bool, bool) {
+    aux.map_or((true, false), |a| (a.diffusion(), a.has_aux()))
+}
+
+/// One step's loss breakdown (epic 2123 E8): the differentiated total, the diffusion term (`None`
+/// on an aux-only step — it was not computed) and the weighted aux term (`None` when none
+/// contributed).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepLosses {
+    pub total: f32,
+    pub diffusion: Option<f32>,
+    pub aux: Option<f32>,
+}
+
+/// Sum a step's terms ([`combine_step_loss`]) into the differentiated loss + its [`StepLosses`].
+pub fn combine_terms(
+    diffusion: Option<Tensor>,
+    aux: Option<Tensor>,
+) -> Result<(Tensor, StepLosses)> {
+    let scalar = |t: &Tensor| -> Result<f32> { Ok(t.to_dtype(DType::F32)?.to_scalar::<f32>()?) };
+    let d = diffusion.as_ref().map(scalar).transpose()?;
+    let a = aux.as_ref().map(scalar).transpose()?;
+    let total = combine_step_loss(diffusion, aux)?;
+    let losses = StepLosses {
+        total: scalar(&total)?,
+        diffusion: d,
+        aux: a,
+    };
+    Ok((total, losses))
+}
+
+/// The engine-wide safe fraction of a device's effective free memory a training run may plan for
+/// (15 % headroom) — the `0.85` the candle decode tilers and the Qwen-Image 2.1 preflight use.
+pub const TRAIN_SAFE_FRAC: f64 = 0.85;
+
+/// This device's training memory budget in bytes: a CUDA device's effective free memory ×
+/// [`TRAIN_SAFE_FRAC`]; `u64::MAX` (nothing to compare against) on CPU/Metal or when free memory
+/// cannot be read (logged — a candle OOM is a catchable error, not a process kill).
+pub fn device_training_budget_bytes(device: &Device, label: &str) -> u64 {
+    if !device.is_cuda() {
+        return u64::MAX;
+    }
+    match crate::gpu::rendered_effective_free_gib() {
+        Some(free) => (free * TRAIN_SAFE_FRAC * 1024.0 * 1024.0 * 1024.0) as u64,
+        None => {
+            eprintln!(
+                "{label}: could not read the device's free memory; the auxiliary-model memory \
+                 preflight cannot refuse this run"
+            );
+            u64::MAX
+        }
+    }
+}
+
+/// On-disk bytes of a snapshot component's `.safetensors` (the trained model's resident weights —
+/// the lower bound the training-time auxiliary models stack on when a trainer has no fitted
+/// activation model).
+pub fn component_bytes(root: &Path, sub: &str, label: &str) -> Result<u64> {
+    component_files(root, sub, label)?
+        .iter()
+        .map(|f| {
+            std::fs::metadata(f)
+                .map(|m| m.len())
+                .map_err(|e| CandleError::Msg(format!("{label}: stat {}: {e}", f.display())))
+        })
+        .sum()
+}
+
+/// Epic 2123 E7: refuse a run whose base estimate plus its training-time auxiliary models
+/// (`aux_bytes`, e.g. `candle_gen_perceptual::perceptual_footprint`) exceeds `budget_bytes`, with
+/// a catchable error naming both. A trainer calls this on every path (checkpointed or dense) when
+/// `aux_bytes > 0`.
+pub fn check_aux_memory(
+    label: &str,
+    base_bytes: u64,
+    aux_bytes: u64,
+    budget_bytes: u64,
+) -> Result<()> {
+    let need = base_bytes.saturating_add(aux_bytes);
+    if need <= budget_bytes {
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    Err(CandleError::Msg(format!(
+        "{label}: this run needs ~{:.1} GiB (trained model ~{:.1} GiB + perceptual auxiliary \
+         models ~{:.1} GiB), which exceeds this device's ~{:.1} GiB training budget. Refusing \
+         before training: lower the resolution, use the Small depth model, or turn off the \
+         perceptual losses.",
+        gib(need),
+        gib(base_bytes),
+        gib(aux_bytes),
+        gib(budget_bytes)
+    )))
+}
+
 /// The per-model hooks the single-model [`run_flow_match_training`] driver calls. A flow-match trainer
 /// with one DiT, one optimizer, and one adapter set (Z-Image, Lens, Krea) implements this; the driver
 /// owns the cache → loop → save scaffolding around it. (Wan's dual-expert loop does not use this — it
@@ -549,6 +788,28 @@ pub trait FlowMatchTrainer {
         Ok(())
     }
 
+    /// Epic 2123 E8: the trainer's auxiliary perceptual path (via `candle_gen_perceptual::
+    /// build_perceptual_path`), built after [`preflight`](Self::preflight) and BEFORE caching so a
+    /// missing checkpoint fails fast. `None` (the default, and whenever no aux loss is enabled)
+    /// leaves every step the plain diffusion step.
+    fn perceptual_path(
+        &self,
+        _req: &TrainingRequest,
+        _device: &Device,
+    ) -> Result<Option<PerceptualPath>> {
+        Ok(None)
+    }
+
+    /// A cache entry's clean latent in the perceptual path's NCHW model-space layout (unpacked /
+    /// un-patchified). Called once per entry, only when [`perceptual_path`](Self::perceptual_path)
+    /// returned a path.
+    fn reference_latent(&self, _cached: &Self::Cached, _aux: &Self::Aux) -> Result<Tensor> {
+        Err(CandleError::Msg(format!(
+            "{}: reference_latent not implemented",
+            Self::LABEL
+        )))
+    }
+
     /// Cache the dataset: encode each item's latent + conditioning (reporting
     /// [`TrainingProgress::Caching`]) and return the per-sample cache plus any run-derived `Aux` and a
     /// [`SamplePlan`]. Honors `req.cancel` (a cancel mid-cache yields a short/empty cache; the driver maps
@@ -573,7 +834,9 @@ pub trait FlowMatchTrainer {
 
     /// One micro-step's forward+backward: build the noised latent for `cached` at the sampled timestep,
     /// predict + regress the velocity through `dit` (the per-model sign / timestep / checkpoint
-    /// convention lives here), and return `(loss, grads)` keyed by `vars`.
+    /// convention lives here), and return `(loss, grads)` keyed by `vars`. `sample` is the step's
+    /// (item, entry) and — perceptual losses on — its [`StepSample::plan`]; a trainer without a
+    /// perceptual path gets [`StepSample::plain`] (its `plan` is `None`).
     #[allow(clippy::too_many_arguments)]
     fn micro_step(
         &self,
@@ -583,6 +846,7 @@ pub trait FlowMatchTrainer {
         aux: &Self::Aux,
         cfg: &TrainingConfig,
         step: u32,
+        sample: StepSample<'_>,
         device: &Device,
     ) -> Result<(f32, GradStore)>;
 
@@ -676,6 +940,8 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         return Err(CandleError::Canceled);
     }
     let fingerprint = request_fingerprint(req)?;
+    // Epic 2123 E8: the frozen perceptual models load before the (minutes-long) caching pass.
+    let perceptual = model.perceptual_path(req, device)?;
 
     // --- cache (latents + conditioning); the encoders load and drop inside the hook ---
     on_progress(TrainingProgress::LoadingModel);
@@ -733,12 +999,26 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // until the next completed optimizer boundary instead of snapshotting without pending grads.
     let mut resume_due = false;
     let schedule = item_major_schedule(T::LABEL, cache.len(), &cfg.training_buckets(), cfg.seed)?;
+    // Epic 2123 E8: references per (item, bucket) entry once, alternation keyed on the real item.
+    let mut aux_driver = match perceptual {
+        Some(path) => Some(AuxDriver::prepare(
+            path,
+            cache.len(),
+            |i| model.reference_latent(&cache[i], &aux),
+            &schedule,
+            accum,
+            start_step,
+        )?),
+        None => None,
+    };
     for step in start_step.saturating_add(1)..=cfg.steps {
         if req.cancel.is_cancelled() {
             break;
         }
-        let cached = &cache[schedule.cache_index((step - 1) as usize)];
-        let (loss, grads) = model.micro_step(&dit, &set.vars, cached, &aux, cfg, step, device)?;
+        let sample = step_sample(aux_driver.as_mut(), step, &schedule);
+        let cached = &cache[sample.entry];
+        let (loss, grads) =
+            model.micro_step(&dit, &set.vars, cached, &aux, cfg, step, sample, device)?;
         last_loss = loss;
         steps_run = step;
         accumulate_grads(&mut accumulated, grads, &set.vars)?;
@@ -1305,6 +1585,7 @@ mod tests {
             _aux: &(),
             _cfg: &TrainingConfig,
             _step: u32,
+            _sample: StepSample<'_>,
             _device: &Device,
         ) -> Result<(f32, GradStore)> {
             unreachable!("the driver must stop before building or training the DiT")
@@ -1357,6 +1638,7 @@ mod tests {
             _aux: &(),
             _cfg: &TrainingConfig,
             step: u32,
+            _sample: StepSample<'_>,
             _device: &Device,
         ) -> Result<(f32, GradStore)> {
             self.steps_seen.set(step);
@@ -1415,11 +1697,12 @@ mod tests {
             aux: &(),
             cfg: &TrainingConfig,
             step: u32,
+            sample: StepSample<'_>,
             device: &Device,
         ) -> Result<(f32, GradStore)> {
             self.seen.borrow_mut().push(*cached);
             self.inner
-                .micro_step(dit, vars, &(), aux, cfg, step, device)
+                .micro_step(dit, vars, &(), aux, cfg, step, sample, device)
         }
         fn save(&self, set: &LoraSet, path: &Path) -> Result<()> {
             self.inner.save(set, path)
@@ -1463,6 +1746,209 @@ mod tests {
             counts[i] += 1;
         }
         assert_eq!(counts, [3, 1, 3, 1]);
+    }
+
+    /// A latent-input toy aux loss (epic 2123 E8 driver tests): reference = the clean latent's mean.
+    struct ToyLatentLoss;
+    impl crate::train::perceptual::PerceptualLoss for ToyLatentLoss {
+        fn name(&self) -> &'static str {
+            "toy"
+        }
+        fn input(&self) -> crate::train::perceptual::PerceptualInput {
+            crate::train::perceptual::PerceptualInput::Latents
+        }
+        fn reference(
+            &self,
+            clean: &Tensor,
+        ) -> Result<Option<crate::train::perceptual::LossReference>> {
+            Ok(Some(Box::new(clean.mean_all()?)))
+        }
+        fn loss(&self, live: &Tensor, r: &dyn std::any::Any) -> Result<Tensor> {
+            let r = crate::train::perceptual::reference_as::<Tensor>("toy", r)?;
+            Ok((live.mean_all()? - r)?.sqr()?)
+        }
+    }
+
+    /// A toy path claiming every 2nd optimizer window of each item.
+    fn toy_path() -> PerceptualPath {
+        PerceptualPath::new(
+            None,
+            vec![crate::train::perceptual::AuxLoss {
+                schedule: crate::train::perceptual::AuxLossSchedule {
+                    weight: 1.0,
+                    t_min: 0.0,
+                    t_max: 1.0,
+                    every_n: 2,
+                },
+                loss: Box::new(ToyLatentLoss),
+            }],
+        )
+        .unwrap()
+    }
+
+    /// A [`MockTrainer`] with a perceptual path: records each step's (item, entry, aux-only) and
+    /// counts reference builds.
+    struct PerceptualTrainer {
+        inner: MockTrainer,
+        references: Cell<usize>,
+        seen: std::cell::RefCell<Vec<(usize, usize, bool)>>,
+    }
+
+    impl FlowMatchTrainer for PerceptualTrainer {
+        type Dit = MockDit;
+        type Cached = usize;
+        type Aux = ();
+        type SampleState = ();
+        const LABEL: &'static str = "perceptual trainer";
+
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn default_targets(&self) -> &'static [&'static str] {
+            self.inner.default_targets()
+        }
+        fn perceptual_path(
+            &self,
+            _req: &TrainingRequest,
+            _device: &Device,
+        ) -> Result<Option<PerceptualPath>> {
+            Ok(Some(toy_path()))
+        }
+        fn reference_latent(&self, cached: &usize, _aux: &()) -> Result<Tensor> {
+            self.references.set(self.references.get() + 1);
+            Ok(Tensor::full(*cached as f32, (1, 1, 1, 1), &Device::Cpu)?)
+        }
+        fn cache(
+            &self,
+            req: &TrainingRequest,
+            device: &Device,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<usize>, (), SamplePlan<()>)> {
+            let (cache, (), plan) = self.inner.cache(req, device, on_progress)?;
+            Ok(((0..cache.len()).collect(), (), plan))
+        }
+        fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<MockDit> {
+            self.inner.build_dit(req, device)
+        }
+        fn micro_step(
+            &self,
+            dit: &MockDit,
+            vars: &[Var],
+            cached: &usize,
+            aux: &(),
+            cfg: &TrainingConfig,
+            step: u32,
+            sample: StepSample<'_>,
+            device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            assert_eq!(*cached, sample.entry, "the driver hands the sampled entry");
+            let planned = sample
+                .plan(0.5)?
+                .expect("a perceptual path plans every step");
+            self.seen
+                .borrow_mut()
+                .push((sample.item, sample.entry, !planned.diffusion()));
+            self.inner
+                .micro_step(dit, vars, &(), aux, cfg, step, sample, device)
+        }
+        fn save(&self, set: &LoraSet, path: &Path) -> Result<()> {
+            self.inner.save(set, path)
+        }
+    }
+
+    /// Epic 2123 E8 through the driver: each (item, bucket) entry's reference is built exactly once,
+    /// every step is planned, and the alternation is keyed on the REAL item (an item alternates
+    /// across its buckets). Mutations: build the reference per step (count ≠ 4) ⇒ red; key the
+    /// alternation on the cache entry instead of the item ⇒ the aux-only pattern diverges ⇒ red.
+    #[test]
+    fn driver_plans_perceptual_steps_per_item_with_references_once() {
+        let model = PerceptualTrainer {
+            inner: MockTrainer {
+                device: Device::Cpu,
+                steps_seen: Cell::new(0),
+                saves: Cell::new(0),
+                cache_len: 4,
+            },
+            references: Cell::new(0),
+            seen: Default::default(),
+        };
+        let (_fixture, mut req) = mock_request(2, 16, 1, 0, CancelFlag::new());
+        req.config.resolution_buckets = vec![
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 1,
+            },
+            ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+        ];
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        assert_eq!(model.references.get(), 4);
+        let seen = model.seen.borrow();
+        assert_eq!(seen.len(), 16);
+        let mut visits = [0u32; 2];
+        let mut both_buckets_aux = false;
+        for &(item, entry, aux_only) in seen.iter() {
+            assert_eq!(item, entry / 2, "item-major entry of the sampled item");
+            visits[item] += 1;
+            assert_eq!(
+                aux_only,
+                visits[item] % 2 == 0,
+                "item {item} visit {}",
+                visits[item]
+            );
+            both_buckets_aux |= aux_only && entry % 2 == 1;
+        }
+        assert!(
+            both_buckets_aux,
+            "the alternation must span an item's buckets"
+        );
+    }
+
+    /// Resume replays the skipped prefix: an [`AuxDriver`] prepared at `start_step = 5` plans steps
+    /// 6.. exactly as one walked from step 1. Mutation: drop the replay loop ⇒ red.
+    #[test]
+    fn aux_driver_resume_replays_the_alternation_prefix() {
+        let buckets = [
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 1,
+            },
+            ResolutionBucket {
+                resolution: 768,
+                repeats: 2,
+            },
+        ];
+        let schedule = BucketSchedule::new(3, &buckets, 7);
+        let clean = |i: usize| Ok(Tensor::full(i as f32, (1, 1, 1, 1), &Device::Cpu)?);
+        let plans = |start: u32| {
+            let mut d = AuxDriver::prepare(toy_path(), 6, clean, &schedule, 2, start).unwrap();
+            (start + 1..=24)
+                .map(|step| {
+                    let s = d.sample(step, &schedule);
+                    let p = s.plan(0.3).unwrap().unwrap();
+                    (s.item, s.entry, p.plan.diffusion, p.plan.aux.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let full = plans(0);
+        assert!(full.iter().any(|p| !p.2) && full.iter().any(|p| p.2));
+        assert_eq!(plans(5), full[5..].to_vec());
+    }
+
+    /// The aux-memory guard refuses only past the budget, naming both terms; the plain sample has no
+    /// plan. Mutation: compare `base` alone ⇒ the in-between budget passes ⇒ red.
+    #[test]
+    fn aux_memory_guard_counts_the_aux_models() {
+        let gib = 1u64 << 30;
+        assert!(check_aux_memory("t", 10 * gib, 2 * gib, 12 * gib).is_ok());
+        let e = check_aux_memory("t", 10 * gib, 2 * gib, 11 * gib)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("perceptual") && e.contains("~12.0 GiB"), "{e}");
+        assert!(StepSample::plain(1, 2).plan(0.5).unwrap().is_none());
+        assert_eq!(step_terms(None), (true, false));
     }
 
     /// Build a driver request over a throwaway on-disk dataset.
@@ -1854,6 +2340,7 @@ mod tests {
             _aux: &(),
             _cfg: &TrainingConfig,
             _step: u32,
+            _sample: StepSample<'_>,
             _device: &Device,
         ) -> Result<(f32, GradStore)> {
             let mut loss = vars[0].as_tensor().sqr()?.sum_all()?;
@@ -2025,6 +2512,7 @@ mod tests {
             aux: &(),
             cfg: &TrainingConfig,
             step: u32,
+            _sample: StepSample<'_>,
             device: &Device,
         ) -> Result<(f32, GradStore)> {
             // Loss through the adapted forward so B (zero-init) gets a gradient too.
