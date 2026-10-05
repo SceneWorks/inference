@@ -2743,7 +2743,7 @@ mod subject_mask_reference_tests {
             _clean: &Tensor,
             mask: Option<&Tensor>,
         ) -> Result<Option<LossReference>> {
-            self.0.lock().unwrap().push(mask.map(|m| {
+            candle_gen::lock_recover(&self.0).push(mask.map(|m| {
                 (
                     m.dims().to_vec(),
                     m.flatten_all().unwrap().to_vec1().unwrap(),
@@ -2818,7 +2818,7 @@ mod subject_mask_reference_tests {
             PerceptualSubjectMasks::load("t", &items, &cfg, 1, CropBox::center_square).unwrap();
         let expected = loaded.clone().unwrap();
         prepare_perceptual_references(&mut path, clean.iter(), loaded).unwrap();
-        let seen = seen.lock().unwrap();
+        let seen = candle_gen::lock_recover(&seen);
         assert_eq!(seen.len(), 2);
         for (entry, got) in seen.iter().enumerate() {
             let (shape, values) = got.as_ref().expect("every reference gets its mask");
