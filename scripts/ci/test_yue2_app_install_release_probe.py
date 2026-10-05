@@ -1,10 +1,14 @@
 """CPU-only release-observation contract tests; no Windows process or GPU calls."""
 
 import importlib.util
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SOURCE = Path(__file__).with_name("yue2_app_install_release_probe.py")
@@ -13,6 +17,22 @@ SPEC = importlib.util.spec_from_file_location("yue2_app_install_release_probe", 
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(MODULE)
+
+
+class FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        current = cls.fromisoformat("2026-10-05T11:01:00+00:00")
+        return current.astimezone(tz) if tz else current
+
+
+class MutableDateTime(datetime):
+    current = "2026-10-05T11:01:00+00:00"
+
+    @classmethod
+    def now(cls, tz=None):
+        current = cls.fromisoformat(cls.current)
+        return current.astimezone(tz) if tz else current
 
 
 def row(pid=100, name="node.exe", created="2026-10-05T10:50:00+00:00",
@@ -36,6 +56,64 @@ def snapshot(rows, start="2026-10-05T11:00:00+00:00", end="2026-10-05T11:00:01+0
             "collectorPid": 999, "totalCimCount": len(retained) + 20, "rows": retained}
 
 
+def snapshot_pair(pair_number, inaccessible=False, persistent=False, old_after_unknown=False,
+                  malformed_after_unknown=False, changed_collector=False):
+    base = datetime.fromisoformat("2026-10-05T11:00:00+00:00") + timedelta(seconds=7 * (pair_number - 1))
+    first_start = base
+    second_start = base + timedelta(seconds=3, milliseconds=500)
+
+    def make(start, suffix):
+        created = start + timedelta(milliseconds=100)
+        rows = []
+        if inaccessible and suffix == "before" or persistent and suffix in ("before", "after"):
+            rows.append(row(pid=24516, created=created.isoformat(), command=None))
+        if old_after_unknown and suffix == "before":
+            rows.append(row(pid=24517, created=created.isoformat(),
+                            command='node.exe "' + MODULE.OLD_RUN_ROOT + r'\child.exe"'))
+        if malformed_after_unknown and suffix == "before":
+            malformed = row(pid=24518, created=created.isoformat())
+            malformed["parentPid"] = None
+            rows.append(malformed)
+        result = snapshot(rows, start.isoformat(), (start + timedelta(milliseconds=200)).isoformat())
+        if changed_collector and suffix == "after":
+            result["rows"][-1]["createdUtc"] = (start - timedelta(seconds=10)).isoformat()
+        return result
+
+    return make(first_start, "before"), make(second_start, "after")
+
+
+class FakePairCollector:
+    def __init__(self, evidence, pairs, finish_callback=None):
+        self.evidence = evidence
+        self.pairs = pairs
+        self.read_count = 0
+        self.decisions = []
+        self.finished = False
+        self.finish_callback = finish_callback
+
+    def snapshot_paths(self, pair_number):
+        stem = "process-snapshot" if pair_number == 1 else f"process-snapshot-{pair_number}"
+        return (self.evidence / f"{stem}-before.json", self.evidence / f"{stem}-after.json")
+
+    def read_pair(self, pair_number):
+        self.read_count += 1
+        paths = self.snapshot_paths(pair_number)
+        for path, payload in zip(paths, self.pairs[pair_number - 1]):
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        return paths
+
+    def decide_continue(self, pair_number, should_continue):
+        self.decisions.append((pair_number, should_continue))
+
+    def finish(self):
+        self.finished = True
+        if self.finish_callback:
+            self.finish_callback()
+
+    def stop(self):
+        self.decisions.append((self.read_count, False))
+
+
 class ReleaseProbeTests(unittest.TestCase):
     def test_frozen_target_matches_stopped_app8_run_receipt(self):
         self.assertEqual((MODULE.OLD_RUN_ID, MODULE.OLD_RUN_ATTEMPT, MODULE.OLD_JOB_ID),
@@ -55,6 +133,126 @@ class ReleaseProbeTests(unittest.TestCase):
         collector = SOURCE.with_name("yue2_app_install_release_processes.ps1").read_text(encoding="utf-8")
         self.assertIn(MODULE.OLD_RUN_ROOT, collector)
         self.assertIn(MODULE.OLD_WORKER_ID, collector)
+
+    def test_two_clean_pairs_finish_without_using_third_pair(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(MODULE, "datetime", FixedDateTime):
+            evidence = Path(directory)
+            collector = FakePairCollector(evidence, [snapshot_pair(1), snapshot_pair(2),
+                                                       snapshot_pair(3, persistent=True)])
+            result = MODULE.validate_release_pairs(evidence, collector)
+            self.assertEqual(collector.read_count, 2)
+            self.assertEqual(collector.decisions, [(1, True), (2, False)])
+            self.assertTrue(collector.finished)
+            self.assertEqual(len(result["pairs"]), 2)
+            self.assertEqual({row["name"] for row in result["processFiles"]}, {
+                "process-snapshot-before.json", "process-snapshot-after.json",
+                "process-snapshot-2-before.json", "process-snapshot-2-after.json"})
+            for item in result["processFiles"]:
+                path = evidence / item["name"]
+                self.assertEqual(item["sha256"], MODULE.file_sha256(path))
+
+    def test_transient_first_pair_requires_two_later_clean_pairs_and_retains_refusal(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(MODULE, "datetime", FixedDateTime):
+            evidence = Path(directory)
+            collector = FakePairCollector(evidence, [snapshot_pair(1, inaccessible=True),
+                                                       snapshot_pair(2), snapshot_pair(3)])
+            result = MODULE.validate_release_pairs(evidence, collector)
+            self.assertEqual(collector.read_count, 3)
+            self.assertEqual(collector.decisions, [(1, True), (2, True), (3, False)])
+            self.assertEqual([pair["valid"] for pair in result["pairs"]], [False, True, True])
+            refusal = evidence / "initial-refusal.json"
+            self.assertTrue(refusal.is_file())
+            refusal_item = result["refusalFiles"][0]
+            self.assertEqual(refusal_item["sha256"], MODULE.file_sha256(refusal))
+            self.assertNotIn("commandLine", refusal.read_text(encoding="utf-8"))
+            self.assertEqual(result["before"]["collector"]["pid"], 999)
+
+    def test_persistent_or_returning_transient_candidate_never_proves_release(self):
+        with patch.object(MODULE, "datetime", FixedDateTime):
+            for case_number, pairs in enumerate((
+                [snapshot_pair(1, persistent=True), snapshot_pair(2, persistent=True),
+                 snapshot_pair(3, persistent=True)],
+                [snapshot_pair(1), snapshot_pair(2, inaccessible=True), snapshot_pair(3)],
+            )):
+                with self.subTest(case_number=case_number), tempfile.TemporaryDirectory() as directory:
+                    evidence = Path(directory)
+                    collector = FakePairCollector(evidence, pairs)
+                    with self.assertRaisesRegex(ValueError, "last two process snapshot pairs"):
+                        MODULE.validate_release_pairs(evidence, collector)
+                    self.assertEqual(collector.read_count, 3)
+                    self.assertTrue((evidence / "refusal.json").is_file() is False)
+                    self.assertTrue((evidence / "initial-refusal.json").exists() or
+                                    (evidence / "process-pair-2-refusal.json").exists())
+
+    def test_old_marker_and_malformed_later_row_override_transient_retry(self):
+        with patch.object(MODULE, "datetime", FixedDateTime):
+            for pair, expected in ((snapshot_pair(1, inaccessible=True, old_after_unknown=True),
+                                    "old app install"),
+                                   (snapshot_pair(1, inaccessible=True, malformed_after_unknown=True),
+                                    "PID/parent")):
+                with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                    evidence = Path(directory)
+                    collector = FakePairCollector(evidence, [pair, snapshot_pair(2), snapshot_pair(3)])
+                    with self.assertRaisesRegex(ValueError, expected):
+                        MODULE.validate_release_pairs(evidence, collector)
+                    self.assertEqual(collector.read_count, 1)
+                    self.assertEqual(collector.decisions[-1], (1, False))
+
+    def test_collector_witness_timing_and_freshness_errors_are_terminal(self):
+        with patch.object(MODULE, "datetime", FixedDateTime):
+            cases = []
+            missing_before, missing_after = snapshot_pair(1, inaccessible=True)
+            missing_before["rows"] = [row(pid=999, name="powershell.exe")]  # no PID-999 self witness
+            missing_before["collectorPid"] = 123
+            cases.append(([(missing_before, missing_after)], "collector process missing"))
+            cases.append(([snapshot_pair(1, changed_collector=True)],
+                          "collector PID/name/creation changed between process snapshots"))
+            pair1 = snapshot_pair(1)
+            recycled = list(snapshot_pair(2))
+            for payload in recycled:
+                next(item for item in payload["rows"] if item["pid"] == payload["collectorPid"])["createdUtc"] = \
+                    "2026-10-05T10:58:00+00:00"
+            cases.append(([pair1, tuple(recycled)],
+                          "collector PID/name/creation changed between process pairs"))
+            too_close = list(snapshot_pair(1))
+            too_close[1]["queriedUtc"] = (datetime.fromisoformat(too_close[0]["completedUtc"])
+                                           + timedelta(seconds=1)).isoformat()
+            cases.append(([(tuple(too_close))], "process snapshots overlap, are too close, or are stale"))
+            stale = list(snapshot_pair(1))
+            stale[0]["completedUtc"] = (datetime.fromisoformat(stale[0]["queriedUtc"])
+                                          + timedelta(seconds=31)).isoformat()
+            cases.append(([(tuple(stale))], "snapshot stale or unbounded"))
+            for pairs, expected in cases:
+                with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                    evidence = Path(directory)
+                    collector = FakePairCollector(evidence, [*pairs, snapshot_pair(3)])
+                    with self.assertRaisesRegex(ValueError, expected):
+                        MODULE.validate_release_pairs(evidence, collector)
+                    self.assertEqual(collector.read_count,
+                                     2 if "between process pairs" in expected else 1)
+
+    def test_inaccessible_collector_argv_is_terminal_not_transient(self):
+        with patch.object(MODULE, "datetime", FixedDateTime), tempfile.TemporaryDirectory() as directory:
+            before, after = snapshot_pair(1, inaccessible=True)
+            own = next(item for item in before["rows"] if item["pid"] == before["collectorPid"])
+            own["commandLineAvailable"] = False
+            own["commandLineLength"] = None
+            own["commandLineSha256"] = None
+            collector = FakePairCollector(Path(directory), [(before, after),
+                                                               snapshot_pair(2), snapshot_pair(3)])
+            with self.assertRaisesRegex(ValueError, "collector PID is not the accessible PowerShell process"):
+                MODULE.validate_release_pairs(Path(directory), collector)
+            self.assertEqual(collector.read_count, 1)
+            self.assertFalse((Path(directory) / "initial-refusal.json").exists())
+
+    def test_final_freshness_is_rechecked_after_collector_finish(self):
+        with patch.object(MODULE, "datetime", MutableDateTime), tempfile.TemporaryDirectory() as directory:
+            MutableDateTime.current = "2026-10-05T11:01:00+00:00"
+            collector = FakePairCollector(Path(directory), [snapshot_pair(1), snapshot_pair(2)],
+                finish_callback=lambda: setattr(MutableDateTime, "current", "2026-10-05T11:03:00+00:00"))
+            with self.assertRaisesRegex(ValueError, "process release observation is not fresh"):
+                MODULE.validate_release_pairs(Path(directory), collector)
+            self.assertEqual(collector.read_count, 2)
 
     def test_foreign_and_gpu0_hosting_do_not_block_old_run_absence(self):
         foreign = row(command='node.exe --token dummy-secret C:\\foreign\\run.js')

@@ -63,6 +63,23 @@ function Save-Snapshot([string]$Name) {
     if (-not $result.complete) { throw "process snapshot $Name failed" }
 }
 
-Save-Snapshot 'process-snapshot-before'
-Start-Sleep -Seconds 3
-Save-Snapshot 'process-snapshot-after'
+for ($pair = 1; $pair -le 3; $pair++) {
+    $stem = if ($pair -eq 1) { 'process-snapshot' } else { "process-snapshot-$pair" }
+    Save-Snapshot "$stem-before"
+    Start-Sleep -Seconds 3
+    Save-Snapshot "$stem-after"
+    Set-Content -LiteralPath (Join-Path $OutputDirectory "process-pair-$pair.ready") `
+        -Value ([string]$pair) -NoNewline -Encoding ascii
+    if ($pair -eq 3) { break }
+    $decisionPath = Join-Path $OutputDirectory "process-pair-$pair.decision"
+    $waited = 0
+    while (-not (Test-Path -LiteralPath $decisionPath -PathType Leaf) -and $waited -lt 400) {
+        Start-Sleep -Milliseconds 100
+        $waited++
+    }
+    if (-not (Test-Path -LiteralPath $decisionPath -PathType Leaf)) { throw 'pair decision timed out' }
+    $decision = Get-Content -LiteralPath $decisionPath -Raw -Encoding ascii
+    if ($decision -ceq 'stop') { break }
+    if ($decision -cne 'continue') { throw 'pair decision invalid' }
+    Start-Sleep -Seconds 3
+}
