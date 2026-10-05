@@ -630,9 +630,10 @@ def real_reference(image: Path, out: Path, vitpose_dir: Path | None, hybrik_pth:
     """The reference implementations at real scale on `image` — what the ports' ignored
     `real_*_matches_the_reference_implementation` tests compare against. Each model is optional;
     only the given ones write their outputs (never run in ordinary CI)."""
-    from PIL import Image
+    # A PIL decoder (binary), imported by name so it is not mistaken for a text-mode Path.open().
+    from PIL.Image import open as open_image
 
-    img = torch.from_numpy(np.asarray(Image.open(image).convert("RGB"), dtype=np.float32) / 255.0)
+    img = torch.from_numpy(np.asarray(open_image(image).convert("RGB"), dtype=np.float32) / 255.0)
     img = img.permute(2, 0, 1).unsqueeze(0).contiguous()
     t = {"input.a": img}
     with torch.no_grad():
@@ -703,7 +704,7 @@ def main() -> None:
                        opt(args.sapiens), list(args.bbox) if args.bbox else None)
         return
     if args.verify:
-        manifest = json.loads(MANIFEST.read_text())
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         assert manifest["producer_sha256"] == sha256(script), "producer drifted: regenerate"
         assert manifest["fixture_sha256"] == sha256(FIXTURE), "fixture drifted: regenerate"
         print("ok")
@@ -729,7 +730,8 @@ def main() -> None:
             },
             indent=2,
         )
-        + "\n"
+        + "\n",
+        encoding="utf-8",
     )
     print("wrote", FIXTURE, FIXTURE.stat().st_size, "bytes")
 
