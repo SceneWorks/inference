@@ -8,7 +8,7 @@ on:
       backend:
         type: choice
         required: true
-        options: [cuda, metal]
+        options: [cuda, metal, app-cpu-check]
       cuda_scheduling_mode:
         type: choice
         required: false
@@ -43,11 +43,137 @@ permissions:
   actions: read
 
 concurrency:
-  group: ${{ inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'shared-gpu1' && 'inference-yue2-owner-gpu1' || inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
+  group: ${{ inputs.backend == 'app-cpu-check' && format('yue2-app-cpu-check-{0}', github.run_id) || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'shared-gpu1' && 'inference-yue2-owner-gpu1' || inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
   queue: max
   cancel-in-progress: false
 
 jobs:
+  app-cpu-check:
+    if: inputs.backend == 'app-cpu-check'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+      EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+    steps:
+      - name: Bind exact CPU-only dispatch and evidence path
+        shell: bash
+        run: |
+          set -euo pipefail
+          CPU_EVIDENCE="$RUNNER_TEMP/yue2-app-cpu-check-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$CPU_EVIDENCE"
+          {
+            echo "CPU_EVIDENCE=$CPU_EVIDENCE"
+            echo "INFERENCE_REPO=$RUNNER_TEMP/inference"
+            echo "STARVECTOR_TERMINAL_INFERENCE_TEST_ROOT=$RUNNER_TEMP/starvector-pinned-inference"
+          } >> "$GITHUB_ENV"
+          [[ "$EXPECTED_ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_APP_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_CONTROL_SHA" = "$GITHUB_SHA"
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: SceneWorks/SceneWorks
+          ref: ${{ inputs.expected_app_sha }}
+          path: app
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+      - name: Bind app source and exact M6 pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C control rev-parse HEAD)" = "$EXPECTED_CONTROL_SHA"
+          test "$(git -C app rev-parse HEAD)" = "$EXPECTED_APP_SHA"
+          test -z "$(git -C control status --porcelain)"
+          test -z "$(git -C app status --porcelain)"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          source = Path('app/Cargo.toml').read_text(encoding='utf-8')
+          expected = os.environ['EXPECTED_ENGINE_SHA']
+          for crate in ('candle-core', 'candle-kernels'):
+              pattern = rf'(?m)^{crate}\s*=\s*\{{[^\n]*git\s*=\s*"https://github.com/SceneWorks/inference"[^\n]*rev\s*=\s*"([0-9a-f]{{40}})"'
+              values = re.findall(pattern, source)
+              if values != [expected]:
+                  raise SystemExit(f'{crate} patch must pin exactly {expected}: {values}')
+          package = Path('app/package.json').read_bytes()
+          (Path(os.environ['CPU_EVIDENCE']) / 'source.json').write_text(
+              json.dumps({
+                  'controlSha': os.environ['EXPECTED_CONTROL_SHA'],
+                  'appSha': os.environ['EXPECTED_APP_SHA'],
+                  'engineSha': expected,
+                  'packageSha256': hashlib.sha256(package).hexdigest(),
+                  'checkScript': json.loads(package)['scripts']['check'],
+              }, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+          PY
+      - name: Fetch the exact public StarVector terminal contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q "$STARVECTOR_TERMINAL_INFERENCE_TEST_ROOT"
+          git -C "$STARVECTOR_TERMINAL_INFERENCE_TEST_ROOT" remote add origin https://github.com/SceneWorks/inference.git
+          git -C "$STARVECTOR_TERMINAL_INFERENCE_TEST_ROOT" fetch -q --depth=2 origin 0b084cbf46b5b4f4f561305ef116268b57eecf7f
+          git -C "$STARVECTOR_TERMINAL_INFERENCE_TEST_ROOT" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$STARVECTOR_TERMINAL_INFERENCE_TEST_ROOT" rev-parse HEAD)" = 0b084cbf46b5b4f4f561305ef116268b57eecf7f
+      - name: Install pinned scaffold dependencies
+        working-directory: app
+        run: npm ci --ignore-scripts
+      - name: Fetch the pinned inference source and every anchor revision
+        shell: bash
+        working-directory: app
+        run: |
+          set -euo pipefail
+          git init -q "$INFERENCE_REPO"
+          git -C "$INFERENCE_REPO" remote add origin https://github.com/SceneWorks/inference
+          git -C "$INFERENCE_REPO" fetch -q --depth=1 origin "$EXPECTED_ENGINE_SHA"
+          while read -r rev; do
+            [ -n "$rev" ] || continue
+            git -C "$INFERENCE_REPO" fetch -q --depth=1 origin "$rev"
+          done < <(node scripts/anchor-loader-closure.mjs --anchor-revisions)
+          git -C "$INFERENCE_REPO" checkout -q "$EXPECTED_ENGINE_SHA"
+          test "$(git -C "$INFERENCE_REPO" rev-parse HEAD)" = "$EXPECTED_ENGINE_SHA"
+          test -z "$(git -C "$INFERENCE_REPO" status --porcelain)"
+      - name: Run the original full app check
+        shell: bash
+        working-directory: app
+        run: |
+          set -o pipefail
+          npm run check 2>&1 | tee "$CPU_EVIDENCE/npm-check.log"
+      - name: Retain source-bound CPU check verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "control_sha=$EXPECTED_CONTROL_SHA"
+            echo "app_sha=$EXPECTED_APP_SHA"
+            echo "engine_sha=$EXPECTED_ENGINE_SHA"
+            echo "job_status=${{ job.status }}"
+          } > "$CPU_EVIDENCE/verdict.txt"
+          if [ -f "$CPU_EVIDENCE/npm-check.log" ]; then
+            sha256sum "$CPU_EVIDENCE/npm-check.log" >> "$CPU_EVIDENCE/verdict.txt"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: yue2-app-cpu-check-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/yue2-app-cpu-check-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+
   cuda:
     if: inputs.backend == 'cuda'
     runs-on: [self-hosted, Windows, X64, cuda, real-weights]
