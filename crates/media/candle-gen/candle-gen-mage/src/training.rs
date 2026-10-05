@@ -63,6 +63,11 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
             resolution_buckets: true,
             subject_mask_loss: true,
             depth_anchoring: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
