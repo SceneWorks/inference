@@ -555,8 +555,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scalar(&n.distance(&x, &x).unwrap()), 0.0);
-        let small = add(&x, &multiply(&d, Array::from_f32(0.05)).unwrap()).unwrap();
-        let big = add(&x, &multiply(&d, Array::from_f32(0.5)).unwrap()).unwrap();
+        let small = add(&x, multiply(&d, Array::from_f32(0.05)).unwrap()).unwrap();
+        let big = add(&x, multiply(&d, Array::from_f32(0.5)).unwrap()).unwrap();
         let (s, b) = (
             scalar(&n.distance(&small, &x).unwrap()),
             scalar(&n.distance(&big, &x).unwrap()),

@@ -300,11 +300,14 @@ impl Attention {
     }
 }
 
+/// One resolution level: its resnets, then the optional stride-2 downsample conv `(weight, bias)`.
+type Level = (Vec<Resnet>, Option<(Tensor, Tensor)>);
+
 /// The frozen FLUX.2 VAE encoder sub-graph that produces the five anchor taps.
 pub struct VaeAnchorEncoder {
     cfg: VaeAnchorEncoderConfig,
     conv_in: (Tensor, Tensor),
-    levels: Vec<(Vec<Resnet>, Option<(Tensor, Tensor)>)>,
+    levels: Vec<Level>,
     mid0: Resnet,
     attn: Attention,
     mid1: Resnet,

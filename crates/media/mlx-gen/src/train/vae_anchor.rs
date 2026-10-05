@@ -294,11 +294,14 @@ impl Attention {
     }
 }
 
+/// One resolution level: its resnets, then the optional stride-2 downsample conv `(weight, bias)`.
+type Level = (Vec<Resnet>, Option<(Array, Array)>);
+
 /// The frozen FLUX.2 VAE encoder sub-graph that produces the five anchor taps.
 pub struct VaeAnchorEncoder {
     cfg: VaeAnchorEncoderConfig,
     conv_in: (Array, Array),
-    levels: Vec<(Vec<Resnet>, Option<(Array, Array)>)>,
+    levels: Vec<Level>,
     mid0: Resnet,
     attn: Attention,
     mid1: Resnet,
@@ -676,7 +679,7 @@ mod tests {
         let at_clean = scalar(&path.aux_loss(&plan, 0, &imgs[0]).unwrap().unwrap().weighted);
         assert!(at_clean.abs() < 1e-5, "self loss {at_clean}");
         let off = mlx_rs::ops::clip(
-            &add(&imgs[0], Array::from_f32(0.15)).unwrap(),
+            add(&imgs[0], Array::from_f32(0.15)).unwrap(),
             (0.0f32, 1.0f32),
         )
         .unwrap();

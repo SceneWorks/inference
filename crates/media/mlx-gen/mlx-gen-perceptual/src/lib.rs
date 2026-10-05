@@ -732,7 +732,7 @@ mod tests {
             label: "t",
             decoder: DecoderSpec::Tiny {
                 name: "TINY",
-                config: cfg4.into(),
+                config: cfg4,
             },
             latent_lpips: None,
         };
