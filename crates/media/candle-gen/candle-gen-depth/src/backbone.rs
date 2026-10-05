@@ -13,14 +13,16 @@
 //! `[B, grid²+1, hidden]` *including* the CLS token; the neck drops the CLS token itself (matching
 //! `transformers`).
 //!
-//! Fixed-size note: the host preprocessor always feeds the default 518² square, so the token grid is
-//! exactly 37×37 (1369 patches + 1 CLS = 1370) and the shipped `position_embeddings` (length 1370) is
-//! added **directly** — no DINOv2 pos-embed interpolation is needed.
+//! Grid note: the host preprocessor feeds the default 518² square (token grid 37×37, the shipped
+//! `position_embeddings` added directly). The differentiable training entry point
+//! (`DepthAnythingV2::forward_pixels`) feeds an aspect-preserving non-square input, for which the
+//! patch part of the position embedding is resampled to the `gh × gw` grid (see
+//! [`Dinov2Backbone::position_embedding`]).
 
 use candle_gen::candle_core::Tensor;
 use candle_gen::Result;
 
-use crate::common::{conv2d_nhwc, join, layer_norm, sdpa, Linear, Weights};
+use crate::common::{bilinear_resize, conv2d_nhwc, join, layer_norm, sdpa, Linear, Weights};
 use crate::config::DepthAnythingConfig;
 
 /// One DINOv2 transformer layer (`backbone.encoder.layer.{i}`).
@@ -131,7 +133,30 @@ impl Dinov2Backbone {
         &self.cfg
     }
 
-    /// `pixel_values`: NHWC `[B, H, W, 3]` (H=W=image_size, ImageNet-normalized) → the four captured
+    /// The absolute position embedding for a `gh × gw` patch grid: the shipped table as-is at the
+    /// native square grid, otherwise its patch part resampled to `gh × gw` (DINOv2's
+    /// `interpolate_pos_encoding`, here bilinear with half-pixel centers — the same choice as the MLX
+    /// twin; the depth-anchoring loss compares two maps produced by this same path) with the CLS slot
+    /// carried over.
+    pub fn position_embedding(&self, gh: usize, gw: usize) -> Result<Tensor> {
+        let g = self.cfg.grid();
+        if gh == g && gw == g {
+            return Ok(self.pos_embed.clone());
+        }
+        let embed = self.cfg.hidden_size;
+        let cls = self.pos_embed.narrow(1, 0, 1)?;
+        let patches = self
+            .pos_embed
+            .narrow(1, 1, g * g)?
+            .reshape((1, g, g, embed))?;
+        let resized = bilinear_resize(&patches, gh, gw, false)?;
+        Ok(Tensor::cat(
+            &[&cls, &resized.reshape((1, gh * gw, embed))?],
+            1,
+        )?)
+    }
+
+    /// `pixel_values`: NHWC `[B, H, W, 3]` (multiples of the patch size, ImageNet-normalized) → the four captured
     /// hidden states (outputs of the `out_indices` layers), each `[B, grid²+1, hidden]` **including**
     /// the CLS token. The final `layernorm` is applied to the captured states (the DPT reassemble
     /// stage in `transformers` consumes the normalized hidden states for DA-V2).
@@ -147,13 +172,13 @@ impl Dinov2Backbone {
             self.cfg.patch_size,
             0,
         )?;
-        let g = y.dim(1)?;
-        let mut x = y.reshape((b, g * g, embed))?;
+        let (gh, gw) = (y.dim(1)?, y.dim(2)?);
+        let mut x = y.reshape((b, gh * gw, embed))?;
 
-        // Prepend CLS, add absolute position embedding.
+        // Prepend CLS, add absolute position embedding (resampled for a non-native grid).
         let cls = self.cls_token.broadcast_as((b, 1, embed))?;
         x = Tensor::cat(&[&cls, &x], 1)?;
-        x = x.broadcast_add(&self.pos_embed)?;
+        x = x.broadcast_add(&self.position_embedding(gh, gw)?)?;
 
         let capture = self.cfg.capture_layers();
         let mut out = Vec::with_capacity(4);

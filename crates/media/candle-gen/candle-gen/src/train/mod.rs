@@ -37,4 +37,9 @@ pub mod lora;
 /// reconstruction. Family-specific key→module resolution stays in each crate.
 pub mod merge;
 pub mod optim;
+// The shared decoded-x0 perceptual auxiliary-loss path (epic 2123 E8) — Candle twin of
+// `mlx_gen::train::perceptual`.
+pub mod perceptual;
 pub mod schedule;
+// TAESD-family tiny differentiable x0 decoders for the perceptual path.
+pub mod tae;

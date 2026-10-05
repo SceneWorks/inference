@@ -39,10 +39,9 @@ use mlx_gen::train::lora::{
     build_lora_targets, LoraParams, TrainAdapter,
 };
 use mlx_gen::train::perceptual::{
-    combine_step_loss, perceptual_footprint_bytes, AuxAlternation, AuxLoss, Parameterization,
-    PerceptualPath, StepPlan,
+    combine_step_loss, AuxAlternation, Parameterization, PerceptualPath, StepPlan,
 };
-use mlx_gen::train::tae::{TinyDecoder, TinyDecoderConfig};
+use mlx_gen::train::tae::TinyDecoderConfig;
 // Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
 // unchanged (the host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
 pub use mlx_gen::train::lora::LoraTarget;
@@ -767,44 +766,23 @@ struct AuxStep<'a> {
 /// default — nothing is loaded and every step is the plain diffusion step). The floor
 /// ([`gen_core::train::validate_training_techniques`]) has already required both directories.
 fn load_perceptual_path(cfg: &TrainingConfig) -> Result<Option<PerceptualPath>> {
-    let depth = &cfg.depth_anchoring;
-    if !depth.schedule.is_enabled() {
-        return Ok(None);
+    mlx_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context())
+}
+
+/// Z-Image's latent family for the shared aux-loss builder (epic 2123 E8): the FLUX.1 16-channel
+/// VAE latent, decoded by TAEF1.
+fn aux_loss_context() -> mlx_gen_perceptual::AuxLossContext<'static> {
+    mlx_gen_perceptual::AuxLossContext {
+        label: "z_image_turbo trainer",
+        decoder: taef1_decoder(),
     }
-    let decoder_dir = cfg.perceptual_decoder_dir.as_ref().ok_or_else(|| {
-        mlx_gen::Error::Msg(
-            "z_image_turbo trainer: depth anchoring needs the TAEF1 decoder (perceptual_decoder_dir)"
-                .into(),
-        )
-    })?;
-    let depth_dir = depth.model_dir.as_ref().ok_or_else(|| {
-        mlx_gen::Error::Msg(format!(
-            "z_image_turbo trainer: depth anchoring needs the Depth-Anything-V2 {} checkpoint \
-             (depth_anchoring.model_dir)",
-            depth.model_size.as_str()
-        ))
-    })?;
-    let decoder = TinyDecoder::from_dir(decoder_dir, TinyDecoderConfig::taef1()).map_err(|e| {
-        mlx_gen::Error::Msg(format!(
-            "z_image_turbo trainer: could not load the TAEF1 decoder from {}: {e}",
-            decoder_dir.display()
-        ))
-    })?;
-    let loss = mlx_gen_depth::anchor::DepthAnchorLoss::from_dir(depth_dir, depth.model_size)
-        .map_err(|e| {
-            mlx_gen::Error::Msg(format!(
-                "z_image_turbo trainer: could not load Depth-Anything-V2 {} from {}: {e}",
-                depth.model_size.as_str(),
-                depth_dir.display()
-            ))
-        })?;
-    Ok(Some(PerceptualPath::new(
-        Some(Box::new(decoder)),
-        vec![AuxLoss {
-            schedule: depth.schedule,
-            loss: Box::new(loss),
-        }],
-    )?))
+}
+
+fn taef1_decoder() -> mlx_gen_perceptual::DecoderSpec {
+    mlx_gen_perceptual::DecoderSpec::Tiny {
+        name: "TAEF1",
+        config: TinyDecoderConfig::taef1(),
+    }
 }
 
 /// One `train_impl` cache entry (item-major, `cache[item * n_buckets + bucket]`, sc-2127): the
@@ -851,20 +829,11 @@ fn prepare_perceptual_references(path: &mut PerceptualPath, cache: &[CacheEntry]
 /// forward/backward each) plus the cached per-image depth references (epic 2123 E7). `0` when
 /// depth anchoring is off.
 fn perceptual_footprint_gb(cfg: &TrainingConfig, edge: u32, images: usize) -> f64 {
-    let depth = &cfg.depth_anchoring;
-    if !depth.schedule.is_enabled() {
-        return 0.0;
-    }
-    let bytes = perceptual_footprint_bytes(
-        Some(TinyDecoderConfig::taef1().footprint(edge, edge)),
-        &[mlx_gen_depth::anchor::depth_anchor_footprint(
-            depth.model_size,
-            edge,
-            edge,
-        )],
-        images,
-    );
-    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    mlx_gen_perceptual::perceptual_footprint_gb(
+        cfg,
+        &taef1_decoder(),
+        mlx_gen_perceptual::AuxGeometry::image(edge, images),
+    )
 }
 
 /// One training micro-step on the 1-based `step`: pick the step's cached item, sample its σ and
@@ -2266,10 +2235,7 @@ mod weight_noise_update_tests {
 mod depth_anchoring_tests {
     use super::*;
     use mlx_gen::train::perceptual::AuxLossSchedule;
-    use mlx_gen::train::tae::synthetic_tiny_decoder_weights;
     use mlx_gen::weights::Weights;
-    use mlx_gen_depth::anchor::{synthetic_weights, tiny_config, DepthAnchorLoss};
-    use mlx_gen_depth::DepthAnythingV2;
 
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2306,26 +2272,7 @@ mod depth_anchoring_tests {
     }
 
     fn path() -> PerceptualPath {
-        let tae = TinyDecoderConfig {
-            latent_channels: 4,
-            channels: 8,
-            blocks: [3, 3, 3, 1],
-        };
-        let decoder =
-            TinyDecoder::from_weights(&synthetic_tiny_decoder_weights(&tae, 11).unwrap(), tae)
-                .unwrap();
-        let da2 = tiny_config();
-        let depth = DepthAnchorLoss::new(
-            DepthAnythingV2::from_weights(&synthetic_weights(&da2, 12).unwrap(), da2).unwrap(),
-        );
-        PerceptualPath::new(
-            Some(Box::new(decoder)),
-            vec![AuxLoss {
-                schedule: schedule(),
-                loss: Box::new(depth),
-            }],
-        )
-        .unwrap()
+        mlx_gen_perceptual::testing::tiny_depth_path(4, schedule()).unwrap()
     }
 
     fn cfg() -> TrainingConfig {
