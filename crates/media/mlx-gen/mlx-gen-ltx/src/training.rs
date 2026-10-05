@@ -2143,7 +2143,10 @@ fn refuse_ltx25_subject_mask(id: &str, req: &TrainingRequest) -> gen_core::Resul
 /// — ahead of the generic technique floor, so the caller sees why. Also validates the
 /// [`DEPTH_ANCHORING_FRAMES_KEY`] knob.
 fn refuse_ltx25_depth_anchoring(id: &str, req: &TrainingRequest) -> gen_core::Result<()> {
-    if id != MODEL_25_ID || !req.config.depth_anchoring.schedule.is_enabled() {
+    // Every decoded-x0 perceptual loss (depth anchoring, and the sc-24831 identity / face-landmark
+    // losses on the same path) decodes the generated video stream.
+    let pixel_losses = mlx_gen_perceptual::enabled_pixel_aux_losses(&req.config);
+    if id != MODEL_25_ID || pixel_losses.is_empty() {
         return Ok(());
     }
     depth_anchoring_frames(&req.config)?;
@@ -2167,9 +2170,10 @@ fn refuse_ltx25_depth_anchoring(id: &str, req: &TrainingRequest) -> gen_core::Re
     };
     if video != Some(true) {
         return Err(gen_core::Error::Unsupported(format!(
-            "{id} trainer: depth anchoring decodes the generated video stream, but workflow `{}` \
-             generates no video (the video stream is {}); turn depth anchoring off for this \
-             workflow",
+            "{id} trainer: depth anchoring and the other decoded-x0 losses ({}) decode the \
+             generated video stream, but workflow `{}` generates no video (the video stream is \
+             {}); turn them off for this workflow",
+            pixel_losses.join(", "),
             workflow.id(),
             if video.is_some() {
                 "frozen conditioning"
@@ -7141,6 +7145,23 @@ mod ltx25_depth_anchoring_tests {
             // Depth off: never refused.
             req.config.depth_anchoring.schedule = AuxLossSchedule::OFF;
             assert!(refuse_ltx25_depth_anchoring(MODEL_25_ID, &req).is_ok());
+            // sc-24831: the identity / face-landmark losses decode the same stream ⇒ the same
+            // refusal, naming the loss. Mutation: gate on depth alone ⇒ red.
+            req.config.identity_loss.schedule = schedule();
+            req.config.face_landmark_loss.schedule = schedule();
+            let face = refuse_ltx25_depth_anchoring(MODEL_25_ID, &req);
+            if refused.contains(&workflow.id()) {
+                match face {
+                    Err(gen_core::Error::Unsupported(m)) => {
+                        assert!(m.contains("identity") && m.contains("face-landmark"), "{m}")
+                    }
+                    other => panic!("{}: expected Unsupported, got {other:?}", workflow.id()),
+                }
+            } else {
+                assert!(face.is_ok(), "{}: {face:?}", workflow.id());
+            }
+            req.config.identity_loss.schedule = AuxLossSchedule::OFF;
+            req.config.face_landmark_loss.schedule = AuxLossSchedule::OFF;
         }
         let mut req = super::validate_request_tests::request(1);
         req.config

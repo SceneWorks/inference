@@ -253,6 +253,16 @@ pub fn any_aux_loss(cfg: &TrainingConfig) -> bool {
     ARMS.iter().any(|a| (a.enabled)(cfg))
 }
 
+/// The names of the enabled auxiliary losses that decode x0 to pixels (depth, identity,
+/// face-landmark, …), in arm order — what a trainer whose decode can be unavailable for a request
+/// (e.g. an LTX-2.5 workflow that generates no video) refuses by name. Empty when none is on.
+pub fn enabled_pixel_aux_losses(cfg: &TrainingConfig) -> Vec<&'static str> {
+    ARMS.iter()
+        .filter(|a| a.input == PerceptualInput::DecodedPixels && (a.enabled)(cfg))
+        .map(|a| a.name)
+        .collect()
+}
+
 fn enabled_arms<'a>(arms: &'a [AuxArm], cfg: &TrainingConfig) -> Vec<&'a AuxArm> {
     arms.iter().filter(|a| (a.enabled)(cfg)).collect()
 }
