@@ -17,14 +17,17 @@ use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
-    self, effective_weight_decay, noise_seed, prepared_subject_mask_weight, sample_noise,
-    save_adapter, validate_flow_match_request, weighted_velocity_loss,
+    self, check_aux_memory, combine_terms, component_bytes, device_training_budget_bytes,
+    effective_weight_decay, noise_seed, prepared_subject_mask_weight, sample_noise, save_adapter,
+    step_sample, step_terms, validate_flow_match_request, weighted_velocity_loss, AuxDriver,
+    AuxStep, StepLosses,
 };
 use candle_gen::train::lora::{
     adapter_optimizer_step, build_adapt_lokr_targets, build_adapt_lora_targets, AdaptLoraHost,
     LoraSet,
 };
 use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use candle_gen::train::perceptual::{AuxModelFootprint, Parameterization, X0Decoder};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 
@@ -53,12 +56,130 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per (item, bucket).
         // sc-24828 (epic 2123): subject-masked loss — a per-bucket weight map, packed like that
         // bucket's latent, cached next to it.
+        // sc-24830 (epic 2123): depth anchoring on the adapter surface through the shared
+        // perceptual builder; Mage-VAE has no tiny decoder, so x0 decodes through the full Mage-VAE
+        // decoder ([`MageX0Decoder`]). The full fine-tune surface refuses it.
         techniques: gen_core::train::TrainingTechniques {
             resolution_buckets: true,
             subject_mask_loss: true,
+            depth_anchoring: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
+}
+
+/// The full Mage-VAE decoder as the perceptual path's x0 decoder (epic 2123 E8, sc-24830): Mage's
+/// 128-channel / 16× latent space has no tiny decoder. Runs [`MageVae::decode_differentiable`]
+/// (every op has a candle backward) and maps the raw `[-1, 1]` RGB to NHWC `[0, 1]`. Candle has no
+/// activation-checkpoint primitive for a graph inside one `backward()`, so the decode's activations
+/// stay on the tape until the step's backward; [`MageDecoderSpec::footprint`] budgets for that.
+pub struct MageX0Decoder {
+    vae: MageVae,
+}
+
+impl MageX0Decoder {
+    /// Wrap a loaded Mage-VAE (its decoder half is used).
+    pub fn new(vae: MageVae) -> Self {
+        Self { vae }
+    }
+}
+
+impl X0Decoder for MageX0Decoder {
+    fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        let rgb = self
+            .vae
+            .decode_differentiable(latents)?
+            .to_dtype(DType::F32)?;
+        Ok(rgb
+            .affine(0.5, 0.5)?
+            .clamp(0f32, 1f32)?
+            .permute((0, 2, 3, 1))?
+            .contiguous()?)
+    }
+}
+
+/// Mage's measured decode curve (decimal GB; `mlx-gen-mage`'s `memory::vae_peak_gb`): a fixed term
+/// plus a per-megapixel term.
+fn mage_vae_peak_gb(h: u32, w: u32) -> f64 {
+    0.267 + 2.039 * (h as f64 * w as f64 / 1e6)
+}
+
+/// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from
+/// `TrainingConfig::perceptual_decoder_dir` (the Mage snapshot's `vae/` folder or the snapshot) only
+/// when an enabled loss decodes pixels.
+struct MageDecoderSpec;
+
+impl candle_gen_perceptual::CustomDecoder for MageDecoderSpec {
+    fn name(&self) -> &'static str {
+        "Mage-VAE decoder"
+    }
+
+    /// Conservative pre-load figures from Mage's measured inference decode curve: f32 weights at
+    /// twice the bf16 fixed term, and a working set of 4× the f32 decode peak (no activation
+    /// checkpointing on candle: the decode's activations and their cotangents are both live in the
+    /// backward). Not a measured training value.
+    fn footprint(&self, h: u32, w: u32) -> AuxModelFootprint {
+        let gb = |v: f64| (v * 1e9) as u64;
+        AuxModelFootprint {
+            param_bytes: gb(2.0 * 0.267),
+            working_set_bytes: gb(4.0 * 2.0 * mage_vae_peak_gb(h, w)),
+            reference_bytes_per_image: 0,
+        }
+    }
+
+    fn load(&self, dir: Option<&Path>, device: &Device) -> Result<Box<dyn X0Decoder>> {
+        let dir = dir.ok_or_else(|| {
+            CandleError::Msg(
+                "the Mage-VAE decoder directory (perceptual_decoder_dir) is unset".into(),
+            )
+        })?;
+        let vae_dir = if dir.join("vae").is_dir() {
+            dir.join("vae")
+        } else {
+            dir.to_path_buf()
+        };
+        Ok(Box::new(MageX0Decoder::new(MageVae::load_full_dtype(
+            &vae_dir,
+            device,
+            DType::F32,
+        )?)))
+    }
+}
+
+/// Mage's latent family for the shared aux-loss builder (epic 2123 E8).
+fn aux_loss_context(device: &Device) -> candle_gen_perceptual::AuxLossContext<'_> {
+    candle_gen_perceptual::AuxLossContext {
+        label: LABEL,
+        decoder: candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec)),
+        device,
+        latent_lpips: None,
+    }
+}
+
+/// Extra training memory (bytes) the enabled aux losses add at the largest bucket `edge` over
+/// `entries` cached (item, bucket) references (epic 2123 E7). `0` when none is enabled.
+fn perceptual_footprint_bytes(
+    cfg: &gen_core::train::TrainingConfig,
+    edge: u32,
+    entries: usize,
+) -> u64 {
+    candle_gen_perceptual::perceptual_footprint(
+        cfg,
+        &candle_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec)),
+        candle_gen_perceptual::AuxGeometry::image(edge, entries),
+    )
+}
+
+/// The perceptual aux losses train the adapter surface only; the full fine-tune has no aux seam, so
+/// the combination is a typed refusal (never silently ignored).
+fn refuse_aux_losses_on_full_finetune(req: &TrainingRequest) -> gen_core::Result<()> {
+    if req.config.full_finetune && candle_gen_perceptual::any_aux_loss(&req.config) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{LABEL}: depth anchoring / perceptual aux losses train a LoRA/LoKr adapter only; \
+             they cannot be combined with a full base fine-tune"
+        )));
+    }
+    Ok(())
 }
 
 pub struct MageTrainer {
@@ -116,6 +237,7 @@ impl Trainer for MageTrainer {
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        refuse_aux_losses_on_full_finetune(req)?;
         validate_request(req).map_err(Into::into)
     }
 
@@ -277,6 +399,10 @@ fn bucket_mask_weight(
 /// velocity through the transformer (adapter or full surface alike), regress it toward
 /// `noise − latent`, weighted by the sample's subject-mask weight (`None` ⇒ exactly the unweighted
 /// `velocity_loss`).
+///
+/// `aux` (epic 2123 E8) carries the step's perceptual plan: on an aux-only step the velocity term is
+/// not computed and the loss is the weighted aux term on the x0 estimate `x_t − σ·v` (Mage regresses
+/// `noise − x0`); with `aux = None` the graph is exactly the pre-epic-2123 one.
 fn step_loss(
     transformer: &MageTransformer,
     sample: &CachedSample,
@@ -284,7 +410,8 @@ fn step_loss(
     sigma: f64,
     compute_dtype: DType,
     mae: bool,
-) -> Result<Tensor> {
+    aux: Option<&AuxStep<'_>>,
+) -> Result<(Tensor, StepLosses)> {
     let (x_t, target) = build_training_batch(&sample.latent, noise, sigma, compute_dtype)?;
     let sigma_tensor = Tensor::new(&[sigma as f32], noise.device())?;
     let prediction = transformer.forward(
@@ -293,12 +420,89 @@ fn step_loss(
         &sigma_tensor,
         &sample.layout,
     )?;
-    Ok(weighted_velocity_loss(
-        &prediction,
-        &target,
-        sample.mask_weight.as_ref(),
+    let (diffusion_on, aux_on) = step_terms(aux);
+    let diffusion = if diffusion_on {
+        Some(weighted_velocity_loss(
+            &prediction,
+            &target,
+            sample.mask_weight.as_ref(),
+            mae,
+        )?)
+    } else {
+        None
+    };
+    let aux_term = match aux {
+        Some(a) if aux_on => {
+            let x0 = Parameterization::FlowNoiseMinusX0 {
+                sigma: sigma as f32,
+            }
+            .recover_x0(
+                &x_t.to_dtype(DType::F32)?,
+                &prediction.to_dtype(DType::F32)?,
+            )?;
+            a.aux_loss(&tokens_to_latent_grid(&x0, sample_grid(sample)?)?)?
+        }
+        _ => None,
+    };
+    combine_terms(diffusion, aux_term)
+}
+
+/// The square latent grid side of a cached sample (`[1, grid², C]` tokens).
+fn sample_grid(sample: &CachedSample) -> Result<usize> {
+    let tokens = sample.latent.dim(1)?;
+    let grid = (tokens as f64).sqrt().round() as usize;
+    if grid * grid != tokens {
+        return Err(CandleError::Msg(format!(
+            "{LABEL}: cached latent has {tokens} tokens, not a square grid"
+        )));
+    }
+    Ok(grid)
+}
+
+/// Mage tokens `[1, grid², C]` → the decoder's NCHW grid `[1, C, grid, grid]` (inverse of
+/// [`pack_latent_tokens`]).
+fn tokens_to_latent_grid(tokens: &Tensor, grid: usize) -> Result<Tensor> {
+    let channels = tokens.dim(2)?;
+    Ok(tokens
+        .reshape((1, grid, grid, channels))?
+        .permute((0, 3, 1, 2))?
+        .contiguous()?)
+}
+
+/// One micro-step on the 1-based `step`: the schedule's (item, entry), its seeded σ + noise (as
+/// before epic 2123), the perceptual plan when a driver is configured (an aux-only step trains at σ
+/// remapped into the loss window), then [`step_loss`]. With no driver the step is bit-identical.
+#[allow(clippy::too_many_arguments)]
+fn run_step(
+    transformer: &MageTransformer,
+    cache: &[CachedSample],
+    schedule: &BucketSchedule,
+    aux: Option<&mut AuxDriver>,
+    cfg: &gen_core::train::TrainingConfig,
+    step: u32,
+    compute_dtype: DType,
+    mae: bool,
+    device: &Device,
+) -> Result<(Tensor, StepLosses)> {
+    let picked = step_sample(aux, step, schedule);
+    let sample = &cache[picked.entry];
+    let raw_sigma = flow_match::sample_unit_timestep(
+        &cfg.timestep_type,
+        &cfg.timestep_bias,
+        flow_match::timestep_seed(cfg.seed, step),
+    );
+    let plan = picked.plan(raw_sigma)?;
+    let sigma = plan.as_ref().map_or(raw_sigma, |p| p.noise_level()) as f64;
+    let noise = sample_noise(sample.latent.dims(), noise_seed(cfg.seed, step), device)?;
+    step_loss(
+        transformer,
+        sample,
+        &noise,
+        sigma,
+        compute_dtype,
         mae,
-    )?)
+        plan.as_ref(),
+    )
 }
 
 /// The packed latent grid side and the single-image generation layout for one bucket `edge` and a
@@ -424,6 +628,26 @@ impl MageTrainer {
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<TrainingOutput> {
         on_progress(TrainingProgress::Preparing);
+        // Epic 2123 E7: the auxiliary perceptual models count against the device budget before any
+        // caching (one reference per (item, bucket) entry, sized at the largest bucket edge).
+        let edges = bucket_edges(&req.config);
+        let edge = edges.iter().copied().max().unwrap_or(req.config.resolution);
+        let aux_bytes =
+            perceptual_footprint_bytes(&req.config, edge, req.items.len() * edges.len());
+        if aux_bytes > 0 {
+            check_aux_memory(
+                LABEL,
+                component_bytes(&self.dirs.transformer, "", LABEL)?,
+                aux_bytes,
+                device_training_budget_bytes(&self.device, LABEL),
+            )?;
+        }
+        // Epic 2123 E8: the shared builder loads the decoder + enabled losses before caching (a
+        // missing checkpoint fails fast); `None` — nothing loaded — when no aux loss is enabled.
+        let perceptual = candle_gen_perceptual::build_perceptual_path(
+            &req.config,
+            &aux_loss_context(&self.device),
+        )?;
         let cache = cache_samples(&self.dirs, req, &self.device, on_progress)?;
         let cfg_text = std::fs::read_to_string(self.dirs.transformer.join(TRANSFORMER_CONFIG))
             .map_err(|error| CandleError::Msg(format!("{LABEL}: read config: {error}")))?;
@@ -486,24 +710,42 @@ impl MageTrainer {
         // adapter and full fine-tune surfaces share this cache and schedule.
         let buckets = req.config.training_buckets();
         let schedule = BucketSchedule::new(cache.len() / buckets.len(), &buckets, req.config.seed);
+        // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the item.
+        let mut aux = perceptual
+            .map(|path| {
+                AuxDriver::prepare(
+                    path,
+                    cache.len(),
+                    |entry| {
+                        let sample = &cache[entry];
+                        tokens_to_latent_grid(
+                            &sample.latent.to_dtype(DType::F32)?,
+                            sample_grid(sample)?,
+                        )
+                    },
+                    &schedule,
+                    accum,
+                    0,
+                )
+            })
+            .transpose()?;
 
         for step in 1..=req.config.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[schedule.cache_index(step as usize - 1)];
-            let sigma = flow_match::sample_unit_timestep(
-                &req.config.timestep_type,
-                &req.config.timestep_bias,
-                flow_match::timestep_seed(req.config.seed, step),
-            ) as f64;
-            let noise = sample_noise(
-                sample.latent.dims(),
-                noise_seed(req.config.seed, step),
+            let (loss, losses) = run_step(
+                &transformer,
+                &cache,
+                &schedule,
+                aux.as_mut(),
+                &req.config,
+                step,
+                compute_dtype,
+                mae,
                 &self.device,
             )?;
-            let loss = step_loss(&transformer, sample, &noise, sigma, compute_dtype, mae)?;
-            last_loss = loss.to_scalar::<f32>()?;
+            last_loss = losses.total;
             let grads = loss.backward()?;
             accumulate_grads(&mut accumulated, grads, &vars)?;
             steps_run = step;
@@ -870,7 +1112,17 @@ mod tests {
         let half: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0];
         for (model, vars) in [(&adapter, &set.vars), (&full, &full_vars)] {
             let loss = |mask: Option<&[f32]>| {
-                step_loss(model, &masked_sample(mask), &noise, 0.5, DType::F32, false).unwrap()
+                step_loss(
+                    model,
+                    &masked_sample(mask),
+                    &noise,
+                    0.5,
+                    DType::F32,
+                    false,
+                    None,
+                )
+                .unwrap()
+                .0
             };
             let plain = loss(None).to_scalar::<f32>().unwrap();
             let ones = loss(Some(&[1.0; 4])).to_scalar::<f32>().unwrap();
@@ -1104,5 +1356,301 @@ mod tests {
         }
         let _reloaded = MageTransformer::load(output.path(), &cfg, &Device::Cpu)
             .expect("full checkpoint reloads through the production Mage transformer loader");
+    }
+
+    /// sc-24830 (epic 2123 depth anchoring) — the Candle Mage step seam on the tiny synthetic
+    /// transformer (4 latent channels) with the builder's tiny random-init decoder + tiny DA2. CPU,
+    /// seconds; no weights downloaded.
+    mod depth_anchoring {
+        use super::*;
+        use candle_gen::gen_core::train::{AuxLossSchedule, DepthModelSize, TrainingConfig};
+
+        fn schedule() -> AuxLossSchedule {
+            AuxLossSchedule {
+                weight: 0.1,
+                t_min: 0.0,
+                t_max: 1.0,
+                every_n: 2,
+            }
+        }
+
+        fn cfg() -> TrainingConfig {
+            let mut c = TrainingConfig {
+                seed: 7,
+                ..Default::default()
+            };
+            c.depth_anchoring.schedule = schedule();
+            c
+        }
+
+        fn sample(seed: u64) -> CachedSample {
+            let (grid, channels) = (2usize, 4usize);
+            let latent = Tensor::randn(0f32, 1f32, (1, channels, grid, grid), &Device::Cpu)
+                .unwrap()
+                .affine(1.0, seed as f64 * 0.01)
+                .unwrap();
+            CachedSample {
+                latent: pack_latent_tokens(&latent, grid, channels).unwrap(),
+                text: Tensor::randn(0f32, 1f32, (1, 1, 8), &Device::Cpu).unwrap(),
+                layout: PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![1])
+                    .unwrap(),
+                mask_weight: None,
+            }
+        }
+
+        fn schedule_of(n: usize) -> BucketSchedule {
+            BucketSchedule::new(
+                n,
+                &[gen_core::train::ResolutionBucket {
+                    resolution: 32,
+                    repeats: 1,
+                }],
+                7,
+            )
+        }
+
+        struct Fixture {
+            _dir: tempfile::TempDir,
+            model: MageTransformer,
+            set: LoraSet,
+        }
+
+        fn fixture() -> Fixture {
+            let dir = tiny_transformer_dir();
+            let mut model =
+                MageTransformer::load_dtype(dir.path(), &tiny_config(), DType::F32, &Device::Cpu)
+                    .unwrap();
+            let set = build_adapt_lora_targets(
+                &mut model,
+                &["proj_out".to_string(), "to_q".to_string()],
+                2,
+                2.0,
+                7,
+                &Device::Cpu,
+            )
+            .unwrap();
+            Fixture {
+                _dir: dir,
+                model,
+                set,
+            }
+        }
+
+        fn driver(cache: &[CachedSample], sched: &BucketSchedule) -> AuxDriver {
+            let path = candle_gen_perceptual::testing::tiny_depth_path(4, schedule(), &Device::Cpu)
+                .unwrap();
+            AuxDriver::prepare(
+                path,
+                cache.len(),
+                |e| tokens_to_latent_grid(&cache[e].latent, sample_grid(&cache[e])?),
+                sched,
+                1,
+                0,
+            )
+            .unwrap()
+        }
+
+        fn step(
+            f: &Fixture,
+            cache: &[CachedSample],
+            sched: &BucketSchedule,
+            aux: Option<&mut AuxDriver>,
+            n: u32,
+        ) -> (Tensor, StepLosses) {
+            run_step(
+                &f.model,
+                cache,
+                sched,
+                aux,
+                &cfg(),
+                n,
+                DType::F32,
+                false,
+                &Device::Cpu,
+            )
+            .unwrap()
+        }
+
+        /// AC1: a depth step has no diffusion term, total == aux, and the LoRA factors get a nonzero
+        /// gradient. Mutation: ignore `plan.diffusion` (always compute the velocity term) ⇒ red.
+        #[test]
+        fn depth_step_trains_the_lora_through_depth_only() {
+            let f = fixture();
+            let cache = vec![sample(1)];
+            let sched = schedule_of(1);
+            let mut aux = driver(&cache, &sched);
+            let (_, d) = step(&f, &cache, &sched, Some(&mut aux), 1);
+            assert_eq!(d.aux, None);
+            assert_eq!(Some(d.total), d.diffusion);
+            let (loss, depth) = step(&f, &cache, &sched, Some(&mut aux), 2);
+            assert_eq!(
+                depth.diffusion, None,
+                "depth step computes no diffusion loss"
+            );
+            let a = depth.aux.expect("depth term");
+            assert!(a > 0.0 && a.is_finite(), "{a}");
+            assert_eq!(depth.total, a);
+            let grads = loss.backward().unwrap();
+            let mag: f32 = f
+                .set
+                .vars
+                .iter()
+                .filter_map(|v| grads.get(v.as_tensor()))
+                .map(|g| {
+                    g.abs()
+                        .unwrap()
+                        .sum_all()
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap()
+                })
+                .sum();
+            assert!(mag > 0.0 && mag.is_finite(), "LoRA grad |Σ| {mag}");
+        }
+
+        /// Alternation on the real item + references once per entry. Mutation: build the driver with
+        /// a per-entry alternation keyed on the global step ⇒ an item locks to one kind ⇒ red.
+        #[test]
+        fn every_item_alternates_and_references_are_built_once() {
+            let f = fixture();
+            let cache = vec![sample(1), sample(2)];
+            let sched = schedule_of(2);
+            let mut aux = driver(&cache, &sched);
+            let mut kinds = vec![Vec::new(), Vec::new()];
+            for n in 1..=8u32 {
+                let item = sched.sample((n - 1) as usize).0;
+                let (_, l) = step(&f, &cache, &sched, Some(&mut aux), n);
+                kinds[item].push(l.aux.is_some());
+            }
+            for k in &kinds {
+                assert_eq!(k, &vec![false, true, false, true], "{kinds:?}");
+            }
+            assert_eq!(aux.path().reference_computations(), cache.len());
+        }
+
+        /// E1: no driver ⇒ the step equals the pre-epic-2123 step bit for bit (loss value and every
+        /// LoRA gradient). Mutation: perturb the off-path loss (scale the prediction by 1.0001) ⇒ red.
+        #[test]
+        fn everything_off_is_bit_identical_to_the_legacy_step() {
+            let f = fixture();
+            let cache = vec![sample(1)];
+            let sched = schedule_of(1);
+            let c = TrainingConfig {
+                seed: 7,
+                ..Default::default()
+            };
+            assert!(candle_gen_perceptual::build_perceptual_path(
+                &c,
+                &aux_loss_context(&Device::Cpu)
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(perceptual_footprint_bytes(&c, 1024, 4), 0);
+            let (loss, off) = run_step(
+                &f.model,
+                &cache,
+                &sched,
+                None,
+                &c,
+                1,
+                DType::F32,
+                false,
+                &Device::Cpu,
+            )
+            .unwrap();
+            assert_eq!(off.aux, None);
+            let g_off = loss.backward().unwrap();
+            // The pre-sc-24830 step body.
+            let s = &cache[0];
+            let sigma = flow_match::sample_unit_timestep(
+                &c.timestep_type,
+                &c.timestep_bias,
+                flow_match::timestep_seed(c.seed, 1),
+            ) as f64;
+            let noise = sample_noise(s.latent.dims(), noise_seed(c.seed, 1), &Device::Cpu).unwrap();
+            let (x_t, target) = build_training_batch(&s.latent, &noise, sigma, DType::F32).unwrap();
+            let pred = f
+                .model
+                .forward(
+                    &x_t,
+                    &s.text,
+                    &Tensor::new(&[sigma as f32], &Device::Cpu).unwrap(),
+                    &s.layout,
+                )
+                .unwrap();
+            let legacy = weighted_velocity_loss(&pred, &target, None, false).unwrap();
+            assert_eq!(off.total, legacy.to_scalar::<f32>().unwrap());
+            let g_legacy = legacy.backward().unwrap();
+            let bits = |t: &Tensor| -> Vec<u32> {
+                t.flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect()
+            };
+            for v in &f.set.vars {
+                let (a, b) = (g_off.get(v.as_tensor()), g_legacy.get(v.as_tensor()));
+                assert_eq!(a.map(bits), b.map(bits));
+            }
+        }
+
+        /// E7: depth grows the estimate by decoder + DA2 (more for Large); the shared check refuses at
+        /// a synthetic budget between base and base + aux. Mutation: compute the footprint with
+        /// `DecoderSpec::None` ⇒ the decoder term vanishes ⇒ red.
+        #[test]
+        fn memory_estimate_includes_the_aux_models() {
+            let mut on = TrainingConfig::default();
+            on.depth_anchoring.schedule = schedule();
+            let small = perceptual_footprint_bytes(&on, 1024, 10);
+            let da2 =
+                candle_gen_depth::anchor::depth_anchor_footprint(DepthModelSize::Small, 1024, 1024);
+            let decoder = MageDecoderSpec.footprint_for_test(1024);
+            assert_eq!(
+                small,
+                candle_gen::train::perceptual::perceptual_footprint_bytes(
+                    Some(decoder),
+                    &[da2],
+                    10
+                )
+            );
+            on.depth_anchoring.model_size = DepthModelSize::Large;
+            let large = perceptual_footprint_bytes(&on, 1024, 10);
+            assert!(large > small + 1_000_000_000, "{small} {large}");
+            let base = 10_000_000_000u64;
+            assert!(check_aux_memory(LABEL, base, 0, base + large / 2).is_ok());
+            assert!(check_aux_memory(LABEL, base, large, base + large / 2).is_err());
+        }
+
+        /// E3: declared; full fine-tune refuses it (typed); a missing decoder dir is named.
+        #[test]
+        fn descriptor_and_refusals() {
+            assert!(trainer_descriptor().techniques.depth_anchoring);
+            let mut req = full_request();
+            req.config.depth_anchoring.schedule = schedule();
+            assert!(matches!(
+                refuse_aux_losses_on_full_finetune(&req),
+                Err(gen_core::Error::Unsupported(_))
+            ));
+            req.config.full_finetune = false;
+            assert!(refuse_aux_losses_on_full_finetune(&req).is_ok());
+            let tmp = tempfile::tempdir().unwrap();
+            let mut c = cfg();
+            c.perceptual_decoder_dir = Some(tmp.path().join("no-vae"));
+            c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+            let e =
+                candle_gen_perceptual::build_perceptual_path(&c, &aux_loss_context(&Device::Cpu))
+                    .err()
+                    .unwrap()
+                    .to_string();
+            assert!(e.contains("Mage-VAE decoder"), "{e}");
+        }
+
+        impl MageDecoderSpec {
+            fn footprint_for_test(&self, edge: u32) -> AuxModelFootprint {
+                candle_gen_perceptual::CustomDecoder::footprint(self, edge, edge)
+            }
+        }
     }
 }

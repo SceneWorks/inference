@@ -805,6 +805,8 @@ dependencies = [
  "candle-core",
  "candle-gen",
  "candle-gen-boogu",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-nn",
  "candle-transformers",
  "image",
