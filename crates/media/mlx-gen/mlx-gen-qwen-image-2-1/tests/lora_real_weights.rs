@@ -19,7 +19,7 @@
 //!    **LoKr** run on one-reference edit pairs, then the same with/without comparison on a held-out
 //!    two-reference edit at every tier.
 //! 3. [`stacked_adapters_apply_with_independent_weights`] — both trained files stacked on one
-//!    load, each at its own strength.
+//!    load, each at its own strength, on the held-out ordered two-reference edit.
 //! 4. [`third_party_lora_applies_strictly_and_moves_every_tier`] — a public third-party 2.1 LoRA
 //!    (operator-supplied via `QWEN_IMAGE_2_1_THIRD_PARTY_LORA`; the lane runs it only when the
 //!    dispatch names one).
@@ -64,6 +64,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use mlx_gen::gen_core;
 use mlx_gen::gen_core::weightsmeta::safetensors_file_metadata;
 use mlx_gen::gen_core::Conditioning;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
@@ -90,7 +91,7 @@ const ID: &str = "qwen_image_2_1";
 /// reaches the DiT moves an 8-step render by far more than 2/255.
 const ADAPTER_MOVES_FLOOR: f64 = 2.0;
 /// Mean |Δ| one stacked file at strength 1 must add over the other alone — the weaker of the two
-/// files (the edit LoKr, on a text-to-image render) must still be visible in the stack.
+/// files must still be visible in the held-out two-reference edit stack.
 const STACK_MOVES_FLOOR: f64 = 0.5;
 /// Mean RGB distance to the nearest training-palette colour ([`palette_distance`]) by which the T2I
 /// LoRA's render must be CLOSER to the palette than the bare base's, same prompt and seed — the "it
@@ -133,6 +134,8 @@ const EDIT_ADAPTER: &str = "qwen21_edit_lokr.safetensors";
 pub(crate) mod edit_protocol;
 #[path = "support/edit_training_balanced64.rs"]
 mod edit_training_balanced64;
+#[path = "support/stack_protocol.rs"]
+mod stack_protocol;
 #[path = "support/style_protocol.rs"]
 mod style_protocol;
 use edit_protocol::{EDIT_INSTRUCTION, T2I_EVAL_PROMPT, TRAIN_EDIT_INSTRUCTION};
@@ -1554,7 +1557,9 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
 
 // ── 3. two stacked adapters, independent strengths ───────────────────────────────────────────────
 
-/// Both trained files on ONE bf16 load, each at its own strength, on the T2I eval render. Asserts:
+/// Both trained files on ONE bf16 load, each at its own strength, on the same held-out edit
+/// as learned evaluation (source 99 at native768, palette key at native512, both fitted by the
+/// production reference helper). Transfer keeps its separate native768 palette key. Asserts:
 /// `[t2i@1, edit@0]` is byte-identical to `[t2i@1]` and `[t2i@0, edit@1]` to `[edit@1]` (a
 /// strength reaches only its own file); `[t2i@1, edit@1]` differs from each single file by at
 /// least [`STACK_MOVES_FLOOR`] (both contribute); halving the T2I strength inside the stack moves
@@ -1576,7 +1581,54 @@ fn stacked_adapters_apply_with_independent_weights() {
         );
     }
     let spec = tier_spec("bf16", None);
-    let request = t2i_request();
+    let request = stack_protocol::request(
+        to_image(edit_source(99, RENDER_EDGE)),
+        to_image(edit_key(TRAIN_EDGE)),
+    );
+    let references = mlx_gen_qwen_image_2_1::collect_references(&request).unwrap();
+    let vision = mlx_gen_qwen_image_2_1::load_vision_config(&snapshot())
+        .unwrap()
+        .expect("two-reference stack requires the snapshot's vision configuration");
+    let fitted_sizes: Vec<_> = references
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            mlx_gen_qwen_image_2_1::reference::reference_fit(
+                (image.width, image.height),
+                index,
+                &vision,
+            )
+            .unwrap()
+        })
+        .collect();
+    let inputs = stack_protocol::reference_receipt(&references, &fitted_sizes);
+    assert_eq!(request.memory_reference_count(), 2);
+    assert!(fitted_sizes.iter().all(|size| *size == (1024, 1024)));
+    let tile_edge = mlx_gen_qwen_image_2_1::pipeline::decode_tiling(&request)
+        .and_then(|t| t.spatial)
+        .map(|s| s.tile_px as u32);
+    // The same derived request budget production installs; the two-reference encode/joint
+    // sequence is priced here, never the old T2I transient. This remains an estimate, not
+    // physical admission or a measurement; the existing physical watchdog remains in force.
+    let transient =
+        mlx_gen_qwen_image_2_1::memory_strategy::derived::request_transient_budget_bytes(
+            request.width,
+            request.height,
+            mlx_gen_qwen_image_2_1::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
+            request.memory_reference_count(),
+            false,
+            tile_edge,
+        );
+    let protocol = json!({"kind":"heldout_two_reference_stack_evaluation",
+        "request":direction_request_facts(&request),"inputs":inputs,
+        "renderCount":6,"tier":"bf16","transientBudgetBytes":transient,
+        "conditioningTokensEstimate":mlx_gen_qwen_image_2_1::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
+        "forecastProvenance":"production derived request allocator budget; NOT measured or physical admission",
+        "decodeTileEdge":tile_edge,"stackMovementFloor":STACK_MOVES_FLOOR,
+        "adapters":[{"kind":"lora","sha256":sha256_file(&t2i)},
+                    {"kind":"lokr","sha256":sha256_file(&edit)}]});
+    // Persist geometry, reference hashes and forecast before any stack weight load/render.
+    write_json(&out, "two-reference-stack-protocol", &protocol);
     let stacks: [(&str, Vec<AdapterSpec>); 6] = [
         ("t2i_1", vec![adapter(&t2i, 1.0, AdapterKind::Lora)]),
         ("edit_1", vec![adapter(&edit, 1.0, AdapterKind::Lokr)]),
@@ -1612,13 +1664,22 @@ fn stacked_adapters_apply_with_independent_weights() {
     let mut rendered = BTreeMap::new();
     let mut facts = Vec::new();
     for (label, stack) in stacks {
-        let (img, f) = render(
-            label,
-            &spec.clone().with_adapters(stack),
-            &request,
-            &guard,
-            &out,
-        );
+        let stack_spec = spec.clone().with_adapters(stack);
+        let contract = memory_strategy_contract(ID, &stack_spec).unwrap();
+        let allocator_resident =
+            mlx_gen_qwen_image_2_1::memory_strategy::derived::resident_weights(
+                mlx_gen_qwen_image_2_1::Tier::Bf16,
+            )
+            .resident_total()
+            .saturating_add(contract.asset_facts.overlay_bytes);
+        let (img, mut f) = render(label, &stack_spec, &request, &guard, &out);
+        f["route"] = json!("two_reference_edit");
+        f["referenceCount"] = json!(request.memory_reference_count());
+        f["inputs"] = inputs.clone();
+        f["request"] = direction_request_facts(&request);
+        f["transientBudgetBytes"] = json!(transient);
+        f["allocatorResidentBytes"] = json!(allocator_resident);
+        f["allocatorMemoryLimitBytes"] = json!(allocator_resident.saturating_add(transient));
         facts.push(f);
         rendered.insert(label, img);
     }
@@ -1639,7 +1700,7 @@ fn stacked_adapters_apply_with_independent_weights() {
     write_json(
         &out_dir(),
         "stacked_adapters",
-        &json!({"renders": facts, "comparisons": comparisons}),
+        &json!({"protocol":protocol,"renders": facts, "comparisons": comparisons}),
     );
 
     for (label, img) in &rendered {
