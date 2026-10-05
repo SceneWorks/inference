@@ -16,8 +16,9 @@
 //! **Latent space.** TAEHV applies no latent scale/shift: it decodes the diffusion model's own
 //! per-channel-**normalized** latent (`(z − latents_mean) / latents_std`) — what the trainers cache.
 //!
-//! Graph, key layout (`decoder.{i}.…`, torch OIHW, cast to f32) and the per-frame `T = 1` decode
-//! are documented on the MLX twin; this module runs the same math in candle's native NCHW layout,
+//! Graph, key layout (`decoder.{i}.…`, torch OIHW, cast to f32), the per-frame `T = 1` decode and
+//! its `T`-frame clip generalization ([`TaehvDecoder::decode_clip_last_frames`]) are documented on
+//! the MLX twin; this module runs the same math in candle's native NCHW layout,
 //! built only from ops with a backward (`conv2d`, `upsample_nearest2d`, `relu`, `tanh`, `cat`,
 //! `reshape`/`permute`/`narrow`, `clamp`), so the decode is differentiable in its input. Shipped
 //! checkpoints also carry `encoder.*` keys, which are ignored; any unread `decoder.*` key is an
@@ -166,6 +167,15 @@ impl TaehvConfig {
     /// ×2 for the gradients) — the same estimate as the MLX twin. Not a measured value. A trainer
     /// decoding `k` frames per step scales it by `k`.
     pub fn training_working_set_bytes(&self, out_h: u32, out_w: u32) -> u64 {
+        self.clip_training_working_set_bytes(out_h, out_w, 1)
+    }
+
+    /// [`training_working_set_bytes`](Self::training_working_set_bytes) for one
+    /// [`TaehvDecoder::decode_clip_last_frames`] clip of `clip_frames` latent frames: every frame
+    /// of the clip runs the head and the MemBlock stages (the memory crosses frames); only the
+    /// clip's final output frame runs the full-resolution tail.
+    pub fn clip_training_working_set_bytes(&self, out_h: u32, out_w: u32, clip_frames: u32) -> u64 {
+        let clip = clip_frames.max(1) as u64;
         let up = self.spatial_upscale() as u64;
         let (lh, lw) = (
             (out_h as u64).div_ceil(up).max(1),
@@ -173,8 +183,8 @@ impl TaehvConfig {
         );
         let nf = self.channels.map(|c| c as u64);
         let mut area = lh * lw;
-        let mut elems = 3 * area * nf[0].max(self.latent_channels as u64);
-        let mut frames = 1u64;
+        let mut elems = 3 * clip * area * nf[0].max(self.latent_channels as u64);
+        let mut frames = clip;
         for s in 0..3 {
             let c = nf[s];
             elems += 3 * 11 * frames * area * c;
@@ -475,9 +485,26 @@ impl TaehvDecoder {
                 self.cfg.display_name()
             )));
         }
-        self.check_channels(dims[1], &dims)?;
-        let n = dims[0];
-        let mut x = self.head(latents)?;
+        self.decode_clip_last_frames(&latents.unsqueeze(1)?)
+    }
+
+    /// Decode `N` clips of `T` latent frames each and keep **only each clip's final output
+    /// frame** — the last of the last latent frame's `t_upscale` grown frames, i.e.
+    /// `decode_video(latents)[:, -1]`, with the MemBlocks carrying the clip's earlier frames:
+    /// NTCHW `[N, T, C, h, w]` → NHWC `[N, H, W, 3]` in `[0, 1]`. Differentiable in `latents`.
+    /// Only that frame's full-resolution tail is computed (the last stage-2 frame through the last
+    /// `n_f[2]` TGrow output channels — no MemBlock follows the final TGrow).
+    pub fn decode_clip_last_frames(&self, latents: &Tensor) -> Result<Tensor> {
+        let dims = latents.dims().to_vec();
+        if dims.len() != 5 {
+            return Err(Error::Msg(format!(
+                "{} decode_clip_last_frames expects NTCHW latents, got shape {dims:?}",
+                self.cfg.display_name()
+            )));
+        }
+        self.check_channels(dims[2], &dims)?;
+        let (n, t, c, h, w) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
+        let mut x = self.head(&latents.reshape((n * t, c, h, w))?)?;
         let last = self.stages.len() - 1;
         for (s, st) in self.stages.iter().enumerate() {
             for b in &st.blocks {
@@ -792,6 +819,45 @@ mod tests {
             .unwrap();
         let last = v.narrow(1, 8, 1).unwrap().squeeze(1).unwrap();
         assert!(max_abs_diff(&alone, &last) > 1e-2);
+    }
+
+    /// `decode_clip_last_frames` on `T = 2` clips is exactly the last frame of the reference
+    /// `decode_video` of the same clips (the last latent frame's last grown frame, decoded with its
+    /// predecessor's memory), one frame per clip. Mutations: keep the clip's first stage-2 frame
+    /// (`f - 1` → `0`) ⇒ red; cut the cross-frame memory (MemBlocks run with `clips = n·t`) ⇒ red.
+    #[test]
+    fn clip_last_frame_decode_equals_the_reference_clips_last_frame() {
+        for cfg in [tiny(TaehvConfig::taew2_1()), tiny(TaehvConfig::taeltx2_3())] {
+            let dec = load(&cfg, 8);
+            let z = splitmix_uniform(
+                &[2, 2, cfg.latent_channels, 2, 2],
+                14,
+                1.0,
+                0.0,
+                &Device::Cpu,
+            )
+            .unwrap();
+            let fast = dec.decode_clip_last_frames(&z).unwrap();
+            let up = cfg.spatial_upscale();
+            assert_eq!(fast.dims(), &[2, 2 * up, 2 * up, 3], "{}", cfg.name);
+            let video = dec.decode_video(&z).unwrap();
+            let frames = video.dim(1).unwrap();
+            assert_eq!(frames, 2 * cfg.t_upscale() - cfg.frames_to_trim());
+            let last = video.narrow(1, frames - 1, 1).unwrap().squeeze(1).unwrap();
+            assert!(max_abs_diff(&fast, &last) < 1e-5, "{}", cfg.name);
+        }
+    }
+
+    /// A `T`-frame clip's working set grows with `T` (head + MemBlock stages run on every frame)
+    /// but stays under `T`× the per-frame figure (one full-resolution tail per clip). Mutation:
+    /// ignore `clip_frames` ⇒ red.
+    #[test]
+    fn clip_working_set_grows_with_the_clip_length() {
+        let cfg = TaehvConfig::taeltx2_3();
+        let one = cfg.clip_training_working_set_bytes(512, 512, 1);
+        let two = cfg.clip_training_working_set_bytes(512, 512, 2);
+        assert_eq!(one, cfg.training_working_set_bytes(512, 512));
+        assert!(two > one && two < 2 * one, "{one} {two}");
     }
 
     #[test]
