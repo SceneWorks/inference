@@ -849,6 +849,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-perceptual"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-depth",
+ "tempfile",
+]
+
+[[package]]
 name = "candle-gen-pid"
 version = "0.0.0"
 dependencies = [
@@ -2618,6 +2627,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-perceptual"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "mlx-gen-depth",
+ "pmetal-mlx-rs",
+ "tempfile",
+]
+
+[[package]]
 name = "mlx-gen-pid"
 version = "0.0.0"
 dependencies = [
@@ -2804,6 +2823,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "safetensors 0.4.5",
