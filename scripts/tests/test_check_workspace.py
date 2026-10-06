@@ -1024,6 +1024,16 @@ class CrossBackendGeometryTests(unittest.TestCase):
                 path = root / crate / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source, encoding="utf-8")
+            # The root crates' training-kit twins the same gate compares (one agreeing constant),
+            # so the synthetic tree isolates the family-pair clause under test.
+            for crate in self.gate.CROSS_BACKEND_ROOT_CRATES:
+                train = root / crate / "src" / "train"
+                train.mkdir(parents=True, exist_ok=True)
+                for twin in self.gate.CROSS_BACKEND_ROOT_TRAIN_TWINS:
+                    (train / twin).write_text(
+                        "pub const DEMO_WEIGHT: f32 = 0.5;\n" if twin == "perceptual.rs" else "",
+                        encoding="utf-8",
+                    )
             for side, crate in (("a", self.A), ("b", self.B)):
                 if drop_crate == side:
                     continue
