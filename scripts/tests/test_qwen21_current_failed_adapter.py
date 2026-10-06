@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 import yaml
@@ -143,6 +144,73 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             mutant["source"]["baseTree"] = "0" * 40
             with self.assertRaises(ValueError):
                 current.acquire_source_base(checkout, head, mutant)
+
+    def test_actual_current_head_source_closure_and_mutations(self):
+        repository = Path(__file__).resolve().parents[2]
+
+        def run(root, *args, env=None):
+            return subprocess.run(["git", *args], cwd=root, env=env, check=True, text=True,
+                                  encoding="utf-8", stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE).stdout.strip()
+
+        head = run(repository, "rev-parse", "HEAD")
+        expected = run(repository, "diff", "--name-only",
+                       self.cfg["source"]["baseCommit"], head).splitlines()
+        self.assertIn("scripts/tests/test_ci_workflow_policy.py", expected)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory).resolve() / "repository"
+            run(Path(directory), "clone", "--shared", "--no-checkout", str(repository),
+                str(fixture))
+            run(fixture, "sparse-checkout", "init", "--no-cone")
+            run(fixture, "sparse-checkout", "set",
+                "/scripts/ci/qwen21_current_failed_adapter.py")
+            run(fixture, "checkout", "--detach", head)
+            self.assertEqual(current.validate_source_closure(fixture, head, self.cfg), expected)
+            selector_name = self.cfg["selector"].rsplit("::", 1)[1]
+            for selector in (f"wrong_module::{selector_name}",
+                             "conditioning_velocity_diagnostic::missing_selector"):
+                mutant = copy.deepcopy(self.cfg)
+                mutant["selector"] = selector
+                with self.subTest(selector=selector), self.assertRaisesRegex(
+                        ValueError, "reviewed current selector is absent"):
+                    current.validate_source_closure(fixture, head, mutant)
+
+            def commit_mutation(path: str, payload: bytes) -> str:
+                index = fixture.parent / ("index-" + hashlib.sha256(path.encode()).hexdigest())
+                environment = os.environ.copy()
+                environment["GIT_INDEX_FILE"] = str(index)
+                run(fixture, "read-tree", head, env=environment)
+                blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=fixture,
+                                      input=payload, check=True, stdout=subprocess.PIPE).stdout.decode(
+                                          "ascii").strip()
+                run(fixture, "update-index", "--add", "--cacheinfo", "100644", blob, path,
+                    env=environment)
+                tree = run(fixture, "write-tree", env=environment)
+                commit_environment = environment.copy()
+                commit_environment.update({"GIT_AUTHOR_NAME": "fixture",
+                                           "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                                           "GIT_COMMITTER_NAME": "fixture",
+                                           "GIT_COMMITTER_EMAIL": "fixture@example.invalid"})
+                commit = subprocess.run(["git", "commit-tree", tree, "-p", head, "-m",
+                                         "source closure mutation"], cwd=fixture,
+                                        env=commit_environment, check=True,
+                                        stdout=subprocess.PIPE).stdout.decode("ascii").strip()
+                run(fixture, "checkout", "--detach", commit)
+                return commit
+
+            unrelated = "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/unrelated.rs"
+            unrelated_commit = commit_mutation(unrelated, b"pub const UNRELATED: bool = true;\n")
+            with self.assertRaisesRegex(ValueError, "diff exceeds reviewed"):
+                current.validate_source_closure(fixture, unrelated_commit, self.cfg)
+
+            production = "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/model.rs"
+            original = subprocess.run(["git", "show", f"{head}:{production}"], cwd=fixture,
+                                      check=True, stdout=subprocess.PIPE).stdout
+            production_commit = commit_mutation(production, original + b"\n// mutation\n")
+            with mock.patch.object(current, "ALLOWED_DIFF", current.ALLOWED_DIFF | {production}):
+                with self.assertRaisesRegex(ValueError, "production blob changed"):
+                    current.validate_source_closure(fixture, production_commit, self.cfg)
 
     def test_zip_checks_complete_digest_and_extracts_only_fixed_members(self):
         with tempfile.TemporaryDirectory() as directory:

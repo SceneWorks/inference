@@ -45,6 +45,7 @@ ALLOWED_DIFF = {
     "scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-current-failed-adapter.sh",
     "scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh",
     "scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh",
+    "scripts/tests/test_ci_workflow_policy.py",
     "scripts/tests/test_qwen21_current_failed_adapter.py",
     "scripts/tests/test_qwen21_direction_protocol.py",
     "scripts/tests/test_qwen21_q4_replay.py",
@@ -281,7 +282,10 @@ def validate_source_closure(root: Path, source_candidate: str, cfg: dict) -> lis
                 f"production blob changed: {path}")
     selector_source = git(root, "show", source_candidate + ":crates/media/mlx-gen/"
                           "mlx-gen-qwen-image-2-1/src/conditioning_velocity_diagnostic.rs")
-    require(cfg["selector"] in selector_source, "reviewed current selector is absent")
+    selector_module, separator, selector_name = cfg["selector"].rpartition("::")
+    require(separator == "::" and selector_module == "conditioning_velocity_diagnostic" and
+            re.search(rf"\bfn\s+{re.escape(selector_name)}\s*\(", selector_source) is not None,
+            "reviewed current selector is absent")
     return changed
 
 
