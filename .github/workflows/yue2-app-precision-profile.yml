@@ -1,7 +1,7 @@
 name: YuE2 app stage-precision admission profile
 
 # Dispatch only, once per owned CUDA or nax-macos-2 window. This runs exactly
-# seven off-plan app profiles; old acceptance, ten-case corpus and quality are untouched.
+# eight CUDA / seven Metal off-plan app profiles; old acceptance, corpus and quality are untouched.
 on:
   workflow_dispatch:
     inputs:
@@ -9,6 +9,12 @@ on:
         type: choice
         required: true
         options: [cuda, metal]
+      cuda_scheduling_mode:
+        type: choice
+        required: false
+        default: shared-host
+        options: [shared-host, shared-gpu1, owner-gpu0, owner-gpu0-mac-anchor]
+        description: shared-gpu1 serializes YuE2 on physical GPU1 while observing external workloads; legacy shared-host remains strict
       expected_engine_sha:
         type: string
         required: true
@@ -37,7 +43,8 @@ permissions:
   actions: read
 
 concurrency:
-  group: ${{ inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
+  group: ${{ inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.backend == 'cuda' && inputs.cuda_scheduling_mode == 'shared-gpu1' && 'inference-yue2-owner-gpu1' || inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -48,8 +55,10 @@ jobs:
     env:
       EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
       EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
       YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
-      CUDA_VISIBLE_DEVICES: "0"
+      YUE2_CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}
+      CUDA_VISIBLE_DEVICES: "1"
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       CUDA_COMPUTE_CAP: "120"
       APP_RUN_ROOT: 'E:\sceneworks-terminal\sc-23002-yue2-precision\${{ github.run_id }}-${{ github.run_attempt }}'
@@ -65,6 +74,8 @@ jobs:
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
         run: |
+          $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000000
+          Add-Content -Path $env:GITHUB_ENV -Value "YUE2_APP_PRECISION_JOB_STARTED_UTC_NS=$stamp"
           if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_APP_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'exact lowercase SHA inputs required' }
           if ($env:EXPECTED_CONTROL_SHA -cne $env:GITHUB_SHA) { throw 'dispatch ref must be the exact workflow control SHA' }
           if (Test-Path -LiteralPath $env:APP_RUN_ROOT) { throw 'run-owned precision state already exists' }
@@ -90,7 +101,7 @@ jobs:
         if: inputs.idle_cuda_context_run_id != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-3391f854565a5f5ea8eea48d4a8d9bad2e68c02d-37106146499-1
+          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-e538120368ac279cc42176c44f9d88fa5af9c9b4-37145909196-1
           run-id: ${{ inputs.idle_cuda_context_run_id }}
           repository: ${{ github.repository }}
           github-token: ${{ github.token }}
@@ -120,6 +131,8 @@ jobs:
           if (-not $pin) { throw 'app Rust channel is not an exact version' }
           Add-Content -Path $env:GITHUB_ENV -Value "RUSTUP_TOOLCHAIN=$($pin.Matches[0].Groups[1].Value)"
       - uses: ./app/.github/actions/prepare-rust-runner
+        with:
+          workspace-directory: app
       - name: Verify selected app Rust channel
         shell: powershell
         working-directory: app
@@ -152,16 +165,20 @@ jobs:
           & $env:REVIEWED_PYTHON control/scripts/ci/yue2_app_precision_profile.py preflight --backend cuda --evidence "$env:APP_EVIDENCE" --label before-install
           if ($LASTEXITCODE -ne 0) { throw 'device became busy before install' }
       - name: Install pinned BF16 model and both decoders through the app, without acceptance cases
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: cmd
         working-directory: app
         run: |
           set "RUSTC_WRAPPER="
           call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           set "NVCC_CCBIN=%VCToolsInstallDir%bin\Hostx64\x64"
-          node scripts\yue2-acceptance.mjs --platform cuda --gpu-id 0 --profile-install-only --out "%APP_RUN_ROOT%\install" --data-dir "%APP_RUN_ROOT%\app-data" --hf-home "%APP_RUN_ROOT%\hf-home" --api-bin "%CARGO_TARGET_DIR%\release\sceneworks-rust-api.exe" --ffmpeg-bin "%YUE2_FFMPEG_BIN%" > "%APP_EVIDENCE%\install.log" 2>&1
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_gpu0_owner_guard.py --evidence "%APP_EVIDENCE%" --label install -- node scripts\yue2-acceptance.mjs --platform cuda --gpu-id 1 --profile-install-only --out "%APP_RUN_ROOT%\install" --data-dir "%APP_RUN_ROOT%\app-data" --hf-home "%APP_RUN_ROOT%\hf-home" --api-bin "%CARGO_TARGET_DIR%\release\sceneworks-rust-api.exe" --ffmpeg-bin "%YUE2_FFMPEG_BIN%" > "%APP_EVIDENCE%\install.log" 2>&1
           if errorlevel 1 exit /b 1
-      - name: Capture exactly seven CUDA app precision profiles
+      - name: Capture exactly eight CUDA app precision profiles
         id: capture
+        env:
+          GH_TOKEN: ${{ github.token }}
         continue-on-error: true
         shell: cmd
         working-directory: app

@@ -22,8 +22,9 @@ def protocol_errors(source):
             errors.append(fragment)
     if body.index('write_json(&out, "edit-training-protocol", &protocol)') > body.index('train(&req'):
         errors.append("protocol must precede admission")
+    source += (SOURCE.parent / "support/edit_protocol.rs").read_text(encoding="utf-8")
     captions = dict(re.findall(r'const (\w*EDIT_INSTRUCTION): &str =\s*"([^"]+)";', source))
-    if captions.get("TRAIN_EDIT_INSTRUCTION") != captions.get("EDIT_INSTRUCTION", "").replace(" shown in image 2", ""):
+    if captions.get("TRAIN_EDIT_INSTRUCTION") != captions.get("EDIT_INSTRUCTION", "").removesuffix("; image 2 is only the RGB level palette; do not copy its layout"):
         errors.append("training caption names a nonexistent second reference or changes RGB semantics")
     for fragment in ['const EDIT_GAIN_FLOOR: f64 = 1.0;', 'const ADAPTER_MOVES_FLOOR: f64 = 2.0;',
                      '"adapterSha256": sha256_file(canonical)',
@@ -45,6 +46,7 @@ class EditProtocolTests(unittest.TestCase):
             ('TRAIN_EDIT_INSTRUCTION.into()', 'EDIT_INSTRUCTION.into()'),
             ('"trainingReferenceCount": 1', '"trainingReferenceCount": 2'),
             ('images: vec![to_image(eval_src), to_image(key)]', 'images: vec![to_image(eval_src)]'),
+            ('images: vec![to_image(eval_src), to_image(key)]', 'images: vec![to_image(key), to_image(eval_src)]'),
             ('const EDIT_GAIN_FLOOR: f64 = 1.0;', 'const EDIT_GAIN_FLOOR: f64 = 0.1;'),
             ('"adapterSha256": sha256_file(canonical)', '"adapterSha256": "unknown"'),
             ('"orderedReferences": item.reference_image_paths.iter()', '"references": item.reference_image_paths.iter()'),

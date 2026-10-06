@@ -20,8 +20,8 @@
 
 use candle_llm::LlamaProvider;
 use core_llm::{
-    Channel, Content, ImageRef, LoadSpec, Message, Role, Sampling, StreamEvent, TextLlm,
-    TextLlmOutput, TextLlmRequest, ThinkingMode, VideoRef,
+    Channel, Content, ImageRef, LoadSpec, Message, ProposerKind, Role, Sampling, Speculative,
+    StreamEvent, TextLlm, TextLlmOutput, TextLlmRequest, ThinkingMode, VideoRef,
 };
 
 fn model_dir() -> String {
@@ -84,12 +84,25 @@ fn qwen3vl_vision_grounds_on_image() {
         ([35u8, 70, 200], "blue", "blue"),
     ] {
         let img = solid_image(256, 256, rgb);
+        // `auto` resolves to prompt lookup (no MTP head), which a Qwen3-VL multimodal request
+        // runs on the engine after its DeepStack / M-RoPE prefill — no fallback (sc-24446).
         let (out, content) = run(
             &p,
-            &image_request(
-                img,
-                "What is the dominant color of this image? Answer with one word.",
-            ),
+            &TextLlmRequest {
+                speculative: Some(Speculative::Auto),
+                ..image_request(
+                    img,
+                    "What is the dominant color of this image? Answer with one word.",
+                )
+            },
+        );
+        let report = out.decode.clone().expect("reported");
+        assert_eq!(report.path, "prompt_lookup", "{label}");
+        assert_eq!(report.proposer, ProposerKind::PromptLookup, "{label}");
+        assert!(
+            report.fallbacks.is_empty(),
+            "{label}: {:?}",
+            report.fallbacks
         );
         println!(
             "\n=== Qwen3-VL VISION ({label}) ===\n[answer] {:?}\n",

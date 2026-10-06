@@ -439,6 +439,7 @@ mod tests {
             supports_preserve_thinking: false,
             supports_tools: false,
             mtp: None,
+            speculative: Vec::new(),
             supported_constraints: constraints.iter().map(Constraint::kind).collect(),
         }
     }

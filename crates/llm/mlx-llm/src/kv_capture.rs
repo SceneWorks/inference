@@ -215,6 +215,10 @@ impl KvCache for CaptureCache {
         self.inner.compressed_dense_fallback()
     }
 
+    fn record_events(&mut self) {
+        self.inner.record_events()
+    }
+
     fn update(
         &mut self,
         layer: usize,
@@ -821,6 +825,7 @@ mod tests {
             yarn: None,
             mrope_section: None,
             gemma4: None,
+            activation_role: Default::default(),
         };
         let mut rng = SplitMix64::new(0x5c20677);
         let mut randn = |shape: &[i32]| {

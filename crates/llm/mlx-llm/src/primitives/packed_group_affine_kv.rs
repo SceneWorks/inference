@@ -813,6 +813,10 @@ impl DenseFallbackPackedDecoderCache {
             admission.admit(self.dense_reconstruction_bytes())?;
         }
         let mut dense = ContiguousKvCache::new(self.staged.layers());
+        // The replacement keeps recording exactly when its predecessor did (campaign only).
+        if self.dense.records_events() {
+            dense.record_events();
+        }
         let mut reconstructed = false;
         for layer_index in 0..self.staged.layers() {
             if self.staged.layer_tokens(layer_index) == 0 {
@@ -1409,6 +1413,10 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     /// reset's release is never missed.
     fn compressed_dense_fallback(&self) -> Option<&ContiguousKvCache> {
         Some(&self.dense)
+    }
+
+    fn record_events(&mut self) {
+        self.dense.record_events()
     }
 
     fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {

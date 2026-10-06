@@ -57,6 +57,31 @@ pub enum Error {
         attempts: u32,
     },
 
+    /// A constraint mask allowed no token of a logits row (story sc-24434): there is nothing the
+    /// sampler may draw. Typed so a caller can tell a dead-ended constraint from a backend fault;
+    /// the sampler never falls back to a forbidden id.
+    #[error("the constraint mask allows no token of the {vocab}-entry logits row")]
+    NoAllowedToken {
+        /// The logits row's width.
+        vocab: usize,
+    },
+
+    /// A forward would take a DeltaNet checkpoint window past the tokens it was armed to record
+    /// (story sc-24435) — more than the speculative width admission priced. Refused before the
+    /// forward runs, with the cache untouched; typed so the cap is never mistaken for another
+    /// fault.
+    #[error(
+        "the DeltaNet checkpoint window holds {recorded} tokens and is armed for {max_tokens}: a \
+         {requested}-token forward would exceed it"
+    )]
+    CheckpointWindowFull {
+        /// Tokens the window has recorded.
+        recorded: i32,
+        /// Tokens the refused forward carried.
+        requested: i32,
+        /// The most the window records.
+        max_tokens: i32,
+    },
     /// A request's memory admission refused it mid-generation (a compressed KV cache's dense
     /// transition that the fresh memory budget cannot hold, sc-20682). Kept typed so the provider
     /// surfaces core-llm's `RequestResourceExhausted` rather than a backend failure.

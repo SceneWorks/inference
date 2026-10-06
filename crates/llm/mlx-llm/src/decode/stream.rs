@@ -6,6 +6,11 @@
 //! (the Llama decoder today, Qwen3 / BYO architectures later), emitting a [`StreamEvent`] per token
 //! through a callback.
 //!
+//! No production path decodes through this loop any more (epic sc-24432 E8): the provider, the
+//! captioners and the LTX-2.5 prompt enhancer all run the shared engine
+//! ([`generate_speculative`](super::generate_speculative)). The loop stays as the plain,
+//! non-engine **parity reference** the engine's token-identity tests compare against.
+//!
 //! Cancellation follows the established contract: a request that is *already cancelled* before any
 //! work returns the typed [`Error::Canceled`]; a cancel that trips
 //! *mid-stream* stops promptly and returns the partial output marked
@@ -15,14 +20,14 @@ use std::time::Instant;
 
 use core_llm::GenerationTimings;
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use super::BufferRelease;
 use crate::error::{Error, Result};
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::kv_cache::{ContiguousKvCache, KV_BLOCK_TOKENS};
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::{draw_token, SamplingParams, SplitMix64};
 
 /// A decoder the streaming loop can drive: it makes its own cache and produces last-position logits.
 pub trait Decode {
@@ -103,14 +108,6 @@ pub struct GenerationOutput {
     pub finish_reason: FinishReason,
 }
 
-/// A generation result whose synchronized phase timer remains live until provider-side stream
-/// processing has completed. The provider finishes the timer after detokenization, stop handling,
-/// and the terminal callback so `decode` includes the complete stream-dispatch path.
-pub(crate) struct TimedGenerationOutput {
-    pub(crate) output: GenerationOutput,
-    pub(crate) timer: GenerationTimer,
-}
-
 /// Two-phase timer with an explicit accelerator synchronization boundary between prefill and
 /// decode. Keeping this stateful prevents a caller from accidentally measuring lazy MLX graph
 /// submission as completed prefill work.
@@ -121,7 +118,8 @@ pub(crate) struct GenerationTimer {
 }
 
 impl GenerationTimer {
-    pub(crate) fn start() -> Self {
+    #[cfg(test)]
+    fn start() -> Self {
         Self::start_at(Instant::now())
     }
 
@@ -243,6 +241,10 @@ pub(crate) fn generate_with_observer(
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let output = {
         let mut cache = decoder.make_cache();
+        // Ownership events are recorded only for an attached campaign observer.
+        if observer.is_some() {
+            cache.record_events();
+        }
         let mut observed_cache = ObservedCache::default();
         // Prefill the whole prompt at offset 0; logits are for the last prompt position.  The
         // observation is deliberately after dispatch so a sampler sees the actual prefill peak.
@@ -252,7 +254,7 @@ pub(crate) fn generate_with_observer(
             // This host read is campaign-only.  Normal generation does not materialize logits or
             // pay this synchronization cost; the receipt producer needs actual product logits for
             // its independent fp32/reference-quality calculation.
-            let values = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+            let values = crate::primitives::sampler::counted_host_f32(&logits)?;
             observer.logits("prefill", &values);
         }
         if let Some(observer) = observer.as_deref_mut() {
@@ -402,81 +404,6 @@ pub(super) fn observe_packed_evidence(
     }
 }
 
-/// Synchronized two-phase variant of [`generate_with`]. Tokenization and template rendering happen
-/// before this function; the returned timer deliberately remains live for provider-side stream
-/// processing.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_timings(
-    decoder: &dyn Decode,
-    prompt_ids: &[i32],
-    config: &GenerationConfig,
-    cancel: &CancelFlag,
-    on_event: &mut dyn FnMut(StreamEvent),
-    constraint: Option<&mut dyn ConstraintMask>,
-    should_stop: Option<&dyn Fn() -> bool>,
-) -> Result<TimedGenerationOutput> {
-    if cancel.is_cancelled() {
-        return Err(Error::Canceled);
-    }
-    if prompt_ids.is_empty() {
-        return Err(Error::Msg("generate_with_timings: empty prompt".into()));
-    }
-
-    let mut cache = decoder.make_cache();
-    generate_with_timings_on(
-        decoder,
-        cache.as_mut(),
-        prompt_ids,
-        config,
-        cancel,
-        on_event,
-        constraint,
-        should_stop,
-    )
-}
-
-/// [`generate_with_timings`] on a caller-selected, empty `cache` — the production compressed-KV
-/// path picks its cache before any K/V mutation and reads the cache's evidence after the decode.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_timings_on(
-    decoder: &dyn Decode,
-    cache: &mut dyn KvCache,
-    prompt_ids: &[i32],
-    config: &GenerationConfig,
-    cancel: &CancelFlag,
-    on_event: &mut dyn FnMut(StreamEvent),
-    constraint: Option<&mut dyn ConstraintMask>,
-    should_stop: Option<&dyn Fn() -> bool>,
-) -> Result<TimedGenerationOutput> {
-    if cancel.is_cancelled() {
-        return Err(Error::Canceled);
-    }
-    if prompt_ids.is_empty() || cache.offset() != 0 {
-        return Err(Error::Msg(
-            "generate_with_timings_on requires a prompt and an empty cache".into(),
-        ));
-    }
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let prompt = input_ids(prompt_ids);
-    let mut timer = GenerationTimer::start();
-    let logits = decoder.step(&prompt, cache, 0)?;
-    timer.finish_prefill([&logits])?;
-    let output = decode_loop(
-        decoder,
-        cache,
-        logits,
-        rng,
-        prompt_ids.to_vec(),
-        config,
-        cancel,
-        on_event,
-        constraint,
-        should_stop,
-        &mut None,
-    )?;
-    Ok(TimedGenerationOutput { output, timer })
-}
-
 /// Like [`generate`], but driving a **caller-provided** KV cache that may already hold a prefix
 /// (e.g. a [`PagedKvCache`](crate::primitives::PagedKvCache) seeded with shared blocks). Prefills
 /// only `prompt_ids[cache.offset()..]` at that offset, then decodes. The cache is borrowed (not
@@ -535,6 +462,10 @@ pub fn generate_with_cache(
 /// The `decoder` drives the **decode steps** only (the prompt is already cached); for the Qwen3.6
 /// multimodal path that decoder shifts the RoPE offset by `mrope_delta` so post-image text positions
 /// continue correctly. Returns [`Error::Canceled`] on an already-set cancel.
+///
+/// Plain-loop parity reference only: production caller-prefilled decoding runs the engine with
+/// [`SpeculativePrompt::Prefilled`](super::SpeculativePrompt::Prefilled).
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn generate_from_prefill(
     decoder: &dyn Decode,
@@ -633,43 +564,6 @@ pub(crate) fn generate_from_prefill_observed(
     )
 }
 
-/// Synchronized variant of [`generate_from_prefill`] for a prefill whose conditioning began at
-/// `prefill_started`. Qwen-VL starts this clock before image/video encoding and fusion.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_from_prefill_with_timings(
-    decoder: &dyn Decode,
-    cache: &mut dyn KvCache,
-    first_logits: Array,
-    history: Vec<i32>,
-    config: &GenerationConfig,
-    cancel: &CancelFlag,
-    on_event: &mut dyn FnMut(StreamEvent),
-    constraint: Option<&mut dyn ConstraintMask>,
-    should_stop: Option<&dyn Fn() -> bool>,
-    prefill_started: Instant,
-) -> Result<TimedGenerationOutput> {
-    if cancel.is_cancelled() {
-        return Err(Error::Canceled);
-    }
-    let mut timer = GenerationTimer::start_at(prefill_started);
-    timer.finish_prefill([&first_logits])?;
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let output = decode_loop(
-        decoder,
-        cache,
-        first_logits,
-        rng,
-        history,
-        config,
-        cancel,
-        on_event,
-        constraint,
-        should_stop,
-        &mut None,
-    )?;
-    Ok(TimedGenerationOutput { output, timer })
-}
-
 /// The token-by-token decode loop shared by [`generate_with`] and the prefix-cached path
 /// ([`crate::decode::generate_cached`]): given the prefill `logits`, an RNG, the seeded `history`
 /// (the prompt — the repetition-penalty window), and a `cache` already positioned past the prompt,
@@ -678,6 +572,9 @@ pub(crate) fn generate_from_prefill_with_timings(
 /// The two entry points differ only in how the cache + first `logits` are produced (cold prefill vs.
 /// shared-prefix reuse); the loop is identical, so a cached run is token-for-token the same as a cold
 /// one for the same prompt.
+///
+/// Plain-loop parity reference only: it has no production caller (E8); every production decode
+/// runs [`generate_speculative`](super::generate_speculative).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_loop(
     decoder: &dyn Decode,
@@ -701,8 +598,9 @@ pub(crate) fn decode_loop(
     let mut release = BufferRelease::new();
 
     for step in 0..config.max_new_tokens {
-        // Pulling logits to host for sampling forces a graph eval each step, so this check is
-        // genuinely effective despite MLX's lazy evaluation.
+        // Reading each drawn token back forces a graph eval each step, so this check is genuinely
+        // effective despite MLX's lazy evaluation. (This loop is the unpipelined reference; the
+        // engine's token-at-a-time loop pipelines — `decode::engine`.)
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
             break;
@@ -726,7 +624,7 @@ pub(crate) fn decode_loop(
         // so the constraint is free to be advanced again below.
         let next = {
             let mask = constraint.as_mut().map(|c| c.allowed());
-            sample(&logits, &history, &config.sampling, &mut rng, mask)?
+            draw_token(&logits, &history, &config.sampling, &mut rng, mask)?
         };
 
         // The model's own choice is what the observer records, forced or not; under teacher
@@ -901,7 +799,7 @@ pub(crate) fn forced_greedy_decode_from(
             logits = decoder.step(&input_ids(&[previous]), cache, offset)?;
             release.advance(1);
         }
-        let next = sample(&logits, &history, &greedy, &mut rng, None)?;
+        let next = draw_token(&logits, &history, &greedy, &mut rng, None)?;
         let streamed = teacher_forced.map_or(next, |forced| forced[step]);
         if score {
             stream_probabilities.push(selected_token_probability(&logits, streamed)?);
@@ -948,8 +846,7 @@ fn selected_token_probability(logits: &Array, token: i32) -> Result<f64> {
     if token < 0 {
         return Err(Error::Msg("negative sampled token id".into()));
     }
-    let logits_f32 = logits.as_dtype(Dtype::Float32)?;
-    let values = logits_f32.as_slice::<f32>();
+    let values = crate::primitives::sampler::counted_host_f32(logits)?;
     let token = token as usize;
     if token >= values.len() || values.iter().any(|value| !value.is_finite()) {
         return Err(Error::Msg(
@@ -1497,12 +1394,14 @@ mod tests {
             has_mask: false,
         };
         let mut cache = select_decoder_cache_with_reader(request, handle).into_cache();
+        // What a campaign observer asks of the cache it observes (events are opt-in).
+        cache.record_events();
         let values = (0..64).map(|i| (i % 7) as f32 * 0.01).collect::<Vec<_>>();
         let kv = Array::from_slice(&values, &[1, 1, 1, 64])
-            .as_dtype(Dtype::Float16)
+            .as_dtype(mlx_rs::Dtype::Float16)
             .unwrap();
         let q = Array::from_slice(&values, &[1, 1, 1, 64])
-            .as_dtype(Dtype::Float16)
+            .as_dtype(mlx_rs::Dtype::Float16)
             .unwrap();
         assert!(cache
             .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)

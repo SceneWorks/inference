@@ -38,6 +38,9 @@ mod continuous;
 #[path = "contract_roundtrip.rs"]
 mod contract_roundtrip;
 
+#[path = "draft_model.rs"]
+mod draft_model;
+
 #[path = "gemma4_decoder.rs"]
 mod gemma4_decoder;
 
@@ -59,8 +62,14 @@ mod gguf_tokenizer;
 #[path = "joycaption.rs"]
 mod joycaption;
 
+#[path = "load_admission_probe.rs"]
+mod load_admission_probe;
+
 #[path = "ltx_2_5_te_tier_quality.rs"]
 mod ltx_2_5_te_tier_quality;
+
+#[path = "moe_routing.rs"]
+mod moe_routing;
 
 #[path = "native_composition.rs"]
 mod native_composition;
@@ -106,6 +115,9 @@ mod snapshot_hf;
 
 #[path = "speculative.rs"]
 mod speculative;
+
+#[path = "speculative_bench.rs"]
+mod speculative_bench;
 
 #[path = "stop_strings.rs"]
 mod stop_strings;

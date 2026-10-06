@@ -211,9 +211,10 @@ pub enum Projection {
     Quantized(QuantizedLinear),
     /// A compact Prism/Bonsai affine-2 or native ternary weight.
     Prism(std::sync::Arc<PrismPackedWeight>),
-    /// An NVFP4 weight quantized at load (sc-24135), resident as packed E2M1 + UE4M3 scales. Boxed:
-    /// its device handles would otherwise grow every projection-holding enum in the decoders.
-    Nvfp4(Box<Nvfp4Weight>),
+    /// An NVFP4 weight quantized at load (sc-24135), resident as packed E2M1 + UE4M3 scales.
+    /// Behind an `Arc` (its device handles would otherwise grow every projection-holding enum in
+    /// the decoders) that an MoE bank's indexed expert table shares (sc-24440).
+    Nvfp4(std::sync::Arc<Nvfp4Weight>),
 }
 
 /// Which representation a loaded [`Projection`] actually holds — the load telemetry's kind.
@@ -414,7 +415,7 @@ impl Projection {
             Some(ProjectionFormat::Nvfp4(ctx)) => {
                 let (rows, cols) = weight.dims2()?;
                 nvfp4_shape_refusal(rows, cols)?;
-                Ok(Self::Nvfp4(Box::new(Nvfp4Weight::quantize(
+                Ok(Self::Nvfp4(std::sync::Arc::new(Nvfp4Weight::quantize(
                     &weight, bias, ctx,
                 )?)))
             }
@@ -535,6 +536,22 @@ impl Projection {
         )?))
     }
 
+    /// Load a `bits`-wide (4 or 8) MLX affine triple — a companion MTP head's stored projections
+    /// (sc-24444) — as its exact affine grid re-packed to the resident Q8_0 form
+    /// ([`QuantizedLinear::from_mlx_affine`]).
+    pub fn load_mlx_affine(
+        weight: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        bits: usize,
+        group_size: usize,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        Ok(Projection::Quantized(QuantizedLinear::from_mlx_affine(
+            weight, scales, biases, None, group_size, bits, device,
+        )?))
+    }
+
     /// `x @ weightᵀ`.
     ///
     /// An NVFP4 projection dispatches between the fused decode GEMV (≤ 8 bf16 rows) and the
@@ -574,6 +591,16 @@ impl Projection {
                 rows * cols
             }
         }) as u64
+    }
+
+    /// The logical `(out, in)` weight shape.
+    pub fn dims(&self) -> (usize, usize) {
+        match self {
+            Projection::Dense(l) => l.weight().dims2().unwrap_or((0, 0)),
+            Projection::Quantized(q) => q.dims(),
+            Projection::Prism(w) => (w.rows(), w.input_width()),
+            Projection::Nvfp4(w) => w.shape(),
+        }
     }
 
     /// Resident weight (+ bias) bytes, or `None` for a representation whose storage is not

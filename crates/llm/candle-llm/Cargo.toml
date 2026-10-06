@@ -35,14 +35,15 @@ thiserror = { workspace = true }
 serde_json = { workspace = true }
 # One-time warning when the CUDA device sampler kernel fails to compile/load (sc-24133).
 tracing = "0.1"
+# bf16 / f16 element types for the fused Prism rotation's CUDA buffers (sc-24440); the CUDA
+# operator tests encode fixture scales as IEEE f16 bytes. Same version candle-core resolves.
+half = "2"
 
 [dev-dependencies]
 # Run the registered LlamaProvider through the backend-neutral contract checks.
 core-llm-testkit = { workspace = true }
 # Self-removing fixture roots for the test suites (sc-17755).
 tempfile = { workspace = true }
-# CUDA operator tests encode fixture scales as IEEE f16 bytes.
-half = "2"
 # Slice identity for the NVFP4 real-weight evidence run (sc-24135); already in the graph.
 sha2 = { workspace = true }
 # This crate's own integration tests arm the compressed-KV test seam (`test-kv-arm`); a dev

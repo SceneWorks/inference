@@ -144,6 +144,9 @@ autotests = false
 mlx-rs = { workspace = true }
 mlx-sys = { workspace = true }
 sceneworks-gen-core = { workspace = true }
+# The shared MLX sampler + SplitMix64 the media pipelines' text decode draws through
+# (`text_sample`, epic sc-24432 E8): one implementation, never a crate-local copy.
+mlx-llm = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # The hoisted turnkey converter glue (quant::write_quantized_config, F-045) writes the packed

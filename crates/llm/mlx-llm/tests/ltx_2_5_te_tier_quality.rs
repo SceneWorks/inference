@@ -279,7 +279,9 @@ fn config_for(path: &Path, bits: Option<i32>) -> ModelConfig {
             serde_json::json!({ "group_size": GROUP, "bits": bits, "mode": "affine" }),
         );
     }
-    let cfg = ModelConfig::from_json(&json).expect("the config must parse");
+    let mut cfg = ModelConfig::from_json(&json).expect("the config must parse");
+    // The text encoder's activation-dtype role (sc-24446), as `mlx-gen-ltx` loads it.
+    cfg.activation_role = mlx_llm::primitives::activation::ActivationRole::LtxTextEncoder;
     assert!(
         cfg.is_gemma4(),
         "{}: must be a Gemma 4 config",
@@ -536,7 +538,8 @@ fn the_shipped_tiers_match_the_measured_text_encoder_decision() {
             json.get("quantization").is_none(),
             "{tier}: the block belongs in `text_config`, not the wrapper's top level"
         );
-        let cfg = ModelConfig::from_json(&json).expect("the tier's config must parse");
+        let mut cfg = ModelConfig::from_json(&json).expect("the tier's config must parse");
+        cfg.activation_role = mlx_llm::primitives::activation::ActivationRole::LtxTextEncoder;
         assert_eq!(
             cfg.quantization.is_some(),
             packed,

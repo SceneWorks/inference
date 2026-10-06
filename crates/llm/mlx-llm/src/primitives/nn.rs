@@ -93,11 +93,11 @@ pub fn gelu(x: &Array) -> Result<Array> {
     Ok(mlx_rs::nn::gelu(x)?)
 }
 
-/// Tanh-approximate GELU — the SigLIP MLP variant. (Do not unify with [`gelu`]: the two are
-/// numerically distinct and both appear in the JoyCaption VLM.)
-pub fn gelu_tanh(x: &Array) -> Result<Array> {
-    Ok(mlx_rs::nn::gelu_approximate(x)?)
-}
+/// Tanh-approximate GELU, in the dtype its [`ActivationRole`] calls for (the policy:
+/// [`crate::primitives::activation`]).
+///
+/// [`ActivationRole`]: crate::primitives::activation::ActivationRole
+pub use crate::primitives::activation::gelu_tanh;
 
 /// Logit soft-cap `cap · tanh(x / cap)` (Gemma-2 caps attention scores and final logits). A no-op as
 /// `cap → ∞`; it squashes extremes toward `±cap` while staying ~linear near 0. Dtype-preserving (the

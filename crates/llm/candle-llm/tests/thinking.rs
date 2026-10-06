@@ -137,9 +137,24 @@ fn provider_records_the_decode_path_it_ran() {
     use candle_llm::primitives::{AttnFormulation, KvCacheKind};
 
     let guard = write_thinking_snapshot();
-    let spec = LoadSpec::dense(guard.path().to_str().unwrap().to_string());
+    // The eager loop's accounting (one host sync per token): graphs pinned off, since a CUDA
+    // load captures by default (sc-24446) and a capture's bit-exact self-check reads its outputs
+    // back too — `causal_engine_requests_record_the_graph_runner` covers the graph path.
+    let spec = LoadSpec {
+        cuda_graphs: Some(false),
+        ..LoadSpec::dense(guard.path().to_str().unwrap().to_string())
+    };
     let mut p = LlamaProvider::load(&spec).expect("load thinking provider");
     assert!(p.last_decode_record().is_none(), "no request yet");
+    // On CUDA the decoder stages device positions by default, so both loops' cached steps run
+    // the length-aware decode attention and say so (sc-24441).
+    let attention = if candle_llm::primitives::device_positions_default(
+        &candle_llm::device::select_device().unwrap(),
+    ) {
+        AttnFormulation::DecodeAttention
+    } else {
+        AttnFormulation::Gqa
+    };
     assert_eq!(p.decode_path(), DecodePath::StepModel);
 
     let mut req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 6);
@@ -152,7 +167,7 @@ fn provider_records_the_decode_path_it_ran() {
         KvCacheKind::Static,
         "on the static KV cache"
     );
-    assert_eq!(record.attn_formulation, AttnFormulation::Gqa);
+    assert_eq!(record.attn_formulation, attention);
     assert_eq!(record.proposer, core_llm::ProposerKind::None);
     assert_eq!(
         record.generated_tokens,
@@ -177,7 +192,7 @@ fn provider_records_the_decode_path_it_ran() {
     let record = p.last_decode_record().expect("record after generate");
     assert_eq!(record.path, DecodePath::Reference, "the reference loop ran");
     assert_eq!(record.kv_cache, KvCacheKind::Growing);
-    assert_eq!(record.attn_formulation, AttnFormulation::Gqa);
+    assert_eq!(record.attn_formulation, attention);
     assert_eq!(record.target_forwards, record.generated_tokens);
     assert_eq!(reference.usage.prompt_tokens, out.usage.prompt_tokens);
     if !candle_llm::device::select_device().unwrap().is_cuda() {
@@ -200,11 +215,12 @@ fn provider_records_the_decode_path_it_ran() {
     );
 }
 
-/// sc-24134 × sc-24138: with the CUDA-graph switch on, the llama family's engine path runs
-/// through the graph runner as the MTP path does — every step eager (the prefill included), and
-/// the record names why no graph ran (the build or device here; the family's own
-/// `positions_host_scalar` on a CUDA own-stream device) rather than a bare `graph: none`. With
-/// the switch off the model runs bare and the record is `graph: none`.
+/// sc-24134 × sc-24138 × sc-24441: with the CUDA-graph switch on, the llama family's engine path
+/// runs through the graph runner as the MTP path does, and the record says which graph path ran:
+/// on a CUDA own-stream device the decode step is captured and replays (`graph_path =
+/// captured`, no fallback); elsewhere every step is eager and the record names why (the build or
+/// device) rather than a bare `graph: none`. With the switch off the model runs bare and the
+/// record is `graph: none`.
 ///
 /// The switch is a load option (sc-24139): each case loads the provider under it
 /// (`LoadSpec::cuda_graphs`), since a CUDA load settles the model's stream then and every
@@ -229,22 +245,39 @@ fn causal_engine_requests_record_the_graph_runner() {
 
     let on = record(true);
     assert_eq!(on.path, DecodePath::StepModel, "the engine ran");
-    assert_eq!(
-        on.cuda_graphs.label(),
-        "eager",
-        "{}",
-        on.cuda_graphs.describe()
-    );
-    assert_eq!(
-        on.cuda_graphs.eager, on.target_forwards,
-        "every target forward went through the runner, eager"
-    );
-    assert_eq!((on.cuda_graphs.replayed, on.cuda_graphs.captured), (0, 0));
-    assert!(
-        on.cuda_graphs.fallback_reason.is_some(),
-        "{}",
-        on.cuda_graphs.describe()
-    );
+    let capturable = cfg!(feature = "cuda")
+        && !cfg!(feature = "flash-attn")
+        && candle_llm::device::select_device().unwrap().is_cuda();
+    if capturable {
+        assert_eq!(
+            on.cuda_graphs.fallback_reason,
+            None,
+            "{}",
+            on.cuda_graphs.describe()
+        );
+        // The dense decode step is captured once and replayed (sc-24441 AC1).
+        assert_eq!(on.cuda_graphs.captured, 1, "{}", on.cuda_graphs.describe());
+        assert!(on.cuda_graphs.replayed > 0, "{}", on.cuda_graphs.describe());
+        assert_eq!(on.report(true).graph_path, "captured");
+    } else {
+        assert_eq!(
+            on.cuda_graphs.label(),
+            "eager",
+            "{}",
+            on.cuda_graphs.describe()
+        );
+        assert_eq!(
+            on.cuda_graphs.eager, on.target_forwards,
+            "every target forward went through the runner, eager"
+        );
+        assert_eq!((on.cuda_graphs.replayed, on.cuda_graphs.captured), (0, 0));
+        assert!(
+            on.cuda_graphs.fallback_reason.is_some(),
+            "{}",
+            on.cuda_graphs.describe()
+        );
+        assert_eq!(on.report(true).graph_path, "eager");
+    }
 
     let off = record(false);
     assert_eq!(off.path, DecodePath::StepModel);

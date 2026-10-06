@@ -3,14 +3,14 @@
 //!
 //! * **AC1** — a 256-token greedy decode with the graph runner **on** is token-identical to the
 //!   same request with it **off**, for speculation off (the step driver on the static KV cache)
-//!   and for MTP `K = 3` (the unified engine). On this revision the 27B hybrid falls back
-//!   eager with the named reason `positions_host_scalar` (the model's positions are Rust-side
-//!   scalars; its cache passes since the sc-24131 DeltaNet ring keeps the recurrent state at
-//!   stable addresses), so identity holds by construction; the records say so.
+//!   and for MTP `K = 3` (the unified engine). Since sc-24441 the 27B hybrid captures: its static
+//!   cache stages the step positions on the device (RoPE, KV write, attention length, DeltaNet
+//!   ring slots), the vendored candle's parameter cache serves every layout, and the captured
+//!   decode / verify steps replay (`graph_path = captured`), verified bit-exact against eager by
+//!   the runner's self-checks.
 //! * **Census** — what a real 27B decode step and a `K = 3` verify step are made of when
-//!   recorded as a graph: kernel launches, host uploads (candle's per-op layout metadata),
-//!   allocations. The number behind the story's finding and the upper bound of what a full
-//!   graph could save.
+//!   recorded as a graph the way the runner records it (warmed under the parameter-cache guard):
+//!   kernel launches, allocations, and no host copy. The upper bound of what a graph saves.
 //!
 //! ```text
 //! BONSAI_QWEN38_SNAPSHOT=E:\...\snapshots\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
@@ -111,14 +111,9 @@ fn ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3() {
         "graphs on diverged from eager at {:?}",
         first_divergence(&eager.tokens, &graphs.tokens)
     );
-    assert_eq!(
-        graphs_record.cuda_graphs.eager,
-        eager_record.target_forwards
-    );
-    assert_eq!(
-        graphs_record.cuda_graphs.fallback_reason,
-        Some("positions_host_scalar")
-    );
+    assert_eq!(graphs_record.cuda_graphs.fallback_reason, None);
+    assert!(graphs_record.cuda_graphs.replayed > 0);
+    assert_eq!(graphs_record.report(true).graph_path, "captured");
     assert_eq!(graphs_record.kv_cache, KvCacheKind::Static);
 
     // ---- MTP K = 3: the engine, graphs off then on. ----
@@ -159,10 +154,8 @@ fn ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3() {
     // (MTP vs the token-at-a-time driver is S2's gate, with its enumerated bf16 knife-edge
     // exceptions; this story's claim is graphs on vs off on the same path, asserted above.)
     assert_eq!(graphs_mtp.stats.accepted, eager_mtp.stats.accepted);
-    assert_eq!(
-        graphs_mtp.record.cuda_graphs.fallback_reason,
-        Some("positions_host_scalar")
-    );
+    assert_eq!(graphs_mtp.record.cuda_graphs.fallback_reason, None);
+    assert_eq!(graphs_mtp.record.report(true).graph_path, "captured");
     assert_eq!(graphs_mtp.record.host_syncs_per_verify_step(), Some(1.0));
 }
 
@@ -178,10 +171,15 @@ fn qwen38_27b_step_census() {
     let (model, _mtp) = common::qwen35::load(&snapshot, &device);
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
     let mut cache = model.new_cache_for(prompt.len() + 64, 4).unwrap();
-    // Prefill and a few eager steps first, so every kernel is compiled before any recording.
+    // Prefill and a few eager steps first, so every kernel is compiled before any recording —
+    // the decode and verify shapes under the parameter-cache guard, as the runner's warm-up.
     model
         .forward_step(&mut cache, StepRequest::last(&prompt))
         .unwrap();
+    let candle_core::Device::Cuda(dev) = &device else {
+        panic!("a CUDA device")
+    };
+    let htod = dev.enable_cuda_graph_htod_cache();
     for t in [1i32, 2, 3] {
         model
             .forward_step(&mut cache, StepRequest::last(&[t]))
@@ -195,9 +193,12 @@ fn qwen38_27b_step_census() {
                 tokens: StepTokens::Device(&ids4),
                 scope: LogitsScope::All,
                 want_hidden: true,
+                prefill: false,
+                snapshot_at: None,
             },
         )
         .unwrap();
+    drop(htod);
     device.synchronize().unwrap();
     let base = cache.len();
     // A deep ring while recording. (The S1 cache pruned a checkpoint inside the capture without
@@ -214,6 +215,8 @@ fn qwen38_27b_step_census() {
             tokens: StepTokens::Device(&ids4),
             scope: LogitsScope::All,
             want_hidden: true,
+            prefill: false,
+            snapshot_at: None,
         },
     )
     .unwrap();

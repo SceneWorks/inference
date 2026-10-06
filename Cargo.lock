@@ -447,7 +447,6 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -787,6 +786,7 @@ dependencies = [
  "candle-gen-flux2",
  "candle-gen-perceptual",
  "candle-gen-pid",
+ "candle-llm",
  "image",
  "rand",
  "rand_distr",
@@ -1043,6 +1043,7 @@ name = "candle-gen-sensenova"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-llm",
  "image",
  "rand",
  "rand_distr",
@@ -1314,6 +1315,7 @@ version = "0.0.0"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -1326,6 +1328,7 @@ version = "0.0.0"
 dependencies = [
  "core-llm",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2329,6 +2332,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "memmap2",
+ "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "safetensors 0.4.5",
@@ -2611,6 +2615,7 @@ dependencies = [
  "mlx-gen-flux2",
  "mlx-gen-perceptual",
  "mlx-gen-pid",
+ "mlx-llm",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
@@ -2924,9 +2929,11 @@ dependencies = [
 name = "mlx-llm-server"
 version = "0.0.0"
 dependencies = [
+ "core-llm-testkit",
  "mlx-llm",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

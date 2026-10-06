@@ -21,6 +21,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # tool-spec/tool-call argument key order insertion-faithful (matching transformers) through the
 # chat-template render and tool-call round-trip (story 7636).
 serde_json = { version = "1", features = ["preserve_order"] }
+# The speculative-decoding request option's wire form (epic sc-24432 E4): a consumer embeds
+# `Speculative` in its own request DTO and the legacy `mtp` shape still deserializes onto it.
+serde = { version = "1", features = ["derive"] }
 # Jinja chat-template rendering (story 7164): HF models ship a Jinja `chat_template`. minijinja is
 # the same engine semantics transformers uses (sandboxed Jinja2). Pure Rust, cross-platform.
 # `json` enables the `tojson` filter the tool-calling templates use to render the `tools` section

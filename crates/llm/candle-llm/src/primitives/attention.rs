@@ -21,7 +21,10 @@
 //! (different reduction order), the same tolerance the batched / prefix-reuse GPU paths carry.
 //!
 //! [`sdpa_gqa_causal`] (epic sc-24128, story sc-24132) is the **zero-copy grouped-query** causal
-//! attention the static-KV decode path runs: queries `[b, H, s, d]` against un-expanded keys/values
+//! attention the static-KV path runs for a prompt prefill (and, on a model without device
+//! positions, for every step; since sc-24441 a cached decode / verify step of a model with device
+//! positions — the CUDA default — attends with the length-aware
+//! [`candle_quant_kernels::decode_attention()`] on every cache instead): queries `[b, H, s, d]` against un-expanded keys/values
 //! `[b, Hkv, L, d]`, with the `H / Hkv` query groups folded into the query-sequence axis so one
 //! batched matmul per side serves every group — no [`repeat_kv`] expansion, and no `contiguous`
 //! copy of the cache's narrowed K/V views (the matmul reads their strides directly). The causal
@@ -110,6 +113,13 @@ pub enum AttnFormulation {
     /// a labelled comparison row against the sealed pre-epic baseline (it reproduces that
     /// baseline's bits); it materializes the expansion every step, so it is never the fast path.
     Expanded,
+    /// The length-aware [`candle_quant_kernels::decode_attention()`] over the cache (sc-24441):
+    /// what a request's cached decode / verify steps ran when its decoder stages device positions
+    /// (the CUDA default, [`DEVICE_POSITIONS_DEFAULT`](crate::primitives::DEVICE_POSITIONS_DEFAULT)).
+    /// Its prompt prefill still attends [`AttnFormulation::Gqa`]. A **report** label: as a
+    /// selector it is [`AttnFormulation::Gqa`] ([`AttnFormulation::selector`]) — which cached
+    /// steps run the decode attention is the device-positions setting's call, not the selector's.
+    DecodeAttention,
 }
 
 impl AttnFormulation {
@@ -118,6 +128,17 @@ impl AttnFormulation {
         match self {
             AttnFormulation::Gqa => "gqa",
             AttnFormulation::Expanded => "expanded",
+            AttnFormulation::DecodeAttention => "decode_attention",
+        }
+    }
+
+    /// The arithmetic selector this names: [`AttnFormulation::DecodeAttention`] (a report label)
+    /// selects [`AttnFormulation::Gqa`]; the others select themselves. Every model's
+    /// `set_attn_formulation` stores this, so a selector field never holds the report label.
+    pub fn selector(self) -> AttnFormulation {
+        match self {
+            AttnFormulation::DecodeAttention => AttnFormulation::Gqa,
+            other => other,
         }
     }
 }
@@ -1824,6 +1845,109 @@ mod tests {
                          gather {g:6.1}us | build {bd:6.1}us | kernel {kn:6.1}us"
                     );
                 }
+            }
+        }
+    }
+
+    /// sc-24446 micro-benchmark (prints, never asserts on time): the length-aware
+    /// `decode_attention` kernel (the device-positions step) against `sdpa_gqa_causal` (the
+    /// static path without device positions) at the Qwen3.8-27B decode shape — 24 query heads over
+    /// 4 KV heads, head dim 256, bf16, one query — at contexts 128 / 337 / 522 / 1024 / 4096, over a
+    /// static buffer of a tight and a wide capacity. Host wall time per call over a synchronized
+    /// loop (the eager decode step's view: launch overhead included), median of five repetitions,
+    /// the two paths interleaved. Written straight to stderr so libtest does not capture it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "on-demand timing for the epic-end campaign or an explicit request; needs CUDA"]
+    fn decode_attention_vs_sdpa_gqa_timing_at_the_qwen38_decode_shape() {
+        use std::io::Write as _;
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
+        let (h, hkv, d) = (24usize, 4usize, 256usize);
+        let scale = (d as f32).powf(-0.5);
+        let mk = |heads: usize, s: usize, phase: f64| {
+            let n = (heads * s * d) as f32;
+            Tensor::arange(0f32, n, &device)
+                .unwrap()
+                .reshape((1, heads, s, d))
+                .unwrap()
+                .affine(0.0137, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let q = mk(h, 1, 0.4);
+        let time = |f: &dyn Fn() -> Tensor| -> f64 {
+            let iters = 100;
+            for _ in 0..10 {
+                drop(f());
+            }
+            device.synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                drop(f());
+            }
+            device.synchronize().unwrap();
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(iters)
+        };
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let mut report = String::new();
+        for cap_kind in ["tight", "wide"] {
+            for ctx in [128usize, 337, 522, 1024, 4096] {
+                let cap = match cap_kind {
+                    "tight" => ctx.max(1024),
+                    _ => 8192,
+                };
+                let k_buf = mk(hkv, cap, 1.7);
+                let v_buf = mk(hkv, cap, 3.1);
+                let start = Tensor::new(&[(ctx - 1) as u32], &device).unwrap();
+                let spec = candle_quant_kernels::DecodeAttnSpec {
+                    scale,
+                    softcap: None,
+                    window: None,
+                };
+                let kernel = || {
+                    candle_quant_kernels::decode_attention(&q, &k_buf, &v_buf, &start, spec)
+                        .unwrap()
+                };
+                let gqa = || {
+                    sdpa_gqa_causal(
+                        &q,
+                        &k_buf.narrow(2, 0, ctx).unwrap(),
+                        &v_buf.narrow(2, 0, ctx).unwrap(),
+                        scale,
+                    )
+                    .unwrap()
+                };
+                let diff = (kernel().to_dtype(DType::F32).unwrap()
+                    - gqa().to_dtype(DType::F32).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+                let (mut tk, mut tg) = (Vec::new(), Vec::new());
+                for _ in 0..5 {
+                    tk.push(time(&kernel));
+                    tg.push(time(&gqa));
+                }
+                let (tk, tg) = (median(tk), median(tg));
+                report.push_str(&format!(
+                    "[attn-bench] cap={cap:>5} ({cap_kind}) ctx={ctx:>5}: decode_attention {tk:>8.1} us  sdpa_gqa {tg:>8.1} us  ratio {:.2}  max|delta| {diff:.3e}\n",
+                    tk / tg
+                ));
+            }
+        }
+        let _ = std::io::stderr().write_all(report.as_bytes());
+        if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+                let _ = writeln!(f, "```\n{report}```");
             }
         }
     }

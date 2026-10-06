@@ -106,6 +106,16 @@ pub const MODEL_25_ID: &str = "ltx_2_5";
 /// The stock, locally staged Gemma-4 instruction snapshot used only for opt-in LTX-2.5 prompt
 /// enhancement.  It lives below the single LTX rehost rather than in a job-time HF cache.
 const LTX25_ENHANCER_COMPONENT: &str = "enhancer";
+
+/// Byte budget of the LTX-2.5 Gemma-4 enhancer's cross-request prefix cache (the system-prompt
+/// KV reused between text-to-video enhancements; sc-24437 made the cache byte-budgeted). It lives
+/// on the provider for as long as the load, so the 2.5 memory contract charges it beside the
+/// enhancer weights whenever the enhancer snapshot is staged
+/// ([`crate::memory_strategy_2_5`]), and this constant is the one figure both read. 1 GiB holds
+/// one enhancement's prompt plus rewrite at bf16 on the 12B enhancer with room to spare; an entry
+/// larger than the budget is simply not kept — the enhancement itself is unaffected, only the
+/// next request's reuse is lost.
+pub(crate) const LTX25_ENHANCER_PREFIX_CACHE_BYTES: u64 = 1 << 30;
 /// Rehost-owned inventory that must accompany the exact stock enhancer snapshot.
 const LTX25_ENHANCER_MANIFEST_FILE: &str = "sceneworks_asset_manifest.json";
 /// Canonical SC-18780 publication manifest. Its semantic inventory digest binds the source repo,
@@ -908,7 +918,9 @@ pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         variant,
         memory_strategy,
         memory_tier,
-        enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
+        enhancer_cache: Rc::new(RefCell::new(PrefixCache::with_budget(
+            LTX25_ENHANCER_PREFIX_CACHE_BYTES,
+        ))),
     }))
 }
 
@@ -2184,7 +2196,7 @@ impl Ltx {
         let cache = self.enhancer_cache.as_ref().ok_or_else(|| {
             Error::Msg("ltx_2_5: Gemma-4 enhancer cache is absent from the 2.5 route".into())
         })?;
-        let prompt = enhance::enhance_gemma4(
+        let (prompt, _decode) = enhance::enhance_gemma4(
             &model,
             &tokenizer,
             prefill,
@@ -2929,7 +2941,10 @@ fn validate_request_for(
 pub(crate) fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
     let sh = frames.shape(); // (F, H, W, 3)
     let (f, h, w) = (sh[0] as usize, sh[1] as u32, sh[2] as u32);
-    let data = frames.as_slice::<u8>();
+    // `as_slice` reads the physical buffer: force logical row-major order rather than rely on
+    // `pipeline::to_uint8_frames` ending in a `contiguous` copy.
+    let owned = mlx_gen::array::contiguous(frames)?;
+    let data = owned.as_slice::<u8>();
     let per = (h as usize) * (w as usize) * 3;
     Ok((0..f)
         .map(|i| Image {
@@ -3164,7 +3179,9 @@ mod tests {
             memory_tier: crate::memory_strategy_2_5::resolved_numeric_tier(&spec).unwrap(),
             spec,
             variant,
-            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
+            enhancer_cache: Rc::new(RefCell::new(PrefixCache::with_budget(
+                LTX25_ENHANCER_PREFIX_CACHE_BYTES,
+            ))),
         }
     }
 
@@ -4508,5 +4525,19 @@ mod tests {
         assert_eq!((imgs[0].width, imgs[0].height), (2, 1));
         assert_eq!(imgs[0].pixels, vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(imgs[1].pixels, vec![6, 7, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn frames_to_images_reads_a_strided_view_logically() {
+        // Physical (3, F=2, H=1, W=2) planes → logical (F, H, W, 3) through a transpose view; a raw
+        // `as_slice` would return the planes in physical order.
+        let planes: Vec<u8> = (0..12).collect();
+        let frames = Array::from_slice(&planes, &[3, 2, 1, 2])
+            .transpose_axes(&[1, 2, 3, 0])
+            .unwrap();
+        frames.eval().unwrap();
+        let imgs = frames_to_images(&frames).unwrap();
+        assert_eq!(imgs[0].pixels, vec![0, 4, 8, 1, 5, 9]);
+        assert_eq!(imgs[1].pixels, vec![2, 6, 10, 3, 7, 11]);
     }
 }

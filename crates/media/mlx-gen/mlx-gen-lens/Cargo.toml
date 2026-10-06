@@ -22,6 +22,11 @@ mlx-gen-flux2 = { path = "../mlx-gen-flux2" }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
+# The PromptReasoner's decode runs on the shared MLX engine (`mlx_llm::decode::generate_speculative`
+# with no proposer, epic sc-24432 E8) instead of a per-model loop. The `mlx-gen-* -> mlx-llm`
+# direction is the documented one (see `mlx-gen-ltx`); the pin lives in the root workspace so cargo
+# unifies ONE mlx-llm across the worker graph.
+mlx-llm = { workspace = true }
 # config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).
 serde_json = { workspace = true }
 # Decode training-dataset images (LoRA/LoKr training, sc-5148) — the trainer center-crops + hands the

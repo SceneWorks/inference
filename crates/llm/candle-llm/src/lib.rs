@@ -54,7 +54,7 @@ pub use decode::{
     GenerationConfig, GenerationOutput, NgramProposer, PrefixCache, PrefixStats, Proposer,
     SpeculativePrompt, SpeculativeRun, SpeculativeStats, StreamEvent,
 };
-pub use device::{compute_dtype, select_device};
+pub use device::{compute_dtype, decode_backend, decode_defaults, select_device};
 pub use error::{Error, Result};
 pub use llava::{LlavaConfig, LlavaModel, LlavaProvider};
 pub use models::CausalLm;

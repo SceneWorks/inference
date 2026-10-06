@@ -95,7 +95,7 @@ fn run_suite(model: &CausalLm, sys: &[i32], q1: &[i32], q2: &[i32], max_new: usi
         "baselines should generate"
     );
 
-    let mut pc = PrefixCache::new(16);
+    let mut pc = PrefixCache::with_budget(1 << 30);
 
     // First cached request: a cold miss (nothing stored yet), but it must equal the baseline, and it
     // stores `p1 + base1` for reuse.
@@ -247,7 +247,7 @@ fn budget_finished_entry_supports_extension() {
     let prompt: Vec<i32> = vec![1, 2, 3, 4, 5];
     let max_new = 6;
 
-    let mut pc = PrefixCache::new(16);
+    let mut pc = PrefixCache::with_budget(1 << 30);
     let out1 = generate_cached(
         &model,
         &prompt,
@@ -415,7 +415,7 @@ fn run_real(fx: Fixture) {
     // exactly the `sys` span (this is exact — derived from token ids, not tensors).
     let q1 = encode(&fx.tok, "What is the capital of France?", false);
     let p1 = prompt(&sys, &q1);
-    let mut pc = PrefixCache::new(16);
+    let mut pc = PrefixCache::with_budget(1 << 30);
     cached(&fx.model, &p1, 8, &mut pc);
     cached(&fx.model, &p2, 8, &mut pc);
     let s = pc.stats();
