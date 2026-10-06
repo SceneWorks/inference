@@ -68,22 +68,9 @@ fn krea_trainer_validates_and_refuses_without_weights() {
     check_train_runs_validate_floors(&|| load_trainer(id, &snapshot), &profile);
 }
 
-/// The profile's request as-is (the control profile carries the control fields).
-fn control_request(profile: &TrainerProfile) -> TrainingRequest {
-    TrainingRequest {
-        items: profile.items.clone(),
-        config: profile.config.clone(),
-        output_dir: profile.output_dir.clone(),
-        file_name: profile.file_name.clone(),
-        trigger_words: Vec::new(),
-        cancel: Default::default(),
-    }
-}
-
-/// The control trainer trains a ControlNet branch: every item carries a control image and the
-/// request names its `control_type`. `check_trainer_validate` is not run here: its network-type
-/// probe (the accepted request uses LoKr when LoRA is not advertised, then requires a LoKr request
-/// to be refused when LoKr is not advertised) cannot pass for a trainer advertising neither.
+/// The control trainer trains a ControlNet branch; the testkit's validate check builds its
+/// positive request as a control request (control type + a conditioning image on every item) for a
+/// trainer advertising `supports_control` and neither adapter kind.
 #[test]
 fn krea_control_trainer_refuses_without_weights() {
     let tmp = temp_root("krea_control");
@@ -96,37 +83,15 @@ fn krea_control_trainer_refuses_without_weights() {
     let mut profile = TrainerProfile::cheap(items, tmp.path().join("out"));
     profile.config.control_type = Some("pose".to_owned());
     let make = || load_trainer(KREA_2_CONTROL_ID, &snapshot);
-    make()
-        .validate(&control_request(&profile))
-        .expect("the control profile is a valid control-training request");
-    // Stand-in for check_trainer_validate's technique half: every technique this trainer leaves
-    // undeclared is a typed refusal from `validate` too.
-    let desc = *make().descriptor();
-    assert!(!desc.techniques.weight_noise && !desc.techniques.gradient_noise);
-    for (knob, enable) in [
-        (
-            "weight_noise_sigma",
-            (|r: &mut TrainingRequest| r.config.weight_noise_sigma = 0.0125)
-                as fn(&mut TrainingRequest),
-        ),
-        ("gradient_noise_eta", |r: &mut TrainingRequest| {
-            r.config.gradient_noise_eta = 0.01
-        }),
-    ] {
-        let mut req = control_request(&profile);
-        enable(&mut req);
-        assert!(
-            matches!(make().validate(&req), Err(Error::Unsupported(_))),
-            "{knob}: validate() must refuse an undeclared technique with a typed Unsupported"
-        );
-    }
+    gen_core_testkit::check_trainer_validate(make().as_ref(), &profile).unwrap();
     gen_core_testkit::check_trainer_technique_refusal(&make, &profile).unwrap();
     check_train_runs_validate_floors(&make, &profile);
 }
 
 /// Epic 2123 E3: `train` called directly (skipping `validate`) refuses a request that only a
-/// non-technique `validate` floor catches — full fine-tune / control branch when not advertised, instruction edit — with a typed `Unsupported` before any
-/// progress event, so nothing is loaded or cached.
+/// non-technique `validate` floor catches — full fine-tune / control branch when not advertised,
+/// instruction edit — with a typed `Unsupported` before any progress event, so nothing is loaded or
+/// cached.
 fn check_train_runs_validate_floors(make: &dyn Fn() -> Box<dyn Trainer>, profile: &TrainerProfile) {
     let base = TrainingRequest {
         items: profile.items.clone(),

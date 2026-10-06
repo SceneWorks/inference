@@ -88,13 +88,25 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
     let id = desc.id;
 
     // Positive: a declared request using a supported network type must be accepted. Prefer LoRA if
-    // supported (every family does), else LoKr.
+    // supported (every adapter family does), else LoKr. A **control-branch** trainer (it advertises
+    // `supports_control` and neither adapter kind — e.g. Krea's ControlNet-branch trainer) trains no
+    // adapter at all: its positive request is a well-formed control request instead (a control type
+    // and a conditioning image on every item; the item's own image stands in — validate never reads
+    // it), and the network type is inert for it.
+    let control_branch = desc.supports_control && !desc.supports_lora && !desc.supports_lokr;
     let mut ok = base_request(profile);
-    ok.config.network_type = if desc.supports_lora {
-        NetworkType::Lora
+    if control_branch {
+        ok.config.control_type = Some("pose".to_owned());
+        for item in &mut ok.items {
+            item.control_image_path = Some(item.image_path.clone());
+        }
     } else {
-        NetworkType::Lokr
-    };
+        ok.config.network_type = if desc.supports_lora {
+            NetworkType::Lora
+        } else {
+            NetworkType::Lokr
+        };
+    }
     t.validate(&ok).map_err(|e| {
         format!(
             "validate-honesty[{id}]: the declared cheap request was rejected by validate(): {e}"
@@ -110,8 +122,9 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
         ));
     }
 
-    // Negative: a network type the descriptor does not advertise must be rejected.
-    if !desc.supports_lokr {
+    // Negative: a network type the descriptor does not advertise must be rejected (an adapter
+    // trainer; a control-branch trainer trains no adapter, so the knob is inert for it).
+    if !desc.supports_lokr && !control_branch {
         let mut lokr = base_request(profile);
         lokr.config.network_type = NetworkType::Lokr;
         if t.validate(&lokr).is_ok() {
@@ -121,7 +134,7 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
             ));
         }
     }
-    if !desc.supports_lora {
+    if !desc.supports_lora && !control_branch {
         let mut lora = base_request(profile);
         lora.config.network_type = NetworkType::Lora;
         if t.validate(&lora).is_ok() {
@@ -135,8 +148,8 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
     // Negative (F-006): a control-branch request on a trainer that does NOT advertise
     // `supports_control` must be rejected by `validate()` — not silently trained as a plain adapter
     // (F-055). The shared `validate_control_request` floor enforces this; assert the trainer routes
-    // through it. (A control-capable trainer is exempt — it should accept a well-formed control
-    // request; there are none shipped today.)
+    // through it. (A control-capable trainer is exempt — its positive request above is a
+    // well-formed control request.)
     if !desc.supports_control {
         let mut ctrl = ok.clone();
         ctrl.config.control_type = Some("pose".to_owned());
