@@ -144,6 +144,48 @@ pub fn plan_step(schedules: &[AuxLossSchedule], key: u32, raw_t: f32) -> StepPla
     }
 }
 
+/// [`plan_step`] with every schedule's window confined to a noise `band` `(lo, hi)` — a Wan MoE
+/// expert's own noise range (epic 2123 E8). An expert only ever trains at noise levels inside its
+/// band, so an aux-only step lands in `window ∩ band`, and a loss whose window misses the band is
+/// disabled for it (its claims fall through to diffusion). `t` is the band-sampled noise level; on
+/// an aux-only step its position within the band (`u = (t − lo)/(hi − lo)`) is remapped into the
+/// confined window, and a diffusion step keeps `t`. With the full band `(0, 1)` this is exactly
+/// [`plan_step`]. Callers then apply [`StepPlan::without_skipped`] for the entry's unusable losses.
+pub fn plan_in_band(
+    schedules: &[AuxLossSchedule],
+    key: u32,
+    (lo, hi): (f32, f32),
+    t: f32,
+) -> StepPlan {
+    let confined: Vec<AuxLossSchedule> = schedules
+        .iter()
+        .map(|&s| {
+            let (a, b) = (s.t_min.max(lo), s.t_max.min(hi));
+            if a <= b {
+                AuxLossSchedule {
+                    t_min: a,
+                    t_max: b,
+                    ..s
+                }
+            } else {
+                AuxLossSchedule { weight: 0.0, ..s }
+            }
+        })
+        .collect();
+    let u = if hi > lo {
+        ((t - lo) / (hi - lo)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // Whether the step is claimed depends only on `key`; a diffusion step keeps the sampled `t`.
+    let claimed = plan_step(&confined, key, u);
+    if claimed.diffusion {
+        plan_step(&confined, key, t)
+    } else {
+        claimed
+    }
+}
+
 /// Sum a step's present loss terms with `add`; `missing()` is the error for a step with neither
 /// (a planning bug — every [`StepPlan`] trains at least one term).
 pub fn combine_step_terms<T, E>(
@@ -211,6 +253,28 @@ mod tests {
             11_110 + 21
         );
         assert_eq!(perceptual_footprint_bytes(None, &[], 3), 0);
+    }
+
+    /// E8 (moved from the two Wan trainers): an aux-only step stays inside `window ∩ band`; a band
+    /// that misses the window disables the loss (diffusion at the sampled `t`); the full band is
+    /// exactly `plan_step`. Mutations: skip the window confinement ⇒ the low-band aux step lands
+    /// above the band ⇒ red; remap with the raw `t` instead of its in-band position `u` ⇒ red;
+    /// keep the miss-band loss enabled ⇒ red.
+    #[test]
+    fn plan_in_band_confines_aux_steps_to_the_expert_band() {
+        let s = [sched(0.5, 0.6, 0.9, 2)];
+        let low = plan_in_band(&s, 2, (0.0, 0.875), 0.4375);
+        assert!(!low.diffusion && low.aux == vec![0], "{low:?}");
+        // u = 0.5 of the band → the middle of [0.6, 0.875].
+        assert!((low.noise_level - 0.7375).abs() < 1e-6, "{low:?}");
+        let miss = plan_in_band(&s, 2, (0.95, 1.0), 0.97);
+        assert!(miss.diffusion && miss.aux.is_empty(), "{miss:?}");
+        assert_eq!(miss.noise_level, 0.97);
+        for key in 1..=4 {
+            for t in [0.1f32, 0.5, 0.95] {
+                assert_eq!(plan_in_band(&s, key, (0.0, 1.0), t), plan_step(&s, key, t));
+            }
+        }
     }
 
     fn sched(weight: f32, t_min: f32, t_max: f32, every_n: u32) -> AuxLossSchedule {

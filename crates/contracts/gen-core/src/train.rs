@@ -25,8 +25,8 @@ pub mod subject_mask;
 use std::path::PathBuf;
 
 pub use aux_schedule::{
-    combine_step_terms, perceptual_footprint_bytes, plan_step, AuxAlternation, AuxModelFootprint,
-    StepPlan,
+    combine_step_terms, perceptual_footprint_bytes, plan_in_band, plan_step, AuxAlternation,
+    AuxModelFootprint, StepPlan,
 };
 pub use body::BodyLossesConfig;
 pub use schedule::LrSchedule;
@@ -1137,6 +1137,10 @@ pub struct TrainingTechniques {
     /// Honors [`TrainingConfig::latent_lpips`] (E-LatentLPIPS on the x0 latent, sc-24833) — only a
     /// trainer whose latent family has published weights ([`LatentLpipsFamily`]) declares it.
     pub latent_lpips_loss: bool,
+    /// Not a technique knob: the trainer's aux-loss builder supplies its **own x0 decoder** (e.g.
+    /// Mage decodes through its full VAE), so the decoded-x0 losses do not need
+    /// [`TrainingConfig::perceptual_decoder_dir`] and the shared floor does not require it.
+    pub builtin_x0_decoder: bool,
 }
 
 impl TrainingTechniques {
@@ -1154,6 +1158,7 @@ impl TrainingTechniques {
         normal_loss: false,
         vae_anchor_loss: false,
         latent_lpips_loss: false,
+        builtin_x0_decoder: false,
     };
 
     /// The adapter-noise pair every LoRA/LoKr trainer implements at its optimizer step (epic 2123
@@ -1171,6 +1176,7 @@ impl TrainingTechniques {
         normal_loss: false,
         vae_anchor_loss: false,
         latent_lpips_loss: false,
+        builtin_x0_decoder: false,
     };
 }
 
@@ -1211,6 +1217,35 @@ pub fn technique_noise_key(seed: u64, salt: u64, update_idx: u32, tensor_idx: us
     splitmix64(splitmix64(stream) ^ tensor_idx as u64)
 }
 
+/// The enabled **auxiliary (perceptual) losses** of `cfg`, by name, in loss-index order — the
+/// same arms both backends' shared aux-loss builders drive (depth, identity, face-landmark, the
+/// three body losses, the VAE anchor, E-LatentLPIPS). Empty when none is on.
+pub fn enabled_aux_losses(cfg: &TrainingConfig) -> Vec<&'static str> {
+    [
+        ("depth", cfg.depth_anchoring.schedule.is_enabled()),
+        ("identity", cfg.identity_loss.schedule.is_enabled()),
+        (
+            "face-landmark",
+            cfg.face_landmark_loss.schedule.is_enabled(),
+        ),
+        ("body-proportion", cfg.body_losses.proportion.is_enabled()),
+        ("body-shape", cfg.body_losses.shape.is_enabled()),
+        ("normal", cfg.body_losses.normal.is_enabled()),
+        ("vae_anchor", cfg.vae_anchor.schedule.is_enabled()),
+        ("latent_lpips", cfg.latent_lpips.schedule.is_enabled()),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect()
+}
+
+/// Whether a decoded-x0 loss lacks its x0 decoder: [`TrainingConfig::perceptual_decoder_dir`] is
+/// unset and the trainer does not build its own decoder
+/// ([`TrainingTechniques::builtin_x0_decoder`]).
+fn lacks_x0_decoder(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> bool {
+    cfg.perceptual_decoder_dir.is_none() && !desc.techniques.builtin_x0_decoder
+}
+
 /// The shared **training-technique floor** (epic 2123 E3/E5) — every trainer's `validate` *and*
 /// `train` entry point calls it before any expensive work, so a requested technique the trainer
 /// does not implement is refused instead of silently ignored.
@@ -1224,6 +1259,8 @@ pub fn technique_noise_key(seed: u64, salt: u64, update_idx: u32, tensor_idx: us
 /// - either noise technique with [`TrainingConfig::full_finetune`] ⇒ typed
 ///   [`crate::Error::Unsupported`]: both perturb adapter factors / adapter gradients only and must
 ///   never touch base weights (E5).
+/// - any auxiliary loss ([`enabled_aux_losses`]) with [`TrainingConfig::full_finetune`] ⇒ typed
+///   [`crate::Error::Unsupported`]: the aux losses train the adapter surface only.
 /// - `resolution_buckets` non-empty but malformed (a zero resolution or repeat count, a resolution
 ///   off the [`RESOLUTION_BUCKET_STRIDE`], a duplicate resolution, more than
 ///   [`MAX_RESOLUTION_BUCKETS`]) ⇒ [`crate::Error::Msg`]; well formed on a
@@ -1303,6 +1340,15 @@ pub fn validate_training_techniques(
             )));
         }
     }
+    let aux = enabled_aux_losses(cfg);
+    if cfg.full_finetune && !aux.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: the auxiliary losses ({}) train a LoRA/LoKr adapter only and cannot be combined \
+             with a full base fine-tune",
+            desc.id,
+            aux.join(", ")
+        )));
+    }
     let depth = &req.config.depth_anchoring;
     depth
         .schedule
@@ -1323,7 +1369,7 @@ pub fn validate_training_techniques(
                 depth.model_size.as_str()
             )));
         }
-        if req.config.perceptual_decoder_dir.is_none() {
+        if lacks_x0_decoder(desc, &req.config) {
             return Err(crate::Error::Msg(format!(
                 "{}: depth anchoring needs the family's small x0 decoder \
                  (perceptual_decoder_dir is unset)",
@@ -1397,7 +1443,7 @@ fn validate_body_losses(desc: &TrainerDescriptor, req: &TrainingRequest) -> crat
     if body.normal.is_enabled() && body.normal_model_dir.is_none() {
         return missing("the Sapiens normal checkpoint (body_losses.normal_model_dir is unset)");
     }
-    if req.config.perceptual_decoder_dir.is_none() {
+    if lacks_x0_decoder(desc, &req.config) {
         return missing("the family's small x0 decoder (perceptual_decoder_dir is unset)");
     }
     if body.normal.is_enabled() && body.normal_restrict_to_subject {
@@ -1474,7 +1520,7 @@ fn validate_face_losses(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> crate
                 desc.id
             )));
         }
-        if cfg.perceptual_decoder_dir.is_none() {
+        if lacks_x0_decoder(desc, cfg) {
             return Err(crate::Error::Msg(format!(
                 "{}: {name} needs the family's small x0 decoder (perceptual_decoder_dir is unset)",
                 desc.id
@@ -1517,7 +1563,7 @@ fn validate_latent_perceptual_losses(
                 desc.id
             )));
         }
-        if cfg.perceptual_decoder_dir.is_none() {
+        if lacks_x0_decoder(desc, cfg) {
             return Err(crate::Error::Msg(format!(
                 "{}: the VAE anchor loss needs the family's small x0 decoder \
                  (perceptual_decoder_dir is unset)",
@@ -2179,6 +2225,98 @@ mod tests {
             .flat_map(|b| (0..4).flat_map(move |i| std::iter::repeat_n((i, b), [2, 1][b])))
             .collect();
         assert_ne!(order(11, 0..12), unshuffled);
+    }
+
+    /// Epic 2123 E3 (feature-end review): the shared floor refuses EVERY auxiliary loss combined
+    /// with a full base fine-tune — even on a trainer that declares the loss and supports full
+    /// fine-tunes (the aux losses train the adapter surface only) — and a trainer that builds its
+    /// own x0 decoder (`builtin_x0_decoder`) is never asked for `perceptual_decoder_dir`.
+    /// Mutations: drop the full-fine-tune + aux check ⇒ the full request passes ⇒ red; drop an arm
+    /// from `enabled_aux_losses` ⇒ red; ignore `builtin_x0_decoder` in `lacks_x0_decoder` ⇒ red.
+    #[test]
+    fn aux_losses_refuse_full_finetune_and_a_builtin_decoder_needs_no_dir() {
+        let items = vec![TrainingItem::captioned(PathBuf::from("a.png"), "a".into())];
+        let mut desc = trainer_desc_with(false, true);
+        desc.techniques = TrainingTechniques {
+            depth_anchoring: true,
+            identity_loss: true,
+            face_landmark_loss: true,
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
+            ..TrainingTechniques::NONE
+        };
+        let dir = |p: &str| Some(PathBuf::from(p));
+        type Enable = fn(&mut TrainingConfig);
+        let arms: [(&str, Enable); 8] = [
+            ("depth", |c| {
+                c.depth_anchoring.schedule.weight = 0.1;
+                c.depth_anchoring.model_dir = Some(PathBuf::from("/m/da2"));
+            }),
+            ("identity", |c| {
+                c.identity_loss.schedule.weight = 0.1;
+                c.face_analysis_dir = Some(PathBuf::from("/m/face"));
+            }),
+            ("face-landmark", |c| {
+                c.face_landmark_loss.schedule.weight = 0.1;
+                c.face_landmark_loss.model_dir = Some(PathBuf::from("/m/mesh"));
+                c.face_analysis_dir = Some(PathBuf::from("/m/face"));
+            }),
+            ("body-proportion", |c| {
+                c.body_losses.proportion.weight = 0.1;
+                c.body_losses.pose_model_dir = Some(PathBuf::from("/m/vitpose"));
+            }),
+            ("body-shape", |c| {
+                c.body_losses.shape.weight = 0.1;
+                c.body_losses.pose_model_dir = Some(PathBuf::from("/m/vitpose"));
+                c.body_losses.shape_model_dir = Some(PathBuf::from("/m/hybrik"));
+            }),
+            ("normal", |c| {
+                c.body_losses.normal.weight = 0.1;
+                c.body_losses.pose_model_dir = Some(PathBuf::from("/m/vitpose"));
+                c.body_losses.normal_model_dir = Some(PathBuf::from("/m/sapiens"));
+            }),
+            ("vae_anchor", |c| {
+                c.vae_anchor.schedule.weight = 0.5;
+                c.vae_anchor.model_dir = Some(PathBuf::from("/m/flux2-vae"));
+            }),
+            ("latent_lpips", |c| {
+                c.latent_lpips.schedule.weight = 0.5;
+                c.latent_lpips.model_dir = Some(PathBuf::from("/m/elpips"));
+            }),
+        ];
+        assert!(enabled_aux_losses(&TrainingConfig::default()).is_empty());
+        for (name, enable) in arms {
+            let mut on = train_req(None, items.clone());
+            enable(&mut on.config);
+            on.config.perceptual_decoder_dir = dir("/m/taef1");
+            assert_eq!(enabled_aux_losses(&on.config), vec![name]);
+            validate_training_techniques(&desc, &on).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut full = on.clone();
+            full.config.full_finetune = true;
+            let err = validate_training_techniques(&desc, &full).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m)
+                    if m.contains("full base fine-tune") && m.contains(name)),
+                "{name}: {err:?}"
+            );
+            // The decoded-x0 losses need the decoder dir — unless the trainer builds its own.
+            let mut no_dec = on.clone();
+            no_dec.config.perceptual_decoder_dir = None;
+            if name != "latent_lpips" {
+                let err = validate_training_techniques(&desc, &no_dec).unwrap_err();
+                assert!(
+                    matches!(err, crate::Error::Msg(ref m) if m.contains("perceptual_decoder_dir")),
+                    "{name}: {err:?}"
+                );
+            }
+            let mut builtin = desc;
+            builtin.techniques.builtin_x0_decoder = true;
+            validate_training_techniques(&builtin, &no_dec)
+                .unwrap_or_else(|e| panic!("{name} (builtin decoder): {e}"));
+        }
     }
 
     /// sc-24832 (epic 2123 E3): each body loss is refused unless its own flag is declared, needs

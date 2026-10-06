@@ -135,9 +135,9 @@ impl From<TinyDecoderConfig> for TinyDecoderSpec {
 }
 
 /// GroupNorm group count of the mid-block pool (`nn.GroupNorm(4, 4·C)`).
-const MIDBLOCK_GN_GROUPS: usize = 4;
+pub(crate) const MIDBLOCK_GN_GROUPS: usize = 4;
 /// torch `nn.GroupNorm` default eps.
-const MIDBLOCK_GN_EPS: f64 = 1e-5;
+pub(crate) const MIDBLOCK_GN_EPS: f64 = 1e-5;
 
 impl TinyDecoderSpec {
     /// `madebyollin/taef1` (plain decoder, 16 latent channels).
@@ -345,7 +345,7 @@ fn pixel_shuffle2(x: &Tensor) -> Result<Tensor> {
 }
 
 /// The key every TAESD-family checkpoint in the diffusers layout carries (the first decoder conv).
-const DECODER_PROBE_KEY: &str = "decoder.layers.0.weight";
+pub(crate) const DECODER_PROBE_KEY: &str = "decoder.layers.0.weight";
 
 /// The loaded, frozen TAESD-family decoder.
 pub struct TinyDecoder {

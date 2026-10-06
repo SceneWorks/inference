@@ -39,7 +39,7 @@
 //!     channel `y` (the reference trains the no-conditioning T2V velocity objective; the attention
 //!     LoRA is the trained surface and is blind to the padded conditioning channels).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::BucketSchedule;
@@ -53,8 +53,7 @@ use mlx_gen::train::lora::{
 };
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, plan_step, AuxAlternation, AuxLossSchedule, Parameterization,
-    PerceptualPath, StepPlan,
+    combine_step_loss, AuxDriver, AuxLossSchedule, Parameterization, PerceptualPath, StepPlan,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
@@ -311,23 +310,36 @@ fn descriptor_ti2v_5b() -> TrainerDescriptor {
 /// the checkpoint's `config.json`. The transformers load bf16 (Wan's native dtype; the trainable f32
 /// factors promote against the bf16 base — clean autograd, the base frozen). `descriptor.id` selects
 /// which Wan variant this registration serves, and is checked against the config.
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights or `config.json`; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 fn build_trainer(spec: &LoadSpec, descriptor: TrainerDescriptor) -> Result<Box<dyn Trainer>> {
-    Ok(Box::new(build_trainer_concrete(spec, descriptor)?))
+    snapshot_root(spec, descriptor.id)?;
+    Ok(Box::new(mlx_gen::train::lazy::LazyTrainer::new(
+        descriptor,
+        validate_floors,
+        {
+            let spec = spec.clone();
+            move || build_trainer_concrete(&spec, descriptor)
+        },
+    )))
+}
+
+/// The snapshot directory a trainer spec names — a single file is refused.
+fn snapshot_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(format!(
+            "{id} trainer expects a converted snapshot directory (model/expert safetensors + \
+             t5_encoder + vae + tokenizer.json), not a single file"
+        ))),
+    }
 }
 
 /// The concrete-typed loader behind [`build_trainer`] (sc-4942 — the first-step memory harness needs
 /// the concrete [`WanMoeTrainer`] to reach `.experts` / `.vae`, which a `Box<dyn Trainer>` hides).
 fn build_trainer_concrete(spec: &LoadSpec, descriptor: TrainerDescriptor) -> Result<WanMoeTrainer> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(mlx_gen::Error::Msg(format!(
-                "{} trainer expects a converted snapshot directory (model/expert safetensors + \
-                 t5_encoder + vae + tokenizer.json), not a single file",
-                descriptor.id
-            )))
-        }
-    };
+    let root = snapshot_root(spec, descriptor.id)?;
     let cfg = WanModelConfig::from_model_dir(root)?;
     check_config_matches(descriptor.id, &cfg)?;
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.text_len)?;
@@ -411,38 +423,43 @@ mlx_gen::register_trainer! {
         descriptor_ti2v_5b => load_trainer_ti2v_5b
 }
 
+/// Every weights-free [`Trainer::validate`] floor — the whole of it (none needs the loaded base).
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    let id = descriptor.id;
+    if req.items.is_empty() {
+        return Err(format!("{id} trainer: dataset is empty").into());
+    }
+    if req.config.rank == 0 {
+        return Err(format!("{id} trainer: rank must be > 0").into());
+    }
+    if !TrainOptimizer::is_supported(&req.config.optimizer) {
+        return Err(format!(
+            "{id} trainer: optimizer '{}' is not available on MLX training (supported: adamw, \
+             adam, rose, prodigy)",
+            req.config.optimizer
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl Trainer for WanMoeTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        let id = self.descriptor.id;
-        if req.items.is_empty() {
-            return Err(format!("{id} trainer: dataset is empty").into());
-        }
-        if req.config.rank == 0 {
-            return Err(format!("{id} trainer: rank must be > 0").into());
-        }
-        if !TrainOptimizer::is_supported(&req.config.optimizer) {
-            return Err(format!(
-                "{id} trainer: optimizer '{}' is not available on MLX training (supported: \
-                 adamw, adam, rose, prodigy)",
-                req.config.optimizer
-            )
-            .into());
-        }
-        Ok(())
+        validate_floors(self.descriptor(), req)
     }
 
     fn train(
@@ -487,7 +504,7 @@ impl WanMoeTrainer {
         // BEFORE the (~minutes-long) latent/UMT5 caching — when gradient checkpointing is off. (Block-
         // checkpointed runs recompute per block, so they are not subject to the dense peak.)
         let will_checkpoint = cfg.gradient_checkpointing && cfg.network_type == NetworkType::Lora;
-        // Epic 2123 E7 (sc-24830): the depth-anchoring models (TAEHV + Depth-Anything-V2) count
+        // Epic 2123 E7 (sc-24830): the aux-loss models (TAEHV + every enabled arm) count
         // against the budget on BOTH paths — a checkpointed depth job must not skip admission.
         let aux_gb = perceptual_footprint_gb(
             cfg,
@@ -496,7 +513,15 @@ impl WanMoeTrainer {
             req.items.len() * edges.len(),
         );
         if !will_checkpoint || aux_gb > 0.0 {
-            preflight_memory_guard(&self.cfg, &edges, n_experts, id, aux_gb, will_checkpoint)?;
+            preflight_memory_guard(
+                &self.cfg,
+                cfg,
+                &edges,
+                n_experts,
+                id,
+                aux_gb,
+                will_checkpoint,
+            )?;
         }
 
         // Epic 2123 depth anchoring (sc-24830): load the frozen TAEHV decoder + Depth-Anything-V2
@@ -583,7 +608,8 @@ impl WanMoeTrainer {
             return Err(format!("{id} trainer: no usable dataset items").into());
         }
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEHV decode of its
-        // cached clean latent → DA2 depth) is computed exactly once per job, here.
+        // cached clean latent → DA2 depth) is computed exactly once per job, by the `AuxDriver`
+        // before the loop.
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
             // cropped like the image and resampled onto its decoded size.
@@ -594,7 +620,6 @@ impl WanMoeTrainer {
                 edges.len(),
                 CropBox::center_square,
             )?);
-            prepare_perceptual_references(path, &cache)?;
         }
         // Free the UMT5 encoder + tokenizer (~11 GB) before training (the reference frees it post-cache).
         self.text_encoder = None;
@@ -734,14 +759,12 @@ impl WanMoeTrainer {
         // expert, the experts interleaving ⇒ `accum · n_experts` global steps), so no expert ever
         // averages a diffusion and an aux micro-step into one update. A resumed run replays the
         // skipped prefix so the phase matches.
-        let mut alternation = perceptual
-            .as_ref()
-            .map(|_| perceptual_alternation(cache.len() / edges.len(), accum, n_experts));
-        if let Some(alt) = alternation.as_mut() {
-            for s in 1..=start_step {
-                alt.key(s, step_item(s, dual, &schedule));
-            }
-        }
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(
+                path, &cache, &schedule, accum, dual, start_step,
+            )?),
+            None => None,
+        };
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
         for step in start_step + 1..=cfg.steps {
@@ -766,20 +789,21 @@ impl WanMoeTrainer {
             // Epic 2123 E8: plan the step's loss terms (alternation keyed on the real item, the aux
             // windows confined to this expert's band); an aux-only step trains at the remapped
             // noise level.
-            let plan = match (perceptual.as_ref(), alternation.as_mut()) {
-                (Some(path), Some(alt)) => {
-                    let key = alt.key(step, step_item(step, dual, &schedule));
+            let plan = match aux_driver.as_mut() {
+                Some(driver) => {
+                    let key = driver.key(step, step_item(step, dual, &schedule));
+                    let path = driver.path();
                     let plan = plan_in_band(path, key, entry, band, t)?;
                     t = plan.noise_level;
                     Some(plan)
                 }
                 _ => None,
             };
-            let aux = perceptual
+            let aux = aux_driver
                 .as_ref()
                 .zip(plan.as_ref())
-                .map(|(path, plan)| AuxStep {
-                    path,
+                .map(|(driver, plan)| AuxStep {
+                    path: driver.path(),
                     plan,
                     image: entry,
                 });
@@ -1007,12 +1031,30 @@ fn step_item(step: u32, dual: bool, schedule: &BucketSchedule) -> usize {
     schedule.sample(((step - 1) as usize) / n_experts).0
 }
 
-/// The perceptual alternation tracker over `items` dataset items (epic 2123 E8): one window is one
-/// optimizer update of every expert — `accum` micro-steps per expert, the experts interleaving by
-/// step parity, so `accum · n_experts` global micro-steps — so each expert's update is all
-/// diffusion or all aux.
-fn perceptual_alternation(items: usize, accum: u32, n_experts: usize) -> AuxAlternation {
-    AuxAlternation::new(items, accum * n_experts as u32)
+/// The loop's [`AuxDriver`] (epic 2123 E8): every (item, bucket) cache entry's perceptual
+/// reference computed once from its clean latent, and the alternation over the schedule's dataset
+/// items keyed on [`step_item`], with one window per optimizer update of every expert — `accum`
+/// micro-steps per expert, the experts interleaving by step parity, so `accum · n_experts` global
+/// micro-steps — so each expert's update is all diffusion or all aux. A resumed prefix
+/// `1..=start_step` is replayed.
+fn aux_driver(
+    path: PerceptualPath,
+    cache: &[(Array, Vec<Array>, Option<Array>)],
+    schedule: &BucketSchedule,
+    accum: u32,
+    dual: bool,
+    start_step: u32,
+) -> Result<AuxDriver> {
+    let n_experts: u32 = if dual { 2 } else { 1 };
+    AuxDriver::prepare_keyed(
+        path,
+        cache.len(),
+        |i| latent_frames_nchw(&cache[i].0),
+        cache.len() / schedule.n_buckets().max(1),
+        accum * n_experts,
+        start_step,
+        |s| step_item(s, dual, schedule),
+    )
 }
 
 /// The per-step loss breakdown [`compute_step_loss_grads`] returns (epic 2123 E8).
@@ -1070,17 +1112,6 @@ fn load_perceptual_path(
     )
 }
 
-/// Compute every (item, bucket) cache entry's perceptual reference once, from its clean latent.
-fn prepare_perceptual_references(
-    path: &mut PerceptualPath,
-    cache: &[(Array, Vec<Array>, Option<Array>)],
-) -> Result<()> {
-    for (entry, (clean, _, _)) in cache.iter().enumerate() {
-        path.ensure_reference(entry, &latent_frames_nchw(clean)?)?;
-    }
-    Ok(())
-}
-
 /// Extra training memory (GB) the enabled perceptual losses add at the largest bucket `edge`
 /// (epic 2123 E7): the TAEHV decoder + the losses' frozen models (one differentiable decode of
 /// the single training frame) plus `entries` cached references. `0` when nothing is enabled.
@@ -1109,12 +1140,10 @@ fn latent_frames_nchw(latent: &Array) -> Result<Array> {
 }
 
 /// The perceptual plan of one micro-step with every aux loss's window confined to the routed
-/// expert's noise `band` (epic 2123 E8): an expert only ever trains at noise levels inside its own
-/// band, so an aux-only step lands in `window ∩ band`, and an expert whose band misses a loss's
-/// window never trains that loss (its claims fall through to diffusion). `t` is the band-sampled
-/// noise level; on an aux-only step its position within the band (`u = (t − lo)/(hi − lo)`) is
-/// remapped into the confined window by the shared [`plan_step`] policy, and a diffusion step keeps
-/// `t`. With the full band `(0, 1)` (the dense TI2V-5B) this is exactly [`PerceptualPath::plan`].
+/// expert's noise `band` (epic 2123 E8) — the shared gen-core
+/// [`plan_in_band`](mlx_gen::gen_core::train::plan_in_band) policy over this path's schedules, minus the
+/// losses unusable for `entry`. With the full band `(0, 1)` this is exactly
+/// [`PerceptualPath::plan`].
 fn plan_in_band(
     path: &PerceptualPath,
     key: u32,
@@ -1122,40 +1151,14 @@ fn plan_in_band(
     band: (f32, f32),
     t: f32,
 ) -> Result<StepPlan> {
-    let (lo, hi) = band;
-    let schedules: Vec<AuxLossSchedule> = path
-        .losses()
-        .iter()
-        .map(|l| {
-            let s = l.schedule;
-            let (a, b) = (s.t_min.max(lo), s.t_max.min(hi));
-            if a <= b {
-                AuxLossSchedule {
-                    t_min: a,
-                    t_max: b,
-                    ..s
-                }
-            } else {
-                AuxLossSchedule { weight: 0.0, ..s }
-            }
-        })
-        .collect();
+    let schedules: Vec<AuxLossSchedule> = path.losses().iter().map(|l| l.schedule).collect();
     let usable = (0..schedules.len())
         .map(|i| path.is_usable(entry, i))
         .collect::<Result<Vec<bool>>>()?;
-    let u = if hi > lo {
-        ((t - lo) / (hi - lo)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    // Whether the step is claimed depends only on `key`; a diffusion step keeps the sampled `t`.
-    let claimed = plan_step(&schedules, key, u);
-    let plan = if claimed.diffusion {
-        plan_step(&schedules, key, t)
-    } else {
-        claimed
-    };
-    Ok(plan.without_skipped(|i| !usable[i]))
+    Ok(
+        mlx_gen::gen_core::train::plan_in_band(&schedules, key, band, t)
+            .without_skipped(|i| !usable[i]),
+    )
 }
 
 /// The bucket index of the largest edge in `edges` (the first on a tie; `0` for an empty list) —
@@ -1549,6 +1552,7 @@ fn training_tokens(cfg: &WanModelConfig, edge: u32) -> f64 {
 /// resident base is the lower bound the auxiliary models stack on).
 fn preflight_memory_guard(
     cfg: &WanModelConfig,
+    training: &TrainingConfig,
     edges: &[u32],
     n_experts: usize,
     id: &str,
@@ -1557,6 +1561,7 @@ fn preflight_memory_guard(
 ) -> Result<()> {
     preflight_memory_guard_with_budget(
         cfg,
+        training,
         edges,
         n_experts,
         id,
@@ -1575,10 +1580,13 @@ fn checkpointed_baseline_gb(cfg: &WanModelConfig, n_experts: usize) -> f64 {
 }
 
 /// [`preflight_memory_guard`] against an explicit budget (`budget_bytes`, the live MLX limit in
-/// production) — so the guard's arithmetic is testable on any host.
+/// production) — so the guard's arithmetic is testable on any host. A checkpointed refusal goes
+/// through the shared [`mlx_gen_perceptual::check_aux_memory`], naming `training`'s enabled aux
+/// losses.
 #[allow(clippy::too_many_arguments)]
 fn preflight_memory_guard_with_budget(
     cfg: &WanModelConfig,
+    training: &TrainingConfig,
     edges: &[u32],
     n_experts: usize,
     id: &str,
@@ -1594,15 +1602,19 @@ fn preflight_memory_guard_with_budget(
     } + extra_gb;
     let budget_gb = budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
-    if projected > safe && checkpointed {
-        return Err(format!(
-            "{id} trainer: a checkpointed training step at resolution {edge} with the \
-             depth-anchoring models (~{extra_gb:.1} GB for the TAEHV decoder and \
-             Depth-Anything-V2) needs at least ~{projected:.0} GB ({n_experts} resident \
-             expert(s)), exceeding this machine's ~{safe:.0} GB safe budget ({budget_gb:.0} GB \
-             MLX limit × 0.85). Use a smaller depth model or reduce the training resolution."
-        )
-        .into());
+    if checkpointed {
+        return mlx_gen_perceptual::check_aux_memory(
+            &format!("{id} trainer"),
+            training,
+            &format!(
+                "a checkpointed training step at resolution {edge} ({n_experts} resident \
+                 expert(s))"
+            ),
+            extra_gb,
+            projected,
+            safe,
+            &format!("{budget_gb:.0} GB MLX limit × 0.85"),
+        );
     }
     if projected > safe {
         return Err(format!(
@@ -2529,8 +2541,7 @@ mod subject_mask_tests {
 /// (`tests/fixtures/s5_low.safetensors`: dim 128, 2 layers, z16 latent `[16, 2, 2, 2]`) with a
 /// random-init tiny-width TAEW2.1 (the real variant's hyperparameters) and a random-init tiny
 /// Depth-Anything-V2. Drives the same [`compute_step_loss_grads`] / [`plan_in_band`] /
-/// [`perceptual_alternation`] / [`prepare_perceptual_references`] `train_impl` runs. Seconds, a
-/// few MB; no weights downloaded.
+/// [`aux_driver`] `train_impl` runs. Seconds, a few MB; no weights downloaded.
 #[cfg(test)]
 mod depth_anchoring_tests {
     use super::*;
@@ -2583,6 +2594,16 @@ mod depth_anchoring_tests {
             }],
         )
         .unwrap()
+    }
+
+    /// The one-item, one-bucket schedule `train_impl` builds for a single cached entry.
+    fn one_item() -> BucketSchedule {
+        BucketSchedule::new(1, &TrainingConfig::default().training_buckets(), 7)
+    }
+
+    /// The fixture's clean latent as a one-entry cache.
+    fn one_entry(f: &Fixture) -> [(Array, Vec<Array>, Option<Array>); 1] {
+        [(f.clean.clone(), vec![], None)]
     }
 
     struct Fixture {
@@ -2684,8 +2705,16 @@ mod depth_anchoring_tests {
     #[test]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
-        let mut p = path_with(schedule(0.0, 1.0));
-        prepare_perceptual_references(&mut p, &[(f.clean.clone(), vec![], None)]).unwrap();
+        let d = aux_driver(
+            path_with(schedule(0.0, 1.0)),
+            &one_entry(&f),
+            &one_item(),
+            1,
+            false,
+            0,
+        )
+        .unwrap();
+        let p = d.into_path();
         for ckpt in [false, true] {
             let plan = plan_in_band(&p, 1, 0, (0.0, 1.0), 0.5).unwrap();
             assert!(plan.diffusion && plan.aux.is_empty());
@@ -2778,8 +2807,16 @@ mod depth_anchoring_tests {
             );
         }
 
-        let mut p = path_with(schedule(0.0, 1.0));
-        prepare_perceptual_references(&mut p, &[(f.clean.clone(), vec![], None)]).unwrap();
+        let d = aux_driver(
+            path_with(schedule(0.0, 1.0)),
+            &one_entry(&f),
+            &one_item(),
+            1,
+            false,
+            0,
+        )
+        .unwrap();
+        let p = d.into_path();
         let plan = plan_in_band(&p, 1, 0, (0.0, 1.0), 0.5).unwrap();
         let (on, g_on) = step(
             &mut f,
@@ -2809,8 +2846,16 @@ mod depth_anchoring_tests {
     fn aux_steps_stay_inside_each_experts_band() {
         let f = fixture();
         let entry = [(f.clean.clone(), vec![], None)];
-        let mut p = path_with(schedule(0.2, 0.6));
-        prepare_perceptual_references(&mut p, &entry).unwrap();
+        let d = aux_driver(
+            path_with(schedule(0.2, 0.6)),
+            &entry,
+            &one_item(),
+            1,
+            false,
+            0,
+        )
+        .unwrap();
+        let p = d.into_path();
         let low = (0.0, 0.875);
         let high = (0.875, 1.0);
         // u = 0.5 within the low band ⇒ the window's midpoint.
@@ -2821,8 +2866,16 @@ mod depth_anchoring_tests {
         assert!(plan.diffusion && plan.aux.is_empty(), "{plan:?}");
         assert_eq!(plan.noise_level, 0.9);
 
-        let mut p = path_with(schedule(0.5, 0.95));
-        prepare_perceptual_references(&mut p, &entry).unwrap();
+        let d = aux_driver(
+            path_with(schedule(0.5, 0.95)),
+            &entry,
+            &one_item(),
+            1,
+            false,
+            0,
+        )
+        .unwrap();
+        let p = d.into_path();
         let plan = plan_in_band(&p, 2, 0, high, 0.875).unwrap();
         assert!(!plan.diffusion, "{plan:?}");
         assert!(
@@ -2831,8 +2884,16 @@ mod depth_anchoring_tests {
             plan.noise_level
         );
 
-        let mut p = path_with(schedule(0.3, 0.7));
-        prepare_perceptual_references(&mut p, &entry).unwrap();
+        let d = aux_driver(
+            path_with(schedule(0.3, 0.7)),
+            &entry,
+            &one_item(),
+            1,
+            false,
+            0,
+        )
+        .unwrap();
+        let p = d.into_path();
         for key in 1..=4 {
             for t in [0.01f32, 0.5, 0.99] {
                 assert_eq!(
@@ -2846,17 +2907,16 @@ mod depth_anchoring_tests {
 
     /// With the dual MoE and gradient accumulation 2, every expert's optimizer window (its own
     /// `accum` routed micro-steps) is one step kind, and depth windows still happen. Mutation:
-    /// build the tracker with `accum` alone (not `accum · n_experts`) ⇒ an expert's window mixes
-    /// kinds ⇒ red.
+    /// build the driver's window with `accum` alone (not `accum · n_experts`) in `aux_driver` ⇒ an
+    /// expert's window mixes kinds ⇒ red.
     #[test]
     fn every_experts_update_window_is_one_step_kind() {
         let f = fixture();
         let items = 3;
-        let mut p = path_with(schedule(0.0, 1.0));
+        let p = path_with(schedule(0.0, 1.0));
         let cache: Vec<_> = (0..items)
             .map(|_| (f.clean.clone(), vec![], None))
             .collect();
-        prepare_perceptual_references(&mut p, &cache).unwrap();
         let schedule = BucketSchedule::new(
             items,
             &[gen_core::train::ResolutionBucket {
@@ -2866,14 +2926,18 @@ mod depth_anchoring_tests {
             7,
         );
         let accum = 2u32;
-        let mut alt = perceptual_alternation(items, accum, 2);
+        let mut d = aux_driver(p, &cache, &schedule, accum, true, 0).unwrap();
+        let keys: Vec<u32> = (1..=24u32)
+            .map(|step| d.key(step, step_item(step, true, &schedule)))
+            .collect();
+        let p = d.into_path();
         // expert -> per-window kinds
         let mut kinds: [Vec<bool>; 2] = [Vec::new(), Vec::new()];
         for step in 1..=24u32 {
             let ei = expert_index(step, true);
             let band = if ei == 0 { (0.0, 0.875) } else { (0.875, 1.0) };
             let entry = expert_item_index(step, true, &schedule);
-            let key = alt.key(step, step_item(step, true, &schedule));
+            let key = keys[(step - 1) as usize];
             let plan = plan_in_band(&p, key, entry, band, band.0 + 0.01).unwrap();
             kinds[ei].push(!plan.diffusion);
         }
@@ -2927,18 +2991,23 @@ mod depth_anchoring_tests {
         let between = |base: f64| ((base + large / 2.0) / 0.85 * GIB) as usize;
         let dense = preflight_projection(&real, &edges, 2).1;
         let b = between(dense);
-        assert!(preflight_memory_guard_with_budget(&real, &edges, 2, "t", 0.0, false, b).is_ok());
         assert!(
-            preflight_memory_guard_with_budget(&real, &edges, 2, "t", large, false, b).is_err()
+            preflight_memory_guard_with_budget(&real, &on, &edges, 2, "t", 0.0, false, b).is_ok()
+        );
+        assert!(
+            preflight_memory_guard_with_budget(&real, &on, &edges, 2, "t", large, false, b)
+                .is_err()
         );
         let ck = checkpointed_baseline_gb(&real, 2);
         assert!(ck < dense);
         let b = between(ck);
-        assert!(preflight_memory_guard_with_budget(&real, &edges, 2, "t", 0.0, true, b).is_ok());
-        let err = preflight_memory_guard_with_budget(&real, &edges, 2, "t", large, true, b)
+        assert!(
+            preflight_memory_guard_with_budget(&real, &on, &edges, 2, "t", 0.0, true, b).is_ok()
+        );
+        let err = preflight_memory_guard_with_budget(&real, &on, &edges, 2, "t", large, true, b)
             .expect_err("checkpointed depth job over budget is refused")
             .to_string();
-        assert!(err.contains("depth-anchoring"), "{err}");
+        assert!(err.contains("[depth]"), "{err}");
     }
 
     /// AC (e): every Wan descriptor declares depth anchoring; the decoder follows the VAE z_dim

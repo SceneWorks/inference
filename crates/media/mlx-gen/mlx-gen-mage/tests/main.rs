@@ -78,3 +78,6 @@ mod vae_encode_real_weights;
 
 #[path = "variable_geometry_real_weights.rs"]
 mod variable_geometry_real_weights;
+
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;

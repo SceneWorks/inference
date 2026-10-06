@@ -88,13 +88,25 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
     let id = desc.id;
 
     // Positive: a declared request using a supported network type must be accepted. Prefer LoRA if
-    // supported (every family does), else LoKr.
+    // supported (every adapter family does), else LoKr. A **control-branch** trainer (it advertises
+    // `supports_control` and neither adapter kind — e.g. Krea's ControlNet-branch trainer) trains no
+    // adapter at all: its positive request is a well-formed control request instead (a control type
+    // and a conditioning image on every item; the item's own image stands in — validate never reads
+    // it), and the network type is inert for it.
+    let control_branch = desc.supports_control && !desc.supports_lora && !desc.supports_lokr;
     let mut ok = base_request(profile);
-    ok.config.network_type = if desc.supports_lora {
-        NetworkType::Lora
+    if control_branch {
+        ok.config.control_type = Some("pose".to_owned());
+        for item in &mut ok.items {
+            item.control_image_path = Some(item.image_path.clone());
+        }
     } else {
-        NetworkType::Lokr
-    };
+        ok.config.network_type = if desc.supports_lora {
+            NetworkType::Lora
+        } else {
+            NetworkType::Lokr
+        };
+    }
     t.validate(&ok).map_err(|e| {
         format!(
             "validate-honesty[{id}]: the declared cheap request was rejected by validate(): {e}"
@@ -110,8 +122,9 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
         ));
     }
 
-    // Negative: a network type the descriptor does not advertise must be rejected.
-    if !desc.supports_lokr {
+    // Negative: a network type the descriptor does not advertise must be rejected (an adapter
+    // trainer; a control-branch trainer trains no adapter, so the knob is inert for it).
+    if !desc.supports_lokr && !control_branch {
         let mut lokr = base_request(profile);
         lokr.config.network_type = NetworkType::Lokr;
         if t.validate(&lokr).is_ok() {
@@ -121,7 +134,7 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
             ));
         }
     }
-    if !desc.supports_lora {
+    if !desc.supports_lora && !control_branch {
         let mut lora = base_request(profile);
         lora.config.network_type = NetworkType::Lora;
         if t.validate(&lora).is_ok() {
@@ -135,8 +148,8 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
     // Negative (F-006): a control-branch request on a trainer that does NOT advertise
     // `supports_control` must be rejected by `validate()` — not silently trained as a plain adapter
     // (F-055). The shared `validate_control_request` floor enforces this; assert the trainer routes
-    // through it. (A control-capable trainer is exempt — it should accept a well-formed control
-    // request; there are none shipped today.)
+    // through it. (A control-capable trainer is exempt — its positive request above is a
+    // well-formed control request.)
     if !desc.supports_control {
         let mut ctrl = ok.clone();
         ctrl.config.control_type = Some("pose".to_owned());
@@ -535,6 +548,61 @@ pub fn check_trainer_technique_refusal(
             "resolution_buckets set",
             "techniques.resolution_buckets",
         )?;
+    }
+    Ok(())
+}
+
+/// **Every validate floor at the `train` entry point** (epic 2123 E3, sc-2124). A caller that
+/// skips `validate` and calls `train` directly with a request only a NON-technique floor refuses —
+/// a full base fine-tune / a control-branch request the descriptor does not advertise, an
+/// instruction-edit item over the reference cap — must get a typed `Err(Error::Unsupported)` before
+/// any progress event, so nothing is loaded, cached or written. Non-vacuous even for a trainer
+/// that declares every probed technique (which leaves [`check_trainer_technique_refusal`] nothing
+/// to refuse).
+pub fn check_trainer_train_floors(
+    make: &dyn Fn() -> Box<dyn Trainer>,
+    profile: &TrainerProfile,
+) -> Result<(), String> {
+    let desc = *make().descriptor();
+    let base = base_request(profile);
+    let mut probes = Vec::new();
+    if !desc.supports_full_finetune {
+        let mut full = base.clone();
+        full.config.full_finetune = true;
+        probes.push(("full_finetune", full));
+    }
+    if !desc.supports_control {
+        let mut control = base.clone();
+        control.config.control_type = Some("pose".to_owned());
+        probes.push(("control_type", control));
+    }
+    let cap = desc.max_reference_images as usize;
+    let mut edit = base;
+    for item in &mut edit.items {
+        item.reference_image_paths = vec![item.image_path.clone(); cap + 1];
+    }
+    probes.push(("instruction edit", edit));
+    for (floor, req) in probes {
+        let mut events = 0u32;
+        let result = make().train(&req, &mut |_| events += 1);
+        match result {
+            Err(Error::Unsupported(_)) if events == 0 => {}
+            Err(Error::Unsupported(_)) => {
+                return Err(format!(
+                    "train-floors[{}]: train() refused the {floor} request only after emitting \
+                     {events} progress event(s) — refuse before any work (E3)",
+                    desc.id
+                ))
+            }
+            other => {
+                return Err(format!(
+                    "train-floors[{}]: train() with an unadvertised {floor} request must return a \
+                     typed Err(Error::Unsupported) before any progress, got {:?}",
+                    desc.id,
+                    other.map(|out| out.steps)
+                ))
+            }
+        }
     }
     Ok(())
 }

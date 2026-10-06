@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod dataset;
 pub mod formula;
 pub mod latent_lpips;
+pub mod lazy;
 pub mod lora;
 pub mod loss;
 pub mod optim;

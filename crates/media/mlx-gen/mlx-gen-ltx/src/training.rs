@@ -48,8 +48,8 @@ use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{accumulate_grads, adapter_optimizer_update, average_grads, LoraParams};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, AuxAlternation, AuxModelFootprint, Parameterization, PerceptualPath,
-    StepPlan, X0Decoder,
+    combine_step_loss, AuxDriver, AuxModelFootprint, Parameterization, PerceptualPath, StepPlan,
+    X0Decoder,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
@@ -2294,34 +2294,71 @@ fn select_depth_frames(
 /// connector + the Gemma-3-12B text-encoder snapshot resolved like inference). The transformer loads
 /// at **f32 activations × quantized weights** (`quant_f32`) for clean autograd — the base is frozen,
 /// gradients flow only through the trainable LoRA factors. Registered via [`mlx_gen::TrainerRegistration`].
+///
+/// The weights load lazily (sc-2124): construction only checks the spec (and that the Gemma-3
+/// override exists), so `validate` and `train`'s refusal floors never read weights; see
+/// [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => return Err(mlx_gen::Error::Msg(
+    snapshot_root_23(spec)?;
+    crate::model::resolve_gemma_dir(spec.text_encoder.as_ref())?;
+    Ok(Box::new(mlx_gen::train::lazy::LazyTrainer::new(
+        trainer_descriptor(),
+        validate_floors,
+        {
+            let spec = spec.clone();
+            move || load_weights_23(&spec)
+        },
+    )))
+}
+
+/// The LTX-2.3 snapshot directory a trainer spec names — a single file is refused.
+fn snapshot_root_23(spec: &LoadSpec) -> Result<&Path> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(
             "ltx_2_3 trainer expects a split-weight snapshot directory (transformer.safetensors \
-                 / vae_*.safetensors / connector.safetensors), not a single file"
+             / vae_*.safetensors / connector.safetensors), not a single file"
                 .into(),
         )),
-    };
-    Ok(Box::new(load_trainer_from_dir(
-        root,
-        spec.text_encoder.as_ref(),
-    )?))
+    }
+}
+
+/// The LTX-2.3 weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
+fn load_weights_23(spec: &LoadSpec) -> Result<LtxTrainer> {
+    load_trainer_from_dir(snapshot_root_23(spec)?, spec.text_encoder.as_ref())
 }
 
 /// Construct the LTX-2.5 trainer from its split Gemma-4 bundle.  This follows the ordinary
 /// provider's component resolver so training cannot quietly combine a 2.5 DiT with a Gemma-3
 /// override or a 2.3-shaped VAE configuration.
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer_25(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(path) => path,
-        WeightsSource::File(_) => {
-            return Err(mlx_gen::Error::Msg(
-                "ltx_2_5 trainer expects a split-component directory, not a single checkpoint"
-                    .into(),
-            ))
-        }
-    };
+    snapshot_root_25(spec)?;
+    Ok(Box::new(mlx_gen::train::lazy::LazyTrainer::new(
+        trainer_descriptor_25(),
+        validate_floors,
+        {
+            let spec = spec.clone();
+            move || load_weights_25(&spec)
+        },
+    )))
+}
+
+/// The LTX-2.5 split-component directory a trainer spec names — a single checkpoint is refused.
+fn snapshot_root_25(spec: &LoadSpec) -> Result<&Path> {
+    match &spec.weights {
+        WeightsSource::Dir(path) => Ok(path),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(
+            "ltx_2_5 trainer expects a split-component directory, not a single checkpoint".into(),
+        )),
+    }
+}
+
+/// The LTX-2.5 weight load behind [`load_trainer_25`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
+fn load_weights_25(spec: &LoadSpec) -> Result<LtxTrainer> {
+    let root = snapshot_root_25(spec)?;
     let bundle = crate::bundle::resolve_split_bundle(spec)?;
     crate::bundle::assert_gemma_version(&bundle)?;
     ensure_ltx25_training_variant(crate::dev_sampler::from_bundle(&bundle)?)?;
@@ -2373,14 +2410,14 @@ pub fn load_trainer_25(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     for w in [&connector_w, &transformer_w, &video_w] {
         w.materialize_accessed()?;
     }
-    Ok(Box::new(LtxTrainer {
+    Ok(LtxTrainer {
         descriptor: trainer_descriptor_25(),
         tokenizer: Some(TrainingTokenizer::Gemma4(tokenizer)),
         text_encoder: Some(TrainingTextEncoder::Gemma4(text_encoder)),
         vae,
         transformer: TrainingTransformer::Ltx25(transformer),
         cfg,
-    }))
+    })
 }
 
 /// The concrete-typed loader behind [`load_trainer`] (sc-4942 — the first-step memory harness needs
@@ -2523,25 +2560,35 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the single-use check.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006 / F-055): the LTX trainer has no control branch, so a
+    // request carrying `control_type` / per-item control images is rejected (typed `Unsupported`)
+    // rather than silently training a plain LoRA and reporting success.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    refuse_ltx25_subject_mask(descriptor.id, req)?;
+    refuse_ltx25_depth_anchoring(descriptor.id, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    if descriptor.id == MODEL_25_ID {
+        validate_ltx25_training_request(req)?;
+    } else {
+        validate_request(req, &format!("{} trainer", descriptor.id))?;
+    }
+    Ok(())
+}
+
 impl Trainer for LtxTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006 / F-055): the LTX trainer has no control branch, so a
-        // request carrying `control_type` / per-item control images is rejected (typed `Unsupported`)
-        // rather than silently training a plain LoRA and reporting success.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        refuse_ltx25_subject_mask(self.descriptor.id, req)?;
-        refuse_ltx25_depth_anchoring(self.descriptor.id, req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         // Single-use enforcement (F-055): `train` frees the Gemma text encoder + tokenizer (~24 GB)
         // after the embed cache, so a second `train` on the same instance can't re-encode. Fail here,
         // up front (validate runs before any progress is emitted), instead of with a late, confusing
@@ -2554,12 +2601,7 @@ impl Trainer for LtxTrainer {
             )
             .into());
         }
-        if self.descriptor.id == MODEL_25_ID {
-            validate_ltx25_training_request(req)?;
-        } else {
-            validate_request(req, &label)?;
-        }
-        Ok(())
+        validate_floors(self.descriptor(), req)
     }
 
     fn train(
@@ -2629,7 +2671,7 @@ impl LtxTrainer {
         // error — BEFORE the (~minutes-long) latent caching — when gradient checkpointing is not
         // enabled. (LTX is LoRA-only, so the LoRA-path condition is always met.)
         let will_checkpoint = cfg.gradient_checkpointing;
-        // Epic 2123 E7 (sc-24830): the depth-anchoring models (TAELTX2.3 + Depth-Anything-V2)
+        // Epic 2123 E7 (sc-24830): the aux-loss models (TAELTX2.3 + every enabled arm)
         // count against the budget on BOTH paths — a checkpointed depth job must not skip it.
         let aux_gb = perceptual_footprint_gb(
             cfg,
@@ -2637,7 +2679,7 @@ impl LtxTrainer {
             req.items.len() * edges.len(),
         );
         if !will_checkpoint || aux_gb > 0.0 {
-            preflight_memory_guard(latent_edge, aux_gb, will_checkpoint)?;
+            preflight_memory_guard(cfg, latent_edge, aux_gb, will_checkpoint)?;
         }
 
         // Epic 2123 depth anchoring (sc-24830): load the frozen TAELTX2.3 decoder +
@@ -2720,7 +2762,8 @@ impl LtxTrainer {
         let sampling_enabled = !sample_ctxs.is_empty();
 
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAELTX2.3 decode of its
-        // cached clean latent → DA2 depth) is computed exactly once per job, here.
+        // cached clean latent → DA2 depth) is computed exactly once per job, by the `AuxDriver`
+        // before the loop.
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
             // cropped like the image and resampled onto its decoded size.
@@ -2731,7 +2774,6 @@ impl LtxTrainer {
                 latent_edges.len(),
                 CropBox::center_square,
             )?);
-            prepare_perceptual_references(path, &cache, &latent_edges)?;
         }
 
         // The RoPE position grid is identical across items at a fixed latent resolution (single
@@ -2832,14 +2874,17 @@ impl LtxTrainer {
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on
         // the real dataset item. A resumed run replays the skipped prefix so the phase matches.
-        let mut alternation = perceptual
-            .as_ref()
-            .map(|_| AuxAlternation::new(cache.len() / edges.len(), accum));
-        if let Some(alt) = alternation.as_mut() {
-            for s in 1..=start_step {
-                alt.key(s, schedule.sample((s - 1) as usize).0);
-            }
-        }
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                &latent_edges,
+                &schedule,
+                accum,
+                start_step,
+            )?),
+            None => None,
+        };
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -2857,23 +2902,19 @@ impl LtxTrainer {
             };
             // Epic 2123 E8: plan the step's loss terms; an aux-only step trains at the σ remapped
             // into the loss window.
-            let plan = match (perceptual.as_ref(), alternation.as_mut()) {
-                (Some(path), Some(alt)) => {
-                    let plan = plan_aux_step(path, alt, &schedule, step, sigma)?;
-                    sigma = plan.noise_level;
-                    Some(plan)
-                }
-                _ => None,
+            let planned = match aux_driver.as_mut() {
+                Some(d) => d.sample(step, &schedule).plan(sigma)?,
+                None => None,
             };
-            let aux = perceptual
-                .as_ref()
-                .zip(plan.as_ref())
-                .map(|(path, plan)| AuxStep {
-                    path,
-                    plan,
-                    image: entry,
-                    latent_edge: latent_edges[bucket],
-                });
+            if let Some(p) = &planned {
+                sigma = p.plan.noise_level;
+            }
+            let aux = planned.as_ref().map(|p| AuxStep {
+                path: p.path,
+                plan: &p.plan,
+                image: p.entry,
+                latent_edge: latent_edges[bucket],
+            });
             let noise = random::normal::<f32>(
                 clean.shape(),
                 None,
@@ -3027,12 +3068,12 @@ impl LtxTrainer {
                 k.min(f.max(1) as usize) as u32,
                 req.items.len(),
             );
-            ltx25_aux_memory_guard(aux_gb, get_memory_limit())?;
+            ltx25_aux_memory_guard(cfg, aux_gb, get_memory_limit())?;
             Some(k)
         } else {
             None
         };
-        let mut perceptual = load_perceptual_path_for(cfg, "ltx_2_5 trainer", ltx25_decoder())?;
+        let perceptual = load_perceptual_path_for(cfg, "ltx_2_5 trainer", ltx25_decoder())?;
         on_progress(TrainingProgress::LoadingModel);
 
         let mut cached = Vec::with_capacity(req.items.len());
@@ -3173,17 +3214,10 @@ impl LtxTrainer {
         let mae = matches!(cfg.loss_type.to_ascii_lowercase().as_str(), "mae" | "l1");
         // sc-24830: each example's depth reference (its clean video frames decoded → DA2) once,
         // and per-example alternation keys (resume replays the skipped prefix).
-        if let Some(path) = perceptual.as_mut() {
-            prepare_ltx25_references(path, &cached)?;
-        }
-        let mut alternation = perceptual
-            .as_ref()
-            .map(|_| AuxAlternation::new(cached.len(), accumulation));
-        if let Some(alt) = alternation.as_mut() {
-            for s in 1..=start_step {
-                alt.key(s, (s as usize - 1) % cached.len());
-            }
-        }
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(ltx25_aux_driver(path, &cached, accumulation, start_step)?),
+            None => None,
+        };
         let mut accumulated: Option<LoraParams> = None;
         let mut final_loss = 0.0;
         let mut steps_run = start_step;
@@ -3199,9 +3233,10 @@ impl LtxTrainer {
             let item = (step as usize - 1) % cached.len();
             let example = &cached[item];
             // sc-24830: plan the step; an aux-only step trains at σ remapped into the loss window.
-            let step_plan = match (perceptual.as_ref(), alternation.as_mut()) {
-                (Some(path), Some(alt)) => {
-                    let plan = path.plan(alt.key(step, item), item, sigma)?;
+            let step_plan = match aux_driver.as_mut() {
+                Some(driver) => {
+                    let key = driver.key(step, item);
+                    let plan = driver.path().plan(key, item, sigma)?;
                     sigma = plan.noise_level;
                     Some(plan)
                 }
@@ -3213,7 +3248,7 @@ impl LtxTrainer {
                 cfg.seed.wrapping_add(step as u64).wrapping_mul(2),
             )?;
             let aux = match (
-                perceptual.as_ref(),
+                aux_driver.as_ref().map(AuxDriver::path),
                 step_plan.as_ref(),
                 example.depth.as_ref(),
             ) {
@@ -3397,37 +3432,36 @@ struct AuxStep<'a> {
     latent_edge: usize,
 }
 
-/// The perceptual plan of 1-based micro-`step` (epic 2123 E8): the alternation key comes from the
-/// step's REAL dataset item (the bucket schedule's `(item, bucket)`), the reference from its
-/// `(item, bucket)` cache entry; `raw_sigma` is the sampled σ.
-fn plan_aux_step(
-    path: &PerceptualPath,
-    alternation: &mut AuxAlternation,
-    schedule: &BucketSchedule,
-    step: u32,
-    raw_sigma: f32,
-) -> Result<StepPlan> {
-    let k = (step - 1) as usize;
-    let key = alternation.key(step, schedule.sample(k).0);
-    path.plan(key, schedule.cache_index(k), raw_sigma)
-}
-
-/// Each LTX-2.5 example's depth reference (sc-24830): its clean video target tokens at the
-/// selected frames, decoded once per job.
-fn prepare_ltx25_references(
-    path: &mut PerceptualPath,
+/// The LTX-2.5 loop's [`AuxDriver`] (sc-24830): each example's depth reference (its clean video
+/// target tokens at the selected frames, decoded) once per job, and the alternation over the
+/// examples in the loop's round-robin order (`(step − 1) mod n`) with `accumulation` micro-steps
+/// per update; a resumed prefix `1..=start_step` is replayed.
+fn ltx25_aux_driver(
+    path: PerceptualPath,
     cached: &[CachedLtx25Example],
-) -> Result<()> {
-    for (index, example) in cached.iter().enumerate() {
-        let (Some(video), Some(depth)) = (example.video.as_ref(), example.depth.as_ref()) else {
-            return Err(format!(
-                "ltx_2_5 trainer: depth anchoring needs a generated video clip (example {index})"
-            )
-            .into());
-        };
-        path.ensure_reference(index, &depth.nchw(&video.clean)?)?;
-    }
-    Ok(())
+    accumulation: u32,
+    start_step: u32,
+) -> Result<AuxDriver> {
+    let n = cached.len();
+    AuxDriver::prepare_keyed(
+        path,
+        n,
+        |index| {
+            let example = &cached[index];
+            let (Some(video), Some(depth)) = (example.video.as_ref(), example.depth.as_ref())
+            else {
+                return Err(format!(
+                    "ltx_2_5 trainer: depth anchoring needs a generated video clip (example {index})"
+                )
+                .into());
+            };
+            depth.nchw(&video.clean)
+        },
+        n,
+        accumulation,
+        start_step,
+        |s| (s as usize - 1) % n,
+    )
 }
 
 /// LTX-2.3's latent family for the shared aux-loss builder (epic 2123 E8): the 128-channel
@@ -3465,18 +3499,26 @@ fn load_perceptual_path_for(
     )
 }
 
-/// Compute every (item, bucket) cache entry's perceptual reference once, from its patchified clean
-/// latent unpatchified at its bucket's latent edge (item-major: bucket = entry % n_buckets).
-fn prepare_perceptual_references(
-    path: &mut PerceptualPath,
+/// The LTX-2.3 loop's [`AuxDriver`] (epic 2123 E8): every (item, bucket) cache entry's perceptual
+/// reference computed once, from its patchified clean latent unpatchified at its bucket's latent
+/// edge (item-major: bucket = entry % n_buckets); the alternation keyed on the schedule's REAL
+/// items with `accum` micro-steps per update, and a resumed prefix `1..=start_step` replayed.
+fn aux_driver(
+    path: PerceptualPath,
     cache: &[(Array, Array, Option<Array>)],
     latent_edges: &[usize],
-) -> Result<()> {
-    for (entry, (clean, _, _)) in cache.iter().enumerate() {
-        let le = latent_edges[entry % latent_edges.len()];
-        path.ensure_reference(entry, &unflatten_latent(clean, le)?)?;
-    }
-    Ok(())
+    schedule: &BucketSchedule,
+    accum: u32,
+    start_step: u32,
+) -> Result<AuxDriver> {
+    AuxDriver::prepare(
+        path,
+        cache.len(),
+        |entry| unflatten_latent(&cache[entry].0, latent_edges[entry % latent_edges.len()]),
+        schedule,
+        accum,
+        start_step,
+    )
 }
 
 /// Extra training memory (GB) the enabled perceptual losses add at the largest bucket pixel `edge`
@@ -3553,21 +3595,21 @@ fn ltx25_perceptual_footprint_gb(
 
 /// The LTX-2.5 depth memory guard (sc-24830, epic 2123 E7): refuse when the resident DiT base (the
 /// calibrated resident term [`checkpointed_baseline_gb`] — a lower bound; the 2.5 trainer has no
-/// fitted AV working-set curve) plus the aux models exceeds `budget_bytes × 0.85`.
-fn ltx25_aux_memory_guard(extra_gb: f64, budget_bytes: usize) -> Result<()> {
+/// fitted AV working-set curve) plus the aux models exceeds `budget_bytes × 0.85`, through the
+/// shared [`mlx_gen_perceptual::check_aux_memory`] (naming `cfg`'s enabled aux losses).
+fn ltx25_aux_memory_guard(cfg: &TrainingConfig, extra_gb: f64, budget_bytes: usize) -> Result<()> {
     let projected = checkpointed_baseline_gb() + extra_gb;
     let budget_gb = budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
-    if projected > safe {
-        return Err(format!(
-            "ltx_2_5 trainer: a training step with the depth-anchoring models (~{extra_gb:.1} GB \
-             for TAELTX2.3 and Depth-Anything-V2) needs at least ~{projected:.0} GB, exceeding \
-             this machine's ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). Use a \
-             smaller depth model or fewer `{DEPTH_ANCHORING_FRAMES_KEY}`."
-        )
-        .into());
-    }
-    Ok(())
+    mlx_gen_perceptual::check_aux_memory(
+        "ltx_2_5 trainer",
+        cfg,
+        &format!("a training step decoding the selected `{DEPTH_ANCHORING_FRAMES_KEY}` frames"),
+        extra_gb,
+        projected,
+        safe,
+        &format!("{budget_gb:.0} GB MLX limit × 0.85"),
+    )
 }
 
 /// One LTX-2.3 item's cached latents, one per bucket edge in `edges` order (the item-major layout
@@ -4503,8 +4545,13 @@ fn largest_bucket(edges: &[usize]) -> usize {
 /// Epic 2123 E7 (sc-24830): `extra_gb` is the training-time auxiliary models' footprint
 /// ([`perceptual_footprint_gb`]); with it the guard also runs with gradient checkpointing on
 /// (`checkpointed`), stacking on the resident base ([`checkpointed_baseline_gb`]).
-fn preflight_memory_guard(latent_edge: usize, extra_gb: f64, checkpointed: bool) -> Result<()> {
-    preflight_memory_guard_with_budget(latent_edge, extra_gb, checkpointed, get_memory_limit())
+fn preflight_memory_guard(
+    cfg: &TrainingConfig,
+    latent_edge: usize,
+    extra_gb: f64,
+    checkpointed: bool,
+) -> Result<()> {
+    preflight_memory_guard_with_budget(cfg, latent_edge, extra_gb, checkpointed, get_memory_limit())
 }
 
 /// The checkpointed baseline the auxiliary-model guard stacks on: the resident-base term of
@@ -4515,8 +4562,10 @@ fn checkpointed_baseline_gb() -> f64 {
 }
 
 /// [`preflight_memory_guard`] against an explicit budget (`budget_bytes`, the live MLX limit in
-/// production) — so the guard's arithmetic is testable on any host.
+/// production) — so the guard's arithmetic is testable on any host. A checkpointed refusal goes
+/// through the shared [`mlx_gen_perceptual::check_aux_memory`], naming `cfg`'s enabled aux losses.
 fn preflight_memory_guard_with_budget(
+    cfg: &TrainingConfig,
     latent_edge: usize,
     extra_gb: f64,
     checkpointed: bool,
@@ -4530,16 +4579,17 @@ fn preflight_memory_guard_with_budget(
     } + extra_gb;
     let budget_gb = budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
-    if projected > safe && checkpointed {
+    if checkpointed {
         let px = latent_edge * SPATIAL_SCALE as usize;
-        return Err(format!(
-            "ltx_2_3 trainer: a checkpointed training step at resolution {px} with the \
-             depth-anchoring models (~{extra_gb:.1} GB for TAELTX2.3 and Depth-Anything-V2) needs \
-             at least ~{projected:.0} GB, exceeding this machine's ~{safe:.0} GB safe budget \
-             ({budget_gb:.0} GB MLX limit × 0.85). Use a smaller depth model or reduce the \
-             training resolution."
-        )
-        .into());
+        return mlx_gen_perceptual::check_aux_memory(
+            "ltx_2_3 trainer",
+            cfg,
+            &format!("a checkpointed training step at resolution {px}"),
+            extra_gb,
+            projected,
+            safe,
+            &format!("{budget_gb:.0} GB MLX limit × 0.85"),
+        );
     }
     if projected > safe {
         let px = latent_edge * SPATIAL_SCALE as usize;
@@ -6333,7 +6383,7 @@ mod load_trainer_tests {
 /// (`rung4_block_window_tests::tiny_cfg` / `tiny_weight_map`: 4 layers, 4 latent channels) with a
 /// random-init tiny-width TAEHV carrying TAELTX2.3's hyperparameters (patch 4, 8× temporal) at 4
 /// latent channels, and a random-init tiny Depth-Anything-V2. Drives the same
-/// [`compute_step_loss_grads`] / [`plan_aux_step`] / [`prepare_perceptual_references`]
+/// [`compute_step_loss_grads`] / [`aux_driver`]
 /// `train_23_impl` runs; the LTX-2.5 refusal through its typed reason. CPU; no weights downloaded.
 #[cfg(test)]
 mod depth_anchoring_tests {
@@ -6374,6 +6424,11 @@ mod depth_anchoring_tests {
             }],
         )
         .unwrap()
+    }
+
+    /// The one-item, one-bucket schedule `train_impl` builds for a single cached entry.
+    fn one_item() -> BucketSchedule {
+        BucketSchedule::new(1, &TrainingConfig::default().training_buckets(), 7)
     }
 
     struct Fixture {
@@ -6480,8 +6535,8 @@ mod depth_anchoring_tests {
     #[test]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
-        let mut p = path();
-        prepare_perceptual_references(&mut p, &cache_of(&f, 1), &[LE]).unwrap();
+        let d = aux_driver(path(), &cache_of(&f, 1), &[LE], &one_item(), 1, 0).unwrap();
+        let p = d.into_path();
         for ckpt in [false, true] {
             let plan = p.plan(1, 0, 0.5).unwrap();
             let (diff, _) = step(&mut f, plan.noise_level, ckpt, aux(&p, &plan));
@@ -6543,8 +6598,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_legacy {
             assert_eq!(bits(v), bits(&g_off[k]), "{k}");
         }
-        let mut p = path();
-        prepare_perceptual_references(&mut p, &cache_of(&f, 1), &[LE]).unwrap();
+        let d = aux_driver(path(), &cache_of(&f, 1), &[LE], &one_item(), 1, 0).unwrap();
+        let p = d.into_path();
         let plan = p.plan(1, 0, 0.5).unwrap();
         let (on, g_on) = step(&mut f, 0.5, false, aux(&p, &plan));
         assert_eq!(on, off);
@@ -6599,15 +6654,13 @@ mod depth_anchoring_tests {
             })
             .collect();
         drop(f);
-        let mut p = path();
-        prepare_perceptual_references(&mut p, &cache, &edges).unwrap();
-        assert_eq!(p.reference_computations(), cache.len());
         let schedule = BucketSchedule::new(items, &buckets, 7);
-        let mut alt = AuxAlternation::new(items, 1);
+        let mut d = aux_driver(path(), &cache, &edges, &schedule, 1, 0).unwrap();
+        assert_eq!(d.path().reference_computations(), cache.len());
         let steps = 2 * schedule.epoch_len() as u32;
         let mut kinds = Vec::new();
         for s in 1..=steps {
-            let plan = plan_aux_step(&p, &mut alt, &schedule, s, 0.5).unwrap();
+            let plan = d.sample(s, &schedule).plan(0.5).unwrap().unwrap().plan;
             kinds.push((schedule.sample((s - 1) as usize).0, !plan.diffusion));
         }
         assert!((0..steps as usize).any(|k| schedule.cache_index(k) != schedule.sample(k).0));
@@ -6639,15 +6692,15 @@ mod depth_anchoring_tests {
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         let between = |base: f64| ((base + large / 2.0) / 0.85 * GIB) as usize;
         let dense = projected_dense_peak_gb(16.0 * 16.0);
-        assert!(preflight_memory_guard_with_budget(16, 0.0, false, between(dense)).is_ok());
-        assert!(preflight_memory_guard_with_budget(16, large, false, between(dense)).is_err());
+        assert!(preflight_memory_guard_with_budget(&on, 16, 0.0, false, between(dense)).is_ok());
+        assert!(preflight_memory_guard_with_budget(&on, 16, large, false, between(dense)).is_err());
         let ck = checkpointed_baseline_gb();
         assert!(ck < dense);
-        assert!(preflight_memory_guard_with_budget(16, 0.0, true, between(ck)).is_ok());
-        let err = preflight_memory_guard_with_budget(16, large, true, between(ck))
+        assert!(preflight_memory_guard_with_budget(&on, 16, 0.0, true, between(ck)).is_ok());
+        let err = preflight_memory_guard_with_budget(&on, 16, large, true, between(ck))
             .expect_err("checkpointed depth job over budget")
             .to_string();
-        assert!(err.contains("depth-anchoring"), "{err}");
+        assert!(err.contains("[depth]"), "{err}");
     }
 
     /// AC (e): LTX-2.3 declares depth anchoring and a missing TAELTX2.3 checkpoint is a named error
@@ -7150,8 +7203,12 @@ mod ltx25_depth_anchoring_tests {
         );
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         let between = ((checkpointed_baseline_gb() + large / 2.0) / 0.85 * GIB) as usize;
-        assert!(ltx25_aux_memory_guard(0.0, between).is_ok());
-        assert!(ltx25_aux_memory_guard(large, between).is_err());
+        assert!(ltx25_aux_memory_guard(&on, 0.0, between).is_ok());
+        let err = ltx25_aux_memory_guard(&on, large, between)
+            .unwrap_err()
+            .to_string();
+        // The refusal names the enabled aux losses (the shared E7 guard).
+        assert!(err.contains("[depth]"), "{err}");
     }
 
     /// AC (e): the LTX-2.5 descriptor declares depth anchoring; exactly the workflows with no

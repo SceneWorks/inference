@@ -286,8 +286,13 @@ fn body_shape_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootp
 }
 
 /// Normal-loss pre-load footprint.
-fn normal_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
-    candle_gen_body::arm_footprint(&cfg.body_losses, candle_gen_body::BodyArm::Normal)
+/// Restricted to the subject, each cache entry also holds the job's subject mask on its decoded
+/// grid (E7).
+fn normal_footprint(cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
+    let mut f = candle_gen_body::arm_footprint(&cfg.body_losses, candle_gen_body::BodyArm::Normal);
+    f.reference_bytes_per_image +=
+        gen_core::train::subject_mask::PerceptualSubjectMasks::bytes_per_entry(cfg, h, w);
+    f
 }
 
 /// The VAE perceptual anchor (sc-24833): a frozen FLUX.2 VAE encoder's multi-scale features on the
@@ -627,6 +632,42 @@ pub mod testing {
         )
     }
 
+    /// A [`PerceptualPath`](candle_gen::train::perceptual::PerceptualPath) with one latent-input
+    /// loss scheduled by `schedule` that finds **no usable reference** for any image (as a face loss
+    /// does for an image with no face) — every step its alternation claims is reverted to diffusion
+    /// by `StepPlan::without_skipped`, at the remapped noise level. No decoder.
+    pub fn skipping_path(
+        schedule: candle_gen::gen_core::train::AuxLossSchedule,
+    ) -> Result<candle_gen::train::perceptual::PerceptualPath> {
+        use candle_gen::train::perceptual::{
+            AuxLoss, LossReference, PerceptualInput, PerceptualLoss, PerceptualPath,
+        };
+        struct NoReference;
+        impl PerceptualLoss for NoReference {
+            fn name(&self) -> &'static str {
+                "no-reference"
+            }
+            fn input(&self) -> PerceptualInput {
+                PerceptualInput::Latents
+            }
+            fn reference(&self, _clean: &Tensor) -> Result<Option<LossReference>> {
+                Ok(None)
+            }
+            fn loss(&self, _live: &Tensor, _reference: &dyn std::any::Any) -> Result<Tensor> {
+                Err(candle_gen::CandleError::Msg(
+                    "no-reference: a skipped loss was evaluated".into(),
+                ))
+            }
+        }
+        PerceptualPath::new(
+            None,
+            vec![AuxLoss {
+                schedule,
+                loss: Box::new(NoReference),
+            }],
+        )
+    }
+
     fn save(map: std::collections::HashMap<String, Tensor>, path: &Path) -> Result<()> {
         safetensors::save(&map, path)?;
         Ok(())
@@ -683,6 +724,30 @@ mod tests {
             name: "TAEF1",
             config: TinyDecoderConfig::taef1().into(),
         }
+    }
+
+    /// E7 (epic 2123 feature-end review): the normal loss restricted to the subject budgets the
+    /// subject mask each cache entry holds on its decoded grid, on top of Sapiens' own reference
+    /// mask. Mutation: drop the `bytes_per_entry` term from `normal_footprint` ⇒ red.
+    #[test]
+    fn a_subject_restricted_normal_loss_budgets_its_masks() {
+        let mut open = TrainingConfig::default();
+        open.body_losses.normal.weight = 0.1;
+        let mut restricted = open.clone();
+        restricted.body_losses.normal_restrict_to_subject = true;
+        let (edge, entries) = (512u32, 3usize);
+        let g = AuxGeometry::image(edge, entries);
+        let sapiens = |c: &TrainingConfig| {
+            candle_gen_body::arm_footprint(&c.body_losses, candle_gen_body::BodyArm::Normal)
+                .reference_bytes_per_image
+        };
+        let extra = perceptual_footprint(&restricted, &taef1(), g)
+            - perceptual_footprint(&open, &taef1(), g);
+        let mask = u64::from(edge) * u64::from(edge) * 4;
+        assert_eq!(
+            extra,
+            entries as u64 * (sapiens(&restricted) - sapiens(&open) + mask)
+        );
     }
 
     /// sc-24832: the body arms are on the seam — ViTPose budgeted once across the three arms, the

@@ -76,6 +76,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
             body_shape_loss: true,
             normal_loss: true,
             vae_anchor_loss: true,
+            // The x0 decoder is the trainer's own Mage-VAE decoder (`MageDecoderSpec`), not a
+            // separately cataloged one, so `perceptual_decoder_dir` is not required.
+            builtin_x0_decoder: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -166,8 +169,8 @@ fn mage_decoder_param_bytes(vae_dir: &Path) -> Result<u64> {
 
 /// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from the trainer's own resolved
 /// VAE directory only when an enabled loss decodes pixels. Mage has no separately cataloged x0
-/// decoder: `TrainingConfig::perceptual_decoder_dir` (which the shared floor requires) names the
-/// base snapshot and is not read here — the split-tier mirror can stage the VAE elsewhere, and the
+/// decoder, so the descriptor declares `builtin_x0_decoder` and the shared floor does not require
+/// `TrainingConfig::perceptual_decoder_dir` (never read here) — the split-tier mirror can stage the VAE elsewhere, and the
 /// trainer already resolved where.
 struct MageDecoderSpec {
     vae_dir: PathBuf,
@@ -258,18 +261,6 @@ fn perceptual_footprint_bytes(
     )
 }
 
-/// The perceptual aux losses train the adapter surface only; the full fine-tune has no aux seam, so
-/// the combination is a typed refusal (never silently ignored).
-fn refuse_aux_losses_on_full_finetune(req: &TrainingRequest) -> gen_core::Result<()> {
-    if req.config.full_finetune && candle_gen_perceptual::any_aux_loss(&req.config) {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{LABEL}: depth anchoring / perceptual aux losses train a LoRA/LoKr adapter only; \
-             they cannot be combined with a full base fine-tune"
-        )));
-    }
-    Ok(())
-}
-
 pub struct MageTrainer {
     descriptor: TrainerDescriptor,
     dirs: MageComponentDirs,
@@ -325,7 +316,6 @@ impl Trainer for MageTrainer {
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        refuse_aux_losses_on_full_finetune(req)?;
         validate_request(req).map_err(Into::into)
     }
 
@@ -1745,12 +1735,16 @@ mod tests {
             assert!(trainer_descriptor().techniques.face_landmark_loss);
             let mut req = full_request();
             req.config.depth_anchoring.schedule = schedule();
-            assert!(matches!(
-                refuse_aux_losses_on_full_finetune(&req),
-                Err(gen_core::Error::Unsupported(_))
-            ));
+            // The shared floor (gen-core) owns the full-fine-tune + aux refusal; the builtin
+            // decoder means no `perceptual_decoder_dir` is needed for the aux request on LoRA.
+            req.config.depth_anchoring.model_dir = Some(PathBuf::from("/da2"));
+            req.config.perceptual_decoder_dir = None;
+            let floor = |r: &TrainingRequest| {
+                gen_core::train::validate_training_techniques(&trainer_descriptor(), r)
+            };
+            assert!(matches!(floor(&req), Err(gen_core::Error::Unsupported(_))));
             req.config.full_finetune = false;
-            assert!(refuse_aux_losses_on_full_finetune(&req).is_ok());
+            assert!(floor(&req).is_ok(), "{:?}", floor(&req));
             let tmp = tempfile::tempdir().unwrap();
             let mut c = cfg();
             c.perceptual_decoder_dir = Some(tmp.path().join("no-vae"));

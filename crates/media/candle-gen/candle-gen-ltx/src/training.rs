@@ -1806,9 +1806,9 @@ impl Trainer for LtxTrainer {
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         if matches!(self.route, TrainingRoute::Ltx25 { .. }) {
-            // The technique floor (epic 2123 E3) guards the 2.5 route too: `validate` must refuse
-            // an undeclared technique, not leave it for `train` to catch.
-            gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+            // The weights-free 2.5 preflight runs the specific LTX-2.5 refusals (subject mask, the
+            // video-less depth workflows) and THEN the technique floor (epic 2123 E3), as the MLX
+            // trainer does — the 2.5 reason wins over the generic "not supported" one.
             return validate_ltx25_training_request(req).map_err(Into::into);
         }
         gen_core::train::validate_control_request(self.descriptor(), req)?;

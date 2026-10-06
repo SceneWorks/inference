@@ -58,3 +58,6 @@ mod transformer;
 
 #[path = "vae_wiring.rs"]
 mod vae_wiring;
+
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;

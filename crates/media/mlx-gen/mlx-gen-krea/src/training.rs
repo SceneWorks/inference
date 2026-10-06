@@ -48,7 +48,7 @@
 //!   budget, returns a catchable, actionable error BEFORE the (minutes-long) latent caching — converting
 //!   the otherwise-uncatchable SIGKILL into a recommendation to enable the toggle.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
@@ -63,7 +63,7 @@ use mlx_gen::train::lora::{
 };
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, AuxAlternation, Parameterization, PerceptualPath, StepPlan,
+    combine_step_loss, step_sample, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
@@ -204,36 +204,55 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// tree: `tokenizer/ text_encoder/ transformer/ vae/`). The DiT is loaded **dense** (the adapter host);
 /// the encoder is Q8. `spec.precision` selects the compute dtype (bf16 default / f32 tight-gate); the
 /// Raw snapshot ships bf16, so f32 widens it via [`Krea2Transformer::cast_weights`].
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p.clone(),
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "krea trainer expects a snapshot directory (tokenizer/ text_encoder/ transformer/ \
-                 vae/), not a single .safetensors file"
-                    .into(),
-            )),
-        };
+    snapshot_root(spec)?;
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor(), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        })
+        .validating_on_base_when(mlx_gen::train::lazy::custom_targets),
+    ))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(
+            "krea trainer expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+             not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
+fn load_weights(spec: &LoadSpec) -> Result<KreaRawTrainer> {
+    let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
         Precision::Bf16 => Dtype::Bfloat16,
         Precision::Fp32 => Dtype::Float32,
     };
-    let tokenizer = KreaTokenizer::from_snapshot(&root)?;
-    let mut encoder = load_text_encoder(&root)?;
+    let tokenizer = KreaTokenizer::from_snapshot(root)?;
+    let mut encoder = load_text_encoder(root)?;
     encoder.quantize(TRAINER_ENCODER_BITS)?;
-    let mut transformer = load_transformer(&root)?;
+    let mut transformer = load_transformer(root)?;
     if transformer.compute_dtype() != dtype {
         transformer.cast_weights(dtype)?;
     }
-    let vae = load_vae(&root)?;
-    Ok(Box::new(KreaRawTrainer {
+    let vae = load_vae(root)?;
+    Ok(KreaRawTrainer {
         descriptor: trainer_descriptor(),
         tokenizer,
         encoder: Some(encoder),
         transformer,
         vae,
         dtype,
-    }))
+    })
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -299,23 +318,29 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for KreaRawTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would train zero
         // parameters yet "succeed". Catch it here, where the loaded DiT is available to match against.
         if resolve_target_paths(&self.transformer, &req.config).is_empty() {
@@ -402,11 +427,11 @@ impl KreaRawTrainer {
         // block-checkpoint (LoRA + the toggle). LoKr always takes the dense path, so it is guarded.
         let will_checkpoint =
             matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
-        // Epic 2123 E7 (sc-24830): the depth-anchoring models (TAEW2.1 + Depth-Anything-V2) count
+        // Epic 2123 E7 (sc-24830): the aux-loss models (TAEW2.1 + every enabled arm) count
         // against the budget on BOTH paths — a checkpointed depth job must not skip admission.
         let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
         if !will_checkpoint || aux_gb > 0.0 {
-            preflight_memory_guard(edge, want_bf16, aux_gb, will_checkpoint)?;
+            preflight_memory_guard(cfg, edge, want_bf16, aux_gb, will_checkpoint)?;
         }
 
         // Epic 2123 depth anchoring (sc-24830): load the frozen TAEW2.1 decoder +
@@ -497,8 +522,9 @@ impl KreaRawTrainer {
         mlx_rs::memory::clear_cache();
 
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEW2.1 decode of its
-        // cached clean latent → DA2 depth) is computed exactly once per job, here — after the text
-        // encoder is freed, so the decoder + DA2 never share residency with it.
+        // cached clean latent → DA2 depth) is computed exactly once per job, by the `AuxDriver`
+        // before the loop — after the text encoder is freed, so the decoder + DA2 never share
+        // residency with it.
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
             // cropped like the image and resampled onto its decoded size.
@@ -509,7 +535,6 @@ impl KreaRawTrainer {
                 edges.len(),
                 CropBox::center_square,
             )?);
-            prepare_perceptual_references(path, &cache)?;
         }
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
@@ -612,14 +637,10 @@ impl KreaRawTrainer {
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on
         // the real dataset item. A resumed run replays the skipped prefix so the phase matches.
-        let mut alternation = perceptual
-            .as_ref()
-            .map(|_| AuxAlternation::new(cache.len() / edges.len(), accum));
-        if let Some(alt) = alternation.as_mut() {
-            for s in 1..=start_step {
-                alt.key(s, schedule.sample((s - 1) as usize).0);
-            }
-        }
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, start_step)?),
+            None => None,
+        };
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -627,7 +648,8 @@ impl KreaRawTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let entry = schedule.cache_index((step - 1) as usize);
+            let picked = step_sample(aux_driver.as_mut(), step, &schedule);
+            let entry = picked.entry;
             let (x0, context, mask_weight) = &cache[entry];
             let mut t = sample_sigma(
                 &cfg.timestep_type,
@@ -644,22 +666,15 @@ impl KreaRawTrainer {
             )?;
             // Epic 2123 E8: plan the step's loss terms; an aux-only step trains at the noise level
             // remapped into the loss window.
-            let plan = match (perceptual.as_ref(), alternation.as_mut()) {
-                (Some(path), Some(alt)) => {
-                    let plan = plan_aux_step(path, alt, &schedule, step, t)?;
-                    t = plan.noise_level;
-                    Some(plan)
-                }
-                _ => None,
-            };
-            let aux = perceptual
-                .as_ref()
-                .zip(plan.as_ref())
-                .map(|(path, plan)| AuxStep {
-                    path,
-                    plan,
-                    image: entry,
-                });
+            let planned = picked.plan(t)?;
+            if let Some(p) = &planned {
+                t = p.plan.noise_level;
+            }
+            let aux = planned.as_ref().map(|p| AuxStep {
+                path: p.path,
+                plan: &p.plan,
+                image: p.entry,
+            });
             let (losses, grads) = compute_step_loss_grads(
                 &mut self.transformer,
                 &params,
@@ -816,21 +831,6 @@ struct AuxStep<'a> {
     image: usize,
 }
 
-/// The perceptual plan of 1-based micro-`step` (epic 2123 E8): the alternation key comes from the
-/// step's REAL dataset item (the bucket schedule's `(item, bucket)`), the reference from its
-/// `(item, bucket)` cache entry; `raw_t` is the sampled noise level.
-fn plan_aux_step(
-    path: &PerceptualPath,
-    alternation: &mut AuxAlternation,
-    schedule: &BucketSchedule,
-    step: u32,
-    raw_t: f32,
-) -> Result<StepPlan> {
-    let k = (step - 1) as usize;
-    let key = alternation.key(step, schedule.sample(k).0);
-    path.plan(key, schedule.cache_index(k), raw_t)
-}
-
 /// Krea's latent family for the shared aux-loss builder (epic 2123 E8): the Qwen-Image VAE's
 /// 16-channel per-channel-normalized latent (`QwenVae::encode` applies `latents_mean` /
 /// `latents_std`, the space the DiT predicts in), decoded by TAEW2.1 — the TAEHV checkpoint
@@ -856,16 +856,25 @@ fn load_perceptual_path(cfg: &TrainingConfig) -> Result<Option<PerceptualPath>> 
     )
 }
 
-/// Compute every (item, bucket) cache entry's perceptual reference once, from its clean
-/// `[1, 16, h, w]` latent (already the decoder's NCHW layout).
-fn prepare_perceptual_references(
-    path: &mut PerceptualPath,
+/// The loop's [`AuxDriver`] (epic 2123 E8): every (item, bucket) cache entry's perceptual
+/// reference computed once, from its clean `[1, 16, h, w]` latent (already the decoder's NCHW
+/// layout); the alternation keyed on the schedule's REAL items with `accum` micro-steps per
+/// update, and a resumed prefix `1..=start_step` replayed.
+fn aux_driver(
+    path: PerceptualPath,
     cache: &[(Array, Array, Option<Array>)],
-) -> Result<()> {
-    for (entry, (x0, _, _)) in cache.iter().enumerate() {
-        path.ensure_reference(entry, x0)?;
-    }
-    Ok(())
+    schedule: &BucketSchedule,
+    accum: u32,
+    start_step: u32,
+) -> Result<AuxDriver> {
+    AuxDriver::prepare(
+        path,
+        cache.len(),
+        |i| Ok(cache[i].0.clone()),
+        schedule,
+        accum,
+        start_step,
+    )
 }
 
 /// Extra training memory (GB) the enabled perceptual losses add at the largest bucket `edge`
@@ -922,9 +931,15 @@ fn preflight_edge(edges: &[u32]) -> u32 {
 /// Epic 2123 E7 (sc-24830): `extra_gb` is the training-time auxiliary models' footprint
 /// ([`perceptual_footprint_gb`]); with it the guard also runs with gradient checkpointing on
 /// (`checkpointed`), stacking on the resident DiT base ([`checkpointed_baseline_gb`]).
-fn preflight_memory_guard(edge: u32, bf16: bool, extra_gb: f64, checkpointed: bool) -> Result<()> {
+fn preflight_memory_guard(
+    cfg: &TrainingConfig,
+    edge: u32,
+    bf16: bool,
+    extra_gb: f64,
+    checkpointed: bool,
+) -> Result<()> {
     let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
-    check_preflight_budget_with(edge, bf16, budget_gb, extra_gb, checkpointed)
+    check_preflight_budget_with(cfg, edge, bf16, budget_gb, extra_gb, checkpointed)
 }
 
 /// The checkpointed DiT baseline the auxiliary-model guard stacks on: the resident-base term of
@@ -935,8 +950,10 @@ fn checkpointed_baseline_gb(bf16: bool) -> f64 {
 }
 
 /// The preflight verdict with the auxiliary models' `extra_gb` on top of the DiT projection
-/// — the dense projection, or the checkpointed baseline when `checkpointed`.
+/// — the dense projection, or the checkpointed baseline when `checkpointed` (refused through the
+/// shared [`mlx_gen_perceptual::check_aux_memory`], naming `cfg`'s enabled aux losses).
 fn check_preflight_budget_with(
+    cfg: &TrainingConfig,
     edge: u32,
     bf16: bool,
     budget_gb: f64,
@@ -948,17 +965,15 @@ fn check_preflight_budget_with(
     }
     let projected = checkpointed_baseline_gb(bf16) + extra_gb;
     let safe = budget_gb * 0.85;
-    if projected > safe {
-        return Err(format!(
-            "krea trainer: a checkpointed training step at resolution {edge} with the \
-             depth-anchoring models (~{extra_gb:.1} GB for TAEW2.1 and Depth-Anything-V2) needs at \
-             least ~{projected:.0} GB, exceeding this machine's ~{safe:.0} GB safe budget \
-             ({budget_gb:.0} GB MLX limit × 0.85). Use a smaller depth model or reduce the \
-             training resolution."
-        )
-        .into());
-    }
-    Ok(())
+    mlx_gen_perceptual::check_aux_memory(
+        "krea trainer",
+        cfg,
+        &format!("a checkpointed training step at resolution {edge}"),
+        extra_gb,
+        projected,
+        safe,
+        &format!("{budget_gb:.0} GB MLX limit × 0.85"),
+    )
 }
 
 /// The pure guard logic (no MLX global state, so it is unit-testable): refuse if the projected dense
@@ -1891,8 +1906,8 @@ mod real_weight_repro {
 /// sc-24830 (epic 2123 depth anchoring) — the Krea step seam on the checked-in tiny `dit_golden`
 /// DiT (4-channel latent `[1, 4, 8, 8]`) with a random-init tiny-width TAEHV carrying TAEW2.1's
 /// hyperparameters at the fixture's 4 latent channels, and a random-init tiny Depth-Anything-V2.
-/// Drives the same [`compute_step_loss_grads`] / [`plan_aux_step`] /
-/// [`prepare_perceptual_references`] `train_impl` runs. Seconds; no weights downloaded.
+/// Drives the same [`compute_step_loss_grads`] / [`aux_driver`] `train_impl` runs. Seconds; no
+/// weights downloaded.
 #[cfg(test)]
 mod depth_anchoring_tests {
     use super::*;
@@ -1931,6 +1946,11 @@ mod depth_anchoring_tests {
             }],
         )
         .unwrap()
+    }
+
+    /// The one-item, one-bucket schedule `train_impl` builds for a single cached entry.
+    fn one_item() -> BucketSchedule {
+        BucketSchedule::new(1, &TrainingConfig::default().training_buckets(), 7)
     }
 
     struct Fixture {
@@ -2050,8 +2070,8 @@ mod depth_anchoring_tests {
     #[test]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
-        let mut p = path();
-        prepare_perceptual_references(&mut p, &cache_of(&f.x0, &f.context, 1)).unwrap();
+        let d = aux_driver(path(), &cache_of(&f.x0, &f.context, 1), &one_item(), 1, 0).unwrap();
+        let p = d.into_path();
         for ckpt in [false, true] {
             let plan = p.plan(1, 0, 0.5).unwrap();
             let (diff, _) = step(
@@ -2125,8 +2145,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_legacy {
             assert_eq!(bits(v), bits(&g_off[k]), "{k}");
         }
-        let mut p = path();
-        prepare_perceptual_references(&mut p, &cache_of(&f.x0, &f.context, 1)).unwrap();
+        let d = aux_driver(path(), &cache_of(&f.x0, &f.context, 1), &one_item(), 1, 0).unwrap();
+        let p = d.into_path();
         let plan = p.plan(1, 0, 0.5).unwrap();
         let (on, g_on) = step(
             &mut f,
@@ -2164,14 +2184,12 @@ mod depth_anchoring_tests {
             },
         ];
         let cache = cache_of(&f.x0, &f.context, items * buckets.len());
-        let mut p = path();
-        prepare_perceptual_references(&mut p, &cache).unwrap();
         let schedule = BucketSchedule::new(items, &buckets, 7);
-        let mut alt = AuxAlternation::new(items, 1);
+        let mut d = aux_driver(path(), &cache, &schedule, 1, 0).unwrap();
         let steps = 2 * schedule.epoch_len() as u32;
         let mut kinds = Vec::new();
         for s in 1..=steps {
-            let plan = plan_aux_step(&p, &mut alt, &schedule, s, 0.5).unwrap();
+            let plan = d.sample(s, &schedule).plan(0.5).unwrap().unwrap().plan;
             kinds.push((schedule.sample((s - 1) as usize).0, !plan.diffusion));
         }
         assert!((0..steps as usize).any(|k| schedule.cache_index(k) != schedule.sample(k).0));
@@ -2184,7 +2202,7 @@ mod depth_anchoring_tests {
             let alternating: Vec<bool> = (0..mine.len()).map(|v| v % 2 == 1).collect();
             assert_eq!(mine, alternating, "image {image} ({kinds:?})");
         }
-        assert_eq!(p.reference_computations(), cache.len());
+        assert_eq!(d.path().reference_computations(), cache.len());
     }
 
     /// AC (d), E7: depth grows the estimate by TAEW2.1 + DA2 (more for Large) and the guard counts
@@ -2204,14 +2222,14 @@ mod depth_anchoring_tests {
         let dense_tokens = (512.0f64 / 16.0).ceil().powi(2) + PREFLIGHT_TXT_TOKENS;
         let dense = projected_dense_peak_gb(dense_tokens, true);
         let between = |base: f64| (base + large / 2.0) / 0.85;
-        assert!(check_preflight_budget_with(512, true, between(dense), 0.0, false).is_ok());
-        assert!(check_preflight_budget_with(512, true, between(dense), large, false).is_err());
+        assert!(check_preflight_budget_with(&on, 512, true, between(dense), 0.0, false).is_ok());
+        assert!(check_preflight_budget_with(&on, 512, true, between(dense), large, false).is_err());
         let ck = checkpointed_baseline_gb(true);
-        assert!(check_preflight_budget_with(512, true, between(ck), 0.0, true).is_ok());
-        let err = check_preflight_budget_with(512, true, between(ck), large, true)
+        assert!(check_preflight_budget_with(&on, 512, true, between(ck), 0.0, true).is_ok());
+        let err = check_preflight_budget_with(&on, 512, true, between(ck), large, true)
             .expect_err("checkpointed depth job over budget")
             .to_string();
-        assert!(err.contains("depth-anchoring"), "{err}");
+        assert!(err.contains("[depth]"), "{err}");
     }
 
     /// AC (e): the descriptor declares depth anchoring; a missing TAEW2.1 checkpoint is an error

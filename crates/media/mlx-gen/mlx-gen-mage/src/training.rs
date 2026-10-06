@@ -64,7 +64,7 @@ use mlx_gen::train::lora::{
 };
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, AuxAlternation, AuxModelFootprint, Parameterization, PerceptualPath,
+    combine_step_loss, step_sample, AuxDriver, AuxModelFootprint, Parameterization, PerceptualPath,
     StepPlan, X0Decoder,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
@@ -252,6 +252,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
             body_shape_loss: true,
             normal_loss: true,
             vae_anchor_loss: true,
+            // The x0 decoder is the trainer's own Mage-VAE decoder (`MageDecoderSpec`), not a
+            // separately cataloged one, so `perceptual_decoder_dir` is not required.
+            builtin_x0_decoder: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -299,8 +302,8 @@ impl X0Decoder for MageX0Decoder {
 
 /// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from the trainer's own resolved
 /// VAE directory only when an enabled loss decodes pixels. Mage has no separately cataloged x0
-/// decoder: `TrainingConfig::perceptual_decoder_dir` (which the shared floor requires) names the
-/// base snapshot and is not read here — the split-tier mirror can stage the VAE elsewhere, and the
+/// decoder, so the descriptor declares `builtin_x0_decoder` and the shared floor does not require
+/// `TrainingConfig::perceptual_decoder_dir` (never read here) — the split-tier mirror can stage the VAE elsewhere, and the
 /// trainer already resolved where.
 struct MageDecoderSpec {
     vae_dir: PathBuf,
@@ -380,26 +383,50 @@ fn projected_training_step_gb(edge: u32) -> f64 {
 /// Refuse a run whose auxiliary training models do not fit (epic 2123 E7): the projected training
 /// step at `edge` ([`projected_training_step_gb`]) plus `extra_gb` (the aux models) against
 /// `safe_gb` (the live safe budget in production — injected for tests). Consulted only when an aux
-/// loss is enabled, so a plain run's admission is unchanged.
-fn preflight_aux_memory(edge: u32, extra_gb: f64, safe_gb: f64) -> Result<()> {
+/// loss is enabled, so a plain run's admission is unchanged. The refusal goes through the shared
+/// [`mlx_gen_perceptual::check_aux_memory`], naming `cfg`'s enabled aux losses.
+fn preflight_aux_memory(
+    cfg: &TrainingConfig,
+    edge: u32,
+    extra_gb: f64,
+    safe_gb: f64,
+) -> Result<()> {
     let base = projected_training_step_gb(edge);
     let projected = base + extra_gb;
-    if !safe_gb.is_finite() || safe_gb <= 0.0 || projected > safe_gb {
-        return Err(format!(
-            "mage_flow_base trainer: the perceptual-loss models (~{extra_gb:.1} GB for the \
-             Mage-VAE decoder and Depth-Anything-V2) on top of the ~{base:.1} GB estimated training \
-             step at resolution {edge} need ~{projected:.1} GB, exceeding this machine's \
-             ~{safe_gb:.1} GB safe budget. Use a smaller depth model or a lower training resolution."
-        )
-        .into());
-    }
-    Ok(())
+    mlx_gen_perceptual::check_aux_memory(
+        "mage_flow_base trainer",
+        cfg,
+        &format!("the ~{base:.1} GB estimated training step at resolution {edge}"),
+        extra_gb,
+        projected,
+        safe_gb,
+        "",
+    )
 }
 
 /// Construct the trainer from a diffusers snapshot directory (`text_encoder/ transformer/ vae/`). No
 /// quantization — training needs the dense base. The VAE is loaded with its **encoder** (latent prep)
 /// and decoder (preview samples). Registered via [`mlx_gen::register_trainer`].
+///
+/// The weights load lazily (sc-2124): construction resolves and checks the component dirs (config
+/// files only), so `validate` and `train`'s refusal floors never read weights; see
+/// [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    component_dirs(spec)?;
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor(), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        })
+        .validating_on_base_when(|r| {
+            !r.config.full_finetune && mlx_gen::train::lazy::custom_targets(r)
+        }),
+    ))
+}
+
+/// The dense component dirs a trainer spec resolves to — a single file, an unknown component and a
+/// pre-quantized tier are refused (`config.json` reads only, no weights).
+fn component_dirs(spec: &LoadSpec) -> Result<crate::MageComponentDirs> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
@@ -434,7 +461,13 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             )));
         }
     }
-    Ok(Box::new(MageFlowTrainer {
+    Ok(dirs)
+}
+
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
+fn load_weights(spec: &LoadSpec) -> Result<MageFlowTrainer> {
+    let dirs = component_dirs(spec)?;
+    Ok(MageFlowTrainer {
         descriptor: trainer_descriptor(),
         text_encoder: Some(crate::text_encoder::load_dir(&dirs.text_encoder)?),
         vae: crate::vae::load(&dirs.vae, VaePart::Both, Dtype::Bfloat16)?,
@@ -446,7 +479,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         // encoder and VAE are shared co-requisites staged from elsewhere, so `root` alone no longer
         // determines where the checkpoint lives.
         transformer_dir: dirs.transformer,
-    }))
+    })
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -548,16 +581,21 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
-/// The perceptual aux losses train through the LoRA/LoKr step only; the full base fine-tune path has
-/// no aux seam, so the combination is a typed refusal (never silently ignored).
-fn refuse_aux_losses_on_full_finetune(req: &TrainingRequest) -> gen_core::Result<()> {
-    if req.config.full_finetune && mlx_gen_perceptual::any_aux_loss(&req.config) {
-        return Err(gen_core::Error::Unsupported(
-            "mage_flow_base trainer: depth anchoring / perceptual aux losses train a LoRA/LoKr \
-             adapter only; they cannot be combined with a full base fine-tune"
-                .into(),
-        ));
-    }
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor: a LoRA-only trainer must reject a control-branch request
+    // (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056). This trainer advertises
+    // `supports_full_finetune`, so the floor is a pass-through here — it is routed through
+    // anyway so the capability claim and the acceptance stay one fact (and the conformance
+    // suite's validate-honesty check exercises the same seam for every family).
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
     Ok(())
 }
 
@@ -567,20 +605,7 @@ impl Trainer for MageFlowTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor: a LoRA-only trainer must reject a control-branch request
-        // (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056). This trainer advertises
-        // `supports_full_finetune`, so the floor is a pass-through here — it is routed through
-        // anyway so the capability claim and the acceptance stay one fact (and the conformance
-        // suite's validate-honesty check exercises the same seam for every family).
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
-        refuse_aux_losses_on_full_finetune(req)?;
+        validate_floors(self.descriptor(), req)?;
         // `lora_target_modules` only scopes the LoRA/LoKr adapter; a full base fine-tune trains every
         // DiT weight, so the target-resolution guard below does not apply to it.
         if !req.config.full_finetune {
@@ -606,7 +631,6 @@ impl Trainer for MageFlowTrainer {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        refuse_aux_losses_on_full_finetune(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -665,6 +689,7 @@ impl MageFlowTrainer {
         let aux_gb = perceptual_footprint_gb(cfg, preview_edge, req.items.len() * edges.len());
         if aux_gb > 0.0 {
             preflight_aux_memory(
+                cfg,
                 preview_edge,
                 aux_gb,
                 crate::memory::production_safe_budget_gb()?,
@@ -689,7 +714,6 @@ impl MageFlowTrainer {
                 edges.len(),
                 CropBox::center_square,
             )?);
-            prepare_perceptual_references(path, &cache)?;
         }
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
@@ -757,16 +781,13 @@ impl MageFlowTrainer {
         // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: per-image, per-update alternation keyed on the real dataset item; a resumed
-        // run replays the skipped prefix so the phase matches.
-        let mut alternation = perceptual
-            .as_ref()
-            .map(|_| AuxAlternation::new(cache.len() / edges.len(), accum));
-        if let Some(alt) = alternation.as_mut() {
-            for step in 1..=start_step {
-                alt.key(step, schedule.sample((step - 1) as usize).0);
-            }
-        }
+        // Epic 2123 E8: every entry's perceptual reference built once, per-image, per-update
+        // alternation keyed on the real dataset item; a resumed run replays the skipped prefix so
+        // the phase matches.
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, start_step)?),
+            None => None,
+        };
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -783,7 +804,7 @@ impl MageFlowTrainer {
                 cfg,
                 &cache,
                 &schedule,
-                perceptual.as_mut().zip(alternation.as_mut()),
+                aux_driver.as_mut(),
                 step,
                 mae,
                 compute_dtype,
@@ -1503,15 +1524,24 @@ fn tokens_to_latent_grid(tokens: &Array, grid: i32) -> Result<Array> {
         .transpose_axes(&[0, 3, 1, 2])?)
 }
 
-/// Every cache entry's perceptual reference, once per job (keyed per (item, bucket) entry).
-fn prepare_perceptual_references(path: &mut PerceptualPath, cache: &[CachedSample]) -> Result<()> {
-    for (i, sample) in cache.iter().enumerate() {
-        path.ensure_reference(
-            i,
-            &tokens_to_latent_grid(&sample.latent_tokens, sample.grid)?,
-        )?;
-    }
-    Ok(())
+/// The loop's [`AuxDriver`] (epic 2123 E8): every cache entry's perceptual reference, once per job
+/// (keyed per (item, bucket) entry); the alternation keyed on the schedule's items with `accum`
+/// micro-steps per update, and a resumed prefix `1..=start_step` replayed.
+fn aux_driver(
+    path: PerceptualPath,
+    cache: &[CachedSample],
+    schedule: &BucketSchedule,
+    accum: u32,
+    start_step: u32,
+) -> Result<AuxDriver> {
+    AuxDriver::prepare(
+        path,
+        cache.len(),
+        |i| tokens_to_latent_grid(&cache[i].latent_tokens, cache[i].grid),
+        schedule,
+        accum,
+        start_step,
+    )
 }
 
 /// One LoRA/LoKr micro-step on the 1-based `step`: the step's (item, bucket) entry from the bucket
@@ -1526,15 +1556,13 @@ fn run_train_step(
     cfg: &TrainingConfig,
     cache: &[CachedSample],
     schedule: &BucketSchedule,
-    perceptual: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+    perceptual: Option<&mut AuxDriver>,
     step: u32,
     mae: bool,
     dtype: Dtype,
 ) -> Result<(StepLosses, LoraParams)> {
-    let k = (step - 1) as usize;
-    let (item, _bucket) = schedule.sample(k);
-    let entry = step_cache_index(schedule, step);
-    let sample = &cache[entry];
+    let picked = step_sample(perceptual, step, schedule);
+    let sample = &cache[picked.entry];
     let mut sigma = sample_sigma(
         &cfg.timestep_type,
         &cfg.timestep_bias,
@@ -1548,24 +1576,15 @@ fn run_train_step(
             cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
         )?),
     )?;
-    let plan;
-    let aux = match perceptual {
-        Some((path, alternation)) => {
-            path.ensure_reference(
-                entry,
-                &tokens_to_latent_grid(&sample.latent_tokens, sample.grid)?,
-            )?;
-            plan = path.plan(alternation.key(step, item), entry, sigma)?;
-            sigma = plan.noise_level;
-            let path: &PerceptualPath = path;
-            Some(AuxStep {
-                path,
-                plan: &plan,
-                entry,
-            })
-        }
-        None => None,
-    };
+    let planned = picked.plan(sigma)?;
+    if let Some(p) = &planned {
+        sigma = p.plan.noise_level;
+    }
+    let aux = planned.as_ref().map(|p| AuxStep {
+        path: p.path,
+        plan: &p.plan,
+        entry: p.entry,
+    });
     compute_loss_grads(
         transformer,
         params,
@@ -2813,10 +2832,9 @@ mod depth_anchoring_tests {
         (TrainAdapter::Lora { targets }, params)
     }
 
-    fn prepared(cache: &[CachedSample], channels: i32) -> (PerceptualPath, AuxAlternation) {
-        let mut p = mlx_gen_perceptual::testing::tiny_depth_path(channels, schedule()).unwrap();
-        prepare_perceptual_references(&mut p, cache).unwrap();
-        (p, AuxAlternation::new(cache.len(), 1))
+    fn prepared(cache: &[CachedSample], channels: i32) -> AuxDriver {
+        let p = mlx_gen_perceptual::testing::tiny_depth_path(channels, schedule()).unwrap();
+        aux_driver(p, cache, &single_bucket(cache.len()), 1, 0).unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2826,7 +2844,7 @@ mod depth_anchoring_tests {
         adapter: &TrainAdapter,
         cfg: &TrainingConfig,
         cache: &[CachedSample],
-        path: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+        path: Option<&mut AuxDriver>,
         n: u32,
     ) -> (StepLosses, LoraParams) {
         let (l, g) = run_train_step(
@@ -2865,27 +2883,11 @@ mod depth_anchoring_tests {
         let cfg = cfg();
         let (adapter, params) = adapter(&mut dit, &cfg);
         let cache = cache_n(&dcfg, 1);
-        let (mut p, mut alt) = prepared(&cache, dcfg.in_channels);
-        let (diff, _) = step(
-            &mut dit,
-            &params,
-            &adapter,
-            &cfg,
-            &cache,
-            Some((&mut p, &mut alt)),
-            1,
-        );
+        let mut d = prepared(&cache, dcfg.in_channels);
+        let (diff, _) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), 1);
         assert_eq!(diff.aux, None);
         assert_eq!(Some(diff.total), diff.diffusion);
-        let (depth, g) = step(
-            &mut dit,
-            &params,
-            &adapter,
-            &cfg,
-            &cache,
-            Some((&mut p, &mut alt)),
-            2,
-        );
+        let (depth, g) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), 2);
         assert_eq!(
             depth.diffusion, None,
             "depth step computes no diffusion loss"
@@ -2899,31 +2901,23 @@ mod depth_anchoring_tests {
 
     /// Alternation keys on the real item and references are built once per entry. Mutations: key
     /// the plan on the global step ⇒ with 2 round-robin items each item is locked to one kind ⇒
-    /// red; drop the `contains_key` early return in `ensure_reference` ⇒ counter grows ⇒ red.
+    /// red; build the references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
     #[test]
     fn every_item_alternates_and_references_are_built_once() {
         let (mut dit, dcfg) = fixture_model();
         let cfg = cfg();
         let (adapter, params) = adapter(&mut dit, &cfg);
         let cache = cache_n(&dcfg, 2);
-        let (mut p, mut alt) = prepared(&cache, dcfg.in_channels);
+        let mut d = prepared(&cache, dcfg.in_channels);
         let mut kinds = vec![Vec::new(), Vec::new()];
         for n in 1..=8u32 {
-            let (l, _) = step(
-                &mut dit,
-                &params,
-                &adapter,
-                &cfg,
-                &cache,
-                Some((&mut p, &mut alt)),
-                n,
-            );
+            let (l, _) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), n);
             kinds[((n - 1) % 2) as usize].push(l.aux.is_some());
         }
         for k in &kinds {
             assert_eq!(k, &vec![false, true, false, true], "{kinds:?}");
         }
-        assert_eq!(p.reference_computations(), cache.len());
+        assert_eq!(d.path().reference_computations(), cache.len());
     }
 
     /// E1: with no aux loss nothing is built and the step is bit-identical to the pre-epic-2123
@@ -3011,12 +3005,17 @@ mod depth_anchoring_tests {
         let base = projected_training_step_gb(1024);
         assert!(base > resident && projected_training_step_gb(512) < base);
         let between = base + large / 2.0;
-        assert!(preflight_aux_memory(1024, 0.0, between).is_ok());
-        assert!(preflight_aux_memory(1024, large, between).is_err());
-        assert!(preflight_aux_memory(1024, large, (base + large) * 2.0).is_ok());
+        assert!(preflight_aux_memory(&on, 1024, 0.0, between).is_ok());
+        let err = preflight_aux_memory(&on, 1024, large, between)
+            .unwrap_err()
+            .to_string();
+        // The refusal names the enabled aux losses (the shared E7 guard).
+        assert!(err.contains("[depth]"), "{err}");
+        assert!(preflight_aux_memory(&on, 1024, large, (base + large) * 2.0).is_ok());
         // A budget the resident peak + aux would fit but the training step + aux does not.
         assert!(
-            preflight_aux_memory(1024, large, resident + large + (base - resident) / 2.0).is_err()
+            preflight_aux_memory(&on, 1024, large, resident + large + (base - resident) / 2.0)
+                .is_err()
         );
     }
 
@@ -3036,12 +3035,16 @@ mod depth_anchoring_tests {
             trigger_words: vec![],
             cancel: mlx_gen::CancelFlag::new(),
         };
-        assert!(refuse_aux_losses_on_full_finetune(&req).is_ok());
+        // The shared floor (gen-core) owns the full-fine-tune + aux refusal; the builtin decoder
+        // means no `perceptual_decoder_dir` is needed for the aux request to pass on LoRA.
+        req.config.depth_anchoring.model_dir = Some(tmp.path().join("da2"));
+        req.config.perceptual_decoder_dir = None;
+        let floor = |r: &TrainingRequest| {
+            gen_core::train::validate_training_techniques(&trainer_descriptor(), r)
+        };
+        assert!(floor(&req).is_ok(), "{:?}", floor(&req));
         req.config.full_finetune = true;
-        assert!(matches!(
-            refuse_aux_losses_on_full_finetune(&req),
-            Err(gen_core::Error::Unsupported(_))
-        ));
+        assert!(matches!(floor(&req), Err(gen_core::Error::Unsupported(_))));
         let mut c = cfg();
         c.perceptual_decoder_dir = Some(tmp.path().join("no-vae"));
         c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));

@@ -427,9 +427,12 @@ fn timestep_at(level: f32) -> usize {
 /// Epic 2123 E8: plan the step on timestep `t`'s noise level; an aux-only step trains at the
 /// plan's remapped level (a diffusion step keeps `t` exactly). `(t, None)` without a perceptual path.
 fn plan_timestep<'a>(sample: &StepSample<'a>, t: usize) -> Result<(usize, Option<AuxStep<'a>>)> {
-    let aux = sample.plan(noise_level_of(t))?;
+    let level = noise_level_of(t);
+    let aux = sample.plan(level)?;
+    // Remapped iff the plan's level moved off the sampled one — an aux-only step, or one that
+    // `StepPlan::without_skipped` reverted to diffusion (which still trains at the remapped level).
     let t = match aux.as_ref() {
-        Some(a) if !a.diffusion() => timestep_at(a.noise_level()),
+        Some(a) if a.noise_level() != level => timestep_at(a.noise_level()),
         _ => t,
     };
     Ok((t, aux))
@@ -809,6 +812,9 @@ impl Trainer for SdxlTrainer {
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        // Shared control-training floor (F-006/F-055): no control branch, so a `control_type`
+        // request is a typed reject, never silently trained as a plain adapter.
+        gen_core::train::validate_control_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
@@ -824,6 +830,9 @@ impl Trainer for SdxlTrainer {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        // Every other `validate` floor too (control / full fine-tune / edit), so a caller that
+        // skips `validate` cannot train a request it would refuse.
+        self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -1906,6 +1915,33 @@ mod tests {
             assert!(!a2.unwrap().diffusion());
             assert!((599..=900).contains(&t2), "aux-only step at {t2}");
             assert_eq!(plan_timestep(&StepSample::plain(0, 0), 100).unwrap().0, 100);
+        }
+
+        /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
+        /// reference) is reverted to diffusion by `StepPlan::without_skipped` — and still trains at the
+        /// plan's remapped level, never the raw sampled one. Mutation: guard the remap on
+        /// `!a.diffusion()` (the pre-fix code) ⇒ the reverted step trains at the raw level ⇒ red.
+        #[test]
+        fn a_reverted_aux_step_trains_at_the_remapped_level() {
+            let path = candle_gen_perceptual::testing::skipping_path(AuxLossSchedule {
+                weight: 0.5,
+                t_min: 0.6,
+                t_max: 0.9,
+                every_n: 2,
+            })
+            .unwrap();
+            let sched = BucketSchedule::new(1, &[], 3);
+            let clean = Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu).unwrap();
+            let mut d = AuxDriver::prepare(path, 1, |_| Ok(clean.clone()), &sched, 1, 0).unwrap();
+            let _ = d.sample(1, &sched);
+            let (got, aux) = plan_timestep(&d.sample(2, &sched), 100).unwrap();
+            let aux = aux.expect("a perceptual path plans the step");
+            assert!(
+                aux.diffusion() && !aux.has_aux(),
+                "reverted to a diffusion step"
+            );
+            assert_eq!(got, timestep_at(aux.noise_level()));
+            assert_ne!(got, 100, "the remapped level, not the sampled one");
         }
 
         /// The aux term is the depth loss of THE trainer's x0 estimate: recomputed independently from

@@ -26,16 +26,17 @@
 //!
 //! ## How a trainer uses it
 //! ```text
-//! let mut path = PerceptualPath::new(Some(Box::new(taef1)), vec![AuxLoss { schedule, loss }])?;
-//! for (i, latent) in cached_latents { path.ensure_reference(i, &latent)?; }  // once per image
-//! let mut alternation = AuxAlternation::new(images, gradient_accumulation);
-//! // per micro-step (image chosen by the trainer's own schedule):
-//! let plan = path.plan(alternation.key(step, image), image, sampled_sigma)?;
-//! let sigma = plan.noise_level;
+//! let path = PerceptualPath::new(Some(Box::new(taef1)), vec![AuxLoss { schedule, loss }])?;
+//! // every entry's reference once, alternation over the schedule's items, resume replayed:
+//! let mut driver = AuxDriver::prepare(path, cache.len(), |e| clean_nchw(e), &schedule, accum, start)?;
+//! // per micro-step (the bucket schedule picks the item and its cache entry):
+//! let sample = driver.sample(step, &schedule);
+//! let step = sample.plan(sampled_sigma)?.expect("a driver plans every step");
+//! let sigma = step.plan.noise_level;
 //! // inside the traced loss closure:
 //! let x0 = Parameterization::FlowNoiseMinusX0 { sigma }.recover_x0(&x_t, &pred)?;
-//! let aux = path.aux_loss(&plan, image, &x0_nchw)?;                          // weighted sum
-//! let total = combine_step_loss(plan.diffusion.then_some(diffusion), aux.map(|a| a.weighted))?;
+//! let aux = step.path.aux_loss(&step.plan, step.entry, &x0_nchw)?;          // weighted sum
+//! let total = combine_step_loss(step.plan.diffusion.then_some(diffusion), aux.map(|a| a.weighted))?;
 //! ```
 //! Memory (E7): [`perceptual_footprint_bytes`] sums the decoder's and every enabled loss's
 //! [`AuxModelFootprint`] (computed from configs, before anything loads).
@@ -404,6 +405,160 @@ impl PerceptualPath {
 }
 
 // ----------------------------------------------------------------------------------------------
+// Epic 2123 E8 — the step-level glue between a trainer loop and its `PerceptualPath` (the MLX twin
+// of `candle_gen::train::flow_match::AuxDriver`), so every MLX trainer prepares references, keys
+// the alternation and replays a resumed prefix the same way.
+// ----------------------------------------------------------------------------------------------
+
+/// A trainer's perceptual path plus its per-item alternation, ready for the loop: every cache
+/// entry's reference is built, and on resume the skipped prefix's alternation keys are replayed.
+pub struct AuxDriver {
+    path: PerceptualPath,
+    alternation: AuxAlternation,
+}
+
+impl AuxDriver {
+    /// Build each of the `n_entries` item-major cache entries' references from `clean(entry)` (the
+    /// entry's clean latent in the path's NCHW model-space layout, once per entry, before the loop),
+    /// key the alternation on the `schedule`'s items with `accum` micro-steps per update, and replay
+    /// micro-steps `1..=start_step` so a resumed run continues the same phase.
+    pub fn prepare(
+        path: PerceptualPath,
+        n_entries: usize,
+        clean: impl FnMut(usize) -> Result<Array>,
+        schedule: &gen_core::BucketSchedule,
+        accum: u32,
+        start_step: u32,
+    ) -> Result<Self> {
+        Self::prepare_keyed(
+            path,
+            n_entries,
+            clean,
+            n_entries / schedule.n_buckets().max(1),
+            accum,
+            start_step,
+            |step| schedule.sample((step - 1) as usize).0,
+        )
+    }
+
+    /// [`prepare`](Self::prepare) for a loop whose step → item mapping is not the plain bucket
+    /// schedule walk (Wan's interleaved experts, LTX-2.5's round-robin): `items` dataset items,
+    /// `window` micro-steps per alternation window, and `item_of(step)` the real dataset item of
+    /// 1-based micro-step `step` (replayed for `1..=start_step`).
+    pub fn prepare_keyed(
+        mut path: PerceptualPath,
+        n_entries: usize,
+        mut clean: impl FnMut(usize) -> Result<Array>,
+        items: usize,
+        window: u32,
+        start_step: u32,
+        item_of: impl Fn(u32) -> usize,
+    ) -> Result<Self> {
+        for entry in 0..n_entries {
+            path.ensure_reference(entry, &clean(entry)?)?;
+        }
+        let mut alternation = AuxAlternation::new(items, window);
+        for step in 1..=start_step {
+            alternation.key(step, item_of(step));
+        }
+        Ok(Self { path, alternation })
+    }
+
+    /// The shared path.
+    pub fn path(&self) -> &PerceptualPath {
+        &self.path
+    }
+
+    /// The prepared path, consuming the driver (for a caller that plans by explicit keys).
+    pub fn into_path(self) -> PerceptualPath {
+        self.path
+    }
+
+    /// Feed micro-step `step` (1-based) on dataset item `item` to the alternation and return its
+    /// key — for the [`prepare_keyed`](Self::prepare_keyed) loops; call for every micro-step, in
+    /// order.
+    pub fn key(&mut self, step: u32, item: usize) -> u32 {
+        self.alternation.key(step, item)
+    }
+
+    /// Feed micro-step `step` (1-based) to the alternation and return its [`StepSample`] — call for
+    /// every micro-step, in order.
+    pub fn sample(&mut self, step: u32, schedule: &gen_core::BucketSchedule) -> StepSample<'_> {
+        let k = (step - 1) as usize;
+        let (item, _) = schedule.sample(k);
+        let key = self.alternation.key(step, item);
+        StepSample {
+            item,
+            entry: schedule.cache_index(k),
+            perceptual: Some((&self.path, key)),
+        }
+    }
+}
+
+/// Micro-step `step`'s sample: its [`AuxDriver::sample`] when the trainer has a perceptual path,
+/// else the plain (item, entry) of the bucket schedule.
+pub fn step_sample<'a>(
+    aux: Option<&'a mut AuxDriver>,
+    step: u32,
+    schedule: &gen_core::BucketSchedule,
+) -> StepSample<'a> {
+    match aux {
+        Some(a) => a.sample(step, schedule),
+        None => {
+            let k = (step - 1) as usize;
+            StepSample::plain(schedule.sample(k).0, schedule.cache_index(k))
+        }
+    }
+}
+
+/// What one micro-step trains on: the real dataset item (alternation key), the item-major cache
+/// entry (reference key), and — perceptual losses on — the shared path with the step's
+/// alternation key.
+#[derive(Clone, Copy)]
+pub struct StepSample<'a> {
+    /// The real dataset item index (`schedule.sample(k).0`).
+    pub item: usize,
+    /// The cache entry (`schedule.cache_index(k)`).
+    pub entry: usize,
+    perceptual: Option<(&'a PerceptualPath, u32)>,
+}
+
+impl<'a> StepSample<'a> {
+    /// A sample with no perceptual path: every step is the plain diffusion step.
+    pub fn plain(item: usize, entry: usize) -> Self {
+        Self {
+            item,
+            entry,
+            perceptual: None,
+        }
+    }
+
+    /// Plan the step at the sampled noise level `raw_t` (the trainer's `σ`/`t ∈ [0, 1]`, `1` =
+    /// pure noise). `None` without a perceptual path — the trainer then runs its legacy step.
+    pub fn plan(&self, raw_t: f32) -> Result<Option<AuxStep<'a>>> {
+        let Some((path, key)) = self.perceptual else {
+            return Ok(None);
+        };
+        Ok(Some(AuxStep {
+            path,
+            plan: path.plan(key, self.entry, raw_t)?,
+            entry: self.entry,
+        }))
+    }
+}
+
+/// One planned perceptual step: the [`StepPlan`] and the path (and cache entry) to evaluate its
+/// aux term on.
+pub struct AuxStep<'a> {
+    /// The shared path.
+    pub path: &'a PerceptualPath,
+    /// The step's plan (aux-only steps carry the remapped noise level).
+    pub plan: StepPlan,
+    /// The cache entry whose reference the aux term compares against.
+    pub entry: usize,
+}
+
+// ----------------------------------------------------------------------------------------------
 // Depth-consistency losses (MiDaS SSI-L1 + multi-scale gradient matching), the comparison half of
 // depth anchoring — a port of ai-toolkit-perceptual `toolkit/depth_consistency.py`
 // (`ssi_l1`, `multiscale_grad_loss`, `compute_depth_consistency_loss`, fork commit 6e01a6e).
@@ -711,6 +866,162 @@ mod tests {
         let t = plan.noise_level;
         assert!(raw > 1e-4);
         assert!((scalar(&terms.weighted) - 0.5 * t * t * raw).abs() < 1e-7);
+    }
+
+    /// A latent-input toy loss for the [`AuxDriver`] tests: its reference is the clean latent's
+    /// value (so each entry's reference is identifiable), its loss `|live − reference|`.
+    struct EntryValue;
+    impl PerceptualLoss for EntryValue {
+        fn name(&self) -> &'static str {
+            "entry-value"
+        }
+        fn input(&self) -> PerceptualInput {
+            PerceptualInput::Latents
+        }
+        fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
+            Ok(Some(Box::new(scalar(&clean.sum(None)?))))
+        }
+        fn loss(&self, live: &Array, reference: &dyn Any) -> Result<Array> {
+            let r = *reference_as::<f32>(self.name(), reference)?;
+            Ok(abs(subtract(&live.sum(None)?, Array::from_f32(r))?)?)
+        }
+    }
+
+    fn entry_path() -> PerceptualPath {
+        PerceptualPath::new(
+            None,
+            vec![AuxLoss {
+                schedule: sched(1.0, 0.0, 1.0, 2),
+                loss: Box::new(EntryValue),
+            }],
+        )
+        .unwrap()
+    }
+
+    /// Entry `e`'s clean latent: a `[1, 1, 1, 1]` holding `e`.
+    fn entry_latent(e: usize) -> Result<Array> {
+        Ok(Array::from_slice(&[e as f32], &[1, 1, 1, 1]))
+    }
+
+    /// 3 items × 2 buckets (repeats 1 and 2): an item-major cache of 6 entries.
+    fn two_bucket_schedule() -> gen_core::BucketSchedule {
+        let buckets = [
+            gen_core::train::ResolutionBucket {
+                resolution: 512,
+                repeats: 1,
+            },
+            gen_core::train::ResolutionBucket {
+                resolution: 768,
+                repeats: 2,
+            },
+        ];
+        gen_core::BucketSchedule::new(3, &buckets, 7)
+    }
+
+    /// [`AuxDriver::prepare`] builds every item-major entry's reference exactly once, each from its
+    /// OWN entry's clean latent (the aux term on entry `e`'s live latent `e` is zero). Mutations:
+    /// build only `0..n_entries - 1` ⇒ entry 5 has no reference ⇒ red; call `clean` twice per
+    /// entry ⇒ 12 calls ⇒ red; pass `clean(0)` for every entry ⇒ entry 3's term is non-zero ⇒ red.
+    #[test]
+    fn aux_driver_builds_each_entry_reference_once() {
+        let schedule = two_bucket_schedule();
+        let mut calls = 0;
+        let d = AuxDriver::prepare(
+            entry_path(),
+            6,
+            |e| {
+                calls += 1;
+                entry_latent(e)
+            },
+            &schedule,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(calls, 6);
+        assert_eq!(d.path().reference_computations(), 6);
+        let plan = plan_step(&[sched(1.0, 0.0, 1.0, 1)], 1, 0.5);
+        for e in 0..6 {
+            assert!(d.path().is_usable(e, 0).unwrap(), "entry {e}");
+            let live = entry_latent(e).unwrap();
+            let terms = d.path().aux_loss(&plan, e, &live).unwrap().unwrap();
+            assert_eq!(scalar(&terms.weighted), 0.0, "entry {e}");
+        }
+    }
+
+    /// The alternation is keyed on the REAL dataset item from the bucket schedule (each item
+    /// strictly alternates diffusion / aux across its own visits, over both buckets), and every
+    /// sample reports the schedule's item and item-major entry. Mutation: key the alternation on
+    /// the cache entry (`schedule.cache_index(k)`) instead of the item ⇒ red.
+    #[test]
+    fn aux_driver_keys_the_alternation_on_the_real_item() {
+        let schedule = two_bucket_schedule();
+        let mut d = AuxDriver::prepare(entry_path(), 6, entry_latent, &schedule, 1, 0).unwrap();
+        let mut visits = [0u32; 3];
+        let mut aux_on_bucket1 = false;
+        for step in 1..=36u32 {
+            let k = (step - 1) as usize;
+            let s = d.sample(step, &schedule);
+            assert_eq!(s.item, schedule.sample(k).0);
+            assert_eq!(s.entry, schedule.cache_index(k));
+            let p = s.plan(0.3).unwrap().expect("a driver plans every step");
+            assert_eq!(p.entry, s.entry);
+            visits[s.item] += 1;
+            assert_eq!(
+                !p.plan.diffusion,
+                visits[s.item] % 2 == 0,
+                "item {} visit {}",
+                s.item,
+                visits[s.item]
+            );
+            aux_on_bucket1 |= !p.plan.diffusion && s.entry % 2 == 1;
+        }
+        assert!(
+            aux_on_bucket1,
+            "the alternation must span an item's buckets"
+        );
+        // Without a driver the sample is the plain schedule pick and plans nothing.
+        let plain = step_sample(None, 4, &schedule);
+        assert_eq!(
+            (plain.item, plain.entry),
+            (schedule.sample(3).0, schedule.cache_index(3))
+        );
+        assert!(plain.plan(0.3).unwrap().is_none());
+    }
+
+    /// Resume replays the skipped prefix: a driver prepared at `start_step = 5` (accumulation 2)
+    /// plans steps 6.. exactly as one walked from step 1 — through [`AuxDriver::prepare`] and
+    /// through [`AuxDriver::prepare_keyed`] with the same step → item map. Mutation: drop the
+    /// replay loop in `prepare_keyed` ⇒ red.
+    #[test]
+    fn aux_driver_resume_replays_the_alternation_prefix() {
+        let schedule = two_bucket_schedule();
+        let plans = |start: u32| {
+            let mut d =
+                AuxDriver::prepare(entry_path(), 6, entry_latent, &schedule, 2, start).unwrap();
+            (start + 1..=24)
+                .map(|step| {
+                    let s = d.sample(step, &schedule);
+                    let p = s.plan(0.3).unwrap().unwrap();
+                    (s.item, s.entry, p.plan.diffusion, p.plan.aux.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let full = plans(0);
+        assert!(full.iter().any(|p| !p.2) && full.iter().any(|p| p.2));
+        assert_eq!(plans(5), full[5..].to_vec());
+
+        let item_of = |s: u32| (s as usize - 1) % 3;
+        let keys = |start: u32| {
+            let mut d =
+                AuxDriver::prepare_keyed(entry_path(), 3, entry_latent, 3, 2, start, item_of)
+                    .unwrap();
+            (start + 1..=12)
+                .map(|step| d.key(step, item_of(step)))
+                .collect::<Vec<_>>()
+        };
+        let full = keys(0);
+        assert_eq!(keys(5), full[5..].to_vec());
     }
 
     /// References are built once per image per job however often `ensure_reference` is called.

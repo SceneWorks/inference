@@ -9,9 +9,10 @@
 //! - [`build_perceptual_path`] before latent caching — `None` when no aux loss is enabled (nothing
 //!   loads; the step is the plain diffusion step), else a ready [`PerceptualPath`];
 //!
-//! then drives the path as the kit documents ([`mlx_gen::train::perceptual`]): references per
-//! (item, bucket) cache entry, `AuxAlternation` keyed on the real item index, `plan` / `aux_loss` /
-//! `combine_step_loss` in the step.
+//! then drives the path as the kit documents ([`mlx_gen::train::perceptual`]): an
+//! [`AuxDriver`](mlx_gen::train::perceptual::AuxDriver) builds references per (item, bucket) cache
+//! entry and keys the alternation on the real item index (replaying a resumed prefix), then
+//! `plan` / `aux_loss` / `combine_step_loss` in the step.
 //!
 //! ## Adding a loss (S10 identity/face, S11 body, S12 latent losses …)
 //! Append one [`AuxArm`] to [`ARMS`]: its name, whether `cfg` enables it, its [`PerceptualInput`]
@@ -274,8 +275,13 @@ fn body_shape_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootp
 }
 
 /// Normal-loss pre-load footprint.
-fn normal_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
-    mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Normal)
+/// Restricted to the subject, each cache entry also holds the job's subject mask on its decoded
+/// grid (E7).
+fn normal_footprint(cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
+    let mut f = mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Normal);
+    f.reference_bytes_per_image +=
+        gen_core::train::subject_mask::PerceptualSubjectMasks::bytes_per_entry(cfg, h, w);
+    f
 }
 
 /// The VAE perceptual anchor (sc-24833): a frozen FLUX.2 VAE encoder's multi-scale features on the
@@ -571,6 +577,55 @@ pub fn perceptual_footprint_gb(
     perceptual_footprint(cfg, decoder, geom) as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
+/// The names of every enabled auxiliary loss (pixel and latent arms), in arm order — what the
+/// aux-memory refusal ([`check_aux_memory`]) names. Empty when none is on.
+pub fn enabled_aux_losses(cfg: &TrainingConfig) -> Vec<&'static str> {
+    enabled_arms(ARMS, cfg)
+        .into_iter()
+        .map(|a| a.name)
+        .collect()
+}
+
+/// The shared MLX aux-memory guard (epic 2123 E7): refuse when the trainer's projected training
+/// step `projected_gb` — its own base projection plus `extra_gb`, the enabled aux models'
+/// footprint ([`perceptual_footprint_gb`]) — exceeds `safe_gb` (or the safe budget is not a
+/// positive finite number). The refusal names the enabled aux losses so the user knows which to
+/// turn off. `label` is the trainer's error label (e.g. `"krea trainer"`), `step` describes the
+/// admitted step (e.g. `"a checkpointed training step at resolution 1024"`), and `budget` how
+/// `safe_gb` was derived (e.g. `"128 GB MLX limit × 0.85"`; empty to omit). The arithmetic is the
+/// caller's: this compares and words the refusal only.
+pub fn check_aux_memory(
+    label: &str,
+    cfg: &TrainingConfig,
+    step: &str,
+    extra_gb: f64,
+    projected_gb: f64,
+    safe_gb: f64,
+    budget: &str,
+) -> Result<()> {
+    if safe_gb.is_finite() && safe_gb > 0.0 && projected_gb <= safe_gb {
+        return Ok(());
+    }
+    let arms = enabled_aux_losses(cfg);
+    let arms = if arms.is_empty() {
+        "none".to_string()
+    } else {
+        arms.join(", ")
+    };
+    let budget = if budget.is_empty() {
+        String::new()
+    } else {
+        format!(" ({budget})")
+    };
+    Err(Error::Msg(format!(
+        "{label}: {step} with the enabled auxiliary losses [{arms}] (~{extra_gb:.1} GB of \
+         training-time models) needs at least ~{projected_gb:.1} GB, exceeding this machine's \
+         ~{safe_gb:.1} GB safe budget{budget}. Disable one of these losses, choose a smaller \
+         auxiliary model (e.g. a smaller depth model), or reduce the training resolution (or a \
+         video trainer's selected frame count)."
+    )))
+}
+
 /// Test fixtures for trainers on this seam.
 pub mod testing {
     use std::path::Path;
@@ -658,6 +713,78 @@ mod tests {
             name: "TAEF1",
             config: TinyDecoderConfig::taef1().into(),
         }
+    }
+
+    /// E7 (epic 2123 feature-end review): the normal loss restricted to the subject budgets the
+    /// subject mask each cache entry holds on its decoded grid, on top of Sapiens' own reference
+    /// mask. Mutation: drop the `bytes_per_entry` term from `normal_footprint` ⇒ red.
+    #[test]
+    fn a_subject_restricted_normal_loss_budgets_its_masks() {
+        let mut open = TrainingConfig::default();
+        open.body_losses.normal.weight = 0.1;
+        let mut restricted = open.clone();
+        restricted.body_losses.normal_restrict_to_subject = true;
+        let (edge, entries) = (512u32, 3usize);
+        let g = AuxGeometry::image(edge, entries);
+        let sapiens = |c: &TrainingConfig| {
+            mlx_gen_body::arm_footprint(&c.body_losses, mlx_gen_body::BodyArm::Normal)
+                .reference_bytes_per_image
+        };
+        let extra = perceptual_footprint(&restricted, &taef1(), g)
+            - perceptual_footprint(&open, &taef1(), g);
+        let mask = u64::from(edge) * u64::from(edge) * 4;
+        assert_eq!(
+            extra,
+            entries as u64 * (sapiens(&restricted) - sapiens(&open) + mask)
+        );
+    }
+
+    /// E7 messaging: the shared aux-memory refusal names EVERY enabled aux loss (pixel and latent
+    /// arms) and no disabled one, and refuses exactly past the safe budget. Mutations: name only
+    /// the pixel arms (`enabled_pixel_aux_losses`) ⇒ `latent_lpips` missing ⇒ red; compare
+    /// `extra_gb` alone against the budget ⇒ the over-budget case passes ⇒ red.
+    #[test]
+    fn aux_memory_refusal_names_each_enabled_arm() {
+        let sched = AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        };
+        let mut all = TrainingConfig::default();
+        all.depth_anchoring.schedule = sched;
+        all.identity_loss.schedule = sched;
+        all.face_landmark_loss.schedule = sched;
+        all.body_losses.proportion.weight = 0.1;
+        all.body_losses.shape.weight = 0.1;
+        all.body_losses.normal.weight = 0.1;
+        all.vae_anchor.schedule = sched;
+        all.latent_lpips.schedule = sched;
+        assert_eq!(enabled_aux_losses(&all).len(), ARMS.len());
+        assert!(check_aux_memory("t trainer", &all, "a step", 2.0, 10.0, 10.0, "").is_ok());
+        let e = check_aux_memory("t trainer", &all, "a step", 2.0, 10.0, 9.0, "x")
+            .unwrap_err()
+            .to_string();
+        for arm in ARMS {
+            assert!(e.contains(arm.name), "{} missing: {e}", arm.name);
+        }
+        assert!(
+            e.starts_with("t trainer: a step") && e.contains("(x)"),
+            "{e}"
+        );
+
+        // Only the enabled arms are named.
+        let e = check_aux_memory("t trainer", &on(), "a step", 2.0, 10.0, 9.0, "")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[depth]"), "{e}");
+        assert!(
+            !e.contains("identity") && !e.contains("latent_lpips"),
+            "{e}"
+        );
+        // A non-positive or non-finite safe budget refuses.
+        assert!(check_aux_memory("t", &on(), "s", 1.0, 1.0, 0.0, "").is_err());
+        assert!(check_aux_memory("t", &on(), "s", 1.0, 1.0, f64::NAN, "").is_err());
     }
 
     /// sc-24832: the body arms are on the seam — ViTPose budgeted once across the three arms, the

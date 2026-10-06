@@ -343,6 +343,18 @@ impl PerceptualSubjectMasks {
         cfg.body_losses.normal.is_enabled() && cfg.body_losses.normal_restrict_to_subject
     }
 
+    /// E7 pre-load estimate of the subject-mask memory the perceptual path holds per cache entry
+    /// at an `h × w` decoded grid: one f32 coverage value per pixel when [`needed`](Self::needed),
+    /// else `0`. The trainer's footprint counts it per reference entry beside the loss's own
+    /// reference.
+    pub fn bytes_per_entry(cfg: &TrainingConfig, h: u32, w: u32) -> u64 {
+        if Self::needed(cfg) {
+            u64::from(h) * u64::from(w) * std::mem::size_of::<f32>() as u64
+        } else {
+            0
+        }
+    }
+
     /// `None` when no perceptual loss needs masks (no file is read); else every item's mask,
     /// decoded and checked once (a missing, mis-sized or empty mask is refused naming the image,
     /// as for subject-masked loss). The trainer's cache is item-major with `entries_per_item`

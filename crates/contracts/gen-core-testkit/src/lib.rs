@@ -82,8 +82,8 @@ pub use memory_strategy::{
 };
 pub use trainer::{
     check_trainer_bucketed_progress, check_trainer_cancellation, check_trainer_progress,
-    check_trainer_registry, check_trainer_technique_refusal, check_trainer_validate,
-    trainer_conformance, TrainerProfile,
+    check_trainer_registry, check_trainer_technique_refusal, check_trainer_train_floors,
+    check_trainer_validate, trainer_conformance, TrainerProfile,
 };
 pub use transcriber::{
     check_transcriber_cancellation, check_transcriber_output, check_transcriber_progress,

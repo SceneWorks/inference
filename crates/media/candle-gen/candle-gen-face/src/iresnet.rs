@@ -16,11 +16,10 @@ use candle_gen::Result;
 
 use crate::common::{Conv, Weights};
 
-/// iresnet100 block counts per layer (`layer1..layer4`) — antelopev2 `glintr100`.
-pub const IRESNET100_LAYERS: [usize; 4] = [3, 13, 30, 3];
-/// iresnet50 block counts per layer — buffalo_l `w600k_r50`, the upstream ai-toolkit-perceptual
-/// identity-loss checkpoint (sc-24831).
-pub const IRESNET50_LAYERS: [usize; 4] = [3, 4, 14, 3];
+/// The iresnet100 (antelopev2 `glintr100`) and iresnet50 (buffalo_l `w600k_r50`, the upstream
+/// ai-toolkit-perceptual identity-loss checkpoint, sc-24831) per-layer block counts — the one
+/// gen-core definition both backends re-export (mlx-gen-face's `iresnet.rs` does the same).
+pub use candle_gen::gen_core::train::face_loss::{IRESNET100_LAYERS, IRESNET50_LAYERS};
 
 /// The per-layer block counts a converted checkpoint carries, read from its keys
 /// (`layer{l}.{b}.conv1.weight`) — the twin of mlx-gen-face's `infer_layers` (sc-24831).

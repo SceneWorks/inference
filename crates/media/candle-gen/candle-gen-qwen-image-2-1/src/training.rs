@@ -1738,14 +1738,23 @@ fn load_perceptual_path(cfg: &TrainingConfig, device: &Device) -> Result<Option<
     candle_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context(device))
 }
 
-/// Extra training memory (bytes) of the enabled perceptual losses: TAEQI2.1 + each loss at the
-/// largest bucket `edge` (an edit target keeps `edge²` pixels at its own aspect), plus one
-/// reference per (item, bucket) cache entry (epic 2123 E7). `0` when no aux loss is on.
-fn perceptual_footprint_bytes(cfg: &TrainingConfig, edge: u32, entries: usize) -> u64 {
+/// Extra training memory (bytes) of the enabled perceptual losses for a run whose largest decoded
+/// target is the square `edge` or (edit) `target_tokens` latent cells: TAEQI2.1 + each loss sized
+/// at the square of equal area, plus one reference per (item, bucket) cache entry (epic 2123 E7) —
+/// the same sizing as the MLX trainer. `0` when no aux loss is on.
+fn perceptual_footprint_bytes(
+    cfg: &TrainingConfig,
+    edge: u32,
+    target_tokens: u64,
+    entries: usize,
+) -> u64 {
+    let token_pixels = (VAE_SCALE_FACTOR * VAE_SCALE_FACTOR) as u64;
+    let pixels = (edge as u64 * edge as u64).max(target_tokens * token_pixels);
+    let side = (pixels as f64).sqrt().ceil() as u32;
     candle_gen_perceptual::perceptual_footprint(
         cfg,
         &taeqi_decoder(),
-        AuxGeometry::image(edge, entries),
+        AuxGeometry::image(side, entries),
     )
 }
 
@@ -1768,10 +1777,9 @@ fn target_decoder_latent(x0: &Tensor, layout: &JointLayout) -> Result<Tensor> {
 /// aux-only step trains at the plan's remapped `t`. `(t, None)` without a perceptual path.
 fn plan_t<'a>(sample: &StepSample<'a>, t: f32) -> Result<(f32, Option<AuxStep<'a>>)> {
     let aux = sample.plan(t)?;
-    let t = match aux.as_ref() {
-        Some(a) if !a.diffusion() => a.noise_level(),
-        _ => t,
-    };
+    // Always the plan's level: an aux-only step's remapped `t`, and also a claimed step that
+    // `StepPlan::without_skipped` reverted to diffusion (it still trains at the remapped `t`).
+    let t = aux.as_ref().map_or(t, |a| a.noise_level());
     Ok((t, aux))
 }
 
@@ -2162,7 +2170,12 @@ impl QwenImage21Trainer {
             optimizer_state_per_param: optimizer_state_per_param(&cfg.optimizer),
             checkpointed,
             sampling: sampling_requested,
-            perceptual_bytes: perceptual_footprint_bytes(cfg, edge, req.items.len() * edges.len()),
+            perceptual_bytes: perceptual_footprint_bytes(
+                cfg,
+                edge,
+                largest_target_tokens,
+                req.items.len() * edges.len(),
+            ),
         };
         let budget = self
             .memory_budget_override
@@ -5853,6 +5866,33 @@ mod tests {
             assert_eq!(plan_t(&StepSample::plain(0, 0), 0.3).unwrap().0, 0.3);
         }
 
+        /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
+        /// reference) is reverted to diffusion by `StepPlan::without_skipped` — and still trains at the
+        /// plan's remapped level, never the raw sampled one. Mutation: guard the remap on
+        /// `!a.diffusion()` (the pre-fix code) ⇒ the reverted step trains at the raw level ⇒ red.
+        #[test]
+        fn a_reverted_aux_step_trains_at_the_remapped_level() {
+            let path = candle_gen_perceptual::testing::skipping_path(AuxLossSchedule {
+                weight: 0.5,
+                t_min: 0.6,
+                t_max: 0.9,
+                every_n: 2,
+            })
+            .unwrap();
+            let sched = BucketSchedule::new(1, &[], 3);
+            let clean = Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu).unwrap();
+            let mut d = AuxDriver::prepare(path, 1, |_| Ok(clean.clone()), &sched, 1, 0).unwrap();
+            let _ = d.sample(1, &sched);
+            let (got, aux) = plan_t(&d.sample(2, &sched), 0.1).unwrap();
+            let aux = aux.expect("a perceptual path plans the step");
+            assert!(
+                aux.diffusion() && !aux.has_aux(),
+                "reverted to a diffusion step"
+            );
+            assert_eq!(got, aux.noise_level());
+            assert_ne!(got, 0.1, "the remapped level, not the sampled one");
+        }
+
         /// The aux term is the depth loss of THE trainer's x0 estimate `x_t − t·v` on the target
         /// block, recomputed independently (edit step). Mutation: `FlowX0MinusNoise` in
         /// `target_step_loss` ⇒ red.
@@ -5925,12 +5965,16 @@ mod tests {
         /// phase ⇒ red.
         #[test]
         fn footprint_counts_the_perceptual_models() {
-            assert_eq!(perceptual_footprint_bytes(&base_config(), 1024, 20), 0);
+            assert_eq!(perceptual_footprint_bytes(&base_config(), 1024, 0, 20), 0);
             let mut cfg = depth_on();
-            let small = perceptual_footprint_bytes(&cfg, 1024, 20);
+            let small = perceptual_footprint_bytes(&cfg, 1024, 0, 20);
             assert!(small > 0);
             cfg.depth_anchoring.model_size = DepthModelSize::Large;
-            assert!(perceptual_footprint_bytes(&cfg, 1024, 20) > small);
+            let large = perceptual_footprint_bytes(&cfg, 1024, 0, 20);
+            assert!(large > small);
+            // An edit target with more latent cells than the square edge prices a larger decode
+            // (the MLX sizing). Mutation: price at `edge` only (ignore `target_tokens`) ⇒ red.
+            assert!(perceptual_footprint_bytes(&cfg, 1024, 4 * 64 * 64, 20) > large);
             let facts = production_facts();
             for checkpointed in [false, true] {
                 let base = shape(1024, checkpointed);

@@ -48,3 +48,6 @@ mod training;
 
 #[path = "velocity_convention.rs"]
 mod velocity_convention;
+
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;
