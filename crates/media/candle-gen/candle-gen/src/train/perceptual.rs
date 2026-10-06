@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use candle_core::{Tensor, D};
 
 pub use crate::gen_core::train::aux_schedule::{
-    combine_step_terms, perceptual_footprint_bytes, plan_step, AuxAlternation, AuxModelFootprint,
-    StepPlan,
+    combine_step_terms, perceptual_footprint_bytes, plan_step, AltKey, AuxAlternation,
+    AuxModelFootprint, StepPlan,
 };
 pub use crate::gen_core::train::AuxLossSchedule;
 
@@ -317,7 +317,7 @@ impl PerceptualPath {
 
     /// The plan for alternation `key` on `image` at sampled noise level `raw_t`: [`plan_step`],
     /// minus the losses this image is unusable for. Requires the image's reference.
-    pub fn plan(&self, key: u32, image: usize, raw_t: f32) -> Result<StepPlan> {
+    pub fn plan(&self, key: impl Into<AltKey>, image: usize, raw_t: f32) -> Result<StepPlan> {
         let refs = self.references_of(image)?;
         let schedules: Vec<AuxLossSchedule> = self.losses.iter().map(|l| l.schedule).collect();
         Ok(plan_step(&schedules, key, raw_t).without_skipped(|i| refs[i].is_none()))
@@ -737,24 +737,31 @@ mod tests {
         assert!(combine_step_loss(None, None).is_err());
     }
 
-    /// Alternation through the path: with `every_n = 2` an image alternates diffusion / aux on its
-    /// own visits. Mutation: key the plan on the global step (`path.plan(step, …)`) with 2 images
-    /// round-robin ⇒ image 0 is locked to one kind ⇒ red.
+    /// Alternation through the path (sc-2124): with `every_n = 2` and 2 images round-robin, the
+    /// steps interleave (never two aux-only steps in a row) and each image gets both kinds within
+    /// 3 epochs. Mutation: key the plan on the bare global step (`path.plan(step, …)`) ⇒ image 0 is
+    /// locked to diffusion ⇒ red.
     #[test]
-    fn every_image_alternates_on_its_own_visits() {
+    fn every_image_gets_both_kinds_through_the_path() {
         let mut path = crop_path();
         for i in 0..2 {
             path.ensure_reference(i, &clean_image(true).0).unwrap();
         }
-        let mut alt = AuxAlternation::new(2, 1);
+        let alt = AuxAlternation::new(2, 1);
         let mut kinds = vec![Vec::new(), Vec::new()];
-        for step in 1..=8u32 {
+        let mut flags = Vec::new();
+        for step in 1..=6u32 {
             let image = ((step - 1) % 2) as usize;
-            let plan = path.plan(alt.key(step, image), image, 0.5).unwrap();
+            let plan = path.plan(alt.key(step), image, 0.5).unwrap();
             kinds[image].push(plan.diffusion);
+            flags.push(plan.diffusion);
         }
+        assert!(
+            flags.windows(2).all(|w| w[0] || w[1]),
+            "two aux-only steps in a row: {flags:?}"
+        );
         for k in &kinds {
-            assert_eq!(k, &vec![true, false, true, false], "{kinds:?}");
+            assert!(k.contains(&true) && k.contains(&false), "{kinds:?}");
         }
     }
 

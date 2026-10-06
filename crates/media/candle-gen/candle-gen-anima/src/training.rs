@@ -479,10 +479,9 @@ impl AnimaTrainer {
         // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the real item
-        // (the trainer has no resume, so nothing to replay).
-        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-        // cropped like the image and resampled onto its decoded size.
+        // Epic 2123 E8: references once per (item, bucket) entry; the alternation over the
+        // schedule's windows. sc-24832: the job's subject masks (restricted normal loss) reach
+        // every reference, cropped like the image and resampled onto its decoded size.
         let mut perceptual = perceptual;
         if let Some(path) = perceptual.as_mut() {
             path.attach_subject_masks(
@@ -502,7 +501,6 @@ impl AnimaTrainer {
                 |i| latent_frames_nchw(&cache[i].0),
                 &schedule,
                 accum,
-                0,
                 &req.cancel,
             )?),
             None => None,
@@ -929,7 +927,6 @@ mod depth_anchoring_tests {
             |_| latent_frames_nchw(&f.x0),
             &sched,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -981,7 +978,6 @@ mod depth_anchoring_tests {
             |_| Ok(clean.clone()),
             &sched,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();

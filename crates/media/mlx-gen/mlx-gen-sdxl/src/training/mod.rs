@@ -1078,7 +1078,6 @@ mod depth_anchoring_tests {
             cache,
             &single_bucket(cache.len()),
             accum,
-            0,
             &Default::default(),
         )
         .unwrap()
@@ -1287,7 +1286,6 @@ mod depth_anchoring_tests {
             &cache,
             &single_bucket(cache.len()),
             1,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -1350,14 +1348,15 @@ mod depth_anchoring_tests {
         assert_eq!(depth, expected);
     }
 
-    /// Per-image alternation through the real step seam: with N = 2 images and `every_n = 2`
-    /// every image gets a diffusion and a depth step within 2·N steps, and with gradient
-    /// accumulation 2 both micro-steps of a window share one kind. Mutations: key the plan on the
-    /// global step ⇒ red; build the tracker with accumulation 1 ⇒ red.
+    /// Interleaved alternation through the real step seam (sc-2124): with N = 2 images and
+    /// `every_n = 2` no two depth steps run back to back and every image gets a diffusion and a
+    /// depth step within 3 epochs, and with gradient accumulation 2 both micro-steps of a window
+    /// share one kind. Mutations: key the plan on the bare global step (no period) ⇒ image 0 never
+    /// trains depth ⇒ red; build the alternation with accumulation 1 ⇒ red.
     #[test]
-    fn alternation_is_per_image_and_per_window() {
+    fn alternation_interleaves_per_window() {
         let h = hooks();
-        for (n_items, accum, steps) in [(2u64, 1u32, 4u32), (3, 2, 8)] {
+        for (n_items, accum, steps) in [(2u64, 1u32, 6u32), (3, 2, 8)] {
             let mut unet = tiny_unet(3).unwrap();
             let cfg = cfg();
             let (adapter, params) = adapter(&mut unet, &cfg);
@@ -1381,6 +1380,10 @@ mod depth_anchoring_tests {
                 })
                 .collect();
             if accum == 1 {
+                assert!(
+                    kinds.windows(2).all(|w| !(w[0].1 && w[1].1)),
+                    "two depth steps in a row: {kinds:?}"
+                );
                 for image in 0..n_items as usize {
                     let mine: Vec<bool> = kinds
                         .iter()
@@ -1401,10 +1404,10 @@ mod depth_anchoring_tests {
 
     /// sc-2127 integration: with two resolution buckets (item-major cache, different latent sizes)
     /// the depth reference is built once per (item, bucket) entry and every depth step trains its
-    /// scheduled entry against that entry's own reference (same decode size), while alternation
-    /// stays keyed on the item. Mutations: key the reference / plan on the item instead of the
-    /// entry in `run_train_step` ⇒ a depth step on bucket 1 compares against bucket 0's reference
-    /// (shape mismatch) or the counter stops at the item count ⇒ red.
+    /// scheduled entry against that entry's own reference (same decode size), while the alternation
+    /// stays keyed on the step's window. Mutations: key the reference / plan on the item instead of
+    /// the entry in `run_train_step` ⇒ a depth step on bucket 1 compares against bucket 0's
+    /// reference (shape mismatch) or the counter stops at the item count ⇒ red.
     #[test]
     fn two_buckets_keep_per_entry_references() {
         let h = hooks();
@@ -1450,7 +1453,7 @@ mod depth_anchoring_tests {
             ],
             7,
         );
-        let mut d = aux_driver(path(), &cache, &schedule, 1, 0, &Default::default()).unwrap();
+        let mut d = aux_driver(path(), &cache, &schedule, 1, &Default::default()).unwrap();
         let steps = 2 * schedule.epoch_len() as u32;
         let mut depth_on_bucket1 = false;
         for n in 1..=steps {

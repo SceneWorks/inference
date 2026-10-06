@@ -789,9 +789,9 @@ impl MageTrainer {
         // adapter and full fine-tune surfaces share this cache and schedule.
         let buckets = req.config.training_buckets();
         let schedule = BucketSchedule::new(cache.len() / buckets.len(), &buckets, req.config.seed);
-        // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the item.
-        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-        // cropped like the image and resampled onto its decoded size.
+        // Epic 2123 E8: references once per (item, bucket) entry; the alternation over the
+        // schedule's windows. sc-24832: the job's subject masks (restricted normal loss) reach
+        // every reference, cropped like the image and resampled onto its decoded size.
         let mut perceptual = perceptual;
         if let Some(path) = perceptual.as_mut() {
             path.attach_subject_masks(
@@ -818,7 +818,6 @@ impl MageTrainer {
                     },
                     &schedule,
                     accum,
-                    0,
                     &req.cancel,
                 )
             })
@@ -1539,7 +1538,6 @@ mod tests {
                 |e| tokens_to_latent_grid(&cache[e].latent, sample_grid(&cache[e])?),
                 sched,
                 1,
-                0,
                 &Default::default(),
             )
             .unwrap()
@@ -1603,22 +1601,30 @@ mod tests {
             assert!(mag > 0.0 && mag.is_finite(), "LoRA grad |Σ| {mag}");
         }
 
-        /// Alternation on the real item + references once per entry. Mutation: build the driver with
-        /// a per-entry alternation keyed on the global step ⇒ an item locks to one kind ⇒ red.
+        /// The alternation interleaves (never two depth steps in a row) and gives each of 2
+        /// round-robin items both kinds (sc-2124); references once per entry. Mutation: build the
+        /// driver's alternation over the item count with a bare global-step key (no period) ⇒
+        /// item 0 locks to diffusion ⇒ red.
         #[test]
-        fn every_item_alternates_and_references_are_built_once() {
+        fn every_item_gets_both_kinds_and_references_are_built_once() {
             let f = fixture();
             let cache = vec![sample(1), sample(2)];
             let sched = schedule_of(2);
             let mut aux = driver(&cache, &sched);
             let mut kinds = vec![Vec::new(), Vec::new()];
+            let mut flags = Vec::new();
             for n in 1..=8u32 {
                 let item = sched.sample((n - 1) as usize).0;
                 let (_, l) = step(&f, &cache, &sched, Some(&mut aux), n);
                 kinds[item].push(l.aux.is_some());
+                flags.push(l.aux.is_some());
             }
+            assert!(
+                flags.windows(2).all(|w| !(w[0] && w[1])),
+                "two depth steps in a row: {flags:?}"
+            );
             for k in &kinds {
-                assert_eq!(k, &vec![false, true, false, true], "{kinds:?}");
+                assert!(k.contains(&true) && k.contains(&false), "{kinds:?}");
             }
             assert_eq!(aux.path().reference_computations(), cache.len());
         }

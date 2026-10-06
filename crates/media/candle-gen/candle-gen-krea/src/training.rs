@@ -1226,7 +1226,6 @@ mod depth_anchoring_tests {
                 |_| Ok(x0.clone()),
                 &sched,
                 1,
-                0,
                 &Default::default(),
             )
             .unwrap();
@@ -1353,7 +1352,6 @@ mod depth_anchoring_tests {
             |_| Ok(x0.clone()),
             &sched,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();

@@ -1,13 +1,15 @@
 //! Backend-neutral **auxiliary-loss step policy** (epic 2123 E8, sc-2125) — which loss terms a
 //! training micro-step trains. Pure policy, so the MLX and Candle trainers share one copy:
 //!
-//! - [`AuxAlternation`] turns `(micro-step, image)` into the step's **alternation key**: how many
-//!   optimizer-update windows the window's first image has started (its own visit count when
-//!   `gradient_accumulation == 1`), shared by the window's other micro-steps. Keying on the image (not the global step)
-//!   means every image alternates between diffusion and aux steps whatever order the trainer visits
-//!   images in — round-robin, shuffled, or bucketed — and the period can never lock an image to one
-//!   step kind. Keying per window means gradient accumulation never averages a diffusion and an aux
-//!   micro-step into one update.
+//! - [`AuxAlternation`] turns a micro-step into its [`AltKey`]: the step's **optimizer window**
+//!   (every micro-step of one gradient-accumulation window shares it, so accumulation never
+//!   averages a diffusion and an aux micro-step into one update) and the visit order's **period**
+//!   in windows. [`AltKey::claims`] decides, per loss period `every_n`, whether the window is an
+//!   aux-only window. Consecutive windows interleave like upstream ai-toolkit-perceptual's
+//!   per-optimizer-step alternation (`step_num % 2`: never two aux-only windows in a row), and the
+//!   phase drifts by one residue per pass over the data so a fixed visit order cannot lock an
+//!   image to one step kind (sc-2124). The key is a pure function of the step, so a resumed run
+//!   needs no replay.
 //! - [`plan_step`] turns the per-loss [`AuxLossSchedule`]s, the key and the sampled noise level into
 //!   a [`StepPlan`]. On an aux-only step the noise level is remapped into the claiming losses'
 //!   window, so the claim never depends on the sampled timestep (every micro-step of a window gets
@@ -59,50 +61,124 @@ impl StepPlan {
     }
 }
 
-/// Per-image alternation keys (see the module docs). Feed it every micro-step in order.
-#[derive(Clone, Debug)]
+/// One micro-step's alternation key (see the module docs and [`AltKey::claims`]).
+///
+/// A bare `u32` converts to the key of that window with no period (`period == 0`): loss `every_n`
+/// claims window `w` iff `w % every_n == 0` — the plain upstream counter, for callers that plan an
+/// explicit window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AltKey {
+    /// The 1-based optimizer window the micro-step belongs to.
+    pub window: u32,
+    /// Windows per period of the visit order (`lcm(epoch_steps, window_steps) / window_steps`), or
+    /// `0` for no period.
+    pub period: u32,
+}
+
+impl From<u32> for AltKey {
+    fn from(window: u32) -> Self {
+        Self { window, period: 0 }
+    }
+}
+
+impl AltKey {
+    /// Whether a loss with alternation period `every_n` claims this window (makes it aux-only).
+    /// `every_n < 2` never claims (summed losses).
+    ///
+    /// The window `w` is mapped to a counter `c(w)` and the loss claims iff `c(w) % every_n == 0`,
+    /// where, with `m` the period and `n = every_n`:
+    ///
+    /// - `s` = the smallest `s ≥ 0` with `gcd(m + s, n) = 1` (`0` whenever `gcd(m, n) = 1`);
+    /// - `s == 0` ⇒ `c(w) = w`;
+    /// - `n == 2`, `s == 1` (an even period) ⇒ `c(w) = w + ⌊(w − 1)/(m + 1)⌋`;
+    /// - otherwise ⇒ `c(w) = w + ⌊(w − 1)·s/m⌋`.
+    ///
+    /// Why: `c` steps by 1 or 2 per window (`s < n` and, when `m < s`, `m ≥ 2`), so two claims are
+    /// never adjacent — a step of 2 skips one value, and for `n ≥ 3` two values 2 apart are never
+    /// both multiples of `n`, while for `n == 2` the skipped values `j·(m + 2)` are all even, so a
+    /// skip makes a diffusion pair, never an aux pair. That is upstream's bound: no two aux-only
+    /// windows in a row. And the same slot of the visit order one period later sits `m + s`
+    /// counter values on (exactly, for `n ≥ 3`) — a unit modulo `n` — so every slot walks through
+    /// every residue within `n` periods; for `n == 2` a slot flips every period except once every
+    /// `m + 1` periods, so it gets both kinds within any 3 periods. (Flipping every slot every
+    /// period is impossible for an even period without two adjacent aux windows at alternate
+    /// period boundaries.)
+    pub fn claims(self, every_n: u32) -> bool {
+        if every_n < 2 {
+            return false;
+        }
+        let (w, n) = (u64::from(self.window.max(1)), u64::from(every_n));
+        if self.period == 0 {
+            return w.is_multiple_of(n);
+        }
+        let m = u64::from(self.period);
+        // `s = (1 − m) mod n` makes `m + s ≡ 1 (mod n)`, so the search always finds one.
+        let s = (0..n)
+            .find(|s| gcd(m + s, n) == 1)
+            .unwrap_or((n + 1 - m % n) % n);
+        let c = match s {
+            0 => w,
+            1 if n == 2 => w + (w - 1) / (m + 1),
+            _ => w + (w - 1) * s / m,
+        };
+        c.is_multiple_of(n)
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// The alternation over a training loop's visit order (see the module docs). Pure: a micro-step's
+/// key depends only on the step, so a resumed run continues the same phase without replay.
+#[derive(Clone, Copy, Debug)]
 pub struct AuxAlternation {
-    window_starts: Vec<u32>,
-    accum: u32,
-    window_key: u32,
+    window: u32,
+    period: u32,
 }
 
 impl AuxAlternation {
-    /// For a dataset of `images` items and `gradient_accumulation` micro-steps per update.
-    pub fn new(images: usize, gradient_accumulation: u32) -> Self {
+    /// For a loop whose visit order repeats every `epoch_steps` micro-steps (one pass over the
+    /// data: `BucketSchedule::epoch_len`, times the expert count for Wan's interleaved experts)
+    /// with `window_steps` micro-steps per optimizer window (the gradient accumulation, times the
+    /// expert count for Wan).
+    pub fn new(epoch_steps: usize, window_steps: u32) -> Self {
+        let window = window_steps.max(1);
+        let l = epoch_steps.max(1) as u64;
+        // lcm(l, window) / window: the windows after which the window ↔ sample layout repeats.
+        let period = l / gcd(l, u64::from(window));
         Self {
-            window_starts: vec![0; images],
-            accum: gradient_accumulation.max(1),
-            window_key: 0,
+            window,
+            period: u32::try_from(period).unwrap_or(u32::MAX),
         }
     }
 
-    /// Record 1-based micro-step `step` visiting dataset item `image` and return the step's key: at
-    /// the first micro-step of an optimizer window, the number of windows `image` has now started
-    /// (1 the first time); the window's later micro-steps reuse it. Call for every micro-step, in order
-    /// (replay the skipped prefix on resume).
-    pub fn key(&mut self, step: u32, image: usize) -> u32 {
-        if (step.max(1) - 1).is_multiple_of(self.accum) {
-            let starts = &mut self.window_starts[image];
-            *starts += 1;
-            self.window_key = *starts;
+    /// The key of 1-based micro-step `step`.
+    pub fn key(&self, step: u32) -> AltKey {
+        AltKey {
+            window: (step.max(1) - 1) / self.window + 1,
+            period: self.period,
         }
-        self.window_key
     }
 }
 
 /// The plan for alternation `key` at sampled noise level `raw_t`:
 ///
-/// - a loss **claims** the step when it is enabled, `every_n ≥ 2` and `key % every_n == 0`;
+/// - a loss **claims** the step when it is enabled and the key [claims](AltKey::claims) its
+///   `every_n`;
 /// - any claim ⇒ **aux-only** step: the noise level is remapped into the claiming windows'
 ///   intersection (the first claimer's window when they do not intersect), and the claiming losses
 ///   whose window holds it contribute, plus every enabled `every_n == 1` loss whose window holds it;
 /// - no claim ⇒ diffusion step at `raw_t`, plus every enabled `every_n == 1` loss in window.
-pub fn plan_step(schedules: &[AuxLossSchedule], key: u32, raw_t: f32) -> StepPlan {
+pub fn plan_step(schedules: &[AuxLossSchedule], key: impl Into<AltKey>, raw_t: f32) -> StepPlan {
+    let key = key.into();
     let claiming: Vec<usize> = schedules
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.is_enabled() && s.every_n >= 2 && key.is_multiple_of(s.every_n))
+        .filter(|(_, s)| s.is_enabled() && key.claims(s.every_n))
         .map(|(i, _)| i)
         .collect();
     let (diffusion, t) = match claiming.first() {
@@ -153,10 +229,11 @@ pub fn plan_step(schedules: &[AuxLossSchedule], key: u32, raw_t: f32) -> StepPla
 /// [`plan_step`]. Callers then apply [`StepPlan::without_skipped`] for the entry's unusable losses.
 pub fn plan_in_band(
     schedules: &[AuxLossSchedule],
-    key: u32,
+    key: impl Into<AltKey>,
     (lo, hi): (f32, f32),
     t: f32,
 ) -> StepPlan {
+    let key = key.into();
     let confined: Vec<AuxLossSchedule> = schedules
         .iter()
         .map(|&s| {
@@ -286,80 +363,230 @@ mod tests {
         }
     }
 
-    /// Each image's step kinds over `steps` micro-steps visiting `order(step)`.
-    fn kinds(
-        n: usize,
-        accum: u32,
-        steps: u32,
-        s: &[AuxLossSchedule],
-        order: impl Fn(u32) -> usize,
-    ) -> (Vec<Vec<bool>>, Vec<bool>) {
-        let mut alt = AuxAlternation::new(n, accum);
-        let mut per_image = vec![Vec::new(); n];
-        let mut flags = Vec::new();
-        for step in 1..=steps {
-            let image = order(step);
-            let plan = plan_step(s, alt.key(step, image), 0.5);
-            per_image[image].push(plan.diffusion);
-            flags.push(plan.diffusion);
-        }
-        (per_image, flags)
+    /// The two real visit orders a trainer walks: the single-bucket round-robin and a seeded
+    /// two-bucket shuffle (each item twice per epoch, a fresh permutation each epoch).
+    fn orders(n: usize) -> Vec<(&'static str, crate::train::BucketSchedule)> {
+        use crate::train::{BucketSchedule, ResolutionBucket};
+        let b = |resolution| ResolutionBucket {
+            resolution,
+            repeats: 1,
+        };
+        vec![
+            ("round-robin", BucketSchedule::new(n, &[b(512)], 7)),
+            ("shuffled", BucketSchedule::new(n, &[b(512), b(768)], 7)),
+            (
+                "shuffled-seed-2",
+                BucketSchedule::new(n, &[b(512), b(768)], 2),
+            ),
+        ]
     }
 
-    /// Review blocker: with round-robin image order and `every_n` dividing N, a global-step key
-    /// locks each image to one step kind. Keying on the image's own visits gives every image both a
-    /// diffusion and an aux step within 2·N steps — for round-robin and for a shuffled order.
-    /// Mutation: key on the global step (`self.window_key = step`) ⇒ N = 2 / N = 4 lock ⇒ red.
+    /// One `(epoch, item, diffusion)` per micro-step over `epochs` passes of `schedule`, keyed like
+    /// the trainers' `AuxDriver` (`AuxAlternation::new(epoch_len, accum)`).
+    fn walk(
+        schedule: &crate::train::BucketSchedule,
+        accum: u32,
+        epochs: usize,
+        s: &[AuxLossSchedule],
+    ) -> Vec<(usize, usize, bool)> {
+        let len = schedule.epoch_len();
+        let alt = AuxAlternation::new(len, accum);
+        (0..len * epochs)
+            .map(|k| {
+                let plan = plan_step(s, alt.key(k as u32 + 1), 0.5);
+                (k / len, schedule.sample(k).0, plan.diffusion)
+            })
+            .collect()
+    }
+
+    /// One diffusion flag per optimizer window, asserting every micro-step of the window agrees.
+    fn window_flags(steps: &[(usize, usize, bool)], accum: u32, what: &str) -> Vec<bool> {
+        steps
+            .chunks(accum as usize)
+            .map(|w| {
+                assert!(
+                    w.iter().all(|x| x.2 == w[0].2),
+                    "{what}: window {w:?} mixes step kinds"
+                );
+                w[0].2
+            })
+            .collect()
+    }
+
+    fn longest_run(flags: &[bool], kind: bool) -> usize {
+        flags
+            .split(|&f| f != kind)
+            .map(<[bool]>::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// sc-2124 (the A/B defect): consecutive optimizer windows interleave like upstream
+    /// ai-toolkit-perceptual (`SDTrainer.calculate_loss`: `step_num % 2 == 0` ⇒ diffusion, else
+    /// depth — never two aux-only steps in a row), for N = 2 / 4 / 76 items, `every_n` 2 and 3,
+    /// accumulation 1 and 2, round-robin and shuffled bucket orders — instead of whole epochs of
+    /// aux-only steps. Diffusion runs stay short too (`≤ 2·every_n − 1` windows) and every
+    /// `every_n`-ish window is aux. Mutations: key on the item's own visit count (the old
+    /// `window_starts[image]`) ⇒ 76-window aux runs ⇒ red; the even-period drift with
+    /// denominator `m` instead of `m + 1` (skips odd values) ⇒ two aux windows in a row ⇒ red.
     #[test]
-    fn every_image_gets_both_step_kinds_for_any_order() {
-        let s = [sched(0.1, 0.0, 1.0, 2)];
-        for n in [2usize, 4] {
-            let steps = 2 * n as u32;
-            let shuffled = |step: u32| {
-                // A fixed per-epoch permutation (reversed on odd epochs).
-                let epoch = (step - 1) / n as u32;
-                let pos = ((step - 1) % n as u32) as usize;
-                if epoch.is_multiple_of(2) {
-                    pos
-                } else {
-                    n - 1 - pos
-                }
-            };
-            for (name, per_image) in [
-                (
-                    "round-robin",
-                    kinds(n, 1, steps, &s, |st| ((st - 1) as usize) % n).0,
-                ),
-                ("shuffled", kinds(n, 1, steps, &s, shuffled).0),
-            ] {
-                for (i, k) in per_image.iter().enumerate() {
-                    assert!(
-                        k.contains(&true) && k.contains(&false),
-                        "{name} N={n}: image {i} got {k:?}"
-                    );
+    fn aux_windows_never_run_back_to_back() {
+        for n in [2usize, 4, 76] {
+            for every_n in [2u32, 3] {
+                let s = [sched(0.1, 0.0, 1.0, every_n)];
+                for accum in [1u32, 2] {
+                    for (name, schedule) in orders(n) {
+                        let what = format!("{name} N={n} every_n={every_n} accum={accum}");
+                        let flags = window_flags(&walk(&schedule, accum, 12, &s), accum, &what);
+                        assert!(
+                            longest_run(&flags, false) <= 1,
+                            "{what}: aux run {}",
+                            longest_run(&flags, false)
+                        );
+                        assert!(
+                            longest_run(&flags, true) < 2 * every_n as usize,
+                            "{what}: diffusion run {}",
+                            longest_run(&flags, true)
+                        );
+                        let aux = flags.iter().filter(|f| !**f).count() as f64;
+                        let share = aux / flags.len() as f64;
+                        assert!(
+                            share >= 1.0 / (2.0 * every_n as f64)
+                                && share <= 1.0 / every_n as f64 + 0.02,
+                            "{what}: aux share {share}"
+                        );
+                    }
                 }
             }
         }
     }
 
-    /// Review major: the plan is keyed per optimizer-update window — with accumulation 2 both
-    /// micro-steps of a window share the diffusion flag (never an averaged diffusion+aux update),
-    /// and windows still alternate. Mutation: update `window_key` on every micro-step ⇒ red.
+    /// sc-2124 (b), round-robin: every image gets both a diffusion and an aux step within any
+    /// `every_n + 1` consecutive epochs (N = 2 / 4 / 76, `every_n` 2 / 3, accumulation 1 / 2) — no
+    /// fixed order locks an image to one kind. (`every_n` epochs is impossible for `every_n = 2`
+    /// and an even epoch: flipping every slot every epoch forces two aux windows in a row at
+    /// alternate epoch boundaries; the drift costs one slot per epoch one extra epoch.) Mutations:
+    /// drop the drift (`c(w) = w`) ⇒ an even N locks ⇒ red; key on the global step ignoring the
+    /// period ⇒ red.
+    #[test]
+    fn every_image_gets_both_kinds_round_robin() {
+        for n in [2usize, 4, 76] {
+            for every_n in [2u32, 3] {
+                let s = [sched(0.1, 0.0, 1.0, every_n)];
+                for accum in [1u32, 2] {
+                    let (_, schedule) = orders(n).remove(0);
+                    let epochs = 4 * (every_n as usize + 1);
+                    let steps = walk(&schedule, accum, epochs, &s);
+                    let bound = every_n as usize + 1;
+                    for item in 0..n {
+                        for e0 in 0..=epochs - bound {
+                            let got: Vec<bool> = steps
+                                .iter()
+                                .filter(|x| x.1 == item && (e0..e0 + bound).contains(&x.0))
+                                .map(|x| x.2)
+                                .collect();
+                            assert!(
+                                got.contains(&true) && got.contains(&false),
+                                "N={n} every_n={every_n} accum={accum}: image {item} epochs \
+                                 {e0}..{} got {got:?}",
+                                e0 + bound
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// sc-2124 (b), seeded bucket shuffle: each sample lands on a random slot of the interleaved
+    /// window pattern, so every image gets both kinds early (here within `3·every_n` epochs, for
+    /// two seeds, N = 2 / 4 / 76, `every_n` 2 / 3, accumulation 1 / 2). Mutation: claim on every
+    /// window ⇒ no diffusion step ⇒ red.
+    #[test]
+    fn every_image_gets_both_kinds_shuffled_buckets() {
+        for n in [2usize, 4, 76] {
+            for every_n in [2u32, 3] {
+                let s = [sched(0.1, 0.0, 1.0, every_n)];
+                for accum in [1u32, 2] {
+                    for (name, schedule) in orders(n).into_iter().skip(1) {
+                        let steps = walk(&schedule, accum, 3 * every_n as usize, &s);
+                        for item in 0..n {
+                            let got: Vec<bool> =
+                                steps.iter().filter(|x| x.1 == item).map(|x| x.2).collect();
+                            assert!(
+                                got.contains(&true) && got.contains(&false),
+                                "{name} N={n} every_n={every_n} accum={accum}: image {item} \
+                                 got {got:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The general claim behind the two tests above, for every period `m ≤ 96` and `every_n` 2..=5:
+    /// no two claimed windows are adjacent, and every slot of the period is claimed and unclaimed
+    /// within any `every_n` (`3` for `every_n = 2` with an even period) consecutive periods.
+    /// Mutations: the even-period drift over `m` (not `m + 1`) ⇒ adjacent claims ⇒ red; `s = 0`
+    /// always ⇒ a period sharing a factor with `every_n` locks its slots ⇒ red.
+    #[test]
+    fn claims_interleave_and_cycle_every_slot() {
+        for m in 1u32..=96 {
+            for n in 2u32..=5 {
+                let bound = if n == 2 && m % 2 == 0 { 3 } else { n };
+                let periods = 3 * bound + 3;
+                let claim = |w: u32| {
+                    AltKey {
+                        window: w,
+                        period: m,
+                    }
+                    .claims(n)
+                };
+                for w in 1..m * periods {
+                    assert!(
+                        !(claim(w) && claim(w + 1)),
+                        "m={m} n={n}: windows {w} and {} both aux",
+                        w + 1
+                    );
+                }
+                for q in 1..=m {
+                    for p0 in 0..=periods - bound {
+                        let got: Vec<bool> = (p0..p0 + bound).map(|p| claim(p * m + q)).collect();
+                        assert!(
+                            got.contains(&true) && got.contains(&false),
+                            "m={m} n={n}: slot {q} periods {p0}.. got {got:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The plan is keyed per optimizer window — with accumulation 2 (and Wan's `accum · experts`
+    /// window) every micro-step of a window shares the diffusion flag (never an averaged
+    /// diffusion + aux update), and windows still alternate. Mutation: key on the micro-step
+    /// (`window: step`) ⇒ red.
     #[test]
     fn accumulation_windows_share_one_step_kind() {
         let s = [sched(0.1, 0.0, 1.0, 2)];
         for n in [1usize, 2, 3, 4] {
-            let (_, flags) = kinds(n, 2, 16, &s, |st| ((st - 1) as usize) % n);
-            for w in flags.chunks(2) {
-                assert_eq!(
-                    w[0], w[1],
-                    "N={n}: window {w:?} mixes step kinds ({flags:?})"
+            for window in [2u32, 4] {
+                let alt = AuxAlternation::new(n, window);
+                let flags: Vec<bool> = (1..=16 * window)
+                    .map(|step| plan_step(&s, alt.key(step), 0.5).diffusion)
+                    .collect();
+                for w in flags.chunks(window as usize) {
+                    assert!(
+                        w.iter().all(|f| *f == w[0]),
+                        "N={n} window={window}: {w:?} mixes step kinds ({flags:?})"
+                    );
+                }
+                assert!(
+                    flags.contains(&true) && flags.contains(&false),
+                    "N={n}: {flags:?}"
                 );
             }
-            assert!(
-                flags.contains(&true) && flags.contains(&false),
-                "N={n}: {flags:?}"
-            );
         }
     }
 
