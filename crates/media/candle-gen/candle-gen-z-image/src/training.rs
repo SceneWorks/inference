@@ -1912,6 +1912,23 @@ mod training_adapter_tests {
             "{err}"
         );
 
+        // Finding 4: one module keyed twice under two prefixes is a named error, never "last wins".
+        let mut tensors = candle_core::safetensors::load(&file, &dev).unwrap();
+        let dup = tensors["diffusion_model.layers.0.attention.to_k.lora_A.weight"].clone();
+        tensors.insert(
+            "transformer.layers.0.attention.to_k.lora_A.weight".into(),
+            dup,
+        );
+        let twice = tmp.path().join("twice.safetensors");
+        candle_core::safetensors::save(&tensors, &twice).unwrap();
+        let err = install_training_adapter(&mut fresh, &twice, DType::F32, &dev)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("spelled twice") && err.contains("layers.0.attention.to_k"),
+            "{err}"
+        );
+
         let missing = tmp.path().join("missing.safetensors");
         let err = install_training_adapter(&mut fresh, &missing, DType::F32, &dev)
             .unwrap_err()

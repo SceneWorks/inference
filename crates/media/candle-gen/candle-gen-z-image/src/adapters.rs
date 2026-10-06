@@ -462,8 +462,9 @@ fn resolve_lora_file(
 /// `[in, rank]`, `b = upᵀ·(alpha/rank)` `[rank, out]` (no `.alpha` ⇒ `alpha = rank`, ai-toolkit's
 /// convention), through the same key classification inference uses ([`classify_lora_key`]: the
 /// `diffusion_model.` / `transformer.` / PEFT prefixes, kohya flattening via `table`). Strict: a LoKr
-/// or LoHa file, a key outside the LoRA surface, a half pair or a conv-shaped factor is an error
-/// naming the file — a training adapter is applied whole or not at all.
+/// or LoHa file, a key outside the LoRA surface, a half pair, a conv-shaped factor, or one module's
+/// factor spelled twice (e.g. under two prefixes — one copy would silently win) is an error naming
+/// the file — a training adapter is applied whole or not at all.
 pub(crate) fn resolve_training_adapter(
     path: &std::path::Path,
     table: &BTreeMap<String, String>,
@@ -478,6 +479,24 @@ pub(crate) fn resolve_training_adapter(
              supported)",
             path.display()
         )));
+    }
+    let mut seen: BTreeMap<(String, &'static str), &str> = BTreeMap::new();
+    for key in af.tensors.keys() {
+        let Some((module, role)) = classify_lora_key(key, table) else {
+            continue;
+        };
+        let role = match role {
+            Role::Down => "down/A",
+            Role::Up => "up/B",
+            Role::Alpha => "alpha",
+        };
+        if let Some(first) = seen.insert((module.clone(), role), key) {
+            return Err(CandleError::Msg(format!(
+                "z_image: training adapter {}: the {role} factor of `{module}` is spelled twice \
+                 (`{first}` and `{key}`) — refusing an ambiguous training adapter",
+                path.display()
+            )));
+        }
     }
     let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut skipped = 0usize;

@@ -68,15 +68,22 @@ fn residual_delta(adapter: &Adapter) -> Result<Array> {
     }
 }
 
-/// The training adapter merged into a Z-Image DiT's frozen base: the file it came from and the
-/// dotted module paths it changed (the ones the preview cancel pushes onto and pops off).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The training adapter merged into a Z-Image DiT's frozen base: the file it came from, the
+/// dotted module paths it changed (the ones the preview cancel pushes onto and pops off), and the
+/// cancelling (-1.0) residual per path, built once on the first preview and reused after.
+#[derive(Clone)]
 pub(crate) struct MergedTrainingAdapter {
     pub(crate) file: PathBuf,
     pub(crate) paths: Vec<String>,
+    cancel: Option<Vec<Adapter>>,
 }
 
 /// Merge the training adapter at `file` into `host`'s dense base weights (`W += Δ`, strength 1.0).
+///
+/// The sum is formed in f32 and rounded ONCE back to the weight's loaded precision: each linear is
+/// widened to f32, merged, and narrowed back (a bf16-loaded base therefore rounds `W + Δ` once,
+/// instead of rounding `Δ` to bf16 and then the bf16 sum). The trainer merges before its compute
+/// cast ([`crate::training`]'s `prepare_training_base`), so an f32-loaded base also rounds once.
 ///
 /// Every block-indexed adaptable path's adapter stack is cleared first (a reused trainer instance
 /// may still hold a previous run's installed factors, which must not be folded in); the fresh run
@@ -110,10 +117,17 @@ pub(crate) fn merge_training_adapter<H: AdaptableHost>(
             .iter()
             .map(residual_delta)
             .collect::<Result<Vec<_>>>()?;
+        let loaded = lin.weight_dtype().ok_or_else(|| {
+            mlx_gen::Error::Msg(format!(
+                "training adapter: `{path}` has a quantized base; the adapter merges into a dense base"
+            ))
+        })?;
+        lin.cast_weights(Dtype::Float32)?;
         for delta in &deltas {
             lin.merge_dense_delta(delta)?;
             folded += 1;
         }
+        lin.cast_weights(loaded)?;
         lin.set_adapters(Vec::new());
         // Materialize this linear's merged weight now, so the f32 delta is freed per layer instead of
         // the whole DiT's deltas staying live in one lazy graph.
@@ -132,6 +146,7 @@ pub(crate) fn merge_training_adapter<H: AdaptableHost>(
     Ok(MergedTrainingAdapter {
         file: file.to_path_buf(),
         paths,
+        cancel: None,
     })
 }
 
@@ -139,21 +154,44 @@ impl MergedTrainingAdapter {
     /// Push the adapter at strength **-1.0** on top of every merged linear's stack, cancelling the
     /// merge for an inference-only forward (the preview render) — ai-toolkit's inverted assistant
     /// LoRA. Pair with [`pop_cancel`](Self::pop_cancel) before the next training step.
-    pub(crate) fn push_cancel<H: AdaptableHost>(&self, host: &mut H) -> Result<()> {
+    ///
+    /// The file is read and parsed once — on the first preview, through the strict loader — and the
+    /// resulting low-rank residuals (the adapter's own factors, not a copy of the base) are
+    /// materialized and kept; every later preview pushes those same residuals.
+    pub(crate) fn push_cancel<H: AdaptableHost>(&mut self, host: &mut H) -> Result<()> {
+        if let Some(cancel) = &self.cancel {
+            for (path, adapter) in self.paths.iter().zip(cancel) {
+                linear(host, path)?.push(adapter.clone());
+            }
+            return Ok(());
+        }
         let mut before = Vec::with_capacity(self.paths.len());
         for path in &self.paths {
             before.push(linear(host, path)?.adapters().len());
         }
         apply_z_image_adapters(host, &[spec(&self.file, -1.0)])?;
+        let mut cancel = Vec::with_capacity(self.paths.len());
         for (path, len) in self.paths.iter().zip(before) {
-            if linear(host, path)?.adapters().len() != len + 1 {
+            let lin = linear(host, path)?;
+            if lin.adapters().len() != len + 1 {
                 return Err(mlx_gen::Error::Msg(format!(
                     "training adapter {}: the preview cancel did not land exactly once on `{path}`",
                     self.file.display()
                 )));
             }
+            let adapter = lin.adapters()[len].clone();
+            adapter.materialize()?;
+            cancel.push(adapter);
         }
+        self.cancel = Some(cancel);
         Ok(())
+    }
+
+    /// Whether the preview-cancel residuals have been built (after the first preview). Test seam for
+    /// the build-once cache.
+    #[cfg(test)]
+    pub(crate) fn cancel_built(&self) -> bool {
+        self.cancel.is_some()
     }
 
     /// Remove the cancelling residual [`push_cancel`](Self::push_cancel) pushed (the top of each
