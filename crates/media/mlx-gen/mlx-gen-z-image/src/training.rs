@@ -26,7 +26,8 @@
 //! sc-3043 generalizes this into a reusable `Trainer` surface (dataset/VAE-cache/bucket, checkpoint,
 //! LR schedule, the `lora_train` job); sc-3044 hardens it for Z-Image + adds LoKr.
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
@@ -149,24 +150,84 @@ fn trainer_descriptor() -> TrainerDescriptor {
 
 /// Construct the trainer from a snapshot directory (the diffusers multi-component tree). No
 /// quantization — training needs the dense base. Registered via [`mlx_gen::TrainerRegistration`].
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see `LazyZImageTrainer`.
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(mlx_gen::Error::Msg(
-                "z_image_turbo trainer expects a snapshot directory (tokenizer/ text_encoder/ \
-                 transformer/ vae/), not a single .safetensors file"
-                    .into(),
-            ))
-        }
-    };
-    Ok(Box::new(ZImageTurboTrainer {
+    snapshot_root(spec)?;
+    Ok(Box::new(LazyZImageTrainer {
+        descriptor: trainer_descriptor(),
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(
+            "z_image_turbo trainer expects a snapshot directory (tokenizer/ text_encoder/ \
+             transformer/ vae/), not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer`], run by `LazyZImageTrainer` on first need.
+fn load_weights(spec: &LoadSpec) -> Result<ZImageTurboTrainer> {
+    let root = snapshot_root(spec)?;
+    Ok(ZImageTurboTrainer {
         descriptor: trainer_descriptor(),
         tokenizer: crate::loader::load_tokenizer(root)?,
         text_encoder: Some(crate::loader::load_text_encoder(root)?),
         vae: crate::loader::load_vae(root)?,
         transformer: crate::loader::load_transformer(root)?,
-    }))
+    })
+}
+
+/// The registered Z-Image trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train` — after every refusal floor — or on a `validate` that must match custom
+/// `lora_target_modules` against the DiT.
+struct LazyZImageTrainer {
+    descriptor: TrainerDescriptor,
+    spec: LoadSpec,
+    loaded: OnceCell<ZImageTurboTrainer>,
+}
+
+impl LazyZImageTrainer {
+    fn loaded(&self) -> Result<&ZImageTurboTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set(load_weights(&self.spec)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazyZImageTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // The default targets exist on every Z-Image base; only custom ones need it loaded.
+        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
+            return validate_floors(&self.descriptor, req);
+        }
+        self.loaded()?.validate(req)
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -254,23 +315,29 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for ZImageTurboTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would resolve
         // to an empty target set — a full-length run that trains zero parameters yet "succeeds"
         // (F-041). Catch it here, where the loaded DiT is available to match suffixes against.

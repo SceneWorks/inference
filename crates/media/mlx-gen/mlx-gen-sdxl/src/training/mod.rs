@@ -45,6 +45,9 @@
 
 pub mod family;
 
+use std::cell::OnceCell;
+use std::path::PathBuf;
+
 use mlx_gen::{
     gen_core, Image, LoadSpec, Modality, Result, TrainOptimizer, Trainer, TrainerDescriptor,
     TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
@@ -269,18 +272,34 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// `tokenizer/ text_encoder/ text_encoder_2/ unet/ vae/`). Loads the base at **f32** (training needs
 /// the dense, high-precision base for clean autograd; inference runs fp16). Registered via
 /// [`mlx_gen::TrainerRegistration`].
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see `LazySdxlTrainer`.
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(mlx_gen::Error::Msg(
-                "sdxl trainer expects a snapshot directory (tokenizer/ text_encoder/ \
-                 text_encoder_2/ unet/ vae/), not a single .safetensors file"
-                    .into(),
-            ))
-        }
-    };
-    Ok(Box::new(SdxlTrainer {
+    snapshot_root(spec)?;
+    Ok(Box::new(LazySdxlTrainer {
+        descriptor: trainer_descriptor(),
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(
+            "sdxl trainer expects a snapshot directory (tokenizer/ text_encoder/ text_encoder_2/ \
+             unet/ vae/), not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer`], run by `LazySdxlTrainer` on first need.
+fn load_weights(spec: &LoadSpec) -> Result<SdxlTrainer> {
+    let root = snapshot_root(spec)?;
+    Ok(SdxlTrainer {
         descriptor: trainer_descriptor(),
         vae: crate::loader::load_vae(root)?,
         unet: crate::loader::load_unet(root)?,
@@ -290,7 +309,49 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             te2: Some(crate::loader::load_text_encoder_2(root)?),
             sampler: EulerSampler::new(&DiffusionConfig::sdxl_base(), true)?,
         },
-    }))
+    })
+}
+
+/// The registered SDXL trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train`, after every refusal floor.
+struct LazySdxlTrainer {
+    descriptor: TrainerDescriptor,
+    spec: LoadSpec,
+    loaded: OnceCell<SdxlTrainer>,
+}
+
+impl LazySdxlTrainer {
+    fn loaded(&self) -> Result<&SdxlTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set(load_weights(&self.spec)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazySdxlTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        match self.loaded.get() {
+            Some(trainer) => trainer.validate(req),
+            None => validate_floors(&self.descriptor, req),
+        }
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -299,42 +360,47 @@ mlx_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
 }
 
+/// Every weights-free [`Trainer::validate`] floor — the whole of it (none needs the loaded base).
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    if req.items.is_empty() {
+        return Err("sdxl trainer: dataset is empty".into());
+    }
+    if req.config.rank == 0 {
+        return Err("sdxl trainer: rank must be > 0".into());
+    }
+    // F-023: steps == 0 makes the `1..=steps` loop empty and the run returns `Canceled` (the
+    // family.rs comment claims validate rejects this — it didn't). z-image checks it; mirror.
+    if req.config.steps == 0 {
+        return Err("sdxl trainer: steps must be > 0".into());
+    }
+    if !TrainOptimizer::is_supported(&req.config.optimizer) {
+        return Err(format!(
+            "sdxl trainer: optimizer '{}' is not available on MLX training (supported: adamw, \
+             adam, rose, prodigy)",
+            req.config.optimizer
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl Trainer for SdxlTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        if req.items.is_empty() {
-            return Err("sdxl trainer: dataset is empty".into());
-        }
-        if req.config.rank == 0 {
-            return Err("sdxl trainer: rank must be > 0".into());
-        }
-        // F-023: steps == 0 makes the `1..=steps` loop empty and the run returns `Canceled` (the
-        // family.rs comment claims validate rejects this — it didn't). z-image checks it; mirror.
-        if req.config.steps == 0 {
-            return Err("sdxl trainer: steps must be > 0".into());
-        }
-        if !TrainOptimizer::is_supported(&req.config.optimizer) {
-            return Err(format!(
-                "sdxl trainer: optimizer '{}' is not available on MLX training (supported: \
-                 adamw, adam, rose, prodigy)",
-                req.config.optimizer
-            )
-            .into());
-        }
-        Ok(())
+        validate_floors(self.descriptor(), req)
     }
 
     fn train(

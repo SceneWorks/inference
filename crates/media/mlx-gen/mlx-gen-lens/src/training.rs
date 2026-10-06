@@ -56,7 +56,8 @@
 //!     latent caching — converting the otherwise-uncatchable SIGKILL into a recommendation to enable
 //!     the toggle. The default-off functional path is unaffected.
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
@@ -206,16 +207,33 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// Construct the trainer from a `microsoft/Lens` snapshot directory (the diffusers multi-component
 /// tree: `tokenizer/ text_encoder/ transformer/ vae/`). The DiT is loaded **dense** (the adapter host);
 /// the encoder is Q8. `spec.precision` selects the compute dtype (bf16 default / f32 tight-gate).
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see `LazyLensTrainer`.
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p.clone(),
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "lens trainer expects a snapshot directory (tokenizer/ text_encoder/ transformer/ \
-                 vae/), not a single .safetensors file"
-                    .into(),
-            )),
-        };
+    snapshot_root(spec)?;
+    Ok(Box::new(LazyLensTrainer {
+        descriptor: trainer_descriptor(),
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(
+            "lens trainer expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+             not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer`], run by `LazyLensTrainer` on first need.
+fn load_weights(spec: &LoadSpec) -> Result<LensTrainer> {
+    let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
         Precision::Bf16 => Dtype::Bfloat16,
         Precision::Fp32 => Dtype::Float32,
@@ -230,15 +248,59 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     let transformer = LensTransformer::from_weights(&dit_w, &dit_cfg, dtype)?;
     // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
     dit_w.materialize_accessed()?;
-    let vae = load_vae(&root)?;
-    Ok(Box::new(LensTrainer {
+    let vae = load_vae(root)?;
+    Ok(LensTrainer {
         descriptor: trainer_descriptor(),
         tokenizer,
         encoder: Some(encoder),
         transformer,
         vae,
         dtype,
-    }))
+    })
+}
+
+/// The registered Lens trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train` — after every refusal floor — or on a `validate` that must match custom
+/// `lora_target_modules` against the DiT.
+struct LazyLensTrainer {
+    descriptor: TrainerDescriptor,
+    spec: LoadSpec,
+    loaded: OnceCell<LensTrainer>,
+}
+
+impl LazyLensTrainer {
+    fn loaded(&self) -> Result<&LensTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set(load_weights(&self.spec)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazyLensTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // The default targets exist on every Lens base; only custom ones need it loaded.
+        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
+            return validate_floors(&self.descriptor, req);
+        }
+        self.loaded()?.validate(req)
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -305,23 +367,29 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for LensTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would train zero
         // parameters yet "succeed". Catch it here, where the loaded DiT is available to match against.
         if resolve_target_paths(&self.transformer, &req.config).is_empty() {

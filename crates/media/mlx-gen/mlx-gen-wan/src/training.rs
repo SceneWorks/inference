@@ -39,7 +39,8 @@
 //!     channel `y` (the reference trains the no-conditioning T2V velocity objective; the attention
 //!     LoRA is the trained surface and is blind to the padded conditioning channels).
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::BucketSchedule;
@@ -310,23 +311,77 @@ fn descriptor_ti2v_5b() -> TrainerDescriptor {
 /// the checkpoint's `config.json`. The transformers load bf16 (Wan's native dtype; the trainable f32
 /// factors promote against the bf16 base — clean autograd, the base frozen). `descriptor.id` selects
 /// which Wan variant this registration serves, and is checked against the config.
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights or `config.json`; see `LazyWanTrainer`.
 fn build_trainer(spec: &LoadSpec, descriptor: TrainerDescriptor) -> Result<Box<dyn Trainer>> {
-    Ok(Box::new(build_trainer_concrete(spec, descriptor)?))
+    snapshot_root(spec, descriptor.id)?;
+    Ok(Box::new(LazyWanTrainer {
+        descriptor,
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The snapshot directory a trainer spec names — a single file is refused.
+fn snapshot_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(format!(
+            "{id} trainer expects a converted snapshot directory (model/expert safetensors + \
+             t5_encoder + vae + tokenizer.json), not a single file"
+        ))),
+    }
+}
+
+/// The registered Wan trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train`, after every refusal floor.
+struct LazyWanTrainer {
+    descriptor: TrainerDescriptor,
+    spec: LoadSpec,
+    loaded: OnceCell<WanMoeTrainer>,
+}
+
+impl LazyWanTrainer {
+    fn loaded(&self) -> Result<&WanMoeTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self
+                .loaded
+                .set(build_trainer_concrete(&self.spec, self.descriptor)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazyWanTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        match self.loaded.get() {
+            Some(trainer) => trainer.validate(req),
+            None => validate_floors(&self.descriptor, req),
+        }
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 /// The concrete-typed loader behind [`build_trainer`] (sc-4942 — the first-step memory harness needs
 /// the concrete [`WanMoeTrainer`] to reach `.experts` / `.vae`, which a `Box<dyn Trainer>` hides).
 fn build_trainer_concrete(spec: &LoadSpec, descriptor: TrainerDescriptor) -> Result<WanMoeTrainer> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(mlx_gen::Error::Msg(format!(
-                "{} trainer expects a converted snapshot directory (model/expert safetensors + \
-                 t5_encoder + vae + tokenizer.json), not a single file",
-                descriptor.id
-            )))
-        }
-    };
+    let root = snapshot_root(spec, descriptor.id)?;
     let cfg = WanModelConfig::from_model_dir(root)?;
     check_config_matches(descriptor.id, &cfg)?;
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.text_len)?;
@@ -410,38 +465,43 @@ mlx_gen::register_trainer! {
         descriptor_ti2v_5b => load_trainer_ti2v_5b
 }
 
+/// Every weights-free [`Trainer::validate`] floor — the whole of it (none needs the loaded base).
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    let id = descriptor.id;
+    if req.items.is_empty() {
+        return Err(format!("{id} trainer: dataset is empty").into());
+    }
+    if req.config.rank == 0 {
+        return Err(format!("{id} trainer: rank must be > 0").into());
+    }
+    if !TrainOptimizer::is_supported(&req.config.optimizer) {
+        return Err(format!(
+            "{id} trainer: optimizer '{}' is not available on MLX training (supported: adamw, \
+             adam, rose, prodigy)",
+            req.config.optimizer
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl Trainer for WanMoeTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        let id = self.descriptor.id;
-        if req.items.is_empty() {
-            return Err(format!("{id} trainer: dataset is empty").into());
-        }
-        if req.config.rank == 0 {
-            return Err(format!("{id} trainer: rank must be > 0").into());
-        }
-        if !TrainOptimizer::is_supported(&req.config.optimizer) {
-            return Err(format!(
-                "{id} trainer: optimizer '{}' is not available on MLX training (supported: \
-                 adamw, adam, rose, prodigy)",
-                req.config.optimizer
-            )
-            .into());
-        }
-        Ok(())
+        validate_floors(self.descriptor(), req)
     }
 
     fn train(

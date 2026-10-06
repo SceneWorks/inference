@@ -49,6 +49,9 @@
 //!     since sc-4733), so the produced adapter reloads through the Kolors inference path directly
 //!     (validated by `tests/trainer_e2e.rs`).
 
+use std::cell::OnceCell;
+use std::path::PathBuf;
+
 use mlx_gen::sampler::AlphaSchedule;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -260,17 +263,33 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// tree: `tokenizer/ text_encoder/ unet/ vae/`, with the materialized `tokenizer/tokenizer.json`).
 /// Loads the base at **f32** (training needs the dense, high-precision base for clean autograd;
 /// inference runs fp16). Registered via [`mlx_gen::TrainerRegistration`].
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see `LazyKolorsTrainer`.
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(mlx_gen::Error::Msg(
-                "kolors trainer expects a Kolors-diffusers snapshot directory (tokenizer/ \
-                 text_encoder/ unet/ vae/), not a single .safetensors file"
-                    .into(),
-            ))
-        }
-    };
+    snapshot_root(spec)?;
+    Ok(Box::new(LazyKolorsTrainer {
+        descriptor: trainer_descriptor(),
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(
+            "kolors trainer expects a Kolors-diffusers snapshot directory (tokenizer/ \
+             text_encoder/ unet/ vae/), not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer`], run by `LazyKolorsTrainer` on first need.
+fn load_weights(spec: &LoadSpec) -> Result<KolorsTrainer> {
+    let root = snapshot_root(spec)?;
     let dtype = Dtype::Float32;
     let te_w = Weights::from_dir(root.join("text_encoder"))?;
     // bf16 frozen encoder (see the struct field) — half the f32 footprint, matches fp16 inference.
@@ -278,7 +297,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         ChatGlmModel::from_weights(&te_w, ChatGlmConfig::chatglm3_6b(), None, Dtype::Bfloat16)?;
     // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
     te_w.materialize_accessed()?;
-    Ok(Box::new(KolorsTrainer {
+    Ok(KolorsTrainer {
         descriptor: trainer_descriptor(),
         vae: load_vae(root)?, // SDXL VAE (sdxl-vae-fp16-fix), f32
         unet: load_unet_kolors_dtype(root, dtype)?,
@@ -287,7 +306,49 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             chatglm: Some(chatglm),
             schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
         },
-    }))
+    })
+}
+
+/// The registered Kolors trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train`, after every refusal floor.
+struct LazyKolorsTrainer {
+    descriptor: TrainerDescriptor,
+    spec: LoadSpec,
+    loaded: OnceCell<KolorsTrainer>,
+}
+
+impl LazyKolorsTrainer {
+    fn loaded(&self) -> Result<&KolorsTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set(load_weights(&self.spec)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazyKolorsTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        match self.loaded.get() {
+            Some(trainer) => trainer.validate(req),
+            None => validate_floors(&self.descriptor, req),
+        }
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -296,42 +357,47 @@ mlx_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
 }
 
+/// Every weights-free [`Trainer::validate`] floor — the whole of it (none needs the loaded base).
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    if req.items.is_empty() {
+        return Err("kolors trainer: dataset is empty".into());
+    }
+    if req.config.rank == 0 {
+        return Err("kolors trainer: rank must be > 0".into());
+    }
+    // F-023: steps == 0 makes the `1..=steps` loop empty and the run returns `Canceled`. z-image
+    // checks it; mirror (the sdxl-family comment claiming upstream rejection was false).
+    if req.config.steps == 0 {
+        return Err("kolors trainer: steps must be > 0".into());
+    }
+    if !TrainOptimizer::is_supported(&req.config.optimizer) {
+        return Err(format!(
+            "kolors trainer: optimizer '{}' is not available on MLX training (supported: adamw, \
+             adam, rose, prodigy)",
+            req.config.optimizer
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl Trainer for KolorsTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        if req.items.is_empty() {
-            return Err("kolors trainer: dataset is empty".into());
-        }
-        if req.config.rank == 0 {
-            return Err("kolors trainer: rank must be > 0".into());
-        }
-        // F-023: steps == 0 makes the `1..=steps` loop empty and the run returns `Canceled`. z-image
-        // checks it; mirror (the sdxl-family comment claiming upstream rejection was false).
-        if req.config.steps == 0 {
-            return Err("kolors trainer: steps must be > 0".into());
-        }
-        if !TrainOptimizer::is_supported(&req.config.optimizer) {
-            return Err(format!(
-                "kolors trainer: optimizer '{}' is not available on MLX training (supported: \
-                 adamw, adam, rose, prodigy)",
-                req.config.optimizer
-            )
-            .into());
-        }
-        Ok(())
+        validate_floors(self.descriptor(), req)
     }
 
     fn train(

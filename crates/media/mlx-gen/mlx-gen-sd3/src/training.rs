@@ -56,7 +56,8 @@
 //!   the toggle) before the minutes-long caching, converting an uncatchable SIGKILL into an actionable
 //!   error.
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
@@ -266,33 +267,50 @@ fn medium_trainer_descriptor() -> TrainerDescriptor {
 /// snapshot ships bf16, so f32 widens it via [`Sd3Transformer::cast_weights`] and bf16 casts the dense
 /// load. The train loop is variant-agnostic — the `attn2` targets are enumerated by the arch-driven
 /// [`AdaptableHost`], so Medium is covered without a train-loop delta (T4 sc-7885).
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see `LazySd3Trainer`.
 pub fn load_trainer_for(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(
-                "sd3 trainer expects a snapshot directory (transformer/ text_encoder{,_2,_3}/ \
-                 tokenizer{,_2,_3}/ vae/), not a single .safetensors file"
-                    .into(),
-            ))
-        }
-    };
+    snapshot_root(spec)?;
+    Ok(Box::new(LazySd3Trainer {
+        descriptor: trainer_descriptor_for(variant),
+        variant,
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(
+            "sd3 trainer expects a snapshot directory (transformer/ text_encoder{,_2,_3}/ \
+             tokenizer{,_2,_3}/ vae/), not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer_for`], run by `LazySd3Trainer` on first need.
+fn load_weights(spec: &LoadSpec, variant: Sd3Variant) -> Result<Sd3LoraTrainer> {
+    let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
         Precision::Bf16 => Dtype::Bfloat16,
         Precision::Fp32 => Dtype::Float32,
     };
     let arch = variant.arch();
-    let clip_tokenizer = loader::load_clip_tokenizer(&root)?;
-    let clip_pad = loader::load_clip_pad_ids(&root)?;
-    let t5_tokenizer = loader::load_t5_tokenizer(&root)?;
-    let mut encoders = loader::load_text_encoders(&root)?;
+    let clip_tokenizer = loader::load_clip_tokenizer(root)?;
+    let clip_pad = loader::load_clip_pad_ids(root)?;
+    let t5_tokenizer = loader::load_t5_tokenizer(root)?;
+    let mut encoders = loader::load_text_encoders(root)?;
     encoders.quantize(TRAINER_ENCODER_BITS)?;
-    let mut transformer = loader::load_transformer(&root, &arch)?;
+    let mut transformer = loader::load_transformer(root, &arch)?;
     if transformer.compute_dtype() != dtype {
         transformer.cast_weights(dtype)?;
     }
-    let vae = loader::load_vae(&root)?;
-    Ok(Box::new(Sd3LoraTrainer {
+    let vae = loader::load_vae(root)?;
+    Ok(Sd3LoraTrainer {
         descriptor: trainer_descriptor_for(variant),
         clip_tokenizer,
         clip_pad,
@@ -301,7 +319,52 @@ pub fn load_trainer_for(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn 
         transformer,
         vae,
         dtype,
-    }))
+    })
+}
+
+/// The registered SD3.5 trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train` — after every refusal floor — or on a `validate` that must match custom
+/// `lora_target_modules` against the MMDiT.
+struct LazySd3Trainer {
+    descriptor: TrainerDescriptor,
+    variant: Sd3Variant,
+    spec: LoadSpec,
+    loaded: OnceCell<Sd3LoraTrainer>,
+}
+
+impl LazySd3Trainer {
+    fn loaded(&self) -> Result<&Sd3LoraTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set(load_weights(&self.spec, self.variant)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazySd3Trainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // The default targets exist on every SD3.5 base; only custom ones need it loaded.
+        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
+            return validate_floors(&self.descriptor, req);
+        }
+        self.loaded()?.validate(req)
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 /// Construct the SD3.5-**Large** trainer (the default base). See [`load_trainer_for`].
@@ -383,23 +446,29 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for Sd3LoraTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         if resolve_target_paths(&self.transformer, &req.config).is_empty() {
             return Err(format!(
                 "sd3 trainer: lora_target_modules {:?} matched no adaptable module on the SD3 MMDiT \

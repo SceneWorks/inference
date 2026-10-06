@@ -49,6 +49,7 @@
 //! where `σ = 1` is noise); the static schedule shift is a *sampling-time* schedule warp and is
 //! **not** applied during training, matching the sibling.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -402,7 +403,22 @@ fn preflight_aux_memory(edge: u32, extra_gb: f64, safe_gb: f64) -> Result<()> {
 /// Construct the trainer from a diffusers snapshot directory (`text_encoder/ transformer/ vae/`). No
 /// quantization — training needs the dense base. The VAE is loaded with its **encoder** (latent prep)
 /// and decoder (preview samples). Registered via [`mlx_gen::register_trainer`].
+///
+/// The weights load lazily (sc-2124): construction resolves and checks the component dirs (config
+/// files only), so `validate` and `train`'s refusal floors never read weights; see
+/// `LazyMageTrainer`.
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    component_dirs(spec)?;
+    Ok(Box::new(LazyMageTrainer {
+        descriptor: trainer_descriptor(),
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The dense component dirs a trainer spec resolves to — a single file, an unknown component and a
+/// pre-quantized tier are refused (`config.json` reads only, no weights).
+fn component_dirs(spec: &LoadSpec) -> Result<crate::MageComponentDirs> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
@@ -437,7 +453,13 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             )));
         }
     }
-    Ok(Box::new(MageFlowTrainer {
+    Ok(dirs)
+}
+
+/// The weight load behind [`load_trainer`], run by `LazyMageTrainer` on first need.
+fn load_weights(spec: &LoadSpec) -> Result<MageFlowTrainer> {
+    let dirs = component_dirs(spec)?;
+    Ok(MageFlowTrainer {
         descriptor: trainer_descriptor(),
         text_encoder: Some(crate::text_encoder::load_dir(&dirs.text_encoder)?),
         vae: crate::vae::load(&dirs.vae, VaePart::Both, Dtype::Bfloat16)?,
@@ -449,7 +471,54 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         // encoder and VAE are shared co-requisites staged from elsewhere, so `root` alone no longer
         // determines where the checkpoint lives.
         transformer_dir: dirs.transformer,
-    }))
+    })
+}
+
+/// The registered Mage trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train` — after every refusal floor — or on a `validate` that must match custom
+/// `lora_target_modules` against the DiT.
+struct LazyMageTrainer {
+    descriptor: TrainerDescriptor,
+    spec: LoadSpec,
+    loaded: OnceCell<MageFlowTrainer>,
+}
+
+impl LazyMageTrainer {
+    fn loaded(&self) -> Result<&MageFlowTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set(load_weights(&self.spec)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazyMageTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // The default targets exist on every Mage base and a full fine-tune matches none; only
+        // custom LoRA/LoKr targets need the loaded base.
+        if self.loaded.get().is_none()
+            && (req.config.full_finetune || req.config.lora_target_modules.is_empty())
+        {
+            return validate_floors(&self.descriptor, req);
+        }
+        self.loaded()?.validate(req)
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -551,25 +620,31 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor: a LoRA-only trainer must reject a control-branch request
+    // (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056). This trainer advertises
+    // `supports_full_finetune`, so the floor is a pass-through here — it is routed through
+    // anyway so the capability claim and the acceptance stay one fact (and the conformance
+    // suite's validate-honesty check exercises the same seam for every family).
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for MageFlowTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor: a LoRA-only trainer must reject a control-branch request
-        // (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056). This trainer advertises
-        // `supports_full_finetune`, so the floor is a pass-through here — it is routed through
-        // anyway so the capability claim and the acceptance stay one fact (and the conformance
-        // suite's validate-honesty check exercises the same seam for every family).
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         // `lora_target_modules` only scopes the LoRA/LoKr adapter; a full base fine-tune trains every
         // DiT weight, so the target-resolution guard below does not apply to it.
         if !req.config.full_finetune {

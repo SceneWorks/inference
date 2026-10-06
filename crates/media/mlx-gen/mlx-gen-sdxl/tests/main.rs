@@ -111,3 +111,6 @@ mod unified_sampler_smoke;
 
 #[path = "vae_real_weights.rs"]
 mod vae_real_weights;
+
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;

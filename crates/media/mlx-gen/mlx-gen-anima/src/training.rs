@@ -49,6 +49,7 @@
 //! LoKr is saved by the shared [`save_lokr`] in the bare-path `lokr_*` convention the sc-10521 LoKr
 //! path consumes. Both reconstruct the residual at **bf16** to match the inference loader.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
@@ -402,8 +403,19 @@ fn load_variant_trainer(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Tra
             "{id} trainer: training needs the dense base; quantized tiers are not trainable"
         )));
     }
+    // The weights load lazily (sc-2124): `validate` and `train`'s refusal floors never read them.
+    Ok(Box::new(LazyAnimaTrainer {
+        descriptor: trainer_descriptor_for(variant),
+        variant,
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The weight load behind [`load_variant_trainer`], run by `LazyAnimaTrainer` on first need.
+fn load_weights(spec: &LoadSpec, variant: Variant) -> Result<AnimaTrainer> {
     let components = AnimaComponents::load(&spec.weights, variant)?;
-    Ok(Box::new(AnimaTrainer {
+    Ok(AnimaTrainer {
         descriptor: trainer_descriptor_for(variant),
         variant,
         tokenizers: components.tokenizers,
@@ -411,7 +423,52 @@ fn load_variant_trainer(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Tra
         vae: components.vae,
         dit: components.dit,
         conditioner: components.conditioner,
-    }))
+    })
+}
+
+/// The registered Anima trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train` — after every refusal floor — or on a `validate` that must match custom
+/// `lora_target_modules` against the DiT/conditioner.
+struct LazyAnimaTrainer {
+    descriptor: TrainerDescriptor,
+    variant: Variant,
+    spec: LoadSpec,
+    loaded: OnceCell<AnimaTrainer>,
+}
+
+impl LazyAnimaTrainer {
+    fn loaded(&self) -> Result<&AnimaTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set(load_weights(&self.spec, self.variant)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazyAnimaTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // The default targets exist on every Anima base; only custom ones need it loaded.
+        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
+            return validate_floors(&self.descriptor, req);
+        }
+        self.loaded()?.validate(req)
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 // Explicit trainer registration constants for all three variants.
@@ -426,23 +483,29 @@ mlx_gen::register_trainer! {
     pub(crate) const TURBO_TRAINER_REGISTRATION = trainer_descriptor_turbo => load_trainer_turbo
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for AnimaTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         if resolve_target_paths(&self.dit, &self.conditioner, &req.config).is_empty() {
             return Err(format!(
                 "anima trainer: lora_target_modules {:?} matched no adaptable module on the DiT or \
