@@ -812,6 +812,9 @@ impl Trainer for SdxlTrainer {
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        // Shared control-training floor (F-006/F-055): no control branch, so a `control_type`
+        // request is a typed reject, never silently trained as a plain adapter.
+        gen_core::train::validate_control_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
@@ -827,6 +830,9 @@ impl Trainer for SdxlTrainer {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        // Every other `validate` floor too (control / full fine-tune / edit), so a caller that
+        // skips `validate` cannot train a request it would refuse.
+        self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }

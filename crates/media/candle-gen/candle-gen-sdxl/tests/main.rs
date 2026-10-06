@@ -23,5 +23,8 @@ mod preview_real_weights;
 #[path = "trainer_e2e.rs"]
 mod trainer_e2e;
 
+#[path = "trainer_weights_free.rs"]
+mod trainer_weights_free;
+
 #[path = "vae_decoder_parity.rs"]
 mod vae_decoder_parity;

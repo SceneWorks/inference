@@ -333,7 +333,9 @@ impl Trainer for KreaControlTrainer {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.validate_inner(req)?;
+        // Every other `validate` floor too (full fine-tune / edit / the control preconditions), so
+        // a caller that skips `validate` cannot train a request it would refuse.
+        self.validate(req)?;
         self.train_inner(req, on_progress).map_err(Into::into)
     }
 }
