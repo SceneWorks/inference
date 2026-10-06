@@ -2546,14 +2546,15 @@ mod depth_anchoring_tests {
     }
 
     /// Review blocker, through the real step seam: with N = 2 and N = 4 images and `every_n = 2`,
-    /// every image gets at least one diffusion step and one depth step within 2·N steps (a
-    /// global-step key would lock even images to diffusion and odd images to depth). Mutation: key
-    /// the plan on the global step (`path.plan(step, …)`) ⇒ red.
+    /// every image gets at least one diffusion step and one depth step within 3 periods = 3·N steps
+    /// (a bare global-step key would lock even images to diffusion and odd images to depth; the
+    /// period-drifting window key flips each slot within any 3 periods). Mutation: drop the period
+    /// drift ⇒ red.
     #[test]
     fn every_image_gets_diffusion_and_depth_steps() {
         for n in [2u64, 4] {
             let cache = cache_n(n);
-            let kinds = run_kinds(&cache, 1, 2 * n as u32);
+            let kinds = run_kinds(&cache, 1, 3 * n as u32);
             for image in 0..n as usize {
                 let mine: Vec<bool> = kinds
                     .iter()
