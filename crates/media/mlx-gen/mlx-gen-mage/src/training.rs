@@ -785,7 +785,14 @@ impl MageFlowTrainer {
         // alternation keyed on the real dataset item; a resumed run replays the skipped prefix so
         // the phase matches.
         let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, start_step)?),
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                &schedule,
+                accum,
+                start_step,
+                &req.cancel,
+            )?),
             None => None,
         };
         let mut accumulated: Option<LoraParams> = None;
@@ -1533,6 +1540,7 @@ fn aux_driver(
     schedule: &BucketSchedule,
     accum: u32,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
         path,
@@ -1541,6 +1549,7 @@ fn aux_driver(
         schedule,
         accum,
         start_step,
+        cancel,
     )
 }
 
@@ -2834,7 +2843,15 @@ mod depth_anchoring_tests {
 
     fn prepared(cache: &[CachedSample], channels: i32) -> AuxDriver {
         let p = mlx_gen_perceptual::testing::tiny_depth_path(channels, schedule()).unwrap();
-        aux_driver(p, cache, &single_bucket(cache.len()), 1, 0).unwrap()
+        aux_driver(
+            p,
+            cache,
+            &single_bucket(cache.len()),
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]

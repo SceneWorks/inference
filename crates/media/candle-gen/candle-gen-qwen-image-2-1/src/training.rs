@@ -712,6 +712,18 @@ pub fn check_training_footprint(
     shape: &TrainingShape,
     budget_bytes: u64,
 ) -> Result<()> {
+    check_training_footprint_with(facts, shape, budget_bytes, &[])
+}
+
+/// [`check_training_footprint`] naming the run's enabled auxiliary losses (`aux_losses`, epic 2123
+/// E7 — `gen_core::train::enabled_aux_losses`) in the advice when their models are part of the
+/// refused figure, so the user knows which to turn off.
+pub fn check_training_footprint_with(
+    facts: &FootprintFacts,
+    shape: &TrainingShape,
+    budget_bytes: u64,
+    aux_losses: &[&str],
+) -> Result<()> {
     let fp = training_footprint(facts, shape);
     let peak = fp.peak();
     if peak <= budget_bytes {
@@ -756,8 +768,13 @@ pub fn check_training_footprint(
         advice.push("turn off preview samples (frees the VAE decoder)".to_string());
     }
     if shape.perceptual_bytes > 0 {
+        let named = if aux_losses.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", aux_losses.join(", "))
+        };
         advice.push(format!(
-            "turn off the perceptual losses or use the Small depth model (~{:.1} GiB of \
+            "turn off the perceptual losses{named} or use the Small depth model (~{:.1} GiB of \
              auxiliary models)",
             gib(shape.perceptual_bytes)
         ));
@@ -2180,7 +2197,12 @@ impl QwenImage21Trainer {
         let budget = self
             .memory_budget_override
             .unwrap_or_else(|| device_budget_bytes(&device));
-        check_training_footprint(&self.facts, &shape, budget)?;
+        check_training_footprint_with(
+            &self.facts,
+            &shape,
+            budget,
+            &gen_core::train::enabled_aux_losses(cfg),
+        )?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
@@ -2377,6 +2399,7 @@ impl QwenImage21Trainer {
                 &schedule,
                 accum,
                 start_step,
+                &req.cancel,
             )?),
             None => None,
         };
@@ -5747,7 +5770,16 @@ mod tests {
                     .unwrap();
             let sched = BucketSchedule::new(1, &[], 3);
             let clean = target_decoder_latent(x0, layout).unwrap();
-            let d = AuxDriver::prepare(path, 1, |_| Ok(clean.clone()), &sched, 1, 0).unwrap();
+            let d = AuxDriver::prepare(
+                path,
+                1,
+                |_| Ok(clean.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             (d, sched)
         }
 
@@ -5881,7 +5913,16 @@ mod tests {
             .unwrap();
             let sched = BucketSchedule::new(1, &[], 3);
             let clean = Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu).unwrap();
-            let mut d = AuxDriver::prepare(path, 1, |_| Ok(clean.clone()), &sched, 1, 0).unwrap();
+            let mut d = AuxDriver::prepare(
+                path,
+                1,
+                |_| Ok(clean.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             let _ = d.sample(1, &sched);
             let (got, aux) = plan_t(&d.sample(2, &sched), 0.1).unwrap();
             let aux = aux.expect("a perceptual path plans the step");
@@ -5992,6 +6033,12 @@ mod tests {
                     .unwrap_err()
                     .to_string();
                 assert!(e.contains("perceptual losses"), "ckpt={checkpointed}: {e}");
+                // E7 (feature-end review round 2): the advice names the enabled aux losses.
+                // Mutation: drop the `named` list from the advice ⇒ red.
+                let e = check_training_footprint_with(&facts, &with, budget, &["depth"])
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("[depth]"), "ckpt={checkpointed}: {e}");
             }
         }
 

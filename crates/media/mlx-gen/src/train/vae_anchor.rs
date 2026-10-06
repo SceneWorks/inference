@@ -45,10 +45,10 @@ use crate::{Error, Result};
 pub const VAE_ANCHOR_LEVELS: [&str; 5] = ["level_0", "level_1", "level_2", "level_3", "mid"];
 /// Upstream `compute_loss` default per-level weights (higher-resolution levels weigh more).
 pub const VAE_ANCHOR_LEVEL_WEIGHTS: [f32; 5] = [4.0, 2.0, 1.0, 1.0, 1.0];
-const GN_GROUPS: i32 = 32;
-const GN_EPS: f32 = 1e-6;
+pub(crate) const GN_GROUPS: i32 = 32;
+pub(crate) const GN_EPS: f32 = 1e-6;
 /// `F.cosine_similarity` default `eps` (each norm is clamped to at least this).
-const COS_EPS: f32 = 1e-8;
+pub(crate) const COS_EPS: f32 = 1e-8;
 const RESNETS_PER_LEVEL: usize = 2;
 
 /// Width of the FLUX.2 VAE encoder whose features the loss taps.

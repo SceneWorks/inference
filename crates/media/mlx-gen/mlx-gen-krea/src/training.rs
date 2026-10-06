@@ -638,7 +638,14 @@ impl KreaRawTrainer {
         // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on
         // the real dataset item. A resumed run replays the skipped prefix so the phase matches.
         let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, start_step)?),
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                &schedule,
+                accum,
+                start_step,
+                &req.cancel,
+            )?),
             None => None,
         };
         let mut accumulated: Option<LoraParams> = None;
@@ -866,6 +873,7 @@ fn aux_driver(
     schedule: &BucketSchedule,
     accum: u32,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
         path,
@@ -874,6 +882,7 @@ fn aux_driver(
         schedule,
         accum,
         start_step,
+        cancel,
     )
 }
 
@@ -961,7 +970,8 @@ fn check_preflight_budget_with(
     checkpointed: bool,
 ) -> Result<()> {
     if !checkpointed {
-        return check_preflight_budget_extra(edge, bf16, budget_gb, extra_gb);
+        return check_preflight_budget_extra(edge, bf16, budget_gb, extra_gb)
+            .map_err(|e| mlx_gen_perceptual::name_aux_losses(e, cfg, extra_gb));
     }
     let projected = checkpointed_baseline_gb(bf16) + extra_gb;
     let safe = budget_gb * 0.85;
@@ -2070,7 +2080,15 @@ mod depth_anchoring_tests {
     #[test]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
-        let d = aux_driver(path(), &cache_of(&f.x0, &f.context, 1), &one_item(), 1, 0).unwrap();
+        let d = aux_driver(
+            path(),
+            &cache_of(&f.x0, &f.context, 1),
+            &one_item(),
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let p = d.into_path();
         for ckpt in [false, true] {
             let plan = p.plan(1, 0, 0.5).unwrap();
@@ -2145,7 +2163,15 @@ mod depth_anchoring_tests {
         for (k, v) in &g_legacy {
             assert_eq!(bits(v), bits(&g_off[k]), "{k}");
         }
-        let d = aux_driver(path(), &cache_of(&f.x0, &f.context, 1), &one_item(), 1, 0).unwrap();
+        let d = aux_driver(
+            path(),
+            &cache_of(&f.x0, &f.context, 1),
+            &one_item(),
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let p = d.into_path();
         let plan = p.plan(1, 0, 0.5).unwrap();
         let (on, g_on) = step(
@@ -2185,7 +2211,7 @@ mod depth_anchoring_tests {
         ];
         let cache = cache_of(&f.x0, &f.context, items * buckets.len());
         let schedule = BucketSchedule::new(items, &buckets, 7);
-        let mut d = aux_driver(path(), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(path(), &cache, &schedule, 1, 0, &Default::default()).unwrap();
         let steps = 2 * schedule.epoch_len() as u32;
         let mut kinds = Vec::new();
         for s in 1..=steps {
@@ -2223,7 +2249,15 @@ mod depth_anchoring_tests {
         let dense = projected_dense_peak_gb(dense_tokens, true);
         let between = |base: f64| (base + large / 2.0) / 0.85;
         assert!(check_preflight_budget_with(&on, 512, true, between(dense), 0.0, false).is_ok());
-        assert!(check_preflight_budget_with(&on, 512, true, between(dense), large, false).is_err());
+        // The dense refusal names the enabled aux losses too (feature-end review round 2).
+        // Mutation: drop the `name_aux_losses` wrap on the dense branch ⇒ red.
+        let err = check_preflight_budget_with(&on, 512, true, between(dense), large, false)
+            .expect_err("dense depth job over budget")
+            .to_string();
+        assert!(
+            err.contains("dense first training step") && err.contains("[depth]"),
+            "{err}"
+        );
         let ck = checkpointed_baseline_gb(true);
         assert!(check_preflight_budget_with(&on, 512, true, between(ck), 0.0, true).is_ok());
         let err = check_preflight_budget_with(&on, 512, true, between(ck), large, true)

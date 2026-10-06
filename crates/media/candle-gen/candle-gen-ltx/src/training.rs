@@ -5110,8 +5110,16 @@ mod depth_anchoring_tests {
             }],
             7,
         );
-        let d =
-            AuxDriver::prepare(path(), 1, |_| ltx23_latent_nchw(&f.clean), &sched, 1, 0).unwrap();
+        let d = AuxDriver::prepare(
+            path(),
+            1,
+            |_| ltx23_latent_nchw(&f.clean),
+            &sched,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         (d, sched)
     }
 
@@ -5507,6 +5515,7 @@ mod ltx25_depth_anchoring_tests {
             &sched,
             1,
             0,
+            &Default::default(),
         )
         .unwrap();
         (d, sched)

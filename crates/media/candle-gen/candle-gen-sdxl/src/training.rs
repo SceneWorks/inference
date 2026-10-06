@@ -1063,6 +1063,7 @@ impl SdxlTrainer {
                 &schedule,
                 accum,
                 0,
+                &req.cancel,
             )?),
             None => None,
         };
@@ -1787,7 +1788,16 @@ mod tests {
                 .unwrap();
             let sched = BucketSchedule::new(1, &[], 3);
             let x0 = f.x0.clone();
-            let d = AuxDriver::prepare(path, 1, |_| Ok(x0.clone()), &sched, 1, 0).unwrap();
+            let d = AuxDriver::prepare(
+                path,
+                1,
+                |_| Ok(x0.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             (d, sched)
         }
 
@@ -1932,7 +1942,16 @@ mod tests {
             .unwrap();
             let sched = BucketSchedule::new(1, &[], 3);
             let clean = Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu).unwrap();
-            let mut d = AuxDriver::prepare(path, 1, |_| Ok(clean.clone()), &sched, 1, 0).unwrap();
+            let mut d = AuxDriver::prepare(
+                path,
+                1,
+                |_| Ok(clean.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             let _ = d.sample(1, &sched);
             let (got, aux) = plan_timestep(&d.sample(2, &sched), 100).unwrap();
             let aux = aux.expect("a perceptual path plans the step");

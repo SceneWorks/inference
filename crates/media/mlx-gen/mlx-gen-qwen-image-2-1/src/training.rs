@@ -553,6 +553,18 @@ pub fn check_training_footprint(
     shape: &TrainingShape,
     budget_bytes: u64,
 ) -> Result<()> {
+    check_training_footprint_with(facts, shape, budget_bytes, &[])
+}
+
+/// [`check_training_footprint`] naming the run's enabled auxiliary losses (`aux_losses`, epic 2123
+/// E7 — `gen_core::train::enabled_aux_losses`) in the advice when their models are part of the
+/// refused figure, so the user knows which to turn off.
+pub fn check_training_footprint_with(
+    facts: &FootprintFacts,
+    shape: &TrainingShape,
+    budget_bytes: u64,
+    aux_losses: &[&str],
+) -> Result<()> {
     let fp = training_footprint(facts, shape);
     let peak = fp.peak();
     if peak <= budget_bytes {
@@ -589,6 +601,14 @@ pub fn check_training_footprint(
     ));
     if shape.sampling {
         advice.push("turn off preview samples (frees the VAE decoder)".to_string());
+    }
+    if shape.aux_model_bytes > 0 && !aux_losses.is_empty() {
+        advice.push(format!(
+            "disable one of the enabled auxiliary losses [{}] (~{:.1} GiB of training-time \
+             models) or choose a smaller auxiliary model",
+            aux_losses.join(", "),
+            gib(shape.aux_model_bytes)
+        ));
     }
     advice.push("lower the rank".to_string());
     Err(Error::Msg(format!(
@@ -1737,6 +1757,7 @@ fn aux_driver(
     schedule: &BucketSchedule,
     accum: u32,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
         path,
@@ -1745,6 +1766,7 @@ fn aux_driver(
         schedule,
         accum,
         start_step,
+        cancel,
     )
 }
 
@@ -2123,7 +2145,12 @@ impl QwenImage21Trainer {
                 .unwrap_or(usize::MAX),
             ),
         );
-        check_training_footprint(&self.facts, &shape, budget)?;
+        check_training_footprint_with(
+            &self.facts,
+            &shape,
+            budget,
+            &gen_core::train::enabled_aux_losses(cfg),
+        )?;
         // Bound MLX's freed-buffer pool for the rest of the run to the derived working set above
         // the DiT. Unbounded, the allocator pools every freed buffer up to ~0.95 x the device's
         // recommended working set, so the process footprint the OS sees climbs to that pool line
@@ -2400,7 +2427,14 @@ impl QwenImage21Trainer {
         // the real dataset item (not the (item, bucket) entry). A resumed run replays the skipped
         // prefix so the phase matches.
         let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, start_step)?),
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                &schedule,
+                accum,
+                start_step,
+                &Default::default(),
+            )?),
             None => None,
         };
         let mut accumulated: Option<LoraParams> = None;
@@ -5089,7 +5123,15 @@ mod depth_anchoring_tests {
                     t2i_entry(4, 4, 1)
                 }];
                 let schedule = single_bucket(1);
-                let mut d = aux_driver(path_with(aux_sched()), &cache, &schedule, 1, 0).unwrap();
+                let mut d = aux_driver(
+                    path_with(aux_sched()),
+                    &cache,
+                    &schedule,
+                    1,
+                    0,
+                    &Default::default(),
+                )
+                .unwrap();
                 let tag = format!("edit={edit} ckpt={ckpt}");
                 let (diff, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, ckpt);
                 assert_eq!(diff.aux, None, "{tag}");
@@ -5121,7 +5163,15 @@ mod depth_anchoring_tests {
         let mut f = fixture(&cfg);
         let cache = vec![edit_entry(1)];
         let schedule = single_bucket(1);
-        let mut d = aux_driver(path_with(window), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(window),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, false);
         let (depth, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, false);
         let raw = sample_sigma(
@@ -5182,7 +5232,15 @@ mod depth_anchoring_tests {
         let mut f = fixture(&cfg);
         let cache = vec![t2i_entry(4, 4, 1), t2i_entry(4, 4, 2)];
         let schedule = single_bucket(2);
-        let mut d = aux_driver(path_with(aux_sched()), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let kinds: Vec<(usize, bool)> = (1..=4)
             .map(|n| {
                 let (l, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), n, false);
@@ -5215,7 +5273,15 @@ mod depth_anchoring_tests {
             ],
             7,
         );
-        let mut d = aux_driver(path_with(aux_sched()), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let mut replay = mlx_gen::train::perceptual::AuxAlternation::new(2, 1);
         let mut depth_off_item = false;
         for n in 1..=2 * schedule.epoch_len() as u32 {
@@ -5332,7 +5398,15 @@ mod depth_anchoring_tests {
         }
         let on_cfg = cfg();
         let mut f2 = fixture(&on_cfg);
-        let mut d = aux_driver(path_with(aux_sched()), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let (on1, g_on1) = step(&mut f2, &on_cfg, &cache, &schedule, Some(&mut d), 1, false);
         let mut f3 = fixture(&on_cfg);
         let (none1, g_none1) = step(&mut f3, &on_cfg, &cache, &schedule, None, 1, false);
@@ -5400,6 +5474,15 @@ mod depth_anchoring_tests {
             assert!(
                 check_training_footprint(&facts, &with_aux, between).is_err(),
                 "checkpointed={checkpointed}"
+            );
+            // E7 (feature-end review round 2): the refusal names the enabled aux losses. Mutation:
+            // drop the aux-loss advice item ⇒ red.
+            let err = check_training_footprint_with(&facts, &with_aux, between, &["depth"])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[depth]"),
+                "checkpointed={checkpointed}: {err}"
             );
         }
     }

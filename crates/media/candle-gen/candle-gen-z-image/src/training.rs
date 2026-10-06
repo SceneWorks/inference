@@ -1279,7 +1279,16 @@ mod tests {
                     .unwrap();
             let sched = gen_core::BucketSchedule::new(1, &[], 3);
             let x0 = f.x0.clone();
-            let d = AuxDriver::prepare(path, 1, |_| Ok(x0.clone()), &sched, 1, 0).unwrap();
+            let d = AuxDriver::prepare(
+                path,
+                1,
+                |_| Ok(x0.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             (d, sched)
         }
 

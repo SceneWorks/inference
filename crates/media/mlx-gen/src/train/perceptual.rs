@@ -28,7 +28,8 @@
 //! ```text
 //! let path = PerceptualPath::new(Some(Box::new(taef1)), vec![AuxLoss { schedule, loss }])?;
 //! // every entry's reference once, alternation over the schedule's items, resume replayed:
-//! let mut driver = AuxDriver::prepare(path, cache.len(), |e| clean_nchw(e), &schedule, accum, start)?;
+//! let mut driver =
+//!     AuxDriver::prepare(path, cache.len(), |e| clean_nchw(e), &schedule, accum, start, &req.cancel)?;
 //! // per micro-step (the bucket schedule picks the item and its cache entry):
 //! let sample = driver.sample(step, &schedule);
 //! let step = sample.plan(sampled_sigma)?.expect("a driver plans every step");
@@ -429,6 +430,7 @@ impl AuxDriver {
         schedule: &gen_core::BucketSchedule,
         accum: u32,
         start_step: u32,
+        cancel: &gen_core::runtime::CancelFlag,
     ) -> Result<Self> {
         Self::prepare_keyed(
             path,
@@ -438,6 +440,7 @@ impl AuxDriver {
             accum,
             start_step,
             |step| schedule.sample((step - 1) as usize).0,
+            cancel,
         )
     }
 
@@ -445,6 +448,7 @@ impl AuxDriver {
     /// schedule walk (Wan's interleaved experts, LTX-2.5's round-robin): `items` dataset items,
     /// `window` micro-steps per alternation window, and `item_of(step)` the real dataset item of
     /// 1-based micro-step `step` (replayed for `1..=start_step`).
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_keyed(
         mut path: PerceptualPath,
         n_entries: usize,
@@ -453,8 +457,14 @@ impl AuxDriver {
         window: u32,
         start_step: u32,
         item_of: impl Fn(u32) -> usize,
+        cancel: &gen_core::runtime::CancelFlag,
     ) -> Result<Self> {
         for entry in 0..n_entries {
+            // A cancel during the (per-entry decode + frozen-model) reference build stops here,
+            // before any DiT work.
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             path.ensure_reference(entry, &clean(entry)?)?;
         }
         let mut alternation = AuxAlternation::new(items, window);
@@ -918,6 +928,32 @@ mod tests {
         gen_core::BucketSchedule::new(3, &buckets, 7)
     }
 
+    /// A cancel tripped during the reference build stops it between entries with a typed
+    /// `Canceled` — no further entry is decoded, so no DiT work follows (feature-end review round
+    /// 2). Mutation: drop the per-entry `cancel` check ⇒ all 6 entries build and `prepare` succeeds
+    /// ⇒ red.
+    #[test]
+    fn aux_driver_prepare_stops_on_cancel_between_entries() {
+        let schedule = two_bucket_schedule();
+        let cancel = gen_core::runtime::CancelFlag::default();
+        let mut calls = 0;
+        let result = AuxDriver::prepare(
+            entry_path(),
+            6,
+            |e| {
+                calls += 1;
+                cancel.cancel();
+                entry_latent(e)
+            },
+            &schedule,
+            1,
+            0,
+            &cancel,
+        );
+        assert!(matches!(result, Err(Error::Canceled)), "{:?}", result.err());
+        assert_eq!(calls, 1, "the build stopped at the next entry");
+    }
+
     /// [`AuxDriver::prepare`] builds every item-major entry's reference exactly once, each from its
     /// OWN entry's clean latent (the aux term on entry `e`'s live latent `e` is zero). Mutations:
     /// build only `0..n_entries - 1` ⇒ entry 5 has no reference ⇒ red; call `clean` twice per
@@ -936,6 +972,7 @@ mod tests {
             &schedule,
             1,
             0,
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(calls, 6);
@@ -956,7 +993,16 @@ mod tests {
     #[test]
     fn aux_driver_keys_the_alternation_on_the_real_item() {
         let schedule = two_bucket_schedule();
-        let mut d = AuxDriver::prepare(entry_path(), 6, entry_latent, &schedule, 1, 0).unwrap();
+        let mut d = AuxDriver::prepare(
+            entry_path(),
+            6,
+            entry_latent,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let mut visits = [0u32; 3];
         let mut aux_on_bucket1 = false;
         for step in 1..=36u32 {
@@ -997,8 +1043,16 @@ mod tests {
     fn aux_driver_resume_replays_the_alternation_prefix() {
         let schedule = two_bucket_schedule();
         let plans = |start: u32| {
-            let mut d =
-                AuxDriver::prepare(entry_path(), 6, entry_latent, &schedule, 2, start).unwrap();
+            let mut d = AuxDriver::prepare(
+                entry_path(),
+                6,
+                entry_latent,
+                &schedule,
+                2,
+                start,
+                &Default::default(),
+            )
+            .unwrap();
             (start + 1..=24)
                 .map(|step| {
                     let s = d.sample(step, &schedule);
@@ -1013,9 +1067,17 @@ mod tests {
 
         let item_of = |s: u32| (s as usize - 1) % 3;
         let keys = |start: u32| {
-            let mut d =
-                AuxDriver::prepare_keyed(entry_path(), 3, entry_latent, 3, 2, start, item_of)
-                    .unwrap();
+            let mut d = AuxDriver::prepare_keyed(
+                entry_path(),
+                3,
+                entry_latent,
+                3,
+                2,
+                start,
+                item_of,
+                &Default::default(),
+            )
+            .unwrap();
             (start + 1..=12)
                 .map(|step| d.key(step, item_of(step)))
                 .collect::<Vec<_>>()

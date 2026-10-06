@@ -503,6 +503,7 @@ impl AnimaTrainer {
                 &schedule,
                 accum,
                 0,
+                &req.cancel,
             )?),
             None => None,
         };
@@ -922,7 +923,16 @@ mod depth_anchoring_tests {
             }],
             7,
         );
-        let d = AuxDriver::prepare(path(), 1, |_| latent_frames_nchw(&f.x0), &sched, 1, 0).unwrap();
+        let d = AuxDriver::prepare(
+            path(),
+            1,
+            |_| latent_frames_nchw(&f.x0),
+            &sched,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         (d, sched)
     }
 
@@ -965,7 +975,16 @@ mod depth_anchoring_tests {
         .unwrap();
         let sched = BucketSchedule::new(1, &[], 3);
         let clean = Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu).unwrap();
-        let mut d = AuxDriver::prepare(path, 1, |_| Ok(clean.clone()), &sched, 1, 0).unwrap();
+        let mut d = AuxDriver::prepare(
+            path,
+            1,
+            |_| Ok(clean.clone()),
+            &sched,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let _ = d.sample(1, &sched);
         let (got, aux) = plan_sigma(&d.sample(2, &sched), 0.1).unwrap();
         let aux = aux.expect("a perceptual path plans the step");

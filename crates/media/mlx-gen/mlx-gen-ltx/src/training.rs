@@ -2882,6 +2882,7 @@ impl LtxTrainer {
                 &schedule,
                 accum,
                 start_step,
+                &Default::default(),
             )?),
             None => None,
         };
@@ -3215,7 +3216,13 @@ impl LtxTrainer {
         // sc-24830: each example's depth reference (its clean video frames decoded → DA2) once,
         // and per-example alternation keys (resume replays the skipped prefix).
         let mut aux_driver = match perceptual {
-            Some(path) => Some(ltx25_aux_driver(path, &cached, accumulation, start_step)?),
+            Some(path) => Some(ltx25_aux_driver(
+                path,
+                &cached,
+                accumulation,
+                start_step,
+                &Default::default(),
+            )?),
             None => None,
         };
         let mut accumulated: Option<LoraParams> = None;
@@ -3441,6 +3448,7 @@ fn ltx25_aux_driver(
     cached: &[CachedLtx25Example],
     accumulation: u32,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     let n = cached.len();
     AuxDriver::prepare_keyed(
@@ -3461,6 +3469,7 @@ fn ltx25_aux_driver(
         accumulation,
         start_step,
         |s| (s as usize - 1) % n,
+        cancel,
     )
 }
 
@@ -3510,6 +3519,7 @@ fn aux_driver(
     schedule: &BucketSchedule,
     accum: u32,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
         path,
@@ -3518,6 +3528,7 @@ fn aux_driver(
         schedule,
         accum,
         start_step,
+        cancel,
     )
 }
 
@@ -4593,14 +4604,18 @@ fn preflight_memory_guard_with_budget(
     }
     if projected > safe {
         let px = latent_edge * SPATIAL_SCALE as usize;
-        return Err(format!(
-            "ltx_2_3 trainer: a dense first training step at resolution {px} needs ~{projected:.0} GB \
-             (the forward working set materializes in one allocation), exceeding this machine's ~{safe:.0} GB \
-             safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS would hard-kill the \
-             worker (SIGKILL) at the first step with no recoverable error (sc-4874/sc-4942). Enable Gradient \
-             Checkpointing (recomputes block activations in the backward) or reduce the training resolution."
-        )
-        .into());
+        return Err(mlx_gen_perceptual::name_aux_losses(
+            format!(
+                "ltx_2_3 trainer: a dense first training step at resolution {px} needs ~{projected:.0} GB \
+                 (the forward working set materializes in one allocation), exceeding this machine's ~{safe:.0} GB \
+                 safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS would hard-kill the \
+                 worker (SIGKILL) at the first step with no recoverable error (sc-4874/sc-4942). Enable Gradient \
+                 Checkpointing (recomputes block activations in the backward) or reduce the training resolution."
+            )
+            .into(),
+            cfg,
+            extra_gb,
+        ));
     }
     Ok(())
 }
@@ -6535,7 +6550,16 @@ mod depth_anchoring_tests {
     #[test]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
-        let d = aux_driver(path(), &cache_of(&f, 1), &[LE], &one_item(), 1, 0).unwrap();
+        let d = aux_driver(
+            path(),
+            &cache_of(&f, 1),
+            &[LE],
+            &one_item(),
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let p = d.into_path();
         for ckpt in [false, true] {
             let plan = p.plan(1, 0, 0.5).unwrap();
@@ -6598,7 +6622,16 @@ mod depth_anchoring_tests {
         for (k, v) in &g_legacy {
             assert_eq!(bits(v), bits(&g_off[k]), "{k}");
         }
-        let d = aux_driver(path(), &cache_of(&f, 1), &[LE], &one_item(), 1, 0).unwrap();
+        let d = aux_driver(
+            path(),
+            &cache_of(&f, 1),
+            &[LE],
+            &one_item(),
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let p = d.into_path();
         let plan = p.plan(1, 0, 0.5).unwrap();
         let (on, g_on) = step(&mut f, 0.5, false, aux(&p, &plan));
@@ -6655,7 +6688,8 @@ mod depth_anchoring_tests {
             .collect();
         drop(f);
         let schedule = BucketSchedule::new(items, &buckets, 7);
-        let mut d = aux_driver(path(), &cache, &edges, &schedule, 1, 0).unwrap();
+        let mut d =
+            aux_driver(path(), &cache, &edges, &schedule, 1, 0, &Default::default()).unwrap();
         assert_eq!(d.path().reference_computations(), cache.len());
         let steps = 2 * schedule.epoch_len() as u32;
         let mut kinds = Vec::new();

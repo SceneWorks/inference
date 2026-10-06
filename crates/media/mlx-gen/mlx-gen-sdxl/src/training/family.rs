@@ -509,15 +509,19 @@ pub fn preflight_memory_guard_with_budget<H: SdxlFamilyHooks>(
         );
     }
     if projected > safe {
-        return Err(format!(
-            "{} trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
-             (the forward working set materializes in one allocation), exceeding this machine's \
-             ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS \
-             could hard-kill the worker (SIGKILL) at the first step with no recoverable error. Enable \
-             Gradient Checkpointing or reduce the training resolution.",
-            hooks.label()
-        )
-        .into());
+        return Err(mlx_gen_perceptual::name_aux_losses(
+            format!(
+                "{} trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+                 (the forward working set materializes in one allocation), exceeding this machine's \
+                 ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS \
+                 could hard-kill the worker (SIGKILL) at the first step with no recoverable error. Enable \
+                 Gradient Checkpointing or reduce the training resolution.",
+                hooks.label()
+            )
+            .into(),
+            cfg,
+            extra_gb,
+        ));
     }
     Ok(())
 }
@@ -583,6 +587,7 @@ pub(crate) fn aux_driver(
     schedule: &BucketSchedule,
     accum: u32,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
         path,
@@ -591,7 +596,23 @@ pub(crate) fn aux_driver(
         schedule,
         accum,
         start_step,
+        cancel,
     )
+}
+
+/// The timestep a planned step trains at (epic 2123 E8): the plan's level whenever it moved off
+/// the sampled `t`'s — an aux-only step, and also a claimed step that `StepPlan::without_skipped`
+/// reverted to diffusion (it still trains at the remapped level, as on Candle) — else `t` exactly.
+pub(crate) fn trained_timestep<H: SdxlFamilyHooks>(
+    hooks: &H,
+    t: TrainTimestep,
+    plan: &StepPlan,
+) -> TrainTimestep {
+    if plan.noise_level != hooks.noise_level(t) {
+        hooks.timestep_at(plan.noise_level)
+    } else {
+        t
+    }
 }
 
 /// One training micro-step on the 1-based `step`: pick the step's cached (item, bucket) entry,
@@ -639,9 +660,7 @@ pub(crate) fn run_train_step<H: SdxlFamilyHooks>(
         None => None,
     };
     if let Some(p) = &planned {
-        if !p.plan.diffusion {
-            t = hooks.timestep_at(p.plan.noise_level);
-        }
+        t = trained_timestep(hooks, t, &p.plan);
     }
     let aux = planned.as_ref().map(|p| AuxStep {
         path: p.path,
@@ -935,7 +954,14 @@ pub fn train_family<H: SdxlFamilyHooks>(
     // real dataset item (not the (item, bucket) cache entry) so an image alternates across its
     // buckets. A resumed run replays the skipped prefix so the phase matches.
     let mut aux_driver = match perceptual {
-        Some(path) => Some(aux_driver(path, &cache, &schedule, accum, start_step)?),
+        Some(path) => Some(aux_driver(
+            path,
+            &cache,
+            &schedule,
+            accum,
+            start_step,
+            &req.cancel,
+        )?),
         None => None,
     };
     let mut accumulated: Option<LoraParams> = None;

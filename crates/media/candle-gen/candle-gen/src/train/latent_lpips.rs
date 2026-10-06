@@ -32,13 +32,14 @@ use crate::{CandleError, Result};
 
 /// Output channels of the five trunk slices (`relu1_2 … relu5_3`).
 pub const LPIPS_CHANNELS: [usize; 5] = [64, 128, 256, 512, 512];
-const SLICE_BOUNDS: [(usize, usize); 5] = [(0, 7), (7, 14), (14, 24), (24, 34), (34, 44)];
+pub(crate) const SLICE_BOUNDS: [(usize, usize); 5] =
+    [(0, 7), (7, 14), (14, 24), (24, 34), (34, 44)];
 /// The `vgg16_bn` "D" config: conv widths, `0` = max-pool.
-const VGG16_CFG: [usize; 18] = [
+pub(crate) const VGG16_CFG: [usize; 18] = [
     64, 64, 0, 128, 128, 0, 256, 256, 256, 0, 512, 512, 512, 0, 512, 512, 512, 0,
 ];
 const IDENTITY_POOLS: usize = 3;
-const BN_EPS: f64 = 1e-5;
+pub(crate) const BN_EPS: f64 = 1e-5;
 const NORMALIZE_EPS: f64 = 1e-8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -626,6 +626,31 @@ pub fn check_aux_memory(
     )))
 }
 
+/// The dense-path twin of [`check_aux_memory`]'s naming (epic 2123 E7): the sentence a trainer's
+/// own dense-step refusal appends when the enabled aux models (`extra_gb > 0`) are part of what it
+/// refused — naming them so the user knows which to turn off. Empty when `extra_gb` is not positive
+/// or no aux loss is enabled.
+pub fn aux_losses_note(cfg: &TrainingConfig, extra_gb: f64) -> String {
+    let arms = enabled_aux_losses(cfg);
+    if extra_gb.is_nan() || extra_gb <= 0.0 || arms.is_empty() {
+        return String::new();
+    }
+    format!(
+        " The enabled auxiliary losses [{}] add ~{extra_gb:.1} GB of training-time models to that \
+         figure; disabling one of them (or choosing a smaller auxiliary model) also lowers it.",
+        arms.join(", ")
+    )
+}
+
+/// [`aux_losses_note`] appended to a trainer's dense-step refusal `err` (a [`Error::Msg`]; any other
+/// error passes through unchanged).
+pub fn name_aux_losses(err: Error, cfg: &TrainingConfig, extra_gb: f64) -> Error {
+    match err {
+        Error::Msg(m) => Error::Msg(m + &aux_losses_note(cfg, extra_gb)),
+        other => other,
+    }
+}
+
 /// Test fixtures for trainers on this seam.
 pub mod testing {
     use std::path::Path;
@@ -739,6 +764,26 @@ mod tests {
         );
     }
 
+    /// E7 (feature-end review round 2): a dense-step refusal names the enabled aux losses when their
+    /// models are part of the refused figure, and nothing when none is on or `extra_gb` is zero.
+    /// Mutation: return the error unchanged from `name_aux_losses` ⇒ red.
+    #[test]
+    fn a_dense_refusal_names_the_enabled_aux_losses() {
+        let e = name_aux_losses(
+            Error::Msg("t trainer: dense step too big.".into()),
+            &on(),
+            2.0,
+        );
+        let e = e.to_string();
+        assert!(
+            e.starts_with("t trainer: dense step too big.") && e.contains("[depth]"),
+            "{e}"
+        );
+        let plain = TrainingConfig::default();
+        assert_eq!(aux_losses_note(&plain, 2.0), "");
+        assert_eq!(aux_losses_note(&on(), 0.0), "");
+    }
+
     /// E7 messaging: the shared aux-memory refusal names EVERY enabled aux loss (pixel and latent
     /// arms) and no disabled one, and refuses exactly past the safe budget. Mutations: name only
     /// the pixel arms (`enabled_pixel_aux_losses`) ⇒ `latent_lpips` missing ⇒ red; compare
@@ -785,6 +830,54 @@ mod tests {
         // A non-positive or non-finite safe budget refuses.
         assert!(check_aux_memory("t", &on(), "s", 1.0, 1.0, 0.0, "").is_err());
         assert!(check_aux_memory("t", &on(), "s", 1.0, 1.0, f64::NAN, "").is_err());
+    }
+
+    /// E3 (feature-end review round 2): gen-core's `enabled_aux_losses` — what the shared floor's
+    /// full-fine-tune refusal reads — names every arm of this kit's `ARMS`, so a new arm cannot skip
+    /// that refusal. A new arm reds here until it is enabled below AND added to gen-core's list.
+    /// Mutation: drop an arm from `gen_core::train::enabled_aux_losses` ⇒ red.
+    #[test]
+    fn gen_core_names_every_aux_arm() {
+        fn enable(cfg: &mut TrainingConfig, arm: &str) {
+            let on = AuxLossSchedule {
+                weight: 0.1,
+                t_min: 0.0,
+                t_max: 1.0,
+                every_n: 2,
+            };
+            match arm {
+                "depth" => cfg.depth_anchoring.schedule = on,
+                "identity" => cfg.identity_loss.schedule = on,
+                "face-landmark" => cfg.face_landmark_loss.schedule = on,
+                "body-proportion" => cfg.body_losses.proportion = on,
+                "body-shape" => cfg.body_losses.shape = on,
+                "normal" => cfg.body_losses.normal = on,
+                "vae_anchor" => cfg.vae_anchor.schedule = on,
+                "latent_lpips" => cfg.latent_lpips.schedule = on,
+                other => panic!(
+                    "new aux arm `{other}`: enable it here and add it to \
+                     gen_core::train::enabled_aux_losses (the full-fine-tune refusal reads it)"
+                ),
+            }
+        }
+        let mut all = TrainingConfig::default();
+        for arm in ARMS {
+            let mut cfg = TrainingConfig::default();
+            enable(&mut cfg, arm.name);
+            assert!(
+                (arm.enabled)(&cfg),
+                "{}: the enabler does not enable it",
+                arm.name
+            );
+            assert_eq!(
+                gen_core::train::enabled_aux_losses(&cfg),
+                vec![arm.name],
+                "gen-core does not name the `{}` arm",
+                arm.name
+            );
+            enable(&mut all, arm.name);
+        }
+        assert_eq!(gen_core::train::enabled_aux_losses(&all).len(), ARMS.len());
     }
 
     /// sc-24832: the body arms are on the seam — ViTPose budgeted once across the three arms, the

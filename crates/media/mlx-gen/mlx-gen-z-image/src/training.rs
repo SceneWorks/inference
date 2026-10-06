@@ -617,7 +617,13 @@ impl ZImageTurboTrainer {
         // its buckets. A resumed run replays the skipped prefix so the phase matches.
         let mut aux_driver = match perceptual {
             Some(path) => Some(aux_driver(
-                path, &cache, aux_masks, &schedule, accum, start_step,
+                path,
+                &cache,
+                aux_masks,
+                &schedule,
+                accum,
+                start_step,
+                &req.cancel,
             )?),
             None => None,
         };
@@ -872,6 +878,7 @@ fn aux_driver(
     schedule: &BucketSchedule,
     accum: u32,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     path.attach_subject_masks(masks);
     AuxDriver::prepare(
@@ -881,6 +888,7 @@ fn aux_driver(
         schedule,
         accum,
         start_step,
+        cancel,
     )
 }
 
@@ -1057,14 +1065,18 @@ fn preflight_memory_guard_with_budget(
         );
     }
     if projected > safe {
-        return Err(format!(
-            "z_image_turbo trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
-             (the forward working set materializes in one allocation), exceeding this machine's ~{safe:.0} GB \
-             safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS would hard-kill the \
-             worker (SIGKILL) at the first step with no recoverable error (sc-4874). Enable Gradient \
-             Checkpointing (recomputes block activations in the backward) or reduce the training resolution."
-        )
-        .into());
+        return Err(mlx_gen_perceptual::name_aux_losses(
+            format!(
+                "z_image_turbo trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+                 (the forward working set materializes in one allocation), exceeding this machine's ~{safe:.0} GB \
+                 safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS would hard-kill the \
+                 worker (SIGKILL) at the first step with no recoverable error (sc-4874). Enable Gradient \
+                 Checkpointing (recomputes block activations in the backward) or reduce the training resolution."
+            )
+            .into(),
+            cfg,
+            extra_gb,
+        ));
     }
     Ok(())
 }
@@ -2386,7 +2398,7 @@ mod depth_anchoring_tests {
     /// A prepared driver (references built, alternation over `schedule`'s items, as `train_impl`
     /// does).
     fn prepared_with(cache: &[CacheEntry], schedule: &BucketSchedule, accum: u32) -> AuxDriver {
-        aux_driver(path(), cache, None, schedule, accum, 0).unwrap()
+        aux_driver(path(), cache, None, schedule, accum, 0, &Default::default()).unwrap()
     }
 
     /// [`prepared_with`] for a single-bucket cache (one entry per item).
@@ -2957,8 +2969,16 @@ mod depth_anchoring_tests {
         let (adapter, params) = adapter(&mut dit, &cfg);
         let cache = cache_n(2);
         let run = |dit: &mut ZImageTransformer, weight: f32, steps: u32| {
-            let mut d =
-                aux_driver(build(weight), &cache, None, &single_bucket(&cache), 1, 0).unwrap();
+            let mut d = aux_driver(
+                build(weight),
+                &cache,
+                None,
+                &single_bucket(&cache),
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             let mut out = Vec::new();
             for n in 1..=steps {
                 out.push(step(dit, &params, &adapter, &cfg, &cache, Some(&mut d), n));
@@ -3107,7 +3127,7 @@ mod subject_mask_reference_tests {
             }],
             7,
         );
-        aux_driver(path, &cache, loaded, &schedule, 1, 0).unwrap();
+        aux_driver(path, &cache, loaded, &schedule, 1, 0, &Default::default()).unwrap();
         let seen = seen.borrow();
         assert_eq!(seen.len(), 2);
         for (entry, got) in seen.iter().enumerate() {
