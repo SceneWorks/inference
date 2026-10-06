@@ -49,7 +49,6 @@
 //! LoKr is saved by the shared [`save_lokr`] in the bare-path `lokr_*` convention the sc-10521 LoKr
 //! path consumes. Both reconstruct the residual at **bf16** to match the inference loader.
 
-use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
@@ -404,15 +403,16 @@ fn load_variant_trainer(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Tra
         )));
     }
     // The weights load lazily (sc-2124): `validate` and `train`'s refusal floors never read them.
-    Ok(Box::new(LazyAnimaTrainer {
-        descriptor: trainer_descriptor_for(variant),
-        variant,
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor_for(variant), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec, variant)
+        })
+        .validating_on_base_when(mlx_gen::train::lazy::custom_targets),
+    ))
 }
 
-/// The weight load behind [`load_variant_trainer`], run by `LazyAnimaTrainer` on first need.
+/// The weight load behind [`load_variant_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec, variant: Variant) -> Result<AnimaTrainer> {
     let components = AnimaComponents::load(&spec.weights, variant)?;
     Ok(AnimaTrainer {
@@ -424,51 +424,6 @@ fn load_weights(spec: &LoadSpec, variant: Variant) -> Result<AnimaTrainer> {
         dit: components.dit,
         conditioner: components.conditioner,
     })
-}
-
-/// The registered Anima trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
-/// first `train` — after every refusal floor — or on a `validate` that must match custom
-/// `lora_target_modules` against the DiT/conditioner.
-struct LazyAnimaTrainer {
-    descriptor: TrainerDescriptor,
-    variant: Variant,
-    spec: LoadSpec,
-    loaded: OnceCell<AnimaTrainer>,
-}
-
-impl LazyAnimaTrainer {
-    fn loaded(&self) -> Result<&AnimaTrainer> {
-        if self.loaded.get().is_none() {
-            let _ = self.loaded.set(load_weights(&self.spec, self.variant)?);
-        }
-        Ok(self.loaded.get().expect("the base was loaded above"))
-    }
-}
-
-impl Trainer for LazyAnimaTrainer {
-    fn descriptor(&self) -> &TrainerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // The default targets exist on every Anima base; only custom ones need it loaded.
-        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
-            return validate_floors(&self.descriptor, req);
-        }
-        self.loaded()?.validate(req)
-    }
-
-    fn train(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> gen_core::Result<TrainingOutput> {
-        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
-        self.validate(req)?;
-        self.loaded()?;
-        let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
-    }
 }
 
 // Explicit trainer registration constants for all three variants.

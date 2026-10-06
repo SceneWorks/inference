@@ -56,7 +56,6 @@
 //!     latent caching — converting the otherwise-uncatchable SIGKILL into a recommendation to enable
 //!     the toggle. The default-off functional path is unaffected.
 
-use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
@@ -209,14 +208,16 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// the encoder is Q8. `spec.precision` selects the compute dtype (bf16 default / f32 tight-gate).
 ///
 /// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
-/// refusal floors never read weights; see `LazyLensTrainer`.
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     snapshot_root(spec)?;
-    Ok(Box::new(LazyLensTrainer {
-        descriptor: trainer_descriptor(),
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor(), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        })
+        .validating_on_base_when(mlx_gen::train::lazy::custom_targets),
+    ))
 }
 
 /// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
@@ -231,7 +232,7 @@ fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
     }
 }
 
-/// The weight load behind [`load_trainer`], run by `LazyLensTrainer` on first need.
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec) -> Result<LensTrainer> {
     let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
@@ -257,50 +258,6 @@ fn load_weights(spec: &LoadSpec) -> Result<LensTrainer> {
         vae,
         dtype,
     })
-}
-
-/// The registered Lens trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
-/// first `train` — after every refusal floor — or on a `validate` that must match custom
-/// `lora_target_modules` against the DiT.
-struct LazyLensTrainer {
-    descriptor: TrainerDescriptor,
-    spec: LoadSpec,
-    loaded: OnceCell<LensTrainer>,
-}
-
-impl LazyLensTrainer {
-    fn loaded(&self) -> Result<&LensTrainer> {
-        if self.loaded.get().is_none() {
-            let _ = self.loaded.set(load_weights(&self.spec)?);
-        }
-        Ok(self.loaded.get().expect("the base was loaded above"))
-    }
-}
-
-impl Trainer for LazyLensTrainer {
-    fn descriptor(&self) -> &TrainerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // The default targets exist on every Lens base; only custom ones need it loaded.
-        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
-            return validate_floors(&self.descriptor, req);
-        }
-        self.loaded()?.validate(req)
-    }
-
-    fn train(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> gen_core::Result<TrainingOutput> {
-        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
-        self.validate(req)?;
-        self.loaded()?;
-        let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
-    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral

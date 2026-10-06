@@ -48,7 +48,6 @@
 //!   budget, returns a catchable, actionable error BEFORE the (minutes-long) latent caching — converting
 //!   the otherwise-uncatchable SIGKILL into a recommendation to enable the toggle.
 
-use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
@@ -207,14 +206,16 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// Raw snapshot ships bf16, so f32 widens it via [`Krea2Transformer::cast_weights`].
 ///
 /// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
-/// refusal floors never read weights; see `LazyKreaTrainer`.
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     snapshot_root(spec)?;
-    Ok(Box::new(LazyKreaTrainer {
-        descriptor: trainer_descriptor(),
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor(), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        })
+        .validating_on_base_when(mlx_gen::train::lazy::custom_targets),
+    ))
 }
 
 /// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
@@ -229,7 +230,7 @@ fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
     }
 }
 
-/// The weight load behind [`load_trainer`], run by `LazyKreaTrainer` on first need.
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec) -> Result<KreaRawTrainer> {
     let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
@@ -252,50 +253,6 @@ fn load_weights(spec: &LoadSpec) -> Result<KreaRawTrainer> {
         vae,
         dtype,
     })
-}
-
-/// The registered Krea trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
-/// first `train` — after every refusal floor — or on a `validate` that must match custom
-/// `lora_target_modules` against the DiT.
-struct LazyKreaTrainer {
-    descriptor: TrainerDescriptor,
-    spec: LoadSpec,
-    loaded: OnceCell<KreaRawTrainer>,
-}
-
-impl LazyKreaTrainer {
-    fn loaded(&self) -> Result<&KreaRawTrainer> {
-        if self.loaded.get().is_none() {
-            let _ = self.loaded.set(load_weights(&self.spec)?);
-        }
-        Ok(self.loaded.get().expect("the base was loaded above"))
-    }
-}
-
-impl Trainer for LazyKreaTrainer {
-    fn descriptor(&self) -> &TrainerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // The default targets exist on every Krea DiT; only custom ones need the loaded base.
-        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
-            return validate_floors(&self.descriptor, req);
-        }
-        self.loaded()?.validate(req)
-    }
-
-    fn train(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> gen_core::Result<TrainingOutput> {
-        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
-        self.validate(req)?;
-        self.loaded()?;
-        let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
-    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral

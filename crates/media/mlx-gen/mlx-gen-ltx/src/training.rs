@@ -38,7 +38,6 @@
 //!   * **LoRA-only.** The reference LTX MLX trainer has no LoKr (LTX *inference* supports LoKr via
 //!     sc-2393, but no LoKr trainer exists); LoKr requests are rejected with that explanation.
 
-use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -2298,16 +2297,18 @@ fn select_depth_frames(
 ///
 /// The weights load lazily (sc-2124): construction only checks the spec (and that the Gemma-3
 /// override exists), so `validate` and `train`'s refusal floors never read weights; see
-/// `LazyLtxTrainer`.
+/// [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     snapshot_root_23(spec)?;
     crate::model::resolve_gemma_dir(spec.text_encoder.as_ref())?;
-    Ok(Box::new(LazyLtxTrainer {
-        descriptor: trainer_descriptor(),
-        load: load_weights_23,
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+    Ok(Box::new(mlx_gen::train::lazy::LazyTrainer::new(
+        trainer_descriptor(),
+        validate_floors,
+        {
+            let spec = spec.clone();
+            move || load_weights_23(&spec)
+        },
+    )))
 }
 
 /// The LTX-2.3 snapshot directory a trainer spec names — a single file is refused.
@@ -2322,7 +2323,7 @@ fn snapshot_root_23(spec: &LoadSpec) -> Result<&Path> {
     }
 }
 
-/// The LTX-2.3 weight load behind [`load_trainer`], run by `LazyLtxTrainer` on first need.
+/// The LTX-2.3 weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights_23(spec: &LoadSpec) -> Result<LtxTrainer> {
     load_trainer_from_dir(snapshot_root_23(spec)?, spec.text_encoder.as_ref())
 }
@@ -2332,15 +2333,17 @@ fn load_weights_23(spec: &LoadSpec) -> Result<LtxTrainer> {
 /// override or a 2.3-shaped VAE configuration.
 ///
 /// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
-/// refusal floors never read weights; see `LazyLtxTrainer`.
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer_25(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     snapshot_root_25(spec)?;
-    Ok(Box::new(LazyLtxTrainer {
-        descriptor: trainer_descriptor_25(),
-        load: load_weights_25,
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+    Ok(Box::new(mlx_gen::train::lazy::LazyTrainer::new(
+        trainer_descriptor_25(),
+        validate_floors,
+        {
+            let spec = spec.clone();
+            move || load_weights_25(&spec)
+        },
+    )))
 }
 
 /// The LTX-2.5 split-component directory a trainer spec names — a single checkpoint is refused.
@@ -2353,7 +2356,7 @@ fn snapshot_root_25(spec: &LoadSpec) -> Result<&Path> {
     }
 }
 
-/// The LTX-2.5 weight load behind [`load_trainer_25`], run by `LazyLtxTrainer` on first need.
+/// The LTX-2.5 weight load behind [`load_trainer_25`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights_25(spec: &LoadSpec) -> Result<LtxTrainer> {
     let root = snapshot_root_25(spec)?;
     let bundle = crate::bundle::resolve_split_bundle(spec)?;
@@ -2415,49 +2418,6 @@ fn load_weights_25(spec: &LoadSpec) -> Result<LtxTrainer> {
         transformer: TrainingTransformer::Ltx25(transformer),
         cfg,
     })
-}
-
-/// The registered LTX trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
-/// first `train`, after every refusal floor.
-struct LazyLtxTrainer {
-    descriptor: TrainerDescriptor,
-    load: fn(&LoadSpec) -> Result<LtxTrainer>,
-    spec: LoadSpec,
-    loaded: OnceCell<LtxTrainer>,
-}
-
-impl LazyLtxTrainer {
-    fn loaded(&self) -> Result<&LtxTrainer> {
-        if self.loaded.get().is_none() {
-            let _ = self.loaded.set((self.load)(&self.spec)?);
-        }
-        Ok(self.loaded.get().expect("the base was loaded above"))
-    }
-}
-
-impl Trainer for LazyLtxTrainer {
-    fn descriptor(&self) -> &TrainerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        match self.loaded.get() {
-            Some(trainer) => trainer.validate(req),
-            None => validate_floors(&self.descriptor, req),
-        }
-    }
-
-    fn train(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> gen_core::Result<TrainingOutput> {
-        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
-        self.validate(req)?;
-        self.loaded()?;
-        let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
-    }
 }
 
 /// The concrete-typed loader behind [`load_trainer`] (sc-4942 — the first-step memory harness needs

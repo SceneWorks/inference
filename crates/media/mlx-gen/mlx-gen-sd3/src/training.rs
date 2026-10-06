@@ -56,7 +56,6 @@
 //!   the toggle) before the minutes-long caching, converting an uncatchable SIGKILL into an actionable
 //!   error.
 
-use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
@@ -269,15 +268,16 @@ fn medium_trainer_descriptor() -> TrainerDescriptor {
 /// [`AdaptableHost`], so Medium is covered without a train-loop delta (T4 sc-7885).
 ///
 /// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
-/// refusal floors never read weights; see `LazySd3Trainer`.
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer_for(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Trainer>> {
     snapshot_root(spec)?;
-    Ok(Box::new(LazySd3Trainer {
-        descriptor: trainer_descriptor_for(variant),
-        variant,
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor_for(variant), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec, variant)
+        })
+        .validating_on_base_when(mlx_gen::train::lazy::custom_targets),
+    ))
 }
 
 /// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
@@ -292,7 +292,7 @@ fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
     }
 }
 
-/// The weight load behind [`load_trainer_for`], run by `LazySd3Trainer` on first need.
+/// The weight load behind [`load_trainer_for`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec, variant: Sd3Variant) -> Result<Sd3LoraTrainer> {
     let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
@@ -320,51 +320,6 @@ fn load_weights(spec: &LoadSpec, variant: Sd3Variant) -> Result<Sd3LoraTrainer> 
         vae,
         dtype,
     })
-}
-
-/// The registered SD3.5 trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
-/// first `train` — after every refusal floor — or on a `validate` that must match custom
-/// `lora_target_modules` against the MMDiT.
-struct LazySd3Trainer {
-    descriptor: TrainerDescriptor,
-    variant: Sd3Variant,
-    spec: LoadSpec,
-    loaded: OnceCell<Sd3LoraTrainer>,
-}
-
-impl LazySd3Trainer {
-    fn loaded(&self) -> Result<&Sd3LoraTrainer> {
-        if self.loaded.get().is_none() {
-            let _ = self.loaded.set(load_weights(&self.spec, self.variant)?);
-        }
-        Ok(self.loaded.get().expect("the base was loaded above"))
-    }
-}
-
-impl Trainer for LazySd3Trainer {
-    fn descriptor(&self) -> &TrainerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // The default targets exist on every SD3.5 base; only custom ones need it loaded.
-        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
-            return validate_floors(&self.descriptor, req);
-        }
-        self.loaded()?.validate(req)
-    }
-
-    fn train(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> gen_core::Result<TrainingOutput> {
-        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
-        self.validate(req)?;
-        self.loaded()?;
-        let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
-    }
 }
 
 /// Construct the SD3.5-**Large** trainer (the default base). See [`load_trainer_for`].

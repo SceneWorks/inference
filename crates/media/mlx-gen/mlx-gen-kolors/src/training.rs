@@ -49,7 +49,6 @@
 //!     since sc-4733), so the produced adapter reloads through the Kolors inference path directly
 //!     (validated by `tests/trainer_e2e.rs`).
 
-use std::cell::OnceCell;
 use std::path::PathBuf;
 
 use mlx_gen::sampler::AlphaSchedule;
@@ -265,14 +264,17 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// inference runs fp16). Registered via [`mlx_gen::TrainerRegistration`].
 ///
 /// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
-/// refusal floors never read weights; see `LazyKolorsTrainer`.
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     snapshot_root(spec)?;
-    Ok(Box::new(LazyKolorsTrainer {
-        descriptor: trainer_descriptor(),
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+    Ok(Box::new(mlx_gen::train::lazy::LazyTrainer::new(
+        trainer_descriptor(),
+        validate_floors,
+        {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        },
+    )))
 }
 
 /// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
@@ -287,7 +289,7 @@ fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
     }
 }
 
-/// The weight load behind [`load_trainer`], run by `LazyKolorsTrainer` on first need.
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec) -> Result<KolorsTrainer> {
     let root = snapshot_root(spec)?;
     let dtype = Dtype::Float32;
@@ -307,48 +309,6 @@ fn load_weights(spec: &LoadSpec) -> Result<KolorsTrainer> {
             schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
         },
     })
-}
-
-/// The registered Kolors trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
-/// first `train`, after every refusal floor.
-struct LazyKolorsTrainer {
-    descriptor: TrainerDescriptor,
-    spec: LoadSpec,
-    loaded: OnceCell<KolorsTrainer>,
-}
-
-impl LazyKolorsTrainer {
-    fn loaded(&self) -> Result<&KolorsTrainer> {
-        if self.loaded.get().is_none() {
-            let _ = self.loaded.set(load_weights(&self.spec)?);
-        }
-        Ok(self.loaded.get().expect("the base was loaded above"))
-    }
-}
-
-impl Trainer for LazyKolorsTrainer {
-    fn descriptor(&self) -> &TrainerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        match self.loaded.get() {
-            Some(trainer) => trainer.validate(req),
-            None => validate_floors(&self.descriptor, req),
-        }
-    }
-
-    fn train(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> gen_core::Result<TrainingOutput> {
-        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
-        self.validate(req)?;
-        self.loaded()?;
-        let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
-    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral

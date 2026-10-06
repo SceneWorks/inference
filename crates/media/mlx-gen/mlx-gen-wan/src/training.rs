@@ -39,7 +39,6 @@
 //!     channel `y` (the reference trains the no-conditioning T2V velocity objective; the attention
 //!     LoRA is the trained surface and is blind to the padded conditioning channels).
 
-use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
@@ -313,14 +312,17 @@ fn descriptor_ti2v_5b() -> TrainerDescriptor {
 /// which Wan variant this registration serves, and is checked against the config.
 ///
 /// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
-/// refusal floors never read weights or `config.json`; see `LazyWanTrainer`.
+/// refusal floors never read weights or `config.json`; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 fn build_trainer(spec: &LoadSpec, descriptor: TrainerDescriptor) -> Result<Box<dyn Trainer>> {
     snapshot_root(spec, descriptor.id)?;
-    Ok(Box::new(LazyWanTrainer {
+    Ok(Box::new(mlx_gen::train::lazy::LazyTrainer::new(
         descriptor,
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+        validate_floors,
+        {
+            let spec = spec.clone();
+            move || build_trainer_concrete(&spec, descriptor)
+        },
+    )))
 }
 
 /// The snapshot directory a trainer spec names — a single file is refused.
@@ -331,50 +333,6 @@ fn snapshot_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a PathBuf> {
             "{id} trainer expects a converted snapshot directory (model/expert safetensors + \
              t5_encoder + vae + tokenizer.json), not a single file"
         ))),
-    }
-}
-
-/// The registered Wan trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
-/// first `train`, after every refusal floor.
-struct LazyWanTrainer {
-    descriptor: TrainerDescriptor,
-    spec: LoadSpec,
-    loaded: OnceCell<WanMoeTrainer>,
-}
-
-impl LazyWanTrainer {
-    fn loaded(&self) -> Result<&WanMoeTrainer> {
-        if self.loaded.get().is_none() {
-            let _ = self
-                .loaded
-                .set(build_trainer_concrete(&self.spec, self.descriptor)?);
-        }
-        Ok(self.loaded.get().expect("the base was loaded above"))
-    }
-}
-
-impl Trainer for LazyWanTrainer {
-    fn descriptor(&self) -> &TrainerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        match self.loaded.get() {
-            Some(trainer) => trainer.validate(req),
-            None => validate_floors(&self.descriptor, req),
-        }
-    }
-
-    fn train(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> gen_core::Result<TrainingOutput> {
-        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
-        self.validate(req)?;
-        self.loaded()?;
-        let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
     }
 }
 

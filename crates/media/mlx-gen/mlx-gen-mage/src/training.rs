@@ -49,7 +49,6 @@
 //! where `σ = 1` is noise); the static schedule shift is a *sampling-time* schedule warp and is
 //! **not** applied during training, matching the sibling.
 
-use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -406,14 +405,18 @@ fn preflight_aux_memory(edge: u32, extra_gb: f64, safe_gb: f64) -> Result<()> {
 ///
 /// The weights load lazily (sc-2124): construction resolves and checks the component dirs (config
 /// files only), so `validate` and `train`'s refusal floors never read weights; see
-/// `LazyMageTrainer`.
+/// [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     component_dirs(spec)?;
-    Ok(Box::new(LazyMageTrainer {
-        descriptor: trainer_descriptor(),
-        spec: spec.clone(),
-        loaded: OnceCell::new(),
-    }))
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor(), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        })
+        .validating_on_base_when(|r| {
+            !r.config.full_finetune && mlx_gen::train::lazy::custom_targets(r)
+        }),
+    ))
 }
 
 /// The dense component dirs a trainer spec resolves to — a single file, an unknown component and a
@@ -456,7 +459,7 @@ fn component_dirs(spec: &LoadSpec) -> Result<crate::MageComponentDirs> {
     Ok(dirs)
 }
 
-/// The weight load behind [`load_trainer`], run by `LazyMageTrainer` on first need.
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec) -> Result<MageFlowTrainer> {
     let dirs = component_dirs(spec)?;
     Ok(MageFlowTrainer {
@@ -472,53 +475,6 @@ fn load_weights(spec: &LoadSpec) -> Result<MageFlowTrainer> {
         // determines where the checkpoint lives.
         transformer_dir: dirs.transformer,
     })
-}
-
-/// The registered Mage trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
-/// first `train` — after every refusal floor — or on a `validate` that must match custom
-/// `lora_target_modules` against the DiT.
-struct LazyMageTrainer {
-    descriptor: TrainerDescriptor,
-    spec: LoadSpec,
-    loaded: OnceCell<MageFlowTrainer>,
-}
-
-impl LazyMageTrainer {
-    fn loaded(&self) -> Result<&MageFlowTrainer> {
-        if self.loaded.get().is_none() {
-            let _ = self.loaded.set(load_weights(&self.spec)?);
-        }
-        Ok(self.loaded.get().expect("the base was loaded above"))
-    }
-}
-
-impl Trainer for LazyMageTrainer {
-    fn descriptor(&self) -> &TrainerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // The default targets exist on every Mage base and a full fine-tune matches none; only
-        // custom LoRA/LoKr targets need the loaded base.
-        if self.loaded.get().is_none()
-            && (req.config.full_finetune || req.config.lora_target_modules.is_empty())
-        {
-            return validate_floors(&self.descriptor, req);
-        }
-        self.loaded()?.validate(req)
-    }
-
-    fn train(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> gen_core::Result<TrainingOutput> {
-        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
-        self.validate(req)?;
-        self.loaded()?;
-        let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
-    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
