@@ -1000,6 +1000,20 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     let mut resume_due = false;
     let schedule = item_major_schedule(T::LABEL, cache.len(), &cfg.training_buckets(), cfg.seed)?;
     // Epic 2123 E8: references per (item, bucket) entry once, alternation keyed on the real item.
+    // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+    // cropped like the image and resampled onto its decoded size.
+    let mut perceptual = perceptual;
+    if let Some(path) = perceptual.as_mut() {
+        path.attach_subject_masks(
+            crate::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
+                T::LABEL,
+                &req.items,
+                cfg,
+                schedule.n_buckets(),
+                crate::gen_core::train::subject_mask::CropBox::center_square,
+            )?,
+        );
+    }
     let mut aux_driver = match perceptual {
         Some(path) => Some(AuxDriver::prepare(
             path,

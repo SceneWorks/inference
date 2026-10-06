@@ -2116,6 +2116,10 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: true,
             face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring.
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -2136,7 +2140,43 @@ fn refuse_ltx25_subject_mask(id: &str, req: &TrainingRequest) -> gen_core::Resul
              subject-masked loss off for this trainer"
         )));
     }
+    // sc-24832: the subject-restricted normal loss reads the same (absent) aligned mask.
+    if id == MODEL_25_ID
+        && mlx_gen::train::subject_mask::PerceptualSubjectMasks::needed(&req.config)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id} trainer: the normal loss restricted to the subject needs a training image aligned \
+             to the latent, but LTX-2.5 trains on preprocessed latent bundles that carry none; turn \
+             body_losses.normal_restrict_to_subject off for this trainer"
+        )));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod ltx25_restricted_normal_tests {
+    use super::*;
+
+    /// sc-24832: LTX-2.5 refuses the subject-restricted normal loss (no image aligned to its
+    /// latent bundles) and still admits the unrestricted one. Mutation: drop the
+    /// `PerceptualSubjectMasks::needed` refusal ⇒ red.
+    #[test]
+    fn ltx25_refuses_subject_restricted_normals() {
+        let mut req = super::validate_request_tests::request(1);
+        req.config.body_losses.normal.weight = 0.1;
+        assert!(refuse_ltx25_subject_mask(MODEL_25_ID, &req).is_ok());
+        req.config.body_losses.normal_restrict_to_subject = true;
+        match refuse_ltx25_subject_mask(MODEL_25_ID, &req) {
+            Err(gen_core::Error::Unsupported(m)) => {
+                assert!(m.contains("normal_restrict_to_subject"))
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(
+            refuse_ltx25_subject_mask(MODEL_ID, &req).is_ok(),
+            "LTX-2.3 has aligned images"
+        );
+    }
 }
 
 /// sc-24830 — LTX-2.5 runs depth anchoring on its generated video stream, so it refuses it for the
@@ -2148,8 +2188,8 @@ fn refuse_ltx25_subject_mask(id: &str, req: &TrainingRequest) -> gen_core::Resul
 /// [`DEPTH_ANCHORING_FRAMES_KEY`] knob.
 fn refuse_ltx25_depth_anchoring(id: &str, req: &TrainingRequest) -> gen_core::Result<()> {
     // Every decoded-x0 perceptual loss (depth anchoring, the sc-24831 identity / face-landmark
-    // losses, the sc-24833 VAE anchor) decodes the same generated video frames, so the refusal
-    // covers whichever ones are on and names them.
+    // losses, the sc-24833 VAE anchor, the sc-24832 body losses) decodes the same generated video
+    // frames, so the refusal covers whichever ones are on and names them.
     let pixel_losses = mlx_gen_perceptual::enabled_pixel_aux_losses(&req.config);
     if id != MODEL_25_ID || pixel_losses.is_empty() {
         return Ok(());
@@ -2682,6 +2722,15 @@ impl LtxTrainer {
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAELTX2.3 decode of its
         // cached clean latent → DA2 depth) is computed exactly once per job, here.
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "ltx trainer",
+                &req.items,
+                cfg,
+                latent_edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache, &latent_edges)?;
         }
 
@@ -7177,6 +7226,16 @@ mod ltx25_depth_anchoring_tests {
             }
             req.config.identity_loss.schedule = AuxLossSchedule::OFF;
             req.config.face_landmark_loss.schedule = AuxLossSchedule::OFF;
+            // sc-24832: a body loss decodes the same video stream, so it is refused alike.
+            // Mutation: check only depth in `refuse_ltx25_depth_anchoring` ⇒ red.
+            req.config.body_losses.normal = schedule();
+            assert_eq!(
+                refuse_ltx25_depth_anchoring(MODEL_25_ID, &req).is_err(),
+                refused.contains(&workflow.id()),
+                "{} (body loss)",
+                workflow.id()
+            );
+            req.config.body_losses.normal = AuxLossSchedule::OFF;
         }
         let mut req = super::validate_request_tests::request(1);
         req.config

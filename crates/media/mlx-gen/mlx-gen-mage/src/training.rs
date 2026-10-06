@@ -246,6 +246,11 @@ fn trainer_descriptor() -> TrainerDescriptor {
             // same shared perceptual builder arms (no trainer-loop change).
             identity_loss: true,
             face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -675,6 +680,15 @@ impl MageFlowTrainer {
         // --- prepare → cache: VAE-latents + prompt-embeds into memory before the loop ---
         let (cache, sample_caps) = self.prepare_caches(req, &edges, on_progress)?;
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "mage_flow_base trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache)?;
         }
 

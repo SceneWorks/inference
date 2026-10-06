@@ -65,6 +65,11 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: true,
             face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -474,6 +479,20 @@ impl AnimaTrainer {
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the real item
         // (the trainer has no resume, so nothing to replay).
+        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+        // cropped like the image and resampled onto its decoded size.
+        let mut perceptual = perceptual;
+        if let Some(path) = perceptual.as_mut() {
+            path.attach_subject_masks(
+                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
+                    "anima trainer",
+                    &req.items,
+                    cfg,
+                    edges.len(),
+                    CropBox::center_square,
+                )?,
+            );
+        }
         let mut aux_driver = match perceptual {
             Some(path) => Some(AuxDriver::prepare(
                 path,

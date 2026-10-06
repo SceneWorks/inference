@@ -237,6 +237,11 @@ fn trainer_descriptor_for(variant: Sd3Variant) -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: true,
             face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             latent_lpips_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
@@ -555,6 +560,15 @@ impl Sd3LoraTrainer {
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference is computed exactly once
         // per job, here, before the loop.
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "sd3 trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache)?;
         }
 

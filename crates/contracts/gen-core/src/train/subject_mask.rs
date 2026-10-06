@@ -39,7 +39,7 @@
 
 use std::path::Path;
 
-use super::{SubjectMaskLoss, TrainingItem};
+use super::{SubjectMaskLoss, TrainingConfig, TrainingItem};
 
 /// At most this many missing images are named in a refusal; the rest are counted.
 const MISSING_NAME_CAP: usize = 10;
@@ -303,6 +303,118 @@ impl PreparedSubjectMask {
             )));
         }
         Ok(m.into_iter().map(|v| self.cfg.weight(v)).collect())
+    }
+}
+
+impl PreparedSubjectMask {
+    /// The mask's raw coverage (no loss weights) of the `crop_of(image_w, image_h)` region,
+    /// area-averaged onto an `out_w × out_h` pixel grid, row-major — the pixel-space mask a
+    /// decoded-x0 perceptual loss averages over (sc-24832).
+    pub fn pixel_coverage(
+        &self,
+        crop_of: impl FnOnce(u32, u32) -> CropBox,
+        out_w: usize,
+        out_h: usize,
+    ) -> Vec<f32> {
+        let (iw, ih) = self.image_dims;
+        self.mask.area_resample(crop_of(iw, ih), out_w, out_h)
+    }
+}
+
+/// A trainer's image crop rule: the source box `(image_w, image_h) → CropBox` it cuts.
+pub type CropRule = fn(u32, u32) -> CropBox;
+
+/// The job's subject masks for the **decoded-x0 perceptual losses** (sc-24832: the normal loss
+/// restricted to the subject), handed to a trainer's perceptual path once
+/// (`PerceptualPath::attach_subject_masks` in either kit) so every reference it builds receives the
+/// mask of its cache entry's item, cropped with the same box as the image (the trainer's own crop
+/// rule, exactly as its subject-masked-loss weights use) and area-averaged onto that entry's decoded
+/// pixel grid.
+#[derive(Clone, Debug)]
+pub struct PerceptualSubjectMasks {
+    /// Per item: its mask and the trainer's crop rule for that item's image.
+    masks: Vec<(PreparedSubjectMask, CropRule)>,
+    entries_per_item: usize,
+}
+
+impl PerceptualSubjectMasks {
+    /// Whether `cfg` turns on a perceptual loss that reads subject masks.
+    pub fn needed(cfg: &TrainingConfig) -> bool {
+        cfg.body_losses.normal.is_enabled() && cfg.body_losses.normal_restrict_to_subject
+    }
+
+    /// `None` when no perceptual loss needs masks (no file is read); else every item's mask,
+    /// decoded and checked once (a missing, mis-sized or empty mask is refused naming the image,
+    /// as for subject-masked loss). The trainer's cache is item-major with `entries_per_item`
+    /// entries (resolution buckets) per item — a reference key `entry` belongs to item
+    /// `entry / entries_per_item` — and `crop_of` is the trainer's image crop rule (one for every
+    /// item; [`load_with`](Self::load_with) picks it per item).
+    pub fn load(
+        label: &str,
+        items: &[TrainingItem],
+        cfg: &TrainingConfig,
+        entries_per_item: usize,
+        crop_of: CropRule,
+    ) -> crate::Result<Option<Self>> {
+        Self::load_with(label, items, cfg, entries_per_item, |_| crop_of)
+    }
+
+    /// [`load`](Self::load) with the crop rule chosen per item (e.g. an edit pair's whole frame vs a
+    /// captioned item's centre square).
+    pub fn load_with(
+        label: &str,
+        items: &[TrainingItem],
+        cfg: &TrainingConfig,
+        entries_per_item: usize,
+        crop_for: impl Fn(&TrainingItem) -> CropRule,
+    ) -> crate::Result<Option<Self>> {
+        if !Self::needed(cfg) {
+            return Ok(None);
+        }
+        // The mask's loss weights are unused here (raw coverage only).
+        let identity = SubjectMaskLoss {
+            background_weight: 1.0,
+            subject_weight: 1.0,
+        };
+        let masks = items
+            .iter()
+            .map(|item| {
+                Ok((
+                    PreparedSubjectMask::load(label, item, &identity)?,
+                    crop_for(item),
+                ))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(Some(Self {
+            masks,
+            entries_per_item: entries_per_item.max(1),
+        }))
+    }
+
+    /// Build from already-prepared masks (tests and trainers that hold them).
+    pub fn from_prepared(
+        masks: Vec<PreparedSubjectMask>,
+        entries_per_item: usize,
+        crop_of: CropRule,
+    ) -> Self {
+        Self {
+            masks: masks.into_iter().map(|m| (m, crop_of)).collect(),
+            entries_per_item: entries_per_item.max(1),
+        }
+    }
+
+    /// Reference key `entry`'s mask on an `out_w × out_h` pixel grid (row-major). An entry past
+    /// the job's items is an error (a trainer keying references outside its cache).
+    pub fn pixel_mask(&self, entry: usize, out_w: usize, out_h: usize) -> crate::Result<Vec<f32>> {
+        let item = entry / self.entries_per_item;
+        let (mask, crop_of) = self.masks.get(item).ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "perceptual subject masks: reference {entry} is item {item}, but the job has {} \
+                 item masks",
+                self.masks.len()
+            ))
+        })?;
+        Ok(mask.pixel_coverage(*crop_of, out_w, out_h))
     }
 }
 

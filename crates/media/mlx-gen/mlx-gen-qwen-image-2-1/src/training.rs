@@ -769,6 +769,11 @@ fn trainer_descriptor() -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: true,
             face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -2271,6 +2276,23 @@ impl QwenImage21Trainer {
         // before the DiT loads.
         let mut perceptual = load_perceptual_path(cfg)?;
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image (an edit pair's whole frame, else the centre square).
+            path.attach_subject_masks(
+                mlx_gen::train::subject_mask::PerceptualSubjectMasks::load_with(
+                    &format!("{TRAINER_ID} trainer"),
+                    &req.items,
+                    cfg,
+                    edges.len(),
+                    |item| {
+                        if item.is_edit_pair() {
+                            CropBox::full
+                        } else {
+                            CropBox::center_square
+                        }
+                    },
+                )?,
+            );
             prepare_perceptual_references(path, &cache)?;
         }
         training_memory_trace(

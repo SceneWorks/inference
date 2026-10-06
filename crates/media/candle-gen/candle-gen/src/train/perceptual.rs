@@ -122,6 +122,17 @@ pub trait PerceptualLoss: Send + Sync {
     /// for [`PerceptualInput::Latents`]). Called once per image per job; the input is detached and
     /// the loss must return gradient-free data. `Ok(None)` ⇒ the image is unusable for this loss.
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>>;
+    /// [`reference`](Self::reference) with the image's **subject mask** in hand — `[H, W]` f32 in
+    /// `[0, 1]` at the decoded pixel size (1 = subject), when the trainer has one (sc-24832: the
+    /// normal loss restricted to the subject reads it). The default ignores the mask.
+    fn reference_with_mask(
+        &self,
+        clean: &Tensor,
+        subject_mask: Option<&Tensor>,
+    ) -> Result<Option<LossReference>> {
+        let _ = subject_mask;
+        self.reference(clean)
+    }
     /// The unweighted scalar loss of the live input for one image, given its reference.
     /// Differentiable in `live`.
     fn loss(&self, live: &Tensor, reference: &dyn Any) -> Result<Tensor>;
@@ -169,6 +180,9 @@ pub struct PerceptualPath {
     losses: Vec<AuxLoss>,
     references: HashMap<usize, Vec<Option<LossReference>>>,
     reference_computations: usize,
+    /// The job's subject masks for the losses that read one (sc-24832), see
+    /// [`attach_subject_masks`](Self::attach_subject_masks).
+    subject_masks: Option<crate::gen_core::train::subject_mask::PerceptualSubjectMasks>,
 }
 
 impl PerceptualPath {
@@ -190,6 +204,7 @@ impl PerceptualPath {
             losses,
             references: HashMap::new(),
             reference_computations: 0,
+            subject_masks: None,
         })
     }
 
@@ -230,6 +245,30 @@ impl PerceptualPath {
     /// space), once per image per job (a repeat call is a no-op). Trainers that cache one latent per
     /// (item, resolution bucket) key it per cache entry. The inputs are detached.
     pub fn ensure_reference(&mut self, image: usize, clean_latents: &Tensor) -> Result<()> {
+        self.ensure_reference_with_mask(image, clean_latents, None)
+    }
+
+    /// Hand the path the job's subject masks (sc-24832): from then on every
+    /// [`ensure_reference`](Self::ensure_reference) passes its reference key's item mask — cropped
+    /// with the trainer's crop rule and area-averaged onto that reference's decoded pixel grid — to
+    /// each loss's [`PerceptualLoss::reference_with_mask`]. `None` is a no-op. Every trainer calls
+    /// this once with `PerceptualSubjectMasks::load` before preparing references.
+    pub fn attach_subject_masks(
+        &mut self,
+        masks: Option<crate::gen_core::train::subject_mask::PerceptualSubjectMasks>,
+    ) {
+        self.subject_masks = masks;
+    }
+
+    /// [`ensure_reference`](Self::ensure_reference) with the image's subject mask (`[H, W]` f32 at
+    /// the decoded pixel size), handed to every loss's
+    /// [`PerceptualLoss::reference_with_mask`] (sc-24832).
+    pub fn ensure_reference_with_mask(
+        &mut self,
+        image: usize,
+        clean_latents: &Tensor,
+        subject_mask: Option<&Tensor>,
+    ) -> Result<()> {
         if self.references.contains_key(&image) {
             return Ok(());
         }
@@ -240,13 +279,26 @@ impl PerceptualPath {
         } else {
             None
         };
+        // An explicit mask wins; else the attached job masks (sc-24832), resampled onto this
+        // reference's decoded pixel grid.
+        let attached = match (subject_mask, &self.subject_masks, &pixels) {
+            (None, Some(masks), Some(px)) => {
+                let (_, h, w, _) = px.dims4()?;
+                let v = masks
+                    .pixel_mask(image, w, h)
+                    .map_err(|e| CandleError::Msg(e.to_string()))?;
+                Some(Tensor::from_vec(v, (h, w), px.device())?)
+            }
+            _ => None,
+        };
+        let subject_mask = subject_mask.or(attached.as_ref());
         let mut refs = Vec::with_capacity(self.losses.len());
         for l in &self.losses {
             let input = match l.loss.input() {
                 PerceptualInput::DecodedPixels => pixels.as_ref().expect("decoded above"),
                 PerceptualInput::Latents => &clean,
             };
-            refs.push(l.loss.reference(input)?);
+            refs.push(l.loss.reference_with_mask(input, subject_mask)?);
         }
         self.references.insert(image, refs);
         self.reference_computations += 1;

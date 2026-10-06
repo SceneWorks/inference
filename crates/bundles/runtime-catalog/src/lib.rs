@@ -703,6 +703,12 @@ pub struct TrainerCapabilitySnapshot {
     pub supports_identity_loss: bool,
     /// Honors `TrainingConfig::face_landmark_loss` (epic 2123 FaceMesh landmark loss, sc-24831).
     pub supports_face_landmark_loss: bool,
+    /// Honors `BodyLossesConfig::proportion` (epic 2123 ViTPose body-proportion loss, sc-24832).
+    pub supports_body_proportion_loss: bool,
+    /// Honors `BodyLossesConfig::shape` (epic 2123 HybrIK body-shape loss, sc-24832).
+    pub supports_body_shape_loss: bool,
+    /// Honors `BodyLossesConfig::normal` (epic 2123 Sapiens normal loss, sc-24832).
+    pub supports_normal_loss: bool,
     /// Honors `TrainingConfig::vae_anchor` (epic 2123 VAE perceptual anchor, sc-24833).
     pub supports_vae_anchor_loss: bool,
     /// Honors `TrainingConfig::latent_lpips` (epic 2123 E-LatentLPIPS, sc-24833).
@@ -728,6 +734,9 @@ impl TrainerCapabilitySnapshot {
             supports_subject_mask_loss: descriptor.techniques.subject_mask_loss,
             supports_identity_loss: descriptor.techniques.identity_loss,
             supports_face_landmark_loss: descriptor.techniques.face_landmark_loss,
+            supports_body_proportion_loss: descriptor.techniques.body_proportion_loss,
+            supports_body_shape_loss: descriptor.techniques.body_shape_loss,
+            supports_normal_loss: descriptor.techniques.normal_loss,
             supports_vae_anchor_loss: descriptor.techniques.vae_anchor_loss,
             supports_latent_lpips_loss: descriptor.techniques.latent_lpips_loss,
         }
@@ -751,6 +760,9 @@ impl TrainerCapabilitySnapshot {
             "supports_subject_mask_loss": self.supports_subject_mask_loss,
             "supports_identity_loss": self.supports_identity_loss,
             "supports_face_landmark_loss": self.supports_face_landmark_loss,
+            "supports_body_proportion_loss": self.supports_body_proportion_loss,
+            "supports_body_shape_loss": self.supports_body_shape_loss,
+            "supports_normal_loss": self.supports_normal_loss,
             "supports_vae_anchor_loss": self.supports_vae_anchor_loss,
             "supports_latent_lpips_loss": self.supports_latent_lpips_loss,
         })
@@ -1038,6 +1050,24 @@ mod tests {
         let noisy_json = TrainerCapabilitySnapshot::from_descriptor(&noisy).to_json();
         assert_eq!(noisy_json["supports_weight_noise"], true);
         assert_eq!(noisy_json["supports_depth_anchoring"], false);
+
+        // sc-24832: each body loss is advertised from its own flag.
+        for (key, set) in [
+            (
+                "supports_body_proportion_loss",
+                (|t: &mut gen_core::train::TrainingTechniques| t.body_proportion_loss = true)
+                    as fn(&mut _),
+            ),
+            ("supports_body_shape_loss", |t| t.body_shape_loss = true),
+            ("supports_normal_loss", |t| t.normal_loss = true),
+        ] {
+            assert_eq!(json[key], false);
+            let mut body = descriptor;
+            set(&mut body.techniques);
+            let body_json = TrainerCapabilitySnapshot::from_descriptor(&body).to_json();
+            assert_eq!(body_json[key], true, "{key}");
+            assert_eq!(body_json["supports_depth_anchoring"], false);
+        }
 
         // sc-2125: depth anchoring is advertised from its own flag.
         assert_eq!(json["supports_depth_anchoring"], false);

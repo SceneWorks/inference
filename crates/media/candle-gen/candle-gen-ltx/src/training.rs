@@ -1364,6 +1364,10 @@ fn trainer_descriptor_for(id: &'static str) -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: depth_anchoring,
             face_landmark_loss: depth_anchoring,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring.
+            body_proportion_loss: depth_anchoring,
+            body_shape_loss: depth_anchoring,
+            normal_loss: depth_anchoring,
             vae_anchor_loss: depth_anchoring,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -1382,7 +1386,44 @@ fn refuse_ltx25_subject_mask_loss(req: &TrainingRequest) -> Result<()> {
              aligned to the latent, so a subject mask cannot be applied"
         )));
     }
+    // sc-24832: the subject-restricted normal loss reads the same (absent) aligned mask.
+    if candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::needed(&req.config) {
+        return Err(CandleError::Unsupported(format!(
+            "{MODEL_25_ID} trainer: the normal loss restricted to the subject is unsupported — every \
+             item trains on a prepared latent bundle with no decodable image aligned to the latent, \
+             so body_losses.normal_restrict_to_subject cannot be applied"
+        )));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod ltx25_restricted_normal_tests {
+    use super::*;
+
+    /// sc-24832: LTX-2.5 refuses the subject-restricted normal loss and still admits the
+    /// unrestricted one. Mutation: drop the `PerceptualSubjectMasks::needed` refusal ⇒ red.
+    #[test]
+    fn ltx25_refuses_subject_restricted_normals() {
+        let mut req = TrainingRequest {
+            items: vec![candle_gen::gen_core::train::TrainingItem::captioned(
+                PathBuf::from("x.png"),
+                "c".into(),
+            )],
+            config: TrainingConfig::default(),
+            output_dir: PathBuf::from("out"),
+            file_name: "a.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        req.config.body_losses.normal.weight = 0.1;
+        assert!(refuse_ltx25_subject_mask_loss(&req).is_ok());
+        req.config.body_losses.normal_restrict_to_subject = true;
+        match refuse_ltx25_subject_mask_loss(&req) {
+            Err(CandleError::Unsupported(m)) => assert!(m.contains("normal_restrict_to_subject")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
 }
 
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
@@ -1477,8 +1518,8 @@ fn validate_ltx_request(req: &TrainingRequest, label: &str) -> Result<()> {
 /// validates the [`DEPTH_ANCHORING_FRAMES_KEY`] knob.
 fn refuse_ltx25_depth_anchoring(req: &TrainingRequest) -> Result<()> {
     // Every decoded-x0 perceptual loss (depth anchoring, the sc-24831 identity / face-landmark
-    // losses, the sc-24833 VAE anchor) decodes the same generated video frames, so the refusal
-    // covers whichever ones are on and names them.
+    // losses, the sc-24833 VAE anchor, the sc-24832 body losses) decodes the same generated video
+    // frames, so the refusal covers whichever ones are on and names them.
     let pixel_losses = candle_gen_perceptual::enabled_pixel_aux_losses(&req.config);
     if pixel_losses.is_empty() {
         return Ok(());
@@ -5842,6 +5883,16 @@ mod ltx25_depth_anchoring_tests {
             }
             req.config.identity_loss.schedule = AuxLossSchedule::OFF;
             req.config.face_landmark_loss.schedule = AuxLossSchedule::OFF;
+            // sc-24832: a body loss decodes the same video stream, so it is refused alike.
+            // Mutation: check only depth in `refuse_ltx25_depth_anchoring` ⇒ red.
+            req.config.body_losses.normal = schedule();
+            assert_eq!(
+                refuse_ltx25_depth_anchoring(&req).is_err(),
+                refused.contains(&workflow.id()),
+                "{} (body loss)",
+                workflow.id()
+            );
+            req.config.body_losses.normal = AuxLossSchedule::OFF;
         }
         let mut cfg = TrainingConfig::default();
         cfg.model_options

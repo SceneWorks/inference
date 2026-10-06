@@ -172,3 +172,59 @@ fn latent_weights_follow_the_mask_and_refuse_bad_masks() {
     let w = subject_mask_latent_weights("t", &item, &cfg, CropBox::center_square, 2, 2).unwrap();
     assert_eq!(w, vec![0.25; 4]);
 }
+
+/// sc-24832: perceptual masks load only when the restricted normal loss is on, map reference keys
+/// to items item-major, and crop with the trainer's rule before resampling onto the pixel grid.
+/// Mutation: key the item by `entry` instead of `entry / entries_per_item` ⇒ entry 1 reads item 1
+/// (left-half mask) instead of item 0 ⇒ red.
+#[test]
+fn perceptual_masks_follow_the_item_major_cache_and_crop() {
+    let dir = tempfile::tempdir().unwrap();
+    // A 12×8 image; item 0's mask is the right half, item 1's the left half.
+    let img = write_png(dir.path(), "img.png", 12, 8, |_, _| 128);
+    let right = write_png(
+        dir.path(),
+        "right.png",
+        12,
+        8,
+        |x, _| if x >= 6 { 255 } else { 0 },
+    );
+    let left = write_png(
+        dir.path(),
+        "left.png",
+        12,
+        8,
+        |x, _| if x < 6 { 255 } else { 0 },
+    );
+    let item = |m: &PathBuf| {
+        let mut it = TrainingItem::captioned(img.clone(), "c".into());
+        it.subject_mask_path = Some(m.clone());
+        it
+    };
+    let items = vec![item(&right), item(&left)];
+    let mut cfg = TrainingConfig::default();
+    assert!(
+        PerceptualSubjectMasks::load("t", &items, &cfg, 2, CropBox::center_square)
+            .unwrap()
+            .is_none()
+    );
+    cfg.body_losses.normal.weight = 0.1;
+    cfg.body_losses.normal_restrict_to_subject = true;
+    let m = PerceptualSubjectMasks::load("t", &items, &cfg, 2, CropBox::center_square)
+        .unwrap()
+        .unwrap();
+    // Center-square crop of 12×8 is x ∈ [2, 10): the right half covers crop columns 4..8.
+    assert_eq!(m.pixel_mask(0, 2, 1).unwrap(), vec![0.0, 1.0]);
+    assert_eq!(
+        m.pixel_mask(1, 2, 1).unwrap(),
+        vec![0.0, 1.0],
+        "entry 1 is item 0's second bucket"
+    );
+    assert_eq!(m.pixel_mask(2, 2, 1).unwrap(), vec![1.0, 0.0]);
+    assert!(m.pixel_mask(4, 2, 1).is_err());
+    // A missing mask is refused naming the image.
+    let mut bad = items.clone();
+    bad[1].subject_mask_path = None;
+    let e = PerceptualSubjectMasks::load("t", &bad, &cfg, 2, CropBox::center_square).unwrap_err();
+    assert!(e.to_string().contains("img.png"), "{e}");
+}

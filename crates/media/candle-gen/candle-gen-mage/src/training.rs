@@ -70,6 +70,11 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
             // same shared perceptual builder arms (no trainer-loop change).
             identity_loss: true,
             face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -795,6 +800,20 @@ impl MageTrainer {
         let buckets = req.config.training_buckets();
         let schedule = BucketSchedule::new(cache.len() / buckets.len(), &buckets, req.config.seed);
         // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the item.
+        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+        // cropped like the image and resampled onto its decoded size.
+        let mut perceptual = perceptual;
+        if let Some(path) = perceptual.as_mut() {
+            path.attach_subject_masks(
+                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
+                    "mage_flow_base trainer",
+                    &req.items,
+                    &req.config,
+                    edges.len(),
+                    CropBox::center_square,
+                )?,
+            );
+        }
         let mut aux = perceptual
             .map(|path| {
                 AuxDriver::prepare(

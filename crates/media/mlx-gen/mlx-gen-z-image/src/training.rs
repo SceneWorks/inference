@@ -124,7 +124,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // (`adapter_optimizer_update`, sc-24826/sc-24827), multi-resolution buckets (sc-2127),
         // depth anchoring (sc-2125) — the shared decoded-x0 perceptual path (TAEF1 decode →
         // Depth-Anything-V2 → cached round-trip reference) — and subject-masked loss (sc-24828,
-        // a per-(item, bucket) weight map cached next to each latent, applied by `reduce_loss`).
+        // a per-(item, bucket) weight map cached next to each latent, applied by `reduce_loss`),
+        // and the body losses (sc-24832: ViTPose proportion, HybrIK shape, Sapiens normals) on the
+        // same perceptual path through the `mlx-gen-perceptual` builder's arms.
         // sc-24833: the VAE anchor (TAEF1 decode → FLUX.2 encoder taps) and E-LatentLPIPS (the
         // FLUX.1 16-channel family weights) through the shared aux-loss builder.
         techniques: gen_core::train::TrainingTechniques {
@@ -135,6 +137,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
             // same shared perceptual builder arms (no trainer-loop change).
             identity_loss: true,
             face_landmark_loss: true,
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             latent_lpips_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
@@ -413,7 +418,16 @@ impl ZImageTurboTrainer {
         // Epic 2123 E8: each image's perceptual reference (TAEF1 decode of its cached clean latent →
         // DA2 depth) is computed exactly once per job, here, before the loop.
         if let Some(path) = perceptual.as_mut() {
-            prepare_perceptual_references(path, &cache)?;
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            let masks = mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "z_image_turbo trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?;
+            prepare_perceptual_references(path, &cache, masks)?;
         }
 
         // sc-5637 — pre-encode the preview-sample prompts while the Qwen encoder is still resident
@@ -826,7 +840,14 @@ fn cache_item_buckets(
 
 /// Compute every cached image's perceptual reference once (its clean `[C, 1, h, w]` latent,
 /// unpacked to the decoder's NCHW layout).
-fn prepare_perceptual_references(path: &mut PerceptualPath, cache: &[CacheEntry]) -> Result<()> {
+/// Hands the path the job's subject masks first (sc-24832), so a mask-reading loss gets each
+/// entry's item mask on its decoded grid.
+fn prepare_perceptual_references(
+    path: &mut PerceptualPath,
+    cache: &[CacheEntry],
+    masks: Option<mlx_gen::train::subject_mask::PerceptualSubjectMasks>,
+) -> Result<()> {
+    path.attach_subject_masks(masks);
     for (i, (x0, _, _)) in cache.iter().enumerate() {
         path.ensure_reference(i, &crate::pipeline::unpack_latents(x0)?)?;
     }
@@ -2339,7 +2360,7 @@ mod depth_anchoring_tests {
         accum: u32,
     ) -> (PerceptualPath, AuxAlternation) {
         let mut p = path();
-        prepare_perceptual_references(&mut p, cache).unwrap();
+        prepare_perceptual_references(&mut p, cache, None).unwrap();
         (p, AuxAlternation::new(items, accum))
     }
 
@@ -2855,6 +2876,14 @@ mod depth_anchoring_tests {
         assert!(trainer_descriptor().techniques.face_landmark_loss);
     }
 
+    /// sc-24832: Z-Image builds its perceptual path through the builder, so it declares the body
+    /// losses the builder's arms provide.
+    #[test]
+    fn descriptor_declares_the_body_losses() {
+        let t = trainer_descriptor().techniques;
+        assert!(t.body_proportion_loss && t.body_shape_loss && t.normal_loss);
+    }
+
     /// A missing aux checkpoint is a clear error naming the model, before any caching.
     #[test]
     fn missing_aux_weights_are_named() {
@@ -2925,7 +2954,7 @@ mod depth_anchoring_tests {
         let cache = cache_n(2);
         let run = |dit: &mut ZImageTransformer, weight: f32, steps: u32| {
             let mut p = build(weight);
-            prepare_perceptual_references(&mut p, &cache).unwrap();
+            prepare_perceptual_references(&mut p, &cache, None).unwrap();
             let mut alt = AuxAlternation::new(cache.len(), 1);
             let mut out = Vec::new();
             for n in 1..=steps {
@@ -2965,5 +2994,138 @@ mod depth_anchoring_tests {
             (gz - gw).abs() > 1e-6 * gz.max(1e-12),
             "the aux term must move the LoRA gradient: {gz} vs {gw}"
         );
+    }
+}
+
+/// sc-24832: the Z-Image reference preparation hands each cache entry its item's subject mask —
+/// cropped like the image (centre square) and resampled onto that entry's decoded grid — to a
+/// mask-reading loss. Mutation: drop `path.attach_subject_masks(masks)` from
+/// `prepare_perceptual_references` ⇒ the probe sees no mask ⇒ red.
+#[cfg(test)]
+mod subject_mask_reference_tests {
+    use super::*;
+    use std::any::Any;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule, LossReference, PerceptualLoss};
+    use mlx_gen::train::subject_mask::PerceptualSubjectMasks;
+    use mlx_gen::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder};
+    use mlx_gen::train::TrainingItem;
+
+    type Seen = Rc<RefCell<Vec<Option<(Vec<i32>, Vec<f32>)>>>>;
+    /// Records the mask every reference receives: `(shape, values)`, or `None`.
+    struct MaskProbe(Seen);
+    impl PerceptualLoss for MaskProbe {
+        fn name(&self) -> &'static str {
+            "mask-probe"
+        }
+        fn reference(&self, clean: &Array) -> mlx_gen::Result<Option<LossReference>> {
+            self.reference_with_mask(clean, None)
+        }
+        fn reference_with_mask(
+            &self,
+            _clean: &Array,
+            mask: Option<&Array>,
+        ) -> mlx_gen::Result<Option<LossReference>> {
+            self.0.borrow_mut().push(mask.map(|m| {
+                m.eval().unwrap();
+                (m.shape().to_vec(), m.as_slice::<f32>().to_vec())
+            }));
+            Ok(Some(Box::new(())))
+        }
+        fn loss(&self, live: &Array, _r: &dyn Any) -> mlx_gen::Result<Array> {
+            Ok(live.mean(None)?)
+        }
+    }
+
+    fn write_png(
+        dir: &std::path::Path,
+        name: &str,
+        f: impl Fn(u32, u32) -> u8,
+    ) -> std::path::PathBuf {
+        let p = dir.join(name);
+        image::GrayImage::from_fn(12, 8, |x, y| image::Luma([f(x, y)]))
+            .save(&p)
+            .unwrap();
+        p
+    }
+
+    #[test]
+    fn the_reference_path_hands_each_entry_its_items_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = write_png(dir.path(), "img.png", |_, _| 128);
+        let masks = [
+            write_png(dir.path(), "right.png", |x, _| if x >= 6 { 255 } else { 0 }),
+            write_png(dir.path(), "top.png", |_, y| if y < 4 { 255 } else { 0 }),
+        ];
+        let items: Vec<TrainingItem> = masks
+            .iter()
+            .map(|m| {
+                let mut it = TrainingItem::captioned(img.clone(), "c".into());
+                it.subject_mask_path = Some(m.clone());
+                it
+            })
+            .collect();
+        let mut cfg = TrainingConfig::default();
+        cfg.body_losses.normal.weight = 0.1;
+        cfg.body_losses.normal_restrict_to_subject = true;
+        // Two items × one bucket; [4, 1, 4, 4] latents decode to 32×32.
+        let cache: Vec<CacheEntry> = (0..2u64)
+            .map(|i| {
+                let x0 = random::normal::<f32>(
+                    &[4, 1, 4, 4],
+                    None,
+                    None,
+                    Some(&random::key(i).unwrap()),
+                )
+                .unwrap();
+                (x0, Array::from_f32(0.0), None)
+            })
+            .collect();
+        let dcfg = mlx_gen_perceptual::testing::tiny_decoder_config(4);
+        let dec =
+            TinyDecoder::from_weights(&synthetic_tiny_decoder_weights(&dcfg, 3).unwrap(), dcfg)
+                .unwrap();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut path = PerceptualPath::new(
+            Some(Box::new(dec)),
+            vec![AuxLoss {
+                schedule: AuxLossSchedule {
+                    weight: 0.1,
+                    t_min: 0.0,
+                    t_max: 1.0,
+                    every_n: 1,
+                },
+                loss: Box::new(MaskProbe(seen.clone())),
+            }],
+        )
+        .unwrap();
+        let loaded =
+            PerceptualSubjectMasks::load("t", &items, &cfg, 1, CropBox::center_square).unwrap();
+        let expected = loaded.clone().unwrap();
+        prepare_perceptual_references(&mut path, &cache, loaded).unwrap();
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        for (entry, got) in seen.iter().enumerate() {
+            let (shape, values) = got.as_ref().expect("every reference gets its mask");
+            assert_eq!(shape, &vec![32, 32]);
+            assert_eq!(
+                values,
+                &expected.pixel_mask(entry, 32, 32).unwrap(),
+                "entry {entry}"
+            );
+        }
+        assert_ne!(seen[0], seen[1], "each entry carries its own item's mask");
+        // Off ⇒ no mask reaches the loss.
+        let none = PerceptualSubjectMasks::load(
+            "t",
+            &items,
+            &TrainingConfig::default(),
+            1,
+            CropBox::center_square,
+        )
+        .unwrap();
+        assert!(none.is_none());
     }
 }

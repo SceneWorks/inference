@@ -278,11 +278,12 @@ pub use ::core_llm;
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{
-    AuxLossSchedule, BucketSchedule, DepthAnchoringConfig, DepthModelSize, FaceLandmarkLossConfig,
-    IdentityLossConfig, IdentityReferenceMode, LatentLpipsConfig, LatentLpipsFamily, LrSchedule,
-    NetworkType, ResolutionBucket, SubjectMaskLoss, Trainer, TrainerDescriptor, TrainingConfig,
-    TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest, TrainingTechniques,
-    VaeAnchorConfig, LATENT_PERCEPTUAL_SCHEDULE, MAX_RESOLUTION_BUCKETS, RESOLUTION_BUCKET_STRIDE,
+    AuxLossSchedule, BodyLossesConfig, BucketSchedule, DepthAnchoringConfig, DepthModelSize,
+    FaceLandmarkLossConfig, IdentityLossConfig, IdentityReferenceMode, LatentLpipsConfig,
+    LatentLpipsFamily, LrSchedule, NetworkType, ResolutionBucket, SubjectMaskLoss, Trainer,
+    TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
+    TrainingRequest, TrainingTechniques, VaeAnchorConfig, LATENT_PERCEPTUAL_SCHEDULE,
+    MAX_RESOLUTION_BUCKETS, RESOLUTION_BUCKET_STRIDE,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,

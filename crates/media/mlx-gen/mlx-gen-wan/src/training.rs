@@ -282,6 +282,11 @@ fn trainer_descriptor(id: &'static str) -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: true,
             face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -580,6 +585,15 @@ impl WanMoeTrainer {
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEHV decode of its
         // cached clean latent → DA2 depth) is computed exactly once per job, here.
         if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "wan trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
             prepare_perceptual_references(path, &cache)?;
         }
         // Free the UMT5 encoder + tokenizer (~11 GB) before training (the reference frees it post-cache).

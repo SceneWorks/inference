@@ -885,6 +885,11 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
             // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
             identity_loss: true,
             face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
             vae_anchor_loss: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
@@ -2331,6 +2336,26 @@ impl QwenImage21Trainer {
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         // Epic 2123 E8: each (item, bucket) entry's reference once (its packed target unpacked to
         // the decoder grid), alternation keyed on the real item, the resumed prefix replayed.
+        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+        // cropped like the image and resampled onto its decoded size.
+        let mut perceptual = perceptual;
+        if let Some(path) = perceptual.as_mut() {
+            path.attach_subject_masks(
+                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load_with(
+                    "qwen_image_2_1 trainer",
+                    &req.items,
+                    cfg,
+                    edges.len(),
+                    |item| {
+                        if item.is_edit_pair() {
+                            CropBox::full
+                        } else {
+                            CropBox::center_square
+                        }
+                    },
+                )?,
+            );
+        }
         let mut aux_driver = match perceptual {
             Some(path) => Some(AuxDriver::prepare(
                 path,
