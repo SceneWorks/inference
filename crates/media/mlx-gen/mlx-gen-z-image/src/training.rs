@@ -39,7 +39,7 @@ use mlx_gen::train::lora::{
     build_lora_targets, LoraParams, TrainAdapter,
 };
 use mlx_gen::train::perceptual::{
-    combine_step_loss, AuxAlternation, Parameterization, PerceptualPath, StepPlan,
+    combine_step_loss, step_sample, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
 use mlx_gen::train::tae::TinyDecoderConfig;
 // Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
@@ -347,7 +347,7 @@ impl ZImageTurboTrainer {
         // One cached depth reference per (item, bucket) entry, sized here at the largest edge.
         let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
         if !will_checkpoint || aux_gb > 0.0 {
-            preflight_memory_guard(edge, use_bf16, aux_gb, will_checkpoint)?;
+            preflight_memory_guard(cfg, edge, use_bf16, aux_gb, will_checkpoint)?;
         }
 
         if use_bf16 {
@@ -356,7 +356,7 @@ impl ZImageTurboTrainer {
 
         // Epic 2123 depth anchoring (sc-2125): load the frozen TAEF1 decoder + Depth-Anything-V2
         // before the (minutes-long) caching pass, so a missing/corrupt aux checkpoint fails fast.
-        let mut perceptual = load_perceptual_path(cfg)?;
+        let perceptual = load_perceptual_path(cfg)?;
 
         // --- prepare → load → cache: VAE-latents + prompt-embeds into memory before the loop ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
@@ -416,19 +416,19 @@ impl ZImageTurboTrainer {
         }
 
         // Epic 2123 E8: each image's perceptual reference (TAEF1 decode of its cached clean latent →
-        // DA2 depth) is computed exactly once per job, here, before the loop.
-        if let Some(path) = perceptual.as_mut() {
-            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-            // cropped like the image and resampled onto its decoded size.
-            let masks = mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+        // DA2 depth) is computed exactly once per job, by the `AuxDriver` before the loop.
+        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+        // cropped like the image and resampled onto its decoded size.
+        let aux_masks = match perceptual {
+            Some(_) => mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
                 "z_image_turbo trainer",
                 &req.items,
                 cfg,
                 edges.len(),
                 CropBox::center_square,
-            )?;
-            prepare_perceptual_references(path, &cache, masks)?;
-        }
+            )?,
+            None => None,
+        };
 
         // sc-5637 — pre-encode the preview-sample prompts while the Qwen encoder is still resident
         // (it is freed just below, sc-4952). Each `sample_every` cadence reuses these cached cap
@@ -591,14 +591,12 @@ impl ZImageTurboTrainer {
         // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on
         // the real dataset item (not the (item, bucket) cache entry) so an image alternates across
         // its buckets. A resumed run replays the skipped prefix so the phase matches.
-        let mut alternation = perceptual
-            .as_ref()
-            .map(|_| AuxAlternation::new(cache.len() / edges.len(), accum));
-        if let Some(alt) = alternation.as_mut() {
-            for step in 1..=start_step {
-                alt.key(step, schedule.sample((step - 1) as usize).0);
-            }
-        }
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(
+                path, &cache, aux_masks, &schedule, accum, start_step,
+            )?),
+            None => None,
+        };
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -613,7 +611,7 @@ impl ZImageTurboTrainer {
                 cfg,
                 &cache,
                 &schedule,
-                perceptual.as_mut().zip(alternation.as_mut()),
+                aux_driver.as_mut(),
                 step,
                 mae,
                 checkpoint_main,
@@ -838,20 +836,28 @@ fn cache_item_buckets(
     Ok(())
 }
 
-/// Compute every cached image's perceptual reference once (its clean `[C, 1, h, w]` latent,
-/// unpacked to the decoder's NCHW layout).
-/// Hands the path the job's subject masks first (sc-24832), so a mask-reading loss gets each
-/// entry's item mask on its decoded grid.
-fn prepare_perceptual_references(
-    path: &mut PerceptualPath,
+/// The loop's [`AuxDriver`] (epic 2123 E8): every cached entry's perceptual reference computed
+/// once (its clean `[C, 1, h, w]` latent, unpacked to the decoder's NCHW layout), the alternation
+/// keyed on the schedule's items with `accum` micro-steps per update, and a resumed prefix
+/// `1..=start_step` replayed. Hands the path the job's subject masks first (sc-24832), so a
+/// mask-reading loss gets each entry's item mask on its decoded grid.
+fn aux_driver(
+    mut path: PerceptualPath,
     cache: &[CacheEntry],
     masks: Option<mlx_gen::train::subject_mask::PerceptualSubjectMasks>,
-) -> Result<()> {
+    schedule: &BucketSchedule,
+    accum: u32,
+    start_step: u32,
+) -> Result<AuxDriver> {
     path.attach_subject_masks(masks);
-    for (i, (x0, _, _)) in cache.iter().enumerate() {
-        path.ensure_reference(i, &crate::pipeline::unpack_latents(x0)?)?;
-    }
-    Ok(())
+    AuxDriver::prepare(
+        path,
+        cache.len(),
+        |i| crate::pipeline::unpack_latents(&cache[i].0),
+        schedule,
+        accum,
+        start_step,
+    )
 }
 
 /// Extra training memory (GB) the enabled perceptual losses add at the bucketed `edge` — the
@@ -880,7 +886,7 @@ fn run_train_step(
     cfg: &TrainingConfig,
     cache: &[CacheEntry],
     schedule: &BucketSchedule,
-    perceptual: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+    perceptual: Option<&mut AuxDriver>,
     step: u32,
     mae: bool,
     checkpoint_main: Option<&[Vec<String>]>,
@@ -889,9 +895,8 @@ fn run_train_step(
     // sc-2127: the step's (item, bucket) from the bucket schedule. The perceptual references are
     // keyed per cache entry (item, bucket) — each bucket's clean latent decodes to its own size —
     // while alternation is keyed on the item.
-    let k = (step - 1) as usize;
-    let (item, _bucket) = schedule.sample(k);
-    let entry = schedule.cache_index(k);
+    let sample = step_sample(perceptual, step, schedule);
+    let entry = sample.entry;
     let (x0, cap, mask_weight) = &cache[entry];
     let mut sigma = sample_sigma(
         &cfg.timestep_type,
@@ -906,22 +911,15 @@ fn run_train_step(
             cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
         )?),
     )?;
-    let plan;
-    let aux = match perceptual {
-        Some((path, alternation)) => {
-            // Normally a no-op (references were computed once, before the loop).
-            path.ensure_reference(entry, &crate::pipeline::unpack_latents(x0)?)?;
-            plan = path.plan(alternation.key(step, item), entry, sigma)?;
-            sigma = plan.noise_level;
-            let path: &PerceptualPath = path;
-            Some(AuxStep {
-                path,
-                plan: &plan,
-                image: entry,
-            })
-        }
-        None => None,
-    };
+    let planned = sample.plan(sigma)?;
+    if let Some(p) = &planned {
+        sigma = p.plan.noise_level;
+    }
+    let aux = planned.as_ref().map(|p| AuxStep {
+        path: p.path,
+        plan: &p.plan,
+        image: p.entry,
+    });
     compute_loss_grads(
         transformer,
         params,
@@ -984,8 +982,14 @@ fn checkpointed_baseline_gb(bf16: bool) -> f64 {
 /// footprint ([`perceptual_footprint_gb`], epic 2123 E7), added on top of the DiT projection. With
 /// `checkpointed`, the DiT projection is [`checkpointed_baseline_gb`] (no fitted checkpointed curve
 /// exists, so the resident base is the lower bound the auxiliary models stack on).
-fn preflight_memory_guard(edge: u32, bf16: bool, extra_gb: f64, checkpointed: bool) -> Result<()> {
-    preflight_memory_guard_with_budget(edge, bf16, extra_gb, checkpointed, get_memory_limit())
+fn preflight_memory_guard(
+    cfg: &TrainingConfig,
+    edge: u32,
+    bf16: bool,
+    extra_gb: f64,
+    checkpointed: bool,
+) -> Result<()> {
+    preflight_memory_guard_with_budget(cfg, edge, bf16, extra_gb, checkpointed, get_memory_limit())
 }
 
 /// The edge the memory pre-flight (and the preview render) sizes for: the largest bucket edge
@@ -995,8 +999,10 @@ fn preflight_edge(edges: &[u32]) -> u32 {
 }
 
 /// [`preflight_memory_guard`] against an explicit memory budget (`budget_bytes`, the live MLX limit
-/// in production) — so the guard's arithmetic is testable on any host.
+/// in production) — so the guard's arithmetic is testable on any host. A checkpointed refusal goes
+/// through the shared [`mlx_gen_perceptual::check_aux_memory`], naming `cfg`'s enabled aux losses.
 fn preflight_memory_guard_with_budget(
+    cfg: &TrainingConfig,
     edge: u32,
     bf16: bool,
     extra_gb: f64,
@@ -1015,15 +1021,16 @@ fn preflight_memory_guard_with_budget(
     } + extra_gb;
     let budget_gb = budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
-    if projected > safe && checkpointed {
-        return Err(format!(
-            "z_image_turbo trainer: a checkpointed training step at resolution {edge} with the \
-             depth-anchoring models (~{extra_gb:.1} GB for the tiny decoder and Depth-Anything-V2) \
-             needs at least ~{projected:.0} GB, exceeding this machine's ~{safe:.0} GB safe budget \
-             ({budget_gb:.0} GB MLX limit × 0.85). Use a smaller depth model or reduce the training \
-             resolution."
-        )
-        .into());
+    if checkpointed {
+        return mlx_gen_perceptual::check_aux_memory(
+            "z_image_turbo trainer",
+            cfg,
+            &format!("a checkpointed training step at resolution {edge}"),
+            extra_gb,
+            projected,
+            safe,
+            &format!("{budget_gb:.0} GB MLX limit × 0.85"),
+        );
     }
     if projected > safe {
         return Err(format!(
@@ -2259,7 +2266,7 @@ mod weight_noise_update_tests {
 /// sc-2125 (epic 2123 depth anchoring) — the Z-Image step seam on the tiny synthetic DiT fixture
 /// (`tests/fixtures/z_transformer.safetensors`: dim 96, 2 main + 1 refiner layers, 4 latent
 /// channels) with a random-init tiny TAESD decoder (4 latent channels) and a random-init tiny
-/// Depth-Anything-V2. Drives the same [`run_train_step`] / [`prepare_perceptual_references`] /
+/// Depth-Anything-V2. Drives the same [`run_train_step`] / [`aux_driver`] /
 /// [`compute_loss_grads`] `train_impl` runs. Seconds, a few MB; no weights downloaded.
 #[cfg(test)]
 mod depth_anchoring_tests {
@@ -2352,21 +2359,15 @@ mod depth_anchoring_tests {
         (TrainAdapter::Lora { targets }, params)
     }
 
-    /// A prepared path (references built, as `train_impl` does) plus its alternation tracker over
-    /// `items` dataset items.
-    fn prepared_items(
-        cache: &[CacheEntry],
-        items: usize,
-        accum: u32,
-    ) -> (PerceptualPath, AuxAlternation) {
-        let mut p = path();
-        prepare_perceptual_references(&mut p, cache, None).unwrap();
-        (p, AuxAlternation::new(items, accum))
+    /// A prepared driver (references built, alternation over `schedule`'s items, as `train_impl`
+    /// does).
+    fn prepared_with(cache: &[CacheEntry], schedule: &BucketSchedule, accum: u32) -> AuxDriver {
+        aux_driver(path(), cache, None, schedule, accum, 0).unwrap()
     }
 
-    /// [`prepared_items`] for a single-bucket cache (one entry per item).
-    fn prepared(cache: &[CacheEntry], accum: u32) -> (PerceptualPath, AuxAlternation) {
-        prepared_items(cache, cache.len(), accum)
+    /// [`prepared_with`] for a single-bucket cache (one entry per item).
+    fn prepared(cache: &[CacheEntry], accum: u32) -> AuxDriver {
+        prepared_with(cache, &single_bucket(cache), accum)
     }
 
     /// The single-bucket schedule `train_impl` builds when buckets are off (round-robin).
@@ -2389,7 +2390,7 @@ mod depth_anchoring_tests {
         cfg: &TrainingConfig,
         cache: &[CacheEntry],
         schedule: &BucketSchedule,
-        path: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+        path: Option<&mut AuxDriver>,
         n: u32,
     ) -> (StepLosses, LoraParams) {
         let (l, g) = run_train_step(
@@ -2416,7 +2417,7 @@ mod depth_anchoring_tests {
         adapter: &TrainAdapter,
         cfg: &TrainingConfig,
         cache: &[CacheEntry],
-        path: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+        path: Option<&mut AuxDriver>,
         n: u32,
     ) -> (StepLosses, LoraParams) {
         let schedule = single_bucket(cache);
@@ -2424,18 +2425,17 @@ mod depth_anchoring_tests {
     }
 
     /// Run micro-steps `1..=steps` through the real step seam over `schedule`; per step
-    /// `(dataset item, is_depth_step)`. Returns the path too, for its reference counter.
+    /// `(dataset item, is_depth_step)`. Returns the driver too, for its reference counter.
     fn run_kinds_with(
         cache: &[CacheEntry],
         schedule: &BucketSchedule,
-        items: usize,
         accum: u32,
         steps: u32,
-    ) -> (Vec<(usize, bool)>, PerceptualPath) {
+    ) -> (Vec<(usize, bool)>, AuxDriver) {
         let mut dit = tiny_dit();
         let cfg = cfg();
         let (adapter, params) = adapter(&mut dit, &cfg);
-        let (mut p, mut alt) = prepared_items(cache, items, accum);
+        let mut d = prepared_with(cache, schedule, accum);
         let kinds = (1..=steps)
             .map(|n| {
                 let (l, _) = step_with(
@@ -2445,7 +2445,7 @@ mod depth_anchoring_tests {
                     &cfg,
                     cache,
                     schedule,
-                    Some((&mut p, &mut alt)),
+                    Some(&mut d),
                     n,
                 );
                 assert_eq!(
@@ -2456,11 +2456,11 @@ mod depth_anchoring_tests {
                 (schedule.sample((n - 1) as usize).0, l.aux.is_some())
             })
             .collect();
-        (kinds, p)
+        (kinds, d)
     }
 
     fn run_kinds(cache: &[CacheEntry], accum: u32, steps: u32) -> Vec<(usize, bool)> {
-        run_kinds_with(cache, &single_bucket(cache), cache.len(), accum, steps).0
+        run_kinds_with(cache, &single_bucket(cache), accum, steps).0
     }
 
     fn abs_sum(g: &LoraParams, filter: &str) -> f32 {
@@ -2488,29 +2488,13 @@ mod depth_anchoring_tests {
         let cfg = cfg();
         let (adapter, params) = adapter(&mut dit, &cfg);
         let cache = cache_n(1);
-        let (mut p, mut alt) = prepared(&cache, 1);
+        let mut d = prepared(&cache, 1);
 
-        let (diff, _) = step(
-            &mut dit,
-            &params,
-            &adapter,
-            &cfg,
-            &cache,
-            Some((&mut p, &mut alt)),
-            1,
-        );
+        let (diff, _) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), 1);
         assert_eq!(diff.aux, None, "diffusion step carries no depth term");
         assert_eq!(Some(diff.total), diff.diffusion);
 
-        let (depth, g) = step(
-            &mut dit,
-            &params,
-            &adapter,
-            &cfg,
-            &cache,
-            Some((&mut p, &mut alt)),
-            2,
-        );
+        let (depth, g) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), 2);
         assert_eq!(
             depth.diffusion, None,
             "depth step must not compute the diffusion loss"
@@ -2617,7 +2601,7 @@ mod depth_anchoring_tests {
         let mut dit = tiny_dit();
         let cfg = cfg();
         let (adapter, params) = adapter(&mut dit, &cfg);
-        let (mut p, mut alt) = prepared_items(&cache, items, 1);
+        let mut d = prepared_with(&cache, &schedule, 1);
         let mut kinds = Vec::new();
         let mut checked_depth_step = false;
         for n in 1..=steps {
@@ -2628,7 +2612,7 @@ mod depth_anchoring_tests {
                 &cfg,
                 &cache,
                 &schedule,
-                Some((&mut p, &mut alt)),
+                Some(&mut d),
                 n,
             );
             let k = (n - 1) as usize;
@@ -2638,7 +2622,7 @@ mod depth_anchoring_tests {
             // Every step recomputed with the scheduled entry's latent and reference (and, on depth
             // steps whose entry differs from the item index, that proves the reference key).
             {
-                let mut replay = AuxAlternation::new(items, 1);
+                let mut replay = mlx_gen::train::perceptual::AuxAlternation::new(items, 1);
                 let mut key = 0;
                 for s in 1..=n {
                     key = replay.key(s, schedule.sample((s - 1) as usize).0);
@@ -2649,7 +2633,7 @@ mod depth_anchoring_tests {
                     cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
                 )
                 .unwrap();
-                let plan = p.plan(key, entry, raw).unwrap();
+                let plan = d.path().plan(key, entry, raw).unwrap();
                 let (x0, cap, _) = &cache[entry];
                 let noise = random::normal::<f32>(
                     x0.shape(),
@@ -2675,7 +2659,7 @@ mod depth_anchoring_tests {
                     None,
                     Dtype::Float32,
                     Some(AuxStep {
-                        path: &p,
+                        path: d.path(),
                         plan: &plan,
                         image: entry,
                     }),
@@ -2706,33 +2690,25 @@ mod depth_anchoring_tests {
             let alternating: Vec<bool> = (0..mine.len()).map(|v| v % 2 == 1).collect();
             assert_eq!(mine, alternating, "image {image} ({kinds:?})");
         }
-        assert_eq!(p.reference_computations(), cache.len());
+        assert_eq!(d.path().reference_computations(), cache.len());
     }
 
     /// AC2: the reference depth is computed once per image per job (per (image, bucket) cache
     /// entry with buckets on; one bucket here) — three epochs over three images leave the counter
-    /// at 3. Mutation: drop the `contains_key` early return in
-    /// `PerceptualPath::ensure_reference` ⇒ every step recomputes ⇒ counter 12 ⇒ red.
+    /// at 3 (only the `AuxDriver` builds references; the step never does). Mutation: build the
+    /// references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
     #[test]
     fn reference_depth_is_computed_once_per_image_across_epochs() {
         let mut dit = tiny_dit();
         let cfg = cfg();
         let (adapter, params) = adapter(&mut dit, &cfg);
         let cache = cache();
-        let (mut p, mut alt) = prepared(&cache, 1);
-        assert_eq!(p.reference_computations(), cache.len());
+        let mut d = prepared(&cache, 1);
+        assert_eq!(d.path().reference_computations(), cache.len());
         for n in 1..=(3 * cache.len() as u32) {
-            step(
-                &mut dit,
-                &params,
-                &adapter,
-                &cfg,
-                &cache,
-                Some((&mut p, &mut alt)),
-                n,
-            );
+            step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), n);
         }
-        assert_eq!(p.reference_computations(), cache.len());
+        assert_eq!(d.path().reference_computations(), cache.len());
     }
 
     /// E1: with depth anchoring off nothing is loaded and the step is bit-identical to the
@@ -2809,14 +2785,14 @@ mod depth_anchoring_tests {
         let mut dit2 = tiny_dit();
         let dcfg = self::cfg();
         let (adapter2, params2) = self::adapter(&mut dit2, &dcfg);
-        let (mut p, mut alt) = prepared(&cache, 1);
+        let mut d = prepared(&cache, 1);
         let (on1, g_on1) = step(
             &mut dit2,
             &params2,
             &adapter2,
             &dcfg,
             &cache,
-            Some((&mut p, &mut alt)),
+            Some(&mut d),
             1,
         );
         let mut dit3 = tiny_dit();
@@ -2855,16 +2831,20 @@ mod depth_anchoring_tests {
         let dense_tokens = (64.0f64 / 16.0).ceil().powi(2) + 544.0;
         let dense_base = projected_dense_peak_gb(dense_tokens, true);
         let budget = between(dense_base);
-        assert!(preflight_memory_guard_with_budget(64, true, 0.0, false, budget).is_ok());
-        assert!(preflight_memory_guard_with_budget(64, true, large, false, budget).is_err());
+        assert!(preflight_memory_guard_with_budget(&on, 64, true, 0.0, false, budget).is_ok());
+        assert!(preflight_memory_guard_with_budget(&on, 64, true, large, false, budget).is_err());
         let ckpt_base = checkpointed_baseline_gb(true);
         let budget = between(ckpt_base);
-        assert!(preflight_memory_guard_with_budget(1024, true, 0.0, true, budget).is_ok());
-        assert!(preflight_memory_guard_with_budget(1024, true, large, true, budget).is_err());
+        assert!(preflight_memory_guard_with_budget(&on, 1024, true, 0.0, true, budget).is_ok());
+        let err = preflight_memory_guard_with_budget(&on, 1024, true, large, true, budget)
+            .unwrap_err()
+            .to_string();
+        // The checkpointed refusal names the enabled aux losses (the shared E7 guard).
+        assert!(err.contains("[depth]"), "{err}");
         // A budget comfortably above projection + aux admits the depth run on both paths.
         let roomy = ((dense_base.max(ckpt_base) + large) / 0.85 * GIB) as usize * 2;
-        assert!(preflight_memory_guard_with_budget(64, true, large, false, roomy).is_ok());
-        assert!(preflight_memory_guard_with_budget(1024, true, large, true, roomy).is_ok());
+        assert!(preflight_memory_guard_with_budget(&on, 64, true, large, false, roomy).is_ok());
+        assert!(preflight_memory_guard_with_budget(&on, 1024, true, large, true, roomy).is_ok());
     }
 
     /// E3: the Z-Image MLX descriptor declares depth anchoring.
@@ -2905,7 +2885,7 @@ mod depth_anchoring_tests {
     /// every step carries the diffusion term AND the weighted aux term; and the aux term alone moves
     /// the LoRA gradient (the same step with the losses zero-weighted differs). Mutations: drop the
     /// `aux_term` from `combine_step_loss` in `compute_loss_grads` ⇒ the gradients match ⇒ red;
-    /// drop `PerceptualPath::ensure_reference`'s cache hit ⇒ counter 6 ⇒ red.
+    /// build the references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
     #[test]
     fn latent_perceptual_losses_train_the_lora_through_the_step_seam() {
         use mlx_gen::train::latent_lpips::{
@@ -2953,22 +2933,13 @@ mod depth_anchoring_tests {
         let (adapter, params) = adapter(&mut dit, &cfg);
         let cache = cache_n(2);
         let run = |dit: &mut ZImageTransformer, weight: f32, steps: u32| {
-            let mut p = build(weight);
-            prepare_perceptual_references(&mut p, &cache, None).unwrap();
-            let mut alt = AuxAlternation::new(cache.len(), 1);
+            let mut d =
+                aux_driver(build(weight), &cache, None, &single_bucket(&cache), 1, 0).unwrap();
             let mut out = Vec::new();
             for n in 1..=steps {
-                out.push(step(
-                    dit,
-                    &params,
-                    &adapter,
-                    &cfg,
-                    &cache,
-                    Some((&mut p, &mut alt)),
-                    n,
-                ));
+                out.push(step(dit, &params, &adapter, &cfg, &cache, Some(&mut d), n));
             }
-            (out, p.reference_computations())
+            (out, d.path().reference_computations())
         };
         let (steps, refs) = run(&mut dit, 0.5, 4);
         assert_eq!(refs, 2, "references are built once per image");
@@ -3000,7 +2971,7 @@ mod depth_anchoring_tests {
 /// sc-24832: the Z-Image reference preparation hands each cache entry its item's subject mask —
 /// cropped like the image (centre square) and resampled onto that entry's decoded grid — to a
 /// mask-reading loss. Mutation: drop `path.attach_subject_masks(masks)` from
-/// `prepare_perceptual_references` ⇒ the probe sees no mask ⇒ red.
+/// `aux_driver` ⇒ the probe sees no mask ⇒ red.
 #[cfg(test)]
 mod subject_mask_reference_tests {
     use super::*;
@@ -3088,7 +3059,7 @@ mod subject_mask_reference_tests {
             TinyDecoder::from_weights(&synthetic_tiny_decoder_weights(&dcfg, 3).unwrap(), dcfg)
                 .unwrap();
         let seen = Rc::new(RefCell::new(Vec::new()));
-        let mut path = PerceptualPath::new(
+        let path = PerceptualPath::new(
             Some(Box::new(dec)),
             vec![AuxLoss {
                 schedule: AuxLossSchedule {
@@ -3104,7 +3075,15 @@ mod subject_mask_reference_tests {
         let loaded =
             PerceptualSubjectMasks::load("t", &items, &cfg, 1, CropBox::center_square).unwrap();
         let expected = loaded.clone().unwrap();
-        prepare_perceptual_references(&mut path, &cache, loaded).unwrap();
+        let schedule = BucketSchedule::new(
+            cache.len(),
+            &[gen_core::train::ResolutionBucket {
+                resolution: 256,
+                repeats: 1,
+            }],
+            7,
+        );
+        aux_driver(path, &cache, loaded, &schedule, 1, 0).unwrap();
         let seen = seen.borrow();
         assert_eq!(seen.len(), 2);
         for (entry, got) in seen.iter().enumerate() {

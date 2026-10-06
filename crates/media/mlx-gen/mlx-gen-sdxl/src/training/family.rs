@@ -38,7 +38,7 @@ use mlx_gen::train::lora::{
 };
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, AuxAlternation, Parameterization, PerceptualPath, StepPlan,
+    combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
@@ -455,6 +455,7 @@ pub fn dense_peak_for_edges(
 /// checkpointed curve exists, so the resident U-Net + VAE is the lower bound the aux models stack on).
 fn preflight_memory_guard<H: SdxlFamilyHooks>(
     hooks: &H,
+    cfg: &TrainingConfig,
     edges: &[u32],
     bf16: bool,
     extra_gb: f64,
@@ -462,6 +463,7 @@ fn preflight_memory_guard<H: SdxlFamilyHooks>(
 ) -> Result<()> {
     preflight_memory_guard_with_budget(
         hooks,
+        cfg,
         edges,
         bf16,
         extra_gb,
@@ -471,10 +473,12 @@ fn preflight_memory_guard<H: SdxlFamilyHooks>(
 }
 
 /// The pre-flight memory guard against an explicit memory budget (`budget_bytes`, the live MLX limit
-/// in production) — so the guard's arithmetic is testable on any host.
+/// in production) — so the guard's arithmetic is testable on any host. A checkpointed refusal goes
+/// through the shared [`mlx_gen_perceptual::check_aux_memory`], naming `cfg`'s enabled aux losses.
 #[doc(hidden)]
 pub fn preflight_memory_guard_with_budget<H: SdxlFamilyHooks>(
     hooks: &H,
+    cfg: &TrainingConfig,
     edges: &[u32],
     bf16: bool,
     extra_gb: f64,
@@ -493,16 +497,16 @@ pub fn preflight_memory_guard_with_budget<H: SdxlFamilyHooks>(
     } + extra_gb;
     let budget_gb = budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
-    if projected > safe && checkpointed {
-        return Err(format!(
-            "{} trainer: a checkpointed training step at resolution {edge} with the \
-             depth-anchoring models (~{extra_gb:.1} GB for the tiny decoder and Depth-Anything-V2) \
-             needs at least ~{projected:.0} GB, exceeding this machine's ~{safe:.0} GB safe budget \
-             ({budget_gb:.0} GB MLX limit × 0.85). Use a smaller depth model or reduce the training \
-             resolution.",
-            hooks.label()
-        )
-        .into());
+    if checkpointed {
+        return mlx_gen_perceptual::check_aux_memory(
+            &format!("{} trainer", hooks.label()),
+            cfg,
+            &format!("a checkpointed training step at resolution {edge}"),
+            extra_gb,
+            projected,
+            safe,
+            &format!("{budget_gb:.0} GB MLX limit × 0.85"),
+        );
     }
     if projected > safe {
         return Err(format!(
@@ -569,16 +573,25 @@ fn step_cache_index(schedule: &BucketSchedule, step: u32) -> usize {
     schedule.cache_index((step - 1) as usize)
 }
 
-/// Compute every cache entry's perceptual reference once (its clean NHWC latent, transposed to the
-/// decoder's NCHW), keyed per (item, bucket) entry — each bucket's latent decodes to its own size.
-pub(crate) fn prepare_perceptual_references(
-    path: &mut PerceptualPath,
+/// The loop's [`AuxDriver`] (epic 2123 E8): every cache entry's perceptual reference computed once
+/// (its clean NHWC latent, transposed to the decoder's NCHW), keyed per (item, bucket) entry —
+/// each bucket's latent decodes to its own size — the alternation keyed on the schedule's items
+/// with `accum` micro-steps per update, and a resumed prefix `1..=start_step` replayed.
+pub(crate) fn aux_driver(
+    path: PerceptualPath,
     cache: &[CachedSample],
-) -> Result<()> {
-    for (i, entry) in cache.iter().enumerate() {
-        path.ensure_reference(i, &nchw(&entry.x0)?)?;
-    }
-    Ok(())
+    schedule: &BucketSchedule,
+    accum: u32,
+    start_step: u32,
+) -> Result<AuxDriver> {
+    AuxDriver::prepare(
+        path,
+        cache.len(),
+        |i| nchw(&cache[i].x0),
+        schedule,
+        accum,
+        start_step,
+    )
 }
 
 /// One training micro-step on the 1-based `step`: pick the step's cached (item, bucket) entry,
@@ -597,14 +610,12 @@ pub(crate) fn run_train_step<H: SdxlFamilyHooks>(
     cfg: &TrainingConfig,
     cache: &[CachedSample],
     schedule: &BucketSchedule,
-    perceptual: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+    perceptual: Option<&mut AuxDriver>,
     step: u32,
     mae: bool,
     compute_dtype: Dtype,
     checkpoint_targets: Option<Vec<String>>,
 ) -> Result<(StepLosses, LoraParams)> {
-    let k = (step - 1) as usize;
-    let (item, _bucket) = schedule.sample(k);
     let entry = step_cache_index(schedule, step);
     let CachedSample {
         x0,
@@ -623,24 +634,20 @@ pub(crate) fn run_train_step<H: SdxlFamilyHooks>(
             cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
         )?),
     )?;
-    let plan;
-    let aux = match perceptual {
-        Some((path, alternation)) => {
-            // Normally a no-op (references were computed once, before the loop).
-            path.ensure_reference(entry, &nchw(x0)?)?;
-            plan = path.plan(alternation.key(step, item), entry, hooks.noise_level(t))?;
-            if !plan.diffusion {
-                t = hooks.timestep_at(plan.noise_level);
-            }
-            let path: &PerceptualPath = path;
-            Some(AuxStep {
-                path,
-                plan: &plan,
-                entry,
-            })
-        }
+    let planned = match perceptual {
+        Some(d) => d.sample(step, schedule).plan(hooks.noise_level(t))?,
         None => None,
     };
+    if let Some(p) = &planned {
+        if !p.plan.diffusion {
+            t = hooks.timestep_at(p.plan.noise_level);
+        }
+    }
+    let aux = planned.as_ref().map(|p| AuxStep {
+        path: p.path,
+        plan: &p.plan,
+        entry: p.entry,
+    });
     compute_step_loss_grads(
         hooks,
         unet,
@@ -758,7 +765,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
     // largest edge.
     let aux_gb = perceptual_footprint_gb(cfg, max_edge, req.items.len() * edges.len());
     // (A checkpointed run with no aux models is not guarded — see the guard.)
-    preflight_memory_guard(hooks, &edges, use_bf16, aux_gb, use_checkpoint)?;
+    preflight_memory_guard(hooks, cfg, &edges, use_bf16, aux_gb, use_checkpoint)?;
     unet.set_sdpa_checkpoint(false);
     if use_bf16 {
         unet.cast_weights(Dtype::Bfloat16)?;
@@ -813,7 +820,8 @@ pub fn train_family<H: SdxlFamilyHooks>(
     }
 
     // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAESDXL decode of its cached
-    // clean latent → DA2 depth) is computed exactly once per job, here, before the loop.
+    // clean latent → DA2 depth) is computed exactly once per job, by the `AuxDriver` before the
+    // loop.
     if let Some(path) = perceptual.as_mut() {
         // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
         // cropped like the image and resampled onto its decoded size.
@@ -824,7 +832,6 @@ pub fn train_family<H: SdxlFamilyHooks>(
             edges.len(),
             CropBox::center_square,
         )?);
-        prepare_perceptual_references(path, &cache)?;
     }
 
     // sc-5637 — pre-encode the preview-sample prompts as a **CFG batch** (`[2, …]` = positive then
@@ -927,14 +934,10 @@ pub fn train_family<H: SdxlFamilyHooks>(
     // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on the
     // real dataset item (not the (item, bucket) cache entry) so an image alternates across its
     // buckets. A resumed run replays the skipped prefix so the phase matches.
-    let mut alternation = perceptual
-        .as_ref()
-        .map(|_| AuxAlternation::new(cache.len() / edges.len(), accum));
-    if let Some(alt) = alternation.as_mut() {
-        for step in 1..=start_step {
-            alt.key(step, schedule.sample((step - 1) as usize).0);
-        }
-    }
+    let mut aux_driver = match perceptual {
+        Some(path) => Some(aux_driver(path, &cache, &schedule, accum, start_step)?),
+        None => None,
+    };
     let mut accumulated: Option<LoraParams> = None;
     let mut last_loss = 0.0f32;
     let mut steps_run = start_step;
@@ -950,7 +953,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
             cfg,
             &cache,
             &schedule,
-            perceptual.as_mut().zip(alternation.as_mut()),
+            aux_driver.as_mut(),
             step,
             mae,
             compute_dtype,
