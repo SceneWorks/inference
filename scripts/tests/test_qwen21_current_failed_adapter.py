@@ -17,7 +17,38 @@ import zipfile
 import yaml
 
 from scripts.ci import qwen21_current_failed_adapter as current
+from scripts.ci import feature_epic_policy
 from scripts.ci.real_weights_workflow import inline_text
+
+
+def diagnostic_candidate_head(repository, environment, expected_repository):
+    """Bind a frozen diagnostic candidate without treating the CI merge as that candidate."""
+    checkout = current.git(repository, "rev-parse", "HEAD")
+    if environment.get("GITHUB_EVENT_NAME") != "pull_request":
+        return checkout
+    current.require(environment.get("GITHUB_SHA") == checkout,
+                    "CI active revision differs from checkout")
+    current.require(environment.get("GITHUB_REPOSITORY") == expected_repository,
+                    "CI repository context changed")
+    event_path = environment.get("GITHUB_EVENT_PATH")
+    current.require(bool(event_path), "pull-request event path is required")
+    payload = current.read_json(Path(event_path))
+    pull_request = payload["pull_request"]
+    for side in ("head", "base"):
+        current.require(pull_request[side]["repo"]["full_name"] == expected_repository,
+                        "pull-request repository identity changed")
+    # Raw commit headers retain parent identities at a depth-one shallow boundary; `git show
+    # --format=%P` deliberately hides them there. Keep the shared exact-parent policy intact.
+    headers = current.git(repository, "cat-file", "-p", checkout).split("\n\n", 1)[0]
+    parents = tuple(line.removeprefix("parent ") for line in headers.splitlines()
+                    if line.startswith("parent "))
+    current.require(len(parents) == 2, "CI checkout must be an exact two-parent test merge")
+    feature_epic_policy.validate_event(
+        "pull_request", payload, repository=expected_repository, active_sha=checkout,
+        feature_resolver=feature_epic_policy.resolve_remote_feature_branch,
+        commit_parent_resolver=lambda revision: parents if revision == checkout else (),
+    )
+    return pull_request["head"]["sha"]
 
 
 class CurrentFailedAdapterTests(unittest.TestCase):
@@ -147,6 +178,69 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 current.acquire_source_base(checkout, head, mutant)
 
+    def test_pull_request_candidate_binding_preserves_merge_checkout_and_rejects_mutants(self):
+        def git(root, *args):
+            return current.git(root, *args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            origin = root / "origin"
+            git(root, "init", "-b", "main", str(origin))
+            git(origin, "config", "user.name", "fixture")
+            git(origin, "config", "user.email", "fixture@example.invalid")
+            (origin / "production.txt").write_text("frozen CE\n", encoding="utf-8")
+            git(origin, "add", "."); git(origin, "commit", "-m", "frozen base")
+            frozen = git(origin, "rev-parse", "HEAD")
+            (origin / "candidate.txt").write_text("diagnostic\n", encoding="utf-8")
+            git(origin, "add", "."); git(origin, "commit", "-m", "native candidate")
+            candidate = git(origin, "rev-parse", "HEAD")
+            git(origin, "checkout", "-B", "advanced-base", frozen)
+            (origin / "production.txt").write_text("advanced AB\n", encoding="utf-8")
+            git(origin, "add", "."); git(origin, "commit", "-m", "advanced production")
+            advanced = git(origin, "rev-parse", "HEAD")
+            merge = git(origin, "commit-tree", "HEAD^{tree}", "-p", advanced,
+                        "-p", candidate, "-m", "CI test merge")
+            git(origin, "update-ref", "refs/heads/pr-merge", merge)
+            checkout = root / "checkout"
+            git(root, "clone", "--depth=1", "--branch", "pr-merge", origin.as_uri(), str(checkout))
+            git(checkout, "checkout", "--detach", "HEAD")
+            self.assertEqual(git(checkout, "rev-parse", "--is-shallow-repository"), "true")
+            self.assertEqual(git(checkout, "show", "-s", "--format=%P", "HEAD"), "")
+            repository = self.cfg["repository"]
+            payload = {"action": "synchronize", "repository": {"full_name": repository},
+                       "pull_request": {"merge_commit_sha": merge,
+                                        "head": {"sha": candidate, "ref": "codex/diagnostic",
+                                                 "repo": {"full_name": repository}},
+                                        "base": {"sha": advanced, "ref": "main",
+                                                 "repo": {"full_name": repository}}}}
+            event_path = root / "event.json"
+            environment = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_SHA": merge,
+                           "GITHUB_REPOSITORY": repository, "GITHUB_EVENT_PATH": str(event_path)}
+            fetch_head_path = checkout / ".git" / "FETCH_HEAD"
+            before = (git(checkout, "rev-parse", "HEAD"), current.symbolic_head(checkout),
+                      git(checkout, "show-ref"), git(checkout, "status", "--porcelain"),
+                      fetch_head_path.read_bytes() if fetch_head_path.is_file() else None)
+            event_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(diagnostic_candidate_head(checkout, environment, repository), candidate)
+            mutants = []
+            for side, sha in (("head", advanced), ("base", frozen)):
+                changed = copy.deepcopy(payload); changed["pull_request"][side]["sha"] = sha
+                mutants.append((changed, environment))
+            foreign = copy.deepcopy(payload)
+            foreign["pull_request"]["head"]["repo"]["full_name"] = "foreign/inference"
+            mutants.append((foreign, environment))
+            wrong_context = dict(environment); wrong_context["GITHUB_SHA"] = candidate
+            mutants.append((payload, wrong_context))
+            missing_path = dict(environment); missing_path.pop("GITHUB_EVENT_PATH")
+            mutants.append((payload, missing_path))
+            for changed, context in mutants:
+                event_path.write_text(json.dumps(changed), encoding="utf-8")
+                with self.subTest(payload=changed, context=context), self.assertRaises(ValueError):
+                    diagnostic_candidate_head(checkout, context, repository)
+            self.assertEqual((git(checkout, "rev-parse", "HEAD"), current.symbolic_head(checkout),
+                              git(checkout, "show-ref"), git(checkout, "status", "--porcelain"),
+                              fetch_head_path.read_bytes() if fetch_head_path.is_file() else None), before)
+
     def test_actual_current_head_source_closure_and_mutations(self):
         repository = Path(__file__).resolve().parents[2]
 
@@ -179,13 +273,9 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                              self.cfg["source"]["baseTree"])
             self.assertEqual(checkout_identity(root), before)
 
-        head = run(repository, "rev-parse", "HEAD")
-        ensure_exact_base(repository, head)
-        expected = run(repository, "diff", "--name-only",
-                       self.cfg["source"]["baseCommit"], head).splitlines()
-        self.assertEqual(len(expected), 16)
-        self.assertIn("scripts/tests/test_ci_workflow_policy.py", expected)
-        self.assertEqual(current.validate_source_closure(repository, head, self.cfg), expected)
+        live_identity = checkout_identity(repository)
+        self.assertEqual(run(repository, "status", "--porcelain"), "")
+        head = diagnostic_candidate_head(repository, os.environ, self.cfg["repository"])
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -196,8 +286,18 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                 objects = repository / objects
             alternates = origin / "objects" / "info" / "alternates"
             alternates.parent.mkdir(parents=True, exist_ok=True)
-            alternates.write_bytes((objects.resolve().as_posix() + "\n").encode("utf-8"))
             base = self.cfg["source"]["baseCommit"]
+            # CI's shallow merge checkout can lack both immutable objects. Fetch only into the
+            # disposable fixture, never move HEAD, refs, FETCH_HEAD or files in the live checkout.
+            for revision in (head, base):
+                if execute(repository, "cat-file", "-e",
+                           revision + "^{commit}", check=False).returncode:
+                    run(root, "--git-dir", str(origin), "fetch", "--no-tags",
+                        "--no-recurse-submodules", "--depth=1", "--no-write-fetch-head",
+                        run(repository, "remote", "get-url", "origin"), revision)
+            # Attach shallow checkout objects only after immutable acquisition: advertising a
+            # merge through alternates during negotiation can expose its missing parent objects.
+            alternates.write_bytes((objects.resolve().as_posix() + "\n").encode("utf-8"))
             run(root, "--git-dir", str(origin), "update-ref", "refs/heads/base", base)
             run(root, "--git-dir", str(origin), "update-ref", "refs/heads/head", head)
             environment = os.environ.copy()
@@ -205,24 +305,22 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                                 "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
                                 "GIT_COMMITTER_NAME": "fixture",
                                 "GIT_COMMITTER_EMAIL": "fixture@example.invalid"})
-            fixture_head = run(root, "--git-dir", str(origin), "commit-tree",
-                               run(repository, "rev-parse", head + "^{tree}"),
-                               "-p", base, "-p", head, "-m", "synthetic PR merge",
-                               env=environment)
-            run(root, "--git-dir", str(origin), "update-ref", "refs/heads/pr-merge",
-                fixture_head)
+            fixture_head = head
             fixture = root / "repository"
-            run(root, "clone", "--depth=1", "--branch", "pr-merge", "--no-checkout",
+            run(root, "clone", "--depth=1", "--branch", "head", "--no-checkout",
                 origin.as_uri(), str(fixture))
             run(fixture, "sparse-checkout", "init", "--no-cone")
             run(fixture, "sparse-checkout", "set",
                 "/scripts/ci/qwen21_current_failed_adapter.py")
-            run(fixture, "checkout", "--detach", "origin/pr-merge")
+            run(fixture, "checkout", "--detach", "origin/head")
             self.assertEqual(run(fixture, "rev-parse", "--is-shallow-repository"), "true")
             self.assertIsNone(current.symbolic_head(fixture))
             self.assertNotEqual(execute(fixture, "cat-file", "-e", base + "^{commit}",
                                         check=False).returncode, 0)
             ensure_exact_base(fixture, fixture_head)
+            expected = run(fixture, "diff", "--name-only", base, fixture_head).splitlines()
+            self.assertEqual(len(expected), 16)
+            self.assertIn("scripts/tests/test_ci_workflow_policy.py", expected)
             self.assertEqual(run(fixture, "diff", "--name-only", base,
                                  fixture_head).splitlines(), expected)
             self.assertEqual(current.validate_source_closure(fixture, fixture_head, self.cfg),
@@ -266,6 +364,8 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             with mock.patch.object(current, "ALLOWED_DIFF", current.ALLOWED_DIFF | {production}):
                 with self.assertRaisesRegex(ValueError, "production blob changed"):
                     current.validate_source_closure(fixture, production_commit, self.cfg)
+        self.assertEqual(checkout_identity(repository), live_identity)
+        self.assertEqual(run(repository, "status", "--porcelain"), "")
 
     def test_zip_checks_complete_digest_and_extracts_only_fixed_members(self):
         with tempfile.TemporaryDirectory() as directory:
