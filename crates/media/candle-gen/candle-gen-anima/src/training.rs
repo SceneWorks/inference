@@ -945,7 +945,9 @@ mod depth_anchoring_tests {
         let (aux_sigma, aux_plan) = plan_sigma(&s2, sigma).unwrap();
         let aux_plan = aux_plan.unwrap();
         assert!(!aux_plan.diffusion());
-        assert_eq!(aux_sigma, aux_plan.noise_level() as f64);
+        // The full `[0, 1]` window remaps σ onto itself, so the exact f64 σ is kept; only its f32
+        // level is the plan's.
+        assert_eq!(aux_sigma as f32, aux_plan.noise_level());
     }
 
     /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
