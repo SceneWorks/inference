@@ -148,25 +148,83 @@ class CurrentFailedAdapterTests(unittest.TestCase):
     def test_actual_current_head_source_closure_and_mutations(self):
         repository = Path(__file__).resolve().parents[2]
 
-        def run(root, *args, env=None):
-            return subprocess.run(["git", *args], cwd=root, env=env, check=True, text=True,
+        def execute(root, *args, env=None, check=True):
+            return subprocess.run(["git", *args], cwd=root, env=env, check=check, text=True,
                                   encoding="utf-8", stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE).stdout.strip()
+                                  stderr=subprocess.PIPE)
+
+        def run(root, *args, env=None):
+            return execute(root, *args, env=env).stdout.strip()
+
+        def fetch_head(root):
+            path = Path(run(root, "rev-parse", "--git-path", "FETCH_HEAD"))
+            if not path.is_absolute():
+                path = root / path
+            return path.read_bytes() if path.is_file() else None
+
+        def checkout_identity(root):
+            refs = execute(root, "show-ref", check=False)
+            self.assertIn(refs.returncode, (0, 1))
+            return (run(root, "rev-parse", "HEAD"), current.symbolic_head(root),
+                    refs.stdout, fetch_head(root))
+
+        def ensure_exact_base(root, source_candidate):
+            before = checkout_identity(root)
+            base = self.cfg["source"]["baseCommit"]
+            if execute(root, "cat-file", "-e", base + "^{commit}", check=False).returncode:
+                current.acquire_source_base(root, source_candidate, self.cfg)
+            self.assertEqual(run(root, "rev-parse", base + "^{tree}"),
+                             self.cfg["source"]["baseTree"])
+            self.assertEqual(checkout_identity(root), before)
 
         head = run(repository, "rev-parse", "HEAD")
+        ensure_exact_base(repository, head)
         expected = run(repository, "diff", "--name-only",
                        self.cfg["source"]["baseCommit"], head).splitlines()
+        self.assertEqual(len(expected), 16)
         self.assertIn("scripts/tests/test_ci_workflow_policy.py", expected)
+        self.assertEqual(current.validate_source_closure(repository, head, self.cfg), expected)
 
         with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory).resolve() / "repository"
-            run(Path(directory), "clone", "--shared", "--no-checkout", str(repository),
-                str(fixture))
+            root = Path(directory).resolve()
+            origin = root / "origin.git"
+            run(root, "init", "--bare", str(origin))
+            objects = Path(run(repository, "rev-parse", "--git-path", "objects"))
+            if not objects.is_absolute():
+                objects = repository / objects
+            alternates = origin / "objects" / "info" / "alternates"
+            alternates.parent.mkdir(parents=True, exist_ok=True)
+            alternates.write_bytes((objects.resolve().as_posix() + "\n").encode("utf-8"))
+            base = self.cfg["source"]["baseCommit"]
+            run(root, "--git-dir", str(origin), "update-ref", "refs/heads/base", base)
+            run(root, "--git-dir", str(origin), "update-ref", "refs/heads/head", head)
+            environment = os.environ.copy()
+            environment.update({"GIT_AUTHOR_NAME": "fixture",
+                                "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                                "GIT_COMMITTER_NAME": "fixture",
+                                "GIT_COMMITTER_EMAIL": "fixture@example.invalid"})
+            fixture_head = run(root, "--git-dir", str(origin), "commit-tree",
+                               run(repository, "rev-parse", head + "^{tree}"),
+                               "-p", base, "-p", head, "-m", "synthetic PR merge",
+                               env=environment)
+            run(root, "--git-dir", str(origin), "update-ref", "refs/heads/pr-merge",
+                fixture_head)
+            fixture = root / "repository"
+            run(root, "clone", "--depth=1", "--branch", "pr-merge", "--no-checkout",
+                origin.as_uri(), str(fixture))
             run(fixture, "sparse-checkout", "init", "--no-cone")
             run(fixture, "sparse-checkout", "set",
                 "/scripts/ci/qwen21_current_failed_adapter.py")
-            run(fixture, "checkout", "--detach", head)
-            self.assertEqual(current.validate_source_closure(fixture, head, self.cfg), expected)
+            run(fixture, "checkout", "--detach", "origin/pr-merge")
+            self.assertEqual(run(fixture, "rev-parse", "--is-shallow-repository"), "true")
+            self.assertIsNone(current.symbolic_head(fixture))
+            self.assertNotEqual(execute(fixture, "cat-file", "-e", base + "^{commit}",
+                                        check=False).returncode, 0)
+            ensure_exact_base(fixture, fixture_head)
+            self.assertEqual(run(fixture, "diff", "--name-only", base,
+                                 fixture_head).splitlines(), expected)
+            self.assertEqual(current.validate_source_closure(fixture, fixture_head, self.cfg),
+                             expected)
             selector_name = self.cfg["selector"].rsplit("::", 1)[1]
             for selector in (f"wrong_module::{selector_name}",
                              "conditioning_velocity_diagnostic::missing_selector"):
@@ -174,27 +232,22 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                 mutant["selector"] = selector
                 with self.subTest(selector=selector), self.assertRaisesRegex(
                         ValueError, "reviewed current selector is absent"):
-                    current.validate_source_closure(fixture, head, mutant)
+                    current.validate_source_closure(fixture, fixture_head, mutant)
 
             def commit_mutation(path: str, payload: bytes) -> str:
                 index = fixture.parent / ("index-" + hashlib.sha256(path.encode()).hexdigest())
-                environment = os.environ.copy()
-                environment["GIT_INDEX_FILE"] = str(index)
-                run(fixture, "read-tree", head, env=environment)
+                mutation_environment = environment.copy()
+                mutation_environment["GIT_INDEX_FILE"] = str(index)
+                run(fixture, "read-tree", fixture_head, env=mutation_environment)
                 blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=fixture,
                                       input=payload, check=True, stdout=subprocess.PIPE).stdout.decode(
                                           "ascii").strip()
                 run(fixture, "update-index", "--add", "--cacheinfo", "100644", blob, path,
-                    env=environment)
-                tree = run(fixture, "write-tree", env=environment)
-                commit_environment = environment.copy()
-                commit_environment.update({"GIT_AUTHOR_NAME": "fixture",
-                                           "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
-                                           "GIT_COMMITTER_NAME": "fixture",
-                                           "GIT_COMMITTER_EMAIL": "fixture@example.invalid"})
-                commit = subprocess.run(["git", "commit-tree", tree, "-p", head, "-m",
+                    env=mutation_environment)
+                tree = run(fixture, "write-tree", env=mutation_environment)
+                commit = subprocess.run(["git", "commit-tree", tree, "-p", fixture_head, "-m",
                                          "source closure mutation"], cwd=fixture,
-                                        env=commit_environment, check=True,
+                                        env=mutation_environment, check=True,
                                         stdout=subprocess.PIPE).stdout.decode("ascii").strip()
                 run(fixture, "checkout", "--detach", commit)
                 return commit
@@ -205,7 +258,7 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                 current.validate_source_closure(fixture, unrelated_commit, self.cfg)
 
             production = "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/model.rs"
-            original = subprocess.run(["git", "show", f"{head}:{production}"], cwd=fixture,
+            original = subprocess.run(["git", "show", f"{fixture_head}:{production}"], cwd=fixture,
                                       check=True, stdout=subprocess.PIPE).stdout
             production_commit = commit_mutation(production, original + b"\n// mutation\n")
             with mock.patch.object(current, "ALLOWED_DIFF", current.ALLOWED_DIFF | {production}):
