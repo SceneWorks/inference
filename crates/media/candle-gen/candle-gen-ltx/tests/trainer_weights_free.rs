@@ -75,7 +75,7 @@ fn ltx_2_3_trainer_validates_and_refuses_without_weights() {
     gen_core_testkit::check_trainer_validate(load_trainer(id, &tier).as_ref(), &profile).unwrap();
     gen_core_testkit::check_trainer_technique_refusal(&|| load_trainer(id, &tier), &profile)
         .unwrap();
-    check_train_runs_validate_floors(&|| load_trainer(id, &tier), &profile);
+    gen_core_testkit::check_trainer_train_floors(&|| load_trainer(id, &tier), &profile).unwrap();
 }
 
 /// Merge `entries` into the `__metadata__` of the safetensors file at `path`, keeping its tensors.
@@ -201,48 +201,4 @@ fn ltx_2_5_trainer_validates_and_refuses_without_weights() {
     let trained = make().train(&masked, &mut |_| events += 1).map(|_| ());
     specific(trained, "train");
     assert_eq!(events, 0, "train() emitted progress before refusing");
-}
-
-/// Epic 2123 E3: `train` called directly (skipping `validate`) refuses a request that only a
-/// non-technique `validate` floor catches — full fine-tune / control branch when not advertised, instruction edit — with a typed `Unsupported` before any
-/// progress event, so nothing is loaded or cached.
-fn check_train_runs_validate_floors(make: &dyn Fn() -> Box<dyn Trainer>, profile: &TrainerProfile) {
-    let base = TrainingRequest {
-        items: profile.items.clone(),
-        config: profile.config.clone(),
-        output_dir: profile.output_dir.clone(),
-        file_name: profile.file_name.clone(),
-        trigger_words: Vec::new(),
-        cancel: Default::default(),
-    };
-    let desc = *make().descriptor();
-    let mut probes = Vec::new();
-    if !desc.supports_full_finetune {
-        let mut full = base.clone();
-        full.config.full_finetune = true;
-        probes.push(("full_finetune", full));
-    }
-    if !desc.supports_control {
-        let mut control = base.clone();
-        control.config.control_type = Some("pose".to_owned());
-        probes.push(("control_type", control));
-    }
-    let mut edit = base;
-    for item in &mut edit.items {
-        item.reference_image_paths = vec![item.image_path.clone()];
-    }
-    probes.push(("edit", edit));
-    for (floor, req) in probes {
-        let mut events = 0;
-        let result = make().train(&req, &mut |_| events += 1);
-        assert!(
-            matches!(result, Err(Error::Unsupported(_))),
-            "{floor}: train() must refuse with a typed Unsupported, got {:?}",
-            result.err()
-        );
-        assert_eq!(
-            events, 0,
-            "{floor}: train() emitted progress before refusing"
-        );
-    }
 }
