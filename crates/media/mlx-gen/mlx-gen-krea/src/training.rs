@@ -48,7 +48,8 @@
 //!   budget, returns a catchable, actionable error BEFORE the (minutes-long) latent caching — converting
 //!   the otherwise-uncatchable SIGKILL into a recommendation to enable the toggle.
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
@@ -204,36 +205,97 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// tree: `tokenizer/ text_encoder/ transformer/ vae/`). The DiT is loaded **dense** (the adapter host);
 /// the encoder is Q8. `spec.precision` selects the compute dtype (bf16 default / f32 tight-gate); the
 /// Raw snapshot ships bf16, so f32 widens it via [`Krea2Transformer::cast_weights`].
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see `LazyKreaTrainer`.
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p.clone(),
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "krea trainer expects a snapshot directory (tokenizer/ text_encoder/ transformer/ \
-                 vae/), not a single .safetensors file"
-                    .into(),
-            )),
-        };
+    snapshot_root(spec)?;
+    Ok(Box::new(LazyKreaTrainer {
+        descriptor: trainer_descriptor(),
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(
+            "krea trainer expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+             not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer`], run by `LazyKreaTrainer` on first need.
+fn load_weights(spec: &LoadSpec) -> Result<KreaRawTrainer> {
+    let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
         Precision::Bf16 => Dtype::Bfloat16,
         Precision::Fp32 => Dtype::Float32,
     };
-    let tokenizer = KreaTokenizer::from_snapshot(&root)?;
-    let mut encoder = load_text_encoder(&root)?;
+    let tokenizer = KreaTokenizer::from_snapshot(root)?;
+    let mut encoder = load_text_encoder(root)?;
     encoder.quantize(TRAINER_ENCODER_BITS)?;
-    let mut transformer = load_transformer(&root)?;
+    let mut transformer = load_transformer(root)?;
     if transformer.compute_dtype() != dtype {
         transformer.cast_weights(dtype)?;
     }
-    let vae = load_vae(&root)?;
-    Ok(Box::new(KreaRawTrainer {
+    let vae = load_vae(root)?;
+    Ok(KreaRawTrainer {
         descriptor: trainer_descriptor(),
         tokenizer,
         encoder: Some(encoder),
         transformer,
         vae,
         dtype,
-    }))
+    })
+}
+
+/// The registered Krea trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train` — after every refusal floor — or on a `validate` that must match custom
+/// `lora_target_modules` against the DiT.
+struct LazyKreaTrainer {
+    descriptor: TrainerDescriptor,
+    spec: LoadSpec,
+    loaded: OnceCell<KreaRawTrainer>,
+}
+
+impl LazyKreaTrainer {
+    fn loaded(&self) -> Result<&KreaRawTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set(load_weights(&self.spec)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazyKreaTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // The default targets exist on every Krea DiT; only custom ones need the loaded base.
+        if self.loaded.get().is_none() && req.config.lora_target_modules.is_empty() {
+            return validate_floors(&self.descriptor, req);
+        }
+        self.loaded()?.validate(req)
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -299,23 +361,29 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for KreaRawTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would train zero
         // parameters yet "succeed". Catch it here, where the loaded DiT is available to match against.
         if resolve_target_paths(&self.transformer, &req.config).is_empty() {

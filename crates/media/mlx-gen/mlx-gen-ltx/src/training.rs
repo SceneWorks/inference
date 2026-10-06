@@ -38,6 +38,7 @@
 //!   * **LoRA-only.** The reference LTX MLX trainer has no LoKr (LTX *inference* supports LoKr via
 //!     sc-2393, but no LoKr trainer exists); LoKr requests are rejected with that explanation.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -2294,34 +2295,67 @@ fn select_depth_frames(
 /// connector + the Gemma-3-12B text-encoder snapshot resolved like inference). The transformer loads
 /// at **f32 activations × quantized weights** (`quant_f32`) for clean autograd — the base is frozen,
 /// gradients flow only through the trainable LoRA factors. Registered via [`mlx_gen::TrainerRegistration`].
+///
+/// The weights load lazily (sc-2124): construction only checks the spec (and that the Gemma-3
+/// override exists), so `validate` and `train`'s refusal floors never read weights; see
+/// `LazyLtxTrainer`.
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => return Err(mlx_gen::Error::Msg(
+    snapshot_root_23(spec)?;
+    crate::model::resolve_gemma_dir(spec.text_encoder.as_ref())?;
+    Ok(Box::new(LazyLtxTrainer {
+        descriptor: trainer_descriptor(),
+        load: load_weights_23,
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The LTX-2.3 snapshot directory a trainer spec names — a single file is refused.
+fn snapshot_root_23(spec: &LoadSpec) -> Result<&Path> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(
             "ltx_2_3 trainer expects a split-weight snapshot directory (transformer.safetensors \
-                 / vae_*.safetensors / connector.safetensors), not a single file"
+             / vae_*.safetensors / connector.safetensors), not a single file"
                 .into(),
         )),
-    };
-    Ok(Box::new(load_trainer_from_dir(
-        root,
-        spec.text_encoder.as_ref(),
-    )?))
+    }
+}
+
+/// The LTX-2.3 weight load behind [`load_trainer`], run by `LazyLtxTrainer` on first need.
+fn load_weights_23(spec: &LoadSpec) -> Result<LtxTrainer> {
+    load_trainer_from_dir(snapshot_root_23(spec)?, spec.text_encoder.as_ref())
 }
 
 /// Construct the LTX-2.5 trainer from its split Gemma-4 bundle.  This follows the ordinary
 /// provider's component resolver so training cannot quietly combine a 2.5 DiT with a Gemma-3
 /// override or a 2.3-shaped VAE configuration.
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see `LazyLtxTrainer`.
 pub fn load_trainer_25(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(path) => path,
-        WeightsSource::File(_) => {
-            return Err(mlx_gen::Error::Msg(
-                "ltx_2_5 trainer expects a split-component directory, not a single checkpoint"
-                    .into(),
-            ))
-        }
-    };
+    snapshot_root_25(spec)?;
+    Ok(Box::new(LazyLtxTrainer {
+        descriptor: trainer_descriptor_25(),
+        load: load_weights_25,
+        spec: spec.clone(),
+        loaded: OnceCell::new(),
+    }))
+}
+
+/// The LTX-2.5 split-component directory a trainer spec names — a single checkpoint is refused.
+fn snapshot_root_25(spec: &LoadSpec) -> Result<&Path> {
+    match &spec.weights {
+        WeightsSource::Dir(path) => Ok(path),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(
+            "ltx_2_5 trainer expects a split-component directory, not a single checkpoint".into(),
+        )),
+    }
+}
+
+/// The LTX-2.5 weight load behind [`load_trainer_25`], run by `LazyLtxTrainer` on first need.
+fn load_weights_25(spec: &LoadSpec) -> Result<LtxTrainer> {
+    let root = snapshot_root_25(spec)?;
     let bundle = crate::bundle::resolve_split_bundle(spec)?;
     crate::bundle::assert_gemma_version(&bundle)?;
     ensure_ltx25_training_variant(crate::dev_sampler::from_bundle(&bundle)?)?;
@@ -2373,14 +2407,57 @@ pub fn load_trainer_25(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     for w in [&connector_w, &transformer_w, &video_w] {
         w.materialize_accessed()?;
     }
-    Ok(Box::new(LtxTrainer {
+    Ok(LtxTrainer {
         descriptor: trainer_descriptor_25(),
         tokenizer: Some(TrainingTokenizer::Gemma4(tokenizer)),
         text_encoder: Some(TrainingTextEncoder::Gemma4(text_encoder)),
         vae,
         transformer: TrainingTransformer::Ltx25(transformer),
         cfg,
-    }))
+    })
+}
+
+/// The registered LTX trainer (sc-2124): it holds the [`LoadSpec`] and loads the base only on the
+/// first `train`, after every refusal floor.
+struct LazyLtxTrainer {
+    descriptor: TrainerDescriptor,
+    load: fn(&LoadSpec) -> Result<LtxTrainer>,
+    spec: LoadSpec,
+    loaded: OnceCell<LtxTrainer>,
+}
+
+impl LazyLtxTrainer {
+    fn loaded(&self) -> Result<&LtxTrainer> {
+        if self.loaded.get().is_none() {
+            let _ = self.loaded.set((self.load)(&self.spec)?);
+        }
+        Ok(self.loaded.get().expect("the base was loaded above"))
+    }
+}
+
+impl Trainer for LazyLtxTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        match self.loaded.get() {
+            Some(trainer) => trainer.validate(req),
+            None => validate_floors(&self.descriptor, req),
+        }
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
+        self.validate(req)?;
+        self.loaded()?;
+        let trainer = self.loaded.get_mut().expect("the base was loaded above");
+        trainer.train(req, on_progress)
+    }
 }
 
 /// The concrete-typed loader behind [`load_trainer`] (sc-4942 — the first-step memory harness needs
@@ -2523,25 +2600,35 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the single-use check.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006 / F-055): the LTX trainer has no control branch, so a
+    // request carrying `control_type` / per-item control images is rejected (typed `Unsupported`)
+    // rather than silently training a plain LoRA and reporting success.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    refuse_ltx25_subject_mask(descriptor.id, req)?;
+    refuse_ltx25_depth_anchoring(descriptor.id, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    if descriptor.id == MODEL_25_ID {
+        validate_ltx25_training_request(req)?;
+    } else {
+        validate_request(req, &format!("{} trainer", descriptor.id))?;
+    }
+    Ok(())
+}
+
 impl Trainer for LtxTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006 / F-055): the LTX trainer has no control branch, so a
-        // request carrying `control_type` / per-item control images is rejected (typed `Unsupported`)
-        // rather than silently training a plain LoRA and reporting success.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        refuse_ltx25_subject_mask(self.descriptor.id, req)?;
-        refuse_ltx25_depth_anchoring(self.descriptor.id, req)?;
-        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         // Single-use enforcement (F-055): `train` frees the Gemma text encoder + tokenizer (~24 GB)
         // after the embed cache, so a second `train` on the same instance can't re-encode. Fail here,
         // up front (validate runs before any progress is emitted), instead of with a late, confusing
@@ -2554,12 +2641,7 @@ impl Trainer for LtxTrainer {
             )
             .into());
         }
-        if self.descriptor.id == MODEL_25_ID {
-            validate_ltx25_training_request(req)?;
-        } else {
-            validate_request(req, &label)?;
-        }
-        Ok(())
+        validate_floors(self.descriptor(), req)
     }
 
     fn train(

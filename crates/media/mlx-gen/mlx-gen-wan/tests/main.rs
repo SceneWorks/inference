@@ -150,3 +150,6 @@ mod wanvace_transformer_parity;
 
 #[path = "wedge_sweep.rs"]
 mod wedge_sweep;
+
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;
