@@ -13,6 +13,10 @@ autotests = false
 # Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
 # build (single resolution; see scripts/check-gen-core-skew.sh).
 candle-gen = { path = "../candle-gen" }
+# The understanding rollouts (VQA / chat, interleave text) decode on the shared Candle engine
+# (`candle_llm::decode`, no proposer — epic sc-24432 E8) instead of per-model loops. The
+# `candle-gen-* -> candle-llm` direction is the documented one (see `candle-gen-ltx`).
+candle-llm = { workspace = true }
 # Qwen2/3 byte-level BPE tokenizer with the NEO-Unify added tokens. The fast `tokenizer.json` is
 # loaded from the snapshot (materialized by SenseNova's `tools/build_sensenova_tokenizer.py`,
 # mirroring the mlx provider); this crate builds the neo1_0 prompt strings itself.
@@ -31,8 +35,8 @@ rand_distr = { workspace = true }
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider crate selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal"]
-cuda = ["candle-gen/cuda"]
+metal = ["candle-gen/metal", "candle-llm/metal"]
+cuda = ["candle-gen/cuda", "candle-llm/cuda"]
 real-weight-diagnostics = []
 
 [[example]]

@@ -17,27 +17,30 @@ use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
     JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults,
-    MtpMode, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Role, Sampling,
-    StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmOutput, TextLlmRequest, ThinkingMode, ThinkingSegmenter, Tokenizer, ToolCall,
-    ToolCallSegmenter, Usage, VideoRef,
+    ProposerCapabilities, ProposerKind, Quantize, ReasoningEffort, RenderOptions,
+    Result as CoreResult, Role, Sampling, SpeculativePlan, SpeculativeProposer, StopMatcher,
+    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingMode, ThinkingSegmenter, Tokenizer, ToolCall, ToolCallSegmenter, Usage,
+    VideoRef,
 };
+
+use core_llm::DraftReport;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_batch, generate_from_prefill, generate_from_prefill_with_timings,
-    generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
-    generate_with_observer, generate_with_timings, generate_with_timings_on, BatchRequest,
-    CancelFlag, ConstraintMask, Decode, FinishReason, GenerationConfig, GenerationOutput,
-    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
+    generate_batch, generate_speculative, generate_with_observer, prefill_restored, BatchRequest,
+    Boundary, CancelFlag, ConstraintMask, Decode, DraftModelProposer, DynCacheTarget,
+    EngineOptions, FinishReason, GenerationConfig, GenerationOutput, MtpProposer, NgramProposer,
+    NoProposer, PrefixCache, PrefixPrefill, PrefixStats, Proposer, Qwen35MtpMultimodalPrompt,
+    RewindableConstraintMask, SpeculativePrompt, SpeculativeRun, SpeculativeTarget, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
 use crate::models::{
-    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
+    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Cache, Qwen35Config, Qwen35Model,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
-use crate::primitives::attention::prefill_attention_tile_bytes;
+use crate::primitives::attention::{prefill_attention_tile_bytes, SDPA_MAX_FUSED_QLEN};
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -508,6 +511,19 @@ impl Decoder {
         }
     }
 
+    /// Bytes a forward's promoted weight copies hold at once ([`promoted_weight_bytes`]), when
+    /// the decoder's activations are wider than its weights ([`CausalLm::activations_promote`]);
+    /// `Some(0)` otherwise.
+    fn promoted_request_bytes(&self) -> Option<u64> {
+        match self {
+            Decoder::Causal(m) => match m.promoted_weight_elements() {
+                Some((head, largest)) => promoted_weight_bytes(head, largest),
+                None => Some(0),
+            },
+            Decoder::Qwen35(_) => Some(0),
+        }
+    }
+
     /// Select the request-memory contract matching the complete decoder implementation.
     fn workspace_contract(&self) -> MlxWorkspaceContract<'_> {
         match self {
@@ -748,32 +764,6 @@ struct Gemma4Runtime {
     mm: Gemma4Mm,
 }
 
-/// A [`Decode`] wrapper that shifts the RoPE offset by a constant `delta` for the post-prompt
-/// continuation of a multimodal decode. Image tokens compress the position cursor, so the text
-/// positions that follow the prompt are `cache_len + mrope_delta`, not `cache_len`; the new tokens
-/// are text, so a single shifted 1-D position is the correct (interleaved-)M-RoPE position. Drives
-/// either backbone through [`VlmDecode`]'s [`Decode`] supertrait — each decoder downcasts its own
-/// cache inside `step`, so no concrete-type fork is needed here.
-struct Shifted<'a> {
-    model: &'a dyn VlmDecode,
-    delta: i32,
-}
-
-impl Decode for Shifted<'_> {
-    fn make_cache(&self) -> Box<dyn KvCache> {
-        self.model.make_cache()
-    }
-
-    fn step(
-        &self,
-        ids: &Array,
-        cache: &mut dyn KvCache,
-        offset: i32,
-    ) -> crate::error::Result<Array> {
-        self.model.step(ids, cache, offset + self.delta)
-    }
-}
-
 /// Collect the image blocks of a conversation, in order.
 fn collect_images(messages: &[Message]) -> Vec<&ImageRef> {
     messages
@@ -999,6 +989,90 @@ pub struct LlamaProvider {
     /// Dense Prism `vision_tower.*` tensors retained verbatim for the native multimodal adapter.
     /// Text loading must not discard them merely because sc-23937 constructs only the decoder.
     _prism_vision_weights: Option<Weights>,
+    /// The cross-turn prefix cache (sc-24437): one per loaded model, every decoder family, under
+    /// the byte budget [`load`](Self::load) admitted.
+    prefix: RefCell<PrefixCache>,
+    /// The resident draft model for `draft_model` speculation (sc-24436), present iff the load
+    /// named a compatible one ([`LoadSpec::draft_source`]); `draft_model` is advertised exactly
+    /// then. A second decoder with its own cache per request, driven as a proposer by the engine.
+    draft: Option<ResidentDraft>,
+    /// What the load settled: the requested weight format, what became of a named draft
+    /// (resident, or refused with the reason), the prefix cache's admitted budget, and every other
+    /// optional accelerator — the companion MTP head (sc-24444) — requested but not attached,
+    /// named in `fallbacks`. Read through [`TextLlm::load_report`].
+    load_report: core_llm::LoadReport,
+    /// The speculative option a request that leaves it unset runs with (E5, sc-24446): the MLX
+    /// defaults-table row ([`core_llm::defaults::MLX`]) unless
+    /// [`set_speculative_default`](LlamaProvider::set_speculative_default) overrides it.
+    speculative_default: core_llm::Speculative,
+}
+
+/// A draft model resident beside its target (sc-24436).
+struct ResidentDraft {
+    /// The draft decoder.
+    model: Decoder,
+    /// Leading draft ids it may propose — its tokenizer's tokens
+    /// ([`core_llm::draft_compatibility`]); a padding row never becomes a draft.
+    proposable: usize,
+    /// The target's logits width, which the draft's logits are shaped to.
+    width: usize,
+    /// The draft's own context window (`0`: unbounded): a request reaching past it runs `auto`
+    /// instead ([`core_llm::fit_draft_context`], E2).
+    context: usize,
+}
+
+/// What a load does with its named draft model (sc-24436), decided before any weight is read.
+enum DraftPlan {
+    /// No draft named.
+    None,
+    /// Admitted beside the target: load it from this spec.
+    Load(LoadSpec),
+    /// Refused before loading (unpriceable, or no room beside the target).
+    Refused(DraftReport),
+}
+
+impl DraftPlan {
+    /// Price a named draft beside the target (E7): its load estimate is admitted together with
+    /// the target's. `Err` only when the target alone does not fit — a draft never fails the load
+    /// (E2); a draft that cannot be priced or does not fit beside the target is refused by name.
+    fn admit(spec: &LoadSpec, target_required: u64, available: u64) -> CoreResult<Self> {
+        let Some(source) = spec.draft_source.as_deref() else {
+            core_llm::admit_load_memory(target_required, available)?;
+            return Ok(DraftPlan::None);
+        };
+        let draft_spec = draft_load_spec(spec, source);
+        let draft_required = match crate::load_memory::required_bytes(&draft_spec) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                core_llm::admit_load_memory(target_required, available)?;
+                return Ok(DraftPlan::Refused(DraftReport::refused(
+                    source,
+                    core_llm::draft_unpriced_refusal(e),
+                )));
+            }
+        };
+        Ok(
+            match core_llm::admit_draft_load(target_required, draft_required, available)? {
+                None => DraftPlan::Load(draft_spec),
+                Some(why) => DraftPlan::Refused(DraftReport::refused(source, why)),
+            },
+        )
+    }
+}
+
+/// The load spec of a named draft: its own source, text-only, at the target's load-time tier
+/// (a quantization tier covers every model the load makes resident) and naming no draft itself.
+fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
+    LoadSpec {
+        source: source.to_string(),
+        projector_source: None,
+        quantize: spec.quantize,
+        cuda_graphs: spec.cuda_graphs,
+        // A draft keeps no cross-turn prefix cache of its own (sc-24437), and no companion head.
+        prefix_cache_bytes: Some(0),
+        draft_source: None,
+        mtp_head_source: None,
+    }
 }
 
 /// The same Qwen3.5/3.8 decoder appears under `model.language_model` in VLM snapshots and
@@ -1017,6 +1091,36 @@ fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static st
             "qwen3_5 checkpoint has both wrapped and flat decoder embeddings".into(),
         )),
     }
+}
+
+/// The MLX projection format of a load-time quantization tier. NVFP4 is a CUDA sm_120
+/// capability (sc-24135): refused by name, never substituted.
+pub(crate) fn quant_spec(quantize: Quantize) -> CoreResult<QuantSpec> {
+    match quantize {
+        Quantize::Q4 => Ok(QuantSpec::q4()),
+        Quantize::Q8 => Ok(QuantSpec::q8()),
+        Quantize::Nvfp4 => Err(CoreError::Unsupported(
+            "nvfp4: NVFP4 projections need a CUDA device with compute capability >= sm_120; the \
+             MLX backend has no NVFP4 GEMM"
+                .into(),
+        )),
+    }
+}
+
+/// Materialize a lazily built decoder group by group ([`Weights::materialize_groups`]) and
+/// refuse the load if any source it read went unconsumed (sc-24446): such a source is held
+/// resident beside the model, outside what `load_memory::required_bytes` prices — an
+/// enumeration gap in the decoder's `param_groups`, never a property of the checkpoint.
+fn materialize_decoder(weights: &mut Weights, groups: &[Vec<Array>]) -> CoreResult<()> {
+    let report = weights.materialize_groups(groups).map_err(to_core)?;
+    if report.leftover > 0 {
+        return Err(CoreError::Load(format!(
+            "load materialization: {} source tensor(s) the decoder read were consumed by none of \
+             its arrays; the load would hold them outside its admitted bound",
+            report.leftover
+        )));
+    }
+    Ok(())
 }
 
 impl LlamaProvider {
@@ -1182,7 +1286,8 @@ impl LlamaProvider {
         };
         let cancel = crate::decode::CancelFlag::new();
         let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
-        let cache = cache_slot.get_or_insert_with(|| crate::decode::PrefixCache::new(2));
+        let cache =
+            cache_slot.get_or_insert_with(|| crate::decode::PrefixCache::with_budget(u64::MAX));
         let mut sink = |_| {};
         crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
             .map_err(to_core)?;
@@ -1229,7 +1334,7 @@ impl LlamaProvider {
                 "campaign prefix cache was already seeded".into(),
             ));
         }
-        let mut cache = crate::decode::PrefixCache::new(2);
+        let mut cache = crate::decode::PrefixCache::with_budget(u64::MAX);
         let mut sink = |_| {};
         let dispatch_started = std::time::Instant::now();
         crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, &mut cache)
@@ -1597,27 +1702,110 @@ impl LlamaProvider {
                     .into(),
             ));
         }
-        let quant = spec
-            .quantize
-            .map(|q| match q {
-                Quantize::Q4 => Ok(QuantSpec::q4()),
-                Quantize::Q8 => Ok(QuantSpec::q8()),
-                // sc-24135: NVFP4 is a CUDA sm_120 capability; refuse by name, never substitute —
-                // before admission, so a memory refusal cannot mask it.
-                Quantize::Nvfp4 => Err(CoreError::Unsupported(
-                    "nvfp4: NVFP4 projections need a CUDA device with compute capability >= \
-                     sm_120; the MLX backend has no NVFP4 GEMM"
-                        .into(),
-                )),
-            })
-            .transpose()?;
+        // sc-24135: NVFP4 is refused by name before admission, so a memory refusal cannot mask it.
+        let quant = spec.quantize.map(quant_spec).transpose()?;
         let required = crate::load_memory::required_bytes(spec)?;
         let available = core_llm::effective_memory_budget(
             core_llm::available_host_memory_bytes(),
-            core_llm::operational_memory_override()?,
+            load_memory_budget()?,
         )?;
-        core_llm::admit_request_memory(required, available)?;
+        let draft = DraftPlan::admit(spec, required, available)?;
+        let mut admitted = match &draft {
+            DraftPlan::Load(draft_spec) => {
+                required.saturating_add(crate::load_memory::required_bytes(draft_spec)?)
+            }
+            DraftPlan::None | DraftPlan::Refused(_) => required,
+        };
+        // E7: a companion head is resident weights; it is admitted on top of the target and any
+        // admitted draft, and a head that does not fit is refused by name while the target still
+        // loads (E2).
+        let mut fallbacks = Vec::new();
+        let mtp_head = spec.mtp_head_source.as_deref().and_then(|source| {
+            admit_companion_head(Path::new(source), admitted, available)
+                .map_err(|reason| fallbacks.push(reason))
+                .ok()
+        });
+        if let Some((_, head_bytes)) = mtp_head {
+            admitted = admitted.saturating_add(head_bytes);
+        }
+        // The cross-turn prefix cache's budget (sc-24437, E7): what the load asked for, clamped to
+        // the headroom this admission leaves beside the target, any admitted draft and any
+        // admitted companion head, so the cache can never push the load past it.
+        let prefix_budget = core_llm::prefix_cache_budget(
+            core_llm::DecodeBackend::Mlx,
+            spec.prefix_cache_bytes,
+            admitted,
+            available,
+        );
 
+        let mut provider = Self::load_admitted(spec, quant, materialize_campaign_weights)?
+            .with_prefix_budget(prefix_budget);
+        provider.load_report.requested = spec.quantize;
+        // The load's own fallbacks (a refused companion head) join what the decoder's load named
+        // (a configured native MTP head the snapshot does not carry).
+        provider.load_report.fallbacks.splice(0..0, fallbacks);
+        provider.attach_mtp_head(mtp_head.map(|(head, _)| head));
+        provider.load_report.record_prefix_budget(
+            core_llm::DecodeBackend::Mlx,
+            spec.prefix_cache_bytes,
+            prefix_budget,
+        );
+        match draft {
+            DraftPlan::None => {}
+            DraftPlan::Refused(report) => provider.load_report.record_draft(report),
+            DraftPlan::Load(draft_spec) => provider.attach_draft(&draft_spec),
+        }
+        Ok(provider)
+    }
+
+    /// Load the draft `spec` names beside this target and keep it only if it can propose for it
+    /// ([`core_llm::draft_compatibility`]): resident — `draft_model` advertised — or refused
+    /// with the reason in the load report, the target unaffected either way (sc-24436, E2).
+    fn attach_draft(&mut self, spec: &LoadSpec) {
+        let source = spec.source.clone();
+        let target_logits = self.model.memory_geometry().vocab_size as usize;
+        // The tokenizer is checked before any draft weight is touched when the draft ships one.
+        let early = core_llm::draft_tokenizer_refusal(&self.tokenizer, Path::new(&source));
+        let outcome = match early {
+            Some(why) => Err(why),
+            None => match spec.quantize.map(quant_spec).transpose() {
+                Err(e) => Err(core_llm::draft_refusal(e)),
+                Ok(quant) => match Self::load_admitted(spec, quant, false) {
+                    Err(e) => Err(core_llm::draft_load_refusal(e)),
+                    Ok(draft) => core_llm::draft_compatibility(
+                        &self.tokenizer,
+                        target_logits,
+                        &draft.tokenizer,
+                        draft.model.memory_geometry().vocab_size as usize,
+                    )
+                    .map(|proposable| ResidentDraft {
+                        proposable,
+                        width: target_logits,
+                        context: draft.descriptor.capabilities.max_context_tokens,
+                        model: draft.model,
+                    }),
+                },
+            },
+        };
+        let (draft, report) = core_llm::settle_draft(
+            source,
+            outcome,
+            &mut self.descriptor.capabilities,
+            &mut self.load_report.fallbacks,
+            recommended_depths(),
+        );
+        self.draft = draft;
+        self.load_report.draft = Some(report);
+    }
+
+    /// [`load`](Self::load) after admission: the target decoder, its tokenizer, template and
+    /// multimodal front-ends, with no draft. `materialize_campaign_weights`: evaluate every tensor
+    /// the constructors consumed before returning (the campaign's parameter-only boundary).
+    fn load_admitted(
+        spec: &LoadSpec,
+        quant: Option<QuantSpec>,
+        materialize_campaign_weights: bool,
+    ) -> CoreResult<Self> {
         let dir = Path::new(&spec.source);
         if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
             return Self::load_prism_gguf(spec, dir);
@@ -1643,7 +1831,7 @@ impl LlamaProvider {
         let campaign_family =
             core_llm::kv_model_family(arch.family(), &architecture_name, &model_type)
                 .map(crate::kv_policy::campaign_family);
-        let weights = Weights::from_dir(dir).map_err(to_core)?;
+        let mut weights = Weights::from_dir(dir).map_err(to_core)?;
         let is_prism =
             cfg_value.get("model_type").and_then(|v| v.as_str()) == Some("prism_hadamard_qwen35");
         if is_prism && quant.is_some() {
@@ -1653,6 +1841,9 @@ impl LlamaProvider {
         }
 
         let mut prism_vision_weights = None;
+        // What the decoder's own load could not attach (E2): a configured native MTP head the
+        // snapshot does not carry, or a variant this runtime does not run.
+        let mut load_fallbacks = Vec::new();
         let (model, mut descriptor) = if arch == Architecture::Qwen35 {
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
             let mut descriptor = descriptor_for_qwen35(&qcfg);
@@ -1660,7 +1851,8 @@ impl LlamaProvider {
                 let pack = PrismMlxPack::from_dir(dir, &cfg_value, &weights).map_err(to_core)?;
                 descriptor.family = "prism_hadamard_qwen35".into();
                 let model =
-                    Qwen35Model::from_prism_weights(&weights, qcfg, &pack).map_err(to_core)?;
+                    Qwen35Model::build_prism_lazy(&weights, qcfg, &pack).map_err(to_core)?;
+                materialize_decoder(&mut weights, &model.param_groups())?;
                 if pack.has_vision_tower {
                     let keys = weights
                         .keys()
@@ -1677,15 +1869,26 @@ impl LlamaProvider {
             } else {
                 // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
                 let prefix = qwen35_dense_prefix(|key| weights.contains(key))?;
-                Qwen35Model::from_weights_with(&weights, prefix, qcfg, quant).map_err(to_core)?
+                let model =
+                    Qwen35Model::build_lazy(&weights, prefix, qcfg, quant).map_err(to_core)?;
+                // Group by group: read, verify, convert, release (sc-24446) — the order
+                // `load_memory::required_bytes` prices.
+                materialize_decoder(&mut weights, &model.param_groups())?;
+                model
             };
+            // A configured head that was not built is named and not advertised: the loaded
+            // config (its MTP layers cleared) settles the advertisement.
+            if let Some(why) = m.mtp_fallback() {
+                load_fallbacks.push(why.to_string());
+                descriptor.capabilities = descriptor_for_qwen35(m.config()).capabilities;
+            }
             (Decoder::Qwen35(Box::new(m)), descriptor)
         } else {
             let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
-            let m = CausalLm::from_weights_with(&weights, "", cfg, quant)
-                .map_err(to_core)?
-                .with_weights_identity(snapshot_weights_identity(dir));
+            let m = CausalLm::build_lazy(&weights, "", cfg, quant).map_err(to_core)?;
+            materialize_decoder(&mut weights, &m.param_groups())?;
+            let m = m.with_weights_identity(snapshot_weights_identity(dir));
             (Decoder::Causal(Box::new(m)), descriptor)
         };
 
@@ -1807,7 +2010,44 @@ impl LlamaProvider {
             kv_reader: OnceCell::new(),
             kv_model_name: spec.source.clone(),
             _prism_vision_weights: prism_vision_weights,
+            prefix: RefCell::new(PrefixCache::with_budget(0)),
+            speculative_default: core_llm::defaults::MLX.speculative,
+            draft: None,
+            load_report: core_llm::LoadReport {
+                fallbacks: load_fallbacks,
+                ..core_llm::LoadReport::default()
+            },
         })
+    }
+
+    /// Attach an admitted companion MTP head (sc-24444). It attaches only to a Qwen3.5/3.8-family
+    /// target (dense `qwen3_5` or Prism/Bonsai) without a native head, and only when its geometry
+    /// matches; anything else is a named load fallback and the target stays exactly as loaded.
+    fn attach_mtp_head(&mut self, head: Option<&Path>) {
+        let Some(head) = head else { return };
+        let outcome = match &mut self.model {
+            Decoder::Qwen35(model) => model
+                .attach_companion_mtp(head)
+                .map(|()| speculative_max_depth([qwen35_attention_geometry(model.config())]))
+                .map_err(|e| format!("mtp_head: {e}")),
+            Decoder::Causal(_) => Err(format!(
+                "{}; this model's family is `{}`",
+                core_llm::COMPANION_MTP_FAMILY_REFUSAL,
+                self.descriptor.family
+            )),
+        };
+        match outcome {
+            // The same backend-true depth a native head advertises (sc-24438): a companion head
+            // runs the identical one-layer predictor through the identical verify path.
+            Ok(max_depth) => self
+                .descriptor
+                .capabilities
+                .advertise_mtp(max_depth, recommended_depths().mtp),
+            Err(reason) => self
+                .load_report
+                .fallbacks
+                .push(core_llm::companion_head_fallback(&reason, head)),
+        }
     }
 
     fn load_prism_gguf(spec: &LoadSpec, path: &Path) -> CoreResult<Self> {
@@ -1873,12 +2113,54 @@ impl LlamaProvider {
             kv_reader: OnceCell::new(),
             kv_model_name: spec.source.clone(),
             _prism_vision_weights: None,
+            prefix: RefCell::new(PrefixCache::with_budget(
+                core_llm::defaults::MLX.prefix_cache_bytes,
+            )),
+            speculative_default: core_llm::defaults::MLX.speculative,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
         })
     }
 
     /// Whether the loaded model's projections are quantized.
     pub fn is_quantized(&self) -> bool {
         self.model.is_quantized()
+    }
+
+    /// The cross-turn prefix cache's byte budget (sc-24437) — what the load admitted for it.
+    pub fn prefix_cache_budget(&self) -> u64 {
+        self.prefix.borrow().budget_bytes()
+    }
+
+    /// Bytes the prefix cache holds now (never more than [`prefix_cache_budget`](Self::prefix_cache_budget)).
+    pub fn prefix_cache_resident_bytes(&self) -> u64 {
+        self.prefix.borrow().resident_bytes()
+    }
+
+    /// The prefix cache's cumulative reuse accounting.
+    pub fn prefix_cache_stats(&self) -> PrefixStats {
+        self.prefix.borrow().stats()
+    }
+
+    /// Settle the prefix cache budget the load admitted: an empty cache of `budget` bytes, and
+    /// the load report naming it.
+    fn with_prefix_budget(mut self, budget: u64) -> Self {
+        self.prefix.replace(PrefixCache::with_budget(budget));
+        self.load_report.prefix_cache_bytes = Some(budget);
+        self
+    }
+
+    /// The speculative option a request that leaves it unset runs with on this provider: the MLX
+    /// defaults-table default ([`core_llm::DecodeDefaults::speculative`], epic sc-24432 E5)
+    /// unless [`set_speculative_default`](Self::set_speculative_default) replaced it.
+    pub fn speculative_default(&self) -> core_llm::Speculative {
+        self.speculative_default
+    }
+
+    /// Replace the speculative option an unset request runs with on this provider (a deployment
+    /// choice, e.g. a server flag); a request's own `speculative` / legacy `mtp` still wins.
+    pub fn set_speculative_default(&mut self, speculative: core_llm::Speculative) {
+        self.speculative_default = speculative;
     }
 
     /// Whether a Prism VLM's dense vision tensors were retained for the multimodal adapter.
@@ -1896,7 +2178,13 @@ impl LlamaProvider {
             _ => None,
         };
         Self {
-            descriptor: provider_descriptor(),
+            descriptor: {
+                let mut d = provider_descriptor();
+                d.capabilities.speculative = vec![prompt_lookup_capabilities(
+                    speculative_max_depth(causal_attention_geometries(model.config())),
+                )];
+                d
+            },
             architecture,
             campaign_family,
             kv_family: None,
@@ -1913,6 +2201,12 @@ impl LlamaProvider {
             kv_reader: OnceCell::new(),
             kv_model_name: String::new(),
             _prism_vision_weights: None,
+            prefix: RefCell::new(PrefixCache::with_budget(
+                core_llm::defaults::MLX.prefix_cache_bytes,
+            )),
+            speculative_default: core_llm::defaults::MLX.speculative,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
         }
     }
 
@@ -2305,6 +2599,11 @@ impl RewindableConstraintMask for JsonMask<'_> {
     }
 
     fn rewind(&mut self, checkpoint: usize) {
+        // Nothing was accepted since the checkpoint: the state is already there, and a rebuild +
+        // replay of every accepted token would make each constrained step O(n).
+        if checkpoint == self.accepted.len() {
+            return;
+        }
         self.accepted.truncate(checkpoint);
         self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
         self.reasoning_tail.clear();
@@ -2711,6 +3010,10 @@ impl TextLlm for LlamaProvider {
             .validate_request(&self.descriptor.id, req)
     }
 
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.load_report.clone())
+    }
+
     fn generate(
         &self,
         req: &TextLlmRequest,
@@ -2757,8 +3060,8 @@ impl TextLlm for LlamaProvider {
 const BATCH_PAGE_TOKENS: usize = 64;
 
 impl LlamaProvider {
-    /// Whether `req` is a plain text generation the batched decode serves exactly as
-    /// [`TextLlm::generate`] would (sc-20681).
+    /// Whether `req` is a plain, non-speculative text generation the batched decode serves exactly
+    /// as [`TextLlm::generate`] would (sc-20681).
     fn batchable(&self, req: &TextLlmRequest) -> bool {
         matches!(self.model, Decoder::Causal(_))
             && collect_images(&req.messages).is_empty()
@@ -2767,6 +3070,9 @@ impl LlamaProvider {
             && req.constraint.is_none()
             && req.tools.is_empty()
             && req.stop.is_empty()
+            // The batched decode has no proposer: a request that resolves to speculation runs on
+            // its own through the engine, never a silent plain decode (epic sc-24432 E2).
+            && req.speculative_or(self.speculative_default) == core_llm::Speculative::Off
     }
 
     /// Decode the requests `indices` of `reqs` together; their results (a request rejected
@@ -3115,7 +3421,7 @@ impl LlamaProvider {
         observer: &mut dyn crate::campaign::Observer,
         packed: Option<&crate::campaign::CompressedKvArm>,
     ) -> CoreResult<(TextLlmOutput, crate::campaign::MultiTurnPromptCacheTurns)> {
-        let mut store = crate::decode::PrefixCache::new(2);
+        let mut store = crate::decode::PrefixCache::with_budget(u64::MAX);
         let (answer, turn1_cache, turn1_ids) = self.campaign_turn_one(turn1, &mut store)?;
         let turn2 = Self::campaign_turn_two_request(turn1, &answer, follow_up);
         let (_, turn2_ids) = self.render_prompt(&turn2, &turn2.messages)?;
@@ -3193,7 +3499,7 @@ impl LlamaProvider {
                     .into(),
             ));
         };
-        let mut store = crate::decode::PrefixCache::new(2);
+        let mut store = crate::decode::PrefixCache::with_budget(u64::MAX);
         let (answer, turn1_cache, turn1_ids) = self.campaign_turn_one(turn1, &mut store)?;
         let turn2 = Self::campaign_turn_two_request(turn1, &answer, follow_up);
         let (_, turn2_ids) = self.render_prompt(&turn2, &turn2.messages)?;
@@ -3329,6 +3635,7 @@ impl LlamaProvider {
     /// Native-memory estimate request admission prices (sc-20682): the K/V term at the
     /// compressed `format`'s bytes ([`crate::kv_policy::compressed_request_kv_bytes`]) when the
     /// request's plan runs compressed, dense otherwise.
+    #[cfg(test)]
     fn admission_estimate(
         &self,
         format: Option<core_llm::KvCompressionFormat>,
@@ -3337,35 +3644,19 @@ impl LlamaProvider {
         vision_workspace: u64,
         mtp_width: u32,
     ) -> CoreResult<u64> {
-        let geometry = self.model.memory_geometry();
-        let contract = self.model.workspace_contract();
-        let estimate = match format {
-            None => estimate_mlx_request_bytes(
-                prompt_tokens,
-                max_new_tokens,
-                geometry,
-                vision_workspace,
-                mtp_width,
-                contract,
-            ),
-            Some(format) => u64::try_from(prompt_tokens)
-                .ok()
-                .and_then(|prompt| {
-                    let total = prompt.checked_add(u64::from(max_new_tokens))?;
-                    crate::kv_policy::compressed_request_kv_bytes(format, &geometry, prompt, total)
-                })
-                .and_then(|kv| {
-                    estimate_mlx_compressed_request_bytes(
-                        prompt_tokens,
-                        max_new_tokens,
-                        geometry,
-                        vision_workspace,
-                        mtp_width,
-                        contract,
-                        kv,
-                    )
-                }),
+        // One pricing for every request (sc-24446 merge): the plain route, or the MTP head's verify
+        // width, through the speculative estimate.
+        let route = match usize::try_from(mtp_width).unwrap_or(usize::MAX) {
+            0 => SpeculativeRoute::Plain,
+            width => SpeculativeRoute::Mtp { width },
         };
+        let estimate = self.speculative_request_bytes(
+            route,
+            format,
+            prompt_tokens,
+            max_new_tokens,
+            vision_workspace,
+        );
         estimate.ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))
     }
 
@@ -3381,6 +3672,9 @@ impl LlamaProvider {
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
         }
+        // The fused-primitive routes the whole request builds — the vision tower and a prefill
+        // run outside the engine included — are what its report names (E3).
+        let fused_start = crate::primitives::fused::fused_tally();
 
         // Multimodal (Qwen-VL + image/video content): replace image blocks with the Qwen-VL image
         // placeholder (`<|vision_start|><|image_pad|><|vision_end|>`) and video blocks with the
@@ -3461,12 +3755,39 @@ impl LlamaProvider {
             admitted_prompt,
             req.max_new_tokens,
         )?;
+        // The backend-neutral speculative resolution (core-llm, sc-24433) against what this
+        // provider advertises, then the proposer this request's shape can run on the engine
+        // (sc-24434). Anything less than the request asked for is named in the report's
+        // `fallbacks` (epic sc-24432 E2) — never a silent downgrade, never a failure. A request
+        // that leaves the option unset runs the MLX defaults-table default (E5, sc-24446).
+        // The engine also gets the option itself: under `auto` it monitors the proposer it runs
+        // against the plain loop it would fall back to, and demotes one measurably slower than
+        // plain decoding (sc-24446, E5); an explicit `{proposer, depth}` runs as asked.
+        let speculative_mode = req.speculative_or(self.speculative_default);
+        let resolution =
+            core_llm::resolve_speculative(speculative_mode, &self.descriptor.capabilities);
+        let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
+        let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
+        // A `draft_model` request reaching past the draft's own context window runs `auto`
+        // instead, by name (sc-24436, E2).
+        let route = self.fit_draft_route(
+            route,
+            admitted_prompt,
+            req.max_new_tokens,
+            gemma4_mm_request,
+            &mut fallbacks,
+        );
 
         // sc-20679: the request's KV cache, decided against the qualification table before any
         // K/V mutation — and, since sc-20682, before admission, so the estimate prices the cache
         // the request will actually run on. Only the plain text decode below runs a compressed
-        // plan; its prompt is the tokenized prompt (no visual expansion on that path).
-        let kv_plan = if observer.is_some() {
+        // plan; its prompt is the tokenized prompt (no visual expansion on that path). The
+        // compressed cache runs every engine route the causal decoder has — the pipelined loop,
+        // prompt lookup and a draft model — rolling a verify back exactly (sc-20681).
+        // A campaign receipt request (an observer attached) measures the plain loop; its output
+        // reports no decode path and no KV plan of its own.
+        let observed = observer.is_some();
+        let kv_plan = if observed {
             KvPlan::Unreported
         } else {
             self.plan_kv_cache(
@@ -3477,28 +3798,52 @@ impl LlamaProvider {
                 multimodal || gemma4_mm_request,
             )
         };
-        let mtp_width = match req.mtp {
-            MtpMode::Off => 0,
-            MtpMode::Auto => self
-                .descriptor
-                .capabilities
-                .mtp
-                .map_or(0, |c| c.recommended_draft_tokens),
-            MtpMode::Enabled { draft_tokens } => draft_tokens,
-        };
-        let geometry = self.model.memory_geometry();
         let compressed_format = match &kv_plan {
             KvPlan::Compressed { format, .. } => Some(*format),
             KvPlan::Unreported | KvPlan::Dense(_) => None,
         };
+
+        // The cross-turn prefix cache (sc-24437) keys on token ids, which cannot tell two images
+        // (or clips) behind the same placeholder ids apart — a multimodal prompt neither reads nor
+        // feeds it, and the report says so. The hybrid decoder snapshots at the end of the
+        // rendered conversation, the prefix the next chat turn extends.
+        let (mut prefix_path, mut prefix_reason) = prefix_path_for(
+            self.prefix.borrow().budget_bytes() > 0,
+            multimodal,
+            gemma4_mm_request,
+        );
+        // Only a request the cache serves reads (restores) or feeds (stores) it — `off` and
+        // `bypassed` never touch it. A compressed request reads it — a dense hit is imported into
+        // its compressed cache — but never feeds it: the store holds dense K/V, and a compressed
+        // cache never re-enters it (sc-20681), so it takes no snapshot.
+        let prefix_route = prefix_path == "miss";
+        let prefix_store = prefix_route && compressed_format.is_none();
+        let prefix_boundary = match &self.model {
+            Decoder::Qwen35(_) if prefix_store => {
+                self.conversation_boundary(messages, req, &prompt_ids)
+            }
+            _ => None,
+        };
+        let snapshot_bytes = if prefix_store {
+            self.prefix_snapshot_bytes(prefix_boundary, route.is_mtp())
+                .ok_or_else(|| {
+                    CoreError::InvalidRequest("prefix snapshot estimate overflow".into())
+                })?
+        } else {
+            0
+        };
+        // The request's native-memory estimate: the K/V term at the compressed format's bytes
+        // when the plan runs compressed (sc-20682), dense otherwise — plus what its speculative
+        // route holds beside it (verify overshoot, a draft model's own request, sc-24436/E7).
         let estimate = |format| {
-            self.admission_estimate(
+            self.speculative_request_bytes(
+                route,
                 format,
                 admitted_prompt,
                 req.max_new_tokens,
                 vision_workspace,
-                mtp_width,
             )
+            .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))
         };
         let required = estimate(compressed_format)?;
         // What a compressed generation that turns dense part-way grows to (its transition is
@@ -3506,12 +3851,79 @@ impl LlamaProvider {
         let dense_final_kv = u64::try_from(admitted_prompt)
             .ok()
             .and_then(|prompt| prompt.checked_add(u64::from(req.max_new_tokens)))
-            .and_then(|total| crate::kv_policy::dense_final_kv_bytes(geometry.kv_shape(), total));
-        let admit = |required: u64| -> CoreResult<()> {
+            .and_then(|total| {
+                crate::kv_policy::dense_final_kv_bytes(
+                    self.model.memory_geometry().kv_shape(),
+                    total,
+                )
+            });
+        // A compressed request looks its dense prefix up before admission, so the reclaim below
+        // never evicts the entry it is about to import (the restored cache shares the entry's
+        // buffers: it holds them, no copy).
+        let mut compressed_prefix = if prefix_route && compressed_format.is_some() {
+            self.prefix
+                .borrow_mut()
+                .restore::<ContiguousKvCache>(&prompt_ids, false)
+                .map_err(to_core)?
+        } else {
+            None
+        };
+        let keeps_hit = compressed_prefix.is_some();
+        let reclaim = |required: u64, available: u64| {
+            let mut prefix = self.prefix.borrow_mut();
+            if keeps_hit {
+                prefix.reclaim_for_keeping_latest(required, available)
+            } else {
+                prefix.reclaim_for(required, available)
+            }
+        };
+        let available = core_llm::effective_memory_budget(
+            core_llm::available_host_memory_bytes(),
+            core_llm::operational_memory_override()?,
+        )?;
+        // Held prefix-cache entries are reclaimable memory (sc-24437, E7): a request that would
+        // not fit evicts them least-recently-used first, and the snapshot it would leave behind
+        // is admitted with it — or not taken, so caching never makes a request fail and never
+        // takes memory admission did not grant.
+        let prefix_admission = if prefix_store {
+            self.prefix
+                .borrow_mut()
+                .admit(required, snapshot_bytes, available)
+        } else {
+            core_llm::PrefixAdmission {
+                available: reclaim(required, available),
+                snapshot: false,
+            }
+        };
+        let keep_prefix = prefix_admission.snapshot;
+        if prefix_store && !keep_prefix {
+            prefix_reason = Some(core_llm::PREFIX_NOT_ADMITTED);
+        }
+        if prefix_route && compressed_format.is_some() {
+            prefix_reason = Some(core_llm::PREFIX_COMPRESSED_NOT_STORED);
+        }
+        core_llm::admit_request_memory_with_geometry(
+            admitted_prompt,
+            req.max_new_tokens,
+            self.descriptor.capabilities.max_context_tokens,
+            if keep_prefix {
+                required.saturating_add(snapshot_bytes)
+            } else {
+                required
+            },
+            prefix_admission.available,
+        )?;
+        let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
+        // A compressed selection the model refuses runs dense from the start: the request was
+        // admitted at the compressed price, so it is admitted again at the dense price before any
+        // K/V exists (sc-20682), held prefix entries reclaimable as above.
+        let admit_dense = || -> CoreResult<()> {
+            let required = estimate(None)?;
             let available = core_llm::effective_memory_budget(
                 core_llm::available_host_memory_bytes(),
                 core_llm::operational_memory_override()?,
             )?;
+            let available = reclaim(required, available);
             core_llm::admit_request_memory_with_geometry(
                 admitted_prompt,
                 req.max_new_tokens,
@@ -3520,7 +3932,6 @@ impl LlamaProvider {
                 available,
             )
         };
-        admit(required)?;
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
@@ -3545,6 +3956,16 @@ impl LlamaProvider {
             prompt_len,
             req.max_new_tokens,
         )?;
+        // A Gemma 4 prompt's soft-token expansion is known only now: a `draft_model` route checks
+        // the draft's context window again against the effective prompt (E2). Nothing has been
+        // allocated for the route yet; the priced draft is only an over-estimate.
+        let route = self.fit_draft_route(
+            route,
+            prompt_len,
+            req.max_new_tokens,
+            gemma4_mm_request,
+            &mut fallbacks,
+        );
 
         let mut kv_report = match &kv_plan {
             KvPlan::Dense(report) => Some(report.clone()),
@@ -3558,25 +3979,7 @@ impl LlamaProvider {
             stop_tokens: self.stop_tokens.clone(),
         };
 
-        let mut mtp_draft_tokens = match req.mtp {
-            MtpMode::Off => None,
-            MtpMode::Auto => self
-                .descriptor
-                .capabilities
-                .mtp
-                .map(|caps| caps.recommended_draft_tokens as usize),
-            MtpMode::Enabled { draft_tokens } => Some(draft_tokens as usize),
-        };
-        // Gemma 4 has no Qwen predictor. Qwen multimodal prompts use the fused-embedding MTP route
-        // below, including their explicit three-axis positions and continuation delta.
-        if mtp_draft_tokens.is_some() && gemma4_mm_request {
-            if matches!(req.mtp, MtpMode::Enabled { .. }) {
-                return Err(CoreError::Unsupported(
-                    "[mlx-llama] native Qwen MTP is unavailable for Gemma 4 prompts".into(),
-                ));
-            }
-            mtp_draft_tokens = None;
-        }
+        let mut prefix_hit = 0usize;
 
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
@@ -3631,12 +4034,26 @@ impl LlamaProvider {
         let tool_seg = matches!(self.tool_call_format, Some(ToolCallFormat::Tagged))
             .then(|| ToolCallSegmenter::new(&req.tools));
 
-        // Drive the internal loop; translate token-id events to contract text-delta events through
-        // the token-to-text pipeline (see `TextPipeline`): the streamed answer is the result text
-        // when stop strings, thinking or tools are active.
+        // Whether the stream has delivered a token yet. The segmenter, the tool segmenter and the
+        // stop matcher can hold the first engine tokens back (a thinking model's opening marker
+        // emits nothing), so the engine keeps its look-ahead out of the way until the first
+        // delivered token is out — the time to first token never waits behind one (sc-24446).
+        let delivered_any = std::cell::Cell::new(false);
+        let mut tracked = |event: CoreEvent| {
+            if matches!(event, CoreEvent::Token { .. }) {
+                delivered_any.set(true);
+            }
+            on_event(event);
+        };
+        let on_event: &mut dyn FnMut(CoreEvent) = &mut tracked;
+        let delivered = || delivered_any.get();
+
+        // Drive the engine; translate token-id events to contract text-delta events through the
+        // token-to-text pipeline (see `TextPipeline`): the streamed answer is the result text when
+        // stop strings, thinking or tools are active.
         let tokenizer = &self.tokenizer;
         let mut pipeline = TextPipeline::new(tokenizer, segmenter, tool_seg, stop_matcher);
-        let (out, mtp_stats, timing) = {
+        let mut run = {
             let mut sink = |ev: StreamEvent| {
                 if let StreamEvent::Token { id, .. } = ev {
                     pipeline.push(id as u32, &halt, &mut *on_event);
@@ -3644,287 +4061,491 @@ impl LlamaProvider {
             };
             let should_stop = || halt.get();
             let should_stop_opt = stop_active.then_some(&should_stop as &dyn Fn() -> bool);
-            match &mm {
-                // Multimodal: prefill the spliced embeds with interleaved M-RoPE + DeepStack fusion,
-                // then decode the continuation (text positions shifted by `mrope_delta`) through the
-                // shared loop — one path for either backbone via the `VlmDecode` seam.
-                Some(m) => {
+            let width = route.width();
+            match (&mm, &g4) {
+                // Qwen-VL multimodal: prefill the spliced embeds with interleaved M-RoPE +
+                // DeepStack fusion, then decode the continuation (RoPE shifted by `mrope_delta`)
+                // through the engine — the MTP head seeds from the fused embeddings.
+                (Some(m), _) => {
                     let (t, h, w, delta) = &m.positions;
                     let pos = [t.as_slice(), h.as_slice(), w.as_slice()];
-                    if let (Decoder::Qwen35(model), Some(num_draft)) =
-                        (&self.model, mtp_draft_tokens)
-                    {
-                        let prompt = Qwen35MtpMultimodalPrompt {
-                            input_ids: &m.expanded_ids,
-                            embeddings: &m.embeds,
-                            positions: pos,
-                            visual_pos_mask: &m.visual_pos_mask,
-                            deepstack: &m.deepstack,
-                            continuation_delta: *delta,
-                        };
-                        let (timed, stats) = generate_qwen35_mtp_multimodal_with_timings(
-                            model,
-                            &prompt,
-                            &config,
-                            num_draft,
-                            &req.cancel,
-                            &mut sink,
-                            json_mask
-                                .as_mut()
-                                .map(|m| m as &mut dyn RewindableConstraintMask),
-                            should_stop_opt,
-                            qwen_prefill_started
-                                .expect("Qwen multimodal preparation starts the prefill clock"),
-                        )
-                        .map_err(to_core)?;
-                        (timed.output, Some(stats), Some(timed.timer))
-                    } else {
-                        let model = self.model.as_vlm();
-                        let mut cache = model.make_cache();
-                        let first = model
-                            .prefill_with_deepstack(
-                                &m.embeds,
-                                pos,
-                                cache.as_mut(),
-                                &m.visual_pos_mask,
-                                &m.deepstack,
+                    let clock = Some(
+                        qwen_prefill_started
+                            .expect("Qwen multimodal preparation starts the prefill clock"),
+                    );
+                    match &self.model {
+                        Decoder::Qwen35(model) => {
+                            let model: &Qwen35Model = model;
+                            let mtp_prompt = Qwen35MtpMultimodalPrompt {
+                                input_ids: &m.expanded_ids,
+                                embeddings: &m.embeds,
+                                positions: pos,
+                                visual_pos_mask: &m.visual_pos_mask,
+                                deepstack: &m.deepstack,
+                                continuation_delta: *delta,
+                            };
+                            let mut cache = model.new_cache();
+                            let (mut proposer, logits, hidden) = if route.is_mtp() {
+                                let (hidden, logits) = model
+                                    .prefill_hidden_and_last_logits_from_embeds_with_deepstack(
+                                        &m.embeds,
+                                        pos,
+                                        &mut cache,
+                                        &m.visual_pos_mask,
+                                        &m.deepstack,
+                                    )
+                                    .map_err(to_core)?;
+                                let proposer: Box<dyn Proposer<Qwen35Model>> =
+                                    Box::new(MtpProposer::multimodal(&mtp_prompt));
+                                (proposer, logits, Some(hidden))
+                            } else {
+                                let logits = model
+                                    .prefill_with_deepstack(
+                                        &m.embeds,
+                                        pos,
+                                        &mut cache,
+                                        &m.visual_pos_mask,
+                                        &m.deepstack,
+                                    )
+                                    .map_err(to_core)?;
+                                (route.plain_proposer(self.draft.as_ref()), logits, None)
+                            };
+                            generate_speculative(
+                                model,
+                                &mut *proposer,
+                                SpeculativePrompt::Prefilled {
+                                    cache: &mut cache,
+                                    logits,
+                                    hidden,
+                                    history: &m.expanded_ids,
+                                    position_delta: *delta,
+                                },
+                                &config,
+                                width,
+                                &req.cancel,
+                                &mut sink,
+                                EngineOptions {
+                                    constraint: json_mask
+                                        .as_mut()
+                                        .map(|m| m as &mut dyn RewindableConstraintMask),
+                                    should_stop: should_stop_opt,
+                                    delivered: Some(&delivered),
+                                    prefill_clock: clock,
+                                    speculative_mode,
+                                    ..EngineOptions::default()
+                                },
                             )
-                            .map_err(to_core)?;
-                        let shifted = Shifted {
-                            model,
-                            delta: *delta,
-                        };
-                        let timed = generate_from_prefill_with_timings(
-                            &shifted,
-                            cache.as_mut(),
-                            first,
-                            m.expanded_ids.clone(),
-                            &config,
-                            &req.cancel,
-                            &mut sink,
-                            json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
-                            should_stop_opt,
-                            qwen_prefill_started
-                                .expect("Qwen multimodal preparation starts the prefill clock"),
-                        )
-                        .map_err(to_core)?;
-                        (timed.output, None, Some(timed.timer))
+                        }
+                        Decoder::Causal(model) => {
+                            let model: &CausalLm = model;
+                            let mut cache = model.new_cache();
+                            let logits = model
+                                .prefill_with_deepstack(
+                                    &m.embeds,
+                                    pos,
+                                    &mut cache,
+                                    &m.visual_pos_mask,
+                                    &m.deepstack,
+                                )
+                                .map_err(to_core)?;
+                            generate_speculative(
+                                model,
+                                &mut *route.plain_proposer(self.draft.as_ref()),
+                                SpeculativePrompt::Prefilled {
+                                    cache: &mut cache,
+                                    logits,
+                                    hidden: None,
+                                    history: &m.expanded_ids,
+                                    position_delta: *delta,
+                                },
+                                &config,
+                                width,
+                                &req.cancel,
+                                &mut sink,
+                                EngineOptions {
+                                    constraint: json_mask
+                                        .as_mut()
+                                        .map(|m| m as &mut dyn RewindableConstraintMask),
+                                    should_stop: should_stop_opt,
+                                    delivered: Some(&delivered),
+                                    prefill_clock: clock,
+                                    speculative_mode,
+                                    ..EngineOptions::default()
+                                },
+                            )
+                        }
                     }
                 }
                 // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
                 // (no M-RoPE, so no position shift for the continuation), then decode through the
-                // shared loop against the unwrapped decoder.
-                None => match &g4 {
-                    Some(m) => {
-                        let model = match &self.model {
+                // engine against the unwrapped decoder.
+                (None, Some(m)) => {
+                    let model: &CausalLm =
+                        match &self.model {
                             Decoder::Causal(c) => c,
-                            Decoder::Qwen35(_) => {
-                                return Err(CoreError::Load(
-                                    "gemma 4: the multimodal path requires the generic causal \
-                                     decoder"
-                                        .into(),
-                                ))
-                            }
+                            Decoder::Qwen35(_) => return Err(CoreError::Load(
+                                "gemma 4: the multimodal path requires the generic causal decoder"
+                                    .into(),
+                            )),
                         };
-                        let mut cache = model.new_cache();
-                        let first = model
-                            .decode_logits_from_embeds(&m.embeds, &mut cache, 0)
-                            .map_err(to_core)?;
-                        let out = generate_from_prefill(
-                            &self.model,
-                            &mut cache,
-                            first,
-                            m.expanded_ids.clone(),
+                    let mut cache = model.new_cache();
+                    let logits = model
+                        .decode_logits_from_embeds(&m.embeds, &mut cache, 0)
+                        .map_err(to_core)?;
+                    generate_speculative(
+                        model,
+                        &mut *route.plain_proposer(self.draft.as_ref()),
+                        SpeculativePrompt::Prefilled {
+                            cache: &mut cache,
+                            logits,
+                            hidden: None,
+                            history: &m.expanded_ids,
+                            position_delta: 0,
+                        },
+                        &config,
+                        width,
+                        &req.cancel,
+                        &mut sink,
+                        EngineOptions {
+                            constraint: json_mask
+                                .as_mut()
+                                .map(|m| m as &mut dyn RewindableConstraintMask),
+                            should_stop: should_stop_opt,
+                            delivered: Some(&delivered),
+                            prefill_clock: None,
+                            speculative_mode,
+                            ..EngineOptions::default()
+                        },
+                    )
+                }
+                // The campaign receipt producer (epic sc-20669): the observed plain decode — the
+                // measurement's own loop, on a dense or compressed (`packed`) cache, through the
+                // campaign prompt-cache store when it passes one. Never installed on a production
+                // request, and never run under a speculative route.
+                (None, None) if observed => {
+                    let observer = observer.expect("matched Some");
+                    if !matches!(route, SpeculativeRoute::Plain) {
+                        return Err(CoreError::Unsupported(
+                            "campaign observer measures only the plain decode".into(),
+                        ));
+                    }
+                    let packed_decoder = match (packed, &self.model) {
+                        (None, _) => None,
+                        (Some(arm), Decoder::Causal(model)) => Some(PackedCampaignDecoder {
+                            model,
+                            arm,
+                            selection_fallbacks: RefCell::new(Vec::new()),
+                        }),
+                        (Some(_), Decoder::Qwen35(_)) => {
+                            return Err(CoreError::Unsupported(
+                                "compressed campaign decode requires the causal decoder".into(),
+                            ))
+                        }
+                    };
+                    let decoder: &dyn Decode = match &packed_decoder {
+                        Some(packed) => packed,
+                        None => &self.model,
+                    };
+                    let output = match (prefix_cache, &self.model) {
+                        // The product prompt-cache path (SC-20671 multi-turn fixture): a hit
+                        // seeds the dense cache or imports into the packed one.
+                        (Some(store), Decoder::Causal(model)) => {
+                            crate::decode::prefix::generate_cached_with_observer(
+                                model,
+                                &prompt_ids,
+                                &config,
+                                &req.cancel,
+                                &mut sink,
+                                store,
+                                json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                                should_stop_opt,
+                                Some(&mut *observer),
+                                packed,
+                            )
+                        }
+                        (Some(_), Decoder::Qwen35(_)) => {
+                            return Err(CoreError::Unsupported(
+                                "the campaign prompt cache requires the causal decoder".into(),
+                            ))
+                        }
+                        (None, _) => generate_with_observer(
+                            decoder,
+                            &prompt_ids,
                             &config,
                             &req.cancel,
                             &mut sink,
                             json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
                             should_stop_opt,
-                        )
-                        .map_err(to_core)?;
-                        (out, None, None)
+                            Some(&mut *observer),
+                        ),
                     }
-                    None => {
-                        if let Some(observer) = observer {
-                            if mtp_draft_tokens.is_some() {
-                                return Err(CoreError::Unsupported(
-                                    "campaign observer cannot measure MTP decode".into(),
-                                ));
-                            }
-                            let packed_decoder = match (packed, &self.model) {
-                                (None, _) => None,
-                                (Some(arm), Decoder::Causal(model)) => {
-                                    Some(PackedCampaignDecoder {
-                                        model,
-                                        arm,
-                                        selection_fallbacks: RefCell::new(Vec::new()),
-                                    })
-                                }
-                                (Some(_), Decoder::Qwen35(_)) => {
-                                    return Err(CoreError::Unsupported(
-                                        "compressed campaign decode requires the causal decoder"
-                                            .into(),
-                                    ))
-                                }
+                    .map_err(to_core)?;
+                    for reason in packed_decoder
+                        .map(|packed| packed.selection_fallbacks.into_inner())
+                        .unwrap_or_default()
+                    {
+                        observer.dense_fallback("cache-selection", &reason);
+                    }
+                    Ok(SpeculativeRun::unmeasured(output, 0))
+                }
+                // Text: prefill on top of the longest prefix the cross-turn cache restores
+                // (sc-24437), decode through the engine, then keep the request's state for the
+                // next turn — a softmax KV cache whole, the hybrid's snapshot at the conversation
+                // boundary (with the MTP head's state there when it ran).
+                (None, None) => {
+                    let options = EngineOptions {
+                        constraint: json_mask
+                            .as_mut()
+                            .map(|m| m as &mut dyn RewindableConstraintMask),
+                        should_stop: should_stop_opt,
+                        delivered: Some(&delivered),
+                        prefill_clock: Some(Instant::now()),
+                        speculative_mode,
+                        ..EngineOptions::default()
+                    };
+                    match &self.model {
+                        // A compressed plan (sc-20679): the compressed cache is selected before
+                        // any K/V mutation and its evidence read before it is reset, and the
+                        // engine runs on it like on any cache — the pipelined loop, or a
+                        // speculative route whose verify steps it rolls back exactly (sc-20681).
+                        Decoder::Causal(model) if compressed_format.is_some() => {
+                            let model: &CausalLm = model;
+                            let KvPlan::Compressed { format, reader } = &kv_plan else {
+                                unreachable!("a compressed format comes from a compressed plan")
                             };
-                            let decoder: &dyn Decode = match &packed_decoder {
-                                Some(packed) => packed,
-                                None => &self.model,
-                            };
-                            let output = match (prefix_cache, &self.model) {
-                                // The product prompt-cache path (SC-20671 multi-turn fixture):
-                                // a hit seeds the dense cache or imports into the packed one.
-                                (Some(store), Decoder::Causal(model)) => {
-                                    crate::decode::prefix::generate_cached_with_observer(
-                                        model,
-                                        &prompt_ids,
-                                        &config,
-                                        &req.cancel,
-                                        &mut sink,
-                                        store,
-                                        json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
-                                        should_stop_opt,
-                                        Some(&mut *observer),
-                                        packed,
-                                    )
-                                }
-                                (Some(_), Decoder::Qwen35(_)) => {
-                                    return Err(CoreError::Unsupported(
-                                        "the campaign prompt cache requires the causal decoder"
-                                            .into(),
-                                    ))
-                                }
-                                (None, _) => generate_with_observer(
-                                    decoder,
-                                    &prompt_ids,
-                                    &config,
-                                    &req.cancel,
-                                    &mut sink,
-                                    json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
-                                    should_stop_opt,
-                                    Some(&mut *observer),
-                                ),
-                            }
-                            .map_err(to_core)?;
-                            for reason in packed_decoder
-                                .map(|packed| packed.selection_fallbacks.into_inner())
-                                .unwrap_or_default()
-                            {
-                                observer.dense_fallback("cache-selection", &reason);
-                            }
-                            (output, None, None)
-                        } else {
-                            match (&self.model, mtp_draft_tokens) {
-                                (Decoder::Qwen35(model), Some(num_draft)) => {
-                                    let (timed, stats) = generate_qwen35_mtp_with_timings(
-                                        model,
-                                        &prompt_ids,
-                                        &config,
-                                        num_draft,
-                                        &req.cancel,
-                                        &mut sink,
-                                        json_mask
-                                            .as_mut()
-                                            .map(|m| m as &mut dyn RewindableConstraintMask),
-                                        should_stop_opt,
-                                    )
-                                    .map_err(to_core)?;
-                                    (timed.output, Some(stats), Some(timed.timer))
-                                }
-                                (Decoder::Causal(model), _) => {
-                                    if let KvPlan::Compressed { format, reader } = &kv_plan {
-                                        // The compressed cache is selected before any K/V
-                                        // mutation and its evidence read before it is reset.
-                                        let (mut cache, refused) =
-                                            crate::kv_policy::select_compressed_cache(
-                                                model,
-                                                reader.clone(),
-                                                prompt_ids.len(),
-                                                crate::kv_policy::dense_transition_admission(
-                                                    dense_final_kv.ok_or_else(|| {
-                                                        CoreError::InvalidRequest(
-                                                            "request memory estimate overflow"
-                                                                .into(),
-                                                        )
-                                                    })?,
-                                                    core_llm::RequestResourceExhausted {
-                                                        prompt_tokens: admitted_prompt,
-                                                        max_new_tokens: req.max_new_tokens,
-                                                        max_context_tokens: self
-                                                            .descriptor
-                                                            .capabilities
-                                                            .max_context_tokens,
-                                                        required_bytes: 0,
-                                                        available_bytes: 0,
-                                                    },
-                                                ),
-                                            );
-                                        // A refused selection runs dense from the start: the
-                                        // request was admitted at the compressed price, so it
-                                        // is admitted again at the dense price before any K/V
-                                        // exists (sc-20682).
-                                        if refused.is_some() {
-                                            admit(estimate(None)?)?;
-                                        }
-                                        let timed = generate_with_timings_on(
-                                            &self.model,
-                                            cache.as_mut(),
-                                            &prompt_ids,
-                                            &config,
-                                            &req.cancel,
-                                            &mut sink,
-                                            json_mask
-                                                .as_mut()
-                                                .map(|m| m as &mut dyn ConstraintMask),
-                                            should_stop_opt,
-                                        );
-                                        let report = timed.as_ref().ok().map(|_| {
-                                            crate::kv_policy::compressed_report(
-                                                *format,
-                                                refused,
-                                                cache.as_ref(),
-                                            )
-                                        });
-                                        let reset = cache.reset();
-                                        let timed = timed.map_err(to_core)?;
-                                        reset.map_err(to_core)?;
-                                        kv_report = report.transpose().map_err(to_core)?;
-                                        (timed.output, None, Some(timed.timer))
-                                    } else {
-                                        let timed = generate_with_timings(
-                                            &self.model,
-                                            &prompt_ids,
-                                            &config,
-                                            &req.cancel,
-                                            &mut sink,
-                                            json_mask
-                                                .as_mut()
-                                                .map(|m| m as &mut dyn ConstraintMask),
-                                            should_stop_opt,
+                            let (cache, refused) = crate::kv_policy::select_compressed_cache(
+                                model,
+                                reader.clone(),
+                                prompt_ids.len(),
+                                crate::kv_policy::dense_transition_admission(
+                                    dense_final_kv.ok_or_else(|| {
+                                        CoreError::InvalidRequest(
+                                            "request memory estimate overflow".into(),
                                         )
-                                        .map_err(to_core)?;
-                                        (timed.output, None, Some(timed.timer))
+                                    })?,
+                                    core_llm::RequestResourceExhausted {
+                                        prompt_tokens: admitted_prompt,
+                                        max_new_tokens: req.max_new_tokens,
+                                        max_context_tokens: self
+                                            .descriptor
+                                            .capabilities
+                                            .max_context_tokens,
+                                        required_bytes: 0,
+                                        available_bytes: 0,
+                                    },
+                                ),
+                            );
+                            if refused.is_some() {
+                                admit_dense()?;
+                            }
+                            let mut cache: Box<dyn KvCache + '_> = cache;
+                            // A dense prefix hit (looked up before admission) is imported into the
+                            // compressed cache by quantize-on-append — never a reconstruction —
+                            // from views of the stored entry's own buffers, no dense copy; a cache
+                            // that declines it prefills the whole prompt instead, by name
+                            // (sc-20681).
+                            let mut reused = 0usize;
+                            if let Some(restored) = compressed_prefix.take() {
+                                let layers = restored.cache.share_live().map_err(to_core)?;
+                                let imported = match layers {
+                                    Some(layers) => {
+                                        cache.import_prefix(&layers).map_err(to_core)?
                                     }
-                                }
-                                (Decoder::Qwen35(_), None) => {
-                                    let timed = generate_with_timings(
-                                        &self.model,
-                                        &prompt_ids,
-                                        &config,
-                                        &req.cancel,
-                                        &mut sink,
-                                        json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
-                                        should_stop_opt,
-                                    )
-                                    .map_err(to_core)?;
-                                    (timed.output, None, Some(timed.timer))
+                                    None => false,
+                                };
+                                if imported {
+                                    reused = restored.reused;
+                                } else {
+                                    prefix_reason =
+                                        Some(core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED);
                                 }
                             }
+                            if req.cancel.is_cancelled() {
+                                return Err(CoreError::Canceled);
+                            }
+                            let logits = model
+                                .decode_logits(
+                                    &crate::primitives::input_ids(&prompt_ids[reused..]),
+                                    cache.as_mut(),
+                                    reused as i32,
+                                )
+                                .map_err(to_core)?;
+                            // Measured, not looked up: the positions the prefill did not feed.
+                            prefix_hit = reused;
+                            if prefix_hit > 0 {
+                                prefix_path = "hit";
+                            }
+                            let run = generate_speculative(
+                                &DynCacheTarget(model),
+                                &mut *route.plain_proposer(self.draft.as_ref()),
+                                SpeculativePrompt::Prefilled {
+                                    cache: &mut cache,
+                                    logits,
+                                    hidden: None,
+                                    history: &prompt_ids,
+                                    position_delta: 0,
+                                },
+                                &config,
+                                width,
+                                &req.cancel,
+                                &mut sink,
+                                options,
+                            );
+                            let report = run.as_ref().ok().map(|_| {
+                                crate::kv_policy::compressed_report(
+                                    *format,
+                                    refused,
+                                    cache.as_ref(),
+                                )
+                            });
+                            let reset = cache.reset();
+                            let run = run.map_err(to_core)?;
+                            reset.map_err(to_core)?;
+                            kv_report = report.transpose().map_err(to_core)?;
+                            Ok(run)
+                        }
+                        Decoder::Causal(model) => {
+                            let model: &CausalLm = model;
+                            let restored = if prefix_route {
+                                self.prefix
+                                    .borrow_mut()
+                                    .restore::<ContiguousKvCache>(&prompt_ids, false)
+                                    .map_err(to_core)?
+                            } else {
+                                None
+                            };
+                            let PrefixPrefill {
+                                mut cache,
+                                logits,
+                                fed_tokens,
+                                ..
+                            } = prefill_restored(
+                                model,
+                                restored,
+                                &prompt_ids,
+                                None,
+                                false,
+                                &req.cancel,
+                            )
+                            .map_err(to_core)?;
+                            // Measured, not looked up: the positions the prefill did not feed.
+                            prefix_hit = prompt_ids.len() - fed_tokens;
+                            if prefix_hit > 0 {
+                                prefix_path = "hit";
+                            }
+                            let run = generate_speculative(
+                                model,
+                                &mut *route.plain_proposer(self.draft.as_ref()),
+                                SpeculativePrompt::Prefilled {
+                                    cache: &mut cache,
+                                    logits,
+                                    hidden: None,
+                                    history: &prompt_ids,
+                                    position_delta: 0,
+                                },
+                                &config,
+                                width,
+                                &req.cancel,
+                                &mut sink,
+                                options,
+                            );
+                            if let (Ok(run), true) = (&run, keep_prefix) {
+                                self.prefix
+                                    .borrow_mut()
+                                    .store_run(&prompt_ids, run, cache, None, None)
+                                    .map_err(to_core)?;
+                            }
+                            run
+                        }
+                        Decoder::Qwen35(model) => {
+                            let model: &Qwen35Model = model;
+                            let mtp = route.is_mtp();
+                            let restored = if prefix_route {
+                                self.prefix
+                                    .borrow_mut()
+                                    .restore::<Qwen35Cache>(&prompt_ids, mtp)
+                                    .map_err(to_core)?
+                            } else {
+                                None
+                            };
+                            let PrefixPrefill {
+                                mut cache,
+                                logits,
+                                hidden,
+                                fed_tokens,
+                                mtp: resume,
+                                boundary,
+                                ..
+                            } = prefill_restored(
+                                model,
+                                restored,
+                                &prompt_ids,
+                                prefix_boundary,
+                                mtp,
+                                &req.cancel,
+                            )
+                            .map_err(to_core)?;
+                            // Measured, not looked up: the positions the prefill did not feed.
+                            prefix_hit = prompt_ids.len() - fed_tokens;
+                            if prefix_hit > 0 {
+                                prefix_path = "hit";
+                            }
+                            let mut head = mtp.then(|| {
+                                MtpProposer::new()
+                                    .resume_from(resume)
+                                    .capture_at(boundary.as_ref().map(Boundary::len))
+                            });
+                            let mut plain = route.plain_proposer(self.draft.as_ref());
+                            let proposer: &mut dyn Proposer<Qwen35Model> = match head.as_mut() {
+                                Some(head) => head,
+                                None => &mut *plain,
+                            };
+                            let run = generate_speculative(
+                                model,
+                                proposer,
+                                SpeculativePrompt::Prefilled {
+                                    cache: &mut cache,
+                                    logits,
+                                    hidden,
+                                    history: &prompt_ids,
+                                    position_delta: 0,
+                                },
+                                &config,
+                                width,
+                                &req.cancel,
+                                &mut sink,
+                                options,
+                            );
+                            if let (Ok(run), true) = (&run, keep_prefix) {
+                                let captured = head.as_mut().and_then(MtpProposer::take_captured);
+                                self.prefix
+                                    .borrow_mut()
+                                    .store_run(&prompt_ids, run, cache, boundary, captured)
+                                    .map_err(to_core)?;
+                            }
+                            run
                         }
                     }
-                },
+                }
             }
+            .map_err(to_core)?
         };
+        let timing = run.take_timer();
+        let out = run.output;
+        let stats = run.stats;
+        let mut report = run.report;
+        // The request's resolution fallbacks join the engine's measured report (E2/E3), and so
+        // does what the prefix cache restored. The engine counts a caller's prefill as its one
+        // prefill forward: the boundary snapshot is taken inside it (sc-24446).
+        report.fallbacks = fallbacks;
+        report.prefix_hit_tokens = prefix_hit as u64;
+        report.prefix_cache = core_llm::PathReport {
+            path: prefix_path.into(),
+            reason: prefix_reason.map(str::to_string),
+        };
+        report.fused_primitives = crate::primitives::fused::fused_tally()
+            .since(&fused_start)
+            .path_report();
 
         // End-of-generation tails (thinking marker, tool block, stop prefix), in pipeline order.
         let (streamed, thinking_buf, tool_seg) =
@@ -3967,15 +4588,417 @@ impl LlamaProvider {
             thinking,
             tool_calls,
             usage,
-            mtp: mtp_stats.map(|stats| core_llm::MtpStats {
+            mtp: (report.proposer == ProposerKind::Mtp).then(|| core_llm::MtpStats {
                 proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
                 accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
                 target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
             }),
-            decode: None,
+            decode: (!observed).then_some(report),
             finish_reason: Some(finish),
             kv_cache: kv_report,
         })
+    }
+}
+
+// Why a multimodal request never reads or feeds the cross-turn prefix cache (sc-24437): the
+// shared reason both backends name (E8).
+#[cfg(test)]
+use core_llm::PREFIX_MULTIMODAL_BYPASS;
+
+/// The cross-turn prefix cache's part in a request before any lookup (sc-24437): `off` when the
+/// load settled a zero budget, `bypassed` (with the reason) for a multimodal prompt — Qwen-VL
+/// (`multimodal`) or Gemma 4 (`gemma4_mm`) — whose token ids cannot tell two images or clips apart,
+/// else `miss` (the lookup may still turn it into a `hit`). Only a `miss` request reads or feeds
+/// the cache.
+fn prefix_path_for(
+    prefix_on: bool,
+    multimodal: bool,
+    gemma4_mm: bool,
+) -> (&'static str, Option<&'static str>) {
+    core_llm::prefix_path_before_lookup(prefix_on, multimodal || gemma4_mm)
+}
+
+/// The ceiling on any speculative proposal MLX runs (sc-24438, epic sc-24432 E4): drafts per
+/// verify step, so the verify forward carries at most `1 + 7 = 8` query rows. A loaded model
+/// advertises its own, possibly lower, depth — [`speculative_max_depth`] over its attention
+/// geometry — and the weightless [`provider_descriptor`] advertises this ceiling.
+///
+/// Why 8 rows: the attention primitive's `MLX_SDPA_VECTOR_MAX_QLEN` is the widest query MLX
+/// 0.32's single-pass **vector** SDPA kernel takes — its decode kernel, the one every plain
+/// `q_len = 1` step runs. A verify it serves in one call costs one fused call per attention layer,
+/// no score matrix, the same kernel as the plain step it must agree with token for token. Past it
+/// the verify moves to the fused **full** kernel (head dims 64/80/128), whose query blocks are
+/// sized for prefill, or — for head dims only the vector kernel serves, like the Qwen35 hybrid's
+/// 256 — to a second vector-kernel tile per layer: the per-step verify cost stops being flat in
+/// the depth exactly where speculation needs it flat. sc-24442 removed the old 8-row cap on
+/// *fused* SDPA; this is the width the decode kernel serves, not that cap. On the Qwen35 hybrid
+/// every extra depth also adds a checkpoint-ring slot per linear layer (sc-24435).
+pub const SPECULATIVE_MAX_DEPTH: u32 =
+    crate::primitives::attention::MLX_SDPA_VECTOR_MAX_QLEN as u32 - 1;
+
+/// The deepest speculative proposal (prompt lookup and MTP alike) a model whose attention layers
+/// have these `(q_heads, kv_heads, qk_head_dim, v_head_dim)` geometries runs on MLX (sc-24438,
+/// E4): one less than the narrowest `vector_verify_rows` among them, so a max-depth verify is one
+/// decode-kernel call in **every** attention layer.
+///
+/// MLX's vector kernel serves `q_len × gqa <= 32`, so a GQA group wider than 4 narrows it:
+/// Qwen3.8-27B (24q/4kv/hd 256, gqa 6) verifies 5 rows in one call → depth 4; Qwen3.5/3.6-35B-A3B
+/// (16q/2kv/hd 256, gqa 8) 4 rows → depth 3; a gqa-4 Llama 8 rows → depth 7
+/// ([`SPECULATIVE_MAX_DEPTH`]). A geometry the vector kernel does not serve is bounded at 8 rows.
+/// Never below 1: a gqa-32 group (one vector row) still speculates one draft, in two calls.
+pub fn speculative_max_depth(geometries: impl IntoIterator<Item = (i32, i32, i32, i32)>) -> u32 {
+    geometries
+        .into_iter()
+        .map(|(hq, hkv, qd, vd)| crate::primitives::attention::vector_verify_rows(hq, hkv, qd, vd))
+        .min()
+        .map_or(SPECULATIVE_MAX_DEPTH, |rows| (rows - 1).max(1) as u32)
+}
+
+/// Every attention geometry `(q_heads, kv_heads, qk_head_dim, v_head_dim)` a causal decoder's
+/// layers hand `sdpa`: per layer type (Gemma 4's sliding and full layers differ), MLA's
+/// head-expanded `qk_nope + qk_rope` / `v_head_dim` keys.
+fn causal_attention_geometries(cfg: &ModelConfig) -> Vec<(i32, i32, i32, i32)> {
+    if let Some(mla) = &cfg.mla {
+        return vec![(
+            cfg.num_heads,
+            cfg.num_heads,
+            mla.q_head_dim(),
+            mla.v_head_dim,
+        )];
+    }
+    let mut geometries: Vec<_> = (0..cfg.num_layers.max(1))
+        .map(|i| {
+            let a = cfg.layer_attention(i);
+            (cfg.num_heads, a.num_kv_heads, a.head_dim, a.head_dim)
+        })
+        .collect();
+    geometries.sort_unstable();
+    geometries.dedup();
+    geometries
+}
+
+/// The attention geometry of the Qwen35 hybrid's full-attention layers — the only layers that run
+/// `sdpa` (the Gated DeltaNet layers are recurrent) — which its MTP predictor layer shares.
+fn qwen35_attention_geometry(cfg: &Qwen35Config) -> (i32, i32, i32, i32) {
+    (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.head_dim)
+}
+
+/// The per-proposer depths [`Speculative::Auto`](core_llm::Speculative::Auto) runs and every MLX
+/// advertisement recommends: the MLX row of the decode-defaults table (E5,
+/// [`core_llm::defaults`]).
+fn recommended_depths() -> &'static core_llm::RecommendedDepths {
+    &core_llm::DecodeBackend::Mlx.defaults().recommended_depths
+}
+
+/// The prompt-lookup advertisement every `mlx-llama` decoder carries, at the model's
+/// [`speculative_max_depth`] (the shared [`core_llm::prompt_lookup_capabilities`], recommending the
+/// MLX row's depth).
+fn prompt_lookup_capabilities(max_depth: u32) -> ProposerCapabilities {
+    core_llm::prompt_lookup_capabilities(max_depth, recommended_depths())
+}
+
+/// The proposer a request runs on the engine, after its resolved plan meets the request's shape
+/// (sc-24434, sc-24436). `width` is the drafts per verify step (`0` for plain decoding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpeculativeRoute {
+    Plain,
+    Mtp { width: usize },
+    PromptLookup { width: usize },
+    DraftModel { width: usize },
+}
+
+impl SpeculativeRoute {
+    fn width(self) -> usize {
+        match self {
+            SpeculativeRoute::Plain => 0,
+            SpeculativeRoute::Mtp { width }
+            | SpeculativeRoute::PromptLookup { width }
+            | SpeculativeRoute::DraftModel { width } => width,
+        }
+    }
+
+    fn is_mtp(self) -> bool {
+        matches!(self, SpeculativeRoute::Mtp { .. })
+    }
+
+    /// The proposer for any target: prompt lookup, the resident `draft` model, or none. (MTP
+    /// needs the Qwen35 target.)
+    fn plain_proposer<'a, T: SpeculativeTarget + 'a>(
+        self,
+        draft: Option<&'a ResidentDraft>,
+    ) -> Box<dyn Proposer<T> + 'a> {
+        match (self, draft) {
+            (SpeculativeRoute::PromptLookup { .. }, _) => Box::new(NgramProposer::default()),
+            (SpeculativeRoute::DraftModel { width: drafts }, Some(resident)) => {
+                let (proposable, width) = (resident.proposable, resident.width);
+                match &resident.model {
+                    Decoder::Causal(draft) => Box::new(
+                        DraftModelProposer::new(&**draft, drafts).with_vocab(proposable, width),
+                    ),
+                    Decoder::Qwen35(draft) => Box::new(
+                        DraftModelProposer::new(&**draft, drafts).with_vocab(proposable, width),
+                    ),
+                }
+            }
+            // `speculative_route` routes `draft_model` only with a resident draft.
+            (SpeculativeRoute::DraftModel { .. }, None)
+            | (SpeculativeRoute::Plain | SpeculativeRoute::Mtp { .. }, _) => Box::new(NoProposer),
+        }
+    }
+}
+
+impl LlamaProvider {
+    /// Where the rendered conversation ends and the generation prompt begins, when that is a
+    /// strict token prefix of `prompt_ids` (sc-24437): the point the hybrid decoder's prefix-cache
+    /// snapshot is taken at, because the next chat turn re-renders these messages and extends
+    /// them (whatever the template later does to this turn's reply). `None` when the template
+    /// renders the messages differently without a generation prompt.
+    fn conversation_boundary(
+        &self,
+        messages: &[Message],
+        req: &TextLlmRequest,
+        prompt_ids: &[i32],
+    ) -> Option<usize> {
+        let rendered = self
+            .template
+            .render_with(
+                messages,
+                &RenderOptions {
+                    add_generation_prompt: false,
+                    enable_thinking: req.enable_thinking_kwarg(),
+                    reasoning_effort: req.reasoning_effort,
+                    preserve_thinking: req.preserve_thinking,
+                    tools: &req.tools,
+                    // The date the request's own render used (the campaign's pinned one, or the
+                    // template's default), so the conversation is a prefix of the prompt.
+                    date_string: self.campaign_template_date,
+                },
+            )
+            .ok()?;
+        let ids = self.tokenizer.encode(&rendered, false).ok()?;
+        let len = ids.len();
+        (len > 0
+            && len < prompt_ids.len()
+            && ids.iter().zip(prompt_ids).all(|(&a, &b)| a as i32 == b))
+        .then_some(len)
+    }
+
+    /// An upper bound on the bytes of the prefix-cache snapshot a text request takes during its
+    /// run (sc-24437), which its admission adds: the hybrid's whole cache at the conversation
+    /// `boundary` (and the MTP head's state there with `mtp`). A softmax decoder keeps the
+    /// request's own cache after the run — memory the request already holds — so it takes none.
+    fn prefix_snapshot_bytes(&self, boundary: Option<usize>, mtp: bool) -> Option<u64> {
+        match (&self.model, boundary) {
+            (Decoder::Qwen35(m), Some(b)) => m.config().prefix_snapshot_bytes(b, mtp),
+            _ => Some(0),
+        }
+    }
+
+    /// The request's admission price under its speculative route. Prompt lookup and a draft
+    /// model's verify roll back without a forward or a copy on both decoders — a softmax decoder
+    /// by truncation, the Qwen35 hybrid through its DeltaNet checkpoint ring (sc-24435) — so they
+    /// pay their verify overshoot
+    /// (`width` more KV positions and `width` more hidden + logit rows) and, on the hybrid, the
+    /// ring ([`Qwen35Model::checkpoint_ring_bytes`]). MTP keeps the predictor-cache pricing
+    /// (`width` in the estimate) plus the ring; the ring replaced the step-start snapshot, so the
+    /// hybrid's recurrent state is charged once, never as clone + replay copies.
+    fn speculative_request_bytes(
+        &self,
+        route: SpeculativeRoute,
+        compressed: Option<core_llm::KvCompressionFormat>,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+        vision_workspace: u64,
+    ) -> Option<u64> {
+        let mut geometry = self.model.memory_geometry();
+        if let (Decoder::Qwen35(m), width @ 1..) = (&self.model, route.width()) {
+            geometry.recurrent_bytes = geometry
+                .recurrent_bytes
+                .checked_add(m.checkpoint_ring_bytes(width)?)?;
+        }
+        let (priced_width, overshoot) = match route {
+            SpeculativeRoute::PromptLookup { width } | SpeculativeRoute::DraftModel { width } => {
+                let width = u64::try_from(width).ok()?;
+                let kv_position = geometry
+                    .layers
+                    .checked_mul(geometry.kv_heads)?
+                    .checked_mul(geometry.head_dim)?
+                    .checked_mul(geometry.element_bytes)?
+                    .checked_mul(2)?;
+                let rows = geometry
+                    .hidden_size
+                    .checked_add(geometry.vocab_size)?
+                    .checked_mul(geometry.element_bytes)?;
+                // The verify step writes `width` positions past the committed ones; the caches
+                // round *that* up to a block. What the target estimate already priced: its own
+                // padding over prompt + generation, plus the `width` rows below.
+                let committed = u64::try_from(prompt_tokens)
+                    .ok()?
+                    .checked_add(u64::from(max_new_tokens))?;
+                let block_extra = kv_overshoot_padding(committed, width)?;
+                (
+                    0,
+                    width
+                        .checked_mul(kv_position.checked_add(rows)?)?
+                        .checked_add(block_extra.checked_mul(kv_position)?)?,
+                )
+            }
+            other => (u32::try_from(other.width()).ok()?, 0),
+        };
+        // The K/V term at the compressed format's bytes when the request runs compressed
+        // (sc-20682), dense otherwise. A verify's overshoot rows stay dense on either cache (the
+        // compressed cache keeps a step's rows unquantized until the rollback, sc-20681).
+        let target = match compressed {
+            None => estimate_mlx_request_bytes(
+                prompt_tokens,
+                max_new_tokens,
+                geometry,
+                vision_workspace,
+                priced_width,
+                self.model.workspace_contract(),
+            )?,
+            Some(format) => {
+                let prompt = u64::try_from(prompt_tokens).ok()?;
+                let total = prompt.checked_add(u64::from(max_new_tokens))?;
+                let kv = crate::kv_policy::compressed_request_kv_bytes(
+                    format, &geometry, prompt, total,
+                )?;
+                estimate_mlx_compressed_request_bytes(
+                    prompt_tokens,
+                    max_new_tokens,
+                    geometry,
+                    vision_workspace,
+                    priced_width,
+                    self.model.workspace_contract(),
+                    kv,
+                )?
+            }
+        }
+        .checked_add(overshoot)?
+        .checked_add(self.model.promoted_request_bytes()?)?;
+        // The draft model's own request (E7, sc-24436): its prefill of the same prompt and a
+        // cache that grows over the whole run plus the provisional drafts a step writes past the
+        // committed tokens — and, when the draft is the hybrid, the checkpoint ring its proposal
+        // window holds (sc-24435), armed for the same `width`: no snapshot, no replay.
+        let draft = match (route, self.draft.as_ref().map(|d| &d.model)) {
+            (SpeculativeRoute::DraftModel { width }, Some(draft)) => {
+                let mut geometry = draft.memory_geometry();
+                if let Decoder::Qwen35(m) = draft {
+                    geometry.recurrent_bytes = geometry
+                        .recurrent_bytes
+                        .checked_add(m.checkpoint_ring_bytes(width)?)?;
+                }
+                estimate_mlx_request_bytes(
+                    prompt_tokens,
+                    max_new_tokens.checked_add(u32::try_from(width).ok()?)?,
+                    geometry,
+                    0,
+                    0,
+                    draft.workspace_contract(),
+                )?
+                .checked_add(draft.promoted_request_bytes()?)?
+            }
+            _ => 0,
+        };
+        target.checked_add(draft)
+    }
+
+    /// The resident draft's context window (`0`: no draft, or an unbounded one).
+    fn draft_context(&self) -> usize {
+        self.draft.as_ref().map_or(0, |draft| draft.context)
+    }
+
+    /// A `draft_model` route whose request — `prompt_tokens` + `max_new_tokens` and a step's
+    /// overshoot — outruns the resident draft's context window runs what `auto` resolves to
+    /// instead, the reason named in `fallbacks` ([`core_llm::fit_draft_context`], sc-24436 E2).
+    /// Any other route is returned unchanged.
+    fn fit_draft_route(
+        &self,
+        route: SpeculativeRoute,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+        gemma4_mm_request: bool,
+        fallbacks: &mut Vec<String>,
+    ) -> SpeculativeRoute {
+        let SpeculativeRoute::DraftModel { width } = route else {
+            return route;
+        };
+        let fit = core_llm::fit_draft_context(
+            core_llm::SpeculativeResolution {
+                plan: SpeculativePlan::Run {
+                    proposer: SpeculativeProposer::DraftModel,
+                    depth: width as u32,
+                },
+                fallback: None,
+            },
+            &self.descriptor.capabilities,
+            self.draft_context(),
+            prompt_tokens,
+            max_new_tokens,
+        );
+        match fit.fallback {
+            None => route,
+            Some(why) => {
+                fallbacks.push(why);
+                self.speculative_route(fit.plan, gemma4_mm_request, fallbacks)
+            }
+        }
+    }
+
+    /// Route a resolved speculative plan onto what this request can run, naming every downgrade
+    /// in `fallbacks` (E2): MTP needs a loaded Qwen3.8 predictor and a text or Qwen-VL prompt, and
+    /// `draft_model` a resident draft (sc-24436) — it runs on every prompt shape, the draft
+    /// proposing over the effective prompt ids.
+    fn speculative_route(
+        &self,
+        plan: SpeculativePlan,
+        gemma4_mm_request: bool,
+        fallbacks: &mut Vec<String>,
+    ) -> SpeculativeRoute {
+        match plan {
+            SpeculativePlan::Off => SpeculativeRoute::Plain,
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::Mtp,
+                depth,
+            } => {
+                let head = matches!(&self.model, Decoder::Qwen35(m) if m.has_mtp());
+                if head && !gemma4_mm_request {
+                    SpeculativeRoute::Mtp {
+                        width: depth as usize,
+                    }
+                } else {
+                    fallbacks.push(if head {
+                        "speculative: `mtp` has no Qwen predictor for a Gemma 4 multimodal \
+                         prompt; decoded without a proposer"
+                            .into()
+                    } else {
+                        "speculative: `mtp` has no loaded MTP predictor on this model; decoded \
+                         without a proposer"
+                            .into()
+                    });
+                    SpeculativeRoute::Plain
+                }
+            }
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::PromptLookup,
+                depth,
+            } => SpeculativeRoute::PromptLookup {
+                width: depth as usize,
+            },
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::DraftModel,
+                depth,
+            } if self.draft.is_some() => SpeculativeRoute::DraftModel {
+                width: depth as usize,
+            },
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::DraftModel,
+                ..
+            } => {
+                fallbacks.push(core_llm::DRAFT_MODEL_NOT_LOADED.into());
+                SpeculativeRoute::Plain
+            }
+        }
     }
 }
 
@@ -4009,6 +5032,10 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // chat template renders tool calls (sc-7636).
             supports_tools: false,
             mtp: None,
+            // Every decoder this provider loads runs the speculative engine (sc-24434), so prompt
+            // lookup needs nothing from the checkpoint. A Qwen3.8 MTP head is advertised on the
+            // legacy `mtp` field by the load path.
+            speculative: vec![prompt_lookup_capabilities(SPECULATIVE_MAX_DEPTH)],
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![ConstraintKind::Json],
         },
@@ -4021,6 +5048,9 @@ fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
     let mut d = provider_descriptor();
     d.family = cfg.architecture.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    d.capabilities.speculative = vec![prompt_lookup_capabilities(speculative_max_depth(
+        causal_attention_geometries(cfg),
+    ))];
     d
 }
 
@@ -4030,13 +5060,61 @@ fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
     let mut d = provider_descriptor();
     d.family = Architecture::Qwen35.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    // Both proposers at the full-attention layers' backend-true depth (sc-24438); a configured
+    // head — dense or sparse-MoE predictor layer — on both the legacy and the per-proposer field.
+    let max_depth = speculative_max_depth([qwen35_attention_geometry(cfg)]);
+    d.capabilities.speculative = vec![prompt_lookup_capabilities(max_depth)];
     if cfg.mtp_num_hidden_layers > 0 {
-        d.capabilities.mtp = Some(core_llm::MtpCapabilities {
-            max_draft_tokens: u32::MAX,
-            recommended_draft_tokens: 3,
-        });
+        d.capabilities
+            .advertise_mtp(max_depth, recommended_depths().mtp);
     }
     d
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's operational load budget on this thread ([`with_load_budget`]); the process-wide
+    /// [`core_llm::AVAILABLE_MEMORY_OVERRIDE`] would leak into every concurrently loading test.
+    static LOAD_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with load admission capped at `budget` bytes on this thread.
+#[cfg(test)]
+pub(crate) fn with_load_budget<R>(budget: u64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOAD_BUDGET.with(|b| b.set(self.0));
+        }
+    }
+    let _restore = Restore(LOAD_BUDGET.with(|b| b.replace(Some(budget))));
+    f()
+}
+
+/// The operational budget load admission caps measured availability with
+/// ([`core_llm::operational_memory_override`]).
+fn load_memory_budget() -> CoreResult<Option<u64>> {
+    #[cfg(test)]
+    if let Some(budget) = LOAD_BUDGET.with(std::cell::Cell::get) {
+        return Ok(Some(budget));
+    }
+    core_llm::operational_memory_override()
+}
+
+/// Admit a companion MTP head's resident bytes on top of what the load already admitted (the
+/// target and any admitted draft, E7), returning the head and its bytes. `Err` is the named load
+/// fallback (E2): the head is unreadable, or those bytes plus the head's exceed the budget.
+fn admit_companion_head(
+    head: &Path,
+    target_bytes: u64,
+    available: u64,
+) -> Result<(&Path, u64), String> {
+    // The shared rule Candle admits by, in MLX's one allocation domain (E8).
+    core_llm::admit_companion_head(
+        head,
+        crate::load_memory::companion_head_bytes(head),
+        [("unified memory", target_bytes, available)],
+    )
 }
 
 /// Read and parse `config.json` from a snapshot directory into a JSON value (used to dispatch the
@@ -4124,10 +5202,53 @@ enum MlxWorkspaceContract<'a> {
 /// MLX permits ten completed command buffers to remain in flight and can be building the next
 /// buffer before applying backpressure. Price that current buffer plus the in-flight set.
 pub(crate) const MLX_EVAL_BUFFER_WINDOW: u64 = 11;
+/// The largest command buffer MLX 0.32 encodes before committing it, in bytes of its ops'
+/// inputs and outputs (`max_mb_per_buffer`: 40 MB on base / Pro / phone GPUs, 50 MB on Max and
+/// Ultra; `MLX_MAX_MB_PER_BUFFER` is never set by this runtime). A buffer may exceed it by the one
+/// op that crosses it.
+const MLX_MAX_BUFFER_BYTES: u64 = 50 * 1024 * 1024;
+
+/// The most ops MLX 0.32 encodes into one command buffer before committing it
+/// (`max_ops_per_buffer`: 20–50 by GPU family; `MLX_MAX_OPS_PER_BUFFER` is never set here).
+const MLX_MAX_OPS_PER_BUFFER: u64 = 50;
+
+/// What a forward's promoted weight copies can hold at once when the decoder's activations are
+/// `f32` against BF16 weights (a Gemma GeGLU whose role the activation-dtype policy keeps on
+/// `f32`, [`CausalLm::activations_promote`]; sc-24446).
+///
+/// Each dense matmul materializes an `f32` copy of its weight (a quantized matmul, of its scales
+/// and biases), held until the command buffer that consumes it completes. The LM head's copy —
+/// the vocabulary-wide one, 2.4 GB on Gemma 2 and 4.0 GB on the 262K-token Gemma 4 — is priced
+/// whole; the decoder's copies are bounded by MLX's evaluation window: at most
+/// [`MLX_EVAL_BUFFER_WINDOW`] command buffers are alive (ten committed plus the one encoding),
+/// each holding at most [`MLX_MAX_BUFFER_BYTES`] plus the one op that crosses it — at most the
+/// largest promoted projection, `largest_elements`.
+fn promoted_weight_bytes(head_elements: u64, largest_elements: u64) -> Option<u64> {
+    const F32: u64 = 4;
+    let per_buffer = largest_elements
+        .checked_mul(F32)?
+        .checked_add(MLX_MAX_BUFFER_BYTES)?;
+    head_elements
+        .checked_mul(F32)?
+        .checked_add(per_buffer.checked_mul(MLX_EVAL_BUFFER_WINDOW)?)
+}
+
 /// Apple-Silicon Metal allocations are rounded to 16-KiB VM pages. Gated DeltaNet retains one
 /// independently allocated output row per prompt token until its final concatenate.
 const MLX_ALLOCATION_PAGE_BYTES: u64 = 16 * 1024;
 /// The recurrence creates five one-element index buffers per step and evaluates every 256 steps.
+///
+/// These `QWEN35_RECURRENCE_*` terms price the op-by-op recurrence the frozen allocator peaks were
+/// measured on. Since sc-24443 the GPU runs the fused Metal kernel instead. Its prompt-sized
+/// buffers are its f32 `y` output and the row-contiguous copies MLX makes of non-contiguous `q`,
+/// `k` and `v` inputs — `2·Hk·Dk + 2·Hv·Dv` elements per token, never more than the
+/// `2·Hv·Dk + 2·Hv·Dv` priced here (`Hv ≥ Hk`). Past `KERNEL_MAX_STEPS` tokens the per-dispatch
+/// input gathers replace those copies and the final concatenate of the per-dispatch outputs adds
+/// one more `Hv·Dv`, still within the priced width while `Hv·Dv ≤ 2·(Hv − Hk)·Dk` (Qwen3.6-27B:
+/// `Hv = 3·Hk`, `Dk = Dv`). Its recurrent state is fixed-size, covered by the 256 × 5 state-array
+/// term, and it allocates neither the per-step index buffers nor the page-padded per-token `y`
+/// rows priced below. On the GPU these terms are therefore a conservative upper bound for those
+/// geometries (the op path remains the CPU-stream route for short runs).
 const QWEN35_RECURRENCE_EVAL_CHUNK: u64 = 256;
 const QWEN35_RECURRENCE_INDEX_BUFFERS: u64 = 5;
 /// Each lazy recurrence step creates five state-shaped arrays: the decayed state, the state-key
@@ -4179,10 +5300,12 @@ fn estimate_qwen35_workspace_extra_bytes(
     let conv_width = key_width.checked_mul(2)?.checked_add(value_width)?;
     let attention_width = query_heads.checked_mul(head_dim)?;
 
-    // PrismLinear builds cast -> sign multiply -> Hadamard -> cast graphs independently for each
-    // projection. The full-attention block has the wider simultaneous input-width sum; the linear
-    // block uses two mixer input rotations plus its output rotation. Four buffers per input width
-    // safely covers the F32 chain and the BF16 result even when donation is unavailable.
+    // PrismLinear rotates each projection input independently. The full-attention block has the
+    // wider simultaneous input-width sum; the linear block uses two mixer input rotations plus its
+    // output rotation. Four buffers per input width covers the unfused cast -> sign multiply ->
+    // Hadamard -> cast chain (F32 intermediates plus the BF16 result, no donation) — the path a
+    // block the fused kernel does not cover still takes. The fused kernel (sc-24444) writes only
+    // the output buffer, so this stays an upper bound on the Bonsai path.
     let packed_rotation_elements = if prism {
         let linear_widths = checked_sum([hidden.checked_mul(4)?, value_width, intermediate])?;
         let attention_widths =
@@ -4310,7 +5433,9 @@ fn estimate_routed_request_bytes(
         vision_workspace_bytes,
         mtp_width,
         attention,
-        if mtp_width > 0 { 3 } else { 1 },
+        // The recurrent term once: the hybrid rolls back through its checkpoint ring, whose bytes
+        // the caller folds into `geometry.recurrent_bytes`, and is never cloned (sc-24435).
+        1,
     )
 }
 
@@ -4343,9 +5468,22 @@ fn estimate_mlx_compressed_request_bytes(
                 vision_workspace_bytes,
                 mtp_width,
                 attention,
-                if mtp_width > 0 { 3 } else { 1 },
+                1,
                 compressed_kv_bytes,
-            )
+            )?
+            .checked_add(mlx_runtime_request_bytes(
+                prompt_tokens,
+                u64::try_from(prompt_tokens)
+                    .ok()?
+                    .checked_add(u64::from(max_new_tokens))?,
+                u64::from(mtp_width),
+                u64::try_from(prompt_tokens)
+                    .ok()?
+                    .min(SDPA_MAX_FUSED_QLEN as u64),
+                geometry,
+                // The compressed format's own bytes already round to its growth blocks.
+                false,
+            )?)
         }
         MlxWorkspaceContract::Eager | MlxWorkspaceContract::Qwen35 { .. } => {
             estimate_mlx_request_bytes(
@@ -4371,24 +5509,170 @@ fn estimate_mlx_request_bytes(
     mtp_width: u32,
     contract: MlxWorkspaceContract<'_>,
 ) -> Option<u64> {
-    // The shared estimates price the dense K/V at exactly `prompt + max_new` positions. The MLX
-    // dense cache holds whole 256-position blocks and, at each block growth, every layer's
-    // pre-growth buffer beside its successor until the evaluator releases it (sc-20682 review:
-    // a dense decode across growth blocks peaked 1.30x the shared estimate). Charge the
-    // difference to every dense MLX estimate.
-    let total = u64::try_from(prompt_tokens)
-        .ok()?
-        .checked_add(u64::from(max_new_tokens))?;
+    let decoder = estimate_mlx_decoder_bytes(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        contract,
+    )?;
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let total = prompt.checked_add(u64::from(max_new_tokens))?;
+    let runtime = match contract {
+        // The hybrid's contract already prices MLX's evaluation window and allocator rounding from
+        // its own frozen probes; only the driver's wake is added.
+        MlxWorkspaceContract::Qwen35 { .. } => MLX_REQUEST_WAKE_BYTES,
+        MlxWorkspaceContract::Eager => mlx_runtime_request_bytes(
+            prompt_tokens,
+            total,
+            u64::from(mtp_width),
+            prompt,
+            geometry,
+            true,
+        )?,
+        MlxWorkspaceContract::Chunked => mlx_runtime_request_bytes(
+            prompt_tokens,
+            total,
+            u64::from(mtp_width),
+            prompt.min(SDPA_MAX_FUSED_QLEN as u64),
+            geometry,
+            true,
+        )?,
+    };
+    // Block growth (sc-20682 review): at each block growth the MLX dense cache holds every layer's
+    // pre-growth buffer beside its successor until the evaluator releases it (a dense decode across
+    // growth blocks peaked 1.30x the shared estimate). The generic runtime term already prices the
+    // block padding itself, so it adds only those retired buffers; the hybrid's frozen probes price
+    // neither, so it is charged the whole growth (padding and retired buffers).
     let shape = geometry.kv_shape();
-    let growth = crate::kv_policy::dense_final_kv_bytes(shape, total)?
-        .checked_sub(shape.dense_bytes(total)?)?;
-    let base = match contract {
-        MlxWorkspaceContract::Eager => core_llm::estimate_request_bytes(
+    let final_kv = crate::kv_policy::dense_final_kv_bytes(shape, total)?;
+    let priced_kv = match contract {
+        MlxWorkspaceContract::Qwen35 { .. } => shape.dense_bytes(total)?,
+        MlxWorkspaceContract::Eager | MlxWorkspaceContract::Chunked => {
+            let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
+            shape.dense_bytes(round_up(total, block)?.max(block))?
+        }
+    };
+    checked_sum([decoder, runtime, final_kv.checked_sub(priced_kv)?])
+}
+
+/// The `phys_footprint` a request re-acquires from the Metal driver after the process has idled
+/// ([`crate::load_memory::MLX_DRIVER_WAKE_BYTES`]), charged once per request.
+const MLX_REQUEST_WAKE_BYTES: u64 = crate::load_memory::MLX_DRIVER_WAKE_BYTES;
+
+/// K/V positions a request's caches allocate beyond `positions`: [`ContiguousKvCache`] grows in
+/// whole [`KV_BLOCK_TOKENS`](crate::primitives::kv_cache::KV_BLOCK_TOKENS)-position blocks.
+fn kv_block_padding(positions: u64) -> Option<u64> {
+    let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
+    round_up(positions, block)?.checked_sub(positions)
+}
+
+/// Block positions a `width`-position verify overshoot past `committed` positions allocates
+/// beyond `committed`'s own block padding and the `width` positions themselves.
+fn kv_overshoot_padding(committed: u64, width: u64) -> Option<u64> {
+    let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
+    let with = round_up(committed.checked_add(width)?, block)?;
+    let without = round_up(committed, block)?.checked_add(width)?;
+    Some(with.saturating_sub(without))
+}
+
+/// What MLX's runtime holds for a generic decoder's request beyond the decoder's own tensors
+/// (sc-24446), which the shared estimates do not see — measured on the one-token requests of the
+/// sc-24446 probes (35–87 MB MLX active on Llama 3.2 1B, Qwen3-1.7B and Qwen3-8B, against 6–9 MB
+/// estimated before):
+///
+/// * **KV block padding**: the caches hold whole blocks over every position the request can write
+///   — the `committed` prompt and generation plus a `verify_width` step past them (an MTP verify;
+///   the prompt-lookup / draft overshoot is added by its route).
+/// * **In-flight layer temporaries.** MLX keeps every op's inputs until the command buffer that
+///   ran it completes, and runs ahead by up to [`MLX_EVAL_BUFFER_WINDOW`] buffers, each holding at
+///   most [`MLX_MAX_BUFFER_BYTES`] plus the one op that crosses it. The shared estimate prices one
+///   layer's activations; the rest in flight is every other layer's, capped by that window —
+///   whose crossing op can be a whole `prompt × inter` MLP activation or an `attention_rows`-row
+///   score block (eager: the full `prompt × prompt` per head).
+/// * **Allocation rounding**: a page per op output in the window.
+/// * **The driver's wake** ([`MLX_REQUEST_WAKE_BYTES`]).
+fn mlx_runtime_request_bytes(
+    prompt_tokens: usize,
+    committed: u64,
+    verify_width: u64,
+    attention_rows: u64,
+    geometry: LlmMemoryGeometry,
+    dense_block_padding: bool,
+) -> Option<u64> {
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let kv_position = checked_product([
+        geometry.layers,
+        geometry.kv_heads,
+        geometry.head_dim,
+        geometry.element_bytes,
+        2,
+    ])?;
+    // Every allocated position past the committed ones: the verify width the step writes beyond
+    // them and — on a dense block-allocated cache — the rest of their last block.
+    let block_padding = if dense_block_padding {
+        kv_block_padding(committed.checked_add(verify_width)?)?
+    } else {
+        0
+    };
+    let kv_padding = checked_sum([verify_width, block_padding])?.checked_mul(kv_position)?;
+    let scores = checked_product([
+        prompt,
+        attention_rows,
+        geometry.query_heads,
+        geometry.element_bytes,
+    ])?;
+    let mlp = checked_product([prompt, geometry.intermediate_size, geometry.element_bytes])?;
+    let per_layer = checked_sum([
+        checked_product([
+            prompt,
+            checked_sum([
+                geometry.intermediate_size.checked_mul(3)?,
+                geometry.hidden_size.checked_mul(8)?,
+            ])?,
+            geometry.element_bytes,
+        ])?,
+        scores.checked_mul(3)?,
+    ])?;
+    let window = MLX_EVAL_BUFFER_WINDOW
+        .checked_mul(checked_sum([MLX_MAX_BUFFER_BYTES, mlp.max(scores)])?)?;
+    let in_flight = geometry
+        .layers
+        .saturating_sub(1)
+        .checked_mul(per_layer)?
+        .min(window);
+    // Each in-flight buffer's op outputs are page-rounded allocations, however small.
+    let rounding = checked_product([
+        MLX_EVAL_BUFFER_WINDOW,
+        MLX_MAX_OPS_PER_BUFFER,
+        MLX_ALLOCATION_PAGE_BYTES,
+    ])?;
+    checked_sum([kv_padding, in_flight, rounding, MLX_REQUEST_WAKE_BYTES])
+}
+
+/// The decoder's own request tensors under its workspace contract: the shared estimates with the
+/// attention term priced from the tile `sdpa` actually runs (sc-20676,
+/// [`estimate_routed_request_bytes`]), plus the Qwen3.5 hybrid's recurrence workspace.
+fn estimate_mlx_decoder_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    contract: MlxWorkspaceContract<'_>,
+) -> Option<u64> {
+    match contract {
+        // The recurrent term once: the only MLX decoder with recurrent state (the Qwen35 hybrid,
+        // eager for MoE) rolls back through its checkpoint ring, whose bytes the caller folds into
+        // `geometry.recurrent_bytes`, and is never cloned; a causal decoder holds none.
+        MlxWorkspaceContract::Eager => core_llm::estimate_request_bytes_with_recurrent_copies(
             prompt_tokens,
             max_new_tokens,
             geometry,
             vision_workspace_bytes,
             mtp_width,
+            1,
         ),
         MlxWorkspaceContract::Chunked => estimate_routed_request_bytes(
             prompt_tokens,
@@ -4411,8 +5695,7 @@ fn estimate_mlx_request_bytes(
                 prism,
             )?)
         }
-    }?;
-    base.checked_add(growth)
+    }
 }
 
 fn validate_context_window(
@@ -4646,6 +5929,9 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The MLX row of the decode-defaults table, read directly (not through the provider's own
+    /// reader) so a provider that stops following the table is caught.
+    const MLX_ROW: &core_llm::DecodeDefaults = core_llm::DecodeBackend::Mlx.defaults();
     pub(crate) fn admit_any_transition() -> crate::primitives::DenseTransitionAdmission {
         crate::primitives::DenseTransitionAdmission::new(|_| Ok(()))
     }
@@ -4741,8 +6027,9 @@ pub(crate) mod tests {
     #[test]
     fn fused_request_estimate_tracks_chunked_attention_and_last_row_logits() {
         // Frozen Qwen3.8 parent geometry. This prompt size reproduces the campaign's long-context
-        // scale: eager prompt-squared scores dominate hundreds of GB, while MLX runs eight query
-        // rows per fused call and projects one final row to the vocabulary.
+        // scale: eager prompt-squared scores dominate hundreds of GB, while MLX's fused full and
+        // vector kernels materialize no score matrix (priced conservatively as one 8-query-row score
+        // tile per call) and the decoder projects one final row to the vocabulary.
         let geometry = LlmMemoryGeometry {
             query_heads: 40,
             kv_heads: 4,
@@ -4761,13 +6048,21 @@ pub(crate) mod tests {
         let eager =
             estimate_mlx_request_bytes(29_600, 128, geometry, 0, 0, MlxWorkspaceContract::Eager)
                 .unwrap();
-        assert!(fused < 36_000_000_000, "bounded MLX peak: {fused}");
+        // sc-24446 prices MLX's in-flight window (eleven command buffers, each up to 50 MB plus
+        // the crossing op — here a 2 GB `prompt × inter` MLP activation), so the fused bound grew
+        // from ~36 GB; it stays an order of magnitude under the quadratic eager one.
+        assert!(
+            fused * 8 < eager,
+            "bounded MLX peak: {fused} vs eager {eager}"
+        );
         assert!(eager > 400_000_000_000, "quadratic eager peak: {eager}");
         assert_eq!(
             eager,
             core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap()
-                + dense_growth(29_600, 128, geometry),
-            "non-fused paths retain the shared fail-closed estimate (plus the MLX dense growth)"
+                + mlx_runtime_request_bytes(29_600, 29_728, 0, 29_600, geometry, true).unwrap()
+                + retired_growth(29_600, 128, geometry),
+            "non-fused paths retain the shared fail-closed estimate, plus MLX's runtime terms and \
+             the dense growth's retired pre-growth buffers"
         );
     }
 
@@ -4777,6 +6072,15 @@ pub(crate) mod tests {
         let total = prompt as u64 + u64::from(new_tokens);
         crate::kv_policy::dense_final_kv_bytes(geometry.kv_shape(), total).unwrap()
             - geometry.kv_shape().dense_bytes(total).unwrap()
+    }
+
+    /// The pre-growth buffers a dense MLX estimate adds beside its runtime block padding: the
+    /// dense growth past the block-rounded capacity (sc-20682 review).
+    fn retired_growth(prompt: usize, new_tokens: u32, geometry: LlmMemoryGeometry) -> u64 {
+        let total = prompt as u64 + u64::from(new_tokens);
+        let capacity = total.div_ceil(256).max(1) * 256;
+        crate::kv_policy::dense_final_kv_bytes(geometry.kv_shape(), total).unwrap()
+            - geometry.kv_shape().dense_bytes(capacity).unwrap()
     }
 
     /// The shared tiled estimate with the attention term `sdpa`'s routing implies for `geometry`.
@@ -4826,7 +6130,17 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(
                 estimate,
-                routed_estimate(prompt, 16, geometry) + dense_growth(prompt, 16, geometry),
+                routed_estimate(prompt, 16, geometry)
+                    + mlx_runtime_request_bytes(
+                        prompt,
+                        prompt as u64 + 16,
+                        0,
+                        (prompt as u64).min(SDPA_MAX_FUSED_QLEN as u64),
+                        geometry,
+                        true,
+                    )
+                    .unwrap()
+                    + retired_growth(prompt, 16, geometry),
                 "head_dim {head_dim}"
             );
         }
@@ -4924,6 +6238,7 @@ pub(crate) mod tests {
         // other term is width-independent.
         let compute_width = LlmMemoryGeometry {
             element_bytes: dtype_bytes(Dtype::Bfloat16),
+            score_element_bytes: 4,
             ..geometry
         };
         let delta = geometry.element_bytes - compute_width.element_bytes;
@@ -4983,7 +6298,8 @@ pub(crate) mod tests {
                 estimate,
                 routed_estimate(prompt, new_tokens, geometry)
                     + estimate_qwen35_workspace_extra_bytes(prompt, &config, true).unwrap()
-                    + dense_growth(prompt, new_tokens, geometry),
+                    + dense_growth(prompt, new_tokens, geometry)
+                    + MLX_REQUEST_WAKE_BYTES,
                 "prompt {prompt}"
             );
         }
@@ -5597,6 +6913,1904 @@ pub(crate) mod tests {
         let _ = h;
     }
 
+    // ---- The speculative engine behind the provider (epic sc-24432, story sc-24434). ----
+
+    /// A whitespace WordLevel tokenizer over `t0..t{vocab-1}`, so every id decodes to a distinct
+    /// piece and the streamed deltas are the generated ids one-for-one.
+    fn word_tokenizer(vocab: usize) -> Tokenizer {
+        let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+        Tokenizer::from_json(&format!(
+            r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+                "decoder": null,
+                "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+            entries.join(", ")
+        ))
+        .unwrap()
+    }
+
+    fn causal_provider() -> LlamaProvider {
+        LlamaProvider::from_parts(
+            crate::decode::engine::tests::causal(),
+            word_tokenizer(24),
+            vec![],
+        )
+    }
+
+    fn qwen35_mtp_provider() -> LlamaProvider {
+        let model = crate::decode::engine::tests::qwen35(true);
+        let descriptor = descriptor_for_qwen35(model.config());
+        LlamaProvider {
+            descriptor,
+            model: Decoder::Qwen35(Box::new(model)),
+            architecture: Architecture::Qwen35,
+            campaign_family: None,
+            kv_family: None,
+            tokenizer: word_tokenizer(50),
+            template: Box::new(Llama3Template),
+            tool_call_format: None,
+            stop_tokens: Vec::new(),
+            constraint_table: OnceCell::new(),
+            vision: None,
+            gemma4: None,
+            campaign_prefix_cache: RefCell::new(None),
+            campaign_template_date: None,
+            kv_reader: OnceCell::new(),
+            kv_model_name: String::new(),
+            _prism_vision_weights: None,
+            prefix: RefCell::new(PrefixCache::with_budget(
+                core_llm::defaults::MLX.prefix_cache_bytes,
+            )),
+            speculative_default: core_llm::defaults::MLX.speculative,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
+        }
+    }
+
+    /// The MoE hybrid (`qwen3_5_moe`), which admission prices on the eager contract.
+    fn qwen35_moe_provider() -> LlamaProvider {
+        use crate::models::qwen35::tests::{cfg_json_moe, synthetic_weights};
+        let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
+        let model =
+            Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg)
+                .unwrap();
+        LlamaProvider {
+            descriptor: descriptor_for_qwen35(model.config()),
+            model: Decoder::Qwen35(Box::new(model)),
+            architecture: Architecture::Qwen35,
+            campaign_family: None,
+            kv_family: None,
+            tokenizer: word_tokenizer(50),
+            template: Box::new(Llama3Template),
+            tool_call_format: None,
+            stop_tokens: Vec::new(),
+            constraint_table: OnceCell::new(),
+            vision: None,
+            gemma4: None,
+            campaign_prefix_cache: RefCell::new(None),
+            campaign_template_date: None,
+            kv_reader: OnceCell::new(),
+            kv_model_name: String::new(),
+            _prism_vision_weights: None,
+            prefix: RefCell::new(PrefixCache::with_budget(
+                core_llm::defaults::MLX.prefix_cache_bytes,
+            )),
+            speculative_default: core_llm::defaults::MLX.speculative,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
+        }
+    }
+
+    fn spec_request(speculative: core_llm::Speculative) -> TextLlmRequest {
+        TextLlmRequest {
+            messages: vec![Message::user("t3 t9 t4 t11 t3 t9 t4 t11 t3 t9 t4 t11")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 16,
+            seed: Some(3),
+            speculative: Some(speculative),
+            ..Default::default()
+        }
+    }
+
+    /// Generate, returning the output and the token ids the stream carried.
+    fn run(provider: &LlamaProvider, req: &TextLlmRequest) -> (TextLlmOutput, Vec<u32>) {
+        let mut ids = Vec::new();
+        let out = provider
+            .generate(req, &mut |ev| {
+                if let CoreEvent::Token { id, .. } = ev {
+                    ids.push(id);
+                }
+            })
+            .unwrap();
+        (out, ids)
+    }
+
+    /// The plain, non-engine token-at-a-time loop over the provider's own decoder and its own
+    /// rendering of `req` — the reference `off` is held to.
+    fn plain_loop(provider: &LlamaProvider, req: &TextLlmRequest) -> Vec<u32> {
+        let prompt = provider
+            .template
+            .render_with(
+                &req.messages,
+                &RenderOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: req.enable_thinking_kwarg(),
+                    reasoning_effort: req.reasoning_effort,
+                    preserve_thinking: req.preserve_thinking,
+                    tools: &req.tools,
+                    date_string: provider.campaign_template_date,
+                },
+            )
+            .unwrap();
+        let ids: Vec<i32> = provider
+            .tokenizer
+            .encode(&prompt, false)
+            .unwrap()
+            .into_iter()
+            .map(|id| id as i32)
+            .collect();
+        let config = GenerationConfig {
+            max_new_tokens: req.max_new_tokens as usize,
+            sampling: map_sampling(&req.sampling),
+            seed: req.seed,
+            stop_tokens: provider.stop_tokens.clone(),
+        };
+        crate::decode::generate(
+            &provider.model,
+            &ids,
+            &config,
+            &crate::decode::CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap()
+        .tokens
+        .into_iter()
+        .map(|t| t as u32)
+        .collect()
+    }
+
+    /// AC1 + AC2: `{proposer: prompt_lookup}` on the Causal decoder and `{proposer: mtp}` on the
+    /// Qwen35 MTP decoder emit exactly the greedy tokens of `off`; `off` itself is the plain,
+    /// non-engine loop over the same decoder and prompt; and every generation carries a populated
+    /// `DecodeReport` naming the proposer, its depth, the verify steps behind the mean accepted
+    /// length and the sampler path.
+    #[test]
+    fn speculative_requests_emit_the_off_tokens_and_off_is_the_plain_loop() {
+        use core_llm::Speculative;
+        // The absolute accounting of a budget-bound run without stop tokens: the first token
+        // comes from the prefill and each verify step commits its accepted drafts plus one; every
+        // forward is the prefill forward (one, also when the hybrid's prefix cache snapshots its
+        // conversation boundary inside it, sc-24446), a verify step or a recovery replay.
+        let accounting = |label: &str, ids: &[u32], report: &core_llm::DecodeReport| {
+            assert_eq!(
+                ids.len() as u64,
+                1 + report.verify_steps + report.accepted_tokens,
+                "{label}: {report:?}"
+            );
+            assert!(
+                matches!(report.prefill_forwards, 1 | 2),
+                "{label}: {report:?}"
+            );
+            assert_eq!(
+                report.target_forwards,
+                report.prefill_forwards
+                    + report.verify_steps
+                    + report.replay_forwards
+                    + report.discarded_forwards,
+                "{label}: {report:?}"
+            );
+        };
+        for (label, provider, proposer, depth) in [
+            (
+                "causal prompt lookup",
+                causal_provider(),
+                SpeculativeProposer::PromptLookup,
+                4,
+            ),
+            (
+                "qwen35 prompt lookup",
+                qwen35_mtp_provider(),
+                SpeculativeProposer::PromptLookup,
+                4,
+            ),
+            (
+                "qwen35 mtp",
+                qwen35_mtp_provider(),
+                SpeculativeProposer::Mtp,
+                3,
+            ),
+        ] {
+            let off_req = spec_request(Speculative::Off);
+            let (off, off_ids) = run(&provider, &off_req);
+            let plain = plain_loop(&provider, &off_req);
+            assert_eq!(off_ids, plain, "{label}: off != the plain loop");
+            assert_eq!(off.text, provider.tokenizer.decode(&plain, true).unwrap());
+            assert_eq!(off_ids.len(), 16, "{label}: runs to the budget");
+            assert!(
+                provider.stop_tokens.is_empty(),
+                "{label}: accounting needs no stop tokens"
+            );
+            let report = off.decode.expect("off reports its decode path");
+            accounting(label, &off_ids, &report);
+            assert_eq!(report.path, "step_model", "{label}");
+            assert_eq!(report.proposer, ProposerKind::None, "{label}");
+            assert_eq!(report.draft_tokens, None, "{label}");
+            assert_eq!(report.verify_steps, 15, "{label}");
+            assert_eq!(report.sampler, "device", "{label}");
+            // E3: no graph runner on MLX — `none`, never `eager`; and the fused primitives that
+            // actually ran: the hybrid's Gated DeltaNet recurrence on the GPU stream is the fused
+            // Metal kernel, the causal fixture has no fused primitive.
+            assert_eq!(report.graph_path, "none", "{label}");
+            let fused = if matches!(provider.model, Decoder::Qwen35(_)) {
+                "fused"
+            } else {
+                "none"
+            };
+            assert_eq!(report.fused_primitives.path, fused, "{label}");
+            assert_eq!(report.fused_primitives.reason, None, "{label}");
+            assert!(
+                report.fallbacks.is_empty(),
+                "{label}: {:?}",
+                report.fallbacks
+            );
+            assert!(off.mtp.is_none(), "{label}");
+            assert!(off.timings.is_some(), "{label}: text decode is timed");
+
+            let (spec, spec_ids) = run(
+                &provider,
+                &spec_request(Speculative::proposer(proposer, depth)),
+            );
+            assert_eq!(spec_ids, off_ids, "{label}: speculative != off");
+            assert_eq!(spec.text, off.text, "{label}");
+            let report = spec.decode.expect("a speculative run reports");
+            accounting(label, &spec_ids, &report);
+            // The lookup fixture accepts drafts, so its pin covers full-acceptance steps (the
+            // MTP fixture's adversarial head never has one accepted).
+            if proposer == SpeculativeProposer::PromptLookup {
+                assert!(report.accepted_tokens > 0, "{label}: {report:?}");
+            }
+            assert_eq!(report.proposer, ProposerKind::from(proposer), "{label}");
+            assert_eq!(report.path, ProposerKind::from(proposer).label(), "{label}");
+            assert_eq!(report.draft_tokens, Some(depth), "{label}");
+            assert!(
+                report.proposed_tokens > 0,
+                "{label}: the proposer ran: {report:?}"
+            );
+            assert!(
+                report.verify_steps > 0 && report.verify_steps <= 15,
+                "{label}"
+            );
+            assert_eq!(
+                report.mean_accepted_length(),
+                Some(report.accepted_tokens as f64 / report.verify_steps as f64),
+                "{label}"
+            );
+            assert_eq!(report.sampler, "device", "{label}");
+            assert!(
+                report.fallbacks.is_empty(),
+                "{label}: {:?}",
+                report.fallbacks
+            );
+            assert_eq!(
+                spec.mtp.is_some(),
+                proposer == SpeculativeProposer::Mtp,
+                "{label}"
+            );
+            if matches!(provider.model, Decoder::Qwen35(_)) {
+                // AC3 (sc-24435): the hybrid rejected drafts and recovered every rejection
+                // through its checkpoint ring — no replay forward.
+                assert!(
+                    report.accepted_tokens < report.proposed_tokens,
+                    "{label}: a draft was rejected: {report:?}"
+                );
+                assert_eq!(report.replay_forwards, 0, "{label}: {report:?}");
+            }
+        }
+    }
+
+    /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
+    /// proposer does not. The synthetic hybrid's random MTP head never drafts a token the target
+    /// accepts, so `auto` (MTP at the recommended depth) is demoted after its first window and
+    /// the report says where, while the same proposer asked for explicitly runs to the end; both
+    /// stream exactly `off`'s tokens.
+    #[test]
+    fn auto_is_demoted_and_an_explicit_proposer_is_not() {
+        use core_llm::Speculative;
+        let provider = qwen35_mtp_provider();
+        let request = |speculative| TextLlmRequest {
+            max_new_tokens: 48,
+            ..spec_request(speculative)
+        };
+        let (_, off_ids) = run(&provider, &request(Speculative::Off));
+        // Untimed (the static threshold decides, no plain probe): the timed monitor's decisions
+        // are pinned on a deterministic clock in the engine's tests.
+        let (auto, auto_ids) =
+            core_llm::with_decode_clock(None, || run(&provider, &request(Speculative::Auto)));
+        let explicit =
+            Speculative::proposer(SpeculativeProposer::Mtp, MLX_ROW.recommended_depths.mtp);
+        let (asked, asked_ids) = run(&provider, &request(explicit));
+        assert_eq!(auto_ids, off_ids, "a demoted run decodes plainly");
+        assert_eq!(asked_ids, off_ids);
+        let auto = auto.decode.unwrap();
+        let asked = asked.decode.unwrap();
+        assert_eq!(
+            (auto.proposer, asked.proposer),
+            (ProposerKind::Mtp, ProposerKind::Mtp)
+        );
+        assert_eq!(
+            (auto.accepted_tokens, asked.accepted_tokens),
+            (0, 0),
+            "the fixture head never pays"
+        );
+        assert_eq!(
+            auto.speculative_demoted_at,
+            Some(1 + u64::from(core_llm::ACCEPTANCE_PROBE_VERIFIES)),
+            "{auto:?}"
+        );
+        assert_eq!(asked.speculative_demoted_at, None, "{asked:?}");
+        assert!(
+            auto.proposed_tokens < asked.proposed_tokens,
+            "auto stopped proposing: {} vs {}",
+            auto.proposed_tokens,
+            asked.proposed_tokens
+        );
+    }
+
+    /// AC2: the speculative resolution's fallback reaches `DecodeReport::fallbacks` through
+    /// `generate` — `auto` against a descriptor advertising no proposer, and (E2, the sc-24432
+    /// feature-end review) an explicit proposer the model does not advertise, which validates and
+    /// decodes plainly with the reason named rather than being refused — driven end to end;
+    /// dropping the resolution's fallback anywhere between `resolve_speculative` and the output
+    /// turns this red.
+    #[test]
+    fn the_resolution_fallback_reaches_the_decode_report() {
+        use core_llm::Speculative;
+        let mut provider = causal_provider();
+        let (auto, _) = run(&provider, &spec_request(Speculative::Auto));
+        let report = auto.decode.unwrap();
+        assert_eq!(
+            report.proposer,
+            ProposerKind::PromptLookup,
+            "auto without a head"
+        );
+        assert_eq!(
+            report.draft_tokens,
+            Some(MLX_ROW.recommended_depths.prompt_lookup)
+        );
+        assert!(report.fallbacks.is_empty());
+
+        provider.descriptor.capabilities.speculative.clear();
+        let (auto, ids) = run(&provider, &spec_request(Speculative::Auto));
+        let (off, off_ids) = run(&provider, &spec_request(Speculative::Off));
+        assert_eq!(ids, off_ids, "the fallback decodes plainly");
+        assert_eq!(auto.text, off.text);
+        let report = auto.decode.unwrap();
+        assert_eq!(report.proposer, ProposerKind::None);
+        assert_eq!(
+            report.fallbacks,
+            vec![
+                "speculative: auto found no proposer this model can run (it advertises none; \
+                 decoded without a proposer)"
+                    .to_string()
+            ]
+        );
+
+        // Unadvertised explicit proposers on the stock causal provider (no head, no draft).
+        let provider = causal_provider();
+        let (off, off_ids) = run(&provider, &spec_request(Speculative::Off));
+        for proposer in [SpeculativeProposer::Mtp, SpeculativeProposer::DraftModel] {
+            let req = spec_request(Speculative::proposer(proposer, 2));
+            provider
+                .validate(&req)
+                .unwrap_or_else(|e| panic!("{proposer}: refused, not run plain: {e}"));
+            let (out, ids) = run(&provider, &req);
+            assert_eq!(ids, off_ids, "{proposer}: the plain path's tokens");
+            assert_eq!(out.text, off.text);
+            let report = out.decode.unwrap();
+            assert_eq!(report.proposer, ProposerKind::None, "{proposer}");
+            assert_eq!(
+                report.fallbacks,
+                vec![format!(
+                    "speculative: `{proposer}` is not available for this model (this model \
+                     does not advertise it; decoded without a proposer)"
+                )]
+            );
+        }
+    }
+
+    /// E2: a plan the request cannot run falls back to plain decoding with the reason named,
+    /// never silently and never as a failure.
+    #[test]
+    fn the_speculative_route_names_every_downgrade() {
+        let run = |proposer, depth| SpeculativePlan::Run { proposer, depth };
+        let causal = causal_provider();
+        let hybrid = qwen35_mtp_provider();
+        let route = |p: &LlamaProvider, plan, gemma4| {
+            let mut why = Vec::new();
+            let route = p.speculative_route(plan, gemma4, &mut why);
+            (route, why)
+        };
+
+        assert_eq!(
+            route(&causal, SpeculativePlan::Off, false),
+            (SpeculativeRoute::Plain, vec![])
+        );
+        assert_eq!(
+            route(&causal, run(SpeculativeProposer::PromptLookup, 4), false),
+            (SpeculativeRoute::PromptLookup { width: 4 }, vec![])
+        );
+        assert_eq!(
+            route(&hybrid, run(SpeculativeProposer::Mtp, 3), false),
+            (SpeculativeRoute::Mtp { width: 3 }, vec![])
+        );
+        let (r, why) = route(&causal, run(SpeculativeProposer::Mtp, 3), false);
+        assert_eq!(r, SpeculativeRoute::Plain);
+        assert!(
+            why[0].contains("`mtp` has no loaded MTP predictor"),
+            "{why:?}"
+        );
+        let (r, why) = route(&hybrid, run(SpeculativeProposer::Mtp, 3), true);
+        assert_eq!(r, SpeculativeRoute::Plain);
+        assert!(why[0].contains("Gemma 4 multimodal"), "{why:?}");
+        let (r, why) = route(&hybrid, run(SpeculativeProposer::DraftModel, 2), false);
+        assert_eq!(r, SpeculativeRoute::Plain);
+        assert!(
+            why[0].contains("`draft_model` has no draft model"),
+            "{why:?}"
+        );
+    }
+
+    /// The causal fixture with its own first layer resident as the draft model (sc-24436).
+    fn causal_provider_with_draft() -> LlamaProvider {
+        let mut provider = causal_provider();
+        provider.draft = Some(ResidentDraft {
+            model: Decoder::Causal(Box::new(crate::decode::engine::tests::causal_model(24, 1))),
+            proposable: 24,
+            width: 24,
+            context: 0,
+        });
+        let max_depth = core_llm::verify_depth_bound(&provider.descriptor.capabilities);
+        provider
+            .descriptor
+            .capabilities
+            .speculative
+            .push(core_llm::draft_model_capabilities(
+                max_depth,
+                &MLX_ROW.recommended_depths,
+            ));
+        provider
+    }
+
+    /// sc-24436: with a resident draft `draft_model` routes onto the engine for every prompt
+    /// shape and decodes exactly `off`'s greedy stream with a report naming it; admission prices
+    /// the draft's own prefill and cache on top of the target's (E7).
+    #[test]
+    fn a_resident_draft_routes_draft_model_and_is_priced() {
+        use core_llm::Speculative;
+        let provider = causal_provider_with_draft();
+        let plan = SpeculativePlan::Run {
+            proposer: SpeculativeProposer::DraftModel,
+            depth: 3,
+        };
+        for gemma4 in [false, true] {
+            let mut why = Vec::new();
+            assert_eq!(
+                provider.speculative_route(plan, gemma4, &mut why),
+                SpeculativeRoute::DraftModel { width: 3 }
+            );
+            assert!(why.is_empty(), "{why:?}");
+        }
+        let (draft, ids) = run(
+            &provider,
+            &spec_request(Speculative::proposer(SpeculativeProposer::DraftModel, 3)),
+        );
+        let (off, off_ids) = run(&provider, &spec_request(Speculative::Off));
+        assert_eq!(ids, off_ids);
+        assert_eq!(draft.text, off.text);
+        let report = draft.decode.unwrap();
+        assert_eq!(report.proposer, ProposerKind::DraftModel);
+        assert_eq!(report.draft_tokens, Some(3));
+        assert!(report.proposed_tokens > 0 && report.fallbacks.is_empty());
+
+        let price = |route| {
+            provider
+                .speculative_request_bytes(route, None, 64, 32, 0)
+                .unwrap()
+        };
+        let lookup = price(SpeculativeRoute::PromptLookup { width: 4 });
+        let with_draft = price(SpeculativeRoute::DraftModel { width: 4 });
+        let draft_model = &provider.draft.as_ref().unwrap().model;
+        let draft_request = estimate_mlx_request_bytes(
+            64,
+            32 + 4,
+            draft_model.memory_geometry(),
+            0,
+            0,
+            draft_model.workspace_contract(),
+        )
+        .unwrap();
+        assert!(draft_request > 0);
+        assert_eq!(
+            with_draft,
+            lookup + draft_request,
+            "the target's verify overshoot plus the draft's own request"
+        );
+        // Without a resident draft nothing extra is priced (and the route never forms).
+        assert_eq!(
+            causal_provider().speculative_request_bytes(
+                SpeculativeRoute::DraftModel { width: 4 },
+                None,
+                64,
+                32,
+                0
+            ),
+            Some(lookup)
+        );
+    }
+
+    /// sc-24436 E2: a `draft_model` route whose request outruns the draft's context window — the
+    /// prompt (the Gemma 4 expansion included, at its second check), the budget and a step's
+    /// `K + 1` positions — runs `auto` (prompt lookup on this target) by name; within it the
+    /// route stands, and an unbounded draft never falls back.
+    #[test]
+    fn a_draft_route_past_the_draft_context_runs_auto_by_name() {
+        let mut provider = causal_provider_with_draft();
+        provider.draft.as_mut().unwrap().context = 20;
+        let draft = SpeculativeRoute::DraftModel { width: 3 };
+        for gemma4 in [false, true] {
+            let mut why = Vec::new();
+            assert_eq!(
+                provider.fit_draft_route(draft, 10, 6, gemma4, &mut why),
+                draft
+            );
+            assert!(why.is_empty(), "{why:?}");
+            let fallen = provider.fit_draft_route(draft, 10, 7, gemma4, &mut why);
+            assert_eq!(
+                fallen,
+                SpeculativeRoute::PromptLookup {
+                    width: MLX_ROW.recommended_depths.prompt_lookup as usize
+                }
+            );
+            assert_eq!(why.len(), 1);
+            assert!(
+                why[0].contains("exceeds the draft model's context window 20"),
+                "{why:?}"
+            );
+            // Other routes are untouched.
+            let lookup = SpeculativeRoute::PromptLookup { width: 3 };
+            assert_eq!(
+                provider.fit_draft_route(lookup, 10, 700, gemma4, &mut why),
+                lookup
+            );
+        }
+        provider.draft.as_mut().unwrap().context = 0;
+        let mut why = Vec::new();
+        assert_eq!(
+            provider.fit_draft_route(draft, 10, 7000, false, &mut why),
+            draft
+        );
+    }
+
+    /// sc-24436 E2/E7 through the real load (the sc-24432 feature-end review; the Candle twin
+    /// is `a_draft_refused_by_load_admission_is_named_in_the_load_fallbacks`): a budget that fits
+    /// the target but not target + draft refuses the draft by name in BOTH the load report's
+    /// `draft` and its `fallbacks`, and the target loads alone.
+    #[test]
+    fn a_draft_refused_by_load_admission_is_named_in_the_load_fallbacks() {
+        let root = crate::test_fixture::Fixture::new("mlx-llm-draft-refused-", None);
+        let fixture = core_llm_testkit::write_draft_model_fixture(&root).unwrap();
+        let spec = fixture.spec_with_draft();
+        let target = crate::load_memory::required_bytes(&spec).unwrap();
+        let draft =
+            crate::load_memory::required_bytes(&LoadSpec::dense(fixture.draft.to_string_lossy()))
+                .unwrap();
+        let provider = with_load_budget(target + draft - 1, || LlamaProvider::load(&spec))
+            .expect("the target fits and loads alone");
+        let report = provider.load_report().unwrap();
+        let refused = report.draft.clone().expect("the named draft is reported");
+        let refusal = refused.refusal.clone().expect("refused by load admission");
+        assert!(refusal.starts_with("draft model:"), "{refusal}");
+        assert_eq!(refused.source, fixture.draft.to_string_lossy());
+        assert!(
+            report.fallbacks.contains(&refusal),
+            "the refused draft is named in the load fallbacks: {:?}",
+            report.fallbacks
+        );
+        assert!(provider
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::DraftModel)
+            .is_none());
+    }
+
+    /// sc-24436 E7: a named draft is admitted at load only beside the target; without room — or
+    /// when it cannot be priced — it is refused by name and the target still loads; a target
+    /// that does not fit is refused exactly as before.
+    #[test]
+    fn a_draft_is_admitted_at_load_only_beside_the_target() {
+        let root = crate::test_fixture::Fixture::new("mlx-llm-draft-admission-", None);
+        let fixture = core_llm_testkit::write_draft_model_fixture(&root).unwrap();
+        let spec = fixture.spec_with_draft();
+        let target = crate::load_memory::required_bytes(&spec).unwrap();
+        let draft =
+            crate::load_memory::required_bytes(&LoadSpec::dense(fixture.draft.to_string_lossy()))
+                .unwrap();
+        assert!(
+            draft > 0 && draft < target,
+            "the draft is the smaller model"
+        );
+
+        match DraftPlan::admit(&spec, target, target + draft).unwrap() {
+            DraftPlan::Load(draft_spec) => {
+                assert_eq!(draft_spec.source, fixture.draft.to_string_lossy());
+                assert_eq!(draft_spec.draft_source, None);
+            }
+            _ => panic!("room for both loads the draft"),
+        }
+        match DraftPlan::admit(&spec, target, target + draft - 1).unwrap() {
+            DraftPlan::Refused(report) => {
+                assert!(!report.is_resident());
+                assert!(report.refusal.unwrap().starts_with("draft model:"));
+            }
+            _ => panic!("no room beside the target refuses the draft"),
+        }
+        assert!(
+            DraftPlan::admit(&spec, target, target - 1).is_err(),
+            "the target alone"
+        );
+        let missing = LoadSpec::dense(fixture.target.to_string_lossy())
+            .with_draft(root.join("no-such-draft").to_string_lossy());
+        match DraftPlan::admit(&missing, target, u64::MAX).unwrap() {
+            DraftPlan::Refused(report) => {
+                assert!(report.refusal.unwrap().contains("cannot be priced"))
+            }
+            _ => panic!("an unpriceable draft is refused"),
+        }
+        let unnamed = LoadSpec::dense(fixture.target.to_string_lossy());
+        assert!(matches!(
+            DraftPlan::admit(&unnamed, target, target).unwrap(),
+            DraftPlan::None
+        ));
+
+        // End to end, an unloadable draft never fails the target's load.
+        let provider = LlamaProvider::load(&missing).unwrap();
+        let report = provider.load_report().unwrap().draft.unwrap();
+        assert!(!report.is_resident());
+        assert!(provider
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::DraftModel)
+            .is_none());
+    }
+
+    /// Both decoder families advertise prompt lookup (the engine runs it on either) at their
+    /// geometry's depth; the Qwen3.8 head keeps its MTP advertisement — the same finite depth on
+    /// the legacy field and the per-proposer list (sc-24438) — and a depth past the bound is
+    /// admitted (it is clamped at generate, by name).
+    #[test]
+    fn every_decoder_advertises_prompt_lookup() {
+        use core_llm::Speculative;
+        for provider in [causal_provider(), qwen35_mtp_provider()] {
+            let caps = &provider.descriptor().capabilities;
+            let lookup = caps.proposer(SpeculativeProposer::PromptLookup).unwrap();
+            // The fixtures' head dims (4, 8) are not vector-kernel dims: the 8-row bound.
+            assert_eq!(lookup.max_depth, SPECULATIVE_MAX_DEPTH);
+            assert_eq!(
+                lookup.recommended_depth,
+                MLX_ROW.recommended_depths.prompt_lookup
+            );
+            let too_deep = spec_request(Speculative::proposer(
+                SpeculativeProposer::PromptLookup,
+                lookup.max_depth + 1,
+            ));
+            provider.validate(&too_deep).unwrap();
+        }
+        let hybrid = qwen35_mtp_provider();
+        let caps = &hybrid.descriptor().capabilities;
+        let mtp = caps.proposer(SpeculativeProposer::Mtp).unwrap();
+        assert_eq!(
+            (mtp.max_depth, mtp.recommended_depth),
+            (SPECULATIVE_MAX_DEPTH, MLX_ROW.recommended_depths.mtp)
+        );
+        assert_eq!(
+            caps.mtp,
+            Some(core_llm::MtpCapabilities {
+                max_draft_tokens: mtp.max_depth,
+                recommended_draft_tokens: mtp.recommended_depth,
+            }),
+            "the legacy field agrees with the proposer list"
+        );
+        assert!(caps.speculative.contains(&mtp));
+        assert!(causal_provider()
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+    }
+
+    /// sc-24438 AC1 (E4): a loaded model's advertised depth is its attention geometry's — one less
+    /// than the rows MLX's decode kernel verifies in one call — for both proposers and on the
+    /// legacy MTP field: the shipped Qwen3.8-27B config (24q/4kv/hd 256) → 4, a 35B-A3B-shaped
+    /// MoE config (16q/2kv/hd 256) → 3, a gqa-4 hd-128 Llama → 7, a gqa-8 one → 3, Gemma 4 the
+    /// narrower of its sliding / full layers, DeepSeek MLA (192/128, head-expanded keys) → 7.
+    #[test]
+    fn the_advertised_depth_is_the_attention_geometrys() {
+        let depths = |caps: &TextLlmCapabilities| {
+            let lookup = caps.proposer(SpeculativeProposer::PromptLookup).unwrap();
+            assert!(lookup.recommended_depth <= lookup.max_depth);
+            let mtp = caps.proposer(SpeculativeProposer::Mtp).map(|m| {
+                assert_eq!(
+                    caps.mtp,
+                    Some(core_llm::MtpCapabilities {
+                        max_draft_tokens: m.max_depth,
+                        recommended_draft_tokens: m.recommended_depth,
+                    })
+                );
+                m.max_depth
+            });
+            (lookup.max_depth, mtp)
+        };
+        let qwen38: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/config.json"
+        )))
+        .unwrap();
+        let dense = Qwen35Config::from_json(&qwen38).unwrap();
+        assert_eq!(
+            (dense.num_heads, dense.num_kv_heads, dense.head_dim),
+            (24, 4, 256)
+        );
+        assert_eq!(
+            depths(&descriptor_for_qwen35(&dense).capabilities),
+            (4, Some(4))
+        );
+        let mut a3b = qwen38.clone();
+        let text = a3b["text_config"].as_object_mut().unwrap();
+        text.insert("num_attention_heads".into(), json!(16));
+        text.insert("num_key_value_heads".into(), json!(2));
+        text.insert("model_type".into(), json!("qwen3_5_moe_text"));
+        text.insert("num_experts".into(), json!(256));
+        text.insert("num_experts_per_tok".into(), json!(8));
+        text.insert("moe_intermediate_size".into(), json!(512));
+        text.insert("shared_expert_intermediate_size".into(), json!(512));
+        let a3b = Qwen35Config::from_json(&a3b).unwrap();
+        assert!(a3b.moe.is_some());
+        assert_eq!(
+            depths(&descriptor_for_qwen35(&a3b).capabilities),
+            (3, Some(3))
+        );
+
+        let llama = |heads: i32, kv: i32, extra: serde_json::Value| {
+            let mut v = json!({
+                "model_type": "llama", "architectures": ["LlamaForCausalLM"],
+                "hidden_size": heads * 128, "intermediate_size": 256, "num_hidden_layers": 2,
+                "num_attention_heads": heads, "num_key_value_heads": kv,
+                "vocab_size": 32, "rms_norm_eps": 1e-5, "max_position_embeddings": 64
+            });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            depths(&descriptor_for(&ModelConfig::from_json(&v).unwrap()).capabilities)
+        };
+        assert_eq!(llama(32, 8, json!({})), (7, None));
+        assert_eq!(llama(64, 8, json!({})), (3, None));
+        assert_eq!(
+            llama(
+                16,
+                16,
+                json!({"model_type": "deepseek_v2", "architectures": ["DeepseekV2ForCausalLM"],
+                       "kv_lora_rank": 64, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64,
+                       "v_head_dim": 128})
+            ),
+            (7, None)
+        );
+
+        // Gemma 4: sliding hd 256 over 2 KV heads (gqa 8 → 4 rows) beats the full layers' hd 512.
+        let gemma4 = |kv: i32| {
+            let cfg = ModelConfig {
+                num_heads: 16,
+                gemma4: Some(Box::new(crate::config::Gemma4Config {
+                    layer_types: vec![
+                        crate::config::LayerAttentionType::Sliding,
+                        crate::config::LayerAttentionType::Full,
+                    ],
+                    sliding: crate::config::LayerAttention {
+                        head_dim: 256,
+                        num_kv_heads: kv,
+                        rope_type: crate::config::RopeType::Default,
+                        rope_theta: 1e4,
+                        partial_rotary_factor: 1.0,
+                        rope_factor: 1.0,
+                        sliding_window: Some(512),
+                        k_eq_v: false,
+                    },
+                    full: crate::config::LayerAttention {
+                        head_dim: 512,
+                        num_kv_heads: 1,
+                        rope_type: crate::config::RopeType::Default,
+                        rope_theta: 1e6,
+                        partial_rotary_factor: 1.0,
+                        rope_factor: 1.0,
+                        sliding_window: None,
+                        k_eq_v: true,
+                    },
+                    bidirectional: None,
+                    num_kv_shared_layers: 0,
+                    use_double_wide_mlp: false,
+                })),
+                num_layers: 2,
+                ..crate::decode::engine::tests::tiny_llama(8).config().clone()
+            };
+            depths(&descriptor_for(&cfg).capabilities)
+        };
+        assert_eq!(gemma4(2), (3, None));
+        assert_eq!(gemma4(8), (7, None));
+    }
+
+    /// sc-24438 AC1: the advertised max depth is finite and backend-true (on these fixtures'
+    /// head dims, the 8-row bound) and a request above it runs at it, with the clamp named in
+    /// `DecodeReport::fallbacks`, emitting exactly `off`'s stream: prompt lookup on both
+    /// decoders, and MTP (the new option and the legacy field) on the Qwen3.8 head.
+    #[test]
+    fn a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp() {
+        use core_llm::{MtpMode, Speculative};
+        let clamp = |proposer: &str, asked: u32, max: u32| {
+            vec![format!(
+                "speculative: `{proposer}` depth {asked} clamped to {max} (advertised 1..={max})"
+            )]
+        };
+        let check = |provider: &LlamaProvider, req: TextLlmRequest, kind, max, label: &str| {
+            let (_, off_ids) = run(provider, &spec_request(Speculative::Off));
+            let (out, ids) = run(provider, &req);
+            let report = out.decode.unwrap();
+            assert_eq!(report.proposer, kind, "{label}");
+            assert_eq!(report.draft_tokens, Some(max), "{label}");
+            assert_eq!(ids, off_ids, "{label}: the clamped run is greedy-exact");
+            report.fallbacks
+        };
+        let max = |provider: &LlamaProvider, proposer| {
+            provider
+                .descriptor()
+                .capabilities
+                .proposer(proposer)
+                .unwrap()
+                .max_depth
+        };
+
+        for (label, provider) in [
+            ("causal", causal_provider()),
+            ("qwen35", qwen35_mtp_provider()),
+        ] {
+            let max = max(&provider, SpeculativeProposer::PromptLookup);
+            let asked = max + 5;
+            let req = spec_request(Speculative::proposer(
+                SpeculativeProposer::PromptLookup,
+                asked,
+            ));
+            let fallbacks = check(&provider, req, ProposerKind::PromptLookup, max, label);
+            assert_eq!(fallbacks, clamp("prompt_lookup", asked, max), "{label}");
+        }
+
+        let hybrid = qwen35_mtp_provider();
+        let mtp_max = max(&hybrid, SpeculativeProposer::Mtp);
+        let new = spec_request(Speculative::proposer(SpeculativeProposer::Mtp, 40));
+        let fallbacks = check(&hybrid, new, ProposerKind::Mtp, mtp_max, "mtp");
+        assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
+        let mut legacy = spec_request(Speculative::Off);
+        legacy.speculative = None;
+        legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 40 });
+        let fallbacks = check(&hybrid, legacy, ProposerKind::Mtp, mtp_max, "legacy");
+        assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
+    }
+
+    /// sc-24438 AC2: a sparse-MoE Qwen35 snapshot carrying an MTP head — its predictor layer a
+    /// sparse-MoE block, as the 35B-A3B ships it, in the fused (Qwen3.6) and the per-expert
+    /// (Qwen3.5) expert layout — loads through the production load path, advertises MTP on both
+    /// fields, and **runs** it: `{mtp}` at depths 1, 3 and the advertised max, the legacy
+    /// `enabled 3` and `auto` each report the MTP proposer with drafts proposed, and emit exactly
+    /// `off`'s stream.
+    #[test]
+    fn a_moe_snapshot_with_an_mtp_head_runs_mtp() {
+        use crate::models::qwen35::tests::{cfg_json_moe_mtp, seeded_moe_mtp_tensors};
+        use core_llm::{MtpMode, Speculative};
+        for fused in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = cfg_json_moe_mtp();
+            config["model_type"] = json!("qwen3_5_moe");
+            config.as_object_mut().unwrap().remove("vision_config");
+            std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+            let entries: Vec<String> = (0..50).map(|i| format!("\"t{i}\": {i}")).collect();
+            std::fs::write(
+                dir.path().join("tokenizer.json"),
+                format!(
+                    r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+                    "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+                    "decoder": null,
+                    "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+                    entries.join(", ")
+                ),
+            )
+            .unwrap();
+            let cfg = Qwen35Config::from_json(&config).unwrap();
+            let tensors = seeded_moe_mtp_tensors(&cfg, fused);
+            let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
+
+            let label = if fused { "fused" } else { "per-expert" };
+            let provider = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
+                .expect("a MoE checkpoint with an MTP head loads");
+            let caps = &provider.descriptor().capabilities;
+            let mtp = caps.proposer(SpeculativeProposer::Mtp).expect(label);
+            assert_eq!(
+                caps.mtp,
+                Some(core_llm::MtpCapabilities {
+                    max_draft_tokens: mtp.max_depth,
+                    recommended_draft_tokens: mtp.recommended_depth,
+                }),
+                "{label}"
+            );
+
+            let (_, off_ids) = run(&provider, &spec_request(Speculative::Off));
+            let mut legacy = spec_request(Speculative::Off);
+            legacy.speculative = None;
+            legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
+            // Epic AT1: the explicit option at depths 1, 3 and the advertised max.
+            let explicit = |depth| {
+                (
+                    depth,
+                    spec_request(Speculative::proposer(SpeculativeProposer::Mtp, depth)),
+                )
+            };
+            for (case, (depth, req)) in [
+                ("explicit 1", explicit(1)),
+                ("explicit 3", explicit(3)),
+                ("explicit max", explicit(mtp.max_depth)),
+                ("legacy", (3, legacy)),
+                // `auto` runs at the advertised recommended depth (sc-24446), not a literal.
+                (
+                    "auto",
+                    (mtp.recommended_depth, spec_request(Speculative::Auto)),
+                ),
+            ] {
+                provider.validate(&req).unwrap();
+                let (out, ids) = run(&provider, &req);
+                let report = out.decode.unwrap();
+                assert_eq!(report.proposer, ProposerKind::Mtp, "{label} {case}");
+                assert_eq!(report.draft_tokens, Some(depth), "{label} {case}");
+                assert!(
+                    report.proposed_tokens > 0,
+                    "{label} {case}: the head drafted"
+                );
+                assert!(report.fallbacks.is_empty(), "{label} {case}");
+                assert_eq!(ids, off_ids, "{label} {case}: greedy-exact");
+            }
+        }
+    }
+
+    /// Admission prices what each route holds: prompt lookup on a softmax decoder pays only its
+    /// verify overshoot (it rolls back by truncation). On the hybrid every speculative route pays
+    /// the DeltaNet checkpoint ring its rollback holds (E7, sc-24435) — prompt lookup the ring plus
+    /// the overshoot, MTP the ring plus its predictor cache and verify rows — and the recurrent
+    /// state once: no step-start snapshot, no clone/replay copies.
+    #[test]
+    fn speculative_admission_prices_the_rollback_the_route_holds() {
+        let causal = causal_provider();
+        let price =
+            |p: &LlamaProvider, route| p.speculative_request_bytes(route, None, 64, 32, 0).unwrap();
+        let off = price(&causal, SpeculativeRoute::Plain);
+        let lookup = price(&causal, SpeculativeRoute::PromptLookup { width: 4 });
+        let g = causal.model.memory_geometry();
+        let kv_position = g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let rows = (g.hidden_size + g.vocab_size) * g.element_bytes;
+        assert_eq!(
+            lookup,
+            off + 4 * (kv_position + rows),
+            "truncation: overshoot only"
+        );
+
+        let hybrid = qwen35_mtp_provider();
+        let Decoder::Qwen35(model) = &hybrid.model else {
+            unreachable!("the hybrid fixture")
+        };
+        let off = price(&hybrid, SpeculativeRoute::Plain);
+        let g = hybrid.model.memory_geometry();
+        let kv_position = g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let rows = (g.hidden_size + g.vocab_size) * g.element_bytes;
+        let kv = (64 + 32) * kv_position;
+        for width in [1usize, 3, 8] {
+            let ring = model.checkpoint_ring_bytes(width).unwrap();
+            let w = width as u64;
+            assert!(ring > 0);
+            assert_eq!(
+                price(&hybrid, SpeculativeRoute::PromptLookup { width }),
+                off + ring + w * (kv_position + rows),
+                "lookup {width}: the ring plus the overshoot"
+            );
+            assert_eq!(
+                price(&hybrid, SpeculativeRoute::Mtp { width }),
+                off + ring + 2 * kv + w * rows,
+                "mtp {width}: the ring plus the predictor cache and verify rows"
+            );
+        }
+
+        // The MoE hybrid prices on the eager contract, with the same once-charged recurrent term.
+        let moe = qwen35_moe_provider();
+        let Decoder::Qwen35(model) = &moe.model else {
+            unreachable!("the MoE fixture")
+        };
+        assert!(matches!(
+            moe.model.workspace_contract(),
+            MlxWorkspaceContract::Eager
+        ));
+        let off = price(&moe, SpeculativeRoute::Plain);
+        let g = moe.model.memory_geometry();
+        let kv_position = g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let rows = (g.hidden_size + g.vocab_size) * g.element_bytes;
+        let kv = (64 + 32) * kv_position;
+        for width in [1usize, 3, 8] {
+            let ring = model.checkpoint_ring_bytes(width).unwrap();
+            let w = width as u64;
+            assert_eq!(
+                price(&moe, SpeculativeRoute::PromptLookup { width }),
+                off + ring + w * (kv_position + rows),
+                "moe lookup {width}"
+            );
+            // The generic runtime terms also hold the verify width's K/V positions and their
+            // block padding (sc-24446).
+            let positions = |extra: u64| w + kv_block_padding(96 + extra).unwrap();
+            assert_eq!(
+                price(&moe, SpeculativeRoute::Mtp { width }),
+                off + ring
+                    + 2 * kv
+                    + w * rows
+                    + (positions(w) - (kv_block_padding(96).unwrap())) * kv_position,
+                "moe mtp {width}: the ring and the live state charged once"
+            );
+        }
+
+        // A draft model (sc-24436) on the hybrid target verifies like prompt lookup: the ring
+        // plus the overshoot. A hybrid draft holds its own proposal window in its ring, armed for
+        // the same width: its request prices that ring, never a snapshot.
+        for width in [1usize, 4] {
+            assert_eq!(
+                price(&hybrid, SpeculativeRoute::DraftModel { width }),
+                price(&hybrid, SpeculativeRoute::PromptLookup { width }),
+                "hybrid target, draft {width}: the ring plus the overshoot"
+            );
+        }
+        let mut drafted = causal_provider();
+        drafted.draft = Some(ResidentDraft {
+            model: Decoder::Qwen35(Box::new(crate::decode::engine::tests::qwen35(false))),
+            proposable: 24,
+            width: 24,
+            context: 0,
+        });
+        let Some(Decoder::Qwen35(draft)) = drafted.draft.as_ref().map(|d| &d.model) else {
+            unreachable!("the hybrid draft")
+        };
+        for width in [1usize, 4] {
+            let mut geometry = drafted.draft.as_ref().unwrap().model.memory_geometry();
+            geometry.recurrent_bytes += draft.checkpoint_ring_bytes(width).unwrap();
+            let draft_request = estimate_mlx_request_bytes(
+                64,
+                32 + width as u32,
+                geometry,
+                0,
+                0,
+                drafted.draft.as_ref().unwrap().model.workspace_contract(),
+            )
+            .unwrap();
+            assert_eq!(
+                price(&drafted, SpeculativeRoute::DraftModel { width }),
+                price(&causal, SpeculativeRoute::PromptLookup { width }) + draft_request,
+                "hybrid draft {width}: its request with its ring, no snapshot"
+            );
+        }
+    }
+
+    // ---- Prism/Bonsai companion MTP head (epic sc-24432, story sc-24444). ----
+
+    /// A Prism snapshot directory and, when `head` names a variant, a companion head beside it.
+    struct PrismLoad {
+        target: crate::test_fixture::Fixture,
+        head: crate::test_fixture::Fixture,
+    }
+
+    fn prism_load(head_text: Option<serde_json::Value>) -> PrismLoad {
+        let target = crate::test_fixture::Fixture::new("mlx-prism-target-", None);
+        // Seed 6 decodes a varied greedy run (not a single repeated id) through the chat template.
+        crate::synthetic::write_prism_snapshot(&target, 6);
+        let head = crate::test_fixture::Fixture::new("mlx-prism-head-", None);
+        let text = head_text
+            .unwrap_or_else(|| crate::synthetic::prism_qwen35_config()["text_config"].clone());
+        crate::synthetic::write_companion_head(&head, &text, 5, None);
+        PrismLoad { target, head }
+    }
+
+    fn prism_request(speculative: core_llm::Speculative) -> TextLlmRequest {
+        TextLlmRequest {
+            messages: vec![Message::user("t3 t9 t40 t11 t3 t9 t40 t11 t7")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 20,
+            seed: Some(3),
+            speculative: Some(speculative),
+            ..Default::default()
+        }
+    }
+
+    /// E2 through the real load (sc-24432 feature-end review; the Candle twin is
+    /// `a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback`): a snapshot whose
+    /// config declares a native MTP head it stores no tensor of loads the target plain, names the
+    /// `mtp:` fallback in the load report, advertises no MTP and decodes.
+    #[test]
+    fn a_configured_mtp_head_the_snapshot_does_not_carry_is_a_named_load_fallback() {
+        let target = crate::test_fixture::Fixture::new("mlx-mtp-absent-", None);
+        crate::synthetic::write_prism_snapshot(&target, 6);
+        let path = target.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+        std::fs::write(&path, config.to_string()).unwrap();
+        let provider = LlamaProvider::load(&LoadSpec::dense(target.to_str().unwrap()))
+            .expect("the target still loads (E2)");
+        let fallbacks = provider.load_report().unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(
+            fallbacks[0].starts_with("mtp: ") && fallbacks[0].contains("stores no `mtp.*` tensor"),
+            "{fallbacks:?}"
+        );
+        assert!(provider
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+        assert!(provider.descriptor().capabilities.mtp.is_none());
+        let (_, ids) = run(&provider, &prism_request(core_llm::Speculative::Off));
+        assert_eq!(ids.len(), 20);
+    }
+
+    /// Per step of `req`'s plain greedy run on `provider`'s hybrid decoder: whether the step is a
+    /// BF16 near-tie — its top-2 logit margin within two BF16 ulps at the top logit's magnitude,
+    /// where a different (and equally correct) BF16 reduction order, a multi-row verify or a
+    /// prefix-hit suffix prefill, may pick the other token. Stepped token by token on the run's own
+    /// stream, the reference `off` is.
+    fn prism_near_ties(provider: &LlamaProvider, req: &TextLlmRequest, off: &[u32]) -> Vec<bool> {
+        let (_, mut ids) = provider.render_prompt(req, &req.messages).unwrap();
+        let Decoder::Qwen35(model) = &provider.model else {
+            panic!("a Prism snapshot loads the hybrid decoder");
+        };
+        let mut cache = model.new_cache();
+        let mut logits = model
+            .decode_logits(&crate::primitives::input_ids(&ids), &mut cache, 0)
+            .unwrap();
+        let mut near = Vec::with_capacity(off.len());
+        for &token in off {
+            let mut row = crate::primitives::nn::to_f32_host(&logits).unwrap();
+            row.sort_by(|a, b| b.total_cmp(a));
+            let ulp = (2f32).powi(row[0].abs().max(f32::MIN_POSITIVE).log2().floor() as i32 - 7);
+            near.push(row[0] - row[1] <= 2.0 * ulp);
+            ids.push(token as i32);
+            let offset = cache.offset();
+            logits = model
+                .decode_logits(
+                    &crate::primitives::input_ids(&[token as i32]),
+                    &mut cache,
+                    offset,
+                )
+                .unwrap();
+        }
+        near
+    }
+
+    /// `ids` is `off`'s greedy run up to its first BF16 near-tie ([`prism_near_ties`]) and may
+    /// part from it only there: the first differing step must be a near-tie of `off`'s, and with
+    /// no near-tie the runs are identical.
+    fn assert_bf16_greedy_parity(label: &str, ids: &[u32], off: &[u32], near_ties: &[bool]) {
+        assert_eq!(ids.len(), off.len(), "{label}: length");
+        match ids.iter().zip(off).position(|(a, b)| a != b) {
+            None => {}
+            Some(step) => assert!(
+                near_ties[step],
+                "{label}: diverged at step {step}, which is not a BF16 near-tie of the off run \
+                 (near-ties at {:?}): {ids:?} vs {off:?}",
+                near_ties
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &n)| n.then_some(i))
+                    .collect::<Vec<_>>()
+            ),
+        }
+    }
+
+    /// Story sc-24444 AC2: a Prism snapshot loaded with a companion head advertises MTP, and
+    /// `{proposer: mtp}` at depths 1, 3 and the advertised max — through the real load path and the provider's
+    /// engine — emits exactly `off`'s greedy tokens, with the report naming the head as the
+    /// proposer that ran.
+    #[test]
+    fn prism_with_a_companion_head_decodes_mtp_with_the_off_tokens() {
+        use core_llm::Speculative;
+        let fx = prism_load(None);
+        let spec =
+            LoadSpec::dense(fx.target.to_str().unwrap()).with_mtp_head(fx.head.to_str().unwrap());
+        let provider = LlamaProvider::load(&spec).unwrap();
+        assert_eq!(provider.descriptor().family, "prism_hadamard_qwen35");
+        let report = provider.load_report().unwrap();
+        assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+        // The companion head advertises the same backend-true depth a native head does (sc-24438).
+        let advertised = provider
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .expect("the attached head is advertised");
+        assert_eq!(advertised.recommended_depth, MLX_ROW.recommended_depths.mtp);
+
+        let (off, off_ids) = run(&provider, &prism_request(Speculative::Off));
+        assert_eq!(off_ids.len(), 20);
+        let distinct: std::collections::BTreeSet<_> = off_ids.iter().collect();
+        assert!(
+            distinct.len() > 2,
+            "fixture must not be degenerate: {off_ids:?}"
+        );
+        assert_eq!(
+            off_ids,
+            plain_loop(&provider, &prism_request(Speculative::Off))
+        );
+        assert_eq!(off.decode.unwrap().proposer, ProposerKind::None);
+        // Since sc-20671 the Prism decoder computes in BF16: the head's verify (a multi-row
+        // forward) and a prefix-hit prefill keep `off`'s tokens up to a BF16 near-tie — this
+        // fixture has one at step 16 — and may part only there. The f32 twin is strict
+        // (`prism_companion_head_in_f32_keeps_the_off_tokens_exactly`).
+        let near_ties = prism_near_ties(&provider, &prism_request(Speculative::Off), &off_ids);
+        for depth in [1, 3, advertised.max_depth] {
+            let req = prism_request(Speculative::proposer(SpeculativeProposer::Mtp, depth));
+            let (out, ids) = run(&provider, &req);
+            assert_bf16_greedy_parity(&format!("depth {depth}"), &ids, &off_ids, &near_ties);
+            let report = out.decode.expect("the engine reports its path");
+            assert_eq!(report.proposer, ProposerKind::Mtp, "depth {depth}");
+            assert_eq!(report.draft_tokens, Some(depth), "depth {depth}");
+            assert!(
+                report.proposed_tokens > 0,
+                "depth {depth}: the head drafted"
+            );
+            assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+        }
+
+        // Without the head the same snapshot has no MTP, and loads the same greedy tokens.
+        let bare = LlamaProvider::load(&LoadSpec::dense(fx.target.to_str().unwrap())).unwrap();
+        assert!(bare.load_report().unwrap().fallbacks.is_empty());
+        assert!(bare
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+        assert_eq!(run(&bare, &prism_request(Speculative::Off)).1, off_ids);
+    }
+
+    /// The f32 twin of the BF16 companion-head parity above: the same Prism fixture computing in
+    /// f32 keeps `off`'s greedy tokens exactly over the whole run — every MTP depth, `auto`, and a
+    /// prefix-cache hit — so the BF16 run's only allowance is its rounding.
+    #[test]
+    fn prism_companion_head_in_f32_keeps_the_off_tokens_exactly() {
+        use core_llm::Speculative;
+        crate::models::qwen35::with_compute_dtype(Dtype::Float32, || {
+            let fx = prism_load(None);
+            let spec = LoadSpec::dense(fx.target.to_str().unwrap())
+                .with_mtp_head(fx.head.to_str().unwrap());
+            let provider = LlamaProvider::load(&spec).unwrap();
+            let advertised = provider
+                .descriptor()
+                .capabilities
+                .proposer(SpeculativeProposer::Mtp)
+                .expect("the attached head is advertised");
+            let (_, off_ids) = run(&provider, &prism_request(Speculative::Off));
+            assert_eq!(off_ids.len(), 20);
+            assert_eq!(
+                off_ids,
+                plain_loop(&provider, &prism_request(Speculative::Off))
+            );
+            let (again, again_ids) = run(&provider, &prism_request(Speculative::Off));
+            assert!(
+                again.decode.unwrap().prefix_hit_tokens > 0,
+                "a prefix-cache hit"
+            );
+            assert_eq!(again_ids, off_ids, "the prefix-cache hit");
+            for depth in [1, 3, advertised.max_depth] {
+                let req = prism_request(Speculative::proposer(SpeculativeProposer::Mtp, depth));
+                assert_eq!(run(&provider, &req).1, off_ids, "depth {depth}");
+            }
+            assert_eq!(
+                run(&provider, &prism_request(Speculative::Auto)).1,
+                off_ids,
+                "auto"
+            );
+        })
+    }
+
+    /// Story sc-24444 AC2 / E2: a head whose geometry does not match, a missing head, and a head
+    /// named for a non-Qwen3.5 target are each refused with a named load fallback; the model still
+    /// loads, advertises no MTP and decodes plainly.
+    #[test]
+    fn an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure() {
+        use core_llm::Speculative;
+        let mut text = crate::synthetic::prism_qwen35_config()["text_config"].clone();
+        text["intermediate_size"] = json!(128);
+        let fx = prism_load(Some(text));
+        let spec =
+            LoadSpec::dense(fx.target.to_str().unwrap()).with_mtp_head(fx.head.to_str().unwrap());
+        let provider = LlamaProvider::load(&spec).expect("the target still loads (E2)");
+        let fallbacks = provider.load_report().unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(fallbacks[0].starts_with("mtp_head: "), "{fallbacks:?}");
+        assert!(
+            fallbacks[0].contains("intermediate_size 128 != target 256"),
+            "{fallbacks:?}"
+        );
+        assert!(
+            fallbacks[0].contains("the model loaded without a companion head"),
+            "{fallbacks:?}"
+        );
+        assert!(provider
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+        let (out, ids) = run(&provider, &prism_request(Speculative::Off));
+        assert_eq!(ids.len(), 20);
+        assert!(out.decode.unwrap().fallbacks.is_empty());
+        // An explicit MTP request (not advertised) decodes plainly with the reason named (E2,
+        // never refused), and `auto` names why it ran no MTP by choosing prompt lookup.
+        let (mtp, mtp_ids) = run(
+            &provider,
+            &prism_request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
+        );
+        // BF16 (sc-20671): this run's prefill is a prefix-cache hit of the first's, which keeps
+        // its tokens up to a near-tie (`prism_near_ties`).
+        let near_ties = prism_near_ties(&provider, &prism_request(Speculative::Off), &ids);
+        assert_bf16_greedy_parity("the plain path's tokens", &mtp_ids, &ids, &near_ties);
+        let mtp = mtp.decode.unwrap();
+        assert_eq!(mtp.proposer, ProposerKind::None);
+        assert_eq!(mtp.fallbacks.len(), 1, "{:?}", mtp.fallbacks);
+        assert!(
+            mtp.fallbacks[0].starts_with("speculative: `mtp` is not available"),
+            "{:?}",
+            mtp.fallbacks
+        );
+        let (auto, auto_ids) = run(&provider, &prism_request(Speculative::Auto));
+        assert_bf16_greedy_parity("auto", &auto_ids, &ids, &near_ties);
+        assert_eq!(auto.decode.unwrap().proposer, ProposerKind::PromptLookup);
+
+        let missing = LoadSpec::dense(fx.target.to_str().unwrap())
+            .with_mtp_head(fx.target.join("no-such-head").to_str().unwrap());
+        let provider = LlamaProvider::load(&missing).expect("a missing head is not fatal");
+        let fallbacks = provider.load_report().unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(fallbacks[0].contains("is not a directory"), "{fallbacks:?}");
+
+        let mut causal = causal_provider();
+        causal.attach_mtp_head(Some(fx.head.as_ref()));
+        let fallbacks = &causal.load_report.fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(
+            fallbacks[0].contains("attach to Qwen3.5/3.8-family"),
+            "{fallbacks:?}"
+        );
+        assert!(causal.descriptor.capabilities.mtp.is_none());
+    }
+
+    /// Story sc-24444 E7: the head's resident bytes are its safetensors payload plus the header's
+    /// norm intermediates, and load admission adds them to the target's: a budget that fits the
+    /// target but not target + head refuses the head by name and nothing else. The head's
+    /// per-request cache is priced by request admission on the `mtp` route.
+    /// Story sc-24444 E7 with sc-24436/sc-24437: the companion head, a draft model and the
+    /// prefix cache are admitted together — the head on top of the target and the admitted
+    /// draft, the prefix cache in what they leave. A budget that fits target + draft but not the
+    /// head too keeps the draft, refuses the head by name and gives the cache the rest; one that
+    /// fits all three plus `x` bytes settles the prefix cache at exactly `x`.
+    #[test]
+    fn companion_head_draft_and_prefix_cache_are_admitted_together() {
+        let fx = prism_load(None);
+        let head: &Path = fx.head.as_ref();
+        let head_bytes = crate::load_memory::companion_head_bytes(head).unwrap();
+        let target =
+            crate::load_memory::required_bytes(&LoadSpec::dense(fx.target.to_str().unwrap()))
+                .unwrap();
+        let mut spec = LoadSpec::dense(fx.target.to_str().unwrap())
+            .with_mtp_head(fx.head.to_str().unwrap())
+            .with_draft(fx.target.to_str().unwrap());
+        spec.prefix_cache_bytes = Some(u64::MAX / 4);
+        let draft = crate::load_memory::required_bytes(&draft_load_spec(
+            &spec,
+            fx.target.to_str().unwrap(),
+        ))
+        .unwrap();
+
+        let short = with_load_budget(target + draft + head_bytes - 1, || {
+            LlamaProvider::load(&spec)
+        })
+        .expect("target + draft fit");
+        let report = short.load_report().unwrap();
+        assert!(report.draft.as_ref().unwrap().is_resident(), "{report:?}");
+        assert_eq!(report.fallbacks.len(), 1, "{:?}", report.fallbacks);
+        assert!(
+            report.fallbacks[0].starts_with("mtp_head: refused by load admission"),
+            "{:?}",
+            report.fallbacks
+        );
+        assert_eq!(
+            report.prefix_cache_bytes,
+            Some(head_bytes - 1),
+            "the refused head's room is the cache's"
+        );
+
+        let x = 4096;
+        let all = with_load_budget(target + draft + head_bytes + x, || {
+            LlamaProvider::load(&spec)
+        })
+        .expect("all three fit");
+        let report = all.load_report().unwrap();
+        assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+        assert!(report.draft.as_ref().unwrap().is_resident(), "{report:?}");
+        assert_eq!(report.prefix_cache_bytes, Some(x));
+        assert!(all
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_some());
+    }
+
+    #[test]
+    fn companion_head_bytes_are_counted_by_load_and_request_admission() {
+        let fx = prism_load(None);
+        let head: &Path = fx.head.as_ref();
+        let head_bytes = crate::load_memory::companion_head_bytes(head).unwrap();
+        let payload = core_llm::checkpoint_payload_bytes(head).unwrap();
+        // Seven 1-D norm vectors (4 × 128 + 2 × 64 + 128 wide) at four intermediate bytes each,
+        // and one 16 KiB page of rounding per stored tensor and per norm result (sc-24446).
+        let norms = (5 * 128 + 2 * 64) * 4;
+        let tensors = crate::load_memory::safetensors_headers(head)
+            .unwrap()
+            .iter()
+            .flat_map(|h| h.as_object().unwrap().keys())
+            .filter(|k| *k != "__metadata__")
+            .count() as u64;
+        assert_eq!(head_bytes, payload + norms + (tensors + 7) * 16 * 1024);
+
+        let target =
+            crate::load_memory::required_bytes(&LoadSpec::dense(fx.target.to_str().unwrap()))
+                .unwrap();
+        let with_head =
+            LoadSpec::dense(fx.target.to_str().unwrap()).with_mtp_head(fx.head.to_str().unwrap());
+        assert_eq!(
+            crate::load_memory::required_bytes(&with_head).unwrap(),
+            target,
+            "the target's own price is unchanged; the head is admitted on top of it"
+        );
+        assert!(admit_companion_head(head, target, target + head_bytes).is_ok());
+        let refused = admit_companion_head(head, target, target + head_bytes - 1).unwrap_err();
+        assert!(
+            refused.starts_with("mtp_head: refused by load admission"),
+            "{refused}"
+        );
+        assert!(refused.contains(&head_bytes.to_string()), "{refused}");
+
+        // Through the real load: a budget that fits the target but not target + head refuses the
+        // head by name and loads the target without MTP; one more byte admits both.
+        let short = with_load_budget(target + head_bytes - 1, || LlamaProvider::load(&with_head))
+            .expect("the target fits and still loads (E2)");
+        let fallbacks = short.load_report().unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(
+            fallbacks[0].starts_with("mtp_head: refused by load admission"),
+            "{fallbacks:?}"
+        );
+        assert!(short
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+        let fits = with_load_budget(target + head_bytes, || LlamaProvider::load(&with_head))
+            .expect("target + head fit");
+        // Nothing beside target + head is left for the prefix cache: it settles to 0 bytes,
+        // named (E2), and the head attaches.
+        let load = fits.load_report().unwrap();
+        assert_eq!(load.prefix_cache_bytes, Some(0));
+        assert_eq!(
+            load.fallbacks,
+            core_llm::prefix_budget_fallback(core_llm::DecodeBackend::Mlx, None, 0)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(fits
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_some());
+
+        let provider = LlamaProvider::load(&with_head).unwrap();
+        // The prefix-cache snapshot of an MTP request carries the head's KV too (sc-24437).
+        let snapshot = |mtp| provider.prefix_snapshot_bytes(Some(64), mtp).unwrap();
+        assert!(
+            snapshot(true) > snapshot(false) + 4 * 128,
+            "the head's KV is priced"
+        );
+        let price = |route| {
+            provider
+                .speculative_request_bytes(route, None, 64, 32, 0)
+                .unwrap()
+        };
+        assert!(
+            price(SpeculativeRoute::Mtp { width: 3 }) > price(SpeculativeRoute::Plain),
+            "the head's cache and rollback are priced on the mtp route"
+        );
+    }
+
+    /// E1/E8: the backend-neutral greedy parity suite (core-llm-testkit) — the one Candle runs —
+    /// holds on both MLX decoders: prompt lookup at depths 1, 3, the recommended 4 and the max,
+    /// `auto`, and on the Qwen3.8 head MTP at depths 1 and 3, each emitting exactly `off`'s
+    /// stream with a report naming its proposer; and something was actually drafted and accepted.
+    #[test]
+    fn the_backend_neutral_parity_suite_holds_on_both_decoders() {
+        use core_llm::Speculative;
+        use core_llm_testkit::{BenchPrompt, ParityCase, PromptClass};
+        let prompts = vec![
+            BenchPrompt::user(
+                "repeat",
+                PromptClass::Predictable,
+                "t3 t9 t4 t11 t3 t9 t4 t11 t3 t9 t4 t11",
+            ),
+            BenchPrompt::user("sparse", PromptClass::OpenEnded, "t5 t8 t1 t20 t13"),
+        ];
+        let lookup = |depth| ParityCase {
+            speculative: Speculative::proposer(SpeculativeProposer::PromptLookup, depth),
+            expect_proposer: ProposerKind::PromptLookup,
+        };
+        let mtp = |depth| ParityCase {
+            speculative: Speculative::proposer(SpeculativeProposer::Mtp, depth),
+            expect_proposer: ProposerKind::Mtp,
+        };
+        let auto = |expect_proposer| ParityCase {
+            speculative: Speculative::Auto,
+            expect_proposer,
+        };
+        let depths = [
+            1,
+            3,
+            MLX_ROW.recommended_depths.prompt_lookup,
+            SPECULATIVE_MAX_DEPTH,
+        ];
+        for (label, provider, cases) in [
+            (
+                "causal",
+                causal_provider(),
+                depths
+                    .map(lookup)
+                    .into_iter()
+                    .chain([auto(ProposerKind::PromptLookup)])
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "qwen35 mtp",
+                qwen35_mtp_provider(),
+                depths
+                    .map(lookup)
+                    .into_iter()
+                    .chain([mtp(1), mtp(3), auto(ProposerKind::Mtp)])
+                    .collect(),
+            ),
+        ] {
+            let rows =
+                core_llm_testkit::check_speculative_greedy_parity(&provider, &prompts, &cases, 20)
+                    .unwrap_or_else(|failures| panic!("{label}: {failures}"));
+            assert_eq!(rows.len(), prompts.len() * cases.len(), "{label}");
+            assert!(
+                rows.iter().all(|r| r.report.fallbacks.is_empty()),
+                "{label}: nothing fell back"
+            );
+            let drafted = |kind| {
+                rows.iter()
+                    .filter(|r| r.report.proposer == kind)
+                    .any(|r| r.report.proposed_tokens > 0)
+            };
+            assert!(
+                drafted(ProposerKind::PromptLookup),
+                "{label}: lookup drafted"
+            );
+            assert!(
+                rows.iter().any(|r| r.report.accepted_tokens > 0),
+                "{label}: some draft was accepted"
+            );
+            if label == "qwen35 mtp" {
+                assert!(drafted(ProposerKind::Mtp), "{label}: the head drafted");
+            }
+        }
+    }
+
+    /// Epic AT1 at a production SDPA geometry: the shared fixture's hybrid target — 6 query heads
+    /// over 1 KV head at head dim 64, a GQA group of 6 — beside its hybrid draft advertises every
+    /// proposer at its geometry's depth (the vector kernel takes `32 / 6 = 5` query rows → 4
+    /// drafts, below the 8-row ceiling), and every proposer at depths 1, 3 and that max emits
+    /// `off`'s greedy stream. Every head-dim-64 attention call ran a fused MLX kernel, never the
+    /// fallback: the prefill on the full kernel and each verify on the vector kernel, a max-depth
+    /// verify (5 rows) in one call — the kernels `vector_verify_rows` / `speculative_max_depth`
+    /// are justified by, which the narrow-head-dim fixtures never reach.
+    #[test]
+    fn every_proposer_is_greedy_exact_on_the_vector_kernel_geometry() {
+        use crate::primitives::attention::kernel_tally::{record, SdpaKernel};
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let provider = LlamaProvider::load(
+            &LoadSpec::dense(fixture.hybrid_target.display().to_string())
+                .with_draft(fixture.hybrid_draft.display().to_string()),
+        )
+        .unwrap();
+        let Decoder::Qwen35(model) = &provider.model else {
+            panic!("the hybrid target loads as the Qwen35 decoder");
+        };
+        let geometry = qwen35_attention_geometry(model.config());
+        assert_eq!(geometry, (6, 1, 64, 64));
+        let caps = &provider.descriptor().capabilities;
+        let cases = core_llm_testkit::advertised_parity_cases(caps);
+        let prompts = core_llm_testkit::draft_model_prompts();
+        let (rows, calls) = record(|| {
+            core_llm_testkit::check_speculative_greedy_parity(&provider, &prompts, &cases, 24)
+        });
+        let rows = rows.unwrap_or_else(|failures| panic!("{failures}"));
+        assert!(rows.iter().all(|r| r.report.fallbacks.is_empty()));
+        for kind in [
+            ProposerKind::Mtp,
+            ProposerKind::PromptLookup,
+            ProposerKind::DraftModel,
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|r| r.report.proposer == kind && r.report.proposed_tokens > 0),
+                "{kind:?} drafted"
+            );
+        }
+
+        // The kernels every head-dim-64 call — the target's and its MTP head's — reached.
+        let wide: Vec<_> = calls.iter().filter(|c| c.head_dim == 64).collect();
+        let fallback: Vec<_> = wide
+            .iter()
+            .filter(|c| c.kernel == SdpaKernel::Fallback)
+            .collect();
+        assert!(fallback.is_empty(), "fell back: {fallback:?}");
+        assert!(
+            wide.iter().any(|c| c.kernel == SdpaKernel::Full),
+            "a prefill on the full kernel"
+        );
+        let deepest = rows
+            .iter()
+            .filter_map(|r| r.report.draft_tokens)
+            .max()
+            .unwrap();
+        assert!(
+            wide.iter()
+                .any(|c| c.kernel == SdpaKernel::Vector && c.q_len == 1 + deepest as i32),
+            "a max-depth ({deepest}) verify in one vector-kernel call"
+        );
+
+        // And that max is the geometry's: every proposer advertises it, the table covers it.
+        let max = speculative_max_depth([geometry]);
+        assert_eq!(max, 4, "the vector kernel's 5 rows, not the 8-row ceiling");
+        assert_eq!(deepest, max);
+        for proposer in SpeculativeProposer::ALL {
+            assert_eq!(
+                caps.proposer(proposer).unwrap().max_depth,
+                max,
+                "{proposer:?}"
+            );
+        }
+    }
+
+    // ---- The cross-turn prefix cache (sc-24437). ----
+
+    fn chat(messages: Vec<Message>, speculative: core_llm::Speculative) -> TextLlmRequest {
+        TextLlmRequest {
+            messages,
+            sampling: Sampling::greedy(),
+            max_new_tokens: 8,
+            seed: Some(3),
+            speculative: Some(speculative),
+            ..Default::default()
+        }
+    }
+
+    fn rendered_ids(provider: &LlamaProvider, req: &TextLlmRequest, generation: bool) -> Vec<i32> {
+        let text = provider
+            .template
+            .render_with(
+                &req.messages,
+                &RenderOptions {
+                    add_generation_prompt: generation,
+                    enable_thinking: req.enable_thinking_kwarg(),
+                    reasoning_effort: req.reasoning_effort,
+                    preserve_thinking: req.preserve_thinking,
+                    tools: &req.tools,
+                    date_string: provider.campaign_template_date,
+                },
+            )
+            .unwrap();
+        provider
+            .tokenizer
+            .encode(&text, false)
+            .unwrap()
+            .into_iter()
+            .map(|id| id as i32)
+            .collect()
+    }
+
+    fn shared(a: &[i32], b: &[i32]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+
+    /// AC1 on the softmax family through the provider: turn 2 re-renders turn 1 and its reply, so
+    /// it restores the shared run of turn 1's cached `prompt + reply` (N), and decodes exactly
+    /// what a cold run (the non-engine plain loop, and a fresh provider) decodes.
+    #[test]
+    fn a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run() {
+        use core_llm::Speculative;
+        let provider = causal_provider();
+        let user = Message::user("t3 t9 t4 t11 t3 t9");
+        let turn1 = chat(vec![user.clone()], Speculative::Off);
+        let (out1, ids1) = run(&provider, &turn1);
+        assert_eq!(out1.decode.as_ref().unwrap().prefix_hit_tokens, 0, "cold");
+        assert_eq!(out1.decode.as_ref().unwrap().prefix_cache.path, "miss");
+        assert_eq!(provider.prefix_cache_stats().inserted, 1);
+
+        let turn2 = chat(
+            vec![
+                user,
+                Message::assistant(out1.text.clone()),
+                Message::user("t5 t7"),
+            ],
+            Speculative::Off,
+        );
+        let p1 = rendered_ids(&provider, &turn1, true);
+        let p2 = rendered_ids(&provider, &turn2, true);
+        // Turn 1's cache holds its prompt and every reply token but the last (never fed).
+        let mut held = p1.clone();
+        held.extend(ids1.iter().map(|&t| t as i32));
+        held.truncate(p1.len() + ids1.len() - 1);
+        let n = shared(&held, &p2).min(p2.len() - 1);
+        assert!(n >= p1.len() - 1, "turn 2 extends turn 1's prompt: {n}");
+
+        let (out2, ids2) = run(&provider, &turn2);
+        let report = out2.decode.unwrap();
+        assert_eq!(report.prefix_hit_tokens, n as u64);
+        assert_eq!(
+            (
+                report.prefix_cache.path.as_str(),
+                report.prefix_cache.reason.as_deref()
+            ),
+            ("hit", None)
+        );
+        assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+        assert_eq!(ids2, plain_loop(&provider, &turn2));
+        assert_eq!(ids2, run(&causal_provider(), &turn2).1);
+        assert!(provider.prefix_cache_resident_bytes() <= provider.prefix_cache_budget());
+    }
+
+    /// AC2 through the provider: the hybrid snapshots at the end of turn 1's rendered
+    /// conversation; turn 2 (and turn 3, re-using the same entry after turn 2 decoded past it)
+    /// restores the recurrent state there and matches a cold run — plain and with the MTP head
+    /// resuming its warm-up from the stored boundary.
+    #[test]
+    fn a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run() {
+        use core_llm::Speculative;
+        for speculative in [
+            Speculative::Off,
+            Speculative::proposer(SpeculativeProposer::Mtp, 3),
+        ] {
+            let provider = qwen35_mtp_provider();
+            let user = Message::user("t3 t9 t4 t11 t3 t9 t4 t11");
+            let turn1 = chat(vec![user.clone()], speculative);
+            let (out1, _) = run(&provider, &turn1);
+            assert_eq!(out1.decode.as_ref().unwrap().prefix_hit_tokens, 0);
+            let boundary = rendered_ids(&provider, &turn1, false).len();
+            assert_eq!(provider.prefix.borrow().keys().len(), 1);
+            assert_eq!(provider.prefix.borrow().keys()[0].len(), boundary);
+            // The admitted estimate bounds what the snapshot holds (E7).
+            let estimate = provider
+                .prefix_snapshot_bytes(Some(boundary), speculative != Speculative::Off)
+                .unwrap();
+            let held = provider.prefix_cache_resident_bytes();
+            assert!(held > 0 && held <= estimate, "{held} > {estimate}");
+
+            for next in ["t5 t7", "t8 t2 t6"] {
+                let turn = chat(
+                    vec![
+                        user.clone(),
+                        Message::assistant(out1.text.clone()),
+                        Message::user(next),
+                    ],
+                    speculative,
+                );
+                let (out, ids) = run(&provider, &turn);
+                let report = out.decode.unwrap();
+                assert_eq!(
+                    report.prefix_hit_tokens, boundary as u64,
+                    "{speculative:?}: restored at the boundary"
+                );
+                assert_eq!(report.prefix_cache.path, "hit");
+                assert_eq!(report.proposer, speculative_kind(speculative));
+                assert_eq!(ids, plain_loop(&provider, &turn), "{speculative:?}");
+                assert_eq!(ids, run(&qwen35_mtp_provider(), &turn).1, "{speculative:?}");
+            }
+        }
+    }
+
+    fn speculative_kind(speculative: core_llm::Speculative) -> ProposerKind {
+        match speculative {
+            core_llm::Speculative::Proposer { proposer, .. } => proposer.into(),
+            _ => ProposerKind::None,
+        }
+    }
+
+    /// A tiny llama snapshot on disk for the load-admission tests.
+    fn tiny_prefix_snapshot() -> crate::test_fixture::Fixture {
+        let dir = crate::test_fixture::Fixture::new("mlx-llm-prefix-", None);
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 1,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": 16,
+                "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "tie_word_embeddings": false,
+                "eos_token_id": 999}"#,
+        )
+        .unwrap();
+        let vocab: Vec<String> = (0..16).map(|i| format!("\"t{i}\": {i}")).collect();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            format!(
+                r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+                    "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+                    "decoder": null,
+                    "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+                vocab.join(", ")
+            ),
+        )
+        .unwrap();
+        let w = |shape: &[i32]| Array::ones::<f32>(shape).unwrap();
+        let mut arrays = vec![
+            ("model.embed_tokens.weight".to_string(), w(&[16, 8])),
+            ("model.norm.weight".to_string(), w(&[8])),
+            ("lm_head.weight".to_string(), w(&[16, 8])),
+        ];
+        for (name, shape) in [
+            ("input_layernorm.weight", vec![8]),
+            ("post_attention_layernorm.weight", vec![8]),
+            ("self_attn.q_proj.weight", vec![8, 8]),
+            ("self_attn.k_proj.weight", vec![4, 8]),
+            ("self_attn.v_proj.weight", vec![4, 8]),
+            ("self_attn.o_proj.weight", vec![8, 8]),
+            ("mlp.gate_proj.weight", vec![16, 8]),
+            ("mlp.up_proj.weight", vec![16, 8]),
+            ("mlp.down_proj.weight", vec![8, 16]),
+        ] {
+            arrays.push((format!("model.layers.0.{name}"), w(&shape)));
+        }
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Array::save_safetensors(refs, None, dir.join("model.safetensors")).unwrap();
+        dir
+    }
+
+    /// Sets the operational memory override for one scope (the crate's tests run on one thread,
+    /// `.cargo/config.toml`, so no other test observes it).
+    struct MemoryOverride;
+
+    impl MemoryOverride {
+        fn set(bytes: u64) -> Self {
+            std::env::set_var(core_llm::AVAILABLE_MEMORY_OVERRIDE, bytes.to_string());
+            Self
+        }
+    }
+
+    impl Drop for MemoryOverride {
+        fn drop(&mut self) {
+            std::env::remove_var(core_llm::AVAILABLE_MEMORY_OVERRIDE);
+        }
+    }
+
     /// Tiny synthetic Llama whose head dimension the packed Metal reader supports.
     fn tiny_packed_capable_model() -> CausalLm {
         tiny_causal_model(2, 1, 64)
@@ -5653,6 +8867,7 @@ pub(crate) mod tests {
             yarn: None,
             mrope_section: None,
             gemma4: None,
+            activation_role: Default::default(),
         };
         let mut rng = SplitMix64::new(0x5c20676);
         let mut randn = |shape: &[i32]| {
@@ -5777,7 +8992,7 @@ pub(crate) mod tests {
         };
         let cancel = CancelFlag::new();
         let seeded_store = || {
-            let mut store = crate::decode::PrefixCache::new(2);
+            let mut store = crate::decode::PrefixCache::with_budget(u64::MAX);
             crate::decode::generate_cached(
                 &model,
                 &prompt,
@@ -5907,7 +9122,7 @@ pub(crate) mod tests {
             .arm()
             .unwrap();
         let turn1_store = || {
-            let mut store = crate::decode::PrefixCache::new(2);
+            let mut store = crate::decode::PrefixCache::with_budget(u64::MAX);
             let out = crate::decode::generate_cached(
                 &model,
                 &turn1,
@@ -5948,7 +9163,7 @@ pub(crate) mod tests {
         let (dense_tokens, dense) = turn2_run(&mut dense_store, None);
         let (mut hit_store, _) = turn1_store();
         let (hit_tokens, hit) = turn2_run(&mut hit_store, Some(&arm));
-        let mut cold_store = crate::decode::PrefixCache::new(2);
+        let mut cold_store = crate::decode::PrefixCache::with_budget(u64::MAX);
         let (cold_tokens, cold) = turn2_run(&mut cold_store, Some(&arm));
 
         assert_eq!(dense_store.stats().hits, 1);
@@ -6335,7 +9550,7 @@ pub(crate) mod tests {
         );
 
         // A turn 2 the cache did not serve is refused.
-        let mut store = crate::decode::PrefixCache::new(2);
+        let mut store = crate::decode::PrefixCache::with_budget(u64::MAX);
         let (answer, _, turn1_ids) = provider.campaign_turn_one(&turn1, &mut store).unwrap();
         let turn2 = LlamaProvider::campaign_turn_two_request(&turn1, &answer, follow_up);
         let (_, turn2_ids) = provider.render_prompt(&turn2, &turn2.messages).unwrap();
@@ -6727,6 +9942,7 @@ pub(crate) mod tests {
         // default cache retired one per growth into MLX's buffer cache, past the row's cap).
         let long_prompt = (0..600).map(|index| index % 31).collect::<Vec<_>>();
         let mut cache = chunked_prefill_cache(&model, long_prompt.len() + 64).unwrap();
+        KvCache::record_events(&mut cache);
         chunked_prefill(&model, &mut cache, &long_prompt, 64).unwrap();
         assert_eq!(cache.offset(), 600);
         assert!(
@@ -6740,6 +9956,7 @@ pub(crate) mod tests {
             Decoder::Causal(model) => model.new_cache(),
             Decoder::Qwen35(_) => unreachable!(),
         };
+        KvCache::record_events(&mut grown);
         chunked_prefill(&model, &mut grown, &long_prompt, 64).unwrap();
         assert!(
             grown
@@ -7222,6 +10439,161 @@ pub(crate) mod tests {
         );
     }
 
+    /// The two epics together (sc-24432 × sc-20669): a qualified compressed request runs through
+    /// the engine like any other — an explicit prompt-lookup route verifies its drafts on the
+    /// compressed cache and rolls the rejected ones back exactly — and still reports the
+    /// compressed cache it ran on. It reads the cross-turn prefix store but never feeds it: the
+    /// store holds dense K/V and a compressed cache never re-enters it, by name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_compressed_request_speculates_on_the_compressed_cache() {
+        use core_llm::{KvCompressionPolicy as Policy, Speculative, SpeculativeProposer};
+        let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
+            .iter()
+            .find(|row| row.family == core_llm::KvModelFamily::Qwen3)
+            .unwrap();
+        let snapshot = tiny_snapshot_with(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            row.min_context_tokens + 1024,
+            true,
+            CONTEXT_SENSITIVE_GAINS,
+        );
+        let provider = load_tiny(&snapshot);
+        let words = usize::try_from(row.min_context_tokens).unwrap();
+        // A repeating pattern, so prompt lookup finds n-gram drafts to propose.
+        let text = (0..words)
+            .map(|i| format!("w{}", (i * 7) % 26 + 6))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let request = TextLlmRequest {
+            messages: vec![Message::text(Role::User, text)],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 16,
+            seed: Some(0),
+            kv_compression: Policy::Qualified,
+            speculative: Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 4)),
+            ..Default::default()
+        };
+        // The same request run plainly on the compressed cache: the tokens speculation must keep.
+        let off_request = TextLlmRequest {
+            speculative: Some(Speculative::Off),
+            ..request.clone()
+        };
+        let (off, off_ids) = run(&provider, &off_request);
+        assert!(off.kv_cache.as_ref().is_some_and(|kv| kv.ran_compressed()));
+        let (output, ids) = run(&provider, &request);
+        assert_eq!(
+            ids, off_ids,
+            "speculation on the compressed cache keeps the plain tokens"
+        );
+        let kv = output.kv_cache.expect("a generation reports its KV cache");
+        assert!(kv.ran_compressed(), "{kv:?}");
+        assert!(kv.counters.fused_attention_calls > 0, "{kv:?}");
+        let decode = output.decode.expect("an engine request reports its decode");
+        assert_eq!(decode.proposer, ProposerKind::PromptLookup, "{decode:?}");
+        assert!(
+            decode.verify_steps > 0 && decode.proposed_tokens > 0,
+            "{decode:?}"
+        );
+        assert_eq!(output.usage.generated_tokens, 16);
+        assert_eq!(
+            decode.prefix_cache.reason.as_deref(),
+            Some(core_llm::PREFIX_COMPRESSED_NOT_STORED)
+        );
+        assert!(provider.prefix.borrow().is_empty(), "nothing was stored");
+    }
+
+    /// The Qwen3 fixture at its compressed qualification row, and the row's minimum context.
+    fn qualified_qwen3_fixture() -> (tempfile::TempDir, usize) {
+        let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
+            .iter()
+            .find(|row| row.family == core_llm::KvModelFamily::Qwen3)
+            .unwrap();
+        let snapshot = tiny_snapshot_with(
+            json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+            row.min_context_tokens + 1024,
+            true,
+            CONTEXT_SENSITIVE_GAINS,
+        );
+        (snapshot, usize::try_from(row.min_context_tokens).unwrap())
+    }
+
+    /// Dense → compressed prefix reuse (sc-24437 × sc-20681): a dense turn stores its KV; the
+    /// compressed turn of the same prompt hits it — imported into the compressed cache, so only
+    /// the suffix is prefilled — and decodes exactly a cold compressed run's tokens, while the
+    /// store is left as the dense turn left it (a compressed cache never re-enters it).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_compressed_turn_imports_the_dense_turns_prefix() {
+        use core_llm::KvCompressionPolicy as Policy;
+        let (snapshot, words) = qualified_qwen3_fixture();
+        const NEW: u32 = 12;
+        let cold = load_tiny(&snapshot);
+        let (cold_out, _, cold_ids) =
+            kv_generate_words(&cold, words, (7, 26), Policy::Qualified, NEW);
+        assert!(cold_out.kv_cache.unwrap().ran_compressed());
+        assert_eq!(cold_out.decode.unwrap().prefix_hit_tokens, 0);
+
+        let provider = load_tiny(&snapshot);
+        kv_generate(&provider, words, Policy::Off, NEW);
+        let stored = (
+            provider.prefix.borrow().keys(),
+            provider.prefix.borrow().resident_bytes(),
+        );
+        assert_eq!(stored.0.len(), 1, "the dense turn stores its KV");
+        let (out, prompt_ids, ids) =
+            kv_generate_words(&provider, words, (7, 26), Policy::Qualified, NEW);
+        let kv = out.kv_cache.unwrap();
+        assert!(kv.ran_compressed(), "{kv:?}");
+        let decode = out.decode.unwrap();
+        assert_eq!(decode.prefix_cache.path, "hit", "{decode:?}");
+        assert_eq!(decode.prefix_hit_tokens as usize, prompt_ids.len() - 1);
+        assert_eq!(
+            decode.prefix_cache.reason.as_deref(),
+            Some(core_llm::PREFIX_COMPRESSED_NOT_STORED)
+        );
+        assert_eq!(
+            ids, cold_ids,
+            "the imported prefix decodes the cold compressed run"
+        );
+        assert_eq!(
+            (
+                provider.prefix.borrow().keys(),
+                provider.prefix.borrow().resident_bytes()
+            ),
+            stored,
+            "the compressed turn leaves the store unchanged"
+        );
+    }
+
+    /// A compressed turn whose cache declines the stored dense prefix (here: a reader its cache
+    /// cannot bind, so the selection runs dense) prefills the whole prompt and says so: no reuse
+    /// reported, the declined import named.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_declined_prefix_import_is_named_not_counted_as_reuse() {
+        use core_llm::KvCompressionPolicy as Policy;
+        let (snapshot, words) = qualified_qwen3_fixture();
+        let provider = load_tiny(&snapshot);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let reader =
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(UnbindableReader));
+        assert!(provider.kv_reader.set(Ok(reader)).is_ok());
+        kv_generate(&provider, words, Policy::Off, 4);
+        let out = kv_generate(&provider, words, Policy::Qualified, 4);
+        assert_eq!(
+            out.kv_cache.unwrap().fallback,
+            Some(core_llm::KvCacheFallbackReason::ReaderUnavailable)
+        );
+        let decode = out.decode.unwrap();
+        assert_eq!(decode.prefix_hit_tokens, 0, "{decode:?}");
+        assert_eq!(decode.prefix_cache.path, "miss", "{decode:?}");
+        assert_eq!(
+            decode.prefix_cache.reason.as_deref(),
+            Some(core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED)
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn qwen3_compressed_kv_matches_dense_at_its_qualified_context() {
@@ -7438,6 +10810,812 @@ pub(crate) mod tests {
         }
     }
 
+    /// E7 at load: the prefix cache's budget is what the load's admission leaves — never more —
+    /// so it cannot push a load past its admission budget, and a load that fits without it still
+    /// loads (with no cache) at the exact boundary.
+    #[test]
+    fn the_load_admits_the_prefix_cache_budget_up_to_its_headroom() {
+        let dir = tiny_prefix_snapshot();
+        let mut spec = LoadSpec::dense(dir.display().to_string());
+        let required = crate::load_memory::required_bytes(&spec).unwrap();
+        let headroom = 4096;
+        spec.prefix_cache_bytes = Some(u64::MAX);
+        {
+            let _budget = MemoryOverride::set(required + headroom);
+            let provider = LlamaProvider::load(&spec).unwrap();
+            assert_eq!(provider.prefix_cache_budget(), headroom);
+            assert_eq!(
+                provider.load_report().unwrap().prefix_cache_bytes,
+                Some(headroom),
+                "the report names the settled budget"
+            );
+            spec.prefix_cache_bytes = Some(100);
+            assert_eq!(
+                LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
+                100
+            );
+            spec.prefix_cache_bytes = None;
+            assert_eq!(
+                LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
+                headroom.min(core_llm::defaults::MLX.prefix_cache_bytes)
+            );
+        }
+        spec.prefix_cache_bytes = Some(u64::MAX);
+        {
+            // At the boundary the budget settles down to nothing rather than refusing.
+            let _budget = MemoryOverride::set(required);
+            let provider = LlamaProvider::load(&spec).unwrap();
+            assert_eq!(provider.prefix_cache_budget(), 0);
+            assert_eq!(provider.load_report().unwrap().prefix_cache_bytes, Some(0));
+        }
+        {
+            let _budget = MemoryOverride::set(required - 1);
+            assert!(LlamaProvider::load(&spec).is_err(), "past admission");
+        }
+    }
+
+    /// The cache's part before any lookup: off with a zero budget, bypassed (named) for either
+    /// multimodal route, else a miss — the only request that reads or feeds it.
+    #[test]
+    fn the_prefix_route_is_off_bypassed_or_a_miss() {
+        assert_eq!(prefix_path_for(false, false, false), ("off", None));
+        assert_eq!(prefix_path_for(false, true, true), ("off", None));
+        for (multimodal, gemma4_mm) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                prefix_path_for(true, multimodal, gemma4_mm),
+                ("bypassed", Some(PREFIX_MULTIMODAL_BYPASS)),
+                "multimodal {multimodal}, gemma4 {gemma4_mm}"
+            );
+        }
+        assert_eq!(prefix_path_for(true, false, false), ("miss", None));
+    }
+
+    /// A load that settled a zero budget never reads or feeds the cache: no lookup, no store,
+    /// and every turn reports `off`.
+    #[test]
+    fn an_off_cache_is_never_read_or_fed() {
+        use core_llm::Speculative;
+        for provider in [causal_provider(), qwen35_mtp_provider()] {
+            let provider = provider.with_prefix_budget(0);
+            let user = Message::user("t3 t9 t4 t11");
+            let (out1, _) = run(&provider, &chat(vec![user.clone()], Speculative::Off));
+            let turn2 = chat(
+                vec![user, Message::assistant(out1.text), Message::user("t5 t7")],
+                Speculative::Off,
+            );
+            let report = run(&provider, &turn2).0.decode.unwrap();
+            assert_eq!(report.prefix_cache.path, "off");
+            assert_eq!(report.prefix_hit_tokens, 0);
+            assert_eq!(provider.prefix_cache_stats(), PrefixStats::default());
+        }
+    }
+
+    /// A tied-embedding decoder snapshot at `vocab × h` (h = 256: every projection a whole number
+    /// of Q4/Q8 groups), Gemma 2's soft caps and sandwich norms when `gemma`, with a word-level
+    /// tokenizer over the whole vocabulary.
+    fn promotion_snapshot(dir: &Path, model_type: &str, arch: &str, vocab: i32, gemma: bool) {
+        let (h, softcap) = (256, gemma);
+        let (inter, layers, heads, kv, hd) = (512, 2, 2, 1, 128);
+        let mut cfg = json!({
+            "architectures": [arch], "model_type": model_type, "hidden_size": h,
+            "intermediate_size": inter, "num_hidden_layers": layers, "num_attention_heads": heads,
+            "num_key_value_heads": kv, "head_dim": hd, "vocab_size": vocab, "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0, "tie_word_embeddings": true, "max_position_embeddings": 8192,
+        });
+        if softcap {
+            cfg["attn_logit_softcapping"] = json!(50.0);
+            cfg["final_logit_softcapping"] = json!(30.0);
+            cfg["query_pre_attn_scalar"] = json!(hd);
+            cfg["sliding_window"] = json!(4096);
+        }
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            format!(
+                r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+                "decoder": null,
+                "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+                entries.join(", ")
+            ),
+        )
+        .unwrap();
+        let mut seed = 1u64;
+        let mut r = |shape: &[i32]| {
+            let n: i32 = shape.iter().product();
+            let v: Vec<f32> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.1
+                })
+                .collect();
+            Array::from_slice(&v, shape)
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .unwrap()
+        };
+        let mut t: Vec<(String, Array)> = vec![
+            ("model.embed_tokens.weight".into(), r(&[vocab, h])),
+            ("model.norm.weight".into(), r(&[h])),
+        ];
+        for i in 0..layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            for n in ["input_layernorm", "post_attention_layernorm"] {
+                t.push((p(&format!("{n}.weight")), r(&[h])));
+            }
+            if softcap {
+                for n in ["pre_feedforward_layernorm", "post_feedforward_layernorm"] {
+                    t.push((p(&format!("{n}.weight")), r(&[h])));
+                }
+            }
+            t.push((p("self_attn.q_proj.weight"), r(&[heads * hd, h])));
+            t.push((p("self_attn.k_proj.weight"), r(&[kv * hd, h])));
+            t.push((p("self_attn.v_proj.weight"), r(&[kv * hd, h])));
+            t.push((p("self_attn.o_proj.weight"), r(&[h, heads * hd])));
+            t.push((p("mlp.gate_proj.weight"), r(&[inter, h])));
+            t.push((p("mlp.up_proj.weight"), r(&[inter, h])));
+            t.push((p("mlp.down_proj.weight"), r(&[h, inter])));
+        }
+        Array::save_safetensors(
+            t.iter().map(|(k, v)| (k.as_str(), v)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+    }
+
+    /// sc-24446 (d): a one-token request's MLX working set is priced, under either activation
+    /// dtype ([`crate::primitives::activation`]).
+    ///
+    /// * **LLM decode** (every provider load): a Gemma GeGLU returns BF16, so the forward stays
+    ///   BF16 and promotes nothing — `promoted_request_bytes` is 0 — and the measured
+    ///   second-request working set on a tied 65,536-token fixture, dense and at load-time Q4,
+    ///   stays within the request estimate, as a SwiGLU decoder's does. Measured both as the exact
+    ///   settled `phys_footprint` peak growth (driver wake, MLX cache and host heap included) and
+    ///   as MLX's active peak growth; the estimate covers the larger.
+    /// * **A role pinned to `f32`** (the LTX-2.5 text encoder): the GeGLU leaves the stream `f32`,
+    ///   every dense matmul materializes an `f32` copy of its BF16 weight (the LM head's alone
+    ///   vocabulary × hidden × 4 bytes), and the promotion term is what covers the measured
+    ///   one-token forward — it exceeds the estimate without it.
+    ///
+    /// The final hidden state is `f32` exactly when the model reports promoting activations.
+    ///
+    /// MUTATION: return `Some(0)` from `Decoder::promoted_request_bytes` and the pinned cases go
+    /// RED; make `CausalLm::activations_promote` ignore the role and the LLM-decode Gemma cases do.
+    #[test]
+    fn a_one_token_request_working_set_is_priced_under_either_activation_dtype() {
+        use crate::primitives::activation::ActivationRole;
+        for (model_type, arch, gemma) in [
+            ("llama", "LlamaForCausalLM", false),
+            ("gemma2", "Gemma2ForCausalLM", true),
+        ] {
+            for quantize in [None, Some(Quantize::Q4)] {
+                let dir = tempfile::tempdir().unwrap();
+                promotion_snapshot(dir.path(), model_type, arch, 65_536, gemma);
+                let mut spec = LoadSpec::dense(dir.path().display().to_string());
+                spec.quantize = quantize;
+                spec.prefix_cache_bytes = Some(0);
+                let label = format!("{model_type} {quantize:?}");
+
+                // LLM decode, through the provider.
+                let provider = LlamaProvider::load(&spec).unwrap();
+                let req = TextLlmRequest {
+                    messages: vec![Message::user("t3 t9 t4 t11")],
+                    sampling: Sampling::greedy(),
+                    max_new_tokens: 1,
+                    seed: Some(0),
+                    speculative: Some(core_llm::Speculative::Off),
+                    ..Default::default()
+                };
+                let prompt = rendered_ids(&provider, &req, true);
+                let estimate = provider
+                    .speculative_request_bytes(SpeculativeRoute::Plain, None, prompt.len(), 1, 0)
+                    .unwrap();
+                let Decoder::Causal(m) = &provider.model else {
+                    unreachable!("a causal fixture")
+                };
+                assert_hidden_dtype_matches_promotion(m, &label);
+                assert!(!m.activations_promote(), "{label}: LLM decode promotes");
+                assert_eq!(provider.model.promoted_request_bytes(), Some(0), "{label}");
+                provider.generate(&req, &mut |_| {}).unwrap();
+                let working_set = second_run_peak(|| {
+                    provider.generate(&req, &mut |_| {}).unwrap();
+                });
+                assert!(
+                    working_set.max() <= estimate,
+                    "{label}: working set {working_set:?} exceeds the estimate {estimate}"
+                );
+
+                // A role pinned to f32, on the decoder directly.
+                if !gemma {
+                    continue;
+                }
+                let cfg_value = read_config_value(dir.path()).unwrap();
+                let mut cfg = ModelConfig::from_json(&cfg_value).unwrap();
+                cfg.activation_role = ActivationRole::LtxTextEncoder;
+                let w = Weights::from_dir(dir.path()).unwrap();
+                let quant = quantize.map(|q| quant_spec(q).unwrap());
+                let pinned = Decoder::Causal(Box::new(
+                    CausalLm::from_weights_with(&w, "", cfg, quant).unwrap(),
+                ));
+                let Decoder::Causal(m) = &pinned else {
+                    unreachable!()
+                };
+                assert_hidden_dtype_matches_promotion(m, &label);
+                assert!(m.activations_promote(), "{label}: the pinned role promotes");
+                let promoted = pinned.promoted_request_bytes().unwrap();
+                assert!(promoted > 0, "{label}");
+                let ids = input_ids(&[3, 9, 4, 11]);
+                let decoder_estimate = estimate_mlx_request_bytes(
+                    4,
+                    1,
+                    pinned.memory_geometry(),
+                    0,
+                    0,
+                    pinned.workspace_contract(),
+                )
+                .unwrap();
+                let forward = || {
+                    m.decode_logits(&ids, &mut m.new_cache(), 0)
+                        .unwrap()
+                        .eval()
+                        .unwrap();
+                };
+                forward();
+                let working_set = second_run_peak(forward);
+                assert!(
+                    working_set.max() <= decoder_estimate + promoted,
+                    "{label} pinned: working set {working_set:?} exceeds {}",
+                    decoder_estimate + promoted
+                );
+                // The promoted copies are GPU transients: MLX's active peak sees them even where
+                // the settled footprint reuses the driver's pooled pages. Without the term, the
+                // decoder's own tensors (the estimate less the driver's wake) do not cover them.
+                assert!(
+                    working_set.active > decoder_estimate - MLX_REQUEST_WAKE_BYTES,
+                    "{label} pinned: the promotion term is not load-bearing ({working_set:?} vs \
+                     {decoder_estimate})"
+                );
+            }
+        }
+    }
+
+    /// The final hidden state is `f32` exactly when `m` reports promoting activations.
+    fn assert_hidden_dtype_matches_promotion(m: &CausalLm, label: &str) {
+        let hidden = m
+            .hidden_states(&input_ids(&[3, 9, 4]), &mut m.new_cache(), 0)
+            .unwrap();
+        let dtype = hidden.last().unwrap().dtype();
+        assert_eq!(
+            dtype == mlx_rs::Dtype::Float32,
+            m.activations_promote(),
+            "{label}: activation dtype {dtype:?}"
+        );
+    }
+
+    /// A request's working set two ways (the model already materialized by a first run): the
+    /// exact `phys_footprint` peak growth after the driver has settled — what macOS charges, MLX's
+    /// buffer cache, the host heap and the driver's wake included — and MLX's own peak active
+    /// growth, which still sees a GPU transient whose pages the driver recycled from its pool.
+    fn second_run_peak(run: impl Fn()) -> WorkingSet {
+        let footprint = crate::test_fixture::footprint::peak_growth(&run);
+        mlx_rs::memory::clear_cache();
+        let before = mlx_rs::memory::get_active_memory();
+        mlx_rs::memory::reset_peak_memory();
+        run();
+        let active = (mlx_rs::memory::get_peak_memory() - before) as u64;
+        WorkingSet { footprint, active }
+    }
+
+    #[derive(Debug)]
+    struct WorkingSet {
+        footprint: u64,
+        active: u64,
+    }
+
+    impl WorkingSet {
+        fn max(&self) -> u64 {
+            self.footprint.max(self.active)
+        }
+    }
+
+    /// sc-24446: the request estimate covers every one-token request working set the 2026-10-01
+    /// exact-peak re-probes measured on real weights — the kernel's `phys_footprint` maximum over
+    /// a second identical one-token "Hi" request after the driver settled (MLX's cache, the host
+    /// heap and the driver's wake included), on the current build: BF16 GeGLU for every LLM
+    /// decode path, and the `f32` GeGLU (a role pinned to it, with the promotion term) for the
+    /// Gemma rows marked so. Recorded evidence, not a machine golden: the relation is pinned.
+    ///
+    /// MUTATION: drop the driver's wake from the request estimate and the BF16 rows go RED.
+    #[test]
+    fn the_request_estimate_covers_the_exact_footprint_working_sets() {
+        let geometry = |q, kv, hd, layers, hidden, inter, vocab, recurrent| LlmMemoryGeometry {
+            query_heads: q,
+            kv_heads: kv,
+            head_dim: hd,
+            layers,
+            element_bytes: 4,
+            score_element_bytes: 4,
+            hidden_size: hidden,
+            intermediate_size: inter,
+            vocab_size: vocab,
+            recurrent_bytes: recurrent,
+        };
+        let llama = geometry(32, 8, 64, 16, 2048, 8192, 128_256, 0);
+        let qwen3_small = geometry(16, 8, 128, 28, 2048, 6144, 151_936, 0);
+        let qwen3_8b = geometry(32, 8, 128, 36, 4096, 12_288, 151_936, 0);
+        let gemma2 = geometry(8, 4, 256, 26, 2304, 9216, 256_000, 0);
+        let gemma4 = geometry(16, 8, 256, 48, 3840, 15_360, 262_144, 0);
+        let qwen38 = frozen_dense_qwen35_config();
+        let qwen38_geometry = geometry(
+            24,
+            4,
+            256,
+            64,
+            5120,
+            17_408,
+            248_320,
+            64 * 48 * 128 * (128 + 4) * 4,
+        );
+        let qwen35 = MlxWorkspaceContract::Qwen35 {
+            config: &qwen38,
+            prism: false,
+        };
+        let qwen36_inter = Qwen35Config::from_json(
+            &serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../testdata/load_admission/qwen3.6-35b-a3b.json"
+            ))
+            .unwrap()["config"],
+        )
+        .unwrap()
+        .intermediate_size as u64;
+        let qwen36 = geometry(
+            16,
+            2,
+            256,
+            40,
+            2048,
+            qwen36_inter,
+            248_320,
+            40 * 32 * 128 * (128 + 4) * 4,
+        );
+        let (g2_head, g2_mlp) = (256_000 * 2304, 9216 * 2304);
+        let (g4_head, g4_mlp) = (262_144 * 3840, 15_360 * 3840);
+        let promoted = |head, largest| promoted_weight_bytes(head, largest).unwrap();
+        use MlxWorkspaceContract::{Chunked, Eager};
+        // (row, geometry, contract, rendered prompt tokens, promoted bytes, measured footprint)
+        let cases = [
+            ("Llama 3.2 1B BF16", llama, Chunked, 36, 0, 171_000_000u64),
+            ("Llama 3.2 1B Q4/Q8", llama, Chunked, 36, 0, 226_000_000),
+            ("Qwen3-1.7B", qwen3_small, Chunked, 13, 0, 237_000_000),
+            ("Qwen3-8B", qwen3_8b, Chunked, 13, 0, 269_000_000),
+            (
+                "Gemma 2 2B-it (BF16 GeGLU)",
+                gemma2,
+                Eager,
+                10,
+                0,
+                195_000_000,
+            ),
+            (
+                "Gemma 4 enhancer (BF16 GeGLU)",
+                gemma4,
+                Eager,
+                14,
+                0,
+                295_000_000,
+            ),
+            ("Qwen3.8-27B", qwen38_geometry, qwen35, 13, 0, 382_000_000),
+            ("Qwen3.6-35B-A3B", qwen36, Eager, 13, 0, 251_000_000),
+            (
+                "Gemma 2 2B-it BF16 (f32 GeGLU)",
+                gemma2,
+                Eager,
+                10,
+                promoted(g2_head, g2_mlp),
+                3_811_000_000,
+            ),
+            (
+                "Gemma 2 2B-it Q4 (f32 GeGLU)",
+                gemma2,
+                Eager,
+                10,
+                promoted(g2_head, g2_mlp / 64 * 2),
+                2_668_000_000,
+            ),
+            (
+                "Gemma 4 enhancer BF16 (f32 GeGLU)",
+                gemma4,
+                Eager,
+                14,
+                promoted(g4_head, g4_mlp),
+                6_411_000_000,
+            ),
+            (
+                "Gemma 4 enhancer Q4 (f32 GeGLU)",
+                gemma4,
+                Eager,
+                14,
+                promoted(g4_head, g4_mlp / 64 * 2),
+                4_659_000_000,
+            ),
+        ];
+        for (row, geometry, contract, prompt, promoted, measured) in cases {
+            let estimate =
+                estimate_mlx_request_bytes(prompt, 1, geometry, 0, 0, contract).unwrap() + promoted;
+            assert!(
+                estimate >= measured,
+                "{row}: estimate {estimate} < measured footprint {measured}"
+            );
+        }
+    }
+
+    /// sc-24446: the K/V caches hold whole 256-position blocks — over the committed positions and
+    /// over any verify width written past them — and a prompt-lookup / draft overshoot that
+    /// crosses into a new block charges the rest of that block.
+    ///
+    /// MUTATION: multiply the runtime K/V padding by zero, or drop `kv_overshoot_padding`, and
+    /// this goes RED.
+    #[test]
+    fn kv_block_padding_covers_committed_and_verify_positions() {
+        let g = LlmMemoryGeometry {
+            query_heads: 8,
+            kv_heads: 4,
+            head_dim: 64,
+            layers: 6,
+            element_bytes: 4,
+            score_element_bytes: 4,
+            hidden_size: 512,
+            intermediate_size: 1024,
+            vocab_size: 4096,
+            recurrent_bytes: 0,
+        };
+        let kv_position = 6 * 4 * 64 * 4 * 2;
+        let runtime =
+            |committed, width| mlx_runtime_request_bytes(8, committed, width, 8, g, true).unwrap();
+        // 10 committed positions allocate a whole block: 246 more than 256 committed do.
+        assert_eq!(runtime(10, 0) - runtime(256, 0), 246 * kv_position);
+        // Three verify positions past 255 committed: the three and the new block's rest.
+        assert_eq!(
+            runtime(255, 3) - runtime(255, 0),
+            (3 + 254 - 1) * kv_position
+        );
+        assert_eq!(kv_overshoot_padding(255, 3), Some(512 - (256 + 3)));
+        assert_eq!(kv_overshoot_padding(100, 3), Some(0));
+    }
+
+    /// sc-24446: a prompt-lookup verify step whose overshoot crosses into a new K/V block is
+    /// charged that block's rest, beyond the overshoot positions themselves.
+    ///
+    /// MUTATION: drop `kv_overshoot_padding` from `speculative_request_bytes` and this goes RED.
+    #[test]
+    fn a_lookup_overshoot_into_a_new_block_charges_the_block() {
+        let provider = causal_provider();
+        let g = provider.model.memory_geometry();
+        let kv_position = g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let rows = (g.hidden_size + g.vocab_size) * g.element_bytes;
+        let price = |route| {
+            provider
+                .speculative_request_bytes(route, None, 200, 50, 0)
+                .unwrap()
+        };
+        let off = price(SpeculativeRoute::Plain);
+        let lookup = price(SpeculativeRoute::PromptLookup { width: 8 });
+        // 250 committed positions + 8 overshoot = 258: a second block, 248 positions beyond.
+        assert_eq!(lookup - off, 8 * (kv_position + rows) + 248 * kv_position);
+    }
+
+    /// sc-24446: a decoder whose `param_groups` leaves a source it read unconsumed is refused at
+    /// load — the source would stay resident outside the admitted bound.
+    ///
+    /// MUTATION: drop the `leftover > 0` refusal from `materialize_decoder` and this goes RED.
+    #[test]
+    fn an_unconsumed_source_is_a_load_error() {
+        let dir = crate::test_fixture::Fixture::new("mlx-llm-leftover-", None);
+        let path = dir.join("model.safetensors");
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        Array::save_safetensors([("used", &a), ("orphan", &a)], None, &path).unwrap();
+        let mut w = Weights::from_file(&path).unwrap();
+        let used = w
+            .require("used")
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+        w.require("orphan").unwrap();
+        let err = materialize_decoder(&mut w, &[vec![used]]).unwrap_err();
+        assert!(err.to_string().contains("load materialization"), "{err}");
+    }
+
+    /// sc-24446: the in-flight window prices each command buffer's crossing op — a long eager
+    /// prefill's `prompt × prompt` score block per head, or a `prompt × inter` MLP activation —
+    /// not just the 50 MB per-buffer cap.
+    ///
+    /// MUTATION: drop the crossing op from the window and this goes RED.
+    #[test]
+    fn the_in_flight_window_prices_each_buffers_crossing_op() {
+        let g = LlmMemoryGeometry {
+            query_heads: 8,
+            kv_heads: 4,
+            head_dim: 256,
+            layers: 26,
+            element_bytes: 4,
+            score_element_bytes: 4,
+            hidden_size: 2304,
+            intermediate_size: 9216,
+            vocab_size: 256_000,
+            recurrent_bytes: 0,
+        };
+        let prompt = 8192u64;
+        let committed = prompt + 1;
+        let fixed = (round_up(committed, 256).unwrap() - committed) * (26 * 4 * 256 * 4 * 2)
+            + MLX_EVAL_BUFFER_WINDOW * MLX_MAX_OPS_PER_BUFFER * MLX_ALLOCATION_PAGE_BYTES
+            + MLX_REQUEST_WAKE_BYTES;
+        let in_flight = mlx_runtime_request_bytes(prompt as usize, committed, 0, prompt, g, true)
+            .unwrap()
+            - fixed;
+        let scores = prompt * prompt * 8 * 4;
+        assert!(
+            scores > prompt * 9216 * 4,
+            "the eager score block is the crossing op"
+        );
+        assert_eq!(
+            in_flight,
+            MLX_EVAL_BUFFER_WINDOW * (MLX_MAX_BUFFER_BYTES + scores)
+        );
+        assert!(in_flight > 10 * MLX_EVAL_BUFFER_WINDOW * MLX_MAX_BUFFER_BYTES);
+    }
+
+    /// The request estimate covers every one-token request working set the sc-24446 guarded
+    /// probes recorded on real weights (`native-memory-admission.md`: a second identical
+    /// one-token "Hi" request on the materialized model), computed from each model's geometry
+    /// and rendered prompt length. Recorded evidence, not a machine golden: the relation is
+    /// pinned. Two limits, both stated rather than hidden:
+    ///
+    /// * the probes recorded MLX's **active** peak, not `phys_footprint` (cache retention and
+    ///   host heap uncounted); the exact footprint working sets are pinned by
+    ///   `the_request_estimate_covers_the_exact_footprint_working_sets`;
+    /// * every Gemma row ran the `f32` GeGLU, so it is pinned with the promotion term — today
+    ///   that is the path a role pinned to `f32` (the LTX-2.5 text encoder) runs.
+    ///
+    /// Before sc-24446 the estimate was 6–9 MB for the Llama / Qwen3 cases (measured 35–87 MB)
+    /// and 14–31 MB for the Gemma cases (measured 2.4–5.4 GB).
+    #[test]
+    fn the_request_estimate_covers_the_recorded_one_token_working_sets() {
+        let geometry = |q, kv, hd, layers, hidden, inter, vocab, recurrent| LlmMemoryGeometry {
+            query_heads: q,
+            kv_heads: kv,
+            head_dim: hd,
+            layers,
+            element_bytes: 4,
+            score_element_bytes: 4,
+            hidden_size: hidden,
+            intermediate_size: inter,
+            vocab_size: vocab,
+            recurrent_bytes: recurrent,
+        };
+        let llama = geometry(32, 8, 64, 16, 2048, 8192, 128_256, 0);
+        let qwen3_small = geometry(16, 8, 128, 28, 2048, 6144, 151_936, 0);
+        let qwen3_8b = geometry(32, 8, 128, 36, 4096, 12_288, 151_936, 0);
+        let gemma2 = geometry(8, 4, 256, 26, 2304, 9216, 256_000, 0);
+        let gemma4 = geometry(16, 8, 256, 48, 3840, 15_360, 262_144, 0);
+        let qwen38 = frozen_dense_qwen35_config();
+        let qwen38_geometry = geometry(
+            24,
+            4,
+            256,
+            64,
+            5120,
+            17_408,
+            248_320,
+            64 * 48 * 128 * (128 + 4) * 4,
+        );
+        let qwen35 = MlxWorkspaceContract::Qwen35 {
+            config: &qwen38,
+            prism: false,
+        };
+        let (g2_head, g2_mlp) = (256_000 * 2304, 9216 * 2304);
+        let (g4_head, g4_mlp) = (262_144 * 3840, 15_360 * 3840);
+        let promoted = |head, largest| promoted_weight_bytes(head, largest).unwrap();
+        // (config, geometry, contract, rendered prompt tokens, promoted bytes, measured bytes)
+        let cases = [
+            (
+                "Llama 3.2 1B",
+                llama,
+                MlxWorkspaceContract::Chunked,
+                36,
+                0,
+                41_000_000u64,
+            ),
+            (
+                "Qwen3-1.7B",
+                qwen3_small,
+                MlxWorkspaceContract::Chunked,
+                13,
+                0,
+                46_000_000,
+            ),
+            (
+                "Qwen3-8B",
+                qwen3_8b,
+                MlxWorkspaceContract::Chunked,
+                13,
+                0,
+                87_000_000,
+            ),
+            ("Qwen3.8-27B", qwen38_geometry, qwen35, 13, 0, 236_000_000),
+            (
+                "Gemma 2 2B-it BF16",
+                gemma2,
+                MlxWorkspaceContract::Eager,
+                10,
+                promoted(g2_head, g2_mlp),
+                3_528_000_000,
+            ),
+            (
+                "Gemma 2 2B-it Q4",
+                gemma2,
+                MlxWorkspaceContract::Eager,
+                10,
+                promoted(g2_head, g2_mlp / 64 * 2),
+                2_426_000_000,
+            ),
+            (
+                "Gemma 4 enhancer BF16",
+                gemma4,
+                MlxWorkspaceContract::Eager,
+                14,
+                promoted(g4_head, g4_mlp),
+                5_416_000_000,
+            ),
+            (
+                "Gemma 4 enhancer Q4",
+                gemma4,
+                MlxWorkspaceContract::Eager,
+                14,
+                promoted(g4_head, g4_mlp / 64 * 2),
+                4_466_000_000,
+            ),
+        ];
+        for (config, geometry, contract, prompt, promoted, measured) in cases {
+            let estimate =
+                estimate_mlx_request_bytes(prompt, 1, geometry, 0, 0, contract).unwrap() + promoted;
+            assert!(
+                estimate >= measured,
+                "{config}: estimate {estimate} < measured {measured}"
+            );
+        }
+        assert!(promoted_weight_bytes(u64::MAX, 1).is_none());
+    }
+
+    /// E7 per request: held entries are reclaimable. A request short by exactly what the cache
+    /// holds is admitted after evicting it; one byte shorter still is refused and leaves the
+    /// cache as it was.
+    #[test]
+    fn a_request_reclaims_the_prefix_cache_up_to_the_admission_boundary() {
+        use core_llm::Speculative;
+        let provider = causal_provider();
+        run(
+            &provider,
+            &chat(vec![Message::user("t3 t9 t4")], Speculative::Off),
+        );
+        let held = provider.prefix_cache_resident_bytes();
+        assert!(held > 0);
+        let req = chat(vec![Message::user("t11 t12 t13 t14")], Speculative::Off);
+        let prompt = rendered_ids(&provider, &req, true);
+        let required = provider
+            .speculative_request_bytes(
+                SpeculativeRoute::Plain,
+                None,
+                prompt.len(),
+                req.max_new_tokens,
+                0,
+            )
+            .unwrap();
+        assert!(
+            required > held,
+            "the test needs a shortfall the cache can cover: {required} vs {held}"
+        );
+
+        {
+            let _budget = MemoryOverride::set(required - held - 1);
+            let err = provider.generate(&req, &mut |_| {}).unwrap_err();
+            assert!(
+                matches!(err, CoreError::RequestResourceExhausted(_)),
+                "{err}"
+            );
+            assert_eq!(
+                provider.prefix_cache_resident_bytes(),
+                held,
+                "kept on refusal"
+            );
+        }
+        {
+            let _budget = MemoryOverride::set(required - held);
+            let before = provider.prefix_cache_stats().evicted;
+            provider.generate(&req, &mut |_| {}).unwrap();
+            assert_eq!(
+                provider.prefix_cache_stats().evicted - before,
+                1,
+                "reclaimed"
+            );
+            assert_eq!(
+                provider.prefix.borrow().len(),
+                1,
+                "only this request's entry"
+            );
+        }
+    }
+
+    /// E7 for the snapshot a hybrid request leaves behind: admitted with the request when the
+    /// memory holds both, and at one byte short the request still runs — without keeping it.
+    #[test]
+    fn a_qwen35_request_keeps_its_snapshot_only_when_admission_holds_it() {
+        use core_llm::Speculative;
+        let req = chat(vec![Message::user("t3 t9 t4 t11")], Speculative::Off);
+        let probe = qwen35_mtp_provider();
+        let prompt = rendered_ids(&probe, &req, true);
+        let boundary = rendered_ids(&probe, &req, false).len();
+        let required = probe
+            .speculative_request_bytes(
+                SpeculativeRoute::Plain,
+                None,
+                prompt.len(),
+                req.max_new_tokens,
+                0,
+            )
+            .unwrap();
+        let snapshot = probe.prefix_snapshot_bytes(Some(boundary), false).unwrap();
+        {
+            let provider = qwen35_mtp_provider();
+            let _budget = MemoryOverride::set(required + snapshot - 1);
+            let out = provider.generate(&req, &mut |_| {}).unwrap();
+            let report = out.decode.unwrap();
+            assert_eq!(report.prefix_hit_tokens, 0);
+            assert!(provider.prefix.borrow().is_empty(), "no room: nothing kept");
+            let reason = report.prefix_cache.reason.unwrap();
+            assert!(reason.starts_with("not kept: admission"), "{reason}");
+        }
+        {
+            let provider = qwen35_mtp_provider();
+            let _budget = MemoryOverride::set(required + snapshot);
+            provider.generate(&req, &mut |_| {}).unwrap();
+            assert_eq!(
+                provider.prefix.borrow().keys(),
+                vec![prompt[..boundary].to_vec()]
+            );
+        }
+    }
+
+    /// sc-24446 (E5): a provider loads with the MLX defaults-table speculative default, and a
+    /// request that leaves the option unset runs whatever the provider's default is — here set to
+    /// `auto` so the hook is observable — while an explicit off (new or legacy spelling) wins.
+    #[test]
+    fn an_unset_speculative_option_runs_the_providers_default() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let mut provider =
+            LlamaProvider::load(&LoadSpec::dense(fixture.target.to_string_lossy())).unwrap();
+        assert_eq!(
+            provider.speculative_default(),
+            core_llm::defaults::MLX.speculative,
+            "loaded with the defaults table's default"
+        );
+        let prompt = &core_llm_testkit::draft_model_prompts()[0];
+        core_llm_testkit::check_speculative_default(
+            &provider,
+            core_llm::defaults::MLX.speculative,
+            prompt,
+            8,
+        );
+        provider.set_speculative_default(core_llm::Speculative::Auto);
+        core_llm_testkit::check_speculative_default(
+            &provider,
+            core_llm::Speculative::Auto,
+            prompt,
+            8,
+        );
+    }
+
     /// An 8-bit reader for the K8V8 identity whose backend the cache refuses to bind.
     #[derive(Debug)]
     struct UnbindableReader;
@@ -7486,7 +11664,13 @@ pub(crate) mod tests {
             row.min_context_tokens + 1024,
             true,
         );
-        let provider = load_tiny(&snapshot);
+        // No cross-turn prefix cache: its held entries are reclaimable memory admission would
+        // evict to fit (sc-24437, E7), and this pins the budget against the request alone.
+        let without_prefix_cache = |provider: LlamaProvider| {
+            *provider.prefix.borrow_mut() = PrefixCache::with_budget(0);
+            provider
+        };
+        let provider = without_prefix_cache(load_tiny(&snapshot));
         const NEW: u32 = 8;
         let prompt = kv_generate(&provider, words, Policy::Off, NEW)
             .usage
@@ -7528,7 +11712,7 @@ pub(crate) mod tests {
             (dense, compressed)
         );
 
-        let unbindable = load_tiny(&snapshot);
+        let unbindable = without_prefix_cache(load_tiny(&snapshot));
         #[allow(clippy::arc_with_non_send_sync)]
         let reader =
             crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(UnbindableReader));
@@ -7802,15 +11986,18 @@ pub(crate) mod tests {
                 prompt.len(),
                 admit_any_transition(),
             );
-            generate_with_timings_on(
+            // The production path: the engine's plain loop on the selected cache.
+            crate::decode::generate_prompt_lookup_on(
                 &model,
                 cache.as_mut(),
                 &prompt,
                 &config,
+                &crate::decode::SpeculativeConfig {
+                    max_ngram: 3,
+                    num_draft: 0,
+                },
                 &CancelFlag::new(),
                 &mut |_| {},
-                None,
-                None,
             )
             .unwrap();
             crate::kv_policy::compressed_report(Format::GroupAffineK8V8, refused, cache.as_ref())

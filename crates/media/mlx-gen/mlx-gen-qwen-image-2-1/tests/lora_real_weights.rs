@@ -19,7 +19,7 @@
 //!    **LoKr** run on one-reference edit pairs, then the same with/without comparison on a held-out
 //!    two-reference edit at every tier.
 //! 3. [`stacked_adapters_apply_with_independent_weights`] — both trained files stacked on one
-//!    load, each at its own strength.
+//!    load, each at its own strength, on the held-out ordered two-reference edit.
 //! 4. [`third_party_lora_applies_strictly_and_moves_every_tier`] — a public third-party 2.1 LoRA
 //!    (operator-supplied via `QWEN_IMAGE_2_1_THIRD_PARTY_LORA`; the lane runs it only when the
 //!    dispatch names one).
@@ -27,6 +27,10 @@
 //!    LoRA/LoKr and preserved MLX 1000-step LoRA, plus this candidate's corrected edit LoKr in
 //!    `edit`/`full` phases, on both routes at every tier. `probe` runs two training steps per mode
 //!    without renders; `edit` reuses the completed T2I file; `imports` runs only donor/public cells.
+//!    The retained style donor's T2I cells use its original style-only request and three dedicated
+//!    bare bases; the terminal edit phase therefore has 51 renders. Other donor requests stay fixed.
+//! 6. [`diagnostic_reused_t2i_style_direction`] — explicitly diagnostic-only six style renders
+//!    (three bare/adapted pairs), reusing the immutable original donor without training.
 //!
 //! EVERY TEST WRITES ITS EVIDENCE BEFORE IT ASSERTS. The PNGs and the `<test>.json` metrics
 //! (per-render mean |Δ|, the learned-direction scores, MLX active peaks, process footprint and the
@@ -60,6 +64,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use mlx_gen::gen_core;
 use mlx_gen::gen_core::weightsmeta::safetensors_file_metadata;
 use mlx_gen::gen_core::Conditioning;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
@@ -86,7 +91,7 @@ const ID: &str = "qwen_image_2_1";
 /// reaches the DiT moves an 8-step render by far more than 2/255.
 const ADAPTER_MOVES_FLOOR: f64 = 2.0;
 /// Mean |Δ| one stacked file at strength 1 must add over the other alone — the weaker of the two
-/// files (the edit LoKr, on a text-to-image render) must still be visible in the stack.
+/// files must still be visible in the held-out two-reference edit stack.
 const STACK_MOVES_FLOOR: f64 = 0.5;
 /// Mean RGB distance to the nearest training-palette colour ([`palette_distance`]) by which the T2I
 /// LoRA's render must be CLOSER to the palette than the bare base's, same prompt and seed — the "it
@@ -112,6 +117,8 @@ const RENDER_EDGE: u32 = 768;
 const RENDER_STEPS: u32 = 8;
 const SEED: u64 = 24163;
 const TRAIN_EDGE: u32 = 512;
+/// Edit-only native targets match 768 evaluation; T2I and evaluation key remain 512.
+const EDIT_TRAIN_EDGE: u32 = edit_training_balanced64::EDGE;
 /// Learning rate of both training runs: the product presets' rate for every Qwen-Image 2.1 target
 /// (`qwen_image_2_1_lora.*` / `qwen_image_2_1_edit_lora.*` balanced = 1e-4). The first real-weight
 /// run (inference run 37122808826) trained the T2I LoRA at 1e-3 and DIVERGED within five AdamW
@@ -123,14 +130,18 @@ const TRAIN_LR: f32 = 1e-4;
 const T2I_ADAPTER: &str = "qwen21_t2i_lora.safetensors";
 const EDIT_ADAPTER: &str = "qwen21_edit_lokr.safetensors";
 
-const T2I_EVAL_PROMPT: &str = "zxq style, a lighthouse on a rocky coast at dusk";
-const EDIT_INSTRUCTION: &str =
-    "zxq edit: invert each RGB colour channel of image 1 independently, then quantize each channel to the four numeric levels 0, 85, 170, 255 shown in image 2; preserve the shapes and keep the result in colour";
-const TRAIN_EDIT_INSTRUCTION: &str =
-    "zxq edit: invert each RGB colour channel of image 1 independently, then quantize each channel to the four numeric levels 0, 85, 170, 255; preserve the shapes and keep the result in colour";
+#[path = "support/edit_protocol.rs"]
+pub(crate) mod edit_protocol;
+#[path = "support/edit_training_balanced64.rs"]
+mod edit_training_balanced64;
+#[path = "support/stack_protocol.rs"]
+mod stack_protocol;
+#[path = "support/style_protocol.rs"]
+mod style_protocol;
+use edit_protocol::{EDIT_INSTRUCTION, T2I_EVAL_PROMPT, TRAIN_EDIT_INSTRUCTION};
 
 /// The T2I training style: concentric rings in exactly these three colours.
-const PALETTE: [[u8; 3]; 3] = [[0, 150, 150], [240, 120, 20], [250, 220, 60]];
+const PALETTE: [[u8; 3]; 3] = style_protocol::PALETTE;
 /// RGB distance under which a pixel counts as "a palette colour".
 const PALETTE_RADIUS: f64 = 60.0;
 
@@ -158,7 +169,7 @@ fn tier_snapshot() -> PathBuf {
     )
 }
 
-fn out_dir() -> PathBuf {
+pub(crate) fn out_dir() -> PathBuf {
     let dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
@@ -187,6 +198,19 @@ fn training_steps(var: &str, default: u32) -> u32 {
 }
 
 #[test]
+fn edit_native768_training_keeps_t2i_and_evaluation_key_at512() {
+    assert_eq!(TRAIN_EDGE, 512);
+    assert_eq!(EDIT_TRAIN_EDGE, 768);
+    assert_eq!(RENDER_EDGE, 768);
+    let key = edit_key(TRAIN_EDGE);
+    assert_eq!(key.dimensions(), (512, 512));
+    assert_eq!(
+        format!("{:x}", Sha256::digest(key.as_raw())),
+        "9daf9ba30effd6474517bbe3be68b131e0a417bccecb9d21bfd5b6658d4408e8"
+    );
+}
+
+#[test]
 fn edit_instruction_and_target_use_independent_rgb_levels() {
     let source = image::RgbImage::from_pixel(1, 1, image::Rgb([0, 85, 170]));
     assert_eq!(edit_transform(&source).get_pixel(0, 0).0, [255, 170, 85]);
@@ -194,7 +218,9 @@ fn edit_instruction_and_target_use_independent_rgb_levels() {
     assert!(EDIT_INSTRUCTION.contains("keep the result in colour"));
     assert_eq!(
         TRAIN_EDIT_INSTRUCTION,
-        EDIT_INSTRUCTION.replace(" shown in image 2", "")
+        EDIT_INSTRUCTION
+            .strip_suffix(edit_protocol::PALETTE_ROLE)
+            .unwrap()
     );
 }
 
@@ -207,7 +233,7 @@ fn tiers() -> [(&'static str, Option<Quant>); 3] {
     ]
 }
 
-fn tier_spec(label: &str, quant: Option<Quant>) -> LoadSpec {
+pub(crate) fn tier_spec(label: &str, quant: Option<Quant>) -> LoadSpec {
     match quant {
         None => LoadSpec::new(WeightsSource::Dir(snapshot())),
         Some(quant) => {
@@ -221,9 +247,9 @@ fn tier_spec(label: &str, quant: Option<Quant>) -> LoadSpec {
 /// A 50 ms `phys_footprint` sampler that keeps a resettable phase high-water mark and aborts the
 /// process above the ceiling (writing a marker into the evidence dir first).
 #[path = "support/physical_watchdog.rs"]
-mod physical_watchdog;
+pub(crate) mod physical_watchdog;
 
-fn host_census() -> (physical_watchdog::Host, Value) {
+pub(crate) fn host_census() -> (physical_watchdog::Host, Value) {
     use std::process::Command;
     let command = |program: &str, args: &[&str]| {
         let result = Command::new(program)
@@ -272,7 +298,7 @@ fn host_census() -> (physical_watchdog::Host, Value) {
     (host, receipt)
 }
 
-struct Footprint {
+pub(crate) struct Footprint {
     phase_max: Arc<AtomicU64>,
     ceiling: Arc<AtomicU64>,
     explicit_cap: Option<u64>,
@@ -281,8 +307,23 @@ struct Footprint {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+struct MlxCacheAllocator;
+
+impl physical_watchdog::CacheAllocator for MlxCacheAllocator {
+    fn set_cache_limit(&self, limit: usize) -> usize {
+        mlx_rs::memory::set_cache_limit(limit)
+    }
+
+    fn clear_cache(&self) {
+        // MLX's cache is process-local. This releases only freed buffers owned by
+        // this native evidence process before any large weight load begins.
+        mlx_rs::memory::clear_cache();
+    }
+}
+
 impl Footprint {
-    fn start(out: &Path) -> Self {
+    pub(crate) fn start(out: &Path) -> Self {
         use std::io::Write;
         let explicit_cap = std::env::var("QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB")
             .ok()
@@ -384,33 +425,104 @@ impl Footprint {
         }
     }
 
-    fn admit_training(&self, preflight: &Value) {
+    fn admit_training(
+        &self,
+        preflight: &Value,
+    ) -> physical_watchdog::ScopedCacheGrant<MlxCacheAllocator> {
         let (mut host, census) = host_census();
-        host.cache_limit = host
-            .cache_limit
-            .min(preflight["requestedCacheLimitBytes"].as_u64().unwrap());
+        let requested_cache = preflight["requestedCacheLimitBytes"].as_u64().unwrap();
+        let previous_cache = host.cache_limit;
+        host.cache_limit = previous_cache.min(requested_cache);
         let envelope = preflight["peakBytes"].as_u64().unwrap();
         let result = physical_watchdog::admit(host, envelope, self.explicit_cap);
+        let grant = match result {
+            Ok(grant) => grant,
+            Err(error) => {
+                let receipt = json!({"host": census, "preflight": preflight,
+                    "requestedCacheLimitBytes": requested_cache,
+                    "previousCacheLimitBytes": previous_cache,
+                    "refusal": error,
+                    "policy": "checked_preflight_plus_measured_overhead_plus_scoped_cache_grant_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
+                std::fs::write(
+                    self.out.join("physical-admission.json"),
+                    serde_json::to_vec_pretty(&receipt).unwrap(),
+                )
+                .unwrap();
+                panic!("selected training case cannot safely fit; see physical-admission.json");
+            }
+        };
+        let cache = physical_watchdog::ScopedCacheGrant::enter(MlxCacheAllocator, grant)
+        .unwrap_or_else(|error| {
+            let receipt = json!({"host": census.clone(), "preflight": preflight,
+                "requestedCacheLimitBytes": requested_cache,
+                "admissionGrant": format!("{grant:?}"), "refusal": error,
+                "policy": "checked_preflight_plus_measured_overhead_plus_scoped_cache_grant_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
+            std::fs::write(
+                self.out.join("physical-admission.json"),
+                serde_json::to_vec_pretty(&receipt).unwrap(),
+            )
+            .unwrap();
+            panic!("allocator cache grant could not be installed; see physical-admission.json");
+        });
+        let effective_cache_bytes =
+            u64::try_from(cache.effective()).expect("allocator cache limit fits receipt u64");
+        let full_envelope = envelope
+            .checked_add(grant.nonallocator_overhead)
+            .and_then(|bytes| bytes.checked_add(effective_cache_bytes))
+            .expect("admitted full envelope stays representable");
+        assert!(
+            full_envelope <= grant.physical_ceiling,
+            "installed cache grant exceeds admitted physical ceiling"
+        );
         let receipt = json!({"host": census, "preflight": preflight,
-            "requestedPoolBoundBytes": host.cache_limit, "physicalCeilingBytes": result.as_ref().ok(),
-            "refusal": result.as_ref().err(), "policy": "preflight_plus_measured_overhead_and_cache_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
+            "requestedCacheLimitBytes": requested_cache,
+            "previousCacheLimitBytes": cache.previous(),
+            "effectiveCacheLimitBytes": effective_cache_bytes,
+            "nonallocatorOverheadBytes": grant.nonallocator_overhead,
+            "activeEnvelopeBytes": grant.active_envelope,
+            "fullEnvelopeBytes": full_envelope,
+            "physicalCeilingBytes": grant.physical_ceiling,
+            "refusal": Value::Null,
+            "policy": "checked_preflight_plus_measured_overhead_plus_scoped_cache_grant_constrained_by_available_RAM_recommended_MLX_and_explicit_cap"});
         std::fs::write(
             self.out.join("physical-admission.json"),
             serde_json::to_vec_pretty(&receipt).unwrap(),
         )
         .unwrap();
-        let ceiling =
-            result.expect("selected training case cannot safely fit; see physical-admission.json");
-        self.ceiling.store(ceiling, Ordering::Relaxed);
-        eprintln!("admitted training: preflight={envelope} physicalCeiling={ceiling} bytes");
+        self.ceiling
+            .store(grant.physical_ceiling, Ordering::Relaxed);
+        eprintln!(
+            "admitted training: preflight={envelope} requestedCache={requested_cache} \
+             effectiveCache={} fullEnvelope={full_envelope} physicalCeiling={} bytes",
+            effective_cache_bytes, grant.physical_ceiling
+        );
+        cache
     }
 
-    fn begin(&self) {
+    #[allow(dead_code)] // Used only by the cfg(test) library diagnostic, not this integration binary.
+    pub(crate) fn admit_numeric(&self, active_envelope: u64, free_cache: u64) {
+        let (host, census) = host_census();
+        // Reserve the entire frozen allowance even if the allocator was already
+        // capped lower. This estimate never modifies the actual allocator policy.
+        let cap = self.explicit_cap.unwrap_or(100_000_000_000);
+        let result =
+            physical_watchdog::admit_numeric_full(host, active_envelope, free_cache, Some(cap));
+        let receipt = json!({"kind": "DIAGNOSTIC_ONLY", "host": census,
+            "activeEnvelopeBytes": active_envelope, "freeCacheAllowanceBytes": free_cache,
+            "actualAllocatorCacheLimitBytes": host.cache_limit,
+            "explicitOrDefaultCapBytes": cap, "physicalCeilingBytes": result.as_ref().ok(),
+            "refusal": result.as_ref().err(), "reservesUnchanged": true});
+        write_json(&self.out, "numeric-physical-admission", &receipt);
+        let ceiling = result.expect("numeric diagnostic cannot safely fit; receipt retained");
+        self.ceiling.store(ceiling, Ordering::Relaxed);
+    }
+
+    pub(crate) fn begin(&self) {
         mlx_rs::memory::reset_peak_memory();
         self.phase_max.store(0, Ordering::Relaxed);
     }
 
-    fn end(&self) -> (u64, u64) {
+    pub(crate) fn end(&self) -> (u64, u64) {
         let (fp, _) = phys_footprint();
         (
             mlx_rs::memory::get_peak_memory() as u64,
@@ -434,7 +546,7 @@ fn gib(bytes: u64) -> f64 {
 
 // ── image metrics ────────────────────────────────────────────────────────────────────────────────
 
-fn mean_abs_diff(a: &Image, b: &Image) -> f64 {
+pub(crate) fn mean_abs_diff(a: &Image, b: &Image) -> f64 {
     assert_eq!((a.width, a.height), (b.width, b.height), "geometry differs");
     assert_eq!(a.pixels.len(), b.pixels.len(), "byte length differs");
     let sum: u64 = a
@@ -483,22 +595,7 @@ fn static_row_fraction(img: &Image) -> f64 {
 /// [`palette_fraction`]: it moves with every partial shift toward the style, not only once a pixel
 /// lands inside [`PALETTE_RADIUS`].
 fn palette_distance(img: &Image) -> f64 {
-    let px = img.pixels.chunks_exact(3);
-    let n = px.len().max(1) as f64;
-    px.map(|px| {
-        PALETTE
-            .iter()
-            .map(|c| {
-                px.iter()
-                    .zip(c)
-                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
-                    .sum::<f64>()
-                    .sqrt()
-            })
-            .fold(f64::INFINITY, f64::min)
-    })
-    .sum::<f64>()
-        / n
+    style_protocol::palette_distance(&img.pixels)
 }
 
 fn palette_fraction(img: &Image) -> f64 {
@@ -556,13 +653,13 @@ fn save_png(path: &Path, img: &Image) {
     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-fn write_json(out: &Path, name: &str, value: &Value) {
+pub(crate) fn write_json(out: &Path, name: &str, value: &Value) {
     let path = out.join(format!("{name}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(value).unwrap()).unwrap();
     eprintln!("wrote {}", path.display());
 }
 
-fn sha256_file(path: &Path) -> String {
+pub(crate) fn sha256_file(path: &Path) -> String {
     let mut file = std::fs::File::open(path).unwrap();
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 65536];
@@ -588,9 +685,12 @@ fn dataset_receipt(items: &[TrainingItem]) -> Value {
         "referenceCount": item.reference_image_paths.len(),
         "orderedReferences": item.reference_image_paths.iter().map(|path| file(path)).collect::<Vec<_>>(),
     })).collect();
-    // Hash binds item/reference order, captions and exact source bytes, independent of host paths.
+    // serde_json's preserve_order feature is unified by the workspace. Canonicalize every
+    // object's keys explicitly, while retaining item/reference array order and exact bytes.
+    let mut rows = Value::Array(rows);
+    rows.sort_all_objects();
     let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&rows).unwrap()));
-    json!({"sha256": hash, "hashSchema": "sha256(serde_json ordered rows with file byte hashes)", "items": rows})
+    json!({"sha256": hash, "hashSchema": "sha256(recursively key-sorted JSON rows; ordered item/reference arrays; file byte hashes)", "items": rows})
 }
 
 #[test]
@@ -621,6 +721,41 @@ fn dataset_hash_binds_caption_bytes_and_reference_order() {
     assert_ne!(original["sha256"], dataset_receipt(&items)["sha256"]);
 }
 
+#[test]
+fn dataset_hash_canonicalizes_nested_objects_without_reordering_items() {
+    let guard = tempfile::tempdir().unwrap();
+    let target = guard.path().join("target.png");
+    let source = guard.path().join("source.png");
+    let key = guard.path().join("key.png");
+    std::fs::write(&target, [1]).unwrap();
+    std::fs::write(&source, [2]).unwrap();
+    std::fs::write(&key, [3]).unwrap();
+    let mut items = vec![
+        TrainingItem::edit_pair(target.clone(), "first".into(), vec![source.clone(), key]),
+        TrainingItem::edit_pair(target, "second".into(), vec![source]),
+    ];
+    let receipt = dataset_receipt(&items);
+    let mut canonical_rows = receipt["items"].clone();
+    canonical_rows.sort_all_objects();
+    assert_eq!(
+        serde_json::to_vec(&receipt["items"]).unwrap(),
+        serde_json::to_vec(&canonical_rows).unwrap(),
+        "nested file objects and item objects must serialize canonically under preserve_order"
+    );
+    assert_eq!(receipt["items"][0]["caption"], "first");
+    assert_eq!(receipt["items"][1]["caption"], "second");
+    assert_eq!(
+        receipt["items"][0]["orderedReferences"][0]["file"],
+        "source.png"
+    );
+    assert_eq!(
+        receipt["items"][0]["orderedReferences"][1]["file"],
+        "key.png"
+    );
+    items.reverse();
+    assert_ne!(receipt["sha256"], dataset_receipt(&items)["sha256"]);
+}
+
 // ── synthetic datasets (deterministic; no fetched or checked-in photographs) ─────────────────────
 
 /// A tiny LCG so every synthetic image is reproducible bit for bit.
@@ -635,7 +770,7 @@ impl Lcg {
     }
 }
 
-fn to_image(img: image::RgbImage) -> Image {
+pub(crate) fn to_image(img: image::RgbImage) -> Image {
     Image {
         width: img.width(),
         height: img.height(),
@@ -657,7 +792,7 @@ fn ring_image(index: u32, edge: u32) -> image::RgbImage {
 }
 
 /// One edit source: a vertical gradient with five seeded discs of seeded colours.
-fn edit_source(seed: u64, edge: u32) -> image::RgbImage {
+pub(crate) fn edit_source(seed: u64, edge: u32) -> image::RgbImage {
     let mut rng = Lcg(seed);
     let discs: Vec<(f32, f32, f32, [u8; 3])> = (0..5)
         .map(|_| {
@@ -689,20 +824,19 @@ fn edit_source(seed: u64, edge: u32) -> image::RgbImage {
     })
 }
 
-/// The edit key (reference 2): four vertical grey bands — the posterize levels.
-fn edit_key(edge: u32) -> image::RgbImage {
-    image::RgbImage::from_fn(edge, edge, |x, _| {
-        let level = (x * 4 / edge).min(3) as u8 * 85;
-        image::Rgb([level, level, level])
+/// Reference 2 is a color palette, not a competing monochrome layout.
+pub(crate) fn edit_key(edge: u32) -> image::RgbImage {
+    image::RgbImage::from_fn(edge, edge, |x, y| {
+        image::Rgb(edit_protocol::palette_pixel(x, y, edge))
     })
 }
 
 /// The trained edit: invert, then posterize every channel to the key's four levels.
-fn edit_transform(src: &image::RgbImage) -> image::RgbImage {
+pub(crate) fn edit_transform(src: &image::RgbImage) -> image::RgbImage {
     let mut out = src.clone();
     for px in out.pixels_mut() {
         for v in px.0.iter_mut() {
-            *v = ((255 - *v) / 64).min(3) * 85;
+            *v = edit_protocol::transformed_channel(*v);
         }
     }
     out
@@ -712,7 +846,7 @@ fn edit_transform(src: &image::RgbImage) -> image::RgbImage {
 
 /// Load `spec` through the explicit catalog, render `req` once, write `<out>/<label>.png`, and
 /// return the image plus its timing / memory / predicted-overlay facts.
-fn render(
+pub(crate) fn render(
     label: &str,
     spec: &LoadSpec,
     req: &GenerationRequest,
@@ -768,7 +902,7 @@ fn render(
     (image, facts)
 }
 
-fn adapter(path: &Path, scale: f32, kind: AdapterKind) -> AdapterSpec {
+pub(crate) fn adapter(path: &Path, scale: f32, kind: AdapterKind) -> AdapterSpec {
     AdapterSpec::new(path.to_path_buf(), scale, kind)
 }
 
@@ -838,7 +972,9 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let predicted_peak_bytes = preflight["peakBytes"]
         .as_u64()
         .expect("exact envelope bytes");
-    guard.admit_training(&preflight);
+    // The returned task-owned guard is installed before the first large weight load and retained
+    // through `Trainer::train`; its Drop restores the caller's allocator policy on every exit.
+    let cache_grant = guard.admit_training(&preflight);
     let predicted_peak_gib = predicted_message
         .split("derived peak memory is ~")
         .nth(1)
@@ -930,6 +1066,9 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let remaining_steps = guard.end();
     drop(trainer);
     mlx_rs::memory::clear_cache();
+    let installed_cache_limit =
+        u64::try_from(cache_grant.effective()).expect("allocator cache limit fits u64");
+    drop(cache_grant);
     let (caching_peak, caching_footprint) = caching_peaks.unwrap_or((0, 0));
     let (train_peak, train_footprint) = training_peaks::aggregate_training_peaks(
         (caching_peak, caching_footprint),
@@ -938,11 +1077,12 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let resident = resident_after_first_step.unwrap_or(0);
     eprintln!(
         "trained in {seconds:.0}s: conservative cache/step peak {:.2} GiB (resident after step 1 {:.2} + \
-         high-water excess {:.2}) vs preflight train ~{} GiB",
+         high-water excess {:.2}) vs preflight train ~{} GiB; scoped cache grant {:.2} GiB restored",
         gib(train_peak),
         gib(resident),
         gib(train_peak.saturating_sub(resident)),
-        predicted_train_gib.map_or("?".into(), |g| format!("{g:.1}"))
+        predicted_train_gib.map_or("?".into(), |g| format!("{g:.1}")),
+        gib(installed_cache_limit),
     );
 
     if output.adapter_path != canonical {
@@ -1097,7 +1237,7 @@ fn assert_overlay_not_underpredicted(label: &str, base: &Value, adapted: &Value)
     );
 }
 
-fn t2i_request() -> GenerationRequest {
+pub(crate) fn t2i_request() -> GenerationRequest {
     GenerationRequest {
         prompt: T2I_EVAL_PROMPT.to_owned(),
         width: RENDER_EDGE,
@@ -1106,6 +1246,34 @@ fn t2i_request() -> GenerationRequest {
         seed: Some(SEED),
         ..Default::default()
     }
+}
+
+fn original_style_request() -> GenerationRequest {
+    GenerationRequest {
+        prompt: style_protocol::ORIGINAL_STYLE_PROMPT.to_owned(),
+        ..t2i_request()
+    }
+}
+
+fn direction_request_facts(request: &GenerationRequest) -> Value {
+    json!({"prompt": request.prompt, "width": request.width, "height": request.height,
+        "steps": request.steps, "seed": request.seed, "guidance": request.guidance,
+        "strength": request.strength, "count": request.count,
+        "negativePrompt": request.negative_prompt, "trueCfg": request.true_cfg,
+        "conditioningCount": request.conditioning.len()})
+}
+
+fn verify_original_style_donor(entry: &Value, file: &Path) {
+    assert_eq!(entry["name"], style_protocol::DONOR_NAME);
+    assert_eq!(entry["kind"], "lora");
+    assert_eq!(entry["origin"], "MLX run 37127726908");
+    assert_eq!(entry["sha256"], style_protocol::DONOR_SHA256);
+    assert_eq!(entry["size"], style_protocol::DONOR_BYTES);
+    assert_eq!(
+        std::fs::metadata(file).unwrap().len(),
+        style_protocol::DONOR_BYTES
+    );
+    assert_eq!(sha256_file(file), style_protocol::DONOR_SHA256);
 }
 
 // ── 1. text-to-image LoRA ────────────────────────────────────────────────────────────────────────
@@ -1294,13 +1462,21 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
     let key_path = data.join("key.png");
     let key = edit_key(TRAIN_EDGE);
     key.save(&key_path).unwrap();
-    let items: Vec<TrainingItem> = (0..6u64)
+    let mut raw_rgb_audits = Vec::new();
+    let items: Vec<TrainingItem> = (0..edit_training_balanced64::ITEMS)
         .map(|i| {
-            let src = edit_source(1000 + i, TRAIN_EDGE);
+            let src = image::RgbImage::from_fn(EDIT_TRAIN_EDGE, EDIT_TRAIN_EDGE, |x, y| {
+                image::Rgb(edit_training_balanced64::training_pixel(i, x, y, EDIT_TRAIN_EDGE))
+            });
+            let target = edit_transform(&src);
+            let audit = edit_training_balanced64::audit(i, src.as_raw(), target.as_raw());
+            raw_rgb_audits.push(json!({"index":i,"sourceRawRgbSha256":audit.source_sha256,
+                "targetRawRgbSha256":audit.target_sha256,"targetColours":64,"pixelsPerTargetColour":9216,
+                "distinctSourceBytesPerChannel":256,"sourcePixelsPerValueByChannel":audit.source_channel_counts}));
             let src_path = data.join(format!("src_{i}.png"));
             let tgt_path = data.join(format!("tgt_{i}.png"));
             src.save(&src_path).unwrap();
-            edit_transform(&src).save(&tgt_path).unwrap();
+            target.save(&tgt_path).unwrap();
             TrainingItem::edit_pair(tgt_path, TRAIN_EDIT_INSTRUCTION.into(), vec![src_path])
         })
         .collect();
@@ -1313,7 +1489,7 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
             learning_rate: TRAIN_LR,
             steps,
             gradient_checkpointing: true,
-            resolution: TRAIN_EDGE,
+            resolution: EDIT_TRAIN_EDGE,
             save_every: 0,
             seed: 42,
             optimizer: "adamw".into(),
@@ -1325,15 +1501,49 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
+    assert!(req.items.iter().all(
+        |item| item.caption == TRAIN_EDIT_INSTRUCTION && item.reference_image_paths.len() == 1
+    ));
+    assert!(
+        edit_training_balanced64::recipe_is_fixed(
+            edit_training_balanced64::Recipe {
+                items: req.items.len(),
+                rank: req.config.rank,
+                alpha: req.config.alpha,
+                learning_rate: req.config.learning_rate,
+                seed: req.config.seed,
+                checkpointing: req.config.gradient_checkpointing,
+                edge: req.config.resolution,
+                references: req.items[0].reference_image_paths.len(),
+                steps: req.config.steps,
+                lokr: req.config.network_type == NetworkType::Lokr,
+                adamw: req.config.optimizer == "adamw",
+            },
+            std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1")
+        ),
+        "balanced64 training recipe drift refused before admission"
+    );
     let protocol = json!({
         "kind": "representative_one_reference_training_two_reference_evaluation",
         "trainingReferenceCount": 1, "evaluationReferenceCount": 2,
         "trainingCaption": TRAIN_EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
-        "trainingTargetEdge": TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
-        "evaluationTargetEdge": RENDER_EDGE, "stepsRequested": steps,
+        "trainingTargetEdge": EDIT_TRAIN_EDGE, "trainingReferenceNativeEdge": EDIT_TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
+        "evaluationTargetEdge": RENDER_EDGE, "evaluationKeyNativeEdge": TRAIN_EDGE, "stepsRequested": steps,
         "dataset": dataset_receipt(&req.items), "evaluationKeySha256": sha256_file(&key_path),
+        "trainingDataRecipe": {"version":edit_training_balanced64::VERSION,"frozenPlanSha256":edit_training_balanced64::PLAN_SHA256,
+            "rawRgbAudits":raw_rgb_audits,"heldoutSource99UsedForTraining":false,
+            "itemExposuresAt120RoundRobinSteps":20,"targetAuthority":"unchanged edit_transform(source)",
+            "nativeCoordinateMap":"floor(2*x/3), floor(2*y/3) into the fixed logical512 layouts; physical mapping is not bijective",
+            "sourceDistribution":"red/green each2304; blue items0/1 2048..2560 and items2..5 1536..3072 pixels/value; all256values covered",
+            "referencePreprocessing":"native768 source is independently Lanczos RGBA fitted to1024 for both vision/VAE; actual fitted content differs from the historical512 source",
+            "scopeLimit":"matching target768 geometry does not remove training-texture/heldout-content, one/two reference or denseBF16/packedQ4 gaps; Q4 cause remains unproven"},
         "historicalTwoReferenceTrainingEvidence": "retained only at its original source SHA",
     });
+    assert_eq!(
+        protocol["dataset"]["sha256"].as_str().unwrap(),
+        edit_training_balanced64::DATASET_PNG_SHA256,
+        "native768 training PNG dataset must match the frozen CPU receipt before admission"
+    );
     // Persist the disclosed protocol before admission, so even an explicit refusal is attributable.
     write_json(&out, "edit-training-protocol", &protocol);
     let mut trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
@@ -1421,7 +1631,9 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
 
 // ── 3. two stacked adapters, independent strengths ───────────────────────────────────────────────
 
-/// Both trained files on ONE bf16 load, each at its own strength, on the T2I eval render. Asserts:
+/// Both trained files on ONE bf16 load, each at its own strength, on the same held-out edit
+/// as learned evaluation (source 99 at native768, palette key at native512, both fitted by the
+/// production reference helper). Transfer keeps its separate native768 palette key. Asserts:
 /// `[t2i@1, edit@0]` is byte-identical to `[t2i@1]` and `[t2i@0, edit@1]` to `[edit@1]` (a
 /// strength reaches only its own file); `[t2i@1, edit@1]` differs from each single file by at
 /// least [`STACK_MOVES_FLOOR`] (both contribute); halving the T2I strength inside the stack moves
@@ -1443,7 +1655,54 @@ fn stacked_adapters_apply_with_independent_weights() {
         );
     }
     let spec = tier_spec("bf16", None);
-    let request = t2i_request();
+    let request = stack_protocol::request(
+        to_image(edit_source(99, RENDER_EDGE)),
+        to_image(edit_key(TRAIN_EDGE)),
+    );
+    let references = mlx_gen_qwen_image_2_1::collect_references(&request).unwrap();
+    let vision = mlx_gen_qwen_image_2_1::load_vision_config(&snapshot())
+        .unwrap()
+        .expect("two-reference stack requires the snapshot's vision configuration");
+    let fitted_sizes: Vec<_> = references
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            mlx_gen_qwen_image_2_1::reference::reference_fit(
+                (image.width, image.height),
+                index,
+                &vision,
+            )
+            .unwrap()
+        })
+        .collect();
+    let inputs = stack_protocol::reference_receipt(&references, &fitted_sizes);
+    assert_eq!(request.memory_reference_count(), 2);
+    assert!(fitted_sizes.iter().all(|size| *size == (1024, 1024)));
+    let tile_edge = mlx_gen_qwen_image_2_1::pipeline::decode_tiling(&request)
+        .and_then(|t| t.spatial)
+        .map(|s| s.tile_px as u32);
+    // The same derived request budget production installs; the two-reference encode/joint
+    // sequence is priced here, never the old T2I transient. This remains an estimate, not
+    // physical admission or a measurement; the existing physical watchdog remains in force.
+    let transient =
+        mlx_gen_qwen_image_2_1::memory_strategy::derived::request_transient_budget_bytes(
+            request.width,
+            request.height,
+            mlx_gen_qwen_image_2_1::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
+            request.memory_reference_count(),
+            false,
+            tile_edge,
+        );
+    let protocol = json!({"kind":"heldout_two_reference_stack_evaluation",
+        "request":direction_request_facts(&request),"inputs":inputs,
+        "renderCount":6,"tier":"bf16","transientBudgetBytes":transient,
+        "conditioningTokensEstimate":mlx_gen_qwen_image_2_1::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
+        "forecastProvenance":"production derived request allocator budget; NOT measured or physical admission",
+        "decodeTileEdge":tile_edge,"stackMovementFloor":STACK_MOVES_FLOOR,
+        "adapters":[{"kind":"lora","sha256":sha256_file(&t2i)},
+                    {"kind":"lokr","sha256":sha256_file(&edit)}]});
+    // Persist geometry, reference hashes and forecast before any stack weight load/render.
+    write_json(&out, "two-reference-stack-protocol", &protocol);
     let stacks: [(&str, Vec<AdapterSpec>); 6] = [
         ("t2i_1", vec![adapter(&t2i, 1.0, AdapterKind::Lora)]),
         ("edit_1", vec![adapter(&edit, 1.0, AdapterKind::Lokr)]),
@@ -1479,13 +1738,22 @@ fn stacked_adapters_apply_with_independent_weights() {
     let mut rendered = BTreeMap::new();
     let mut facts = Vec::new();
     for (label, stack) in stacks {
-        let (img, f) = render(
-            label,
-            &spec.clone().with_adapters(stack),
-            &request,
-            &guard,
-            &out,
-        );
+        let stack_spec = spec.clone().with_adapters(stack);
+        let contract = memory_strategy_contract(ID, &stack_spec).unwrap();
+        let allocator_resident =
+            mlx_gen_qwen_image_2_1::memory_strategy::derived::resident_weights(
+                mlx_gen_qwen_image_2_1::Tier::Bf16,
+            )
+            .resident_total()
+            .saturating_add(contract.asset_facts.overlay_bytes);
+        let (img, mut f) = render(label, &stack_spec, &request, &guard, &out);
+        f["route"] = json!("two_reference_edit");
+        f["referenceCount"] = json!(request.memory_reference_count());
+        f["inputs"] = inputs.clone();
+        f["request"] = direction_request_facts(&request);
+        f["transientBudgetBytes"] = json!(transient);
+        f["allocatorResidentBytes"] = json!(allocator_resident);
+        f["allocatorMemoryLimitBytes"] = json!(allocator_resident.saturating_add(transient));
         facts.push(f);
         rendered.insert(label, img);
     }
@@ -1506,7 +1774,7 @@ fn stacked_adapters_apply_with_independent_weights() {
     write_json(
         &out_dir(),
         "stacked_adapters",
-        &json!({"renders": facts, "comparisons": comparisons}),
+        &json!({"protocol":protocol,"renders": facts, "comparisons": comparisons}),
     );
 
     for (label, img) in &rendered {
@@ -1650,6 +1918,9 @@ fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
             entry["sha256"].as_str().unwrap(),
             "transferred adapter hash"
         );
+        if entry["name"] == style_protocol::DONOR_NAME {
+            verify_original_style_donor(entry, &file);
+        }
         let kind = match entry["kind"].as_str().unwrap() {
             "lora" => AdapterKind::Lora,
             "lokr" => AdapterKind::Lokr,
@@ -1712,28 +1983,52 @@ fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
                 &guard,
                 &out,
             );
+            // The retained style donor was trained/evaluated before the mixed edit-prefix
+            // diagnostic. Its learned direction uses that frozen request and its own base.
+            let style_request = original_style_request();
+            let style_base = (mode == "t2i").then(|| {
+                render(
+                    &format!("{tier}_t2i_original_style_base"),
+                    &spec,
+                    &style_request,
+                    &guard,
+                    &out,
+                )
+            });
             for (name, file, kind) in &imports {
                 let label = format!("{tier}_{mode}_{name}");
+                let (paired_base, paired_base_facts, paired_request) =
+                    if style_protocol::uses_original_style_request(name, mode) {
+                        let (image, facts) = style_base.as_ref().unwrap();
+                        (image, facts, &style_request)
+                    } else {
+                        (&base, &base_facts, &request)
+                    };
                 let (adapted, adapted_facts) = render(
                     &label,
                     &spec.clone().with_adapters(vec![adapter(file, 1.0, *kind)]),
-                    &request,
+                    paired_request,
                     &guard,
                     &out,
                 );
                 cases.push(json!({"tier": tier, "mode": mode, "adapter": name,
-                    "base": base_facts, "adapted": adapted_facts,
-                    "meanAbsDiff": mean_abs_diff(&adapted, &base),
-                    "paletteDistanceGain": palette_distance(&base) - palette_distance(&adapted),
+                    "base": paired_base_facts, "adapted": adapted_facts,
+                    "request": direction_request_facts(paired_request),
+                    "requestProtocol": if style_protocol::uses_original_style_request(name, mode) {
+                        "original-1000-step-style" } else if mode == "t2i" {
+                        "common-edit-prefix" } else { "ordered-two-reference-edit" },
+                    "meanAbsDiff": mean_abs_diff(&adapted, paired_base),
+                    "paletteDistanceGain": palette_distance(paired_base) - palette_distance(&adapted),
                 }));
-                images.push((label, base.clone(), adapted));
+                images.push((label, paired_base.clone(), adapted));
             }
         }
     }
     write_json(
         &out_dir(),
         "imported_adapters",
-        &json!({"manifest": manifest, "correctedEditAdapter": corrected_edit, "renders": cases}),
+        &json!({"manifest": manifest, "correctedEditAdapter": corrected_edit, "renders": cases,
+            "additionalOriginalStyleBaseRenders": 3, "stylePalette": PALETTE}),
     );
     assert_eq!(
         cases.len(),
@@ -1752,5 +2047,449 @@ fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
             assert!(case["paletteDistanceGain"].as_f64().unwrap() >= PALETTE_DISTANCE_GAIN_FLOOR,
                 "{label}: the preserved 1000-step adapter must still move toward its learned palette");
         }
+    }
+}
+
+/// Fixed style-protocol diagnosis: six renders, no training or terminal acceptance.
+#[test]
+#[ignore = "needs pinned snapshots, immutable original style donor and Metal"]
+fn diagnostic_reused_t2i_style_direction() {
+    let source = std::env::var("GITHUB_SHA").expect("record exact diagnostic source SHA");
+    assert!(source.len() == 40 && source.bytes().all(|b| b.is_ascii_hexdigit()));
+    let manifest_path = PathBuf::from(
+        std::env::var("QWEN_IMAGE_2_1_IMPORT_MANIFEST")
+            .expect("exact hash-pinned original donor manifest required"),
+    );
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let directory = PathBuf::from(manifest["directory"].as_str().unwrap());
+    assert!(directory.is_absolute() && directory.is_dir());
+    let entries = manifest["adapters"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    let donors: Vec<_> = entries
+        .iter()
+        .filter(|e| e["name"] == style_protocol::DONOR_NAME)
+        .collect();
+    assert_eq!(
+        donors.len(),
+        1,
+        "exactly one immutable original style donor"
+    );
+    let entry = donors[0];
+    let basename = entry["file"].as_str().unwrap();
+    assert!(Path::new(basename).components().count() == 1);
+    assert_eq!(Path::new(basename).file_name().unwrap(), basename);
+    let file = directory.join(basename);
+    verify_original_style_donor(entry, &file);
+
+    let out = out_dir().join("style-protocol");
+    std::fs::create_dir_all(&out).unwrap();
+    let control_path = out.join("stage-controls.json");
+    assert!(
+        !control_path.exists(),
+        "style diagnostics require a fresh owned output directory"
+    );
+    let started_unix_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let request = original_style_request();
+    let provenance = json!({"trainingSource": style_protocol::TRAINING_SOURCE,
+        "trainingRun": style_protocol::TRAINING_RUN, "trainingSteps": 1000,
+        "donorSha256": style_protocol::DONOR_SHA256, "donorBytes": style_protocol::DONOR_BYTES});
+    write_json(
+        &out,
+        "DIAGNOSTIC_ONLY",
+        &json!({
+        "purpose": "DIAGNOSTIC_ONLY", "acceptanceEvidence": false, "retrain": false,
+        "sourceCandidate": source, "trainingProvenance": provenance,
+        "request": direction_request_facts(&request), "adapterStrength": 1.0,
+        "stylePalette": PALETTE, "renderCount": 6,
+        "movementFloor": ADAPTER_MOVES_FLOOR, "paletteGainFloor": PALETTE_DISTANCE_GAIN_FLOOR}),
+    );
+    let guard = Footprint::start(&out);
+    let mut cases = Vec::new();
+    let mut images = Vec::new();
+    for (tier, quant) in tiers() {
+        let spec = tier_spec(tier, quant);
+        let (base, base_facts) =
+            render(&format!("{tier}_style_base"), &spec, &request, &guard, &out);
+        let label = format!("{tier}_style_mlx_t2i_1000_steps");
+        let (adapted, adapted_facts) = render(
+            &label,
+            &spec.with_adapters(vec![adapter(&file, 1.0, AdapterKind::Lora)]),
+            &request,
+            &guard,
+            &out,
+        );
+        cases.push(json!({"tier": tier, "mode": "t2i", "adapter": style_protocol::DONOR_NAME,
+            "base": base_facts, "adapted": adapted_facts, "request": direction_request_facts(&request),
+            "requestProtocol": "original-1000-step-style", "adapterSha256": sha256_file(&file),
+            "meanAbsDiff": mean_abs_diff(&adapted, &base),
+            "paletteDistanceBase": palette_distance(&base),
+            "paletteDistanceAdapted": palette_distance(&adapted),
+            "paletteDistanceGain": palette_distance(&base) - palette_distance(&adapted)}));
+        images.push((label, base, adapted));
+    }
+    // Persist all six fixed cells before a learned-direction assertion can fail.
+    write_json(
+        &out,
+        "style-direction",
+        &json!({
+        "purpose": "DIAGNOSTIC_ONLY", "acceptanceEvidence": false, "retrain": false,
+        "sourceCandidate": source, "trainingProvenance": provenance, "donor": entry,
+        "stylePalette": PALETTE, "renderCount": 6, "renders": cases}),
+    );
+    assert_eq!(cases.len(), 3);
+    for ((label, base, adapted), case) in images.iter().zip(&cases) {
+        assert_sane(label, base);
+        assert_sane(label, adapted);
+        assert_overlay_not_underpredicted(label, &case["base"], &case["adapted"]);
+    }
+    // All generators have returned pixels, dropped and cleared their unused caches in render().
+    // Dropping this guard joins the physical sampler; a sampler panic/pressure breach aborts,
+    // so neither incomplete work nor a failed guard can leave a continuation marker.
+    let physical_ceiling = guard.ceiling.load(Ordering::Relaxed);
+    drop(guard);
+    for name in [
+        "MEMORY_SAMPLER_FAILED.txt",
+        "FOOTPRINT_CEILING_EXCEEDED.txt",
+        "physical-watchdog-abort.json",
+    ] {
+        assert!(
+            !out.join(name).exists(),
+            "no continuation after a safety failure"
+        );
+    }
+    verify_original_style_donor(entry, &file);
+    let trace_path = out.join("physical-allocator-samples.jsonl");
+    let trace = std::fs::read_to_string(&trace_path).unwrap();
+    let decode = |sample: &Value| style_protocol::SafetySample {
+        unix_millis: sample["unixMillis"].as_u64().unwrap(),
+        physical: sample["physFootprintBytes"].as_u64().unwrap(),
+        ceiling: sample["physicalCeilingBytes"].as_u64().unwrap(),
+        pressure: sample["pressureLevel"].as_u64().unwrap(),
+        available: sample["reclaimableBytes"].as_u64().unwrap(),
+    };
+    let samples: Vec<_> = trace
+        .lines()
+        .map(|line| decode(&serde_json::from_str::<Value>(line).unwrap()))
+        .collect();
+    let (final_host, final_census) = host_census();
+    let final_sample = json!({
+        "unixMillis": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+        "physFootprintBytes": final_host.baseline_physical, "physicalCeilingBytes": physical_ceiling,
+        "pressureLevel": final_host.pressure, "reclaimableBytes": final_host.available,
+    });
+    style_protocol::validate_retired_samples(&samples, decode(&final_sample), started_unix_millis)
+        .expect("all joined samples and final pressure census must be safe and current");
+    let mut direction_failures = Vec::new();
+    for case in &cases {
+        for (criterion, field, floor) in [
+            ("movement", "meanAbsDiff", ADAPTER_MOVES_FLOOR),
+            (
+                "palette_gain",
+                "paletteDistanceGain",
+                PALETTE_DISTANCE_GAIN_FLOOR,
+            ),
+        ] {
+            let actual = case[field].as_f64().unwrap();
+            assert!(
+                actual.is_finite(),
+                "nonfinite metrics cannot authorize continuation"
+            );
+            if actual < floor {
+                direction_failures.push(json!({"tier": case["tier"], "criterion": criterion,
+                    "actual": actual, "floor": floor}));
+            }
+        }
+    }
+    let controls = json!({"kind": "DIAGNOSTIC_ONLY", "purpose": "DIAGNOSTIC_ONLY", "acceptanceEvidence": false,
+        "sourceCandidate": source, "githubRunId": std::env::var("GITHUB_RUN_ID").ok(),
+        "donorSha256": style_protocol::DONOR_SHA256, "renderCount": 6,
+        "safetyChecksComplete": true, "foregroundRetired": true, "samplerJoined": true,
+        "startedUnixMillis": started_unix_millis, "sampleTrace": "physical-allocator-samples.jsonl",
+        "sampleTraceSha256": sha256_file(&trace_path), "sampleCount": samples.len(),
+        "finalSafetySample": final_sample, "finalHostCensus": final_census,
+        "directionFailures": direction_failures,
+        "stageResult": if direction_failures.is_empty() { "passed" } else { "direction_failed" }});
+    use std::io::Write;
+    let mut control_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(control_path)
+        .unwrap();
+    control_file
+        .write_all(&serde_json::to_vec_pretty(&controls).unwrap())
+        .unwrap();
+    control_file.sync_all().unwrap();
+    for ((label, _, _), case) in images.iter().zip(&cases) {
+        assert!(case["meanAbsDiff"].as_f64().unwrap() >= ADAPTER_MOVES_FLOOR);
+        assert!(
+            case["paletteDistanceGain"].as_f64().unwrap() >= PALETTE_DISTANCE_GAIN_FLOOR,
+            "{label}: original style donor must move toward its frozen training palette"
+        );
+    }
+}
+
+/// A fixed 19-render investigation reuses completed training from the rejected candidate.
+/// Passing this test never makes it terminal acceptance: provenance and all results say so.
+#[test]
+#[ignore = "needs pinned snapshots, exact diagnostic donor receipt and Metal"]
+fn diagnostic_reused_edit_adapter_semantics() {
+    const ORIGINAL_SOURCE: &str = "b3ec3f0b8ee6880dc55e6433a35dc60116709752";
+    const DONOR_SHA: &str = "c233129e9a64e384850331c9804b5b496d5208c08fe34aca4c680920fddb03d7";
+    const RECEIPT_SHA: &str = "fa5b6234870f6ac0784f893067524407178ee9ee1678c50bc6bd6713d008e333";
+    let diagnostic_source =
+        std::env::var("GITHUB_SHA").expect("record the exact diagnostic source SHA");
+    assert!(
+        diagnostic_source.len() == 40 && diagnostic_source.bytes().all(|b| b.is_ascii_hexdigit())
+    );
+    let manifest_path = PathBuf::from(
+        std::env::var("QWEN_IMAGE_2_1_DIAGNOSTIC_MANIFEST")
+            .expect("exact hash-pinned diagnostic manifest required"),
+    );
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["purpose"], "DIAGNOSTIC_ONLY");
+    assert_eq!(manifest["acceptanceEvidence"], false);
+    assert_eq!(
+        manifest["trainingProvenance"]["trainingSourceMain"],
+        ORIGINAL_SOURCE
+    );
+    assert_eq!(
+        manifest["trainingProvenance"]["trainingRun"],
+        37214050997_u64
+    );
+    assert_eq!(
+        manifest["trainingProvenance"]["trainingJob"],
+        111470848550_u64
+    );
+    assert_eq!(manifest["trainingProvenance"]["steps"], 120);
+    let directory = PathBuf::from(manifest["directory"].as_str().unwrap());
+    let entries = manifest["adapters"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    let mut files = BTreeMap::new();
+    for entry in entries {
+        let name = entry["name"].as_str().unwrap();
+        let basename = entry["file"].as_str().unwrap();
+        assert_eq!(Path::new(basename).file_name().unwrap(), basename);
+        let path = directory.join(basename);
+        let expected = match name {
+            "cuda_lokr" => "201bffa58dc8a1b61ec6399845109ebc3741220f9942f6caa0bfdc85695abf96",
+            "mlx_corrected_edit_lokr" => DONOR_SHA,
+            "training_receipt" => RECEIPT_SHA,
+            _ => panic!("unexpected diagnostic input"),
+        };
+        assert_eq!(entry["sha256"], expected);
+        assert_eq!(sha256_file(&path), expected);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            entry["size"].as_u64().unwrap()
+        );
+        assert!(files.insert(name, path).is_none());
+    }
+    let original: Value =
+        serde_json::from_slice(&std::fs::read(&files["training_receipt"]).unwrap()).unwrap();
+    let training = &original["training"];
+    assert_eq!(training["stepsRun"], 120);
+    assert_eq!(training["steps"], 120);
+    assert_eq!(training["adapterSha256"], DONOR_SHA);
+    assert_eq!(training["trainingStageTraceComplete"], true);
+    let losses = training["losses"].as_array().unwrap();
+    assert_eq!(losses.len(), 120);
+    assert!(losses
+        .iter()
+        .all(|x| x.as_f64().is_some_and(f64::is_finite)));
+    assert_eq!(training["editProtocol"]["trainingReferenceCount"], 1);
+    assert_eq!(training["editProtocol"]["evaluationReferenceCount"], 2);
+    assert_eq!(
+        training["editProtocol"]["trainingCaption"],
+        TRAIN_EDIT_INSTRUCTION
+    );
+    assert_eq!(
+        training["dataset"]["sha256"],
+        manifest["trainingProvenance"]["datasetSha256"]
+    );
+    for name in ["cuda_lokr", "mlx_corrected_edit_lokr"] {
+        let metadata = safetensors_file_metadata(&files[name]).unwrap();
+        for (key, value) in [
+            ("family", "qwen-image-2-1"),
+            ("baseModel", ID),
+            ("trainingMode", "edit"),
+            ("networkType", "lokr"),
+            ("rank", "16"),
+            ("alpha", "16"),
+            (
+                "license",
+                "Qwen Research License Agreement (research/evaluation only)",
+            ),
+        ] {
+            assert_eq!(metadata.get(key).map(String::as_str), Some(value));
+        }
+    }
+    let out = out_dir().join("diagnostic");
+    std::fs::create_dir_all(&out).unwrap();
+    write_json(
+        &out,
+        "DIAGNOSTIC_ONLY",
+        &json!({"kind": "DIAGNOSTIC_ONLY", "acceptanceEvidence": false,
+        "trainingProvenance": manifest["trainingProvenance"], "diagnosticSource": diagnostic_source,
+        "trainingCaption": TRAIN_EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
+        "t2iPrompt": T2I_EVAL_PROMPT, "trainingReferenceCount": 1, "evaluationReferenceCount": 2,
+        "seed": SEED, "steps": RENDER_STEPS, "strength": 1.0, "renderCount": 19}),
+    );
+    let key = edit_key(RENDER_EDGE);
+    key.save(out.join("palette-key.png")).unwrap();
+    let expected = to_image(edit_transform(&edit_source(99, RENDER_EDGE)));
+    let edit_request = GenerationRequest {
+        prompt: EDIT_INSTRUCTION.to_owned(),
+        conditioning: vec![Conditioning::MultiReference {
+            images: vec![
+                to_image(edit_source(99, RENDER_EDGE)),
+                to_image(key.clone()),
+            ],
+        }],
+        ..t2i_request()
+    };
+    let guard = Footprint::start(&out);
+    let mut learned = Vec::new();
+    let mut transfer = Vec::new();
+    let mut zero = Vec::new();
+    let mut failures = Vec::new();
+    for (tier, quant) in tiers() {
+        let spec = tier_spec(tier, quant);
+        let (edit_base, edit_base_facts) = render(
+            &format!("{tier}_edit_base"),
+            &spec,
+            &edit_request,
+            &guard,
+            &out,
+        );
+        let (edit_adapted, edit_adapted_facts) = render(
+            &format!("{tier}_edit_mlx_lokr"),
+            &spec.clone().with_adapters(vec![adapter(
+                &files["mlx_corrected_edit_lokr"],
+                1.0,
+                AdapterKind::Lokr,
+            )]),
+            &edit_request,
+            &guard,
+            &out,
+        );
+        let base_error = mean_abs_diff(&edit_base, &expected);
+        let adapted_error = mean_abs_diff(&edit_adapted, &expected);
+        let movement = mean_abs_diff(&edit_base, &edit_adapted);
+        if adapted_error + EDIT_GAIN_FLOOR > base_error || movement < ADAPTER_MOVES_FLOOR {
+            failures.push(format!("{tier}: learned edit movement={movement}, expected error {base_error}->{adapted_error}"));
+        }
+        diagnostic_render_checks(
+            &format!("{tier}_edit"),
+            &edit_base_facts,
+            &edit_adapted_facts,
+            &mut failures,
+        );
+        learned.push(json!({"tier": tier, "base": edit_base_facts, "adapted": edit_adapted_facts,
+            "meanAbsDiff": movement, "errorToExpectedBase": base_error, "errorToExpectedAdapted": adapted_error}));
+        let (t2i_base, t2i_base_facts) = render(
+            &format!("{tier}_t2i_base"),
+            &spec,
+            &t2i_request(),
+            &guard,
+            &out,
+        );
+        for name in ["cuda_lokr", "mlx_corrected_edit_lokr"] {
+            let (image, facts) = render(
+                &format!("{tier}_t2i_{name}"),
+                &spec
+                    .clone()
+                    .with_adapters(vec![adapter(&files[name], 1.0, AdapterKind::Lokr)]),
+                &t2i_request(),
+                &guard,
+                &out,
+            );
+            let movement = mean_abs_diff(&t2i_base, &image);
+            if movement < ADAPTER_MOVES_FLOOR {
+                failures.push(format!("{tier}_t2i_{name}: movement={movement}"));
+            }
+            diagnostic_render_checks(
+                &format!("{tier}_t2i_{name}"),
+                &t2i_base_facts,
+                &facts,
+                &mut failures,
+            );
+            transfer.push(json!({"tier": tier, "adapter": name, "base": t2i_base_facts, "adapted": facts, "meanAbsDiff": movement}));
+            if tier == "bf16" {
+                for (mode, request, base, base_facts) in [
+                    ("t2i", t2i_request(), &t2i_base, &t2i_base_facts),
+                    (
+                        "two_reference_edit",
+                        edit_request.clone(),
+                        &edit_base,
+                        &edit_base_facts,
+                    ),
+                ] {
+                    let label = format!("bf16_{mode}_{name}_zero");
+                    let (image, facts) = render(
+                        &label,
+                        &spec.clone().with_adapters(vec![adapter(
+                            &files[name],
+                            0.0,
+                            AdapterKind::Lokr,
+                        )]),
+                        &request,
+                        &guard,
+                        &out,
+                    );
+                    let same = image.pixels == base.pixels;
+                    if !same {
+                        failures.push(format!("{label}: scale0 changed output"));
+                    }
+                    diagnostic_render_checks(&label, base_facts, &facts, &mut failures);
+                    zero.push(json!({"mode": mode, "adapter": name, "base": base_facts, "zero": facts, "samePixelsAsBase": same}));
+                }
+            }
+        }
+    }
+    let render_count = learned.len() * 2 + 3 + transfer.len() + zero.len();
+    if render_count != 19 {
+        failures.push(format!("expected19 renders, captured{render_count}"));
+    }
+    write_json(
+        &out_dir(),
+        "diagnostic_semantics",
+        &json!({"kind": "DIAGNOSTIC_ONLY", "acceptanceEvidence": false,
+        "renderCount": render_count, "diagnosticSource": diagnostic_source,
+        "trainingProvenance": manifest["trainingProvenance"], "originalTrainingReceipt": original,
+        "donors": manifest["adapters"], "paletteKeySha256": sha256_file(&out.join("palette-key.png")),
+        "paletteKeyRawRgbSha256": format!("{:x}", Sha256::digest(key.as_raw())),
+        "trainingCaption": TRAIN_EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION, "t2iPrompt": T2I_EVAL_PROMPT,
+        "thresholds": {"movement": ADAPTER_MOVES_FLOOR, "editGain": EDIT_GAIN_FLOOR,
+            "pixelStd": NON_DEGENERATE_STD, "overlaySlackBytes": PREDICTION_SLACK_BYTES},
+        "learnedEdit": learned, "t2iTransfers": transfer, "zeroControls": zero, "failures": failures}),
+    );
+    assert!(
+        failures.is_empty(),
+        "DIAGNOSTIC_ONLY failures retained: {failures:?}"
+    );
+}
+
+fn diagnostic_render_checks(
+    label: &str,
+    base: &Value,
+    adapted: &Value,
+    failures: &mut Vec<String>,
+) {
+    for facts in [base, adapted] {
+        if facts["image"]["pixelStd"].as_f64().unwrap() <= NON_DEGENERATE_STD
+            || facts["image"]["staticRowFraction"].as_f64().unwrap() > 0.25
+        {
+            failures.push(format!("{label}: image sanity"));
+        }
+    }
+    if adapted["mlxActivePeakBytes"].as_u64().unwrap()
+        > base["mlxActivePeakBytes"].as_u64().unwrap()
+            + adapted["predictedOverlayBytes"].as_u64().unwrap()
+            + PREDICTION_SLACK_BYTES
+    {
+        failures.push(format!("{label}: overlay prediction"));
     }
 }

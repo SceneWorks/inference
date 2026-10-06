@@ -42,10 +42,20 @@ PINNED_WORKSPACE_DEPENDENCIES = {
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-flash-attn": ("candle-flash-attn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
 }
+# candle-core resolves to the in-tree vendored copy (sc-24441), not the git pin: the root [patch]
+# redirects it to VENDORED_PACKAGES' path, which records the same upstream revision (plus the
+# CUDA-graph parameter cache cherry-picked onto it) in its VENDORED.md. The root manifest still
+# declares the git pin above, so a candle bump still has to move every revision in lockstep.
+VENDORED_PACKAGES = {
+    "candle-core": {
+        "path": "crates/media/candle-gen/vendor/candle-core",
+        "upstream_rev": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+    },
+}
 DEFAULT_GRAPH_PINNED_PACKAGES = {
     package_name: revision
     for dependency_name, (package_name, revision) in PINNED_WORKSPACE_DEPENDENCIES.items()
-    if dependency_name != "candle-flash-attn"
+    if dependency_name != "candle-flash-attn" and package_name not in VENDORED_PACKAGES
 }
 FORBIDDEN_GRAPH_PACKAGES = {
     # Provider composition is ordinary, value-scoped source code. Reintroducing this crate would
@@ -57,6 +67,11 @@ FORBIDDEN_GRAPH_PACKAGES = {
 # each a separate checkout carrying its own Cargo.lock/manifest (.claude, .codex). They must not
 # be swept into the single-lockfile / single-manifest invariants below.
 IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex"})
+# The Rust-source lints below additionally skip `vendor/` subtrees: those are upstream crates
+# copied verbatim (candle-kernels, candle-core — each with a VENDORED.md) that a [patch] points
+# at, not first-party code, so a lint finding there could only be fixed by forking upstream.
+# The lockfile / manifest invariants still see them.
+SOURCE_LINT_IGNORED_PARTS = IGNORED_TREE_PARTS | {"vendor"}
 
 # --- epic 13657 guardrail: inference never fetches weights and never derives a download-cache
 # location. Every model component is a caller-provisioned local path (WeightsSource::Dir / File);
@@ -1018,6 +1033,20 @@ def check_graph(metadata: dict) -> None:
         if not source.endswith(f"#{revision}"):
             fail(f"{name} does not resolve at {revision}: {source}")
 
+    for name, vendored in VENDORED_PACKAGES.items():
+        vendor_dir, revision = vendored["path"], vendored["upstream_rev"]
+        matches = [package for package in packages if package["name"] == name]
+        if len(matches) != 1:
+            fail(f"expected one {name} resolution, found {len(matches)}")
+        if matches[0]["source"] is not None:
+            fail(f"{name} must resolve to the vendored copy, not {matches[0]['source']}")
+        manifest = Path(matches[0]["manifest_path"]).resolve()
+        if manifest != (ROOT / vendor_dir / "Cargo.toml").resolve():
+            fail(f"{name} resolves to {manifest}, expected the vendored {vendor_dir}")
+        provenance = ROOT / vendor_dir / "VENDORED.md"
+        if not provenance.is_file() or revision not in provenance.read_text(encoding="utf-8"):
+            fail(f"{vendor_dir}/VENDORED.md must record the upstream revision {revision}")
+
     tokenizer_minors = {
         ".".join(package["version"].split(".")[:2])
         for package in packages
@@ -1680,7 +1709,7 @@ def check_rust_sources(root: Path) -> None:
     violations: list[str] = []
     for path in sorted(crates.rglob("*.rs")):
         relative = path.relative_to(root)
-        if not IGNORED_TREE_PARTS.isdisjoint(relative.parts):
+        if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(relative.parts):
             continue
         text = path.read_text(encoding="utf-8")
 
@@ -1792,7 +1821,7 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
         trigger_sources: list[str] = []
         evidence_sources: list[str] = []
         for path in sorted(manifest_dir.rglob("*.rs")):
-            if not IGNORED_TREE_PARTS.isdisjoint(path.relative_to(root).parts):
+            if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(path.relative_to(root).parts):
                 continue
             source = path.read_text(encoding="utf-8")
             trigger_sources.append(strip_rust_comments(source, strip_literals=True))
@@ -1952,7 +1981,7 @@ def check_snapshot_path_derivation(root: Path) -> None:
     violations: list[str] = []
     for path in sorted(root.rglob("*.rs")):
         relative = path.relative_to(root)
-        if not IGNORED_TREE_PARTS.isdisjoint(relative.parts):
+        if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(relative.parts):
             continue
         lines = strip_rust_comments(path.read_text(encoding="utf-8")).split("\n")
         for index, line in enumerate(lines):
@@ -2035,7 +2064,7 @@ def _test_only_files(root: Path) -> set[Path]:
     """Files pulled in by a `#[cfg(test)] mod name;` declaration — test code end to end."""
     files: set[Path] = set()
     for path in root.rglob("*.rs"):
-        if not IGNORED_TREE_PARTS.isdisjoint(path.relative_to(root).parts):
+        if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(path.relative_to(root).parts):
             continue
         text = path.read_text(encoding="utf-8")
         for match in re.finditer(
@@ -2107,7 +2136,7 @@ def check_test_temp_dir_guards(root: Path) -> None:
     violations: list[str] = []
     for path in sorted(root.rglob("*.rs")):
         relative = path.relative_to(root)
-        if not IGNORED_TREE_PARTS.isdisjoint(relative.parts):
+        if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(relative.parts):
             continue
         text = strip_rust_comments(path.read_text(encoding="utf-8"))
         whole_file_is_test = path in test_only or not TEST_TARGET_DIRS.isdisjoint(relative.parts)

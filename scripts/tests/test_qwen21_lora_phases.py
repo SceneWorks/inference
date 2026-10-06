@@ -21,22 +21,24 @@ def shell_path(path):
 
 @unittest.skipUnless(BASH and Path(BASH).is_file(), "requires bash")
 class PhaseTests(unittest.TestCase):
-    def run_phase(self, phase, fail=""):
+    def run_phase(self, phase, fail="", script=SCRIPT, zero=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cargo = root / "cargo"
             cargo.write_text('#!/bin/bash\n'
                 'printf "%s|probe=%s|t2i=%s|edit=%s\\n" "$*" "$QWEN_IMAGE_2_1_PROBE_ONLY" '
                 '"$QWEN_IMAGE_2_1_LORA_T2I_STEPS" "$QWEN_IMAGE_2_1_LORA_EDIT_STEPS" >> "$CARGO_CALLS"\n'
-                'if [[ -n "$FAIL_TEST" && "$*" == *"$FAIL_TEST"* ]]; then exit 1; fi\n'
-                'echo "test result: ok. 1 passed"\n', encoding="utf-8")
+                'if [[ -n "$FAIL_TEST" && "$*" == *"$FAIL_TEST"* ]]; then exit "${FAIL_EXIT:-1}"; fi\n'
+                'if [[ "$ZERO_TESTS" == 1 ]]; then echo "test result: ok. 0 passed"; '
+                'else echo "test result: ok. 1 passed"; fi\n', encoding="utf-8")
             cargo.chmod(0o755)
             calls = root / "calls"
             result = subprocess.run([BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c",
-                'export PATH="$FAKE_BIN:$PATH"; source ' + SCRIPT], cwd=ROOT,
+                'export PATH="$FAKE_BIN:$PATH"; source ' + script], cwd=ROOT,
                 env={**os.environ, "FAKE_BIN": shell_path(root), "CARGO_CALLS": shell_path(calls),
                      "QWEN_IMAGE_2_1_RENDER_OUT": shell_path(root), "QWEN_IMAGE_2_1_LORA_PHASE": phase,
-                     "QWEN_IMAGE_2_1_THIRD_PARTY_LORA": "fake.safetensors", "FAIL_TEST": fail},
+                     "QWEN_IMAGE_2_1_THIRD_PARTY_LORA": "fake.safetensors", "FAIL_TEST": fail,
+                     "ZERO_TESTS": "1" if zero else "0"},
                 capture_output=True, text=True, encoding="utf-8", check=False)
             text = calls.read_text(encoding="utf-8") if calls.exists() else ""
             names = re.findall(r"lora_real_weights::(\w+)", text)
@@ -48,7 +50,7 @@ class PhaseTests(unittest.TestCase):
         stack = "stacked_adapters_apply_with_independent_weights"
         imports = "imported_adapters_move_t2i_and_two_reference_edit_every_tier"
         public = "third_party_lora_applies_strictly_and_moves_every_tier"
-        expected = {"probe": [t2i, edit], "edit": [edit, stack, imports, public],
+        expected = {"q4-numeric": [], "diagnostic": ["diagnostic_reused_edit_adapter_semantics"], "probe": [t2i, edit], "edit": [edit, stack, imports, public],
                     "imports": [imports, public], "full": [t2i, edit, stack, imports, public]}
         for phase, cells in expected.items():
             with self.subTest(phase=phase):
@@ -58,6 +60,33 @@ class PhaseTests(unittest.TestCase):
                 if phase == "probe":
                     self.assertEqual(text.count("probe=1|t2i=2|edit=2"), 2)
 
+    def assert_numeric_calls(self, text):
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertIn('--locked --release -p mlx-gen-qwen-image-2-1 --lib q4_diagnostic::fixed_q4_numeric_diagnostic -- --ignored --exact --nocapture --test-threads 1', text)
+        self.assertNotIn("--test integration", text)
+        self.assertIn("probe=|t2i=|edit=", text)
+
+    def test_numeric_is_one_lib_test_and_failures_or_zero_tests_fail_closed(self):
+        result, _, calls = self.run_phase("q4-numeric")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_numeric_calls(calls)
+        for fail, zero in [("fixed_q4_numeric", False), ("", True)]:
+            result, _, calls = self.run_phase("q4-numeric", fail, zero=zero)
+            self.assertNotEqual(result.returncode, 0)
+            self.assert_numeric_calls(calls)
+
+    def test_lib_routing_and_exact_selector_mutants_are_observable(self):
+        source = (ROOT / SCRIPT).read_text(encoding="utf-8")
+        for old, new in [("--lib \\", "--test integration \\") ,
+                         ("q4_diagnostic::fixed_q4_numeric_diagnostic", "q4_diagnostic::wrong_test"),
+                         ("--ignored --exact --nocapture", "--ignored --nocapture")]:
+            with self.subTest(mutation=old), tempfile.TemporaryDirectory() as directory:
+                mutant = Path(directory) / "mutant.sh"
+                mutant.write_text(source.replace(old, new), encoding="utf-8")
+                _, _, calls = self.run_phase("q4-numeric", script=shell_path(mutant))
+                with self.assertRaises(AssertionError):
+                    self.assert_numeric_calls(calls)
+
     def test_unknown_phase_runs_nothing_and_failed_cell_is_not_green(self):
         result, names, _ = self.run_phase("unknown")
         self.assertNotEqual(result.returncode, 0)
@@ -65,3 +94,6 @@ class PhaseTests(unittest.TestCase):
         result, names, _ = self.run_phase("edit", "stacked_adapters")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(names), 4, "retain evidence from independent cells after failure")
+        result, names, _ = self.run_phase("diagnostic", "diagnostic_reused")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(names, ["diagnostic_reused_edit_adapter_semantics"])

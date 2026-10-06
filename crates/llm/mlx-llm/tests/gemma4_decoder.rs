@@ -46,14 +46,26 @@ const GOLDENS: &str = include_str!("../../testdata/gemma4/gemma4_decoder_goldens
 /// oracle ran, and none of the gap is a different set of weights.
 ///
 /// **Measured**, not guessed: the worst relative deviation across all five hidden states is
-/// **5.8e-3** (logits 2.9e-3, stepped-decode-vs-prefill 3.9e-4) on an idle machine. The budget is
-/// ~3.4x that, which is the headroom `tests/architecture_forward.rs` documents MLX's Metal kernels
-/// needing under runner load (drift of ~1.6e-3 absolute observed there on values near 1).
+/// **5.8e-3** (logits 2.9e-3, stepped-decode-vs-prefill 3.9e-4) on an idle machine with the `f32`
+/// GeGLU activations the LTX-2.5 text encoder keeps. The budget is ~3.4x that, which is the
+/// headroom `tests/architecture_forward.rs` documents MLX's Metal kernels needing under runner
+/// load (drift of ~1.6e-3 absolute observed there on values near 1). The goldens below load the
+/// fixture with the LTX-2.5 text encoder's activation role (`f32` GeGLU) — these are the hidden
+/// states its feature extractor consumes — so this budget keeps that headroom; the BF16 GeGLU
+/// every LLM decode path runs is held to [`BF16_ABS_TOL`].
 ///
 /// Loose in absolute terms and still decisive: the four mutations land at 1.1e-1 to 5.8e-1
 /// relative — 6x to 30x this budget. [`mutations_are_all_outside_the_tolerance`] pins that gap
 /// every run rather than trusting this comment.
 const ABS_TOL: f32 = 2.0e-2;
+
+/// The budget for the BF16 GeGLU path (sc-24446), **derived, not fitted**: by the triangle
+/// inequality its distance to the `f32` oracle is at most its distance to this decoder's `f32`
+/// path plus that path's distance to the oracle — the parity gate's `2⁻⁵` of the tensor's
+/// magnitude (eight BF16 ULPs: one 2⁻⁹ rounding of each GeGLU output, then a BF16 stream, over the
+/// fixture's layers; `mlx_llm::primitives::activation`) plus [`ABS_TOL`]. Measured 1.3e-2 hidden /
+/// 1.1e-2 logits: ~3.9x headroom. The narrowest mutation (1.1e-1) still lands 2.1x outside it.
+const BF16_ABS_TOL: f32 = ABS_TOL + 1.0 / 32.0;
 
 /// How far outside [`ABS_TOL`] a mutation must land for the fixture to count as discriminating.
 ///
@@ -88,6 +100,16 @@ fn scale_of(want: &[f32]) -> f32 {
     want.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1.0)
 }
 
+fn assert_close_within(got: &[f32], want: &[f32], tol: f32, what: &str) {
+    let scale = scale_of(want);
+    let err = max_abs_err(got, want);
+    assert!(
+        err <= tol * scale,
+        "{what}: max|delta| = {err} exceeds {} (rel {tol} of magnitude {scale})",
+        tol * scale
+    );
+}
+
 fn assert_abs_close(got: &[f32], want: &[f32], what: &str) {
     let scale = scale_of(want);
     let err = max_abs_err(got, want);
@@ -111,7 +133,9 @@ fn host(a: &Array) -> Vec<f32> {
 /// `section` is the fixture root (the top level, or the `kv_shared` variant), both of which carry a
 /// `config` and a `weights` map.
 fn model_from(section: &Value) -> CausalLm {
-    let cfg = ModelConfig::from_json(&section["config"]).expect("fixture config parses");
+    let mut cfg = ModelConfig::from_json(&section["config"]).expect("fixture config parses");
+    // The text encoder's role: `f32` GeGLU activations, the path the oracle's budget is set for.
+    cfg.activation_role = mlx_llm::primitives::activation::ActivationRole::LtxTextEncoder;
     assert!(
         cfg.is_gemma4(),
         "the fixture must exercise the Gemma 4 path"
@@ -538,6 +562,11 @@ fn mutations_are_all_outside_the_tolerance() {
             .collect();
         let err = worst_relative(&mutated, want);
         assert!(
+            err > BF16_ABS_TOL * 2.0,
+            "mutation {name:?} deviates by only {err} (rel), within 2x the {BF16_ABS_TOL} BF16 \
+             budget"
+        );
+        assert!(
             err > ABS_TOL * MUTATION_MARGIN,
             "mutation {name:?} ({}) deviates from the golden by only {err} (rel), within \
              {MUTATION_MARGIN}x the {ABS_TOL} budget the real forward sits inside at {real} — the \
@@ -739,5 +768,270 @@ fn only_the_sliding_layers_ship_a_value_projection() {
             ),
             other => panic!("unexpected layer type {other:?}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Speculative decoding on Gemma 4 (epic sc-24432 AT1)
+// ---------------------------------------------------------------------------------------------
+
+/// Both fixture variants — the alternating-layer model and its KV-shared tail — with every
+/// projection and embedding scaled by 0.3. At the goldens' own scale the tiny model saturates and
+/// greedy emits one token forever, which prompt lookup always predicts; scaled, the stream moves
+/// between tokens, so lookup's drafts are both accepted and rejected.
+fn speculative_fixtures(g: &Value) -> [(&'static str, CausalLm); 2] {
+    let scaled = |section: &Value| {
+        let mut section = section.clone();
+        for (key, entry) in section["weights"].as_object_mut().unwrap() {
+            if key.contains("norm") || key.contains("layer_scalar") {
+                continue;
+            }
+            let data = floats(&entry["data"]).iter().map(|x| x * 0.3).collect();
+            entry["data"] = serde_json::to_value::<Vec<f32>>(data).unwrap();
+        }
+        model_from(&section)
+    };
+    [
+        ("gemma4", scaled(g)),
+        ("gemma4 kv-shared", scaled(&g["kv_shared"])),
+    ]
+}
+
+/// A whitespace WordLevel tokenizer over `t0..t{vocab-1}`: every id decodes to its own piece.
+fn word_tokenizer(vocab: usize) -> core_llm::Tokenizer {
+    let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+    core_llm::Tokenizer::from_json(&format!(
+        r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+            "decoder": null,
+            "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+        entries.join(", ")
+    ))
+    .unwrap()
+}
+
+/// Gemma 4's speculative verify through the provider: prompt lookup at depths 1, 3 and the
+/// advertised max emits exactly `off`'s greedy stream on both fixture variants. Every verify runs
+/// `decode_logits_all` over `1 + depth` rows at a cache offset past the prompt — the sliding
+/// layers' 3-key window bottom-right aligned over the cached keys, each layer type on its own
+/// RoPE table — and the suite's drafts are both accepted and rejected, so a rejection truncates
+/// the cache back over drafts the window and the shared KV tail already saw.
+#[test]
+fn gemma4_prompt_lookup_is_greedy_exact_at_every_depth() {
+    use core_llm::{ProposerKind, SpeculativeProposer, TextLlm};
+    let g = goldens();
+    let vocab = g["config"]["text_config"]["vocab_size"].as_u64().unwrap() as usize;
+    let prompts = core_llm_testkit::draft_model_prompts();
+    for (label, model) in speculative_fixtures(&g) {
+        let provider = mlx_llm::LlamaProvider::from_parts(model, word_tokenizer(vocab), vec![]);
+        let caps = &provider.descriptor().capabilities;
+        // The sliding layers' head dim 8 is no fused-kernel dim: the 8-row verify bound.
+        assert_eq!(
+            caps.proposer(SpeculativeProposer::PromptLookup)
+                .unwrap()
+                .max_depth,
+            7,
+            "{label}"
+        );
+        let cases = core_llm_testkit::advertised_parity_cases(caps);
+        assert_eq!(cases.len(), 3, "{label}: prompt lookup at 1, 3 and max");
+        let rows =
+            core_llm_testkit::check_speculative_greedy_parity(&provider, &prompts, &cases, 24)
+                .unwrap_or_else(|failures| panic!("{label}: {failures}"));
+        assert!(rows
+            .iter()
+            .all(|r| r.report.fallbacks.is_empty()
+                && r.report.proposer == ProposerKind::PromptLookup));
+        let (proposed, accepted) = rows.iter().fold((0, 0), |(p, a), r| {
+            (p + r.report.proposed_tokens, a + r.report.accepted_tokens)
+        });
+        assert!(
+            accepted > 0 && accepted < proposed,
+            "{label}: drafts accepted and rejected ({accepted} of {proposed})"
+        );
+    }
+}
+
+/// Gemma 4's truncate rollback at the model seam: a verify forward of `[t, d1, d2, d3]` at an
+/// offset past the prompt scores `t` as a single-token step does, and after the drafts are
+/// rejected — the cache truncated back to just after `t` — a step on a different token scores as
+/// a cache that never saw the drafts (both within the fixture's bf16 budget, [`ABS_TOL`]), on
+/// both fixture variants. Without the truncation the drafts stay in the window and the shared KV
+/// tail, and the step reads them.
+#[test]
+fn gemma4_truncate_rollback_forgets_the_rejected_drafts() {
+    let g = goldens();
+    let prompt = prompt_ids(&g);
+    let n = prompt.len() as i32;
+    let (t, drafts, other) = (7, [11, 2, 30], 19);
+    for (label, model) in speculative_fixtures(&g) {
+        let vocab = model.config().vocab_size as usize;
+
+        // The reference: no drafts ever reach the cache.
+        let mut plain = model.new_cache();
+        model
+            .decode_logits(&input_ids(&prompt), &mut plain, 0)
+            .unwrap();
+        let t_plain = host(
+            &model
+                .decode_logits(&input_ids(&[t]), &mut plain, n)
+                .unwrap(),
+        );
+        let other_plain = host(
+            &model
+                .decode_logits(&input_ids(&[other]), &mut plain, n + 1)
+                .unwrap(),
+        );
+
+        // The speculative path: verify `t` and three drafts in one forward, reject the drafts.
+        let mut spec = model.new_cache();
+        model
+            .decode_logits(&input_ids(&prompt), &mut spec, 0)
+            .unwrap();
+        let verify = host(
+            &model
+                .decode_logits_all(
+                    &input_ids(&[t, drafts[0], drafts[1], drafts[2]]),
+                    &mut spec,
+                    n,
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            verify.len(),
+            4 * vocab,
+            "{label}: one logits row per verified token"
+        );
+        let row0 = &verify[..vocab];
+        assert_abs_close(
+            row0,
+            &t_plain,
+            &format!("{label}: verify row 0 vs a single step"),
+        );
+        mlx_llm::primitives::KvCache::truncate(&mut spec, n + 1).unwrap();
+        let other_spec = host(
+            &model
+                .decode_logits(&input_ids(&[other]), &mut spec, n + 1)
+                .unwrap(),
+        );
+        assert_abs_close(
+            &other_spec,
+            &other_plain,
+            &format!("{label}: the step after the rollback"),
+        );
+    }
+}
+
+/// sc-24446: the reference holds under **either** activation dtype the policy can pick
+/// (`mlx_llm::primitives::activation`) — the `f32` GeGLU the LTX-2.5 text encoder keeps and the
+/// BF16 GeGLU every LLM decode path runs — at every hidden state and every logit, inside the one
+/// [`ABS_TOL`] budget. Measured: worst relative deviation 5.8e-3 (hidden) / 3.0e-3 (logits) on the
+/// `f32` path, 1.3e-2 / 1.1e-2 on the BF16 path — rounding the GeGLU output (and hence the
+/// residual stream) to BF16's 8-bit significand once per layer, against an `f32` NumPy oracle;
+/// held to [`ABS_TOL`] and the derived [`BF16_ABS_TOL`] respectively.
+///
+/// MUTATION: map `ActivationRole::LlmDecode` to `GeluPrecision::F32` in the policy (so the
+/// "BF16" case silently ran the `f32` path) and this goes RED.
+#[test]
+fn the_reference_holds_under_either_activation_dtype() {
+    use mlx_llm::primitives::activation::ActivationRole;
+    let g = goldens();
+    let ids = prompt_ids(&g);
+    let want_layers = g["hidden_states"]["layers"].as_array().unwrap();
+    let want_logits = floats(&g["logits"]["data"]);
+    for (role, stream) in [
+        (ActivationRole::LtxTextEncoder, Dtype::Float32),
+        (ActivationRole::LlmDecode, Dtype::Bfloat16),
+    ] {
+        let mut model_cfg = ModelConfig::from_json(&g["config"]).unwrap();
+        model_cfg.activation_role = role;
+        let mut map: HashMap<String, Array> = HashMap::new();
+        for (key, entry) in g["weights"].as_object().unwrap() {
+            let shape: Vec<i32> = entry["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect();
+            map.insert(
+                key.clone(),
+                Array::from_slice(&floats(&entry["data"]), &shape),
+            );
+        }
+        let model = CausalLm::from_weights(&Weights::from_map(map), "", model_cfg).unwrap();
+        let states = model
+            .hidden_states(&input_ids(&ids), &mut model.new_cache(), 0)
+            .unwrap();
+        assert_eq!(states.last().unwrap().dtype(), stream, "{role:?}");
+        let tol = if stream == Dtype::Float32 {
+            ABS_TOL
+        } else {
+            BF16_ABS_TOL
+        };
+        for (i, (got, want)) in states.iter().zip(want_layers).enumerate() {
+            assert_close_within(
+                &host(got),
+                &floats(want),
+                tol,
+                &format!("{role:?} hidden[{i}]"),
+            );
+        }
+        let logits = model
+            .decode_logits_all(&input_ids(&ids), &mut model.new_cache(), 0)
+            .unwrap();
+        assert_close_within(
+            &host(&logits),
+            &want_logits,
+            tol,
+            &format!("{role:?} logits"),
+        );
+    }
+}
+
+/// sc-24446: the Gemma 4 decoder (both fixtures: alternating sliding / full, and the KV-shared
+/// tail) loads through the production provider path with every source it read consumed — its
+/// layer scalars, q/k norms and k = v projections included (an unconsumed source is a load
+/// error).
+///
+/// MUTATION: drop `layer_scalar` from `LlamaLayer::arrays` and this goes RED.
+#[test]
+fn gemma4_loads_through_the_provider_with_every_source_consumed() {
+    let g = goldens();
+    for section in [&g, &g["kv_shared"]] {
+        let mut map: HashMap<String, Array> = HashMap::new();
+        for (key, entry) in section["weights"].as_object().unwrap() {
+            let shape: Vec<i32> = entry["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect();
+            map.insert(
+                key.clone(),
+                Array::from_slice(&floats(&entry["data"]), &shape),
+            );
+        }
+        let cfg = ModelConfig::from_json(&section["config"]).unwrap();
+        // A text-only snapshot: the fixture carries no media front-end tensors.
+        let mut config = section["config"].clone();
+        // The multimodal block names its splice token ids even for a text-only checkpoint.
+        let last = cfg.vocab_size as i64 - 1;
+        for (i, key) in [
+            "image_token_id",
+            "boi_token_id",
+            "eoi_token_id",
+            "audio_token_id",
+            "boa_token_id",
+            "eoa_token_id",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            config[key] = serde_json::json!(last - i as i64);
+        }
+        let dir = crate::common::Fixture::new("mlx-llm-gemma4-load-", None);
+        crate::common::write_snapshot(&dir, &config, &map, cfg.vocab_size as usize);
+        mlx_llm::LlamaProvider::load(&core_llm::LoadSpec::dense(dir.to_str().unwrap()))
+            .expect("the Gemma 4 fixture loads with every source consumed");
     }
 }

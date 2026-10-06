@@ -95,6 +95,7 @@ parity tests:
 | `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |
 | `BONSAI_QWEN38_SNAPSHOT` | the frozen Qwen3.8-27B snapshot dir (the manifest's own name for it) | `decode_step_parity` — the sc-24129 seam gates on real weights: a 256-token greedy decode through `StepModel` is token-identical to the `Decode` loop, and `Qwen35Cache::rollback_to` re-decodes to the same logits as a fresh decode |
 | `DECODE_BENCH_SNAPSHOT` + `DECODE_BENCH_OUTPUT` | the same snapshot (or Qwen3-8B for the llama family), plus a JSON path to write | `decode_bench` — the one decode-perf home (tok/s, acceptance, forwards and host syncs per token, sampler path and logits rows to host, device memory) for reference / `StepModel` / native MTP `K=1..5` / n-gram and the seeded temperature + top-p rows, in any `DECODE_BENCH_FORMAT` (`bf16`, `q8`, `q4`, `nvfp4` — both families); run and sealed by `scripts/release/decode_bench.py`, whose `campaign` subcommand runs (or collects) the whole matrix — models x formats x speculative modes x CUDA graphs — and seals one index over it |
+| `SPECULATIVE_BENCH_SNAPSHOT` + `SPECULATIVE_BENCH_OUTPUT` | any `candle-llama` snapshot, plus a JSON path to write | `speculative_bench` — the epic sc-24432 benchmark harness: the predictable (code edit, RAG answer, summary) and open-ended (chat, creative) prompt set under each `SPECULATIVE_BENCH_OPTIONS` option (default `["off","auto"]`), one baseline-format row per (prompt, option) with decode tok/s, TTFT, proposer and mean accepted length |
 | `QWEN3_8B_SNAPSHOT` | the pinned `Qwen/Qwen3-8B` snapshot dir (the manifest's name for it) | `speculative_engine_parity::llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate` — the llama family's 256-token gate (sc-24140): static seam, fused-off loops and the CUDA-graph fallback token-identical to the reference loop; teacher-forced verify-shaped forwards flip only at ≤ 1 bf16 ULP knife-edges (the E1 gate); free-running n-gram divergences recorded with their gaps |
 | `NVFP4_EVIDENCE_SNAPSHOT` (+ `_OUTPUT`, `_PPL_TEXT`) | a Qwen3.5/3.8 or llama-family snapshot | `nvfp4_evidence` — bf16 vs NVFP4: weight census (bits/param by projection kind), the 256-token fixture's first divergence, perplexity over a fixed slice, and the provider's `Quantize::Nvfp4` load record |
 
@@ -197,12 +198,32 @@ the reference loop. A rollback past the ring is the typed
 `Error::RollbackUnavailable`. Every path ends in
 a measured `decode::DecodeRecord` (path taken, target forwards, proposed/accepted tokens, host syncs);
 the provider exposes the last one through `LlamaProvider::last_decode_record`. A Qwen3.5-family
-request with speculation off (`Off`, or `Auto` on a checkpoint without an MTP head) decodes through
-the same engine with no proposer — `decode::generate_step` is that engine with `K = 0`, the seam's
+request with speculation off decodes through the same engine with no proposer — `decode::generate_step` is that engine with `K = 0`, the seam's
 one token-at-a-time loop — on the static KV cache, the checkpoint ring and the CUDA-graph runner
 (sc-24140); with no drafts the engine draws each token through `sample`, so a temperature / top-p
 request stays on the device sampler. The reference `Decode` loop is unchanged and stays the parity
 oracle, selectable with `LlamaProvider::set_decode_path(DecodePath::Reference)`.
+
+Speculation is chosen per request through core-llm's one proposer-agnostic option (sc-24433,
+`TextLlmRequest::speculative`: `off | auto | {proposer: mtp|prompt_lookup|draft_model, depth}`; the
+legacy `mtp` field maps onto it). Every decoder this provider loads advertises prompt lookup
+(`PROMPT_LOOKUP_MAX_DEPTH` = 7, recommended 4) and a qwen3_5 checkpoint with a head — dense or
+sparse-MoE predictor layer, fused or per-expert experts — also MTP at the same depth (sc-24438: a
+deeper request runs at 7, the clamp named in `DecodeReport::fallbacks`); `auto`
+resolves to MTP where the head exists, else prompt lookup, and the engine runs the resolved
+proposer (`decode::MtpProposer` / `decode::NgramProposer`) for both decoder families. A proposer
+that cannot run on the request's path (a Qwen3-VL multimodal request decodes on the reference loop)
+falls back with its reason in `DecodeReport::fallbacks`. A load names a draft model with
+`LoadSpec::with_draft` (sc-24436): it loads beside the target on the same device at the same tier,
+admitted with it (a draft without room, an unreadable one, one whose tokenizer vocabulary is not
+the target's, or one scoring more ids than the target is refused by name in `LoadReport::draft`
+and the target loads alone; a draft padded less than its target proposes only its tokenizer's
+ids), and only a resident draft advertises `draft_model` (the model's prompt-lookup depth bound,
+recommended 4) — which the engine then runs with `decode::DraftModelProposer`, pricing the
+draft's own prefill and cache in request admission. A request whose reach outruns the draft's own
+context window runs `auto` instead, the reason named in `DecodeReport::fallbacks`. The greedy parity suite and the
+benchmark harness are core-llm-testkit's `check_speculative_greedy_parity` /
+`run_speculative_bench`; `tests/speculative_bench.rs` drives the harness on real weights.
 
 Every other decoder reaches the same machinery through the same two seams (sc-24138): `CausalLm`
 (the whole llama family — Llama, Qwen3 dense, Gemma 2/4, GLM-4, DeepSeek-V2 MLA, Qwen3-VL's

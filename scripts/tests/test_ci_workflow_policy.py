@@ -207,14 +207,15 @@ def posix_shell() -> str | None:
 
 
 def bash_syntax_check(shell: str, script: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    result = subprocess.run(
         [shell, "-n"],
-        input=script,
-        text=True,
-        encoding="utf-8",
+        # Windows text-mode stdin translates LF to CRLF before Bash reads it.
+        input=script.encode("utf-8"),
         capture_output=True,
         check=False,
     )
+    return subprocess.CompletedProcess(result.args, result.returncode,
+        result.stdout.decode("utf-8"), result.stderr.decode("utf-8"))
 
 
 def chroma_packed_build_script() -> str:
@@ -292,7 +293,8 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
                 # Separate runs, revisions and phases on the primary must all share one group.
                 variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
-                            ("3", "c" * 40, "imports"), ("4", "d" * 40, "full")) if primary else (("1", "a" * 40, "probe"),)
+                            ("3", "c" * 40, "imports"), ("4", "d" * 40, "full"),
+                            ("5", "e" * 40, "diagnostic"), ("6", "f" * 40, "q4-numeric")) if primary else (("1", "a" * 40, "probe"),)
                 for run_id, sha, phase in variants:
                     values = {"github.event_name": event, "inputs.profile": profile,
                               "inputs.qwen_image_2_1_lora_runner": runner,
@@ -386,6 +388,37 @@ def minimax_h3_vram_policy_errors(workflow: str, manifest: str) -> list[str]:
         source = models.get(f"minimax-h3-mlx-{tier}", {})
         if source.get("revision") != "137ce668c55a20bc0935fd1cf2a3de8448abb7f4":
             errors.append(f"minimax-h3-mlx-{tier}: does not match the provider's built-in revision")
+    return errors
+
+
+GIT_BASH_BIN = "C:\\Program Files\\Git\\bin"
+
+
+def windows_bash_selection_errors(name: str, job: dict) -> list[str]:
+    """On a self-hosted Windows runner a bare `bash` resolves to WSL's
+    `C:\\Windows\\System32\\bash.exe`, which has no distribution there and fails every step
+    (sc-24446: `execvpe(/bin/bash) failed`). Every step that runs bash — `shell: bash`, or
+    `dtolnay/rust-toolchain`, whose steps are `shell: bash` — must come after the step that checks
+    for Git Bash and puts it first on `GITHUB_PATH`."""
+    if "self-hosted" not in job.get("runs-on", []) or "windows" not in [
+        str(label).lower() for label in job.get("runs-on", [])
+    ]:
+        return []
+    selected = False
+    errors = []
+    for step in job.get("steps", []):
+        run = str(step.get("run", ""))
+        if f'"{GIT_BASH_BIN}\\bash.exe"' in run and f'{GIT_BASH_BIN}>>"%GITHUB_PATH%"' in run:
+            selected = True
+            continue
+        runs_bash = step.get("shell") == "bash" or str(step.get("uses", "")).startswith(
+            "dtolnay/rust-toolchain@"
+        )
+        if runs_bash and not selected:
+            errors.append(
+                f"{name}: `{step.get('name') or step.get('uses')}` runs bash before Git Bash is "
+                "selected (a bare `bash` is WSL's on the Windows runners)"
+            )
     return errors
 
 
@@ -1468,6 +1501,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         result = bash_syntax_check(self.require_posix_shell(), script)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_bash_syntax_check_preserves_lf_under_windows_stdin_translation(self) -> None:
+        from unittest.mock import patch
+        shell = self.require_posix_shell()
+        native_run = subprocess.run
+        script = "for bits in 4 8; do\n  :\ndone\n"
+        def windows_stdin(command, **kwargs):
+            payload = kwargs["input"]
+            if isinstance(payload, str):
+                payload = payload.replace("\n", "\r\n").encode("utf-8")
+            return native_run(command, input=payload, text=False, capture_output=True, check=False)
+        with patch.object(subprocess, "run", side_effect=windows_stdin):
+            actual = bash_syntax_check(shell, script)
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            # The previous text-mode implementation must fail the same discriminator.
+            mutant = subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
+                                    capture_output=True, check=False)
+            self.assertNotEqual(mutant.returncode, 0, "text stdin mutation escaped Windows-equivalent gate")
 
     def test_bash_syntax_check_rejects_a_malformed_build_script(self) -> None:
         # The positive case alone cannot tell "the script parses" from "the checker never fails".
@@ -4212,6 +4263,186 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(mutation=mutate):
                 self.assertTrue(self.qwen_image_2_1_lane_errors(mutated, source))
 
+    def decode_speedups_bench_errors(self, workflow: dict) -> list[str]:
+        """Everything `test_decode_speedups_bench_…` below binds, as a list of findings."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "speculative_bench_campaign",
+            WORKFLOW.parents[2] / "scripts" / "release" / "speculative_bench_campaign.py",
+        )
+        assert spec and spec.loader
+        campaign = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(campaign)
+
+        errors: list[str] = []
+        inputs = workflow[True]["workflow_dispatch"]["inputs"]
+        if "decode-speedups-bench" not in inputs["profile"]["options"]:
+            errors.append("`decode-speedups-bench` is not a dispatchable profile")
+        if inputs.get("decode_bench_matrix", {}).get("type") != "string":
+            errors.append("no string `decode_bench_matrix` input")
+        job = workflow["jobs"].get("candle-decode-speedups-bench")
+        if job is None:
+            return errors + ["no `candle-decode-speedups-bench` job"]
+        if job["if"] != (
+            "github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench'"
+        ):
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        if job["runs-on"] != ["self-hosted", "windows", "cuda", "real-weights"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+        if job.get("timeout-minutes", 0) < 480:
+            errors.append(f"timeout {job.get('timeout-minutes')} is under 480 minutes")
+        env = job.get("env", {})
+        for name, value in (
+            ("DECODE_BENCH_MATRIX", "${{ inputs.decode_bench_matrix }}"),
+            ("DECODE_BENCH_SNAPSHOT_QWEN38", "${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}"),
+            ("DECODE_BENCH_SNAPSHOT_BONSAI_MLX", "${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}"),
+            ("CUDA_VISIBLE_DEVICES", "1"),
+            # CUDA numbers the cards as nvidia-smi does, so ordinal 1 is the inventory's GPU 1.
+            ("CUDA_DEVICE_ORDER", "PCI_BUS_ID"),
+            ("CUDA_PATH", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"),
+        ):
+            if env.get(name) != value:
+                errors.append(f"job env {name} is {env.get(name)!r}, expected {value!r}")
+        for name in campaign.SNAPSHOT_ALIASES.values():
+            if name not in env:
+                errors.append(f"snapshot alias variable {name} is not mapped")
+        # The untrusted matrix reaches the job through `env:` only, never a step body or `with:`.
+        steps = job["steps"]
+        if "inputs.decode_bench_matrix" in json.dumps(steps):
+            errors.append("a step interpolates the untrusted matrix input")
+
+        checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
+        expected = [
+            {"path": "inference"},
+            {"ref": campaign.PRE_EPIC_SHA, "path": "inference-pre-epic"},
+        ]
+        if [s.get("with") for s in checkouts] != expected:
+            errors.append(f"checkouts are {[s.get('with') for s in checkouts]!r}")
+        if job.get("defaults", {}).get("run", {}).get("working-directory") != "inference":
+            errors.append("steps do not run in the dispatched checkout")
+
+        named = {s.get("name"): s for s in steps}
+        index = {s.get("name"): i for i, s in enumerate(steps)}
+        wrapper = "Disable unstable sccache wrapper for the heavy Candle lane"
+        if "RUSTC_WRAPPER=" not in named.get(wrapper, {}).get("run", ""):
+            errors.append("RUSTC_WRAPPER is not cleared")
+        copy = named.get("Copy the baseline driver into the pre-epic checkout", {}).get("run", "")
+        driver = "crates\\contracts\\core-llm\\core-llm-testkit\\baseline\\speculative_bench_baseline.rs"
+        target = "..\\inference-pre-epic\\crates\\llm\\candle-llm\\tests\\speculative_bench_baseline.rs"
+        if driver not in copy or target not in copy or "|| exit /b 1" not in copy:
+            errors.append(f"the driver is not copied into the pre-epic checkout: {copy!r}")
+        # The runner script builds both checkouts itself, stamping the commit at compile time; a
+        # separate unstamped build would only be rebuilt (or, run as is, refused).
+        for step in steps:
+            if "cargo test" in step.get("run", ""):
+                errors.append(f"{step.get('name')}: builds outside the stamping runner script")
+        plan = named.get(
+            "Validate the matrix and initialize the run-scoped evidence directory", {}
+        ).get("run", "")
+        if "speculative_bench_campaign.py plan --lane cuda " not in plan:
+            errors.append("the matrix is not planned for the cuda lane")
+        if campaign.LANES["cuda"].features != ("cuda",) or campaign.LANES["cuda"].backend != "candle-cuda":
+            errors.append("the runner's cuda lane does not build candle-llm with `cuda`")
+        run_name = "Build both checkouts and run every matrix row (epic and baseline alternating)"
+        if index.get(run_name, -1) < index.get(wrapper, len(steps)):
+            errors.append("the runner builds before RUSTC_WRAPPER is cleared")
+        run = named.get(run_name, {}).get("run", "")
+        for fragment in (
+            'call "%VCVARS%"',
+            '"%REVIEWED_PYTHON%" scripts/release/speculative_bench_campaign.py run ',
+            '--epic-sha "%GITHUB_SHA%"',
+            "--pre-epic-root ..\\inference-pre-epic",
+            '--pre-epic-target-dir "%DECODE_BENCH_PRE_EPIC_TARGET%"',
+            '--output "%DECODE_BENCH_OUT%"',
+        ):
+            if fragment not in run:
+                errors.append(f"the run step lacks {fragment!r}")
+        errors += windows_bash_selection_errors("candle-decode-speedups-bench", job)
+        upload = named.get("Keep the decode-speedups benchmark documents", {})
+        if upload.get("if") != "always()":
+            # A job that hits `timeout-minutes` counts as cancelled: `!cancelled()` dropped every
+            # finished row of run 36891326535 (sc-24446).
+            errors.append("the documents upload must survive a failed row, a cancel and a timeout")
+        if upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("an empty upload must red")
+        if upload.get("with", {}).get("path") != (
+            "${{ runner.temp }}/decode-speedups-bench-${{ github.run_id }}-${{ github.run_attempt }}"
+        ):
+            errors.append("the upload is not the run-scoped directory")
+        return errors
+
+    def test_decode_speedups_bench_is_dispatch_only_and_runs_both_checkouts_per_row(self) -> None:
+        """sc-24446: the epic sc-24432 campaign lane — dispatch-only, on the second card, the
+        untrusted matrix only through `env:`, the dispatched ref and the pre-epic revision checked
+        out side by side with the driver copied in, and every document kept."""
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(self.decode_speedups_bench_errors(workflow), [])
+        header = (
+            REAL_WEIGHTS_WORKFLOW.parents[2]
+            / "crates/contracts/core-llm/core-llm-testkit/baseline/speculative_bench_baseline.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("worktree add ../inference-pre-epic c1e8f8e02", header)
+
+        def interpolate(job: dict) -> None:
+            job["steps"][-2]["run"] += ' & echo "${{ inputs.decode_bench_matrix }}"'
+
+        def git_bash_index(job: dict) -> int:
+            return next(i for i, s in enumerate(job["steps"]) if s.get("name") == "Select Git Bash")
+
+        def drop_git_bash(job: dict) -> None:
+            job["steps"].pop(git_bash_index(job))
+
+        def select_git_bash_after_the_toolchain(job: dict) -> None:
+            step = job["steps"].pop(git_bash_index(job))
+            job["steps"].insert(git_bash_index_after_toolchain(job), step)
+
+        def git_bash_index_after_toolchain(job: dict) -> int:
+            return 1 + next(
+                i
+                for i, s in enumerate(job["steps"])
+                if str(s.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+            )
+
+        def bare_bash_step_first(job: dict) -> None:
+            job["steps"].insert(2, {"name": "probe", "shell": "bash", "run": "true"})
+
+        for mutate in (
+            lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench'"}),
+            lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "0"}),
+            lambda job: job["env"].pop("CUDA_DEVICE_ORDER"),
+            lambda job: job.update({"timeout-minutes": 240}),
+            lambda job: job["steps"][1]["with"].update({"ref": "main"}),
+            lambda job: job["steps"][-1].pop("if"),
+            lambda job: job["steps"][-1].update({"if": "${{ !cancelled() }}"}),
+            interpolate,
+            drop_git_bash,
+            select_git_bash_after_the_toolchain,
+            bare_bash_step_first,
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["candle-decode-speedups-bench"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.decode_speedups_bench_errors(mutated))
+
+
+class WindowsBashSelectionTests(unittest.TestCase):
+    def test_every_self_hosted_windows_job_selects_git_bash_before_running_bash(self) -> None:
+        """sc-24446: the decode-speedups lane's `dtolnay/rust-toolchain` ran WSL's bash. Every
+        self-hosted Windows job in every workflow selects Git Bash before any bash step."""
+        checked = 0
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            text = (
+                real_weights_inline_text()
+                if path == REAL_WEIGHTS_WORKFLOW
+                else path.read_text(encoding="utf-8")
+            )
+            for name, job in (yaml.safe_load(text).get("jobs") or {}).items():
+                with self.subTest(workflow=path.name, job=name):
+                    self.assertEqual(windows_bash_selection_errors(name, job), [])
+                checked += "windows" in str(job.get("runs-on", "")).lower()
+        self.assertGreater(checked, 0)
+
 
     def mlx_qwen_image_2_1_lane_errors(self, workflow: dict, source: str) -> list[str]:
         """Everything `test_qwen_image_2_1_mlx_lane_…` below binds, as a list of findings."""
@@ -4383,6 +4614,64 @@ class WorkflowFileSizeTests(unittest.TestCase):
             set(yaml.safe_load(real_weights_inline_text())["jobs"]),
             set(yaml.safe_load(workflow_text)["jobs"]),
         )
+
+
+class Qwen21TerminalPhysicalCeilingTests(unittest.TestCase):
+    CAP = "QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB"
+    JOB = "mlx-qwen-image-2-1"
+
+    @classmethod
+    def ceiling_errors(cls, workflow: dict) -> list[str]:
+        errors: list[str] = []
+        jobs = workflow.get("jobs", {})
+        job = jobs.get(cls.JOB, {})
+        if job.get("env", {}).get(cls.CAP) != "100":
+            errors.append("Qwen 2.1 profile must bind the existing physical cap to literal 100 GB")
+        if cls.CAP in workflow.get("env", {}):
+            errors.append("Qwen's selected cap must not change other profiles through global env")
+        for name, other in jobs.items():
+            if name != cls.JOB and cls.CAP in other.get("env", {}):
+                errors.append(f"Qwen's selected cap leaked into {name}")
+        for step in job.get("steps", []):
+            if cls.CAP in step.get("env", {}):
+                errors.append("a step must not override the fixed profile cap")
+            if re.search(rf"\b{cls.CAP}\s*=", step.get("run", "")):
+                errors.append("a script must not override the fixed profile cap")
+        return errors
+
+    def test_selected_profile_binds_existing_cap_without_other_profile_changes(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(self.ceiling_errors(workflow), [])
+
+    def test_omitted_raised_dynamic_or_unscoped_caps_are_rejected(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        mutations = []
+        for value in [None, "101", "nan", "${{ vars.QWEN_PHYSICAL_CAP || '100' }}"]:
+            mutant = copy.deepcopy(workflow)
+            env = mutant["jobs"][self.JOB]["env"]
+            if value is None:
+                env.pop(self.CAP)
+            else:
+                env[self.CAP] = value
+            mutations.append((f"job value {value!r}", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["env"].pop(self.CAP)
+        mutant.setdefault("env", {})[self.CAP] = "100"
+        mutations.append(("global instead of profile", mutant))
+        mutant = copy.deepcopy(workflow)
+        other = next(name for name in mutant["jobs"] if name != self.JOB)
+        mutant["jobs"][other].setdefault("env", {})[self.CAP] = "100"
+        mutations.append(("other job leak", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["steps"][0].setdefault("env", {})[self.CAP] = "101"
+        mutations.append(("step env override", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["steps"].append({"run": f"export {self.CAP}=101"})
+        mutations.append(("script override", mutant))
+        self.assertEqual(len(mutations), 8)
+        for name, mutant in mutations:
+            with self.subTest(mutation=name):
+                self.assertTrue(self.ceiling_errors(mutant))
 
 
 if __name__ == "__main__":

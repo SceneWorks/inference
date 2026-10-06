@@ -278,6 +278,8 @@ fn validate_adapters_on_lazy_dit(spec: &LoadSpec) -> Result<()> {
 }
 
 fn load_heavy(spec: &LoadSpec) -> Result<Heavy> {
+    #[cfg(test)]
+    let _diagnostic_bounds = crate::q4_diagnostic::materialization_bounds();
     let root: &Path = loader::snapshot_root(&spec.weights)?;
     let mut transformer = loader::load_transformer(root)?;
     // A pre-quantized tier is already packed — `quantize` would be a no-op over packed weights, so
@@ -296,8 +298,56 @@ fn load_heavy(spec: &LoadSpec) -> Result<Heavy> {
     if !spec.adapters.is_empty() {
         crate::adapters::apply_qwen_image_2_1_adapters(&mut transformer, &spec.adapters)?;
     }
+    #[cfg(test)]
+    crate::q4_diagnostic::install_variant(&mut transformer, spec)?;
     let vae = loader::load_vae(root)?;
     Ok(Heavy { transformer, vae })
+}
+
+/// Separate test-only first-step prediction; all render replays finish before
+/// this capture is enabled, so numeric observation cannot alter their lifecycle.
+#[cfg(test)]
+pub(crate) fn diagnostic_first_forward(spec: &LoadSpec, req: &GenerationRequest) -> Result<()> {
+    let root = loader::snapshot_root(&spec.weights)?;
+    let tokenizer = loader::load_tokenizer(root)?;
+    let drop = system_prompt_drop_count(&tokenizer)?;
+    let scheduler = loader::load_scheduler_config(root)?;
+    let params = resolve_run_params(&scheduler, req)?;
+    assert!(
+        !params.use_negative,
+        "fixed diagnostic uses the default positive branch"
+    );
+    let te = load_text_encoder(spec)?;
+    let branches = assemble_reference_branches(&te, &tokenizer, req, drop, params.use_negative)?;
+    let heavy = load_heavy(spec)?;
+    assert_eq!(heavy.transformer.compute_dtype(), mlx_rs::Dtype::Float32);
+    let references = encode_references(&heavy.vae, &branches.references)?;
+    let noise = create_noise(
+        params.base_seed,
+        req.width,
+        req.height,
+        heavy.transformer.config().in_channels,
+    )?;
+    let _bounds = crate::memory_strategy::AllocatorBounds::enter(
+        10_505_507_280 + 6_759_417,
+        crate::memory_strategy::derived::request_transient_budget_bytes(
+            req.width,
+            req.height,
+            crate::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
+            req.memory_reference_count(),
+            params.use_negative,
+            None,
+        ),
+    );
+    let velocity = heavy.transformer.forward_joint(
+        &branches.pos.text,
+        &crate::pipeline::joint_images(&references, &noise),
+        params.sigmas[0],
+        &branches.pos.layout,
+    )?;
+    mlx_rs::transforms::eval([&velocity])?;
+    assert_eq!(velocity.dtype(), mlx_rs::Dtype::Float32);
+    Ok(())
 }
 
 impl Generator for QwenImage21 {
@@ -391,13 +441,17 @@ impl QwenImage21 {
         // The resident term credits the installed adapter stack (sc-24156) — its residual factors
         // and any materialized LyCORIS deltas, exactly as the loaded contract prices them in
         // `overlay_bytes` — so an adapter load does not run under a limit sized for the bare base.
+        let resident_bytes = crate::memory_strategy::derived::resident_weights(
+            crate::quant::Tier::from_selected(self.spec.quantize)
+                .unwrap_or(crate::quant::Tier::Bf16),
+        )
+        .resident_total()
+        .saturating_add(self.memory_strategy.asset_facts.overlay_bytes);
+        #[cfg(test)]
+        let resident_bytes =
+            resident_bytes.saturating_add(crate::q4_diagnostic::resident_surcharge());
         let _bounds = crate::memory_strategy::AllocatorBounds::enter(
-            crate::memory_strategy::derived::resident_weights(
-                crate::quant::Tier::from_selected(self.spec.quantize)
-                    .unwrap_or(crate::quant::Tier::Bf16),
-            )
-            .resident_total()
-            .saturating_add(self.memory_strategy.asset_facts.overlay_bytes),
+            resident_bytes,
             crate::memory_strategy::derived::request_transient_budget_bytes(
                 req.width,
                 req.height,

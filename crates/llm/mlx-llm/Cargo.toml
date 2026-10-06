@@ -25,6 +25,8 @@ autotests = false
 # pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
 # with mlx-gen's pin so the two still build ONE mlx-rs.
 mlx-rs = { workspace = true }
+# The raw MLX C API, for the stream → device query the Gated DeltaNet kernel dispatch needs
+# (a custom Metal kernel only runs on a GPU stream; mlx-rs exposes no stream-device getter).
 # The mlx-c binding for ops mlx-rs does not wrap (`mlx_contiguous`, sc-20676), same pinned rev.
 mlx-sys = { workspace = true }
 # The backend-neutral contract this crate implements.
@@ -51,6 +53,9 @@ libc = { workspace = true }
 core-llm-testkit = { workspace = true }
 # Self-removing fixture roots for the unit + integration suites (sc-17768).
 tempfile = { workspace = true }
+# `mlx_array_is_available`: the MoE routing suite (sc-24440) asserts a decode step leaves its lazy
+# inputs unevaluated, i.e. read nothing back to the host. mlx-rs does not expose the query.
+mlx-sys = { workspace = true }
 # Mock the chat template's `strftime_now` clock: campaign renders must not depend on the date.
 core-llm = { workspace = true, features = ["test-clock"] }
 

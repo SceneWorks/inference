@@ -137,8 +137,22 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
     let dir = write_tiny_qwen38_snapshot();
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string())).unwrap();
     let mtp = provider.descriptor().capabilities.mtp.unwrap();
-    assert_eq!(mtp.recommended_draft_tokens, 3);
-    assert_eq!(mtp.max_draft_tokens, u32::MAX);
+    assert_eq!(
+        mtp.recommended_draft_tokens,
+        mlx_llm::core_llm::DecodeBackend::Mlx
+            .defaults()
+            .recommended_depths
+            .mtp
+    );
+    // 2q/1kv/hd 4: a head dim the vector kernel does not serve, so the 8-row bound (sc-24438).
+    assert_eq!(
+        mtp.max_draft_tokens,
+        mlx_llm::provider::speculative_max_depth([(2, 1, 4, 4)])
+    );
+    assert_eq!(
+        mtp.max_draft_tokens,
+        mlx_llm::provider::SPECULATIVE_MAX_DEPTH
+    );
 
     let ar = provider
         .generate(
@@ -153,7 +167,7 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
     );
 
     let mut request = req("What is 2+2?", ThinkingMode::Disabled, 4);
-    request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    request.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
     let (output, thinking, content) = run(&provider, &request);
     assert_eq!(output.usage.generated_tokens, 4);
     assert!(thinking.is_empty());
@@ -169,7 +183,7 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
 
     // The same native provider route accepts the frozen template's tool prompt while MTP is active.
     let mut with_tool = req("weather in Paris?", ThinkingMode::Disabled, 2);
-    with_tool.mtp = MtpMode::Auto;
+    with_tool.mtp = Some(MtpMode::Auto);
     with_tool.tools = vec![ToolSpec::new(
         "get_weather",
         "Get the weather",
@@ -179,7 +193,7 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
     assert!(out.mtp.is_some());
 
     let mut constrained = req("return json", ThinkingMode::Disabled, 2);
-    constrained.mtp = MtpMode::Enabled { draft_tokens: 1 };
+    constrained.mtp = Some(MtpMode::Enabled { draft_tokens: 1 });
     constrained.constraint = Some(core_llm::Constraint::Json);
     let constrained_mtp = provider.generate(&constrained, &mut |_| {}).unwrap();
     assert!(
@@ -187,7 +201,7 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
         "explicit MTP must preserve native JSON-constrained generation"
     );
 
-    constrained.mtp = MtpMode::Auto;
+    constrained.mtp = Some(MtpMode::Auto);
     let auto = provider.generate(&constrained, &mut |_| {}).unwrap();
     assert!(
         auto.mtp.is_some(),
@@ -195,7 +209,7 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
     );
 
     let mut over_context = req("context gate", ThinkingMode::Disabled, 513);
-    over_context.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    over_context.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
     let error = provider
         .generate(&over_context, &mut |_| {})
         .expect_err("MTP request beyond the expanded context must fail before prefill");
@@ -311,6 +325,9 @@ fn qwen35_quantize_on_load_q8() {
         projector_source: None,
         quantize: Some(Quantize::Q8),
         cuda_graphs: None,
+        mtp_head_source: None,
+        prefix_cache_bytes: None,
+        draft_source: None,
     })
     .expect("load q8");
     assert!(q8.is_quantized(), "Q8 load must report quantized");

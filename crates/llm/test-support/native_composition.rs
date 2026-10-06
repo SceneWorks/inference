@@ -221,7 +221,7 @@ fn native_reasoning_json_stop_and_timing_routes() {
                         max_new_tokens: 12,
                         sampling: Sampling::greedy(),
                         thinking: mode,
-                        mtp,
+                        mtp: Some(mtp),
                         constraint: Some(Constraint::Json),
                         ..Default::default()
                     };
@@ -342,7 +342,9 @@ fn native_resource_rejects_within_window_before_allocating() {
             .unwrap()
             .to_string();
         assert!(
-            error.contains("bytes of native workspace but only 1 bytes are available"),
+            error.contains("load admission:")
+                && error.contains("bytes are available")
+                && error.contains("only 1 bytes"),
             "{error}"
         );
         std::env::set_var(core_llm::AVAILABLE_MEMORY_OVERRIDE, "invalid-budget");

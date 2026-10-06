@@ -32,6 +32,7 @@ members = [
     "crates/media/candle-gen/candle-gen*",
 ]
 exclude = [
+    "crates/media/candle-gen/vendor/candle-core",
     "crates/media/candle-gen/vendor/candle-kernels",
 ]
 
@@ -117,6 +118,11 @@ tempfile = "3"
 [profile.dev.package."*"]
 opt-level = 3
 
-# Preserve the vendored multi-architecture CUDA kernel override.
+# Preserve the vendored multi-architecture CUDA kernel override, and the vendored candle-core:
+# upstream 1e6aa85e plus the CUDA-graph parameter cache (#3564 + #3598) the decode graph runner
+# needs (sc-24441; provenance and the eager-behaviour argument in
+# crates/media/candle-gen/vendor/candle-core/VENDORED.md). A [patch] only applies to the top-level
+# workspace: a consumer that builds these crates by git must carry the same two entries.
 [patch."https://github.com/huggingface/candle"]
+candle-core = { path = "crates/media/candle-gen/vendor/candle-core" }
 candle-kernels = { path = "crates/media/candle-gen/vendor/candle-kernels" }

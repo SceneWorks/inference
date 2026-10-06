@@ -223,7 +223,10 @@ impl GptBigCodeLayer {
         // The published StarVector safetensors store every GPTBigCode projection in ordinary
         // `[out, in]` layout, matching the shared linear helper.
         let mlp = linear_batched_gemv(&normed, &self.fc_weight, Some(&self.fc_bias))?;
-        let mlp = gelu_tanh(&mlp)?;
+        let mlp = gelu_tanh(
+            &mlp,
+            crate::primitives::activation::ActivationRole::LlmDecode,
+        )?;
         let mlp = linear_batched_gemv(&mlp, &self.proj_weight, Some(&self.proj_bias))?;
         Ok(add(&hidden, &mlp)?)
     }
@@ -419,6 +422,56 @@ mod tests {
             &[4],
         );
         GptBigCode::from_weights(&Weights::from_map(map), prefix, cfg).unwrap()
+    }
+
+    /// sc-24446 parity gate: StarVector-1B's GPTBigCode decoder switches its tanh-GELU MLP to
+    /// the activation dtype; on a random BF16 fixture its logits stay within the gate's budget of
+    /// the `f32` path and its greedy tokens agree ([`crate::primitives::activation::parity`]).
+    #[test]
+    fn geglu_activation_dtype_parity() {
+        use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
+        let (v, h, layers, heads, positions) = (64, 64, 2, 4, 64);
+        let kv = 2 * (h / heads);
+        let mut shapes: Vec<(String, Vec<i32>)> = vec![
+            ("p.transformer.wte.weight".into(), vec![v, h]),
+            ("p.transformer.wpe.weight".into(), vec![positions, h]),
+            ("p.transformer.ln_f.weight".into(), vec![h]),
+            ("p.transformer.ln_f.bias".into(), vec![h]),
+        ];
+        for i in 0..layers {
+            let l = |s: &str| format!("p.transformer.h.{i}.{s}");
+            for (key, shape) in [
+                ("ln_1.weight", vec![h]),
+                ("ln_1.bias", vec![h]),
+                ("ln_2.weight", vec![h]),
+                ("ln_2.bias", vec![h]),
+                ("attn.c_attn.weight", vec![h + kv, h]),
+                ("attn.c_attn.bias", vec![h + kv]),
+                ("attn.c_proj.weight", vec![h, h]),
+                ("attn.c_proj.bias", vec![h]),
+                ("mlp.c_fc.weight", vec![4 * h, h]),
+                ("mlp.c_fc.bias", vec![4 * h]),
+                ("mlp.c_proj.weight", vec![h, 4 * h]),
+                ("mlp.c_proj.bias", vec![h]),
+            ] {
+                shapes.push((l(key), shape));
+            }
+        }
+        let cfg = GptBigCodeConfig {
+            vocab_size: v,
+            hidden_size: h,
+            layers: layers as usize,
+            heads,
+            positions,
+        };
+        let model = GptBigCode::from_weights(
+            &Weights::from_map(random_bf16(&shapes, 0x2444_6601)),
+            "p",
+            cfg,
+        )
+        .unwrap();
+        let report = assert_geglu_parity("gpt_bigcode", &model, &[3, 17, 5, 40, 9], 16);
+        eprintln!("gpt_bigcode GeGLU parity: {report:?}");
     }
 
     #[test]

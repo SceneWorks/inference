@@ -1,10 +1,12 @@
 """CPU-only controls for the dispatch-only precision proof."""
 import importlib.util
 import json
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import copy
 import base64
+import os
 import subprocess
 import time
 import sys
@@ -23,6 +25,158 @@ WORKFLOW = ROOT / ".github/workflows/yue2-precision-proof.yml"
 
 
 class PrecisionControlTests(unittest.TestCase):
+    @staticmethod
+    def concurrency_settings(source):
+        block = re.search(r"(?m)^concurrency:\n((?: +[^\n]*\n)+)", source)
+        if block is None:
+            raise AssertionError("workflow concurrency block missing")
+        settings = {}
+        current = None
+        for line in block[1].splitlines():
+            if line.startswith("  ") and not line.startswith("    "):
+                key, value = line.strip().split(": ", 1)
+                current = key if value == ">-" else None
+                settings[key] = "" if current else value
+            elif current and line.startswith("    "):
+                settings[current] += (" " if settings[current] else "") + line.strip()
+            else:
+                raise AssertionError("unexpected workflow concurrency layout")
+        return settings
+
+    @staticmethod
+    def concurrency_group(group, stage, run_id, scheduling="shared-host", receipt="", engine=""):
+        # A restricted GitHub &&/|| interpreter reads both workflow expressions.
+        # It has no scheduling policy of its own; the tests below specify routing.
+        if not (group.startswith("${{ ") and group.endswith(" }}")):
+            raise AssertionError("unexpected precision concurrency expression")
+        values = {"stage": stage, "backend": stage, "cuda_scheduling_mode": scheduling,
+                  "idle_cuda_context_run_id": receipt, "expected_engine_sha": engine}
+        for branch in group[4:-3].split(" || "):
+            clauses = branch.split(" && ")
+            selected = True
+            for clause in clauses[:-1]:
+                match = re.fullmatch(r"inputs\.([a-z_]+) == '([^']*)'", clause)
+                if match is None or match[1] not in values:
+                    raise AssertionError("unsupported selector")
+                selected &= values[match[1]] == match[2]
+            if selected:
+                result = clauses[-1]
+                match = re.fullmatch(r"format\('([^']+)', github\.run_id\)", result)
+                if match:
+                    return match[1].format(run_id)
+                match = re.fullmatch(r"'([^']+)'", result)
+                if match:
+                    return match[1]
+                raise AssertionError("unsupported group")
+        raise AssertionError("group expression has no default")
+
+    def test_fixture_transfers_use_distinct_run_owned_cpu_groups(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        settings = self.concurrency_settings(source)
+        group = settings["group"]
+        first = self.concurrency_group(group, "fixture", "101")
+        second = self.concurrency_group(group, "fixture", "102")
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(first, "inference-real-weights-physical-host")
+        fixture = source.split("  reference:\n", 1)[1].split("\n  cuda:", 1)[0]
+        self.assertIn("    if: inputs.stage == 'fixture'\n", fixture)
+        self.assertIn("    runs-on: ubuntu-latest\n", fixture)
+
+    def test_accelerators_retain_their_exact_physical_host_groups(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        settings = self.concurrency_settings(source)
+        group = settings["group"]
+        for stage in ("cuda", "metal", "cuda-diagnostic", "", "unknown"):
+            for run_id in ("101", "102"):
+                with self.subTest(stage=stage, run_id=run_id):
+                    self.assertEqual(self.concurrency_group(group, stage, run_id),
+                                     "yue2-app-precision-nax-macos-2" if stage == "metal" else
+                                     "inference-real-weights-physical-host")
+        # Keep all other workflow users of the accelerator lock byte-consistent.
+        for name in ("real-weights.yml", "real-weights-yue.yml", "yue2-bf16-tile-diagnostic.yml",
+                     "ltx25-quant-campaign.yml", "ltx25-quant-promotion.yml"):
+            other = self.concurrency_settings(WORKFLOW.with_name(name).read_text(encoding="utf-8"))
+            with self.subTest(workflow=name):
+                if name == "real-weights.yml":
+                    self.assertEqual(other["group"],
+                                     "${{ github.event_name == 'workflow_dispatch' && "
+                                     "inputs.profile == 'qwen-image-2-1-lora-mlx' && "
+                                     "inputs.qwen_image_2_1_lora_runner == 'rw-starvector' && "
+                                     "'inference-real-weights-qwen21-primary-mac' || "
+                                     "'inference-real-weights-physical-host' }}")
+                else:
+                    self.assertEqual(other["group"],
+                                     self.concurrency_group(group, "cuda", "101"))
+                self.assertEqual(other["cancel-in-progress"], "false")
+        app = self.concurrency_settings(
+            WORKFLOW.with_name("yue2-app-precision-profile.yml").read_text(encoding="utf-8"))
+        for backend, expected in (("cuda", "inference-real-weights-physical-host"),
+                                  ("metal", "yue2-app-precision-nax-macos-2")):
+            self.assertEqual(self.concurrency_group(app["group"], backend, "101"), expected)
+        self.assertEqual(app["cancel-in-progress"], "false")
+        self.assertEqual(self.concurrency_group(group, "metal", "101"),
+                         self.concurrency_group(app["group"], "metal", "102"))
+        for stage in ("cuda", "cuda-diagnostic"):
+            self.assertEqual(self.concurrency_group(group, stage, "101", scheduling="shared-gpu1"),
+                             "inference-yue2-owner-gpu1")
+        self.assertEqual(self.concurrency_group(app["group"], "cuda", "102", scheduling="shared-gpu1"),
+                         "inference-yue2-owner-gpu1")
+        self.assertEqual(self.concurrency_group(app["group"], "metal", "102", scheduling="shared-gpu1"),
+                         "yue2-app-precision-nax-macos-2")
+
+    def test_precision_queue_preserves_existing_pending_and_running_work(self):
+        settings = self.concurrency_settings(WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(settings["queue"], "max")
+        self.assertEqual(settings["cancel-in-progress"], "false")
+
+    def test_optional_app_sha_is_absent_when_empty_and_one_argument_when_set(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        cuda = workflow.split("      - name: Run two exact CUDA smokes then the unchanged precision test with external sampling\n", 1)[1].split("      - name: Upload raw CUDA proof", 1)[0]
+        metal = workflow.split("      - name: Run exactly one Metal precision test with external sampling\n", 1)[1].split("      - name: Upload raw Metal proof", 1)[0]
+
+        def conditional_flags(cuda_source, metal_source):
+            self.assertRegex(cuda_source, r"\$proofArgs = @\('run', '--backend', 'cuda'[^\n]*\)")
+            self.assertIn("if ($env:EXPECTED_APP_SHA) { $proofArgs += @('--app-sha', $env:EXPECTED_APP_SHA) }", cuda_source)
+            self.assertIn("yue2_precision_proof.py @proofArgs", cuda_source)
+            self.assertRegex(metal_source, r"proof_args=\(run --backend metal[^\n]*\)")
+            self.assertIn('if [[ -n "$EXPECTED_APP_SHA" ]]; then proof_args+=(--app-sha "$EXPECTED_APP_SHA"); fi', metal_source)
+            self.assertIn('yue2_precision_proof.py "${proof_args[@]}"', metal_source)
+
+        conditional_flags(cuda, metal)
+        with self.assertRaises(AssertionError):
+            conditional_flags(cuda.replace("if ($env:EXPECTED_APP_SHA) { ", "", 1), metal)
+        with self.assertRaises(AssertionError):
+            conditional_flags(cuda, metal.replace('if [[ -n "$EXPECTED_APP_SHA" ]]; then ', "", 1))
+
+        # Execute the Bash workflow body with a fake Python entrypoint to inspect
+        # its real argument vector without loading a model or running the controller.
+        lines = metal.split("        run: |\n", 1)[1].splitlines()
+        script = "\n".join(line[10:] for line in lines if line.startswith("          ")) + "\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "yue2-precision-proof").mkdir()
+            (root / "yue2-precision-proof/binary.txt").write_text("test-binary\n", encoding="utf-8")
+            stub = root / "python3.12"
+            stub.write_text("#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+            stub.chmod(0o755)
+            base = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "RUNNER_TEMP": directory,
+                    "YUE2_PRECISION_WORK_DIR": str(root / "listening"), "EXPECTED_ENGINE_SHA": "a" * 40,
+                    "EXPECTED_CONTROL_SHA": "b" * 40}
+            for app_sha in ("", "c" * 40):
+                result = subprocess.run(["bash", "-e"], input=script, text=True, encoding="utf-8", capture_output=True,
+                                        env={**base, "EXPECTED_APP_SHA": app_sha}, check=True)
+                argv = json.loads(result.stdout)
+                self.assertEqual(argv.pop(0), "../control/scripts/ci/yue2_precision_proof.py")
+                self.assertEqual(argv.count("--app-sha"), bool(app_sha))
+                if app_sha:
+                    self.assertEqual(argv[-2:], ["--app-sha", app_sha])
+                else:
+                    self.assertEqual(argv[-2:], ["--control-sha", "b" * 40])
+                with patch.object(CONTROL, "execute") as execute, \
+                     patch.object(sys, "argv", ["yue2_precision_proof.py", *argv]):
+                    CONTROL.main()
+                self.assertEqual(execute.call_args.args[0].app_sha, app_sha)
+
     def test_workflow_control_and_engine_revisions_are_independent_and_exact(self):
         engine, control = "a" * 40, "b" * 40
         result = type("Result", (), {"stdout": engine + "\n"})()
@@ -96,12 +250,13 @@ class PrecisionControlTests(unittest.TestCase):
             with self.subTest(platform=platform, visible=visible, order=order), \
                  self.assertRaisesRegex(RuntimeError, "PCI-ordered CUDA GPU0"):
                 IDLE.check_device_selection(platform, visible, order)
-        self.assertEqual(IDLE.RUN_ID, "37106146499")
+        self.assertEqual(IDLE.RUN_ID, "37145909196")
         self.assertEqual(IDLE.BASELINE_DIGEST,
-                         "1b6f2d9588b2e25da62f22eec80d406a8b8aeea578d913aefb74e4cc971ae112")
+                         "d67f8d2c7cd79040bbe48ada71e6e27722237a3316bf622e69808ca341f77a2c")
         IDLE.check_dispatch(IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40)
         for run_id, engine, control, github in (
             ("36956986577", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
+            ("37122359802", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
             ("other", IDLE.BASELINE_ENGINE_SHA, "a" * 40, "a" * 40),
             (IDLE.RUN_ID, "bad", "a" * 40, "a" * 40),
             (IDLE.RUN_ID, IDLE.BASELINE_ENGINE_SHA, "a" * 40, "b" * 40),
@@ -117,11 +272,28 @@ class PrecisionControlTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                     IDLE.verify_artifact(Path(directory))
 
+    def test_all_consumers_bind_one_exact_new_baseline(self):
+        import yue2_gpu0_owner_guard as owner
+        self.assertEqual(IDLE.BASELINE_ENGINE_SHA, "4127a675fc8575555e029e01b7f6867488880a8f")
+        self.assertEqual(IDLE.BASELINE_CONTROL_SHA, "e538120368ac279cc42176c44f9d88fa5af9c9b4")
+        self.assertEqual(owner.RECEIPT, IDLE.RUN_ID)
+        self.assertEqual(owner.RECEIPT_DIGEST, IDLE.BASELINE_DIGEST)
+        expected = (f"yue2-cuda-diagnostic-engine-{IDLE.BASELINE_ENGINE_SHA}"
+                    f"-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1")
+        for name in ("yue2-precision-proof.yml", "yue2-app-precision-profile.yml",
+                     "yue2-bf16-tile-diagnostic.yml"):
+            source = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+            self.assertEqual(source.count(f"name: {expected}\n"), 1, name)
+            self.assertNotIn("-37122359802-1", source)
+            if name != "yue2-bf16-tile-diagnostic.yml":
+                self.assertIn(f"inputs.idle_cuda_context_run_id == '{IDLE.RUN_ID}'", source)
+                self.assertNotIn("inputs.idle_cuda_context_run_id == '37122359802'", source)
+
     def test_saved_runner_is_pinned_and_fresh_runner_matches_an_eligible_listener(self):
-        self.assertEqual(IDLE.BASELINE_RUNNER, "cuda-windows-2")
+        self.assertEqual(IDLE.BASELINE_RUNNER, "cuda-windows")
         source = {"completed": True, "targetPid": 38212, "engineSha": IDLE.BASELINE_ENGINE_SHA,
                   "controlSha": IDLE.BASELINE_CONTROL_SHA}
-        with patch.object(IDLE, "read_json", return_value={**source, "runner": "cuda-windows"}), \
+        with patch.object(IDLE, "read_json", return_value={**source, "runner": "cuda-windows-2"}), \
              self.assertRaisesRegex(RuntimeError, "manifest/source/runner mismatch"):
             IDLE.summarize(Path("unused"), baseline=True, pid=38212,
                            engine_sha=IDLE.BASELINE_ENGINE_SHA, control_sha=IDLE.BASELINE_CONTROL_SHA)
@@ -151,9 +323,11 @@ class PrecisionControlTests(unittest.TestCase):
         header = "# gpu pid type fb sm\n"
         with patch.dict("os.environ", {"YUE2_IDLE_CONTEXT_RUN_ID": IDLE.RUN_ID}):
             with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 - - - -\n")), \
-                 patch.object(IDLE, "census_mixed_context") as attestation:
-                self.assertEqual(CONTROL.cuda_census()[1], [])
+                 patch.object(IDLE, "census_mixed_context") as attestation, \
+                 patch.object(IDLE, "census_empty_device", return_value=("fresh empty proof", True)) as empty:
+                self.assertEqual(CONTROL.cuda_census(), ("fresh empty proof", []))
                 attestation.assert_not_called()
+                empty.assert_called_once()
             with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 38212 C+G 0 -\n")), \
                  patch.object(IDLE, "census_mixed_context", return_value=("reviewed raw receipt", True)):
                 self.assertEqual(CONTROL.cuda_census(), ("reviewed raw receipt", []))
@@ -174,6 +348,25 @@ class PrecisionControlTests(unittest.TestCase):
                  patch.object(IDLE, "census_mixed_context") as attestation:
                 self.assertEqual(len(CONTROL.cuda_census()[1]), 1)
                 attestation.assert_not_called()
+
+    def test_saved_physical_refusal_is_visible_without_exempting_pid(self):
+        busy = ["0 38212 C+G - - ChatGPT.exe"]
+        for reason in ("adapterDedicated rose over reviewed baseline",
+                       "target GPU Engine activity", "process identity changed"):
+            raw = json.dumps({"commandExit": 0, "refusal": reason})
+            with patch.object(CONTROL, "cuda_census", return_value=(raw, busy)):
+                saved, refused = CONTROL.cuda_physical_census()
+            self.assertEqual(refused, busy)
+            message = CONTROL.physical_busy_message(saved, refused, "before test")
+            self.assertIn(reason, message)
+            self.assertIn("38212", message)
+        for raw in ("typed pmon rows", "[]", '{"refusal": true}', '{"refusal": ""}'):
+            self.assertEqual(CONTROL.physical_busy_message(raw, busy, "before test"),
+                             f"before test: {busy}")
+        for pid in (38213, 123):
+            foreign = [f"0 {pid} C+G - - ChatGPT.exe"]
+            with patch.object(CONTROL, "cuda_census", return_value=("typed rows", foreign)):
+                self.assertEqual(CONTROL.cuda_physical_census()[1], foreign)
 
     def test_full_cuda_proof_refuses_bare_pmon_and_requires_all_fresh_files(self):
         for raw, busy in (("# gpu pid type\n0 - -\n", []),
@@ -201,6 +394,38 @@ class PrecisionControlTests(unittest.TestCase):
         changed["diagnosticFileBytesB64"]["sample-0.json"] = base64.b64encode(b"wrong").decode()
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, "raw bytes disagree"):
             CONTROL.retain_cuda_physical_evidence(Path(directory), "before", json.dumps(changed))
+
+    def test_fresh_physical_files_preserve_windows_bom_and_crlf_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            original = {}
+            for index in range(29):
+                name = f"sample-{index:02d}.json"
+                data = (b"\xef\xbb\xbf{\r\n  \"epoch\": 1\r\n}\r\n" if index % 2 == 0
+                        else b"{\n  \"epoch\": 1\n}\n")
+                (source / name).write_bytes(data)
+                original[name] = data
+            files, encoded = IDLE.diagnostic_file_pairs(source)
+            self.assertEqual(files["sample-00.json"], '{\r\n  "epoch": 1\r\n}\r\n')
+            self.assertEqual(files["sample-01.json"], '{\n  "epoch": 1\n}\n')
+            self.assertEqual({name: base64.b64decode(value) for name, value in encoded.items()}, original)
+            probe = {"diagnosticFiles": files, "diagnosticFileBytesB64": encoded}
+            inventory = CONTROL.retain_cuda_physical_evidence(root, "before", json.dumps(probe))
+            self.assertEqual(len(inventory), 29)
+            for name, data in original.items():
+                self.assertEqual((root / "physical-before" / name).read_bytes(), data)
+
+            normalized = copy.deepcopy(probe)
+            normalized["diagnosticFiles"]["sample-00.json"] = files["sample-00.json"].replace("\r\n", "\n")
+            with self.assertRaisesRegex(RuntimeError, "raw bytes disagree"):
+                CONTROL.retain_cuda_physical_evidence(root, "normalized", json.dumps(normalized))
+            changed = copy.deepcopy(probe)
+            changed["diagnosticFileBytesB64"]["sample-00.json"] = base64.b64encode(
+                original["sample-00.json"].replace(b"1", b"2", 1)).decode("ascii")
+            with self.assertRaisesRegex(RuntimeError, "raw bytes disagree"):
+                CONTROL.retain_cuda_physical_evidence(root, "mutated", json.dumps(changed))
 
     def test_reviewed_baseline_copy_remains_byte_bound_to_original_28_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -297,24 +522,26 @@ class PrecisionControlTests(unittest.TestCase):
             binary.write_bytes(b"binary")
             args = type("Args", (), {"evidence": evidence, "reference": reference,
                                      "binary": binary, "work_dir": root / "listening",
+                                     "quant_smoke_binary": binary, "vae_smoke_binary": binary,
                                      "engine_sha": "a" * 40, "control_sha": "b" * 40,
                                      "app_sha": "", "backend": "cuda"})()
             baseline = {"completedUtc": "2026-10-03T00:00:00.0000000Z"}
             census = '{"diagnosticFiles":{},"diagnosticFileBytesB64":{}}'
             child = Owned()
             with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows-2",
-                                        "CUDA_VISIBLE_DEVICES": "0",
+                                        "CUDA_VISIBLE_DEVICES": "1",
                                         "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
                  patch.object(CONTROL, "sha256", return_value=CONTROL.REFERENCE_SHA256), \
                  patch.object(CONTROL, "verify_revisions"), \
                  patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
-                 patch.object(IDLE, "require_remaining_window", return_value=(baseline, root)), \
+                 patch.object(IDLE, "check_shared_gpu1_dispatch"), \
                  patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(CONTROL, "cuda_physical_census", return_value=(census, [])) as physical, \
                  patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
+                 patch.object(CONTROL, "verify_binary_identity", return_value={}), \
                  patch.object(CONTROL.subprocess, "Popen", return_value=child), \
                  patch("builtins.print"), \
-                 patch.object(CONTROL, "sample_cuda", return_value={"raw": "0,0,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}):
+                 patch.object(CONTROL, "sample_cuda", return_value={"raw": "t,1,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}):
                 with self.assertRaisesRegex(RuntimeError, "timed out"):
                     CONTROL.execute(args)
             result = json.loads((evidence / "control.json").read_text(encoding="utf-8"))
@@ -322,9 +549,96 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertTrue(result["owned_test_timed_out"])
             self.assertTrue(result["owned_test_released"])
             self.assertIsNone(result["post_census_error"])
-            self.assertEqual(physical.call_count, 2)
+            self.assertEqual(physical.call_count, 4)
             self.assertTrue((evidence / "external-samples.json").is_file())
             self.assertTrue((evidence / "census-after.txt").is_file())
+
+    def _simulate_cuda_smokes(self, zero_quant=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence, reference, binary = root / "evidence", root / "reference", root / "binary"
+            reference.mkdir()
+            (reference / "vae_real_reference.safetensors").write_bytes(b"fixture")
+            binary.write_bytes(b"binary")
+            args = type("Args", (), {"evidence": evidence, "reference": reference,
+                                     "binary": binary, "quant_smoke_binary": binary,
+                                     "vae_smoke_binary": binary, "work_dir": root / "listening",
+                                     "engine_sha": "a" * 40, "control_sha": "b" * 40,
+                                     "app_sha": "", "backend": "cuda"})()
+            baseline = {"completedUtc": "2026-10-03T00:00:00.0000000Z"}
+            census = '{"diagnosticFiles":{},"diagnosticFileBytesB64":{}}'
+            launched = []
+            events = []
+            def identity(path, label, out):
+                events.append(f"identity-{label}")
+                return {"binary_sha256": "verified"}
+            def physical_census(*, admission=True):
+                events.append("physical-census")
+                return census, []
+            def fake_child(path, name, label, backend, env, out, total_deadline, guard, identity):
+                events.append(f"launch-{label}")
+                launched.append((label, name, total_deadline))
+                (out / ("test.log" if label == "precision" else f"{label}-smoke.log")).write_text(
+                    f"running 1 test\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n",
+                    encoding="utf-8")
+                if label == "precision":
+                    (out / "precision-receipt.json").write_text("{}", encoding="utf-8")
+                    args.work_dir.mkdir()
+                    (args.work_dir / "audio.wav").write_bytes(b"wav")
+                row = {"label": label, "name": name, "pid": 8000 + len(launched),
+                       "exit_code": 0, "timed_out": False, "wait_error": None,
+                       "released": True, "exact_one_test_passed": True,
+                       "binary_unchanged_after_child": True,
+                       "sample_count": 0 if zero_quant and label == "quant" else 1,
+                       "sampler_faults": [], "scheduling": {"mode": "shared-host"}}
+                sample = {"raw": "t,1,19,1000", "started_utc_ns": 1, "ended_utc_ns": 2}
+                return row, ([] if zero_quant and label == "quant" else [sample]), []
+            with patch.dict("os.environ", {"RUNNER_NAME": "cuda-windows-2", "CUDA_VISIBLE_DEVICES": "1",
+                                        "YUE2_PRECISION_JOB_STARTED_UTC_NS": str(time.time_ns())}), \
+                 patch.object(CONTROL, "sha256", return_value=CONTROL.REFERENCE_SHA256), \
+                 patch.object(CONTROL, "verify_revisions"), \
+                 patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
+                 patch.object(IDLE, "check_shared_gpu1_dispatch"), \
+                 patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
+                 patch.object(CONTROL, "cuda_physical_census", side_effect=physical_census) as physical, \
+                 patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
+                 patch.object(CONTROL, "verify_binary_identity", side_effect=identity), \
+                 patch.object(CONTROL, "run_test_child", side_effect=fake_child), \
+                 patch.object(CONTROL, "validate_receipt"), \
+                 patch.object(CONTROL, "missing_stage_markers", return_value=[]), \
+                 patch.object(CONTROL, "stage_markers", return_value=[{"stage": "test", "event": "start", "unixMs": 1}]), \
+                 patch("builtins.print"):
+                if zero_quant:
+                    with self.assertRaisesRegex(RuntimeError, "owned exact-test sequence failed"):
+                        CONTROL.execute(args)
+                else:
+                    CONTROL.execute(args)
+            self.assertEqual([row[0] for row in launched], ["quant"] if zero_quant else ["quant", "vae", "precision"])
+            if not zero_quant:
+                self.assertEqual(launched[0][2], launched[1][2])
+                self.assertEqual(launched[1][2], launched[2][2])
+            report = json.loads((evidence / "control.json").read_text(encoding="utf-8"))
+            self.assertEqual([row["label"] for row in report["owned_children"]],
+                             ["quant"] if zero_quant else ["quant", "vae", "precision"])
+            self.assertEqual(physical.call_count, 4 if zero_quant else 8)
+            for label in [row[0] for row in launched]:
+                start = events.index(f"identity-{label}")
+                launch = events.index(f"launch-{label}")
+                self.assertEqual(events[launch - 1], "physical-census")
+                self.assertLess(start, launch - 1)
+
+    def test_cuda_smokes_complete_in_order_before_real_weight_child(self):
+        self._simulate_cuda_smokes()
+
+    def test_zero_sample_smoke_refuses_before_next_child(self):
+        good = {"exit_code": 0, "timed_out": False, "wait_error": None,
+                "released": True, "exact_one_test_passed": True,
+                "binary_unchanged_after_child": True, "sample_count": 1,
+                "sampler_faults": [], "post_census_error": None, "post_census_busy": []}
+        self.assertTrue(CONTROL.child_stage_succeeded(good))
+        self.assertFalse(CONTROL.child_stage_succeeded(dict(good, sample_count=0)))
+        self.assertFalse(CONTROL.child_stage_succeeded(dict(good, binary_unchanged_after_child=False)))
+        self._simulate_cuda_smokes(zero_quant=True)
 
     def test_counter_status_and_missing_fields_refuse_instead_of_becoming_zero(self):
         luid = "luid_0x00000000_0x00020d46"
@@ -422,10 +736,92 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["/bin/ps", "-axo", "pid=,comm="])
 
     def test_one_exact_ignored_test_must_execute(self):
-        good = "test explicit_stage_precision_real_weights ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n"
+        good = "running 1 test\ntest explicit_stage_precision_real_weights ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n"
         self.assertTrue(CONTROL.one_test_executed(good))
         for bad in (good.replace("1 passed", "0 passed"), good.replace("explicit_stage_precision_real_weights", "wrong_test"), good.replace("0 ignored", "1 ignored")):
             self.assertFalse(CONTROL.one_test_executed(bad))
+        for _, name in CONTROL.CUDA_SMOKES:
+            smoke = f"running 1 test\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 9 filtered out\n"
+            self.assertTrue(CONTROL.exact_one_test_executed(smoke, name))
+            self.assertFalse(CONTROL.exact_one_test_executed(smoke.replace("1 passed", "0 passed"), name))
+            self.assertFalse(CONTROL.exact_one_test_executed(smoke.replace(name, "wrong::test"), name))
+            self.assertFalse(CONTROL.exact_one_test_executed(smoke + smoke, name))
+        captured_shape = ("running 1 test\n"
+                          f"test {CONTROL.TEST_NAME} ... YUE2_PRECISION_LISTENING_DIR E:\\audio\n"
+                          'YUE2_PRECISION_STAGE {"stage":"Bf16:registered_load","event":"start","unixMs":1}\n'
+                          "ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n")
+        self.assertTrue(CONTROL.one_test_executed(captured_shape))
+        self.assertFalse(CONTROL.one_test_executed(captured_shape.replace("\nok\n", "\nnot ok\n")))
+        self.assertFalse(CONTROL.one_test_executed(captured_shape.replace("running 1 test", "running 0 tests")))
+        self.assertFalse(CONTROL.one_test_executed(captured_shape.replace("\nok\n", "\ntest wrong::extra ... ok\n")))
+
+    def test_exact_cargo_binary_identity_and_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary, build, output = root / "test.exe", root / "build.jsonl", root / "quant-binary.txt"
+            binary.write_bytes(b"owned test binary")
+            manifest = (Path.cwd() / CONTROL.BUILD_TARGETS["quant"][3]).resolve()
+            package_id = "path+file:///engine/crates/kernels/candle-quant-kernels#candle-quant-kernels@0.0.0"
+            metadata = {"packages": [{"name": "candle-quant-kernels", "id": package_id,
+                                      "manifest_path": str(manifest)}]}
+            row = {"reason": "compiler-artifact", "package_id": package_id,
+                   "target": {"name": "candle_quant_kernels", "kind": ["lib"],
+                              "src_path": str((Path.cwd() / CONTROL.BUILD_TARGETS["quant"][4]).resolve())},
+                   "profile": {"test": True}, "executable": str(binary)}
+            def resolve(rows):
+                build.write_text("\n".join(json.dumps(item) for item in rows), encoding="utf-8")
+                args = type("Args", (), {"target": "quant", "build_json": build, "output": output})()
+                result = type("Result", (), {"stdout": json.dumps(metadata)})()
+                with patch.object(CONTROL.subprocess, "run", return_value=result):
+                    CONTROL.resolve_binary(args)
+            resolve([row])
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), str(binary.resolve()))
+            self.assertEqual(CONTROL.verify_binary_identity(binary, "quant", root)["package_id"], package_id)
+            for bad in (dict(row, package_id="wrong"),
+                        dict(row, target={"name": "candle_quant_kernels", "kind": ["test"]}),
+                        dict(row, target={"name": "candle_quant_kernels", "kind": ["lib"],
+                                          "src_path": str(Path(directory) / "wrong.rs")}),
+                        dict(row, profile={"test": False})):
+                with self.subTest(bad=bad), self.assertRaisesRegex(RuntimeError, "exactly one"):
+                    resolve([bad])
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                resolve([row, row])
+            resolve([row])
+            binary.write_bytes(b"mutated")
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                CONTROL.verify_binary_identity(binary, "quant", root)
+
+    def test_three_children_share_one_cuda_deadline_and_tail(self):
+        job_start = time.time_ns()
+        with patch.dict("os.environ", {"YUE2_IDLE_CONTEXT_RUN_ID": IDLE.RUN_ID}), \
+             patch.object(IDLE, "require_remaining_window", return_value=({}, Path("baseline"))) as check, \
+             patch.object(CONTROL.time, "monotonic", side_effect=[100.0, 110.0, 179.0]):
+            self.assertEqual(CONTROL.remaining_cuda_budget(200.0, job_start), 100.0)
+            self.assertEqual(CONTROL.remaining_cuda_budget(200.0, job_start), 90.0)
+            self.assertEqual(CONTROL.remaining_cuda_budget(200.0, job_start), 21.0)
+            self.assertEqual([call.args[0] for call in check.call_args_list], [700.0, 690.0, 621.0])
+        with patch.object(CONTROL.time, "monotonic", return_value=201.0), \
+             self.assertRaisesRegex(RuntimeError, "combined CUDA child deadline"):
+            CONTROL.remaining_cuda_budget(200.0, job_start)
+
+    def test_slow_prelaunch_checks_cannot_renew_absolute_child_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "test.exe"
+            binary.write_bytes(b"binary")
+            job_start = time.time_ns()
+            with patch.object(IDLE, "require_remaining_window", return_value=({}, root)), \
+                 patch.object(CONTROL.time, "monotonic", return_value=100.0):
+                self.assertEqual(CONTROL.remaining_cuda_budget(200.0, job_start), 100.0)
+            # Identity, owner preflight, and the 29-file census can consume the
+            # provisional budget. The child must recheck the same deadline at
+            # the final Popen boundary, without giving those seconds back.
+            with patch.object(CONTROL.time, "monotonic", return_value=201.0), \
+                 patch.object(CONTROL.subprocess, "Popen") as launch, \
+                 self.assertRaisesRegex(RuntimeError, "expired before Popen"):
+                CONTROL.run_test_child(binary, "exact::test", "quant", "cuda", {}, root,
+                                       200.0, None, {"binary_sha256": CONTROL.sha256(binary)})
+            launch.assert_not_called()
 
     def test_stage_markers_remain_machine_readable(self):
         line = 'test explicit_stage_precision_real_weights ... YUE2_PRECISION_STAGE {"stage":"Bf16:standard:encoder","event":"start","unixMs":100}'
@@ -473,6 +869,26 @@ class PrecisionControlTests(unittest.TestCase):
             args.control_sha = "d" * 40
             with self.assertRaisesRegex(RuntimeError, "transfer provenance"):
                 CONTROL.verify_reference(args)
+            args.control_sha = "c" * 40
+            metadata.update({"reference_source_mode": "relay",
+                             "relay_run_id": TRANSFER.RELAY_RUN_ID,
+                             "relay_artifact_id": TRANSFER.RELAY_ARTIFACT_ID,
+                             "relay_engine_sha": TRANSFER.RELAY_ENGINE_SHA,
+                             "relay_control_sha": TRANSFER.RELAY_CONTROL_SHA,
+                             "relay_artifact_zip_sha256": TRANSFER.RELAY_ZIP_SHA256,
+                             "relay_provenance_sha256": TRANSFER.RELAY_METADATA_SHA256})
+            (root / "reference-provenance.json").write_text(json.dumps(metadata), encoding="utf-8")
+            with patch.object(CONTROL, "sha256", side_effect=lambda path:
+                              TRANSFER.LICENSE_SHA256 if path.name == "NONCOMMERCIAL.txt" else actual_sha(path)):
+                with self.assertRaisesRegex(RuntimeError, "digest differs"):
+                    CONTROL.verify_reference(args)
+            for field, wrong in (("relay_run_id", 1),
+                                 ("relay_artifact_zip_sha256", "0" * 64),
+                                 ("relay_provenance_sha256", None)):
+                changed = dict(metadata, **{field: wrong})
+                (root / "reference-provenance.json").write_text(json.dumps(changed), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "relay identity"):
+                    CONTROL.verify_reference(args)
 
     def test_actual_rust_receipt_shape_and_cross_policy_mutations(self):
         def decoder(variant, dtype):
@@ -522,8 +938,9 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("if: inputs.stage == 'fixture'", source)
         self.assertIn("if: inputs.stage == 'cuda'", source)
         self.assertIn("if: inputs.stage == 'metal'", source)
-        self.assertIn("group: inference-real-weights-physical-host", source)
-        self.assertIn('CUDA_VISIBLE_DEVICES: "0"', source)
+        self.assertEqual(self.concurrency_group(self.concurrency_settings(source)["group"],
+                                               "cuda", "101"), "inference-real-weights-physical-host")
+        self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "1"'), 2)
         self.assertEqual(source.count("path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav"), 2)
         self.assertEqual(source.count("if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}"), 2)
         self.assertNotIn("path: ${{ env.YUE2_PRECISION_WORK_DIR }}\n", source)
@@ -531,6 +948,13 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("yue2-precision-listening-metal-cc-by-nc-internal-", source)
         self.assertIn("test \"$RUNNER_NAME\" = nax-macos-2", source)
         self.assertIn("--test precision_real_weights", source)
+        cuda = source.split("  cuda:\n", 1)[1].split("  metal:\n", 1)[0]
+        for package, target in (("candle-quant-kernels", "quant"), ("candle-audio-yue2", "vae")):
+            self.assertIn(f"-p {package} --features cuda --lib --no-run", cuda)
+            self.assertIn(f"resolve-binary --target {target}", cuda)
+            self.assertIn(f"--{target}-smoke-binary", cuda)
+        self.assertLess(cuda.index("--target quant"), cuda.index("--target vae"))
+        self.assertLess(cuda.index("--target vae"), cuda.index("$proofArgs = @('run'"))
         self.assertIn("expected_control_sha:", source)
         self.assertIn("ref: ${{ inputs.expected_engine_sha }}", source)
         self.assertLess(source.index("Select checked Git Bash before pinned Rust"),
@@ -549,8 +973,8 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertIn(f"{IDLE.BASELINE_ENGINE_SHA}-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1", workflow)
             self.assertNotIn("-36956986577-1", workflow)
             self.assertIn("run-id: ${{ inputs.idle_cuda_context_run_id }}", workflow)
-            self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
-        self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
+        self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
+        self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "1"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
 
     def test_cuda_deadline_stamp_uses_existing_directory_before_checkout(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -568,10 +992,11 @@ class PrecisionControlTests(unittest.TestCase):
         job = workflow.split("  cuda_diagnostic:\n", 1)[1].split("  reference:\n", 1)[0]
         probe = (ROOT / "scripts/ci/yue2_cuda_context_diagnostic.ps1").read_text(encoding="utf-8")
         self.assertIn("if: inputs.stage == 'cuda-diagnostic'", job)
-        self.assertIn("group: inference-real-weights-physical-host", workflow)
+        self.assertEqual(self.concurrency_group(self.concurrency_settings(workflow)["group"],
+                                               "cuda-diagnostic", "101"), "inference-real-weights-physical-host")
         self.assertIn("$env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA", job)
         self.assertIn("(git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA", job)
-        self.assertIn("diagnostic_pid must be a positive decimal PID", job)
+        self.assertIn("diagnostic_pid must be 0 or a positive decimal PID", job)
         self.assertIn("if: always()", job)
         self.assertNotIn("cargo ", job)
         self.assertNotIn("download-artifact", job)

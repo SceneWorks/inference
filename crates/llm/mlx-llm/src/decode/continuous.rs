@@ -65,7 +65,7 @@ use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::input_ids;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::{draw_token, SamplingParams, SplitMix64};
 use crate::primitives::{
     BlockPool, CompiledKernelHandle, PackedCodeBits, PackedPagePool, PagedCacheIdentity,
     PagedCacheRequest, PagedCacheSelection, PagedKvCache, PagedModelKey, PagedPackedKvCache,
@@ -671,7 +671,7 @@ pub fn generate_continuous_kv(
             .collect::<Vec<_>>();
         for (i, logits) in per_lane.into_iter().enumerate() {
             let mut lane = slots[i].take().expect("each lane is sampled once");
-            let tok = sample(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
+            let tok = draw_token(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
             match record_token(&mut sched, &mut lane, tok, on_event) {
                 LaneStep::Continue => slots[i] = Some(lane),
                 LaneStep::Done => {
@@ -823,7 +823,7 @@ fn admit_lane(
         history: r.prompt_ids.clone(),
         next_token: 0,
     };
-    let tok = sample(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
+    let tok = draw_token(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
     // Later requests sharing this prompt's prefix start on its pages while it decodes.
     run.store_sequence(&mut lane, &r.prompt_ids)?;
     Ok(match record_token(sched, &mut lane, tok, on_event) {

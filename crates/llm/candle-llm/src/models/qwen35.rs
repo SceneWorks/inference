@@ -14,9 +14,9 @@
 //!   `sigmoid(gate)` before the output projection).
 //!
 //! Each decoder layer is `input_layernorm → mixer → residual → post_attention_layernorm → MLP →
-//! residual`. The MLP is a dense SwiGLU (the 27B) or a sparse Mixture-of-Experts bank (`MoeFfn`, the
-//! 35B-A3B). The KV cache (full-attn layers) and the recurrent [`DeltaNetCache`] (linear
-//! layers) live side by side in a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next
+//! residual`. The MLP is a dense SwiGLU (the 27B) or a sparse Mixture-of-Experts bank (the shared
+//! [`SparseMoe`] block, the 35B-A3B). The KV cache (full-attn layers) and the recurrent
+//! [`DeltaNetCache`] (linear layers) live side by side in a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next
 //! `(1 + weight)` convention; the recurrence accumulates in f32 (matching the reference GPU kernel)
 //! while the rest of the decoder runs in the device compute dtype (bf16 on GPU, f32 on CPU).
 
@@ -30,10 +30,12 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{repeat_kv, sdpa, sdpa_gqa_causal, AttnFormulation, AttnMask};
 use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
+use crate::primitives::device_positions::{DevicePositions, DeviceRope, MAX_DEVICE_STEP_TOKENS};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
 };
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu};
 use crate::primitives::nn::{embed, rms_norm, rms_norm_residual, swiglu};
 use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, WeightCensus};
 use crate::primitives::quant::is_ggml_block_tensor;
@@ -43,7 +45,7 @@ use crate::primitives::{KvCache, PrismRegistry, Weights};
 /// Whether a dense [`Qwen35Model`] / [`Qwen35Mtp`] load stores the checkpoint tensor `key` in a
 /// requested projection format rather than dense: in every decoder (and MTP) layer the Gated
 /// DeltaNet in/out projections (`in_proj_qkv`, `in_proj_z`, `out_proj`), the attention q/k/v/o,
-/// the dense MLP, the stacked MoE experts and the shared expert; and the MTP `fc`. The per-head
+/// the dense MLP, the MoE experts (stacked, or per expert) and the shared expert; and the MTP `fc`. The per-head
 /// `in_proj_a` / `in_proj_b`, the conv, `A_log` / `dt_bias`, the norms, the MoE router and
 /// shared-expert gate, and the embeddings stay dense. The LM head is quantized under every
 /// format — a tied head from a copy of the embedding — and is not a keyed rule here.
@@ -69,8 +71,24 @@ pub(crate) fn quantizes_tensor(key: &str) -> bool {
         "mlp.shared_expert.down_proj.weight",
     ];
     key == "mtp.fc.weight"
-        || super::split_layer_key(key)
-            .is_some_and(|(_, _, suffix)| LAYER_PROJECTIONS.contains(&suffix))
+        || super::split_layer_key(key).is_some_and(|(_, _, suffix)| {
+            LAYER_PROJECTIONS.contains(&suffix) || is_per_expert_projection(suffix)
+        })
+}
+
+/// A layer-relative key of one routed expert's projection in the per-expert layout (the bf16
+/// Qwen3.5 release): `mlp.experts.{e}.{gate,up,down}_proj.weight`.
+fn is_per_expert_projection(suffix: &str) -> bool {
+    suffix
+        .strip_prefix("mlp.experts.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(e, part)| {
+            e.parse::<usize>().is_ok()
+                && matches!(
+                    part,
+                    "gate_proj.weight" | "up_proj.weight" | "down_proj.weight"
+                )
+        })
 }
 
 /// Whether a [`Qwen35Model`] / [`Qwen35Mtp`] load of a snapshot with this config stores the
@@ -157,7 +175,7 @@ impl QwenEmbedding {
 pub type MropePositions = (Vec<i32>, Vec<i32>, Vec<i32>, i32);
 
 /// Mixture-of-Experts FFN parameters (`qwen3_5_moe`, the 35B-A3B): the routed-expert count / top-k
-/// and the per-expert + shared-expert FFN widths that drive the un-fused `MoeFfn`.
+/// and the per-expert + shared-expert FFN widths that drive the MoE block.
 #[derive(Clone, Copy, Debug)]
 pub struct MoeParams {
     pub num_experts: i32,
@@ -304,6 +322,26 @@ impl Qwen35Config {
         let rd = (self.head_dim as f32 * self.partial_rotary_factor).round() as i32;
         rd & !1
     }
+
+    /// This config projected onto the backend-neutral companion-head contract (sc-24444, E8): the
+    /// one geometry check both backends refuse a mismatched head by.
+    pub fn companion_mtp_geometry(&self) -> core_llm::CompanionMtpGeometry {
+        core_llm::CompanionMtpGeometry {
+            hidden_size: self.hidden_size,
+            num_attention_heads: self.num_heads,
+            num_key_value_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            intermediate_size: self.intermediate_size,
+            vocab_size: self.vocab_size,
+            rotary_dim: self.rotary_dim(),
+            rms_norm_eps: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            mrope_section: self.mrope_section_resolved(),
+            mtp_num_hidden_layers: self.mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings: self.mtp_use_dedicated_embeddings,
+            moe: self.moe.is_some(),
+        }
+    }
 }
 
 /// L2-normalize over the last axis: `x · rsqrt(Σ x² + eps)` (the FLA `use_qk_l2norm_in_kernel`
@@ -364,7 +402,19 @@ impl GatedDeltaNet {
         }
     }
 
+    #[cfg(test)]
     fn forward(&self, x: &Tensor, cache: &mut DeltaNetCache) -> Result<Tensor> {
+        self.forward_at(x, cache, None)
+    }
+
+    /// [`forward`](Self::forward) with the checkpoint ring read and written through the device
+    /// indices of `positions` when they are staged (sc-24441, see [`DeltaNetCache::advance_at`]).
+    fn forward_at(
+        &self,
+        x: &Tensor,
+        cache: &mut DeltaNetCache,
+        positions: Option<&DevicePositions>,
+    ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
         // Four independent in-projections (dtype follows the projection weights).
@@ -379,8 +429,8 @@ impl GatedDeltaNet {
 
         // Short conv over the q‖k‖v channels (only these are convolved), seeded by the cache tail,
         // then a *contiguous* split into q [key_dim] ‖ k [key_dim] ‖ v [value_dim] and reshape to heads.
-        let conv_state = match cache.conv_state() {
-            Some(cs) => cs.clone(),
+        let conv_state = match cache.live_conv_state(positions)? {
+            Some(cs) => cs,
             None => Tensor::zeros((b, self.conv_kernel - 1, self.conv_dim), dt, x.device())?,
         };
         let (conv_out, conv_trace) =
@@ -405,19 +455,25 @@ impl GatedDeltaNet {
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel), run by
         // the cache so every token's post-step state (conv tail + SSM state) lands in its
-        // checkpoint ring (sc-24131). GQA (q/k from Hk key heads → Hv value heads) is handled
-        // inside the recurrence primitive.
+        // checkpoint ring (sc-24131) — except in a prompt prefill, whose positions are never
+        // rolled back to: it runs final-state-only and rings just its last state (sc-24446).
+        // GQA (q/k from Hk key heads → Hv value heads) is handled inside the recurrence
+        // primitive.
         let beta = sigmoid(&b_in)?;
         let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
         let f = DType::F32;
-        let y = cache.advance(
-            &conv_trace,
-            &qn.to_dtype(f)?,
-            &kn.to_dtype(f)?,
-            &vc.to_dtype(f)?,
-            &g.to_dtype(f)?,
-            &beta.to_dtype(f)?,
-        )?;
+        let (q, k, v, g, beta) = (
+            qn.to_dtype(f)?,
+            kn.to_dtype(f)?,
+            vc.to_dtype(f)?,
+            g.to_dtype(f)?,
+            beta.to_dtype(f)?,
+        );
+        let y = if crate::primitives::in_prefill() {
+            cache.advance_prefill(&conv_trace, &q, &k, &v, &g, &beta)?
+        } else {
+            cache.advance_at(&conv_trace, &q, &k, &v, &g, &beta, positions)?
+        };
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
         let out = rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
@@ -450,8 +506,14 @@ struct Qwen35Attention {
 /// are token-identical by construction; [`AttnFormulation::Expanded`] keeps the pre-S4
 /// `repeat_kv` + [`sdpa`] arithmetic selectable on the growing slot as a labelled comparison row.
 enum KvSlot<'a> {
-    Growing(&'a mut AttnKv),
-    Static(&'a mut StaticKvCache),
+    /// The growing reference slot; with a step start, a short cached step attends with the
+    /// length-aware decode attention (sc-24441).
+    Growing(&'a mut AttnKv, Option<&'a Tensor>),
+    /// A static slot written at its host offset; the start as for `Growing`.
+    Static(&'a mut StaticKvCache, Option<&'a Tensor>),
+    /// The static cache on the device-positions step (sc-24441): written at the staged device
+    /// start, attended by the length-aware decode attention over the whole buffers.
+    Indexed(&'a mut StaticKvCache, &'a DevicePositions),
 }
 
 impl Qwen35Attention {
@@ -486,16 +548,41 @@ impl Qwen35Attention {
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
+        let decode = |q: &Tensor, k_all: &Tensor, v_all: &Tensor, start: &Tensor| {
+            candle_quant_kernels::decode_attention(
+                q,
+                &k_all.contiguous()?,
+                &v_all.contiguous()?,
+                start,
+                candle_quant_kernels::DecodeAttnSpec {
+                    scale: self.scale,
+                    softcap: None,
+                    window: None,
+                },
+            )
+        };
         let out = match (cache, formulation) {
+            // A short cached step of a model with device positions (sc-24441): the static
+            // path's length-aware attention, over the growing concat — one arithmetic still.
+            (
+                KvSlot::Growing(growing, Some(start)),
+                AttnFormulation::Gqa | AttnFormulation::DecodeAttention,
+            ) => {
+                let (k_all, v_all) = growing.update(&k, &v)?;
+                decode(&q, &k_all, &v_all, start)?
+            }
             // Reference path: growing concat, then the same grouped-query attention the static
             // path runs (the S4 decision: one attention arithmetic for both slots).
-            (KvSlot::Growing(growing), AttnFormulation::Gqa) => {
+            (
+                KvSlot::Growing(growing, _),
+                AttnFormulation::Gqa | AttnFormulation::DecodeAttention,
+            ) => {
                 let (k_all, v_all) = growing.update(&k, &v)?;
                 sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)? // [b,H,s,hd]
             }
             // The pre-S4 reference arithmetic, selectable only for comparison rows: growing
             // concat, GQA expanded per step, eager/fused SDPA.
-            (KvSlot::Growing(growing), AttnFormulation::Expanded) => {
+            (KvSlot::Growing(growing, _), AttnFormulation::Expanded) => {
                 let (k_all, v_all) = growing.update(&k, &v)?;
                 let k_all = repeat_kv(&k_all, self.groups)?;
                 let v_all = repeat_kv(&v_all, self.groups)?;
@@ -504,9 +591,30 @@ impl Qwen35Attention {
             // Static path: in-place write, bounded views, grouped-query attention over them —
             // no `cat`, no `repeat_kv`, no copy of the cached history. The formulation selector
             // does not apply: expanding would be exactly the copy this cache exists to remove.
-            (KvSlot::Static(fixed), _) => {
+            (KvSlot::Static(fixed, Some(start)), _) => {
+                let (k_all, v_all) = fixed.update(0, &k, &v)?;
+                decode(&q, &k_all, &v_all, start)?
+            }
+            (KvSlot::Static(fixed, None), _) => {
                 let (k_all, v_all) = fixed.update(0, &k, &v)?;
                 sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)? // [b,H,s,hd]
+            }
+            // The device-positions step: the same write and causal grouped-query attention, with
+            // the position read on the device so the step replays as a CUDA graph.
+            (KvSlot::Indexed(fixed, positions), _) => {
+                let start = positions.start()?;
+                let (k_all, v_all) = fixed.update_at(0, &k, &v, &start)?;
+                candle_quant_kernels::decode_attention(
+                    &q,
+                    &k_all,
+                    &v_all,
+                    &start,
+                    candle_quant_kernels::DecodeAttnSpec {
+                        scale: self.scale,
+                        softcap: None,
+                        window: None,
+                    },
+                )? // [b,H,s,hd]
             }
         };
         let merged = out
@@ -540,86 +648,14 @@ impl Mlp {
     }
 }
 
-/// Sparse Mixture-of-Experts FFN (`Qwen3_5MoeSparseMoeBlock`, the 35B-A3B): a softmax router over
-/// `experts` (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
-/// **sigmoid-gated** shared expert. Each expert runs only on its routed tokens (gathered, then
-/// scatter-added back), so active compute scales with `experts_per_tok` (~3B of 35B). The fused
-/// checkpoint tensors (`experts.gate_up_proj` / `experts.down_proj`) are un-fused into per-expert
-/// [`Mlp`]s at load. Routing mirrors the generic [`MoeMlp`](super::llama) bank's CPU path.
-struct MoeFfn {
-    router: Tensor, // [num_experts, hidden]
-    experts: Vec<Mlp>,
-    shared: Mlp,
-    shared_gate: Tensor, // [1, hidden] sigmoid gate
-    experts_per_tok: usize,
-}
-
-impl MoeFfn {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, s, h) = x.dims3()?;
-        let t = b * s;
-        let dtype = x.dtype();
-        let device = x.device();
-        let xf = x.reshape((t, h))?;
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Router probabilities (f32 softmax for a stable top-k), pulled to host.
-        let logits = xf.matmul(&self.router.t()?)?; // [t, E]
-        crate::primitives::host_sync::note_host_sync();
-        let probs =
-            candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?.to_vec2::<f32>()?;
-
-        // Invert the per-token top-k into per-expert (token, weight) lists, renormalized to sum 1.
-        let mut routed: Vec<Vec<(u32, f32)>> = vec![Vec::new(); num_experts];
-        for (ti, row) in probs.iter().enumerate() {
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
-            let top = &idx[..k];
-            let denom = top
-                .iter()
-                .map(|&e| row[e])
-                .sum::<f32>()
-                .max(f32::MIN_POSITIVE);
-            for &e in top {
-                routed[e].push((ti as u32, row[e] / denom));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = Tensor::zeros((t, h), dtype, device)?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len();
-            let idx = Tensor::from_vec(
-                toks.iter().map(|&(ti, _)| ti).collect::<Vec<u32>>(),
-                (n,),
-                device,
-            )?;
-            let wts = Tensor::from_vec(
-                toks.iter().map(|&(_, w)| w).collect::<Vec<f32>>(),
-                (n, 1),
-                device,
-            )?
-            .to_dtype(dtype)?;
-            let xe = xf.index_select(&idx, 0)?; // [n, h]
-            let ye = self.experts[e].forward(&xe)?.broadcast_mul(&wts)?; // [n, h]
-            out = out.index_add(&idx, &ye, 0)?;
-        }
-
-        // Always-on shared expert, gated by sigmoid(x · shared_gateᵀ).
-        let shared = self.shared.forward(&xf)?;
-        let sg = sigmoid(&xf.matmul(&self.shared_gate.t()?)?)?; // [t, 1]
-        Ok((out + shared.broadcast_mul(&sg)?)?.reshape((b, s, h))?)
-    }
-}
-
 /// The per-layer FFN: a dense SwiGLU (27B) or a sparse MoE block (35B-A3B).
+///
+/// The MoE block is the crate's shared [`SparseMoe`] (sc-24440): a softmax router over the experts
+/// (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
+/// **sigmoid-gated** shared expert, routed on the device.
 enum Ffn {
     Dense(Mlp),
-    Moe(MoeFfn),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -660,14 +696,7 @@ impl DecoderLayer {
         }
         match &self.ffn {
             Ffn::Dense(m) => m.record(census),
-            Ffn::Moe(moe) => {
-                census.record_tensor(&moe.router);
-                census.record_tensor(&moe.shared_gate);
-                moe.shared.record(census);
-                for e in &moe.experts {
-                    e.record(census);
-                }
-            }
+            Ffn::Moe(moe) => moe.record(census),
         }
     }
 }
@@ -681,14 +710,41 @@ impl DecoderLayer {
         cache: &mut Qwen35LayerCache,
         formulation: AttnFormulation,
     ) -> Result<Tensor> {
+        self.forward_with(x, cos, sin, cache, formulation, None, None)
+    }
+
+    /// [`forward`](Self::forward) on the device-positions step when `positions` is set
+    /// (sc-24441): a static attention slot writes and attends at the staged device start, a
+    /// DeltaNet ring is indexed on the device. With `decode_start` set instead, an ordinary
+    /// attention slot attends with the same length-aware decode attention from that host-staged
+    /// start.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cache: &mut Qwen35LayerCache,
+        formulation: AttnFormulation,
+        positions: Option<&DevicePositions>,
+        decode_start: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
         let r = match (&self.mixer, cache) {
-            (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward(&normed, c)?,
-            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => {
-                a.forward(&normed, cos, sin, KvSlot::Growing(c), formulation)?
-            }
+            (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward_at(&normed, c, positions)?,
+            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(
+                &normed,
+                cos,
+                sin,
+                KvSlot::Growing(c, decode_start),
+                formulation,
+            )?,
             (Mixer::Attn(a), Qwen35LayerCache::StaticAttn(c)) => {
-                a.forward(&normed, cos, sin, KvSlot::Static(c), formulation)?
+                let slot = match positions {
+                    Some(p) => KvSlot::Indexed(c, p),
+                    None => KvSlot::Static(c, decode_start),
+                };
+                a.forward(&normed, cos, sin, slot, formulation)?
             }
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
@@ -857,6 +913,9 @@ pub struct Qwen35Cache {
     /// Added to the cache position to form the RoPE position of every token a
     /// [`StepModel::forward_step`] feeds (see [`set_rope_delta`](Self::set_rope_delta)).
     rope_delta: i32,
+    /// The device-staged step positions of a static cache built with them (sc-24441; see
+    /// [`Qwen35Model::set_device_positions`]); `None` otherwise.
+    positions: Option<DevicePositions>,
 }
 
 impl Qwen35Cache {
@@ -874,6 +933,26 @@ impl Qwen35Cache {
             max_checkpoints: self.max_checkpoints,
             recurrent_shape: self.recurrent_shape.clone(),
             rope_delta: self.rope_delta,
+            // Own buffers (staged per step, so nothing to copy).
+            positions: self
+                .positions
+                .as_ref()
+                .map(|p| DevicePositions::new(p.device()))
+                .transpose()?,
+        })
+    }
+
+    /// The staged device positions, when this cache keeps them (sc-24441).
+    pub fn device_positions(&self) -> Option<&DevicePositions> {
+        self.positions.as_ref()
+    }
+
+    /// The linear layers' checkpoint-ring length (`None` without a ring): what the device ring
+    /// indices are taken modulo.
+    fn ring_slots(&self) -> Option<usize> {
+        self.layers.iter().find_map(|l| match l {
+            Qwen35LayerCache::Delta(c) => c.ring_spec().map(|s| s.slots),
+            _ => None,
         })
     }
 
@@ -1147,6 +1226,209 @@ impl Qwen35Cache {
     }
 }
 
+/// A [`Qwen35Cache`]'s state after its first `len` positions, held by the cross-turn prefix cache
+/// (story sc-24437): every full-attention layer's KV `[1, heads, len, dim]` and every linear
+/// layer's conv tail and recurrent state — **copies**, so the live cache's in-place writes (the
+/// static KV buffers, the checkpoint ring) can never reach it.
+#[derive(Clone, Debug)]
+pub struct Qwen35PrefixState {
+    layers: Vec<Qwen35PrefixLayer>,
+    len: usize,
+}
+
+#[derive(Clone, Debug)]
+enum Qwen35PrefixLayer {
+    Attn(Option<(Tensor, Tensor)>),
+    Delta(Option<(Tensor, Tensor)>),
+}
+
+impl Qwen35PrefixState {
+    /// The positions the state covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the state covers no position.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every held tensor on the host, in layer order (`(K, V)` or `(conv, ssm)` per layer).
+    #[cfg(test)]
+    pub(crate) fn host_tensors(&self) -> Vec<Vec<f32>> {
+        self.layers
+            .iter()
+            .flat_map(|l| match l {
+                Qwen35PrefixLayer::Attn(Some((a, b))) | Qwen35PrefixLayer::Delta(Some((a, b))) => {
+                    vec![a.clone(), b.clone()]
+                }
+                _ => Vec::new(),
+            })
+            .map(|t| {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// Bytes the held tensors occupy.
+    pub fn bytes(&self) -> usize {
+        self.layers.iter().fold(0usize, |acc, l| {
+            let (Qwen35PrefixLayer::Attn(Some((a, b))) | Qwen35PrefixLayer::Delta(Some((a, b)))) =
+                l
+            else {
+                return acc;
+            };
+            acc.saturating_add(tensor_bytes(a))
+                .saturating_add(tensor_bytes(b))
+        })
+    }
+}
+
+impl Qwen35Cache {
+    /// Copy the cache's whole state — it must hold exactly the positions a later request resumes
+    /// at, because a recurrent state exists only at the position it was taken (story sc-24437).
+    pub fn prefix_snapshot(&self) -> Result<Qwen35PrefixState> {
+        self.prefix_snapshot_at(self.offset().max(0) as usize)
+    }
+
+    /// Ask the next prefill forward to capture every linear layer's state after `position` — a
+    /// boundary strictly inside that prefill — so [`prefix_snapshot_at`](Self::prefix_snapshot_at)
+    /// can copy the cache as it was there without splitting the prefill into two forwards
+    /// (sc-24446).
+    pub fn capture_boundary(&mut self, position: i32) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.capture_at(position);
+            }
+        }
+    }
+
+    /// Drop every linear layer's pending [`capture_boundary`](Self::capture_boundary) — after a
+    /// forward that failed part-way, whose later layers never consumed it.
+    pub fn clear_boundary_capture(&mut self) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.clear_capture();
+            }
+        }
+    }
+
+    /// [`prefix_snapshot`](Self::prefix_snapshot) of the cache's first `len` positions: at the
+    /// cache length, its live state; before it, the attention KV narrowed to `len` (causal: no
+    /// later position wrote it) and the linear states the last prefill captured at `len`
+    /// ([`capture_boundary`](Self::capture_boundary)) — the state a prefill that stopped at `len`
+    /// would have left. A linear layer holding no state at `len` is an error.
+    pub fn prefix_snapshot_at(&self, len: usize) -> Result<Qwen35PrefixState> {
+        let offset = self.offset().max(0) as usize;
+        if len > offset {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: no snapshot at {len} past the cache length {offset}"
+            )));
+        }
+        let position = len as i32;
+        let copy_kv = |k: &Tensor, v: &Tensor| -> Result<(Tensor, Tensor)> {
+            // Compact copies of exactly `len` positions: `Tensor::copy` would keep the view's
+            // layout over a clone of the whole static buffer — the cache's full capacity, pinned
+            // by an entry charged for `len` positions.
+            Ok((
+                k.narrow(2, 0, len)?.force_contiguous()?,
+                v.narrow(2, 0, len)?.force_contiguous()?,
+            ))
+        };
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| {
+                Ok(match l {
+                    Qwen35LayerCache::Delta(c) if len < offset => {
+                        let (conv, ssm) = c.captured(position).ok_or_else(|| {
+                            Error::Msg(format!(
+                                "Qwen35Cache: no recurrent state captured at {len} (the cache is \
+                                 at {offset})"
+                            ))
+                        })?;
+                        // Already compact copies the cache owns: shared, never written.
+                        Qwen35PrefixLayer::Delta(Some((conv.clone(), ssm.clone())))
+                    }
+                    Qwen35LayerCache::Delta(c) => {
+                        Qwen35PrefixLayer::Delta(match (c.conv_state(), c.ssm_state()) {
+                            // Compact copies: the live state may be a slot view of the
+                            // checkpoint ring, which `copy` would clone whole.
+                            (Some(conv), Some(ssm)) => {
+                                Some((conv.force_contiguous()?, ssm.force_contiguous()?))
+                            }
+                            _ => None,
+                        })
+                    }
+                    Qwen35LayerCache::Attn(a) => Qwen35PrefixLayer::Attn(
+                        a.kv.as_ref().map(|(k, v)| copy_kv(k, v)).transpose()?,
+                    ),
+                    Qwen35LayerCache::StaticAttn(s) => {
+                        let (k, v) = s.views(0)?;
+                        Qwen35PrefixLayer::Attn(Some(copy_kv(&k, &v)?))
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Qwen35PrefixState { layers, len })
+    }
+
+    /// Seed an **empty** cache with `state`, positioning it at `state.len()`: the attention KV is
+    /// written at positions `0..len` (into a static layer's buffers, or held by a growing one,
+    /// which never writes in place), and each linear layer takes the stored conv tail and
+    /// recurrent state as its live state at `len` — through its checkpoint ring when it keeps
+    /// one, so `len` is the ring's oldest restorable position and a verify step's rollback never
+    /// reaches below it. The stored tensors are never written.
+    pub fn restore_prefix(&mut self, state: &Qwen35PrefixState) -> Result<()> {
+        if self.offset() != 0 {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: a prefix restores into an empty cache, not one at {}",
+                self.offset()
+            )));
+        }
+        if state.layers.len() != self.layers.len() {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: a {}-layer prefix state for a {}-layer cache",
+                state.layers.len(),
+                self.layers.len()
+            )));
+        }
+        let len = i32::try_from(state.len)
+            .map_err(|_| Error::Msg("Qwen35Cache: prefix length overflow".into()))?;
+        for (slot, stored) in self.layers.iter_mut().zip(&state.layers) {
+            match (slot, stored) {
+                (Qwen35LayerCache::Delta(c), Qwen35PrefixLayer::Delta(Some((conv, ssm)))) => {
+                    c.update(conv.clone(), ssm.clone(), len)?
+                }
+                (Qwen35LayerCache::Attn(a), Qwen35PrefixLayer::Attn(Some((k, v)))) => {
+                    a.kv = Some((k.clone(), v.clone()))
+                }
+                (Qwen35LayerCache::StaticAttn(s), Qwen35PrefixLayer::Attn(Some((k, v)))) => {
+                    s.update(0, k, v)?;
+                }
+                (Qwen35LayerCache::Delta(_), Qwen35PrefixLayer::Delta(None))
+                | (
+                    Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_),
+                    Qwen35PrefixLayer::Attn(None),
+                ) if len == 0 => {}
+                _ => {
+                    self.reset();
+                    return Err(Error::Msg(
+                        "Qwen35Cache: the prefix state's layer schedule does not match the cache"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DecodeCache for Qwen35Cache {
     fn len(&self) -> i32 {
         self.offset()
@@ -1175,7 +1457,8 @@ impl DecodeCache for Qwen35Cache {
         Qwen35Cache::kv_kind(self)
     }
 
-    /// A CUDA-graph replay (story sc-24134) needs every state tensor at a stable address. The
+    /// A CUDA-graph replay (stories sc-24134, sc-24441) needs every state tensor at a stable
+    /// address and every per-step position on the device. The
     /// static KV buffers are, and so is a linear layer's recurrent state once it keeps the
     /// per-token checkpoint ring (sc-24131): the live state is a view of the newest preallocated
     /// ring slot, written in place, so a recorded step leaves no allocation alive past it (the
@@ -1183,10 +1466,10 @@ impl DecodeCache for Qwen35Cache {
     /// which replaced both states of every linear layer per step, read `escaped=96` on the 27B).
     /// A ring-less linear layer — the reference caches ([`REFERENCE_MAX_CHECKPOINTS`]) — still
     /// replaces its state per step and says `deltanet_state_unstable`; a growing `AttnKv` cache
-    /// says `growing_kv`. A cache that passes is still refused by its model: [`Qwen35Model`]'s
-    /// positions are Rust-side scalars (`positions_host_scalar`) — the static KV write offset
-    /// and the ring slot a step writes alike — so this cache keeps the trait's refusing
-    /// `replay_advance`.
+    /// says `growing_kv`. The positions are device data only on a cache built with device
+    /// positions ([`Qwen35Model::set_device_positions`], the CUDA default): the static KV write
+    /// offset, the attention length, the RoPE positions and the ring slots are staged there;
+    /// without them they are Rust-side scalars (`positions_host_scalar`).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
         for layer in &self.layers {
             match layer {
@@ -1195,6 +1478,77 @@ impl DecodeCache for Qwen35Cache {
                 }
                 Qwen35LayerCache::Attn(_) => return Err("growing_kv"),
                 Qwen35LayerCache::Delta(_) | Qwen35LayerCache::StaticAttn(_) => {}
+            }
+        }
+        if self.positions.is_none() {
+            return Err("positions_host_scalar");
+        }
+        Ok(())
+    }
+
+    /// The cache's own address folded with every buffer a captured step reads or writes: each
+    /// checkpoint ring, each static attention layer's K/V buffers and the staged
+    /// [`DevicePositions`]. A ring reallocated by
+    /// [`set_max_checkpoints`](Qwen35Cache::set_max_checkpoints) (a deeper retention mid-request)
+    /// or a fresh cache moved into this one's place (a restored prefix) holds different buffers,
+    /// so the identity changes and the runner drops its graphs instead of replaying into freed
+    /// memory (sc-24441).
+    fn graph_identity(&self) -> usize {
+        use crate::primitives::decode_cache::fold_graph_identity;
+        let mut id = self as *const Self as usize;
+        if let Ok(rings) = self.recurrent_ring_addresses() {
+            id = fold_graph_identity(id, rings);
+        }
+        if let Ok(kv) = self.static_kv_addresses() {
+            id = fold_graph_identity(id, kv);
+        }
+        if let Some(Ok(positions)) = self.positions.as_ref().map(DevicePositions::addresses) {
+            id = fold_graph_identity(id, [positions]);
+        }
+        id
+    }
+
+    /// Stage the next step's start, RoPE positions (offset + delta) and ring slots on the device.
+    fn stage_positions(&mut self) -> Result<()> {
+        match &self.positions {
+            Some(p) => p.stage(self.offset(), self.rope_delta, self.ring_slots()),
+            None => Ok(()),
+        }
+    }
+
+    /// A replayed `n`-token step's host side (sc-24441): the capacity check, every static
+    /// attention layer's length and every linear layer's ring bookkeeping — what the forward
+    /// does on the host, with the device work done by the graph.
+    fn replay_advance(&mut self, n: usize) -> Result<()> {
+        if self.positions.is_none() {
+            return Err(Error::Unsupported(
+                "Qwen35Cache::replay_advance: only a cache with device positions backs a graph \
+                 replay"
+                    .into(),
+            ));
+        }
+        self.begin_forward(n)?;
+        // Every layer's bookkeeping is checked before any moves: a linear layer that cannot
+        // replay (no live state) refuses before an attention layer has advanced.
+        for l in &self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                if c.offset() == 0 || c.ssm_state().is_none() {
+                    return Err(Error::Msg(
+                        "Qwen35Cache::replay_advance: no live recurrent state to replay from"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => c.replay_advance(n)?,
+                Qwen35LayerCache::StaticAttn(s) => s.advance(n)?,
+                Qwen35LayerCache::Attn(_) => {
+                    return Err(Error::Msg(
+                        "Qwen35Cache::replay_advance: a growing KV slot cannot replay".into(),
+                    ))
+                }
             }
         }
         Ok(())
@@ -1220,6 +1574,103 @@ pub struct Qwen35Model {
     /// (the same arithmetic as the static cache); [`AttnFormulation::Expanded`] is the pre-S4
     /// `repeat_kv` + `sdpa` arithmetic, selectable for comparison rows only.
     attn_formulation: AttnFormulation,
+    /// [`Qwen35Model::rope`] with its inverse frequencies on the device, for the step's RoPE
+    /// tables on the device-positions path (sc-24441).
+    device_rope: DeviceRope,
+    /// Whether a static cache stages its positions on the device (sc-24441; see
+    /// [`Qwen35Model::set_device_positions`]): built from the process default
+    /// ([`device_positions_default`](crate::primitives::device_positions_default)) — on CUDA, off
+    /// on the CPU.
+    device_positions: bool,
+}
+
+/// The FFN of the decoder or MTP predictor layer whose tensors live under `lp` (the layer prefix
+/// with its trailing dot: `model.language_model.layers.3.`, `mtp.layers.0.`): a dense SwiGLU (27B)
+/// or the crate's shared sparse-MoE block (35B-A3B). The body and the MTP head share it, so a
+/// predictor layer takes exactly the body's FFN choice and expert layout (sc-24438). `proj_q` is
+/// the loader's keyed projection reader (Prism, stored GGML blocks, or dense in `format`).
+///
+/// MoE experts come in two checkpoint layouts. The fused one (Qwen3.6) stacks them:
+/// `experts.gate_up_proj` `[E, 2·moe_inter, hidden]` (gate rows ‖ up rows, matching the reference
+/// `linear(x, gate_up_proj[e]).chunk(2, -1)`) and `experts.down_proj` `[E, hidden, moe_inter]`,
+/// un-fused here into per-expert SwiGLUs. The per-expert one (the bf16 Qwen3.5 release) stores
+/// each expert's `experts.{e}.{gate,up,down}_proj.weight`, read as keyed projections.
+fn build_ffn(
+    w: &Weights,
+    lp: &str,
+    cfg: &Qwen35Config,
+    format: Option<&ProjectionFormat>,
+    dtype: DType,
+    device: &Device,
+    proj_q: &dyn Fn(String) -> Result<Projection>,
+) -> Result<Ffn> {
+    let lp = |s: &str| format!("{lp}{s}");
+    let req = |key: String| -> Result<Tensor> { dense_weight(w, &key, dtype) };
+    let Some(moe) = &cfg.moe else {
+        return Ok(Ffn::Dense(Mlp {
+            gate: proj_q(lp("mlp.gate_proj.weight"))?,
+            up: proj_q(lp("mlp.up_proj.weight"))?,
+            down: proj_q(lp("mlp.down_proj.weight"))?,
+        }));
+    };
+    let mut experts = Vec::with_capacity(moe.num_experts as usize);
+    if w.contains(&lp("mlp.experts.0.gate_proj.weight")) {
+        for e in 0..moe.num_experts as usize {
+            let part = |p: &str| proj_q(lp(&format!("mlp.experts.{e}.{p}_proj.weight")));
+            experts.push(SwiGlu {
+                gate: part("gate")?,
+                up: part("up")?,
+                down: part("down")?,
+            });
+        }
+    } else {
+        let mi = moe.moe_intermediate_size as usize;
+        debug_assert_priced(&lp("mlp.experts.gate_up_proj"), format);
+        debug_assert_priced(&lp("mlp.experts.down_proj"), format);
+        // A prepared tier stores each stacked tensor as GGML blocks
+        // `[E, rows, blocks, block_bytes]` (sc-19375); an expert's rows are whole blocks, so it is
+        // sliced out exactly like the dense `[E, rows, cols]`.
+        let stacked = |key: String| -> Result<(Tensor, bool)> {
+            let t = w.require(&key)?;
+            match is_ggml_block_tensor(t) {
+                true => Ok((t.clone(), true)),
+                false => Ok((req(key)?, false)),
+            }
+        };
+        let (gate_up_key, down_key) = (lp("mlp.experts.gate_up_proj"), lp("mlp.experts.down_proj"));
+        let (gate_up, gate_up_stored) = stacked(gate_up_key.clone())?;
+        let (down, down_stored) = stacked(down_key.clone())?;
+        let expert = |key: &str, slice: Tensor, stored: bool| -> Result<Projection> {
+            match stored {
+                true => Projection::load_stored_blocks(key, &slice, None, format, device),
+                false => Projection::load_as(slice.contiguous()?, None, format),
+            }
+        };
+        for e in 0..moe.num_experts as usize {
+            let gu = gate_up.narrow(0, e, 1)?.squeeze(0)?; // [2·mi, hidden]
+            let dn = down.narrow(0, e, 1)?.squeeze(0)?; // [hidden, mi]
+            experts.push(SwiGlu {
+                gate: expert(&gate_up_key, gu.narrow(0, 0, mi)?, gate_up_stored)?,
+                up: expert(&gate_up_key, gu.narrow(0, mi, mi)?, gate_up_stored)?,
+                down: expert(&down_key, dn, down_stored)?,
+            });
+        }
+    }
+    Ok(Ffn::Moe(SparseMoe::new(
+        req(lp("mlp.gate.weight"))?,
+        experts,
+        SwiGlu {
+            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
+            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
+            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
+        },
+        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+        MoeRouting {
+            experts_per_tok: moe.experts_per_tok,
+            norm_topk_prob: true,
+            routed_scaling_factor: 1.0,
+        },
+    )?))
 }
 
 /// The checkpoint-native Qwen3.8 multi-token predictor.
@@ -1261,12 +1712,35 @@ impl Qwen35MtpCache {
             layer.kv = None;
         }
     }
+
+    /// Bytes the predictor's KV holds (story sc-24437).
+    pub fn bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .fold(0usize, |acc, l| acc.saturating_add(l.bytes()))
+    }
+
+    /// Every layer's keys then values, flattened to f32 (test comparison of two warm-ups).
+    #[cfg(test)]
+    pub(crate) fn flat_keys(&self) -> Result<Vec<f32>> {
+        let mut out = Vec::new();
+        for (k, v) in self.layers.iter().filter_map(|l| l.kv.as_ref()) {
+            for t in [k, v] {
+                out.extend(t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?);
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl Qwen35Mtp {
-    /// All tensors required by the frozen Qwen3.8 MTP layout. A checkpoint is advertised as MTP
-    /// capable only when every key is present; a partial auxiliary head is never used.
-    pub fn required_keys(num_layers: usize) -> Vec<String> {
+    /// All tensors the configured MTP head requires: the frozen Qwen3.8 layout, whose predictor
+    /// layer FFN is the body's — the dense MLP, or for a sparse-MoE config (35B-A3B) the router,
+    /// shared expert and routed experts in the snapshot's layout (fused `gate_up_proj` /
+    /// `down_proj`, or per-expert `experts.{e}.*` when `per_expert`). A checkpoint is advertised as
+    /// MTP capable only when every key is present; a partial auxiliary head is never used.
+    pub fn required_keys(cfg: &Qwen35Config, per_expert: bool) -> Vec<String> {
+        let num_layers = cfg.mtp_num_hidden_layers;
         let mut keys = vec![
             "mtp.fc.weight".to_string(),
             "mtp.norm.weight".to_string(),
@@ -1283,21 +1757,52 @@ impl Qwen35Mtp {
                 "self_attn.o_proj.weight",
                 "self_attn.q_norm.weight",
                 "self_attn.k_norm.weight",
-                "mlp.gate_proj.weight",
-                "mlp.up_proj.weight",
-                "mlp.down_proj.weight",
             ] {
                 keys.push(format!("mtp.layers.{i}.{suffix}"));
             }
+            let mut ffn: Vec<String> = match &cfg.moe {
+                None => ["gate_proj", "up_proj", "down_proj"]
+                    .map(|p| format!("mlp.{p}.weight"))
+                    .into(),
+                Some(moe) => {
+                    let mut ffn: Vec<String> = [
+                        "mlp.gate.weight",
+                        "mlp.shared_expert.gate_proj.weight",
+                        "mlp.shared_expert.up_proj.weight",
+                        "mlp.shared_expert.down_proj.weight",
+                        "mlp.shared_expert_gate.weight",
+                    ]
+                    .map(String::from)
+                    .into();
+                    if per_expert {
+                        for e in 0..moe.num_experts {
+                            for p in ["gate_proj", "up_proj", "down_proj"] {
+                                ffn.push(format!("mlp.experts.{e}.{p}.weight"));
+                            }
+                        }
+                    } else {
+                        ffn.push("mlp.experts.gate_up_proj".into());
+                        ffn.push("mlp.experts.down_proj".into());
+                    }
+                    ffn
+                }
+            };
+            keys.extend(ffn.drain(..).map(|k| format!("mtp.layers.{i}.{k}")));
         }
         keys
+    }
+
+    /// Whether the snapshot `w` stores the MTP predictor layer's routed experts per expert
+    /// (`experts.{e}.*`, the bf16 Qwen3.5 release) rather than fused.
+    fn per_expert_in(w: &Weights) -> bool {
+        w.contains("mtp.layers.0.mlp.experts.0.gate_proj.weight")
     }
 
     /// Whether the complete configured MTP tensor set is present.
     pub fn complete_in(w: &Weights, cfg: &Qwen35Config) -> bool {
         cfg.mtp_num_hidden_layers == 1
             && !cfg.mtp_use_dedicated_embeddings
-            && Self::required_keys(cfg.mtp_num_hidden_layers)
+            && Self::required_keys(cfg, Self::per_expert_in(w))
                 .iter()
                 .all(|key| w.contains(key))
     }
@@ -1350,7 +1855,7 @@ impl Qwen35Mtp {
                     .into(),
             ));
         }
-        let missing: Vec<String> = Self::required_keys(cfg.mtp_num_hidden_layers)
+        let missing: Vec<String> = Self::required_keys(cfg, Self::per_expert_in(w))
             .into_iter()
             .filter(|key| !w.contains(key))
             .collect();
@@ -1360,50 +1865,63 @@ impl Qwen35Mtp {
                 missing.join(", ")
             )));
         }
-        if cfg.moe.is_some() {
-            return Err(Error::Config(
-                "qwen3_5 MoE MTP loading requires the checkpoint's sparse MTP FFN layout".into(),
-            ));
-        }
 
+        let proj_q = |key: &str| -> Result<Projection> {
+            debug_assert_priced(key, format);
+            keyed_projection(w, key, target.dtype, format, &target.device)
+        };
+        Self::assemble(w, target, format, &proj_q)
+    }
+
+    /// Build the one-layer predictor from `mtp.`-prefixed tensors in `w`, reading each projection
+    /// with `proj_q`, sharing the target's embedding and LM head. The geometry is the target's:
+    /// the predictor runs inside its residual stream, RoPE and vocabulary. Every RMSNorm vector is
+    /// zero-centred (`1 + w`) — the Qwen3.8 checkpoint convention of the native and the published
+    /// companion heads alike, whatever convention the target's own norms follow.
+    fn assemble(
+        w: &Weights,
+        target: &Qwen35Model,
+        format: Option<&ProjectionFormat>,
+        proj_q: &dyn Fn(&str) -> Result<Projection>,
+    ) -> Result<Self> {
+        let cfg = &target.cfg;
         let dtype = target.dtype;
         let eps = cfg.rms_norm_eps as f64;
         let req = |key: &str| -> Result<Tensor> { dense_weight(w, key, dtype) };
         // Qwen3.5/Qwen3.8 RMSNorm parameters are zero-centered (`1 + weight`).
         let norm_w = |key: &str| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
-        let proj_q = |key: &str| -> Result<Projection> {
-            debug_assert_priced(key, format);
-            keyed_projection(w, key, dtype, format, &target.device)
-        };
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
-        let mut layers = Vec::with_capacity(cfg.mtp_num_hidden_layers);
-        for i in 0..cfg.mtp_num_hidden_layers {
-            let lp = |suffix: &str| format!("mtp.layers.{i}.{suffix}");
-            layers.push(DecoderLayer {
-                input_ln: norm_w(&lp("input_layernorm.weight"))?,
-                post_ln: norm_w(&lp("post_attention_layernorm.weight"))?,
-                mixer: Mixer::Attn(Qwen35Attention {
-                    q_proj: proj_q(&lp("self_attn.q_proj.weight"))?,
-                    k_proj: proj_q(&lp("self_attn.k_proj.weight"))?,
-                    v_proj: proj_q(&lp("self_attn.v_proj.weight"))?,
-                    o_proj: proj_q(&lp("self_attn.o_proj.weight"))?,
-                    q_norm: norm_w(&lp("self_attn.q_norm.weight"))?,
-                    k_norm: norm_w(&lp("self_attn.k_norm.weight"))?,
-                    num_heads: cfg.num_heads as usize,
-                    num_kv_heads: cfg.num_kv_heads as usize,
-                    head_dim: cfg.head_dim as usize,
-                    groups,
-                    scale: (cfg.head_dim as f32).powf(-0.5),
-                    eps,
-                }),
-                ffn: Ffn::Dense(Mlp {
-                    gate: proj_q(&lp("mlp.gate_proj.weight"))?,
-                    up: proj_q(&lp("mlp.up_proj.weight"))?,
-                    down: proj_q(&lp("mlp.down_proj.weight"))?,
-                }),
+        let lp = |suffix: &str| format!("mtp.layers.0.{suffix}");
+        let layer = DecoderLayer {
+            input_ln: norm_w(&lp("input_layernorm.weight"))?,
+            post_ln: norm_w(&lp("post_attention_layernorm.weight"))?,
+            mixer: Mixer::Attn(Qwen35Attention {
+                q_proj: proj_q(&lp("self_attn.q_proj.weight"))?,
+                k_proj: proj_q(&lp("self_attn.k_proj.weight"))?,
+                v_proj: proj_q(&lp("self_attn.v_proj.weight"))?,
+                o_proj: proj_q(&lp("self_attn.o_proj.weight"))?,
+                q_norm: norm_w(&lp("self_attn.q_norm.weight"))?,
+                k_norm: norm_w(&lp("self_attn.k_norm.weight"))?,
+                num_heads: cfg.num_heads as usize,
+                num_kv_heads: cfg.num_kv_heads as usize,
+                head_dim: cfg.head_dim as usize,
+                groups,
+                scale: (cfg.head_dim as f32).powf(-0.5),
                 eps,
-            });
-        }
+            }),
+            // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
+            // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`).
+            ffn: build_ffn(
+                w,
+                &lp(""),
+                cfg,
+                format,
+                dtype,
+                &target.device,
+                &|key: String| proj_q(&key),
+            )?,
+            eps,
+        };
 
         Ok(Self {
             embed_tokens: target.embed_tokens.clone(),
@@ -1411,7 +1929,7 @@ impl Qwen35Mtp {
             pre_fc_norm_embedding: norm_w("mtp.pre_fc_norm_embedding.weight")?,
             pre_fc_norm_hidden: norm_w("mtp.pre_fc_norm_hidden.weight")?,
             fc: proj_q("mtp.fc.weight")?,
-            layers,
+            layers: vec![layer],
             norm: norm_w("mtp.norm.weight")?,
             rope: Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false),
             mrope_section: cfg.mrope_section_resolved(),
@@ -1423,10 +1941,129 @@ impl Qwen35Mtp {
         })
     }
 
+    /// Load a standalone Qwen3.8 MTP proposal head (a directory holding its `config.json` and
+    /// `*.safetensors`, `model_type` [`core_llm::COMPANION_MTP_MODEL_TYPE`]) for a target that has
+    /// none of its own — the Prism/Bonsai path, whose packed artifact ships no `mtp.*` tensors
+    /// (sc-24444, the Candle twin of mlx-llm's `attach_companion_mtp`).
+    ///
+    /// The head owns only its predictor layer; it reads token embeddings and projects logits
+    /// through the target's own embedding and `lm_head` (for Prism, the packed ones). Its geometry
+    /// is checked against the target's by the shared [`core_llm::CompanionMtpGeometry`] contract
+    /// and every stored tensor's `[out, in]` / width against the target's before anything is
+    /// built; a mismatch is an [`Error::Config`] naming each disagreement. Tensor names may be bare
+    /// (`fc.weight`, the published layout) or `mtp.`-prefixed; bare names are remapped to `mtp.`.
+    /// Projections are read in the head's own stored MLX affine quantization (its `quantization`
+    /// block: 4- or 8-bit, re-packed to Q8_0 like every MLX affine triple Candle loads) or dense;
+    /// RMSNorm vectors are `1 + w`. Every tensor in the head must be consumed.
+    pub fn from_companion_dir(dir: &std::path::Path, target: &Qwen35Model) -> Result<Self> {
+        if target.cfg.moe.is_some() {
+            return Err(Error::Config(core_llm::COMPANION_MTP_MOE_REFUSAL.into()));
+        }
+        let value =
+            core_llm::read_companion_mtp_config(dir).map_err(|e| Error::Config(e.to_string()))?;
+        let head_cfg = Qwen35Config::from_json(&value)?;
+        let geometry = head_cfg.companion_mtp_geometry();
+        geometry
+            .check_against(&target.cfg.companion_mtp_geometry())
+            .map_err(Error::Config)?;
+        let quant = value
+            .get("text_config")
+            .and_then(|t| t.get("quantization"))
+            .or_else(|| value.get("quantization"))
+            .map(|q| -> Result<(usize, usize)> {
+                let field = |k: &str| q.get(k).and_then(serde_json::Value::as_u64);
+                match (field("bits"), field("group_size"), q.get("mode")) {
+                    (Some(bits @ (4 | 8)), Some(group), mode)
+                        if group > 0 && mode.is_none_or(|m| m.as_str() == Some("affine")) =>
+                    {
+                        Ok((bits as usize, group as usize))
+                    }
+                    _ => Err(Error::Config(format!(
+                        "companion MTP head quantization {q} is not MLX affine 4- or 8-bit"
+                    ))),
+                }
+            })
+            .transpose()?;
+        let raw = Weights::from_dir(dir, &target.device)?;
+        let prefix = core_llm::companion_mtp_prefix(|key| raw.contains(key))
+            .map_err(|e| Error::Config(e.to_string()))?;
+
+        let logical = |key: &str| -> Option<[usize; 2]> {
+            let (rows, cols) = raw.get(key)?.dims2().ok()?;
+            match quant {
+                Some((_, group)) => {
+                    let stem = key.strip_suffix(".weight").unwrap_or(key);
+                    let (_, groups) = raw.get(&format!("{stem}.scales"))?.dims2().ok()?;
+                    Some([rows, groups.checked_mul(group)?])
+                }
+                None => Some([rows, cols]),
+            }
+        };
+        // The shared stored-tensor check (E8: MLX refuses exactly the same heads).
+        geometry
+            .check_tensors(prefix, logical, |key| {
+                raw.get(key).map(|t| t.dims().to_vec())
+            })
+            .map_err(Error::Config)?;
+        let mut expected_keys = std::collections::BTreeSet::new();
+        for (name, _) in geometry.matrices() {
+            expected_keys.insert(format!("{prefix}{name}.weight"));
+            if quant.is_some() {
+                expected_keys.insert(format!("{prefix}{name}.scales"));
+                expected_keys.insert(format!("{prefix}{name}.biases"));
+            }
+        }
+        for (name, _) in geometry.norms() {
+            expected_keys.insert(format!("{prefix}{name}.weight"));
+        }
+        core_llm::check_companion_unused(
+            raw.keys()
+                .filter(|key| !expected_keys.contains(*key))
+                .map(str::to_string)
+                .collect(),
+        )
+        .map_err(Error::Config)?;
+
+        // The predictor reads the native `mtp.` layout.
+        let device = raw.device().clone();
+        let w = Weights::from_map(
+            raw.into_map()
+                .into_iter()
+                .map(|(key, t)| match key.strip_prefix(prefix) {
+                    Some(bare) if prefix.is_empty() => (format!("mtp.{bare}"), t),
+                    _ => (key, t),
+                })
+                .collect(),
+            device,
+        );
+        let proj_q = |key: &str| -> Result<Projection> {
+            match quant {
+                Some((bits, group)) => {
+                    let stem = key.strip_suffix(".weight").unwrap_or(key);
+                    Projection::load_mlx_affine(
+                        w.require(key)?,
+                        w.require(&format!("{stem}.scales"))?,
+                        w.require(&format!("{stem}.biases"))?,
+                        bits,
+                        group,
+                        &target.device,
+                    )
+                }
+                None => keyed_projection(&w, key, target.dtype, None, &target.device),
+            }
+        };
+        Self::assemble(&w, target, None, &proj_q)
+    }
+
+    /// The predictor's decoder layers (one for every head this runtime loads).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
     /// Select how the predictor layers attend (see [`Qwen35Model::set_attn_formulation`]); the
     /// head copies the target's selection when it is built.
     pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
-        self.attn_formulation = formulation;
+        self.attn_formulation = formulation.selector();
     }
 
     /// How the predictor layers attend.
@@ -1760,6 +2397,7 @@ impl Qwen35Model {
             max_checkpoints,
             recurrent_shape: shape,
             rope_delta: 0,
+            positions: None,
         }
     }
 
@@ -1815,12 +2453,32 @@ impl Qwen35Model {
                 )?)
             });
         }
+        let positions = self
+            .device_positions_active()
+            .then(|| DevicePositions::new(&self.device))
+            .transpose()?;
         Ok(Qwen35Cache {
             layers,
             max_checkpoints,
             recurrent_shape: shape,
             rope_delta: 0,
+            positions,
         })
+    }
+
+    /// The widest per-token working set of this model's Mixture-of-Experts dispatch in bytes
+    /// ([`SparseMoe::step_bytes_per_token`](crate::primitives::moe::SparseMoe::step_bytes_per_token)
+    /// over every MoE layer; sc-24440) — `0` for a dense model. Admission prices it per token row
+    /// on top of the dense step working set.
+    pub fn moe_step_bytes_per_token(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe(m) => Some(m.step_bytes_per_token()),
+                Ffn::Dense(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions:
@@ -1862,12 +2520,67 @@ impl Qwen35Model {
     /// target's formulation when it is built ([`Qwen35Mtp::set_attn_formulation`] changes it
     /// afterwards).
     pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
-        self.attn_formulation = formulation;
+        self.attn_formulation = formulation.selector();
     }
 
     /// How the growing `AttnKv` slots attend.
     pub fn attn_formulation(&self) -> AttnFormulation {
         self.attn_formulation
+    }
+
+    /// Select whether a static cache stages its positions on the device (sc-24441): RoPE tables
+    /// from device positions, the full-attention K/V written at a device-held index and attended
+    /// by the length-aware [`candle_quant_kernels::decode_attention()`], the DeltaNet checkpoint
+    /// ring indexed on the device — the path a CUDA graph can replay, and the one the eager static
+    /// path runs too, so graphs on and off are the same arithmetic. The process default
+    /// ([`crate::primitives::DEVICE_POSITIONS_DEFAULT`]) turns it on on CUDA; off by
+    /// default on the CPU (the host path serves), where it can be switched on to exercise the same
+    /// logic. Applies to caches built afterwards, and only when the model supports it
+    /// ([`Qwen35Model::device_positions_support`]).
+    pub fn set_device_positions(&mut self, on: bool) {
+        self.device_positions = on;
+    }
+
+    /// Whether static caches are asked to stage device positions (the setting).
+    pub fn device_positions(&self) -> bool {
+        self.device_positions
+    }
+
+    /// Why this decoder's step cannot run on device positions (`Ok` when it can): the
+    /// length-aware attention takes F32/BF16 heads no wider than
+    /// [`candle_quant_kernels::DECODE_ATTN_MAX_HEAD_DIM`] and must compile on the device
+    /// (`decode_attention_dtype`, `decode_attention_head_dim`, `decode_attention_unavailable`).
+    pub fn device_positions_support(&self) -> std::result::Result<(), &'static str> {
+        if !candle_quant_kernels::decode_attention::served_dtype(self.dtype) {
+            return Err("decode_attention_dtype");
+        }
+        if self.cfg.head_dim.max(0) as usize > candle_quant_kernels::DECODE_ATTN_MAX_HEAD_DIM {
+            return Err("decode_attention_head_dim");
+        }
+        if candle_quant_kernels::decode_attention::available(&self.device).is_err() {
+            return Err("decode_attention_unavailable");
+        }
+        Ok(())
+    }
+
+    /// What a request asking for `requested` reports (sc-24441):
+    /// [`AttnFormulation::DecodeAttention`] when its cached decode / verify steps attend with the
+    /// length-aware decode attention — the model's device positions are active and `requested`
+    /// is un-expanded, the condition the model's `decode_start` takes it on under (the prompt
+    /// prefill still attends [`AttnFormulation::Gqa`]); else `requested`. The reference loop's
+    /// report reads this with the model's selector.
+    pub fn decode_attention_formulation(&self, requested: AttnFormulation) -> AttnFormulation {
+        if requested.selector() == AttnFormulation::Gqa && self.device_positions_active() {
+            AttnFormulation::DecodeAttention
+        } else {
+            requested
+        }
+    }
+
+    /// Whether a static cache built now stages device positions (the setting, and the model
+    /// supports it).
+    pub fn device_positions_active(&self) -> bool {
+        self.device_positions && self.device_positions_support().is_ok()
     }
 
     /// The device the model's tensors live on.
@@ -1877,11 +2590,67 @@ impl Qwen35Model {
 
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
     /// hidden states `[B, S, hidden]` (before the final norm / lm_head).
+    ///
+    /// A cached decode / verify step (at most [`MAX_DEVICE_STEP_TOKENS`] tokens, past position
+    /// zero) on a cache that stages device positions, at the cache's own position, runs the
+    /// device-positions path (sc-24441): every position the step's kernels read — RoPE, KV
+    /// write, attention length, ring slots — is device data, so the step replays as a CUDA
+    /// graph. Anything else runs the host path, where a short cached step of a model with device
+    /// positions still attends with the same length-aware attention (so the growing reference
+    /// cache and the static path stay one arithmetic); both keep the cache's host-side state
+    /// identical.
     fn hidden(&self, input_ids: &Tensor, cache: &mut Qwen35Cache, offset: i32) -> Result<Tensor> {
         let h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
-        let s = h.dim(1)? as i32;
-        let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
+        let s = h.dim(1)?;
+        if s <= MAX_DEVICE_STEP_TOKENS
+            && cache.offset() > 0
+            && cache.positions.is_some()
+            && offset == cache.offset() + cache.rope_delta()
+            && !crate::primitives::in_prefill()
+        {
+            cache.stage_positions()?;
+            cache.begin_forward(s)?;
+            let Qwen35Cache {
+                layers, positions, ..
+            } = cache;
+            let positions = positions.as_ref().expect("checked above");
+            let (cos, sin) = self
+                .device_rope
+                .cos_sin(&positions.rope_positions(s)?, self.dtype)?;
+            let mut h = h;
+            for (layer, slot) in self.layers.iter().zip(layers.iter_mut()) {
+                h = layer.forward_with(
+                    &h,
+                    &cos,
+                    &sin,
+                    slot,
+                    self.attn_formulation,
+                    Some(positions),
+                    None,
+                )?;
+            }
+            return Ok(h);
+        }
+        let (cos, sin) = self
+            .rope
+            .cos_sin(s as i32, offset, self.dtype, &self.device)?;
         self.hidden_from_embeds(&h, &cos, &sin, cache)
+    }
+
+    /// The step start a short cached step attends from with the length-aware decode attention
+    /// on an ordinary (growing, or static without device positions) cache — `Some` exactly when
+    /// this model's static caches stage device positions, the growing slots attend un-expanded
+    /// ([`AttnFormulation::Gqa`]) and the step is a cached decode / verify step (sc-24441).
+    fn decode_start(&self, cache: &Qwen35Cache, s: usize) -> Result<Option<Tensor>> {
+        if s > MAX_DEVICE_STEP_TOKENS
+            || cache.offset() <= 0
+            || crate::primitives::in_prefill()
+            || self.attn_formulation != AttnFormulation::Gqa
+            || !self.device_positions_active()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Tensor::new(&[cache.offset() as u32], &self.device)?))
     }
 
     /// Run the decoder stack over precomputed input `embeds` `[B, S, hidden]` with the given RoPE
@@ -1894,10 +2663,19 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        let decode_start = self.decode_start(cache, embeds.dim(1)?)?;
         cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
         for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            h = layer.forward(&h, cos, sin, slot, self.attn_formulation)?;
+            h = layer.forward_with(
+                &h,
+                cos,
+                sin,
+                slot,
+                self.attn_formulation,
+                None,
+                decode_start.as_ref(),
+            )?;
         }
         Ok(h)
     }
@@ -2111,6 +2889,8 @@ impl Qwen35Model {
         positions: [&[i32]; 3],
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -2133,6 +2913,8 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<Tensor> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -2164,6 +2946,8 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<(Tensor, Tensor)> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -2195,6 +2979,8 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<(Tensor, Tensor)> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -2395,66 +3181,15 @@ impl Qwen35Model {
                     eps,
                 })
             };
-            let ffn = match &cfg.moe {
-                // Dense SwiGLU (27B).
-                None => Ffn::Dense(Mlp {
-                    gate: proj_q(lp("mlp.gate_proj.weight"))?,
-                    up: proj_q(lp("mlp.up_proj.weight"))?,
-                    down: proj_q(lp("mlp.down_proj.weight"))?,
-                }),
-                // Sparse MoE (35B-A3B): un-fuse the stacked expert tensors into per-expert SwiGLUs.
-                // `experts.gate_up_proj` is [E, 2·moe_inter, hidden] (gate rows ‖ up rows, matching the
-                // reference `linear(x, gate_up_proj[e]).chunk(2, -1)`); `experts.down_proj` is
-                // [E, hidden, moe_inter].
-                Some(moe) => {
-                    let mi = moe.moe_intermediate_size as usize;
-                    debug_assert_priced(&lp("mlp.experts.gate_up_proj"), format);
-                    debug_assert_priced(&lp("mlp.experts.down_proj"), format);
-                    // A prepared tier stores each stacked tensor as GGML blocks
-                    // `[E, rows, blocks, block_bytes]` (sc-19375); an expert's rows are whole
-                    // blocks, so it is sliced out exactly like the dense `[E, rows, cols]`.
-                    let stacked = |key: String| -> Result<(Tensor, bool)> {
-                        let t = w.require(&key)?;
-                        match is_ggml_block_tensor(t) {
-                            true => Ok((t.clone(), true)),
-                            false => Ok((req(key)?, false)),
-                        }
-                    };
-                    let (gate_up_key, down_key) =
-                        (lp("mlp.experts.gate_up_proj"), lp("mlp.experts.down_proj"));
-                    let (gate_up, gate_up_stored) = stacked(gate_up_key.clone())?;
-                    let (down, down_stored) = stacked(down_key.clone())?;
-                    let expert = |key: &str, slice: Tensor, stored: bool| -> Result<Projection> {
-                        match stored {
-                            true => {
-                                Projection::load_stored_blocks(key, &slice, None, format, &device)
-                            }
-                            false => Projection::load_as(slice.contiguous()?, None, format),
-                        }
-                    };
-                    let mut experts = Vec::with_capacity(moe.num_experts as usize);
-                    for e in 0..moe.num_experts as usize {
-                        let gu = gate_up.narrow(0, e, 1)?.squeeze(0)?; // [2·mi, hidden]
-                        let dn = down.narrow(0, e, 1)?.squeeze(0)?; // [hidden, mi]
-                        experts.push(Mlp {
-                            gate: expert(&gate_up_key, gu.narrow(0, 0, mi)?, gate_up_stored)?,
-                            up: expert(&gate_up_key, gu.narrow(0, mi, mi)?, gate_up_stored)?,
-                            down: expert(&down_key, dn, down_stored)?,
-                        });
-                    }
-                    Ffn::Moe(MoeFfn {
-                        router: req(lp("mlp.gate.weight"))?,
-                        experts,
-                        shared: Mlp {
-                            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
-                            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
-                            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
-                        },
-                        shared_gate: req(lp("mlp.shared_expert_gate.weight"))?,
-                        experts_per_tok: moe.experts_per_tok,
-                    })
-                }
-            };
+            let ffn = build_ffn(
+                w,
+                &join(&format!("layers.{i}.")),
+                &cfg,
+                format,
+                dtype,
+                &device,
+                &proj_q,
+            )?;
             layers.push(DecoderLayer {
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
@@ -2465,11 +3200,15 @@ impl Qwen35Model {
         }
 
         let rope = Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false);
+        let device_rope = DeviceRope::new(&rope, &device)?;
+        let device_positions = crate::primitives::device_positions_default(&device);
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
+            device_rope,
+            device_positions,
             rope,
             eps,
             cfg,
@@ -2563,26 +3302,43 @@ impl StepModel for Qwen35Model {
         Ok(cache)
     }
 
-    /// The static cache always attends un-expanded ([`AttnFormulation::Gqa`]); a growing cache
-    /// runs the model's selector.
+    /// [`AttnFormulation::DecodeAttention`] when the request's cached steps attend with the
+    /// length-aware decode attention (sc-24441): a cache that stages device positions, or — the
+    /// condition the model's `decode_start` takes it on under — a model whose device
+    /// positions are active with the un-expanded selector. Otherwise the static cache attends
+    /// un-expanded ([`AttnFormulation::Gqa`]) and a growing cache runs the model's selector.
     fn attn_formulation(&self, cache: &Qwen35Cache) -> AttnFormulation {
+        if cache.device_positions().is_some() {
+            return AttnFormulation::DecodeAttention;
+        }
         match cache.kv_kind() {
-            KvCacheKind::Static => AttnFormulation::Gqa,
-            KvCacheKind::Growing => self.attn_formulation,
+            KvCacheKind::Static => self.decode_attention_formulation(AttnFormulation::Gqa),
+            KvCacheKind::Growing => self.decode_attention_formulation(self.attn_formulation),
         }
     }
 
-    /// Not replayable as a CUDA graph on this revision (story sc-24134), declared so the runner
-    /// refuses before any capture: the MoE block (35B-A3B) pulls its router probabilities to
-    /// the host every step (`moe_router_host_read`), and every step's positions are Rust-side
-    /// scalars — the RoPE tables built on the host for `offset`, the KV written at
-    /// `slice_set(offset)`, attention bounded by `narrow(len)` — which a graph would replay at
-    /// the captured position (`positions_host_scalar`).
+    /// Replayable as a CUDA graph (stories sc-24134, sc-24441) when every per-step position is
+    /// device data: with device positions on (the CUDA default) a step reads its RoPE positions,
+    /// KV write index, attention length and DeltaNet ring slots from the cache's staged buffers.
+    /// Still declared uncapturable, so the runner refuses before any capture: an MoE block
+    /// (35B-A3B) whose experts no indexed kernel serves — Prism-packed, a mixed or biased bank,
+    /// NVFP4 with the decode GEMV off, a kernel that does not compile, any bank off CUDA —
+    /// dispatches them from host-read routes (`moe_expert_host_dispatch:<cause>`, sc-24440; dense,
+    /// GGML, MLX-affine Q8 and NVFP4 banks are dispatched on the device and capture); with device
+    /// positions off the positions are Rust-side scalars
+    /// (`positions_host_scalar`); and a model the device path does not serve says why
+    /// ([`Qwen35Model::device_positions_support`]).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
-        if self.cfg.moe.is_some() {
-            return Err("moe_router_host_read");
+        if let Some(reason) = self.layers.iter().find_map(|l| match &l.ffn {
+            Ffn::Moe(m) => m.graph_refusal(),
+            Ffn::Dense(_) => None,
+        }) {
+            return Err(reason);
         }
-        Err("positions_host_scalar")
+        if !self.device_positions {
+            return Err("positions_host_scalar");
+        }
+        self.device_positions_support()
     }
 
     fn device(&self) -> &Device {
@@ -2606,16 +3362,41 @@ impl StepModel for Qwen35Model {
         // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
         let offset = cache.offset() + cache.rope_delta();
         let ids = request.tokens.ids(&self.device)?;
-        let (logits, hidden) = match (request.scope, request.want_hidden) {
-            (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
-            (LogitsScope::Last, true) => {
-                let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
-                (logits, Some(hidden))
+        if let Some(b) = request.snapshot_at {
+            // The boundary snapshot (sc-24446): a prefill keeps every linear layer's state after
+            // its first `b` tokens; the attention KV is narrowed there afterwards.
+            let n = request.len()?;
+            if !request.prefill || b == 0 || b >= n {
+                return Err(Error::Msg(format!(
+                    "Qwen35Model::forward_step: a snapshot after {b} of {n} tokens needs a \
+                     prefill step that continues past it"
+                )));
             }
-            (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
-            (LogitsScope::All, true) => {
-                let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
-                (logits, Some(hidden))
+            cache.capture_boundary(cache.offset() + b as i32);
+        }
+        let _prefill = crate::primitives::prefill_scope(request.prefill);
+        let run = (|| -> Result<(Tensor, Option<Tensor>)> {
+            Ok(match (request.scope, request.want_hidden) {
+                (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
+                (LogitsScope::Last, true) => {
+                    let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+                (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
+                (LogitsScope::All, true) => {
+                    let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+            })
+        })();
+        let (logits, hidden) = match run {
+            Ok(out) => out,
+            Err(e) => {
+                // A forward that failed part-way leaves the boundary capture (sc-24446) pending
+                // in the linear layers it never reached: drop it, so no later prefill on this
+                // cache captures a stale boundary.
+                cache.clear_boundary_capture();
+                return Err(e);
             }
         };
         Ok(StepOutput { logits, hidden })
@@ -2700,8 +3481,47 @@ impl crate::models::VlmDecode for Qwen35Model {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// sc-24437: a prefix snapshot owns compact copies of exactly the positions it holds — never a
+    /// view into the live cache's static KV buffer, which would pin that whole buffer beyond the
+    /// bytes the entry is charged for.
+    #[test]
+    fn a_prefix_snapshot_holds_compact_copies_of_its_positions() {
+        use crate::decode::{StepModel, StepRequest};
+        let (_, model) = text_model();
+        let mut cache = model.new_cache_for(32, 3).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[3, 9, 4, 11, 3, 9, 4, 11]))
+            .unwrap();
+        let state = cache.prefix_snapshot().unwrap();
+        let pinned = crate::primitives::decode_cache::pinned_f32_elems;
+        for layer in &state.layers {
+            if let Qwen35PrefixLayer::Delta(Some((conv, ssm))) = layer {
+                for t in [conv, ssm] {
+                    assert_eq!(pinned(t), t.elem_count(), "{:?}", t.layout());
+                }
+            }
+        }
+        let mut attention = 0;
+        for layer in &state.layers {
+            if let Qwen35PrefixLayer::Attn(Some((k, v))) = layer {
+                for t in [k, v] {
+                    assert_eq!(t.dim(2).unwrap(), 8);
+                    assert_eq!(
+                        pinned(t),
+                        t.elem_count(),
+                        "the entry pins more than it holds: {:?}",
+                        t.layout()
+                    );
+                }
+                attention += 1;
+            }
+        }
+        assert!(attention > 0, "the fixture has full-attention layers");
+    }
 
     #[test]
     fn published_prism_norm_multiplier_matches_independent_rms_oracle() {
@@ -2791,7 +3611,12 @@ pub(crate) mod tests {
         )))
         .unwrap();
         let cfg = Qwen35Config::from_json(&value).unwrap();
-        let mut keys = Qwen35Mtp::required_keys(cfg.mtp_num_hidden_layers);
+        let mut keys = Qwen35Mtp::required_keys(&cfg, false);
+        assert_eq!(
+            Qwen35Mtp::required_keys(&cfg, true),
+            keys,
+            "dense: no experts"
+        );
         keys.sort();
         let expected = [
             "mtp.fc.weight",
@@ -2829,6 +3654,52 @@ pub(crate) mod tests {
             Device::Cpu,
         );
         assert!(!Qwen35Mtp::complete_in(&incomplete, &cfg));
+    }
+
+    /// sc-24438: a sparse-MoE config's MTP inventory is its predictor layer's MoE block in the
+    /// snapshot's expert layout — the 35B-A3B's router, shared expert and either the fused
+    /// (Qwen3.6) `gate_up_proj` / `down_proj` or the 256 per-expert (Qwen3.5) triples — never the
+    /// dense MLP; `complete_in` reads the layout off the snapshot.
+    #[test]
+    fn a_moe_mtp_inventory_follows_the_expert_layout() {
+        let mut value: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/config.json"
+        )))
+        .unwrap();
+        let text = value["text_config"].as_object_mut().unwrap();
+        text.insert("model_type".into(), serde_json::json!("qwen3_5_moe_text"));
+        text.insert("num_experts".into(), serde_json::json!(256));
+        text.insert("num_experts_per_tok".into(), serde_json::json!(8));
+        text.insert("moe_intermediate_size".into(), serde_json::json!(512));
+        text.insert(
+            "shared_expert_intermediate_size".into(),
+            serde_json::json!(512),
+        );
+        let cfg = Qwen35Config::from_json(&value).unwrap();
+        let (fused, split) = (
+            Qwen35Mtp::required_keys(&cfg, false),
+            Qwen35Mtp::required_keys(&cfg, true),
+        );
+        let mlp = |keys: &[String]| {
+            keys.iter()
+                .filter(|k| k.starts_with("mtp.layers.0.mlp."))
+                .count()
+        };
+        for keys in [&fused, &split] {
+            assert!(!keys.contains(&"mtp.layers.0.mlp.gate_proj.weight".to_string()));
+            for k in [
+                "mtp.layers.0.mlp.gate.weight",
+                "mtp.layers.0.mlp.shared_expert_gate.weight",
+                "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+            ] {
+                assert!(keys.contains(&k.to_string()), "{k}");
+            }
+        }
+        assert!(fused.contains(&"mtp.layers.0.mlp.experts.gate_up_proj".to_string()));
+        assert_eq!(mlp(&fused), 5 + 2);
+        assert!(split.contains(&"mtp.layers.0.mlp.experts.255.down_proj.weight".to_string()));
+        assert_eq!(mlp(&split), 5 + 256 * 3);
     }
 
     /// A deterministic small tensor of shape `dims` (finite, non-degenerate), on CPU.
@@ -3075,6 +3946,82 @@ pub(crate) mod tests {
         );
     }
 
+    /// AC (sc-24443): chunkwise prefill leaves Qwen35 greedy decoding unchanged against the
+    /// per-token reference recurrence — a short and a multi-chunk prompt, a speculative-verify-width
+    /// forward and the decode steps after it, on a plain cache and on a checkpointing (ringed) one.
+    #[test]
+    fn greedy_tokens_match_the_per_token_reference_recurrence() {
+        let (_cfg, model) = text_model();
+        let argmax_rows = |logits: &Tensor| -> Vec<u32> {
+            let v = *logits.dims().last().unwrap();
+            host(logits)
+                .chunks(v)
+                .map(|r| {
+                    r.iter()
+                        .enumerate()
+                        .fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                        .0 as u32
+                })
+                .collect()
+        };
+        let run = |prompt: &[u32], ringed: bool| -> (Vec<u32>, Vec<f32>) {
+            let mut cache = if ringed {
+                model.new_cache_with_checkpoints(3)
+            } else {
+                model.new_cache()
+            };
+            let n = prompt.len() as i32;
+            let mut logits = Vec::new();
+            let pre = model.decode_logits(&ids(prompt), &mut cache, 0).unwrap();
+            let mut next = argmax_rows(&pre)[0];
+            logits.extend(host(&pre));
+            let verify = model
+                .forward(
+                    &ids(&[next, (next + 1) % 50, (next + 2) % 50]),
+                    &mut cache,
+                    n,
+                )
+                .unwrap();
+            let mut out = argmax_rows(&verify);
+            logits.extend(host(&verify));
+            next = out[2];
+            for i in 0..6 {
+                let step = model
+                    .decode_logits(&ids(&[next]), &mut cache, n + 3 + i)
+                    .unwrap();
+                next = argmax_rows(&step)[0];
+                out.push(next);
+                logits.extend(host(&step));
+            }
+            (out, logits)
+        };
+        let long: Vec<u32> = (0..90).map(|i| (i * 7 + 3) % 50).collect();
+        for prompt in [&[1u32, 7, 3, 42, 9, 2][..], &long[..]] {
+            for ringed in [false, true] {
+                let (tokens, logits) = run(prompt, ringed);
+                let (ref_tokens, ref_logits) =
+                    crate::primitives::gated_delta::with_per_token_reference(|| {
+                        run(prompt, ringed)
+                    });
+                let md = logits
+                    .iter()
+                    .zip(&ref_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "prompt len {} ringed={ringed}: max logit diff vs per-token {md:.2e}",
+                    prompt.len()
+                );
+                assert_eq!(tokens, ref_tokens, "prompt len {}", prompt.len());
+                assert!(
+                    md < 1e-4,
+                    "prompt len {}: max logit diff {md}",
+                    prompt.len()
+                );
+            }
+        }
+    }
+
     /// The whole Gated DeltaNet layer, validated against the numeric oracle from the exact
     /// `Qwen3_5GatedDeltaNet.forward` reference (4-way in-projection → short conv → contiguous q|k|v
     /// split → L2-norm + q-scale → GQA delta recurrence → gated RMS-norm(z) → out-proj). The same
@@ -3197,23 +4144,28 @@ pub(crate) mod tests {
                 .unwrap()
                 .contiguous()
                 .unwrap();
-            experts.push(Mlp {
+            experts.push(SwiGlu {
                 gate: proj(gate_w),
                 up: proj(up_w),
                 down: proj(dn),
             });
         }
-        let moe = MoeFfn {
-            router: mk("router", &[e, h]),
+        let moe = SparseMoe::new(
+            mk("router", &[e, h]),
             experts,
-            shared: Mlp {
+            SwiGlu {
                 gate: proj(mk("sh_gate", &[mi, h])),
                 up: proj(mk("sh_up", &[mi, h])),
                 down: proj(mk("sh_down", &[h, mi])),
             },
-            shared_gate: mk("sh_gatew", &[1, h]),
-            experts_per_tok: k,
-        };
+            Some(mk("sh_gatew", &[1, h])),
+            MoeRouting {
+                experts_per_tok: k,
+                norm_topk_prob: true,
+                routed_scaling_factor: 1.0,
+            },
+        )
+        .unwrap();
 
         let out = moe.forward(&mk("x", &[1, 1, h])).unwrap();
         assert_eq!(out.dims(), &[1, 1, h]);
@@ -3228,6 +4180,210 @@ pub(crate) mod tests {
             md < 2e-4,
             "moe ffn vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}"
         );
+    }
+
+    /// [`cfg_json_moe`] with a configured MTP head — the 35B-A3B checkpoint's layout (sc-24438).
+    pub(crate) fn cfg_json_moe_mtp() -> Value {
+        let mut v = cfg_json_moe();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("mtp_num_hidden_layers".into(), json!(1));
+        tc.insert("mtp_use_dedicated_embeddings".into(), json!(false));
+        v
+    }
+
+    /// The synthetic tensors of a sparse-MoE `cfg` with an MTP head whose predictor layer carries
+    /// a sparse-MoE FFN (router, experts, shared expert) instead of the dense MLP — as the 35B-A3B
+    /// checkpoint ships it (sc-24438) — with every MoE tensor (body and head) seeded **non-zero
+    /// random**. `fused` stores the experts as the Qwen3.6 release does (`experts.gate_up_proj` /
+    /// `experts.down_proj`); otherwise each under its own keys, as the bf16 Qwen3.5 release does
+    /// (`experts.{e}.{gate,up,down}_proj.weight`) — the same values either way.
+    pub(crate) fn seeded_moe_mtp_tensors(
+        cfg: &Qwen35Config,
+        fused: bool,
+    ) -> HashMap<String, Tensor> {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let moe = cfg.moe.as_ref().expect("a MoE config");
+        assert_eq!(cfg.mtp_num_hidden_layers, 1);
+        let h = cfg.hidden_size as usize;
+        let (e, mi, si) = (
+            moe.num_experts as usize,
+            moe.moe_intermediate_size as usize,
+            moe.shared_expert_intermediate_size as usize,
+        );
+        let weights = synthetic_weights(cfg);
+        let mut m: HashMap<String, Tensor> = weights
+            .keys()
+            .map(|k| (k.to_string(), weights.get(k).unwrap().clone()))
+            .collect();
+        for dense in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(m
+                .remove(&format!("mtp.layers.0.mlp.{dense}.weight"))
+                .is_some());
+        }
+        let mut rng = SplitMix64::new(0x5EED_24438);
+        let mut layers: Vec<String> = (0..cfg.num_layers)
+            .map(|i| format!("model.language_model.layers.{i}."))
+            .collect();
+        layers.push("mtp.layers.0.".into());
+        for lp in layers {
+            let mut rand = |key: &str, dims: &[usize]| {
+                let n: usize = dims.iter().product();
+                let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.8).collect();
+                let t = Tensor::from_vec(data.clone(), dims.to_vec(), &Device::Cpu).unwrap();
+                m.insert(format!("{lp}{key}"), t);
+                data
+            };
+            let gate_up = rand("mlp.experts.gate_up_proj", &[e, 2 * mi, h]);
+            let down = rand("mlp.experts.down_proj", &[e, h, mi]);
+            rand("mlp.gate.weight", &[e, h]);
+            rand("mlp.shared_expert.gate_proj.weight", &[si, h]);
+            rand("mlp.shared_expert.up_proj.weight", &[si, h]);
+            rand("mlp.shared_expert.down_proj.weight", &[h, si]);
+            rand("mlp.shared_expert_gate.weight", &[1, h]);
+            if !fused {
+                m.remove(&format!("{lp}mlp.experts.gate_up_proj"));
+                m.remove(&format!("{lp}mlp.experts.down_proj"));
+                let rows = mi * h;
+                let put = |m: &mut HashMap<String, Tensor>, key: String, d: &[f32], dims| {
+                    m.insert(
+                        key,
+                        Tensor::from_vec(d.to_vec(), dims, &Device::Cpu).unwrap(),
+                    );
+                };
+                for x in 0..e {
+                    let key = |p: &str| format!("{lp}mlp.experts.{x}.{p}_proj.weight");
+                    let gu = &gate_up[x * 2 * rows..(x + 1) * 2 * rows];
+                    put(&mut m, key("gate"), &gu[..rows], (mi, h));
+                    put(&mut m, key("up"), &gu[rows..], (mi, h));
+                    put(
+                        &mut m,
+                        key("down"),
+                        &down[x * rows..(x + 1) * rows],
+                        (h, mi),
+                    );
+                }
+            }
+        }
+        m
+    }
+
+    fn load_moe_mtp(
+        cfg: &Qwen35Config,
+        tensors: HashMap<String, Tensor>,
+    ) -> (Qwen35Model, Qwen35Mtp) {
+        let w = Weights::from_map(tensors, Device::Cpu);
+        assert!(
+            Qwen35Mtp::complete_in(&w, cfg),
+            "the MoE MTP head is complete"
+        );
+        let model = Qwen35Model::from_weights(&w, "model.language_model", cfg.clone()).unwrap();
+        let mtp = Qwen35Mtp::from_weights_with(&w, &model, None)
+            .expect("a MoE checkpoint's MTP head loads");
+        (model, mtp)
+    }
+
+    /// sc-24438 AC2 (a): a sparse-MoE checkpoint's MTP head loads — its predictor layer the body's
+    /// sparse-MoE block — and the fused (Qwen3.6) and per-expert (Qwen3.5) expert layouts of the
+    /// same seeded non-zero weights give identical target hidden states and identical MTP
+    /// logits / hidden state.
+    #[test]
+    fn a_moe_mtp_head_runs_identically_in_both_expert_layouts() {
+        let cfg = Qwen35Config::from_json(&cfg_json_moe_mtp()).unwrap();
+        let run = |fused: bool| {
+            let (model, mtp) = load_moe_mtp(&cfg, seeded_moe_mtp_tensors(&cfg, fused));
+            let Ffn::Moe(_) = &mtp.layers[0].ffn else {
+                panic!("the predictor layer is the sparse-MoE block");
+            };
+            let hidden = model
+                .hidden(&ids(&[1, 7, 3, 42]), &mut model.new_cache(), 0)
+                .unwrap();
+            let (logits, mtp_hidden) = mtp
+                .forward_sequence(&[7, 3, 42, 9], &hidden, 0, &mut mtp.new_cache())
+                .unwrap();
+            (host(&hidden), host(&mtp_hidden), host(&logits))
+        };
+        let (a, b) = (run(true), run(false));
+        assert!(
+            a.2.iter().any(|x| x.abs() > 1e-3),
+            "non-degenerate MTP logits"
+        );
+        assert_eq!(a.0, b.0, "target hidden");
+        assert_eq!(a.1, b.1, "MTP hidden");
+        assert_eq!(a.2, b.2, "MTP logits");
+    }
+
+    /// sc-24438 AC2 (b): the MTP predictor layer's FFN, built by the loader under the
+    /// `mtp.layers.0.` prefix from the `Qwen3_5MoeSparseMoeBlock.forward` oracle's weights (the
+    /// fused layout and the per-expert split of it), reproduces the oracle's output — the check
+    /// [`moe_ffn_matches_qwen3_5_moe_reference`] holds the block itself to.
+    #[test]
+    fn the_mtp_layer_ffn_matches_the_moe_reference() {
+        let json: Value =
+            serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
+        let arr = |k: &str| -> Vec<f32> {
+            json[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let (h, e, mi) = (8usize, 6usize, 4usize);
+        let mut v = cfg_json_moe_mtp();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("hidden_size".into(), json!(h));
+        tc.insert("moe_intermediate_size".into(), json!(mi));
+        tc.insert("shared_expert_intermediate_size".into(), json!(mi));
+        let cfg = Qwen35Config::from_json(&v).unwrap();
+        for fused in [true, false] {
+            let mut m = seeded_moe_mtp_tensors(&cfg, fused);
+            let lp = |s: &str| format!("mtp.layers.0.mlp.{s}");
+            let mut put = |key: String, data: &[f32], dims: &[usize]| {
+                let t = Tensor::from_vec(data.to_vec(), dims.to_vec(), &Device::Cpu).unwrap();
+                m.insert(key, t);
+            };
+            let (gate_up, down) = (arr("gate_up"), arr("down"));
+            if fused {
+                put(lp("experts.gate_up_proj"), &gate_up, &[e, 2 * mi, h]);
+                put(lp("experts.down_proj"), &down, &[e, h, mi]);
+            } else {
+                let rows = mi * h;
+                for x in 0..e {
+                    let gu = &gate_up[x * 2 * rows..(x + 1) * 2 * rows];
+                    let key = |p: &str| lp(&format!("experts.{x}.{p}_proj.weight"));
+                    put(key("gate"), &gu[..rows], &[mi, h]);
+                    put(key("up"), &gu[rows..], &[mi, h]);
+                    put(key("down"), &down[x * rows..(x + 1) * rows], &[h, mi]);
+                }
+            }
+            put(lp("gate.weight"), &arr("router"), &[e, h]);
+            put(
+                lp("shared_expert.gate_proj.weight"),
+                &arr("sh_gate"),
+                &[mi, h],
+            );
+            put(lp("shared_expert.up_proj.weight"), &arr("sh_up"), &[mi, h]);
+            put(
+                lp("shared_expert.down_proj.weight"),
+                &arr("sh_down"),
+                &[h, mi],
+            );
+            put(lp("shared_expert_gate.weight"), &arr("sh_gatew"), &[1, h]);
+            let (_, mtp) = load_moe_mtp(&cfg, m);
+            let x = Tensor::from_vec(arr("x"), (1, 1, h), &Device::Cpu).unwrap();
+            let got = host(&mtp.layers[0].ffn.forward(&x).unwrap());
+            let exp = arr("expected_output");
+            let md = got
+                .iter()
+                .zip(&exp)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                md < 2e-4,
+                "fused {fused}: MTP-layer ffn vs reference: max abs diff {md}\n got {got:?}\n \
+                 exp {exp:?}"
+            );
+        }
     }
 
     /// sc-24140 review: the qwen3_5 loader quantizes every MoE expert from a view narrowed out of
@@ -3276,15 +4432,21 @@ pub(crate) mod tests {
             let (Ffn::Moe(d), Ffn::Moe(q)) = (&d.ffn, &q.ffn) else {
                 panic!("an MoE layer")
             };
-            for (e, (de, qe)) in d.experts.iter().zip(&q.experts).enumerate() {
-                assert_eq!(qe.gate.kind(), crate::primitives::ProjectionKind::Ggml);
-                let hidden = de.gate.forward(&x).unwrap();
-                for (name, dp, qp, input) in [
-                    ("gate", &de.gate, &qe.gate, &x),
-                    ("up", &de.up, &qe.up, &x),
-                    ("down", &de.down, &qe.down, &hidden),
+            for e in 0..d.num_experts() {
+                assert_eq!(
+                    q.expert_kind(e, ExpertPart::Gate),
+                    crate::primitives::ProjectionKind::Ggml
+                );
+                let hidden = d.expert_projection(e, ExpertPart::Gate, &x).unwrap();
+                for (name, part, input) in [
+                    ("gate", ExpertPart::Gate, &x),
+                    ("up", ExpertPart::Up, &x),
+                    ("down", ExpertPart::Down, &hidden),
                 ] {
-                    let err = rel(&qp.forward(input).unwrap(), &dp.forward(input).unwrap());
+                    let err = rel(
+                        &q.expert_projection(e, part, input).unwrap(),
+                        &d.expert_projection(e, part, input).unwrap(),
+                    );
                     assert!(err < 0.02, "expert {e} {name}: relative error {err}");
                 }
                 experts += 1;
@@ -3358,7 +4520,6 @@ pub(crate) mod tests {
 
     /// The synthetic decoder's weights moved to `device` (bf16 on a GPU, f32 on CPU: what the
     /// loader would produce there).
-    #[cfg(feature = "cuda")]
     fn synthetic_weights_on(cfg: &Qwen35Config, device: &Device) -> Weights {
         let cpu = synthetic_weights(cfg);
         Weights::from_map(
@@ -3374,8 +4535,8 @@ pub(crate) mod tests {
         )
     }
 
-    /// [`text_model`] built on `device` (the CUDA-graph runner's tests).
-    #[cfg(feature = "cuda")]
+    /// [`text_model`] built on `device` (the CUDA-graph runner's tests; the CPU for the
+    /// device-positions parity).
     pub(crate) fn text_model_on(device: &Device) -> (Qwen35Config, Qwen35Model) {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -3387,10 +4548,28 @@ pub(crate) mod tests {
         (cfg, model)
     }
 
+    /// [`text_model_on`] computing in `dtype` (sc-24441: the CUDA prefix-parity check runs f32
+    /// and the production bf16).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn text_model_dtype_on(
+        device: &Device,
+        dtype: DType,
+    ) -> (Qwen35Config, Qwen35Model) {
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let model = Qwen35Model::from_weights_dtype(
+            &synthetic_weights_on(&cfg, device),
+            "model.language_model",
+            cfg.clone(),
+            None,
+            dtype,
+        )
+        .unwrap();
+        (cfg, model)
+    }
+
     /// The synthetic decoder with **every** layer a full-attention layer (interval 1: no
     /// Gated DeltaNet state), on `device` — the shape whose static cache holds nothing but
     /// stable-address KV buffers (story sc-24134).
-    #[cfg(feature = "cuda")]
     pub(crate) fn text_model_attention_only_on(device: &Device) -> (Qwen35Config, Qwen35Model) {
         let mut json = cfg_json();
         json["text_config"]["full_attention_interval"] = json!(1);
@@ -3402,6 +4581,407 @@ pub(crate) mod tests {
         )
         .unwrap();
         (cfg, model)
+    }
+
+    // ---- Prism/Bonsai companion MTP head fixtures (epic sc-24432, story sc-24444). ----
+
+    /// A uniform `[-0.4, 0.4)` draw — mlx-llm's `Synth::randn` — from `rng`.
+    fn uniform(rng: &mut crate::primitives::sampler::SplitMix64, n: usize) -> Vec<f32> {
+        use crate::primitives::sampler::TokenRng;
+        (0..n).map(|_| (rng.next_f32() - 0.5) * 0.8).collect()
+    }
+
+    /// The text geometry of the Prism fixture — mlx-llm's `prism_qwen35_config` (hidden 128, one
+    /// Gated DeltaNet and one attention layer, heads 2/1 × 64, MLP 256, vocab 64).
+    pub(crate) fn prism_text_config() -> Value {
+        json!({
+            "model_type": "qwen3_5_text", "hidden_size": 128, "num_hidden_layers": 2,
+            "intermediate_size": 256, "num_attention_heads": 2, "num_key_value_heads": 1,
+            "head_dim": 64, "vocab_size": 64, "rms_norm_eps": 1e-6, "rope_theta": 10000000.0,
+            "partial_rotary_factor": 0.5, "max_position_embeddings": 512,
+            "tie_word_embeddings": false, "full_attention_interval": 2,
+            "linear_num_value_heads": 2, "linear_num_key_heads": 1, "linear_key_head_dim": 64,
+            "linear_value_head_dim": 64, "linear_conv_kernel_dim": 4,
+            "mtp_num_hidden_layers": 0, "mtp_use_dedicated_embeddings": false
+        })
+    }
+
+    /// Write a frozen Prism MLX snapshot (schema-2 `config.json`, `hadamard.json`,
+    /// `model.safetensors` — no tokenizer) of [`prism_text_config`] with random packed codes and
+    /// signs from `seed`, the layout `PrismMlxCheckpoint::open` reads.
+    pub(crate) fn write_prism_snapshot(dir: &std::path::Path, seed: u64) {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        const BLOCK: usize = 128;
+        let mut rng = SplitMix64::new(seed);
+        let mut signs_by_width = std::collections::BTreeMap::new();
+        for width in [128usize, 256] {
+            let signs: Vec<i8> = (0..width)
+                .map(|_| if rng.next_u64() & 1 == 0 { -1 } else { 1 })
+                .collect();
+            signs_by_width.insert(width, signs);
+        }
+        // (module path, embedding, rows, input width, scale magnitude)
+        let packed: [(&str, bool, usize, usize, f32); 15] = [
+            ("lm_head", false, 64, 128, 0.25),
+            ("model.embed_tokens", true, 64, 128, 0.5),
+            (
+                "model.layers.0.linear_attn.in_proj_qkv",
+                false,
+                256,
+                128,
+                0.05,
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_z",
+                false,
+                128,
+                128,
+                0.05,
+            ),
+            ("model.layers.0.linear_attn.out_proj", false, 128, 128, 0.05),
+            ("model.layers.0.mlp.gate_proj", false, 256, 128, 0.05),
+            ("model.layers.0.mlp.up_proj", false, 256, 128, 0.05),
+            ("model.layers.0.mlp.down_proj", false, 128, 256, 0.05),
+            ("model.layers.1.self_attn.q_proj", false, 256, 128, 0.05),
+            ("model.layers.1.self_attn.k_proj", false, 64, 128, 0.05),
+            ("model.layers.1.self_attn.v_proj", false, 64, 128, 0.05),
+            ("model.layers.1.self_attn.o_proj", false, 128, 128, 0.05),
+            ("model.layers.1.mlp.gate_proj", false, 256, 128, 0.05),
+            ("model.layers.1.mlp.up_proj", false, 256, 128, 0.05),
+            ("model.layers.1.mlp.down_proj", false, 128, 256, 0.05),
+        ];
+        let cpu = Device::Cpu;
+        let mut tensors = HashMap::new();
+        let (mut forward, mut inverse) = (Vec::new(), Vec::new());
+        for (path, embedding, rows, width, magnitude) in packed {
+            let words: Vec<u32> = (0..rows * width / 16)
+                .map(|_| rng.next_u64() as u32)
+                .collect();
+            let scales: Vec<half::f16> = (0..rows * width / BLOCK)
+                .map(|_| half::f16::from_f32(magnitude * (0.5 + rng.next_f32())))
+                .collect();
+            let biases: Vec<half::f16> = scales.iter().map(|s| -*s).collect();
+            let signs: Vec<f32> = signs_by_width[&width].iter().map(|&s| s as f32).collect();
+            let base = format!("language_model.{path}");
+            let t = |v, shape: &[usize]| Tensor::from_vec(v, shape, &cpu).unwrap();
+            tensors.insert(format!("{base}.weight"), t(words, &[rows, width / 16]));
+            tensors.insert(
+                format!("{base}.scales"),
+                Tensor::from_vec(scales, (rows, width / BLOCK), &cpu).unwrap(),
+            );
+            tensors.insert(
+                format!("{base}.biases"),
+                Tensor::from_vec(biases, (rows, width / BLOCK), &cpu).unwrap(),
+            );
+            tensors.insert(format!("{base}.signs"), Tensor::new(signs, &cpu).unwrap());
+            match embedding {
+                true => inverse.push(format!("{base}.weight")),
+                false => forward.push(format!("{base}.weight")),
+            }
+        }
+        let mut rng = SplitMix64::new(seed ^ 0x5eed);
+        let p = "language_model.model";
+        let mut dense = |key: String, shape: &[usize], shift: f32| {
+            let n = shape.iter().product();
+            let values: Vec<f32> = uniform(&mut rng, n)
+                .into_iter()
+                .map(|v| v + shift)
+                .collect();
+            tensors.insert(key, Tensor::from_vec(values, shape, &cpu).unwrap());
+        };
+        // Direct-multiplier norms near one; small GDN decay/gate parameters.
+        for (key, width) in [
+            (format!("{p}.norm.weight"), 128),
+            (format!("{p}.layers.0.input_layernorm.weight"), 128),
+            (format!("{p}.layers.0.post_attention_layernorm.weight"), 128),
+            (format!("{p}.layers.1.input_layernorm.weight"), 128),
+            (format!("{p}.layers.1.post_attention_layernorm.weight"), 128),
+            (format!("{p}.layers.1.self_attn.q_norm.weight"), 64),
+            (format!("{p}.layers.1.self_attn.k_norm.weight"), 64),
+            (format!("{p}.layers.0.linear_attn.norm.weight"), 64),
+        ] {
+            dense(key, &[width], 1.0);
+        }
+        dense(
+            format!("{p}.layers.0.linear_attn.in_proj_a.weight"),
+            &[2, 128],
+            0.0,
+        );
+        dense(
+            format!("{p}.layers.0.linear_attn.in_proj_b.weight"),
+            &[2, 128],
+            0.0,
+        );
+        dense(
+            format!("{p}.layers.0.linear_attn.conv1d.weight"),
+            &[256, 1, 4],
+            0.0,
+        );
+        dense(format!("{p}.layers.0.linear_attn.A_log"), &[2], 0.0);
+        dense(format!("{p}.layers.0.linear_attn.dt_bias"), &[2], 0.0);
+        candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+
+        let modules: Vec<Value> = packed
+            .iter()
+            .map(|(path, embedding, ..)| {
+                json!({"path": path, "block": BLOCK, "embedding": embedding, "dtype": "float16"})
+            })
+            .collect();
+        let config = json!({
+            "model_type": "prism_hadamard_qwen35",
+            "text_config": prism_text_config(),
+            "schema_version": 2, "base_model_type": "qwen3_5",
+            "tensor_namespace": "mlx-vlm-qwen3_5", "requires_runtime": "runtime/artifact.py",
+            "hadamard_config": "hadamard.json", "gdn_activation_layout": "grouped",
+            "components": {"text": true, "vision": false, "mtp": false},
+            "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+            "modules": modules,
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let widths: Vec<usize> = signs_by_width.keys().copied().collect();
+        let values: Vec<f64> = signs_by_width
+            .values()
+            .flatten()
+            .map(|&s| f64::from(s))
+            .collect();
+        let hadamard = json!({
+            "prism.hadamard.version": 1,
+            "prism.hadamard.block_size": BLOCK,
+            "prism.hadamard.transform": "normalized-sylvester-walsh-hadamard",
+            "prism.hadamard.axis": "input-last-dimension",
+            "prism.hadamard.sign_mode": "explicit",
+            "prism.hadamard.weight_names": forward,
+            "prism.hadamard.inverse_weight_names": inverse,
+            "prism.hadamard.sign_widths": widths,
+            "prism.hadamard.sign_values": values,
+            "prism.hadamard.gdn_v_grouped": true,
+        });
+        std::fs::write(dir.join("hadamard.json"), hadamard.to_string()).unwrap();
+    }
+
+    /// Write a standalone companion MTP head (`model_type` `qwen3_5_mtp`, bare tensor names, MLX
+    /// affine Q4 group 64 with BF16 scales — the published `EigenLabs/Qwen3.8-27B-MTP-4bit`
+    /// layout; group 32 when an input width is not a multiple of 64) of `text_config`'s geometry
+    /// into `dir`, with random codes from `seed`. Every norm vector is zero-centred (the runtime
+    /// applies `1 + w`); `pre_fc_norm_embedding` is all `embedding_norm` when given.
+    pub(crate) fn write_companion_head(
+        dir: &std::path::Path,
+        text_config: &Value,
+        seed: u64,
+        embedding_norm: Option<f32>,
+    ) {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let mut text = text_config.clone();
+        text["mtp_num_hidden_layers"] = json!(1);
+        let geometry = Qwen35Config::from_json(&text)
+            .unwrap()
+            .companion_mtp_geometry();
+        let group = match geometry.matrices().iter().all(|(_, [_, c])| c % 64 == 0) {
+            true => 64,
+            false => 32,
+        };
+        let quantization = json!({"bits": 4, "group_size": group, "mode": "affine"});
+        let config = json!({
+            "model_type": "qwen3_5_mtp",
+            "block_size": 3,
+            "quantization": quantization,
+            "quantization_config": quantization,
+            "text_config": text,
+            "tie_word_embeddings": false,
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let mut rng = SplitMix64::new(seed);
+        let cpu = Device::Cpu;
+        let mut tensors = HashMap::new();
+        for (name, [rows, cols]) in geometry.matrices() {
+            let words: Vec<u32> = (0..rows * cols / 8)
+                .map(|_| rng.next_u64() as u32)
+                .collect();
+            // Codes 0..15 around zero: scale · code − 7.5 · scale.
+            let scales: Vec<f32> = (0..rows * cols / group)
+                .map(|_| 0.02 * (0.5 + rng.next_f32()))
+                .collect();
+            let biases: Vec<f32> = scales.iter().map(|s| -7.5 * s).collect();
+            let bf16 = |v: Vec<f32>| {
+                Tensor::from_vec(v, (rows, cols / group), &cpu)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+            };
+            tensors.insert(
+                format!("{name}.weight"),
+                Tensor::from_vec(words, (rows, cols / 8), &cpu).unwrap(),
+            );
+            tensors.insert(format!("{name}.scales"), bf16(scales));
+            tensors.insert(format!("{name}.biases"), bf16(biases));
+        }
+        for (name, width) in geometry.norms() {
+            let values = match (name, embedding_norm) {
+                ("pre_fc_norm_embedding", Some(v)) => vec![v; width],
+                _ => uniform(&mut rng, width)
+                    .into_iter()
+                    .map(|v| v * 0.25)
+                    .collect(),
+            };
+            tensors.insert(
+                format!("{name}.weight"),
+                Tensor::from_vec(values, width, &cpu)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap(),
+            );
+        }
+        candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+    }
+
+    /// The Prism fixture loaded as a target model on the CPU.
+    fn prism_target(seed: u64) -> (tempfile::TempDir, Qwen35Model) {
+        let dir = tempfile::tempdir().unwrap();
+        write_prism_snapshot(dir.path(), seed);
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        let ck =
+            crate::prism_checkpoint::PrismMlxCheckpoint::open(dir.path(), &Device::Cpu, &config)
+                .unwrap();
+        let model = Qwen35Model::from_prism_weights(
+            &ck.weights,
+            "language_model.model",
+            Qwen35Config::from_json(&config).unwrap(),
+            &ck.registry,
+            DType::F32,
+        )
+        .unwrap();
+        (dir, model)
+    }
+
+    /// Story sc-24444: a companion head's RMSNorm vectors follow the zero-centred Qwen3.8
+    /// checkpoint convention (`1 + w`) whatever the target's own convention — a Prism target's
+    /// norms are direct multipliers, the head's are not (the published Qwen3.8 heads'
+    /// `pre_fc_norm_embedding` values are all negative, mean ≈ −0.46).
+    #[test]
+    fn a_companion_heads_norms_are_applied_as_one_plus_w() {
+        let (_target_dir, target) = prism_target(11);
+        let head = tempfile::tempdir().unwrap();
+        write_companion_head(head.path(), &prism_text_config(), 3, Some(-0.5));
+        let predictor = Qwen35Mtp::from_companion_dir(head.path(), &target).unwrap();
+        let applied = predictor
+            .pre_fc_norm_embedding
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(applied, vec![0.5f32; 128]);
+    }
+
+    /// Story sc-24444 E2/E8: the Candle companion head is refused by the same shared geometry
+    /// check as mlx-llm's — each field the predictor computes with but no tensor shape reveals
+    /// named on its own (`vocab_size` is the only guard against a head for another tokenizer) —
+    /// and a stored tensor that disagrees, an unused tensor and a head for another model type are
+    /// each named refusals.
+    #[test]
+    fn a_mismatched_companion_head_is_refused_by_name() {
+        let (_target_dir, target) = prism_target(11);
+        let text = prism_text_config();
+        let refusal = |edit: &dyn Fn(&mut Value)| {
+            let head = tempfile::tempdir().unwrap();
+            let mut other = text.clone();
+            edit(&mut other);
+            write_companion_head(head.path(), &other, 3, None);
+            match Qwen35Mtp::from_companion_dir(head.path(), &target) {
+                Ok(_) => panic!("a mismatched head attached"),
+                Err(e) => e.to_string(),
+            }
+        };
+        for (field, value, named) in [
+            (
+                "intermediate_size",
+                json!(128),
+                "intermediate_size 128 != target 256",
+            ),
+            (
+                "num_key_value_heads",
+                json!(2),
+                "num_key_value_heads 2 != target 1",
+            ),
+            ("vocab_size", json!(65), "vocab_size 65 != target 64"),
+            (
+                "partial_rotary_factor",
+                json!(0.25),
+                "rotary_dim 16 != target 32",
+            ),
+            (
+                "rope_theta",
+                json!(1000000.0),
+                "rope_theta 1000000 != target 10000000",
+            ),
+            (
+                "rms_norm_eps",
+                json!(1e-5),
+                "rms_norm_eps 0.00001 != target 0.000001",
+            ),
+        ] {
+            let err = refusal(&|t| t[field] = value.clone());
+            assert!(err.contains("geometry does not match"), "{field}: {err}");
+            assert!(err.contains(named), "{field}: {err}");
+        }
+
+        // The config matches but a stored tensor does not: overwrite `q_proj` with half its rows.
+        let head = tempfile::tempdir().unwrap();
+        write_companion_head(head.path(), &text, 3, None);
+        let path = head.path().join("model.safetensors");
+        let mut tensors = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        for part in ["weight", "scales", "biases"] {
+            let key = format!("layers.0.self_attn.q_proj.{part}");
+            let half = tensors[&key]
+                .narrow(0, 0, 128)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            tensors.insert(key, half);
+        }
+        tensors.insert(
+            "extra.weight".into(),
+            Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+        let err = Qwen35Mtp::from_companion_dir(head.path(), &target)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("`layers.0.self_attn.q_proj` is [128, 128], the target needs [256, 128]"),
+            "{err}"
+        );
+        // Shapes fixed, the stray tensor alone is named.
+        write_companion_head(head.path(), &text, 3, None);
+        let mut tensors = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        tensors.insert(
+            "extra.weight".into(),
+            Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+        let err = Qwen35Mtp::from_companion_dir(head.path(), &target)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("tensors the predictor does not use: extra.weight"),
+            "{err}"
+        );
+
+        let head = tempfile::tempdir().unwrap();
+        write_companion_head(head.path(), &text, 3, None);
+        let config_path = head.path().join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["model_type"] = json!("qwen3_5");
+        std::fs::write(&config_path, config.to_string()).unwrap();
+        let err = Qwen35Mtp::from_companion_dir(head.path(), &target)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("must be `qwen3_5_mtp`"), "{err}");
     }
 
     /// The synthetic decoder's config JSON (4 layers: 3 linear, 1 full attention).
@@ -3918,6 +5498,70 @@ pub(crate) mod tests {
         }
     }
 
+    /// sc-24446 (defect A) on the model: a prompt prefill takes no per-token Gated DeltaNet step
+    /// and writes one ring slot per linear layer whatever the request's draft depth, so its
+    /// logits are bit-identical for every depth; a verify step after it still rolls back to its
+    /// start (the prefill's state, bit for bit) and to each of its positions.
+    #[test]
+    fn a_prompt_prefill_rings_only_its_final_state_at_every_draft_depth() {
+        use crate::primitives::gated_delta::counters;
+        let (_cfg, model) = text_model();
+        let linear = model
+            .new_cache()
+            .layers
+            .iter()
+            .filter(|l| matches!(l, Qwen35LayerCache::Delta(_)))
+            .count();
+        let prompt: Vec<i32> = (0..100).map(|i| (i * 7 % 49) + 1).collect();
+        let p = prompt.len() as i32;
+        let states = |cache: &Qwen35Cache| -> Vec<(Vec<f32>, Vec<f32>)> {
+            cache
+                .layers
+                .iter()
+                .filter_map(|l| match l {
+                    Qwen35LayerCache::Delta(c) => {
+                        Some((host(c.conv_state().unwrap()), host(c.ssm_state().unwrap())))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut logits = Vec::new();
+        for k in [0usize, 2, 6] {
+            let mut cache = model.new_cache_for(prompt.len() + 8, k).unwrap();
+            let (out, steps, writes) = counters::counting(|| {
+                model
+                    .forward_step(&mut cache, StepRequest::last(&prompt).as_prefill())
+                    .unwrap()
+            });
+            assert_eq!(
+                (steps, writes),
+                (0, linear),
+                "K={k}: one write per linear layer"
+            );
+            assert!(cache.checkpoint_offsets().is_empty(), "K={k}");
+            logits.push(host(&out.logits));
+            let at_prompt = states(&cache);
+            let verify: Vec<i32> = (0..=k as i32).map(|i| i + 3).collect();
+            model
+                .forward_step(&mut cache, StepRequest::all(&verify))
+                .unwrap();
+            assert_eq!(
+                cache.checkpoint_offsets(),
+                (p..p + k as i32 + 1).collect::<Vec<_>>(),
+                "K={k}: the step start and every verify position are restorable"
+            );
+            for j in (0..=k as i32 + 1).rev() {
+                cache.rollback_to(p + j).unwrap();
+            }
+            assert_eq!(states(&cache), at_prompt, "K={k}: back at the step start");
+        }
+        assert!(
+            logits.windows(2).all(|w| w[0] == w[1]),
+            "bit-identical logits"
+        );
+    }
+
     /// **AC1 (tiny config).** After one verify forward of `K + 1` tokens, rolling back to any
     /// `j in 0..=K + 1` positions into it leaves every linear layer's conv and SSM state equal to
     /// a fresh decode of that many tokens (max abs error `<= 1e-6`; exact on CPU), for every
@@ -3966,6 +5610,8 @@ pub(crate) mod tests {
                         tokens: crate::decode::StepTokens::Host(&verify),
                         scope: LogitsScope::All,
                         want_hidden: false,
+                        prefill: false,
+                        snapshot_at: None,
                     },
                 )
                 .unwrap();
@@ -4538,18 +6184,118 @@ pub(crate) mod tests {
         assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
     }
 
-    /// sc-24134 after sc-24131: the cache's CUDA-graph declaration. A linear layer that keeps the
-    /// per-token checkpoint ring holds its state at stable addresses, so the engine's static cache
-    /// passes — before and after a forward — and the model's own `positions_host_scalar` is what
-    /// refuses it; a ring-less linear layer still replaces its state per step
-    /// (`deltanet_state_unstable`, including once a ring is dropped), and a growing attention
-    /// cache is `growing_kv`.
+    /// sc-24441: a request's record names the attention its cached steps ran — the length-aware
+    /// decode attention whenever the model's device positions are active (the static cache that
+    /// stages them, and an un-expanded growing cache alike), `gqa` / `expanded` otherwise.
+    #[test]
+    fn records_report_the_decode_attention_when_device_positions_run_it() {
+        use crate::decode::{generate_step, CancelFlag, GenerationConfig};
+        let (_cfg, mut model) = text_model();
+        let config = GenerationConfig {
+            max_new_tokens: 6,
+            seed: Some(5),
+            ..Default::default()
+        };
+        let attention = |model: &Qwen35Model| {
+            let (_, record) = generate_step(
+                model,
+                &[1, 7, 3, 42, 9],
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            record.report(false).attention
+        };
+        assert!(!model.device_positions(), "off on the CPU by default");
+        assert_eq!(attention(&model), "gqa");
+        model.set_device_positions(true);
+        assert_eq!(attention(&model), "decode_attention");
+        model.set_step_kv_cache(KvCacheKind::Growing);
+        assert_eq!(attention(&model), "decode_attention");
+        model.set_attn_formulation(AttnFormulation::Expanded);
+        assert_eq!(
+            attention(&model),
+            "expanded",
+            "the expanded selector keeps sdpa"
+        );
+    }
+
+    /// sc-24441: a cache's graph identity follows the device buffers a captured step touches,
+    /// not only its host address — stable across steps, but a fresh cache moved into the same
+    /// place (fresh static K/V; fresh device positions) reads as a different identity, so the
+    /// runner never replays a graph into freed buffers. The attention-only decoder has no
+    /// checkpoint ring, so the K/V and position buffers are all that can move the identity.
+    #[test]
+    fn graph_identity_follows_the_kv_and_position_buffers() {
+        let (_cfg, mut model) = text_model_attention_only_on(&Device::Cpu);
+        let mut cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        assert!(cache.device_positions().is_none());
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        let identity = DecodeCache::graph_identity(&cache);
+        model
+            .forward_step(&mut cache, StepRequest::last(&[5]))
+            .unwrap();
+        assert_eq!(identity, DecodeCache::graph_identity(&cache), "stable");
+        // A fresh cache in the same place: only its static K/V buffers differ.
+        cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        let fresh = DecodeCache::graph_identity(&cache);
+        assert_ne!(identity, fresh, "fresh K/V buffers");
+
+        model.set_device_positions(true);
+        let mut cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        let identity = DecodeCache::graph_identity(&cache);
+        // The same K/V buffers with fresh position buffers.
+        cache.positions = Some(DevicePositions::new(&Device::Cpu).unwrap());
+        assert_ne!(
+            identity,
+            DecodeCache::graph_identity(&cache),
+            "fresh position buffers"
+        );
+
+        // A prefix restore (sc-24437): a fresh cache seeded with the live cache's prefix and
+        // moved into its place holds the same positions in different buffers.
+        let mut cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        let identity = DecodeCache::graph_identity(&cache);
+        let state = cache.prefix_snapshot().unwrap();
+        let mut restored = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        restored.restore_prefix(&state).unwrap();
+        cache = restored;
+        assert_eq!(cache.len(), 3);
+        assert_ne!(
+            identity,
+            DecodeCache::graph_identity(&cache),
+            "a restored cache in its place"
+        );
+    }
+
+    /// sc-24134 after sc-24131 and sc-24441: the CUDA-graph declarations. A linear layer that
+    /// keeps the per-token checkpoint ring holds its state at stable addresses; with device
+    /// positions (off by default on the CPU) the static cache and the model pass — before and
+    /// after a forward — and without them both say `positions_host_scalar`. A ring-less linear
+    /// layer still replaces its state per step (`deltanet_state_unstable`, including once a ring
+    /// is dropped), and a growing attention cache is `growing_kv`.
     #[test]
     fn graph_support_accepts_the_ringed_static_cache_and_names_the_rest() {
-        let (_cfg, model) = text_model();
+        let (_cfg, mut model) = text_model();
+        assert!(!model.device_positions(), "off on the CPU by default");
         assert_eq!(model.graph_support(), Err("positions_host_scalar"));
+        let host_positions = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        assert_eq!(
+            DecodeCache::graph_support(&host_positions),
+            Err("positions_host_scalar")
+        );
+        model.set_device_positions(true);
+        assert_eq!(model.graph_support(), Ok(()));
 
         let mut ringed = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        assert!(ringed.device_positions().is_some());
         assert_eq!(DecodeCache::graph_support(&ringed), Ok(()));
         model
             .forward_step(&mut ringed, StepRequest::last(&[1, 7, 3]))
@@ -4558,6 +6304,14 @@ pub(crate) mod tests {
             .forward_step(&mut ringed, StepRequest::last(&[5]))
             .unwrap();
         assert_eq!(DecodeCache::graph_support(&ringed), Ok(()));
+        // A deeper retention reallocates the rings a captured graph writes: the identity moves,
+        // so the runner drops its graphs.
+        let identity = DecodeCache::graph_identity(&ringed);
+        assert_eq!(identity, DecodeCache::graph_identity(&ringed), "stable");
+        ringed
+            .set_max_checkpoints(STEP_MAX_CHECKPOINTS + 2)
+            .unwrap();
+        assert_ne!(identity, DecodeCache::graph_identity(&ringed));
         ringed.set_max_checkpoints(0).unwrap();
         assert_eq!(
             DecodeCache::graph_support(&ringed),
@@ -4573,6 +6327,171 @@ pub(crate) mod tests {
         );
         let growing = model.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS);
         assert_eq!(DecodeCache::graph_support(&growing), Err("growing_kv"));
+    }
+
+    fn assert_rows_close(what: &str, a: &Tensor, b: &Tensor) {
+        assert_eq!(a.dims(), b.dims(), "{what}: shape");
+        let (a, b) = (host(a), host(b));
+        let scale = b.iter().fold(1f32, |m, x| m.max(x.abs()));
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                (x - y).abs() <= 1e-4 * scale,
+                "{what}: [{i}] device positions {x} vs host {y}"
+            );
+        }
+    }
+
+    /// sc-24441 AC (CPU half): the device-positions step path — RoPE from device positions, the
+    /// full-attention K/V written at a device index and attended by the length-aware decode
+    /// attention, the DeltaNet ring read and written through device slot indices — agrees with
+    /// the host path to f32 rounding through a prefill, decodes, a 4-token verify with hidden
+    /// states, a rollback into it (a ring-slot selection) and decodes past it, on the hybrid and
+    /// the attention-only configs; greedy tokens through the step driver and the speculative
+    /// engine are identical; and the cache's host bookkeeping (lengths, restorable positions) is
+    /// the same on both paths.
+    #[test]
+    fn device_positions_steps_match_the_host_path() {
+        use crate::decode::{
+            generate_speculative, generate_step, CancelFlag, GenerationConfig, NgramProposer,
+            SpeculativePrompt,
+        };
+        let device = Device::Cpu;
+        for (what, build) in [
+            (
+                "hybrid",
+                text_model_on as fn(&Device) -> (Qwen35Config, Qwen35Model),
+            ),
+            ("attention-only", text_model_attention_only_on),
+        ] {
+            let (_, host_model) = build(&device);
+            let (_, mut dev_model) = build(&device);
+            dev_model.set_device_positions(true);
+            let mut hc = host_model.new_cache_for(40, 3).unwrap();
+            let mut dc = dev_model.new_cache_for(40, 3).unwrap();
+            assert!(hc.device_positions().is_none() && dc.device_positions().is_some());
+            // The growing reference cache of the device-positions model: one arithmetic with its
+            // static path, bit for bit.
+            let mut gc = dev_model.new_cache_with_checkpoints(3);
+            let steps: [(&[i32], bool); 6] = [
+                (&[1, 7, 3, 42, 9, 1, 7], false),
+                (&[3], false),
+                (&[5], false),
+                (&[4, 5, 6, 7], true),
+                (&[8], false),
+                (&[2], false),
+            ];
+            for (n, (tokens, all)) in steps.iter().enumerate() {
+                let req = if *all {
+                    StepRequest::all(tokens).with_hidden(true)
+                } else {
+                    StepRequest::last(tokens)
+                };
+                let h = host_model.forward_step(&mut hc, req).unwrap();
+                let d = dev_model.forward_step(&mut dc, req).unwrap();
+                let g = dev_model.forward_step(&mut gc, req).unwrap();
+                assert_rows_close(&format!("{what} step {n}"), &d.logits, &h.logits);
+                assert_eq!(host(&g.logits), host(&d.logits), "{what} step {n}: growing");
+                if let (Some(dh), Some(hh)) = (&d.hidden, &h.hidden) {
+                    assert_rows_close(&format!("{what} step {n} hidden"), dh, hh);
+                }
+                assert_eq!(hc.offset(), dc.offset());
+                assert_eq!(hc.checkpoint_offsets(), dc.checkpoint_offsets());
+                if *all {
+                    let back = hc.offset() - 2;
+                    hc.rollback_to(back).unwrap();
+                    dc.rollback_to(back).unwrap();
+                    gc.rollback_to(back).unwrap();
+                }
+            }
+            let mut config = GenerationConfig {
+                max_new_tokens: 12,
+                seed: Some(0),
+                stop_tokens: Vec::new(),
+                ..Default::default()
+            };
+            config.sampling.temperature = 0.0;
+            let prompt = [1i32, 7, 3, 42, 9, 1, 7, 3];
+            let step = |m: &Qwen35Model| {
+                generate_step(m, &prompt, &config, &CancelFlag::new(), &mut |_| {}, None)
+                    .unwrap()
+                    .0
+                    .tokens
+            };
+            let greedy = step(&host_model);
+            assert_eq!(step(&dev_model), greedy, "{what}: step driver");
+            let spec = |m: &Qwen35Model| {
+                generate_speculative(
+                    m,
+                    &mut NgramProposer { max_ngram: 3 },
+                    SpeculativePrompt::Tokens(&prompt),
+                    &config,
+                    3,
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                    None,
+                )
+                .unwrap()
+                .output
+                .tokens
+            };
+            assert_eq!(spec(&dev_model), spec(&host_model), "{what}: speculative");
+            assert_eq!(spec(&dev_model), greedy, "{what}: greedy-exact");
+        }
+    }
+
+    /// sc-24441: a replayed step's host side ([`DecodeCache::replay_advance`]) leaves the cache
+    /// exactly where the forward it stands for does — lengths, the restorable window and the live
+    /// ring views — and refuses where a replay could not be correct (no device positions, or no
+    /// live state to read at position zero).
+    #[test]
+    fn replay_advance_does_the_forwards_bookkeeping() {
+        let (_, mut model) = text_model();
+        model.set_device_positions(true);
+        let mut forward = model.new_cache_for(32, 3).unwrap();
+        let mut replayed = model.new_cache_for(32, 3).unwrap();
+        assert!(
+            DecodeCache::replay_advance(&mut replayed, 1).is_err(),
+            "nothing to replay from at position zero"
+        );
+        for c in [&mut forward, &mut replayed] {
+            model
+                .forward_step(c, StepRequest::last(&[1, 7, 3, 42]))
+                .unwrap();
+        }
+        for n in [1usize, 4, 1] {
+            let tokens = vec![5i32; n];
+            model
+                .forward_step(&mut forward, StepRequest::all(&tokens))
+                .unwrap();
+            DecodeCache::stage_positions(&mut replayed).unwrap();
+            DecodeCache::replay_advance(&mut replayed, n).unwrap();
+            assert_eq!(forward.offset(), replayed.offset());
+            assert_eq!(forward.checkpoint_offsets(), replayed.checkpoint_offsets());
+            let views = |c: &Qwen35Cache| -> Vec<usize> {
+                c.recurrent_states()
+                    .iter()
+                    .flat_map(|(conv, ssm)| {
+                        [conv.unwrap(), ssm.unwrap()]
+                            .map(|t| crate::primitives::storage_address(t).unwrap())
+                    })
+                    .collect()
+            };
+            let rings = |c: &Qwen35Cache| c.recurrent_ring_addresses().unwrap();
+            // The live views sit at the same slot offsets of each cache's own ring.
+            let offsets = |c: &Qwen35Cache| -> Vec<usize> {
+                let base: Vec<usize> = rings(c).iter().flat_map(|(a, b)| [*a, *b]).collect();
+                views(c).iter().zip(&base).map(|(v, b)| v - b).collect()
+            };
+            assert_eq!(offsets(&forward), offsets(&replayed));
+        }
+        let mut host = {
+            model.set_device_positions(false);
+            model.new_cache_for(32, 3).unwrap()
+        };
+        model
+            .forward_step(&mut host, StepRequest::last(&[1, 7]))
+            .unwrap();
+        assert!(DecodeCache::replay_advance(&mut host, 1).is_err());
     }
 
     /// **E6.** The static cache is bounded by the request and the model: a capacity of zero is a
