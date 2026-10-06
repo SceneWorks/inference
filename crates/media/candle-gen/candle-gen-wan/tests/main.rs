@@ -26,6 +26,9 @@ mod trainer_conformance;
 #[path = "trainer_e2e.rs"]
 mod trainer_e2e;
 
+#[path = "trainer_weights_free.rs"]
+mod trainer_weights_free;
+
 #[path = "training_modes_cuda.rs"]
 mod training_modes_cuda;
 

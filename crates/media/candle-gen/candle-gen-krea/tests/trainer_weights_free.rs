@@ -1,0 +1,169 @@
+//! Weights-free gen-core **Trainer contract** conformance for the candle Krea trainers — the
+//! `krea_2_raw` LoRA trainer and the `krea_2_control` ControlNet-branch trainer (epic 2123 AT1) —
+//! runs on every CPU lane.
+//!
+//! Both are loaded through the crate's registered `load_trainer` (the production path), which is
+//! lazy: it only records the snapshot directory. `validate` and the `train` refusal floors run before
+//! any weight is read, so an empty per-process snapshot dir drives the testkit checks. Both also pin
+//! that `train`, called directly, runs every `validate` floor (epic 2123 E3).
+
+use std::path::Path;
+
+use candle_gen::gen_core::{
+    Error, LoadSpec, Trainer, TrainingItem, TrainingRequest, WeightsSource,
+};
+use gen_core_testkit::TrainerProfile;
+
+/// Two small swatch PNGs + captions in `dir`.
+fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
+    std::fs::create_dir_all(dir).unwrap();
+    [[200u8, 40, 40], [40, 80, 200]]
+        .iter()
+        .enumerate()
+        .map(|(i, color)| {
+            let path = dir.join(format!("img{i}.png"));
+            image::RgbImage::from_pixel(32, 32, image::Rgb(*color))
+                .save(&path)
+                .unwrap();
+            TrainingItem::captioned(path, format!("a solid colour swatch number {i}"))
+        })
+        .collect()
+}
+
+/// A per-process temp root (CI shares `$TMPDIR` across processes).
+fn temp_root(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("{tag}_trainer_wf_{}_", std::process::id()))
+        .tempdir()
+        .unwrap()
+}
+
+/// The control trainer's id (its constant is crate-private).
+const KREA_2_CONTROL_ID: &str = "krea_2_control";
+
+fn load_trainer(id: &str, snapshot: &Path) -> Box<dyn Trainer> {
+    candle_gen_krea::provider_registry()
+        .unwrap()
+        .load_trainer(
+            id,
+            &LoadSpec::new(WeightsSource::Dir(snapshot.to_path_buf())),
+        )
+        .unwrap_or_else(|e| panic!("load the {id} trainer: {e}"))
+}
+
+#[test]
+fn krea_trainer_validates_and_refuses_without_weights() {
+    let tmp = temp_root("krea");
+    let snapshot = tmp.path().join("snapshot");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    let profile = TrainerProfile::cheap(
+        make_dataset(&tmp.path().join("data")),
+        tmp.path().join("out"),
+    );
+    let id = candle_gen_krea::KREA_2_RAW_ID;
+    gen_core_testkit::check_trainer_validate(load_trainer(id, &snapshot).as_ref(), &profile)
+        .unwrap();
+    gen_core_testkit::check_trainer_technique_refusal(&|| load_trainer(id, &snapshot), &profile)
+        .unwrap();
+    check_train_runs_validate_floors(&|| load_trainer(id, &snapshot), &profile);
+}
+
+/// The profile's request as-is (the control profile carries the control fields).
+fn control_request(profile: &TrainerProfile) -> TrainingRequest {
+    TrainingRequest {
+        items: profile.items.clone(),
+        config: profile.config.clone(),
+        output_dir: profile.output_dir.clone(),
+        file_name: profile.file_name.clone(),
+        trigger_words: Vec::new(),
+        cancel: Default::default(),
+    }
+}
+
+/// The control trainer trains a ControlNet branch: every item carries a control image and the
+/// request names its `control_type`. `check_trainer_validate` is not run here: its network-type
+/// probe (the accepted request uses LoKr when LoRA is not advertised, then requires a LoKr request
+/// to be refused when LoKr is not advertised) cannot pass for a trainer advertising neither.
+#[test]
+fn krea_control_trainer_refuses_without_weights() {
+    let tmp = temp_root("krea_control");
+    let snapshot = tmp.path().join("snapshot");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    let mut items = make_dataset(&tmp.path().join("data"));
+    for item in &mut items {
+        item.control_image_path = Some(item.image_path.clone());
+    }
+    let mut profile = TrainerProfile::cheap(items, tmp.path().join("out"));
+    profile.config.control_type = Some("pose".to_owned());
+    let make = || load_trainer(KREA_2_CONTROL_ID, &snapshot);
+    make()
+        .validate(&control_request(&profile))
+        .expect("the control profile is a valid control-training request");
+    // Stand-in for check_trainer_validate's technique half: every technique this trainer leaves
+    // undeclared is a typed refusal from `validate` too.
+    let desc = *make().descriptor();
+    assert!(!desc.techniques.weight_noise && !desc.techniques.gradient_noise);
+    for (knob, enable) in [
+        (
+            "weight_noise_sigma",
+            (|r: &mut TrainingRequest| r.config.weight_noise_sigma = 0.0125)
+                as fn(&mut TrainingRequest),
+        ),
+        ("gradient_noise_eta", |r: &mut TrainingRequest| {
+            r.config.gradient_noise_eta = 0.01
+        }),
+    ] {
+        let mut req = control_request(&profile);
+        enable(&mut req);
+        assert!(
+            matches!(make().validate(&req), Err(Error::Unsupported(_))),
+            "{knob}: validate() must refuse an undeclared technique with a typed Unsupported"
+        );
+    }
+    gen_core_testkit::check_trainer_technique_refusal(&make, &profile).unwrap();
+    check_train_runs_validate_floors(&make, &profile);
+}
+
+/// Epic 2123 E3: `train` called directly (skipping `validate`) refuses a request that only a
+/// non-technique `validate` floor catches — full fine-tune / control branch when not advertised, instruction edit — with a typed `Unsupported` before any
+/// progress event, so nothing is loaded or cached.
+fn check_train_runs_validate_floors(make: &dyn Fn() -> Box<dyn Trainer>, profile: &TrainerProfile) {
+    let base = TrainingRequest {
+        items: profile.items.clone(),
+        config: profile.config.clone(),
+        output_dir: profile.output_dir.clone(),
+        file_name: profile.file_name.clone(),
+        trigger_words: Vec::new(),
+        cancel: Default::default(),
+    };
+    let desc = *make().descriptor();
+    let mut probes = Vec::new();
+    if !desc.supports_full_finetune {
+        let mut full = base.clone();
+        full.config.full_finetune = true;
+        probes.push(("full_finetune", full));
+    }
+    if !desc.supports_control {
+        let mut control = base.clone();
+        control.config.control_type = Some("pose".to_owned());
+        probes.push(("control_type", control));
+    }
+    let mut edit = base;
+    for item in &mut edit.items {
+        item.reference_image_paths = vec![item.image_path.clone()];
+    }
+    probes.push(("edit", edit));
+    for (floor, req) in probes {
+        let mut events = 0;
+        let result = make().train(&req, &mut |_| events += 1);
+        assert!(
+            matches!(result, Err(Error::Unsupported(_))),
+            "{floor}: train() must refuse with a typed Unsupported, got {:?}",
+            result.err()
+        );
+        assert_eq!(
+            events, 0,
+            "{floor}: train() emitted progress before refusing"
+        );
+    }
+}
