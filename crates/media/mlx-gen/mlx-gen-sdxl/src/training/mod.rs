@@ -961,8 +961,8 @@ mod depth_anchoring_tests {
     use family::test_support::{tiny_unet, TINY_CONTEXT_DIM, TINY_POOLED_DIM};
     use family::{
         aux_driver, compute_step_loss_grads, load_perceptual_path, perceptual_footprint_gb,
-        preflight_memory_guard_with_budget, resolve_target_paths, run_train_step, AuxStep,
-        CachedSample, StepLosses,
+        preflight_memory_guard_with_budget, resolve_target_paths, run_train_step, trained_timestep,
+        AuxStep, CachedSample, StepLosses,
     };
     use mlx_gen::gen_core::BucketSchedule;
     use mlx_gen::train::lora::{build_lora_targets, LoraParams, TrainAdapter};
@@ -1073,7 +1073,15 @@ mod depth_anchoring_tests {
     }
 
     fn prepared(cache: &[CachedSample], accum: u32) -> AuxDriver {
-        aux_driver(path(), cache, &single_bucket(cache.len()), accum, 0).unwrap()
+        aux_driver(
+            path(),
+            cache,
+            &single_bucket(cache.len()),
+            accum,
+            0,
+            &Default::default(),
+        )
+        .unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1220,6 +1228,44 @@ mod depth_anchoring_tests {
         }
     }
 
+    /// Epic 2123 E8 (the Candle `a_reverted_aux_step_trains_at_the_remapped_level` twin): a step the
+    /// alternation claims for a loss that skips the image is reverted to diffusion by
+    /// `StepPlan::without_skipped` — and still trains at the plan's remapped timestep, never the raw
+    /// sampled one; an unclaimed diffusion step keeps the sampled timestep exactly. Mutation: remap
+    /// only `if !plan.diffusion` (the pre-fix code) ⇒ the reverted step trains at the raw `t` ⇒ red.
+    #[test]
+    fn a_reverted_aux_step_trains_at_the_remapped_level() {
+        use mlx_gen::gen_core::train::plan_step;
+        let h = hooks();
+        let window = AuxLossSchedule {
+            weight: 0.5,
+            t_min: 0.6,
+            t_max: 0.9,
+            every_n: 2,
+        };
+        let raw = h.timestep_at(0.1);
+        let reverted = plan_step(&[window], 2, h.noise_level(raw)).without_skipped(|_| true);
+        assert!(
+            reverted.diffusion && reverted.aux.is_empty(),
+            "{reverted:?}"
+        );
+        let t = trained_timestep(&h, raw, &reverted);
+        assert_eq!(
+            t.unet_time(),
+            h.timestep_at(reverted.noise_level).unet_time()
+        );
+        assert_ne!(
+            t.unet_time(),
+            raw.unet_time(),
+            "the remapped level, not the sampled one"
+        );
+        let diffusion = plan_step(&[window], 1, h.noise_level(raw));
+        assert_eq!(
+            trained_timestep(&h, raw, &diffusion).unet_time(),
+            raw.unet_time()
+        );
+    }
+
     /// The aux step trains at the remapped timestep (window `[0.6, 0.8]` ⇒ index ∈ [600, 800]),
     /// with that timestep's `ᾱ` — the step equals a direct `compute_step_loss_grads` at
     /// `timestep_at(plan.noise_level)`. Mutation: keep the sampled `t` on an aux step ⇒ red.
@@ -1236,8 +1282,15 @@ mod depth_anchoring_tests {
         cfg.depth_anchoring.schedule = window;
         let (adapter, params) = adapter(&mut unet, &cfg);
         let cache = cache_n(1);
-        let mut d =
-            aux_driver(path_with(window), &cache, &single_bucket(cache.len()), 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(window),
+            &cache,
+            &single_bucket(cache.len()),
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let mut l = None;
         for n in 1..=2 {
             l = Some(step(
@@ -1397,7 +1450,7 @@ mod depth_anchoring_tests {
             ],
             7,
         );
-        let mut d = aux_driver(path(), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(path(), &cache, &schedule, 1, 0, &Default::default()).unwrap();
         let steps = 2 * schedule.epoch_len() as u32;
         let mut depth_on_bucket1 = false;
         for n in 1..=steps {

@@ -750,6 +750,54 @@ mod tests {
         );
     }
 
+    /// E3 (feature-end review round 2): gen-core's `enabled_aux_losses` — what the shared floor's
+    /// full-fine-tune refusal reads — names every arm of this kit's `ARMS`, so a new arm cannot skip
+    /// that refusal. A new arm reds here until it is enabled below AND added to gen-core's list.
+    /// Mutation: drop an arm from `gen_core::train::enabled_aux_losses` ⇒ red.
+    #[test]
+    fn gen_core_names_every_aux_arm() {
+        fn enable(cfg: &mut TrainingConfig, arm: &str) {
+            let on = AuxLossSchedule {
+                weight: 0.1,
+                t_min: 0.0,
+                t_max: 1.0,
+                every_n: 2,
+            };
+            match arm {
+                "depth" => cfg.depth_anchoring.schedule = on,
+                "identity" => cfg.identity_loss.schedule = on,
+                "face-landmark" => cfg.face_landmark_loss.schedule = on,
+                "body-proportion" => cfg.body_losses.proportion = on,
+                "body-shape" => cfg.body_losses.shape = on,
+                "normal" => cfg.body_losses.normal = on,
+                "vae_anchor" => cfg.vae_anchor.schedule = on,
+                "latent_lpips" => cfg.latent_lpips.schedule = on,
+                other => panic!(
+                    "new aux arm `{other}`: enable it here and add it to \
+                     gen_core::train::enabled_aux_losses (the full-fine-tune refusal reads it)"
+                ),
+            }
+        }
+        let mut all = TrainingConfig::default();
+        for arm in ARMS {
+            let mut cfg = TrainingConfig::default();
+            enable(&mut cfg, arm.name);
+            assert!(
+                (arm.enabled)(&cfg),
+                "{}: the enabler does not enable it",
+                arm.name
+            );
+            assert_eq!(
+                gen_core::train::enabled_aux_losses(&cfg),
+                vec![arm.name],
+                "gen-core does not name the `{}` arm",
+                arm.name
+            );
+            enable(&mut all, arm.name);
+        }
+        assert_eq!(gen_core::train::enabled_aux_losses(&all).len(), ARMS.len());
+    }
+
     /// sc-24832: the body arms are on the seam — ViTPose budgeted once across the three arms, the
     /// decoder counted, and a missing checkpoint named with the trainer label. Mutations: drop
     /// an arm from `ARMS` ⇒ its footprint is missing ⇒ red; build the arm without the label ⇒ red.

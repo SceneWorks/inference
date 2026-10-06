@@ -761,7 +761,13 @@ impl WanMoeTrainer {
         // skipped prefix so the phase matches.
         let mut aux_driver = match perceptual {
             Some(path) => Some(aux_driver(
-                path, &cache, &schedule, accum, dual, start_step,
+                path,
+                &cache,
+                &schedule,
+                accum,
+                dual,
+                start_step,
+                &req.cancel,
             )?),
             None => None,
         };
@@ -1044,6 +1050,7 @@ fn aux_driver(
     accum: u32,
     dual: bool,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     let n_experts: u32 = if dual { 2 } else { 1 };
     AuxDriver::prepare_keyed(
@@ -1054,6 +1061,7 @@ fn aux_driver(
         accum * n_experts,
         start_step,
         |s| step_item(s, dual, schedule),
+        cancel,
     )
 }
 
@@ -1617,15 +1625,19 @@ fn preflight_memory_guard_with_budget(
         );
     }
     if projected > safe {
-        return Err(format!(
-            "{id} trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
-             ({n_experts} resident expert(s) + the forward working set, materialized in one allocation), \
-             exceeding this machine's ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). \
-             Without mitigation the OS would hard-kill the worker (SIGKILL) at the first step with no \
-             recoverable error (sc-4874/sc-4942). Enable Gradient Checkpointing (recomputes block \
-             activations in the backward) or reduce the training resolution."
-        )
-        .into());
+        return Err(mlx_gen_perceptual::name_aux_losses(
+            format!(
+                "{id} trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+                 ({n_experts} resident expert(s) + the forward working set, materialized in one allocation), \
+                 exceeding this machine's ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). \
+                 Without mitigation the OS would hard-kill the worker (SIGKILL) at the first step with no \
+                 recoverable error (sc-4874/sc-4942). Enable Gradient Checkpointing (recomputes block \
+                 activations in the backward) or reduce the training resolution."
+            )
+            .into(),
+            training,
+            extra_gb,
+        ));
     }
     Ok(())
 }
@@ -2712,6 +2724,7 @@ mod depth_anchoring_tests {
             1,
             false,
             0,
+            &Default::default(),
         )
         .unwrap();
         let p = d.into_path();
@@ -2814,6 +2827,7 @@ mod depth_anchoring_tests {
             1,
             false,
             0,
+            &Default::default(),
         )
         .unwrap();
         let p = d.into_path();
@@ -2853,6 +2867,7 @@ mod depth_anchoring_tests {
             1,
             false,
             0,
+            &Default::default(),
         )
         .unwrap();
         let p = d.into_path();
@@ -2873,6 +2888,7 @@ mod depth_anchoring_tests {
             1,
             false,
             0,
+            &Default::default(),
         )
         .unwrap();
         let p = d.into_path();
@@ -2891,6 +2907,7 @@ mod depth_anchoring_tests {
             1,
             false,
             0,
+            &Default::default(),
         )
         .unwrap();
         let p = d.into_path();
@@ -2926,7 +2943,7 @@ mod depth_anchoring_tests {
             7,
         );
         let accum = 2u32;
-        let mut d = aux_driver(p, &cache, &schedule, accum, true, 0).unwrap();
+        let mut d = aux_driver(p, &cache, &schedule, accum, true, 0, &Default::default()).unwrap();
         let keys: Vec<u32> = (1..=24u32)
             .map(|step| d.key(step, step_item(step, true, &schedule)))
             .collect();

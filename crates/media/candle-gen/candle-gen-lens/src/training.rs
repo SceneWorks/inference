@@ -1370,7 +1370,16 @@ mod tests {
                 .unwrap();
             let sched = gen_core::BucketSchedule::new(1, &[], 3);
             let clean = unpack_to_decoder_latent(&f.x0, f.h, f.w).unwrap();
-            let d = AuxDriver::prepare(path, 1, |_| Ok(clean.clone()), &sched, 1, 0).unwrap();
+            let d = AuxDriver::prepare(
+                path,
+                1,
+                |_| Ok(clean.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             (d, sched)
         }
 

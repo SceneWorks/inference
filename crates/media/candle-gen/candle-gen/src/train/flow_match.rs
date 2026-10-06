@@ -535,7 +535,8 @@ impl AuxDriver {
     /// Build each of the `n_entries` item-major cache entries' references from `clean(entry)` (the
     /// entry's clean latent in the path's NCHW model-space layout, once per entry, before the loop),
     /// key the alternation on the `schedule`'s items with `accum` micro-steps per update, and replay
-    /// micro-steps `1..=start_step` so a resumed run continues the same phase.
+    /// micro-steps `1..=start_step` so a resumed run continues the same phase. A tripped `cancel`
+    /// stops the reference build between entries with `Canceled`.
     pub fn prepare(
         mut path: PerceptualPath,
         n_entries: usize,
@@ -543,8 +544,14 @@ impl AuxDriver {
         schedule: &BucketSchedule,
         accum: u32,
         start_step: u32,
+        cancel: &crate::gen_core::runtime::CancelFlag,
     ) -> Result<Self> {
         for entry in 0..n_entries {
+            // A cancel during the (per-entry decode + frozen-model) reference build stops here,
+            // before any DiT work.
+            if cancel.is_cancelled() {
+                return Err(crate::CandleError::Canceled);
+            }
             path.ensure_reference(entry, &clean(entry)?)?;
         }
         let mut alternation = AuxAlternation::new(n_entries / schedule.n_buckets().max(1), accum);
@@ -1022,6 +1029,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             &schedule,
             accum,
             start_step,
+            &req.cancel,
         )?),
         None => None,
     };
@@ -1920,6 +1928,36 @@ mod tests {
         );
     }
 
+    /// A cancel tripped during the reference build stops it between entries with a typed
+    /// `Canceled` — no further entry is decoded, so no DiT work follows (feature-end review round
+    /// 2). Mutation: drop the per-entry `cancel` check ⇒ all 6 entries build and `prepare` succeeds
+    /// ⇒ red.
+    #[test]
+    fn aux_driver_prepare_stops_on_cancel_between_entries() {
+        let schedule = BucketSchedule::new(6, &[], 7);
+        let cancel = CancelFlag::default();
+        let calls = Cell::new(0);
+        let result = AuxDriver::prepare(
+            toy_path(),
+            6,
+            |i| {
+                calls.set(calls.get() + 1);
+                cancel.cancel();
+                Ok(Tensor::full(i as f32, (1, 1, 1, 1), &Device::Cpu)?)
+            },
+            &schedule,
+            1,
+            0,
+            &cancel,
+        );
+        assert!(
+            matches!(result, Err(crate::CandleError::Canceled)),
+            "{:?}",
+            result.err().map(|e| e.to_string())
+        );
+        assert_eq!(calls.get(), 1, "the build stopped at the next entry");
+    }
+
     /// Resume replays the skipped prefix: an [`AuxDriver`] prepared at `start_step = 5` plans steps
     /// 6.. exactly as one walked from step 1. Mutation: drop the replay loop ⇒ red.
     #[test]
@@ -1937,7 +1975,16 @@ mod tests {
         let schedule = BucketSchedule::new(3, &buckets, 7);
         let clean = |i: usize| Ok(Tensor::full(i as f32, (1, 1, 1, 1), &Device::Cpu)?);
         let plans = |start: u32| {
-            let mut d = AuxDriver::prepare(toy_path(), 6, clean, &schedule, 2, start).unwrap();
+            let mut d = AuxDriver::prepare(
+                toy_path(),
+                6,
+                clean,
+                &schedule,
+                2,
+                start,
+                &Default::default(),
+            )
+            .unwrap();
             (start + 1..=24)
                 .map(|step| {
                     let s = d.sample(step, &schedule);

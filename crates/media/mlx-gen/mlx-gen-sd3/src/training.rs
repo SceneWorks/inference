@@ -702,7 +702,14 @@ impl Sd3LoraTrainer {
         // the real dataset item (not the (item, bucket) entry). A resumed run replays the skipped
         // prefix so the phase matches.
         let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, start_step)?),
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                &schedule,
+                accum,
+                start_step,
+                &req.cancel,
+            )?),
             None => None,
         };
         let mut accumulated: Option<LoraParams> = None;
@@ -909,15 +916,19 @@ fn check_preflight_budget_with_aux(
         );
     }
     if projected > safe {
-        return Err(format!(
-            "sd3 trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
-             (the forward working set materializes in one allocation), exceeding this machine's \
-             ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the \
-             OS would hard-kill the worker (SIGKILL) at the first step with no recoverable error. \
-             Enable Gradient Checkpointing (recomputes block activations in the backward) or reduce \
-             the training resolution."
-        )
-        .into());
+        return Err(mlx_gen_perceptual::name_aux_losses(
+            format!(
+                "sd3 trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+                 (the forward working set materializes in one allocation), exceeding this machine's \
+                 ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the \
+                 OS would hard-kill the worker (SIGKILL) at the first step with no recoverable error. \
+                 Enable Gradient Checkpointing (recomputes block activations in the backward) or reduce \
+                 the training resolution."
+            )
+            .into(),
+            cfg,
+            extra_gb,
+        ));
     }
     Ok(())
 }
@@ -1282,6 +1293,7 @@ fn aux_driver(
     schedule: &BucketSchedule,
     accum: u32,
     start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
         path,
@@ -1290,6 +1302,7 @@ fn aux_driver(
         schedule,
         accum,
         start_step,
+        cancel,
     )
 }
 
@@ -2665,7 +2678,15 @@ mod depth_anchoring_tests {
             let mut f = fixture(&cfg);
             let cache = cache_n(1, 6, 4);
             let schedule = single_bucket(1);
-            let mut d = aux_driver(path_with(aux_sched()), &cache, &schedule, 1, 0).unwrap();
+            let mut d = aux_driver(
+                path_with(aux_sched()),
+                &cache,
+                &schedule,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             let (diff, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, ckpt);
             assert_eq!(diff.aux, None, "ckpt={ckpt}");
             assert_eq!(Some(diff.total), diff.diffusion);
@@ -2695,7 +2716,15 @@ mod depth_anchoring_tests {
         let mut f = fixture(&cfg);
         let cache = cache_n(1, 6, 4);
         let schedule = single_bucket(1);
-        let mut d = aux_driver(path_with(window), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(window),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, false);
         let (depth, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, false);
         assert!(depth.aux.is_some());
@@ -2801,7 +2830,15 @@ mod depth_anchoring_tests {
             ],
             7,
         );
-        let mut d = aux_driver(path_with(aux_sched()), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let steps = 2 * schedule.epoch_len() as u32;
         let mut kinds = Vec::new();
         let mut depth_on_bucket1 = false;
@@ -2882,7 +2919,15 @@ mod depth_anchoring_tests {
 
         let on_cfg = cfg();
         let mut f2 = fixture(&on_cfg);
-        let mut d = aux_driver(path_with(aux_sched()), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let (on1, g_on1) = step(&mut f2, &on_cfg, &cache, &schedule, Some(&mut d), 1, false);
         let mut f3 = fixture(&on_cfg);
         let (none1, g_none1) = step(&mut f3, &on_cfg, &cache, &schedule, None, 1, false);
@@ -2939,7 +2984,15 @@ mod depth_anchoring_tests {
         let mut f = fixture(&cfg);
         let cache = cache_n(2, 6, 4);
         let schedule = single_bucket(2);
-        let mut d = aux_driver(path_with(aux_sched()), &cache, &schedule, 1, 0).unwrap();
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let kinds: Vec<(usize, bool)> = (1..=4)
             .map(|n| {
                 let (l, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), n, false);

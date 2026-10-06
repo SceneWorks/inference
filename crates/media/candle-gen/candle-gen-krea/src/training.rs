@@ -1220,8 +1220,16 @@ mod depth_anchoring_tests {
         let (x0, cap, noise) = tiny_batch(&c);
         let sched = one_item_schedule();
         for ckpt in [false, true] {
-            let mut driver =
-                AuxDriver::prepare(path(), 1, |_| Ok(x0.clone()), &sched, 1, 0).unwrap();
+            let mut driver = AuxDriver::prepare(
+                path(),
+                1,
+                |_| Ok(x0.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
             let s1 = driver.sample(1, &sched).plan(0.5).unwrap().unwrap();
             let (diff, _) = compute_step_loss_grads(
                 &dit,
@@ -1339,7 +1347,16 @@ mod depth_anchoring_tests {
             grad_bits(&g_legacy, &set.vars)
         );
         let sched = one_item_schedule();
-        let mut driver = AuxDriver::prepare(path(), 1, |_| Ok(x0.clone()), &sched, 1, 0).unwrap();
+        let mut driver = AuxDriver::prepare(
+            path(),
+            1,
+            |_| Ok(x0.clone()),
+            &sched,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
         let s1 = driver.sample(1, &sched).plan(0.5).unwrap().unwrap();
         let (on, g_on) = compute_step_loss_grads(
             &dit,

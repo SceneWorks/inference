@@ -819,6 +819,7 @@ impl MageTrainer {
                     &schedule,
                     accum,
                     0,
+                    &req.cancel,
                 )
             })
             .transpose()?;
@@ -1539,6 +1540,7 @@ mod tests {
                 sched,
                 1,
                 0,
+                &Default::default(),
             )
             .unwrap()
         }
