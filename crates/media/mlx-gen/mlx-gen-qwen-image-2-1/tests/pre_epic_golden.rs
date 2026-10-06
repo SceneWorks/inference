@@ -12,9 +12,8 @@
 //! cargo test -p mlx-gen-qwen-image-2-1 --test integration -- pre_epic_golden::` there.
 //!
 //! The comparison: identical key names and shapes, and every tensor within [`RTOL`] of the
-//! golden's peak — far above the run-to-run CPU reduction-order noise (~1e-8 relative), far below
-//! what a technique leaking into the off path does (an extra RNG draw, a changed sample order, a
-//! noise term: percent-level moves on every element).
+//! golden's peak — see [`RTOL`] for the measured cross-machine drift and leak effects it sits
+//! between.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,8 +25,17 @@ use mlx_rs::Array;
 
 use crate::common::{host_f32, tiny_snapshot};
 
-/// Per-tensor tolerance: `max |got − golden| ≤ RTOL · max |golden|`.
-const RTOL: f64 = 1e-4;
+/// Per-tensor tolerance: `max |got − golden| ≤ RTOL · max |golden|`. Sized from measurements, not
+/// guessed (sc-2124):
+/// * **cross-machine drift** — the hosted macOS runner's run of the unchanged off path sits at
+///   `1.6e-4` (worst tensor) against this golden (same-machine run-to-run noise is ~`1e-7`): Adam's
+///   first steps normalise tiny gradients, which amplifies CPU-BLAS float differences. RTOL is
+///   **31×** above it.
+/// * **leak effects** (worst tensor, measured by forcing each leak into the off path): weight noise
+///   at the probe σ 0.0125 → `7.4e-1` (even σ 0.001 → `4.3e-2`); gradient noise at η 0.01 → `2.0`;
+///   a shifted noise draw → `1.9`; a shifted timestep draw → `1.9`. RTOL is **8.7×** below even the
+///   σ 0.001 leak and **150×** below the smallest probe-strength one.
+const RTOL: f64 = 5e-3;
 
 /// The committed pre-epic adapter.
 fn golden_path() -> PathBuf {
@@ -130,6 +138,8 @@ fn everything_off_trains_the_pre_epic_adapter() {
     got_names.sort();
     assert_eq!(got_names, names, "adapter key names changed");
     let mut trained_b = false;
+    // The worst tensor's `max |Δ| / peak` — printed, so a run reports how far it sits from RTOL.
+    let mut worst = (0f64, String::new());
     for name in names {
         let ((gs, g), (ws, w)) = (&got[name], &want[name]);
         assert_eq!(gs, ws, "{name}: shape changed");
@@ -137,11 +147,21 @@ fn everything_off_trains_the_pre_epic_adapter() {
         let diff = g.iter().zip(w).fold(0f64, |m, (&a, &b)| {
             m.max((f64::from(a) - f64::from(b)).abs())
         });
-        assert!(
-            diff <= RTOL * peak,
-            "{name}: max |Δ| {diff:.3e} vs the pre-epic adapter (peak {peak:.3e}, rtol {RTOL})"
-        );
+        let rel = if peak > 0.0 { diff / peak } else { diff };
+        if rel > worst.0 {
+            worst = (rel, name.clone());
+        }
         trained_b |= (name.contains("lora_B") || name.contains("lora_up")) && peak > 0.0;
     }
+    eprintln!(
+        "[pre_epic_golden] worst max|Δ|/peak = {:.3e} ({})",
+        worst.0, worst.1
+    );
+    assert!(
+        worst.0 <= RTOL,
+        "{}: max |Δ| / peak {:.3e} vs the pre-epic adapter exceeds rtol {RTOL}",
+        worst.1,
+        worst.0
+    );
     assert!(trained_b, "the golden carries no trained up factor");
 }
