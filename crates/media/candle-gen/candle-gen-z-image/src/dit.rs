@@ -8,8 +8,9 @@
 //!
 //! Only the three structs that *own* the attention projections are vendored — [`ZImageAttention`]
 //! (the LoRA seam), [`ZImageTransformerBlock`] (owns the attention), and
-//! [`ZImageTransformer2DModel`] (owns the blocks + the [`LoraHost`] walk). Everything else
-//! (`TimestepEmbedder`, `FeedForward`, `QkNorm`, `RopeEmbedder`, `FinalLayer`, `patchify`/
+//! [`ZImageTransformer2DModel`] (owns the blocks + the [`LoraHost`] walk) — plus the SwiGLU
+//! `FeedForward` (sc-25213), whose projections the frozen training adapter reaches. Everything else
+//! (`TimestepEmbedder`, `QkNorm`, `RopeEmbedder`, `FinalLayer`, `patchify`/
 //! `unpatchify`/`apply_rotary_emb`, the `Config`) is **reused** straight from candle-transformers —
 //! those are `pub`, frozen, and not adapter targets, so re-deriving them would only invite drift.
 //!
@@ -23,8 +24,8 @@
 //!     on contiguous input — which is exactly the gradient-killer that left the attention factors
 //!     with no grad in the first cut. Every norm here (the vendored [`QkNorm`], the block's four
 //!     `attention_norm`/`ffn_norm`s, the model's `cap_embedder_norm`) calls `forward_diff`, the
-//!     composable `LayerNorm` path. (The reused `FinalLayer`/`TimestepEmbedder`/`FeedForward` hold no
-//!     fused op — only Linears + `silu` + the manual-ops `LayerNormNoParams` — so they stay stock.)
+//!     composable `LayerNorm` path. (`FinalLayer`/`TimestepEmbedder`/`FeedForward` hold no fused
+//!     op — only Linears + `silu` + the manual-ops `LayerNormNoParams` — so they need no swap.)
 //!  3. **No flash-attn / SDPA dispatch.** Those fused kernels are likewise non-differentiable; the
 //!     trainer always runs the materialized math attention. (Inference keeps using the stock model —
 //!     this vendored copy is training-only; the [`crate::adapters`] merge is how a trained adapter
@@ -35,12 +36,12 @@
 //! matching candle-transformers); the trainer negates it to match the inference pipeline's
 //! `noise_pred.neg()` (the Z-Image sign convention) — see [`crate::training`].
 
-use candle_core::{DType, Module, Result, Tensor, D};
+use candle_core::{DType, Result, Tensor, D};
 use candle_nn::{RmsNorm, VarBuilder};
 
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::train::gradient_checkpoint::Segment;
-use candle_gen::train::lora::{lora_linear_no_bias, LoraHost, LoraLinear};
+use candle_gen::train::lora::{lora_linear, lora_linear_no_bias, LoraHost, LoraLinear};
 
 fn default_attention_plan() -> AttentionPlan<'static> {
     AttentionPlan::budgeted(AttentionBudget::from_score_elements(
@@ -62,9 +63,38 @@ fn into_candle_core(result: candle_gen::Result<Tensor>) -> Result<Tensor> {
 // (`QkNorm` is the one exception — see the local [`QkNorm`] below — because its `RmsNorm::forward`
 // dispatches to a no-backward fused kernel.)
 use candle_transformers::models::z_image::transformer::{
-    apply_rotary_emb, create_coordinate_grid, patchify, unpatchify, Config, FeedForward,
-    FinalLayer, RopeEmbedder, TimestepEmbedder, ADALN_EMBED_DIM,
+    apply_rotary_emb, create_coordinate_grid, patchify, unpatchify, Config, FinalLayer,
+    RopeEmbedder, TimestepEmbedder, ADALN_EMBED_DIM,
 };
+
+/// The SwiGLU feed-forward, vendored (sc-25213) so its three projections are [`LoraLinear`]s that
+/// can carry the frozen **training adapter** residual ([`crate::training_adapter`]) — ostris'
+/// de-distill adapter targets `feed_forward.w{1,2,3}`. Same `w1`/`w2`/`w3` keys and the same op
+/// sequence as the stock `FeedForward` (`w2(silu(w1·x) ⊙ w3·x)`); with nothing installed a
+/// [`LoraLinear`] forward is its dense base's, so this is bit-identical to the stock module (the
+/// `parity_tests` gate pins the whole DiT).
+#[derive(Debug, Clone)]
+struct FeedForward {
+    w1: LoraLinear,
+    w2: LoraLinear,
+    w3: LoraLinear,
+}
+
+impl FeedForward {
+    fn new(dim: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            w1: lora_linear_no_bias(dim, hidden_dim, vb.pp("w1"))?,
+            w2: lora_linear_no_bias(hidden_dim, dim, vb.pp("w2"))?,
+            w3: lora_linear_no_bias(dim, hidden_dim, vb.pp("w3"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x1 = x.apply(&self.w1)?.silu()?;
+        let x3 = x.apply(&self.w3)?;
+        (x1 * x3)?.apply(&self.w2)
+    }
+}
 
 /// QK normalization (RMSNorm on the per-head query/key), vendored so it uses the **composable**
 /// `RmsNorm::forward_diff` rather than `RmsNorm::forward` (which dispatches to the no-backward fused
@@ -246,8 +276,9 @@ impl ZImageAttention {
 // ==================== ZImageTransformerBlock ====================
 
 /// Z-Image transformer block with optional AdaLN modulation. Identical to the stock block except its
-/// attention is the vendored [`ZImageAttention`]; the norms / FFN / AdaLN projection are stock
-/// frozen modules.
+/// attention is the vendored [`ZImageAttention`] and its FFN / AdaLN projections are
+/// [`LoraLinear`]s (sc-25213 — frozen, bit-identical with nothing installed, so the training adapter
+/// can reach them); the norms are stock frozen modules.
 #[derive(Debug, Clone)]
 pub struct ZImageTransformerBlock {
     attention: ZImageAttention,
@@ -256,7 +287,7 @@ pub struct ZImageTransformerBlock {
     attention_norm2: RmsNorm,
     ffn_norm1: RmsNorm,
     ffn_norm2: RmsNorm,
-    adaln_modulation: Option<candle_nn::Linear>,
+    adaln_modulation: Option<LoraLinear>,
 }
 
 impl ZImageTransformerBlock {
@@ -274,7 +305,7 @@ impl ZImageTransformerBlock {
 
         let adaln_modulation = if modulation {
             let adaln_dim = dim.min(ADALN_EMBED_DIM);
-            Some(candle_nn::linear(
+            Some(lora_linear(
                 adaln_dim,
                 4 * dim,
                 vb.pp("adaLN_modulation").pp("0"),
@@ -299,6 +330,38 @@ impl ZImageTransformerBlock {
         f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
         self.attention.visit_lora_mut(f)
+    }
+
+    /// Every projection of the block a frozen training adapter can reach (sc-25213): the four
+    /// attention projections, the three FFN projections and (modulated blocks) the AdaLN projection.
+    fn visit_linears(&self, f: &mut dyn FnMut(&LoraLinear)) {
+        let a = &self.attention;
+        for lin in [&a.to_q, &a.to_k, &a.to_v, &a.to_out] {
+            f(lin);
+        }
+        let ff = &self.feed_forward;
+        for lin in [&ff.w1, &ff.w2, &ff.w3] {
+            f(lin);
+        }
+        if let Some(adaln) = &self.adaln_modulation {
+            f(adaln);
+        }
+    }
+
+    /// [`visit_linears`](Self::visit_linears), mutably.
+    fn visit_linears_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.attention.visit_lora_mut(f)?;
+        let ff = &mut self.feed_forward;
+        for lin in [&mut ff.w1, &mut ff.w2, &mut ff.w3] {
+            f(lin)?;
+        }
+        if let Some(adaln) = &mut self.adaln_modulation {
+            f(adaln)?;
+        }
+        Ok(())
     }
 
     pub fn forward(
@@ -784,6 +847,38 @@ impl ZImageTransformer2DModel {
             self.cfg.all_f_patch_size[0],
             self.cfg.in_channels,
         )
+    }
+}
+
+impl ZImageTransformer2DModel {
+    /// Every block projection a frozen training adapter can reach (sc-25213), across the noise
+    /// refiner, context refiner and main stacks — a superset of the trainable [`LoraHost`] walk,
+    /// which stays the attention projections only.
+    pub(crate) fn visit_block_linears(&self, f: &mut dyn FnMut(&LoraLinear)) {
+        for blk in self
+            .noise_refiner
+            .iter()
+            .chain(self.context_refiner.iter())
+            .chain(self.layers.iter())
+        {
+            blk.visit_linears(f);
+        }
+    }
+
+    /// [`visit_block_linears`](Self::visit_block_linears), mutably.
+    pub(crate) fn visit_block_linears_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for blk in self
+            .noise_refiner
+            .iter_mut()
+            .chain(self.context_refiner.iter_mut())
+            .chain(self.layers.iter_mut())
+        {
+            blk.visit_linears_mut(f)?;
+        }
+        Ok(())
     }
 }
 

@@ -525,6 +525,7 @@ fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
             normal_loss: true,
             vae_anchor_loss: true,
             latent_lpips_loss: true,
+            training_adapter: true,
             ..gen_core::TrainingTechniques::ADAPTER_NOISE
         };
         Box::new(stub)
@@ -608,6 +609,50 @@ fn declared_depth_anchoring_passes_the_technique_checks() {
     let make = || -> Box<dyn Trainer> {
         let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
         stub.desc.techniques.depth_anchoring = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-25213: a trainer that declares every other probed technique but silently accepts a training
+/// adapter fails both technique checks on the `training_adapter` probe; declaring it passes, and
+/// (adapter-only) a declaring trainer that accepts it with a full fine-tune fails.
+/// Mutation: drop the `training_adapter` row from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_training_adapter_fails_both_technique_checks() {
+    let all_but_adapter = gen_core::TrainingTechniques {
+        depth_anchoring: true,
+        subject_mask_loss: true,
+        resolution_buckets: true,
+        identity_loss: true,
+        face_landmark_loss: true,
+        vae_anchor_loss: true,
+        latent_lpips_loss: true,
+        body_proportion_loss: true,
+        body_shape_loss: true,
+        normal_loss: true,
+        ..gen_core::TrainingTechniques::ADAPTER_NOISE
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques = all_but_adapter;
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.training_adapter == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("training_adapter") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.training_adapter = true;
         Box::new(stub)
     };
     check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();

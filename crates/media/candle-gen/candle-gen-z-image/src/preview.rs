@@ -1146,6 +1146,7 @@ mod tests {
             ("packed_te.rs", include_str!("packed_te.rs")),
             ("preview.rs", include_str!("preview.rs")),
             ("quant.rs", include_str!("quant.rs")),
+            ("training_adapter.rs", include_str!("training_adapter.rs")),
         ] {
             assert!(
                 call_sites(file, &format!("{DRIVER}("), source).is_empty(),
@@ -1200,6 +1201,7 @@ mod tests {
                 "preview.rs",
                 "quant.rs",
                 "training.rs",
+                "training_adapter.rs",
                 "turbo_img2img_validate.rs", // #[cfg(test)] mod — not shipped code
             ],
             "a module joined or left src/ — add it to the route inventory or to the negative pin"

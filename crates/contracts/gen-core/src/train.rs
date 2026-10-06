@@ -313,6 +313,22 @@ pub struct TrainingConfig {
     /// [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss) — which no trainer whose latent
     /// family has no published E-LatentLPIPS weights declares.
     pub latent_lpips: LatentLpipsConfig,
+    /// **Training adapter** (sc-25213) — a frozen LoRA `.safetensors` applied to the base model for
+    /// the training forward/backward only, ai-toolkit's `assistant_lora_path`. Its use is the
+    /// step-distilled Z-Image-Turbo base: ostris' de-distill adapter is applied to the base while
+    /// the user's LoRA trains, so the user's adapter learns the concept rather than undoing the
+    /// distillation, and is then removed again — preview samples render without it, and the saved
+    /// adapter carries **only** the trainable keys, so the LoRA applies to the bare distilled base at
+    /// generation time exactly as the previews showed.
+    ///
+    /// `None` (the default) is **off**: nothing is read and the trainer trains on the bare base
+    /// exactly as before this field existed. `Some` is refused (typed
+    /// [`crate::Error::Unsupported`]) by any trainer whose [`TrainerDescriptor::techniques`] does
+    /// not declare [`training_adapter`](TrainingTechniques::training_adapter), and for a
+    /// [`full_finetune`](Self::full_finetune) run (the adapter would be baked into the fine-tuned
+    /// weights) — see [`validate_training_techniques`]. A file that cannot be read fails the run
+    /// when the trainer loads it, naming the path.
+    pub training_adapter: Option<PathBuf>,
 }
 
 /// Where [`IdentityLossConfig`]'s per-image target embedding comes from.
@@ -721,6 +737,8 @@ impl Default for TrainingConfig {
             // The latent-space perceptual losses are OFF by default (epic 2123 E1, sc-24833).
             vae_anchor: VaeAnchorConfig::default(),
             latent_lpips: LatentLpipsConfig::default(),
+            // No training adapter by default (sc-25213): the trainer trains on the bare base.
+            training_adapter: None,
         }
     }
 }
@@ -1137,6 +1155,9 @@ pub struct TrainingTechniques {
     /// Honors [`TrainingConfig::latent_lpips`] (E-LatentLPIPS on the x0 latent, sc-24833) — only a
     /// trainer whose latent family has published weights ([`LatentLpipsFamily`]) declares it.
     pub latent_lpips_loss: bool,
+    /// Honors [`TrainingConfig::training_adapter`] (a frozen LoRA applied to the base for the
+    /// training forward/backward only — the Z-Image-Turbo de-distill adapter, sc-25213).
+    pub training_adapter: bool,
     /// Not a technique knob: the trainer's aux-loss builder supplies its **own x0 decoder** (e.g.
     /// Mage decodes through its full VAE), so the decoded-x0 losses do not need
     /// [`TrainingConfig::perceptual_decoder_dir`] and the shared floor does not require it.
@@ -1158,6 +1179,7 @@ impl TrainingTechniques {
         normal_loss: false,
         vae_anchor_loss: false,
         latent_lpips_loss: false,
+        training_adapter: false,
         builtin_x0_decoder: false,
     };
 
@@ -1176,6 +1198,7 @@ impl TrainingTechniques {
         normal_loss: false,
         vae_anchor_loss: false,
         latent_lpips_loss: false,
+        training_adapter: false,
         builtin_x0_decoder: false,
     };
 }
@@ -1290,6 +1313,9 @@ fn lacks_x0_decoder(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> bool {
 ///   [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss) ⇒ typed
 ///   [`crate::Error::Unsupported`]; enabled without its model directory (or, for the VAE anchor,
 ///   without [`TrainingConfig::perceptual_decoder_dir`]) ⇒ [`crate::Error::Msg`].
+/// - [`TrainingConfig::training_adapter`] set with [`TrainingConfig::full_finetune`], or on a
+///   trainer whose descriptor lacks [`training_adapter`](TrainingTechniques::training_adapter) ⇒
+///   typed [`crate::Error::Unsupported`].
 /// - every technique off ⇒ no-op.
 pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
@@ -1391,6 +1417,23 @@ pub fn validate_training_techniques(
     }
     validate_body_losses(desc, req)?;
     validate_resolution_buckets(desc, &cfg.resolution_buckets)?;
+    if let Some(adapter) = &cfg.training_adapter {
+        if cfg.full_finetune {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: a training adapter ({}) is applied to the frozen base of a LoRA/LoKr run and \
+                 cannot be combined with a full base fine-tune",
+                desc.id,
+                adapter.display()
+            )));
+        }
+        if !desc.techniques.training_adapter {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: a training adapter ({}) is not supported by this trainer",
+                desc.id,
+                adapter.display()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2013,6 +2056,41 @@ mod tests {
             let err = validate_training_techniques(&noisy_desc, &r).unwrap_err();
             assert!(matches!(err, crate::Error::Msg(_)), "{bad}: {err:?}");
         }
+    }
+
+    #[test]
+    fn validate_training_techniques_gates_the_training_adapter() {
+        // sc-25213 (E3): a training adapter is refused unless the descriptor declares it, and with a
+        // full fine-tune even where declared (it would be baked into the fine-tuned weights).
+        // Mutations: drop the `!desc.techniques.training_adapter` arm ⇒ the `plain` assert fails;
+        // drop the `full_finetune` arm ⇒ the `full` assert fails.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut declaring = trainer_desc_with(false, true);
+        declaring.techniques.training_adapter = true;
+
+        let off = train_req(None, items);
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.training_adapter = Some(PathBuf::from("/adapters/de-distill.safetensors"));
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("training adapter")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&declaring, &on).is_ok());
+
+        let mut full = on;
+        full.config.full_finetune = true;
+        let err = validate_training_techniques(&declaring, &full).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("full base fine-tune")),
+            "{err:?}"
+        );
     }
 
     #[test]

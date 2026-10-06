@@ -713,6 +713,8 @@ pub struct TrainerCapabilitySnapshot {
     pub supports_vae_anchor_loss: bool,
     /// Honors `TrainingConfig::latent_lpips` (epic 2123 E-LatentLPIPS, sc-24833).
     pub supports_latent_lpips_loss: bool,
+    /// Honors `TrainingConfig::training_adapter` (the frozen de-distill training adapter, sc-25213).
+    pub supports_training_adapter: bool,
 }
 
 impl TrainerCapabilitySnapshot {
@@ -739,6 +741,7 @@ impl TrainerCapabilitySnapshot {
             supports_normal_loss: descriptor.techniques.normal_loss,
             supports_vae_anchor_loss: descriptor.techniques.vae_anchor_loss,
             supports_latent_lpips_loss: descriptor.techniques.latent_lpips_loss,
+            supports_training_adapter: descriptor.techniques.training_adapter,
         }
     }
 
@@ -765,6 +768,7 @@ impl TrainerCapabilitySnapshot {
             "supports_normal_loss": self.supports_normal_loss,
             "supports_vae_anchor_loss": self.supports_vae_anchor_loss,
             "supports_latent_lpips_loss": self.supports_latent_lpips_loss,
+            "supports_training_adapter": self.supports_training_adapter,
         })
     }
 }
@@ -1118,6 +1122,13 @@ mod tests {
         let lpips_json = TrainerCapabilitySnapshot::from_descriptor(&lpips).to_json();
         assert_eq!(lpips_json["supports_latent_lpips_loss"], true);
         assert_eq!(lpips_json["supports_vae_anchor_loss"], false);
+        // sc-25213: the training adapter is advertised from its own flag.
+        assert_eq!(json["supports_training_adapter"], false);
+        let mut adapted = descriptor;
+        adapted.techniques.training_adapter = true;
+        let adapted_json = TrainerCapabilitySnapshot::from_descriptor(&adapted).to_json();
+        assert_eq!(adapted_json["supports_training_adapter"], true);
+        assert_eq!(adapted_json["supports_latent_lpips_loss"], false);
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {

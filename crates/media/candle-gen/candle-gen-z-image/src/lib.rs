@@ -48,6 +48,7 @@ mod packed_te;
 pub mod preview;
 mod quant;
 mod training;
+mod training_adapter;
 
 // Base (non-Turbo) `z_image` text-to-image generator (sc-8414, the candle sibling of mlx sc-8320).
 // Registers its own engine id `z_image` alongside the Turbo `z_image_turbo` below; it
