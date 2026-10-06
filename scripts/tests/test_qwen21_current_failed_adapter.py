@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -289,6 +291,71 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                 mutant = copy.deepcopy(cfg); mutate(mutant)
                 with self.subTest(mutant=mutant), self.assertRaises(ValueError):
                     current.extract_selected(archive_path, root / ("stage-" + os.urandom(3).hex()), mutant)
+
+    def test_historical_job_log_transport_preserves_ansi_bytes_and_unflagged_refuses(self):
+        repository = Path(__file__).resolve().parents[2]
+        materializer = (repository / "scripts" / "ci" / "real-weights" /
+                        "mlx-qwen-image-2-1" / "materialize-current-failed-adapter.sh")
+        source_line = next(
+            line.strip() for line in materializer.read_text(encoding="utf-8").splitlines()
+            if "actions/jobs/112039296411/logs" in line
+        )
+        ansi_log = b"historical log\n\x1b[31mfailed\x1b[0m\nupload receipt\n"
+        fixture_sha = "cd95b07e66bfa521f7c9d0acf08d7272acf69f95fb6a5779dfdfe3ad62087983"
+        packet_root = os.environ.get("QWEN21_CURRENT_PACKET_ROOT")
+        if packet_root:
+            ansi_log = (Path(packet_root) / "terminal" / "logs" /
+                        "job-112039296411.log").read_bytes()
+            self.assertEqual(len(ansi_log), 286177)
+            fixture_sha = self.cfg["source"]["jobLogSha256"]
+        self.assertIn(b"\x1b", ansi_log)
+        self.assertEqual(hashlib.sha256(ansi_log).hexdigest(), fixture_sha)
+        git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+        bash = str(git_bash) if os.name == "nt" and git_bash.is_file() else shutil.which("bash")
+        self.assertIsNotNone(bash, "log transport regression requires Bash")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            fixture = root / "source-job.fixture.log"
+            fake_gh = root / "fake-gh.py"
+            destination = root / "source-job.log"
+            fixture.write_bytes(ansi_log)
+            fake_gh.write_text(
+                "import os, pathlib, sys\n"
+                "payload = pathlib.Path(os.environ['FAKE_GH_RESPONSE']).read_bytes()\n"
+                "if b'\\x1b' in payload and '--allow-escape-sequences' not in sys.argv[1:]:\n"
+                "    print('the response contains terminal escape sequences; pass "
+                "--allow-escape-sequences to output it anyway', file=sys.stderr)\n"
+                "    raise SystemExit(1)\n"
+                "sys.stdout.buffer.write(payload)\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["FAKE_GH_RESPONSE"] = str(fixture)
+            prelude = (
+                "gh() { " + shlex.quote(Path(sys.executable).as_posix()) + " " +
+                shlex.quote(fake_gh.as_posix()) + " \"$@\"; }\n" +
+                "api=" + shlex.quote(root.as_posix()) + "\n"
+            )
+
+            accepted = subprocess.run(
+                [bash, "-e", "-c", prelude + source_line], env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr.decode("utf-8"))
+            self.assertEqual(accepted.stdout, b"")
+            self.assertEqual(destination.read_bytes(), ansi_log)
+            self.assertEqual(current.sha256_file(destination), fixture_sha)
+
+            mutant_line = source_line.replace("--allow-escape-sequences ", "")
+            self.assertNotEqual(mutant_line, source_line)
+            refused = subprocess.run(
+                [bash, "-e", "-c", prelude + mutant_line], env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(refused.returncode, 1)
+            self.assertEqual(refused.stdout, b"")
+            self.assertEqual(destination.read_bytes(), b"")
+            self.assertIn(b"pass --allow-escape-sequences", refused.stderr)
 
     def test_zip_rejects_traversal_duplicates_and_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:

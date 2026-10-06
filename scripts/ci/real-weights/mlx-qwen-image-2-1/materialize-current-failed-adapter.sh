@@ -30,7 +30,7 @@ trap refuse ERR
 gh api repos/SceneWorks/inference/actions/runs/37392084691 > "$api/source-run.json"
 gh api repos/SceneWorks/inference/actions/runs/37392084691/attempts/1 > "$api/source-attempt.json"
 gh api 'repos/SceneWorks/inference/actions/runs/37392084691/attempts/1/jobs?per_page=100' > "$api/source-jobs.json"
-gh api repos/SceneWorks/inference/actions/jobs/112039296411/logs > "$api/source-job.log"
+gh api --allow-escape-sequences repos/SceneWorks/inference/actions/jobs/112039296411/logs > "$api/source-job.log"
 gh api repos/SceneWorks/inference/actions/artifacts/11383988900 > "$api/source-artifact.json"
 gh api repos/SceneWorks/inference/actions/artifacts/11383988900/zip > "$api/source-artifact.zip"
 
