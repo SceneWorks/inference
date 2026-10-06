@@ -569,7 +569,7 @@ fn run(binding: Binding) -> Result<()> {
         "discriminatorProtocolSha256":binding.protocol_identity(),
         "runId":std::env::var("GITHUB_RUN_ID").expect("native run identity").parse::<u64>().unwrap(),
         "runAttempt":std::env::var("GITHUB_RUN_ATTEMPT").expect("native attempt identity").parse::<u64>().unwrap(),
-        "inputManifestSha256":evidence::sha256_file(&manifest_path),"trainingProvenance":manifest["trainingProvenance"],
+        "inputManifestSha256":evidence::sha256_file(manifest_path),"trainingProvenance":manifest["trainingProvenance"],
         "adapterSha256":donor_sha,"trainingReceiptSha256":training_sha,
         "forwardCount":0,"stateCount":4,"repeatCount":2,
         "adapterStrength":1,"sigma":0.5,"arithmeticBoundVerdict":math::ARITHMETIC,
