@@ -142,9 +142,9 @@ impl From<TinyDecoderConfig> for TinyDecoderSpec {
 }
 
 /// GroupNorm group count of the mid-block pool (`nn.GroupNorm(4, 4·C)`).
-const MIDBLOCK_GN_GROUPS: i32 = 4;
+pub(crate) const MIDBLOCK_GN_GROUPS: i32 = 4;
 /// torch `nn.GroupNorm` default eps.
-const MIDBLOCK_GN_EPS: f32 = 1e-5;
+pub(crate) const MIDBLOCK_GN_EPS: f32 = 1e-5;
 
 impl TinyDecoderSpec {
     /// `madebyollin/taef1` (plain decoder, 16 latent channels).
@@ -373,7 +373,7 @@ fn ohwi(w: &Array) -> Result<Array> {
 }
 
 /// The key every TAESD-family checkpoint in the diffusers layout carries (the first decoder conv).
-const DECODER_PROBE_KEY: &str = "decoder.layers.0.weight";
+pub(crate) const DECODER_PROBE_KEY: &str = "decoder.layers.0.weight";
 
 /// The file a decoder checkpoint directory is read from: the diffusers
 /// `diffusion_pytorch_model.safetensors` when present (taef1 / taesdxl / taesd3 — the taesd/taesdxl

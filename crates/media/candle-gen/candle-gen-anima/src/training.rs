@@ -325,8 +325,10 @@ fn plan_sigma<'a>(
     sigma: f64,
 ) -> Result<(f64, Option<flow_match::AuxStep<'a>>)> {
     let aux = sample.plan(sigma as f32)?;
+    // Remapped iff the plan's level moved off the sampled one — an aux-only step, or one that
+    // `StepPlan::without_skipped` reverted to diffusion (which still trains at the remapped level).
     let sigma = match aux.as_ref() {
-        Some(a) if !a.diffusion() => a.noise_level() as f64,
+        Some(a) if a.noise_level() != sigma as f32 => a.noise_level() as f64,
         _ => sigma,
     };
     Ok((sigma, aux))
@@ -926,7 +928,7 @@ mod depth_anchoring_tests {
 
     /// Review fix: a diffusion step keeps the exact f64 σ (an f32-rounded noise level would break
     /// depth-on/off bit-identity); an aux-only step trains at the plan's remapped level. Mutation:
-    /// remap on every planned step (drop the `!a.diffusion()` guard) ⇒ the diffusion step's σ is
+    /// remap on every planned step (drop the `!= sigma as f32` guard) ⇒ the diffusion step's σ is
     /// f32-rounded ⇒ red.
     #[test]
     fn plan_sigma_remaps_only_aux_steps() {
@@ -944,6 +946,33 @@ mod depth_anchoring_tests {
         let aux_plan = aux_plan.unwrap();
         assert!(!aux_plan.diffusion());
         assert_eq!(aux_sigma, aux_plan.noise_level() as f64);
+    }
+
+    /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
+    /// reference) is reverted to diffusion by `StepPlan::without_skipped` — and still trains at the
+    /// plan's remapped level, never the raw sampled one. Mutation: guard the remap on
+    /// `!a.diffusion()` (the pre-fix code) ⇒ the reverted step trains at the raw level ⇒ red.
+    #[test]
+    fn a_reverted_aux_step_trains_at_the_remapped_level() {
+        let path = candle_gen_perceptual::testing::skipping_path(AuxLossSchedule {
+            weight: 0.5,
+            t_min: 0.6,
+            t_max: 0.9,
+            every_n: 2,
+        })
+        .unwrap();
+        let sched = BucketSchedule::new(1, &[], 3);
+        let clean = Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        let mut d = AuxDriver::prepare(path, 1, |_| Ok(clean.clone()), &sched, 1, 0).unwrap();
+        let _ = d.sample(1, &sched);
+        let (got, aux) = plan_sigma(&d.sample(2, &sched), 0.1).unwrap();
+        let aux = aux.expect("a perceptual path plans the step");
+        assert!(
+            aux.diffusion() && !aux.has_aux(),
+            "reverted to a diffusion step"
+        );
+        assert_eq!(got, aux.noise_level() as f64);
+        assert_ne!(got, 0.1, "the remapped level, not the sampled one");
     }
 
     fn grad_bits(g: &GradStore, vars: &[Var]) -> Vec<Vec<u32>> {

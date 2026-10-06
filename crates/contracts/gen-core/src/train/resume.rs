@@ -130,8 +130,9 @@ pub fn request_fingerprint(req: &TrainingRequest) -> crate::Result<String> {
 /// `;subject_mask_loss=<background>,<subject>` when on and nothing when off.
 ///
 /// The auxiliary perceptual losses (depth anchoring sc-2125, VAE anchor + E-LatentLPIPS sc-24833)
-/// change the objective, so each enabled one appends `;<loss>=<weight>@<t_min>..<t_max>/<every_n>`;
-/// an off loss appends nothing.
+/// change the objective, so each enabled one appends `;<loss>=<weight>@<t_min>..<t_max>/<every_n>`
+/// (depth anchoring also `,model=<small|base|large>`, its Depth-Anything-V2 size); an off loss
+/// appends nothing.
 ///
 /// The identity / face-landmark losses (sc-24831) change the objective, so each appends its
 /// schedule (and the identity loss its gate + reference mode) when on and nothing when off.
@@ -234,6 +235,13 @@ pub fn training_config_fingerprint(cfg: &TrainingConfig) -> String {
                 ";{tag}={:?}@{:?}..{:?}/{}",
                 schedule.weight, schedule.t_min, schedule.t_max, schedule.every_n
             ));
+            // The depth checkpoint size changes the frozen model the loss compares through.
+            if tag == "depth_anchoring" {
+                fingerprint.push_str(&format!(
+                    ",model={}",
+                    cfg.depth_anchoring.model_size.as_str()
+                ));
+            }
         }
     }
     fingerprint
@@ -650,7 +658,19 @@ mod tests {
             training_config_fingerprint(&lp),
             format!("{base};latent_lpips=0.5@0.0..0.5/1")
         );
-        let fps: Vec<String> = [&off, &va, &lp, &lp_period, &depth]
+        // The depth model size joins the append (a different frozen model). Mutation: drop the
+        // `,model=` append ⇒ `depth` == `depth_large` ⇒ red.
+        assert_eq!(
+            training_config_fingerprint(&depth),
+            format!("{base};depth_anchoring=0.5@0.0..0.5/1,model=small")
+        );
+        let mut depth_large = depth.clone();
+        depth_large.depth_anchoring.model_size = crate::train::DepthModelSize::Large;
+        // Off, the size is inert: the knobs-off fingerprint never names it.
+        let mut off_large = off.clone();
+        off_large.depth_anchoring.model_size = crate::train::DepthModelSize::Large;
+        assert_eq!(training_config_fingerprint(&off_large), base);
+        let fps: Vec<String> = [&off, &va, &lp, &lp_period, &depth, &depth_large]
             .iter()
             .map(|c| training_config_fingerprint(c))
             .collect();

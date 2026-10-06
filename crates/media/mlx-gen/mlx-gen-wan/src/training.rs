@@ -53,8 +53,7 @@ use mlx_gen::train::lora::{
 };
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, plan_step, AuxAlternation, AuxLossSchedule, Parameterization,
-    PerceptualPath, StepPlan,
+    combine_step_loss, AuxAlternation, AuxLossSchedule, Parameterization, PerceptualPath, StepPlan,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
@@ -1109,12 +1108,10 @@ fn latent_frames_nchw(latent: &Array) -> Result<Array> {
 }
 
 /// The perceptual plan of one micro-step with every aux loss's window confined to the routed
-/// expert's noise `band` (epic 2123 E8): an expert only ever trains at noise levels inside its own
-/// band, so an aux-only step lands in `window ∩ band`, and an expert whose band misses a loss's
-/// window never trains that loss (its claims fall through to diffusion). `t` is the band-sampled
-/// noise level; on an aux-only step its position within the band (`u = (t − lo)/(hi − lo)`) is
-/// remapped into the confined window by the shared [`plan_step`] policy, and a diffusion step keeps
-/// `t`. With the full band `(0, 1)` (the dense TI2V-5B) this is exactly [`PerceptualPath::plan`].
+/// expert's noise `band` (epic 2123 E8) — the shared gen-core
+/// [`plan_in_band`](mlx_gen::gen_core::train::plan_in_band) policy over this path's schedules, minus the
+/// losses unusable for `entry`. With the full band `(0, 1)` this is exactly
+/// [`PerceptualPath::plan`].
 fn plan_in_band(
     path: &PerceptualPath,
     key: u32,
@@ -1122,40 +1119,14 @@ fn plan_in_band(
     band: (f32, f32),
     t: f32,
 ) -> Result<StepPlan> {
-    let (lo, hi) = band;
-    let schedules: Vec<AuxLossSchedule> = path
-        .losses()
-        .iter()
-        .map(|l| {
-            let s = l.schedule;
-            let (a, b) = (s.t_min.max(lo), s.t_max.min(hi));
-            if a <= b {
-                AuxLossSchedule {
-                    t_min: a,
-                    t_max: b,
-                    ..s
-                }
-            } else {
-                AuxLossSchedule { weight: 0.0, ..s }
-            }
-        })
-        .collect();
+    let schedules: Vec<AuxLossSchedule> = path.losses().iter().map(|l| l.schedule).collect();
     let usable = (0..schedules.len())
         .map(|i| path.is_usable(entry, i))
         .collect::<Result<Vec<bool>>>()?;
-    let u = if hi > lo {
-        ((t - lo) / (hi - lo)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    // Whether the step is claimed depends only on `key`; a diffusion step keeps the sampled `t`.
-    let claimed = plan_step(&schedules, key, u);
-    let plan = if claimed.diffusion {
-        plan_step(&schedules, key, t)
-    } else {
-        claimed
-    };
-    Ok(plan.without_skipped(|i| !usable[i]))
+    Ok(
+        mlx_gen::gen_core::train::plan_in_band(&schedules, key, band, t)
+            .without_skipped(|i| !usable[i]),
+    )
 }
 
 /// The bucket index of the largest edge in `edges` (the first on a tie; `0` for an empty list) —

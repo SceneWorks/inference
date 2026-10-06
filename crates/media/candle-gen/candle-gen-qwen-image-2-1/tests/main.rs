@@ -31,6 +31,9 @@ mod generator_contract;
 #[path = "pipeline_parity.rs"]
 mod pipeline_parity;
 
+#[path = "pre_epic_golden.rs"]
+mod pre_epic_golden;
+
 #[path = "registration.rs"]
 mod registration;
 

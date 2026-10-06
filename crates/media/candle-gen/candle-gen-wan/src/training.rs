@@ -64,7 +64,7 @@ use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::{LoraHost, LoraSet};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
 use candle_gen::train::perceptual::{
-    plan_step, AuxAlternation, AuxLossSchedule, Parameterization, PerceptualPath, StepPlan,
+    AuxAlternation, AuxLossSchedule, Parameterization, PerceptualPath, StepPlan,
 };
 use candle_gen::train::schedule::schedule_updates;
 use candle_gen::train::taehv::TaehvConfig;
@@ -475,12 +475,10 @@ fn perceptual_alternation(items: usize, accum: u32, n_experts: usize) -> AuxAlte
 }
 
 /// The perceptual plan of one micro-step with every aux loss's window confined to the routed
-/// expert's noise `band` (epic 2123 E8): an expert only ever trains at noise levels inside its band,
-/// so an aux-only step lands in `window ∩ band`, and an expert whose band misses a loss's window never
-/// trains that loss (its claims fall through to diffusion). `t` is the band-sampled level; on an
-/// aux-only step its position within the band is remapped into the confined window by the shared
-/// [`plan_step`] policy, and a diffusion step keeps `t`. With the full band `(0, 1)` (the dense 5B)
-/// this is exactly [`PerceptualPath::plan`].
+/// expert's noise `band` (epic 2123 E8) — the shared gen-core
+/// [`plan_in_band`](candle_gen::gen_core::train::plan_in_band) policy over this path's schedules, minus the
+/// losses unusable for `entry`. With the full band `(0, 1)` this is exactly
+/// [`PerceptualPath::plan`].
 fn plan_in_band(
     path: &PerceptualPath,
     key: u32,
@@ -488,41 +486,16 @@ fn plan_in_band(
     band: (f64, f64),
     t: f64,
 ) -> Result<StepPlan> {
-    let (lo, hi) = (band.0 as f32, band.1 as f32);
+    let band = (band.0 as f32, band.1 as f32);
     let t = t as f32;
-    let schedules: Vec<AuxLossSchedule> = path
-        .losses()
-        .iter()
-        .map(|l| {
-            let s = l.schedule;
-            let (a, b) = (s.t_min.max(lo), s.t_max.min(hi));
-            if a <= b {
-                AuxLossSchedule {
-                    t_min: a,
-                    t_max: b,
-                    ..s
-                }
-            } else {
-                AuxLossSchedule { weight: 0.0, ..s }
-            }
-        })
-        .collect();
+    let schedules: Vec<AuxLossSchedule> = path.losses().iter().map(|l| l.schedule).collect();
     let usable = (0..schedules.len())
         .map(|i| path.is_usable(entry, i))
         .collect::<Result<Vec<bool>>>()?;
-    let u = if hi > lo {
-        ((t - lo) / (hi - lo)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    // Whether the step is claimed depends only on `key`; a diffusion step keeps the sampled `t`.
-    let claimed = plan_step(&schedules, key, u);
-    let plan = if claimed.diffusion {
-        plan_step(&schedules, key, t)
-    } else {
-        claimed
-    };
-    Ok(plan.without_skipped(|i| !usable[i]))
+    Ok(
+        candle_gen::gen_core::train::plan_in_band(&schedules, key, band, t)
+            .without_skipped(|i| !usable[i]),
+    )
 }
 
 /// Tokenize + UMT5-encode `caption` → `[1, 512, 4096]` (f32, zero-padded to 512 — the same context

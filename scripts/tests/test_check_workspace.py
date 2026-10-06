@@ -1961,5 +1961,50 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
         )
 
 
+
+class RootTrainTwinTests(unittest.TestCase):
+    """Epic 2123 feature-end review: the root crates' training-kit twins (`src/train/{perceptual,
+    tae,taehv,vae_anchor,latent_lpips}.rs`) are compared like a family pair."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def tree(self, candle: dict[str, str], mlx: dict[str, str]) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        for crate, files in zip(self.gate.CROSS_BACKEND_ROOT_CRATES, (candle, mlx)):
+            train = root / crate / "src" / "train"
+            train.mkdir(parents=True)
+            for name in self.gate.CROSS_BACKEND_ROOT_TRAIN_TWINS:
+                (train / name).write_text(files.get(name, ""), encoding="utf-8")
+        return root
+
+    def test_the_shipped_root_twins_agree(self) -> None:
+        self.assertEqual(self.gate._root_train_twin_violations(ROOT), [])
+
+    def test_a_diverging_twin_constant_is_reported(self) -> None:
+        root = self.tree(
+            {"tae.rs": "pub(crate) const MIDBLOCK_GN_EPS: f64 = 1e-5;\n"},
+            {"tae.rs": "pub(crate) const MIDBLOCK_GN_EPS: f32 = 1e-6;\n"},
+        )
+        violations = self.gate._root_train_twin_violations(root)
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn("MIDBLOCK_GN_EPS", violations[0])
+
+    def test_spelling_differences_of_one_value_agree(self) -> None:
+        root = self.tree(
+            {"perceptual.rs": "pub const DEPTH_GRAD_WEIGHT: f64 = 0.5;\n"},
+            {"perceptual.rs": "pub const DEPTH_GRAD_WEIGHT: f32 = 5e-1;\n"},
+        )
+        self.assertEqual(self.gate._root_train_twin_violations(root), [])
+
+    def test_a_missing_twin_or_nothing_shared_fails_closed(self) -> None:
+        root = self.tree({}, {})
+        self.assertIn("share no constant", self.gate._root_train_twin_violations(root)[0])
+        (root / self.gate.CROSS_BACKEND_ROOT_CRATES[1] / "src" / "train" / "taehv.rs").unlink()
+        self.assertTrue(
+            any("taehv.rs is missing" in v for v in self.gate._root_train_twin_violations(root))
+        )
+
 if __name__ == "__main__":
     unittest.main()
