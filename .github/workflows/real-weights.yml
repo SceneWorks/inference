@@ -144,11 +144,11 @@ on:
         default: rw-mage
         options: [rw-mage, rw-starvector]
       qwen_image_2_1_lora_phase:
-        description: "MLX 2.1 LoRA: probe, diagnostic, q4-numeric, direction-protocol (diagnostics only), edit, imports, or full"
+        description: "MLX 2.1 LoRA: probe, historical diagnostics, current-diagnostic, edit, imports, or full"
         type: choice
         required: false
         default: full
-        options: [probe, diagnostic, q4-numeric, direction-protocol, edit, imports, full]
+        options: [probe, diagnostic, q4-numeric, direction-protocol, current-diagnostic, edit, imports, full]
       profile:
         description: Real-weight profile to run
         type: choice
@@ -5068,7 +5068,8 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]
     timeout-minutes: 300
     permissions:
-      contents: write # authenticated GET of hash-pinned unpublished transfer assets
+      actions: read # exact current/historical run, job, log and artifact inputs
+      contents: read # checkout plus authenticated GET of hash-pinned transfer assets
     env:
       # Composed from the ONE `~/`-relative hub-root variable every macOS lane already shares; the
       # resolve step below expands the `~/` against whichever Mac claimed the job. The names on the
@@ -5093,6 +5094,9 @@ jobs:
         run: rustc --version && cargo --version
       - name: Require the resolved snapshot paths and initialize evidence
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/require-the-resolved-snapshot-paths-and-initialize-evidence.sh
+      - name: Initialize the current diagnostic-only receipt
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic'
+        run: python3.12 -m scripts.ci.qwen21_current_failed_adapter init --output "$QWEN_IMAGE_2_1_RENDER_OUT"
       - name: Report runner disk headroom
         continue-on-error: true
         run: >-
@@ -5110,16 +5114,25 @@ jobs:
       - name: Build the Qwen-Image 2.1 MLX test binary
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/build-and-record-mlx-library-identity.sh
       - name: Prove trained velocity survives adapter save and reload
+        if: inputs.qwen_image_2_1_lora_phase != 'current-diagnostic'
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
       - name: Materialize and verify immutable snapshots
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
       - name: Materialize hash-pinned transferred adapters
-        if: inputs.qwen_image_2_1_lora_phase != 'probe'
+        if: inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic'
         env:
           GH_TOKEN: ${{ github.token }}
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-hash-pinned-transferred-adapters.sh
+      - name: Bind live job and materialize the exact current failed adapter
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-current-failed-adapter.sh
       - name: Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh
+      - name: Seal a current diagnostic refusal if the selector never started
+        if: ${{ always() && inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' }}
+        run: python3.12 -m scripts.ci.qwen21_current_failed_adapter seal --output "$QWEN_IMAGE_2_1_RENDER_OUT"
       - name: Keep the Qwen-Image 2.1 MLX evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

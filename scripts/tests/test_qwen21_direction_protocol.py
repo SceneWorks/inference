@@ -201,7 +201,8 @@ class DirectionPhaseTests(phases.PhaseTests):
         workflow = yaml.safe_load((ROOT / ".github/workflows/real-weights.yml").read_text(encoding="utf-8"))
         self.assertIn("direction-protocol", workflow[True]["workflow_dispatch"]["inputs"]["qwen_image_2_1_lora_phase"]["options"])
         self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
-        self.assertEqual(workflow["jobs"]["mlx-qwen-image-2-1"]["permissions"], {"contents": "write"})
+        self.assertEqual(workflow["jobs"]["mlx-qwen-image-2-1"]["permissions"],
+                         {"actions": "read", "contents": "read"})
         helper = wiring.WiringTests()
         result, calls, env = helper.run_script(ROOT / "scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-hash-pinned-transferred-adapters.sh", "direction-protocol")
         self.assertEqual(result.returncode, 0, result.stderr)

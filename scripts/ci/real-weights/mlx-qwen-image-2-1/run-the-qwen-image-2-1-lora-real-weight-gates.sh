@@ -4,7 +4,7 @@ phase="${QWEN_IMAGE_2_1_LORA_PHASE:-full}"
 case "$phase" in
   probe) export QWEN_IMAGE_2_1_PROBE_ONLY=1 QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS=1
          export QWEN_IMAGE_2_1_LORA_T2I_STEPS=2 QWEN_IMAGE_2_1_LORA_EDIT_STEPS=2 ;;
-  diagnostic|q4-numeric|direction-protocol|edit|imports|full) ;;
+  diagnostic|q4-numeric|direction-protocol|current-diagnostic|edit|imports|full) ;;
   *) echo "unknown Qwen-Image 2.1 LoRA phase: $phase" >&2; exit 1 ;;
 esac
 echo "$phase" > "$QWEN_IMAGE_2_1_RENDER_OUT/selected-phase.txt"
@@ -28,6 +28,32 @@ run_one() {
     return 1
   fi
 }
+# One exact current-adapter selector. This phase is not included in `full` and runs no integration
+# gate, training, render, replay or historical diagnostic selector.
+if [[ "$phase" == current-diagnostic ]]; then
+  log="$QWEN_IMAGE_2_1_RENDER_OUT/current-diagnostic/current-q4-selector.log"
+  selector_exit=0
+  if cargo test --locked --release -p mlx-gen-qwen-image-2-1 --lib \
+    conditioning_velocity_diagnostic::diagnostic_current_failed_adapter_dense_q4_conditioning_velocity -- --ignored --exact --nocapture --test-threads 1 2>&1 | tee "$log"; then
+    :
+  else
+    codes=("${PIPESTATUS[@]}")
+    selector_exit="${codes[0]}"
+    if [[ "${codes[1]}" != 0 ]]; then selector_exit=1; fi
+    echo "::error::Current failed-adapter Q4 diagnostic failed" >&2
+  fi
+  if [[ "$selector_exit" == 0 ]] && ! grep -qE 'test result: ok\. 1 passed' "$log"; then
+    selector_exit=1
+    echo "::error::Current Q4 diagnostic did not run exactly one passing test" >&2
+  fi
+  printf '%s\n' "$selector_exit" > "$QWEN_IMAGE_2_1_RENDER_OUT/current-diagnostic/selector.exit-code"
+  if ! python3.12 -m scripts.ci.qwen21_current_failed_adapter finish \
+    --output "$QWEN_IMAGE_2_1_RENDER_OUT" --selector-exit "$selector_exit"; then
+    echo "::error::Current Q4 diagnostic receipt is missing or incomplete" >&2
+    exit 1
+  fi
+  exit "$selector_exit"
+fi
 # Serial DIAGNOSTIC_ONLY style six captures and the fixed16 teacher-forced forwards.
 # Retain both receipts if an independent style assertion fails; either failure keeps the phase red.
 if [[ "$phase" == direction-protocol ]]; then
