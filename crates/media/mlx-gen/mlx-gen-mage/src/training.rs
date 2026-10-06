@@ -781,18 +781,11 @@ impl MageFlowTrainer {
         // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: every entry's perceptual reference built once, per-image, per-update
-        // alternation keyed on the real dataset item; a resumed run replays the skipped prefix so
-        // the phase matches.
+        // Epic 2123 E8: every entry's perceptual reference built once; the alternation interleaves
+        // optimizer windows over the schedule's epochs (sc-2124) — a pure function of the step, so
+        // a resumed run needs no replay.
         let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(
-                path,
-                &cache,
-                &schedule,
-                accum,
-                start_step,
-                &req.cancel,
-            )?),
+            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
             None => None,
         };
         let mut accumulated: Option<LoraParams> = None;
@@ -1532,14 +1525,13 @@ fn tokens_to_latent_grid(tokens: &Array, grid: i32) -> Result<Array> {
 }
 
 /// The loop's [`AuxDriver`] (epic 2123 E8): every cache entry's perceptual reference, once per job
-/// (keyed per (item, bucket) entry); the alternation keyed on the schedule's items with `accum`
-/// micro-steps per update, and a resumed prefix `1..=start_step` replayed.
+/// (keyed per (item, bucket) entry); the alternation over the schedule's epochs with `accum`
+/// micro-steps per update.
 fn aux_driver(
     path: PerceptualPath,
     cache: &[CachedSample],
     schedule: &BucketSchedule,
     accum: u32,
-    start_step: u32,
     cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
@@ -1548,15 +1540,15 @@ fn aux_driver(
         |i| tokens_to_latent_grid(&cache[i].latent_tokens, cache[i].grid),
         schedule,
         accum,
-        start_step,
         cancel,
     )
 }
 
 /// One LoRA/LoKr micro-step on the 1-based `step`: the step's (item, bucket) entry from the bucket
 /// schedule, its seeded σ + noise (exactly as before epic 2123), the perceptual plan when a path is
-/// configured (alternation keyed on the real item; an aux-only step trains at σ remapped into the
-/// loss window), then [`compute_loss_grads`]. With no path the step is bit-identical to before.
+/// configured (alternation keyed on the step's optimizer window; an aux-only step trains at σ
+/// remapped into the loss window), then [`compute_loss_grads`]. With no path the step is
+/// bit-identical to before.
 #[allow(clippy::too_many_arguments)]
 fn run_train_step(
     transformer: &mut MageTransformer,
@@ -2848,7 +2840,6 @@ mod depth_anchoring_tests {
             cache,
             &single_bucket(cache.len()),
             1,
-            0,
             &Default::default(),
         )
         .unwrap()
@@ -2916,23 +2907,30 @@ mod depth_anchoring_tests {
         assert!(gb > 0.0 && gb.is_finite(), "LoRA-B grad |Σ| = {gb}");
     }
 
-    /// Alternation keys on the real item and references are built once per entry. Mutations: key
-    /// the plan on the global step ⇒ with 2 round-robin items each item is locked to one kind ⇒
-    /// red; build the references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
+    /// The alternation interleaves (never two depth steps in a row) and gives each of 2
+    /// round-robin items both kinds (sc-2124); references are built once per entry. Mutations: key
+    /// the plan on the bare global step (no period) ⇒ item 0 is locked to diffusion ⇒ red; build
+    /// the references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
     #[test]
-    fn every_item_alternates_and_references_are_built_once() {
+    fn every_item_gets_both_kinds_and_references_are_built_once() {
         let (mut dit, dcfg) = fixture_model();
         let cfg = cfg();
         let (adapter, params) = adapter(&mut dit, &cfg);
         let cache = cache_n(&dcfg, 2);
         let mut d = prepared(&cache, dcfg.in_channels);
         let mut kinds = vec![Vec::new(), Vec::new()];
+        let mut flags = Vec::new();
         for n in 1..=8u32 {
             let (l, _) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), n);
             kinds[((n - 1) % 2) as usize].push(l.aux.is_some());
+            flags.push(l.aux.is_some());
         }
+        assert!(
+            flags.windows(2).all(|w| !(w[0] && w[1])),
+            "two depth steps in a row: {flags:?}"
+        );
         for k in &kinds {
-            assert_eq!(k, &vec![false, true, false, true], "{kinds:?}");
+            assert!(k.contains(&true) && k.contains(&false), "{kinds:?}");
         }
         assert_eq!(d.path().reference_computations(), cache.len());
     }

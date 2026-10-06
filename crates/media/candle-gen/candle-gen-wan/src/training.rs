@@ -461,17 +461,13 @@ fn check_perceptual_memory(
     flow_match::check_aux_memory(LABEL, base_bytes, aux, budget_bytes)
 }
 
-/// The dataset item `step` trains on (the item half of [`expert_cache_index`]'s `(item, bucket)`) —
-/// what the perceptual alternation keys on (epic 2123 E8).
-fn expert_item(step: u32, dual: bool, schedule: &BucketSchedule) -> usize {
-    schedule.sample(expert_sample_counter(step, dual)).0
-}
-
-/// The perceptual alternation over `items` dataset items (epic 2123 E8): one window is one optimizer
-/// update of every expert — `accum` micro-steps per expert, the experts interleaving by step parity,
-/// so `accum · n_experts` global micro-steps — so each expert's update is all diffusion or all aux.
-fn perceptual_alternation(items: usize, accum: u32, n_experts: usize) -> AuxAlternation {
-    AuxAlternation::new(items, accum * n_experts as u32)
+/// The perceptual alternation over the loop's visit order (epic 2123 E8): one schedule epoch per
+/// `n_experts` global steps (each expert sweeps the schedule, see [`expert_sample_counter`]), and
+/// one window per optimizer update of every expert — `accum` micro-steps per expert, the experts
+/// interleaving by step parity, so `accum · n_experts` global micro-steps — so each expert's update
+/// is all diffusion or all aux.
+fn perceptual_alternation(epoch_len: usize, accum: u32, n_experts: usize) -> AuxAlternation {
+    AuxAlternation::new(epoch_len * n_experts, accum * n_experts as u32)
 }
 
 /// The perceptual plan of one micro-step with every aux loss's window confined to the routed
@@ -481,7 +477,7 @@ fn perceptual_alternation(items: usize, accum: u32, n_experts: usize) -> AuxAlte
 /// [`PerceptualPath::plan`].
 fn plan_in_band(
     path: &PerceptualPath,
-    key: u32,
+    key: impl Into<candle_gen::train::perceptual::AltKey>,
     entry: usize,
     band: (f64, f64),
     t: f64,
@@ -1149,8 +1145,8 @@ impl WanMoeTrainer {
         // sc-2127: which cached (item, bucket) latent each expert visit trains on.
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: references once per (item, bucket) entry; alternation keyed on the real item
-        // with one window per update of every expert (the trainer has no resume, so no replay).
+        // Epic 2123 E8: references once per (item, bucket) entry; the alternation interleaves
+        // windows of one update of every expert.
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
             // cropped like the image and resampled onto its decoded size.
@@ -1163,9 +1159,9 @@ impl WanMoeTrainer {
             )?;
             prepare_perceptual_references(path, cache.iter().map(|(x0, _, _)| x0), masks)?;
         }
-        let mut alternation = perceptual.as_ref().map(|_| {
+        let alternation = perceptual.as_ref().map(|_| {
             perceptual_alternation(
-                cache.len() / edges.len(),
+                schedule.epoch_len(),
                 cfg.gradient_accumulation.max(1),
                 if dual { 2 } else { 1 },
             )
@@ -1253,9 +1249,9 @@ impl WanMoeTrainer {
             );
             // Epic 2123 E8: plan the step (windows confined to this expert's band); an aux-only step
             // trains at the remapped noise level.
-            let aux = match (perceptual.as_ref(), alternation.as_mut()) {
+            let aux = match (perceptual.as_ref(), alternation.as_ref()) {
                 (Some(path), Some(alt)) => {
-                    let key = alt.key(step, expert_item(step, dual, &schedule));
+                    let key = alt.key(step);
                     let plan = plan_in_band(path, key, ci, band, t)?;
                     t = plan.noise_level as f64;
                     Some(AuxStep {
@@ -2567,8 +2563,9 @@ mod depth_anchoring_tests {
     /// Each expert trains its aux steps only inside its band: with the depth window `[0.2, 0.6]`
     /// the low-noise band `[0, 0.875]` trains depth inside the window while the high-noise band
     /// `[0.875, 1]` falls through to diffusion; the full band equals `PerceptualPath::plan`; and with
-    /// the dual MoE + accumulation 2 every expert's update window is one step kind. Mutations: drop
-    /// the band confinement ⇒ red; build the alternation with `accum` alone ⇒ red.
+    /// the dual MoE + accumulation 2 every expert's update window is one step kind, and an expert's
+    /// consecutive updates never both train aux-only (sc-2124). Mutations: drop the band
+    /// confinement ⇒ red; build the alternation with `accum` alone ⇒ red.
     #[test]
     fn aux_steps_stay_inside_each_experts_band_and_update_window() {
         let f = fixture();
@@ -2602,12 +2599,12 @@ mod depth_anchoring_tests {
             }],
             7,
         );
-        let mut alt = perceptual_alternation(items, 2, 2);
+        let alt = perceptual_alternation(sched.epoch_len(), 2, 2);
         let mut kinds: [Vec<bool>; 2] = [Vec::new(), Vec::new()];
         for s in 1..=24u32 {
             let ei = expert_index(s, true);
             let band = if ei == 0 { (0.875, 1.0) } else { (0.0, 0.875) };
-            let key = alt.key(s, expert_item(s, true, &sched));
+            let key = alt.key(s);
             let plan = plan_in_band(
                 &p,
                 key,
@@ -2625,6 +2622,11 @@ mod depth_anchoring_tests {
             assert!(
                 k.contains(&true) && k.contains(&false),
                 "expert {ei}: {k:?}"
+            );
+            let updates: Vec<bool> = k.chunks(2).map(|w| w[0]).collect();
+            assert!(
+                updates.windows(2).all(|u| !(u[0] && u[1])),
+                "expert {ei}: two aux-only updates in a row {updates:?}"
             );
         }
     }

@@ -1758,15 +1758,14 @@ fn perceptual_footprint_bytes(
 }
 
 /// The loop's [`AuxDriver`] (epic 2123 E8): every cache entry's perceptual reference computed once
-/// (its clean packed target latent, unpacked to the decoder layout at the entry's own target
-/// grid), keyed per (item, bucket) entry; the alternation keyed on the schedule's items with
-/// `accum` micro-steps per update, and a resumed prefix `1..=start_step` replayed.
+/// (its clean packed target latent, unpacked to the decoder layout at the entry's own target grid),
+/// keyed per (item, bucket) entry; the alternation over the schedule's epochs with `accum`
+/// micro-steps per update.
 fn aux_driver(
     path: PerceptualPath,
     cache: &[CachedItem],
     schedule: &BucketSchedule,
     accum: u32,
-    start_step: u32,
     cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
@@ -1775,15 +1774,14 @@ fn aux_driver(
         |i| unpack_to_decoder_layout(&cache[i].x0, &cache[i].layout),
         schedule,
         accum,
-        start_step,
         cancel,
     )
 }
 
 /// One training micro-step on the 1-based `step`: pick the step's cached (item, bucket) entry,
-/// sample its `t` and noise (seeded, exactly as before epic 2123), plan the step's loss terms through
-/// the perceptual path (when one is configured: the alternation key comes from the item's own update
-/// count, and an aux-only step trains at `t` remapped into the loss window), and run
+/// sample its `t` and noise (seeded, exactly as before epic 2123), plan the step's loss terms
+/// through the perceptual path (when one is configured: the alternation key comes from the step's
+/// optimizer window, and an aux-only step trains at `t` remapped into the loss window), and run
 /// [`compute_step_loss_grads`]. With no perceptual path every step is the plain diffusion step,
 /// bit-identical to the pre-epic-2123 loop.
 #[allow(clippy::too_many_arguments)]
@@ -2433,16 +2431,15 @@ impl QwenImage21Trainer {
         // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on
-        // the real dataset item (not the (item, bucket) entry). A resumed run replays the skipped
-        // prefix so the phase matches.
+        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
+        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
+        // replay.
         let mut aux_driver = match perceptual {
             Some(path) => Some(aux_driver(
                 path,
                 &cache,
                 &schedule,
                 accum,
-                start_step,
                 &Default::default(),
             )?),
             None => None,
@@ -5578,7 +5575,6 @@ mod depth_anchoring_tests {
                     &cache,
                     &schedule,
                     1,
-                    0,
                     &Default::default(),
                 )
                 .unwrap();
@@ -5613,15 +5609,8 @@ mod depth_anchoring_tests {
         let mut f = fixture(&cfg);
         let cache = vec![edit_entry(1)];
         let schedule = single_bucket(1);
-        let mut d = aux_driver(
-            path_with(window),
-            &cache,
-            &schedule,
-            1,
-            0,
-            &Default::default(),
-        )
-        .unwrap();
+        let mut d =
+            aux_driver(path_with(window), &cache, &schedule, 1, &Default::default()).unwrap();
         step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, false);
         let (depth, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, false);
         let raw = sample_sigma(
@@ -5673,11 +5662,13 @@ mod depth_anchoring_tests {
         );
     }
 
-    /// Per-image alternation (round-robin N = 2) and per-entry references across two buckets with
-    /// different target grids (every step recomputed against its SCHEDULED entry). Mutations: key
-    /// the plan on the global step ⇒ red; pass the item as the `AuxStep` entry ⇒ red.
+    /// Interleaved alternation (round-robin N = 2: no two depth steps in a row, each image both
+    /// kinds within 3 epochs, sc-2124) and per-entry references across two buckets of different
+    /// grids (every step recomputed against its SCHEDULED entry). Mutations: key the plan on the
+    /// bare global step (no period) ⇒ image 0 never trains depth ⇒ red; pass the item as the
+    /// `AuxStep` entry ⇒ a bucket-1 depth step compares against bucket 0's reference ⇒ red.
     #[test]
-    fn alternation_is_per_image_with_per_entry_references() {
+    fn alternation_interleaves_with_per_entry_references() {
         let cfg = cfg();
         let mut f = fixture(&cfg);
         let cache = vec![t2i_entry(4, 4, 1), t2i_entry(4, 4, 2)];
@@ -5687,16 +5678,19 @@ mod depth_anchoring_tests {
             &cache,
             &schedule,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();
-        let kinds: Vec<(usize, bool)> = (1..=4)
+        let kinds: Vec<(usize, bool)> = (1..=6)
             .map(|n| {
                 let (l, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), n, false);
                 (schedule.sample((n - 1) as usize).0, l.aux.is_some())
             })
             .collect();
+        assert!(
+            kinds.windows(2).all(|w| !(w[0].1 && w[1].1)),
+            "two depth steps in a row: {kinds:?}"
+        );
         for image in 0..2 {
             let mine: Vec<bool> = kinds.iter().filter(|k| k.0 == image).map(|k| k.1).collect();
             assert!(mine.contains(&true) && mine.contains(&false), "{kinds:?}");
@@ -5728,11 +5722,10 @@ mod depth_anchoring_tests {
             &cache,
             &schedule,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();
-        let mut replay = mlx_gen::train::perceptual::AuxAlternation::new(2, 1);
+        let alternation = mlx_gen::train::perceptual::AuxAlternation::new(schedule.epoch_len(), 1);
         let mut depth_off_item = false;
         for n in 1..=2 * schedule.epoch_len() as u32 {
             let (l, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), n, false);
@@ -5744,7 +5737,7 @@ mod depth_anchoring_tests {
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
             )
             .unwrap();
-            let plan = d.path().plan(replay.key(n, item), entry, raw).unwrap();
+            let plan = d.path().plan(alternation.key(n), entry, raw).unwrap();
             let c = &cache[entry];
             let noise = random::normal::<f32>(
                 c.x0.shape(),
@@ -5853,7 +5846,6 @@ mod depth_anchoring_tests {
             &cache,
             &schedule,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();

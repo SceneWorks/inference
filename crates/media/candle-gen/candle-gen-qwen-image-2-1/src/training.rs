@@ -2370,7 +2370,7 @@ impl QwenImage21Trainer {
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         // Epic 2123 E8: each (item, bucket) entry's reference once (its packed target unpacked to
-        // the decoder grid), alternation keyed on the real item, the resumed prefix replayed.
+        // the decoder grid), the alternation over the schedule's windows.
         // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
         // cropped like the image and resampled onto its decoded size.
         let mut perceptual = perceptual;
@@ -2398,7 +2398,6 @@ impl QwenImage21Trainer {
                 |i| target_decoder_latent(&cache[i].x0, &cache[i].layout),
                 &schedule,
                 accum,
-                start_step,
                 &req.cancel,
             )?),
             None => None,
@@ -5776,7 +5775,6 @@ mod tests {
                 |_| Ok(clean.clone()),
                 &sched,
                 1,
-                0,
                 &Default::default(),
             )
             .unwrap();
@@ -5919,7 +5917,6 @@ mod tests {
                 |_| Ok(clean.clone()),
                 &sched,
                 1,
-                0,
                 &Default::default(),
             )
             .unwrap();

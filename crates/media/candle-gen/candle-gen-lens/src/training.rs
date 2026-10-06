@@ -1376,7 +1376,6 @@ mod tests {
                 |_| Ok(clean.clone()),
                 &sched,
                 1,
-                0,
                 &Default::default(),
             )
             .unwrap();

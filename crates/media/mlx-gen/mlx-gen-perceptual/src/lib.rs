@@ -11,7 +11,7 @@
 //!
 //! then drives the path as the kit documents ([`mlx_gen::train::perceptual`]): an
 //! [`AuxDriver`](mlx_gen::train::perceptual::AuxDriver) builds references per (item, bucket) cache
-//! entry and keys the alternation on the real item index (replaying a resumed prefix), then
+//! entry and interleaves the alternation over the schedule's optimizer windows, then
 //! `plan` / `aux_loss` / `combine_step_loss` in the step.
 //!
 //! ## Adding a loss (S10 identity/face, S11 body, S12 latent losses …)

@@ -25,8 +25,8 @@ pub mod subject_mask;
 use std::path::PathBuf;
 
 pub use aux_schedule::{
-    combine_step_terms, perceptual_footprint_bytes, plan_in_band, plan_step, AuxAlternation,
-    AuxModelFootprint, StepPlan,
+    combine_step_terms, perceptual_footprint_bytes, plan_in_band, plan_step, AltKey,
+    AuxAlternation, AuxModelFootprint, StepPlan,
 };
 pub use body::BodyLossesConfig;
 pub use schedule::LrSchedule;
@@ -461,13 +461,13 @@ pub struct AuxLossSchedule {
     pub t_min: f32,
     /// Inclusive upper bound of the noise-level window (see [`t_min`](Self::t_min)).
     pub t_max: f32,
-    /// Alternation period, counted per image and per optimizer update (see
-    /// [`aux_schedule::AuxAlternation`]):
+    /// Alternation period, counted in optimizer updates (see [`aux_schedule::AltKey::claims`]):
     /// - `1` — the weighted aux loss is **added** to the diffusion loss on every in-window step;
-    /// - `n ≥ 2` — every `n`-th update of each image is an **aux-only** update on which the
-    ///   diffusion loss contributes **zero**; the others are diffusion-only. An aux-only update
-    ///   samples its noise level inside `[t_min, t_max]`, so no step is wasted. `2` (the default)
-    ///   is the upstream strict alternation.
+    /// - `n ≥ 2` — about every `n`-th optimizer update is an **aux-only** update on which the
+    ///   diffusion loss contributes **zero** (never two in a row); the others are diffusion-only.
+    ///   The phase drifts per pass over the data, so every image gets both kinds. An aux-only
+    ///   update samples its noise level inside `[t_min, t_max]`, so no step is wasted. `2` (the
+    ///   default) is upstream's every-other-update alternation.
     pub every_n: u32,
 }
 
