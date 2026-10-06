@@ -960,15 +960,15 @@ mod depth_anchoring_tests {
     use super::*;
     use family::test_support::{tiny_unet, TINY_CONTEXT_DIM, TINY_POOLED_DIM};
     use family::{
-        compute_step_loss_grads, load_perceptual_path, perceptual_footprint_gb,
-        preflight_memory_guard_with_budget, prepare_perceptual_references, resolve_target_paths,
-        run_train_step, AuxStep, CachedSample, StepLosses,
+        aux_driver, compute_step_loss_grads, load_perceptual_path, perceptual_footprint_gb,
+        preflight_memory_guard_with_budget, resolve_target_paths, run_train_step, AuxStep,
+        CachedSample, StepLosses,
     };
     use mlx_gen::gen_core::BucketSchedule;
     use mlx_gen::train::lora::{build_lora_targets, LoraParams, TrainAdapter};
     use mlx_gen::train::loss::reduce_loss;
     use mlx_gen::train::perceptual::{
-        AuxAlternation, AuxLossSchedule, Parameterization, PerceptualPath,
+        AuxDriver, AuxLossSchedule, Parameterization, PerceptualPath,
     };
     use mlx_gen::TrainingConfig;
     use mlx_rs::error::{Exception, Result as MlxResult};
@@ -1072,10 +1072,8 @@ mod depth_anchoring_tests {
         )
     }
 
-    fn prepared(cache: &[CachedSample], accum: u32) -> (PerceptualPath, AuxAlternation) {
-        let mut p = path();
-        prepare_perceptual_references(&mut p, cache).unwrap();
-        (p, AuxAlternation::new(cache.len(), accum))
+    fn prepared(cache: &[CachedSample], accum: u32) -> AuxDriver {
+        aux_driver(path(), cache, &single_bucket(cache.len()), accum, 0).unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1086,7 +1084,7 @@ mod depth_anchoring_tests {
         adapter: &TrainAdapter,
         cfg: &TrainingConfig,
         cache: &[CachedSample],
-        path: Option<(&mut PerceptualPath, &mut AuxAlternation)>,
+        path: Option<&mut AuxDriver>,
         n: u32,
         ckpt: Option<Vec<String>>,
     ) -> (StepLosses, LoraParams) {
@@ -1179,7 +1177,7 @@ mod depth_anchoring_tests {
             let (adapter, params) = adapter(&mut unet, &cfg);
             let targets = ckpt.then(|| checkpoint_targets(&adapter));
             let cache = cache_n(1);
-            let (mut p, mut alt) = prepared(&cache, 1);
+            let mut d = prepared(&cache, 1);
             let (diff, _) = step(
                 &h,
                 &mut unet,
@@ -1187,7 +1185,7 @@ mod depth_anchoring_tests {
                 &adapter,
                 &cfg,
                 &cache,
-                Some((&mut p, &mut alt)),
+                Some(&mut d),
                 1,
                 targets.clone(),
             );
@@ -1203,7 +1201,7 @@ mod depth_anchoring_tests {
                 &adapter,
                 &cfg,
                 &cache,
-                Some((&mut p, &mut alt)),
+                Some(&mut d),
                 2,
                 targets,
             );
@@ -1238,9 +1236,8 @@ mod depth_anchoring_tests {
         cfg.depth_anchoring.schedule = window;
         let (adapter, params) = adapter(&mut unet, &cfg);
         let cache = cache_n(1);
-        let mut p = path_with(window);
-        prepare_perceptual_references(&mut p, &cache).unwrap();
-        let mut alt = AuxAlternation::new(1, 1);
+        let mut d =
+            aux_driver(path_with(window), &cache, &single_bucket(cache.len()), 1, 0).unwrap();
         let mut l = None;
         for n in 1..=2 {
             l = Some(step(
@@ -1250,7 +1247,7 @@ mod depth_anchoring_tests {
                 &adapter,
                 &cfg,
                 &cache,
-                Some((&mut p, &mut alt)),
+                Some(&mut d),
                 n,
                 None,
             ));
@@ -1261,7 +1258,7 @@ mod depth_anchoring_tests {
         let raw = h
             .sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(2))
             .unwrap();
-        let plan = p.plan(2, 0, h.noise_level(raw)).unwrap();
+        let plan = d.path().plan(2, 0, h.noise_level(raw)).unwrap();
         let t = h.timestep_at(plan.noise_level);
         assert!((600.0..=800.0).contains(&t.unet_time()), "{t:?}");
         assert_ne!(t.unet_time(), raw.unet_time());
@@ -1291,7 +1288,7 @@ mod depth_anchoring_tests {
             Dtype::Float32,
             None,
             Some(AuxStep {
-                path: &p,
+                path: d.path(),
                 plan: &plan,
                 entry: 0,
             }),
@@ -1312,7 +1309,7 @@ mod depth_anchoring_tests {
             let cfg = cfg();
             let (adapter, params) = adapter(&mut unet, &cfg);
             let cache = cache_n(n_items);
-            let (mut p, mut alt) = prepared(&cache, accum);
+            let mut d = prepared(&cache, accum);
             let schedule = single_bucket(cache.len());
             let kinds: Vec<(usize, bool)> = (1..=steps)
                 .map(|n| {
@@ -1323,7 +1320,7 @@ mod depth_anchoring_tests {
                         &adapter,
                         &cfg,
                         &cache,
-                        Some((&mut p, &mut alt)),
+                        Some(&mut d),
                         n,
                         None,
                     );
@@ -1345,7 +1342,7 @@ mod depth_anchoring_tests {
                 }
                 assert!(kinds.iter().any(|k| k.1), "{kinds:?}");
             }
-            assert_eq!(p.reference_computations(), cache.len());
+            assert_eq!(d.path().reference_computations(), cache.len());
         }
     }
 
@@ -1400,9 +1397,7 @@ mod depth_anchoring_tests {
             ],
             7,
         );
-        let mut p = path();
-        prepare_perceptual_references(&mut p, &cache).unwrap();
-        let mut alt = AuxAlternation::new(items, 1);
+        let mut d = aux_driver(path(), &cache, &schedule, 1, 0).unwrap();
         let steps = 2 * schedule.epoch_len() as u32;
         let mut depth_on_bucket1 = false;
         for n in 1..=steps {
@@ -1414,7 +1409,7 @@ mod depth_anchoring_tests {
                 &cfg,
                 &cache,
                 &schedule,
-                Some((&mut p, &mut alt)),
+                Some(&mut d),
                 n,
                 false,
                 Dtype::Float32,
@@ -1425,7 +1420,7 @@ mod depth_anchoring_tests {
             depth_on_bucket1 |= l.aux.is_some() && entry % 2 == 1;
         }
         assert!(depth_on_bucket1, "no depth step on the second bucket");
-        assert_eq!(p.reference_computations(), cache.len());
+        assert_eq!(d.path().reference_computations(), cache.len());
     }
 
     /// E1: with depth off nothing is loaded, the estimate adds nothing, and the step is
@@ -1500,7 +1495,7 @@ mod depth_anchoring_tests {
         let dcfg = self::cfg();
         let mut unet2 = tiny_unet(3).unwrap();
         let (adapter2, params2) = self::adapter(&mut unet2, &dcfg);
-        let (mut p, mut alt) = prepared(&cache, 1);
+        let mut d = prepared(&cache, 1);
         let (on1, g_on1) = step(
             &h,
             &mut unet2,
@@ -1508,7 +1503,7 @@ mod depth_anchoring_tests {
             &adapter2,
             &dcfg,
             &cache,
-            Some((&mut p, &mut alt)),
+            Some(&mut d),
             1,
             None,
         );
@@ -1548,23 +1543,46 @@ mod depth_anchoring_tests {
         for (checkpointed, base) in [(false, dense), (true, ckpt)] {
             let budget = between(base);
             assert!(
-                preflight_memory_guard_with_budget(&h, &edges, true, 0.0, checkpointed, budget)
-                    .is_ok(),
+                preflight_memory_guard_with_budget(
+                    &h,
+                    &on,
+                    &edges,
+                    true,
+                    0.0,
+                    checkpointed,
+                    budget
+                )
+                .is_ok(),
                 "checkpointed={checkpointed}"
             );
             assert!(
-                preflight_memory_guard_with_budget(&h, &edges, true, large, checkpointed, budget)
-                    .is_err(),
+                preflight_memory_guard_with_budget(
+                    &h,
+                    &on,
+                    &edges,
+                    true,
+                    large,
+                    checkpointed,
+                    budget
+                )
+                .is_err(),
                 "checkpointed={checkpointed}"
             );
         }
+        // The checkpointed refusal names the enabled aux losses (the shared E7 guard).
+        let err =
+            preflight_memory_guard_with_budget(&h, &on, &edges, true, large, true, between(ckpt))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("[depth]"), "{err}");
         // Checkpointed with no aux models: not guarded, even at a starvation budget.
-        assert!(preflight_memory_guard_with_budget(&h, &edges, true, 0.0, true, 1).is_ok());
-        assert!(preflight_memory_guard_with_budget(&h, &edges, true, 0.0, false, 1).is_err());
+        assert!(preflight_memory_guard_with_budget(&h, &on, &edges, true, 0.0, true, 1).is_ok());
+        assert!(preflight_memory_guard_with_budget(&h, &on, &edges, true, 0.0, false, 1).is_err());
         let roomy = ((dense + large) / 0.85 * GIB) as usize * 2;
         for checkpointed in [false, true] {
             assert!(preflight_memory_guard_with_budget(
                 &h,
+                &on,
                 &edges,
                 true,
                 large,

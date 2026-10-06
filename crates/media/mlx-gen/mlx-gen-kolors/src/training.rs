@@ -1137,6 +1137,7 @@ mod depth_anchoring_tests {
             let budget = ((base + large / 2.0) / 0.85 * GIB) as usize;
             assert!(preflight_memory_guard_with_budget(
                 &h,
+                &on,
                 &[1024],
                 true,
                 0.0,
@@ -1146,6 +1147,7 @@ mod depth_anchoring_tests {
             .is_ok());
             assert!(preflight_memory_guard_with_budget(
                 &h,
+                &on,
                 &[1024],
                 true,
                 large,
