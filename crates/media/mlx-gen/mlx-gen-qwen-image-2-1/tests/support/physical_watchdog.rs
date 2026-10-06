@@ -197,6 +197,34 @@ pub fn admit_numeric_full(
     admit_full(host, envelope, explicit_cap)
 }
 
+/// Reserve the diagnostic's entire frozen free-cache allowance, then derive the
+/// typed allocator grant from the actual current cache policy. The reservation
+/// cannot shrink merely because a previous task left the process cache lower.
+pub fn admit_numeric_scoped(
+    host: Host,
+    envelope: u64,
+    frozen_free_cache: u64,
+    explicit_cap: Option<u64>,
+) -> Result<(u64, AdmissionGrant), String> {
+    let reserved_ceiling = admit_numeric_full(host, envelope, frozen_free_cache, explicit_cap)?;
+    let mut installed_host = host;
+    installed_host.cache_limit = host.cache_limit.min(frozen_free_cache);
+    let installed = admit(installed_host, envelope, Some(reserved_ceiling))?;
+    if installed.full_envelope > reserved_ceiling {
+        return Err(format!(
+            "installed numeric cache grant {} exceeds reserved physical ceiling {reserved_ceiling}",
+            installed.full_envelope
+        ));
+    }
+    Ok((
+        reserved_ceiling,
+        AdmissionGrant {
+            physical_ceiling: reserved_ceiling,
+            ..installed
+        },
+    ))
+}
+
 /// Parse the printed `vm_stat` snapshot, whose "Pages free" excludes speculative
 /// pages. Its printed free, speculative and inactive buckets are disjoint.
 /// Raw Mach `free_count` already contains speculative pages and is a different
@@ -327,6 +355,38 @@ mod tests {
             measured.cache_limit, 0,
             "reservation must not alter allocator policy"
         );
+    }
+
+    #[test]
+    fn numeric_scoped_reserves_frozen_allowance_and_types_actual_cache() {
+        let measured = Host {
+            cache_limit: 0,
+            ..host()
+        };
+        let active = 69_080_366_523;
+        let reserve = 11_142_168_576;
+        let (ceiling, grant) =
+            admit_numeric_scoped(measured, active, reserve, Some(100_000_000_000)).unwrap();
+        assert_eq!(ceiling, 80_222_535_099 + GIB / 2);
+        assert_eq!(grant.physical_ceiling, ceiling);
+        assert_eq!(grant.requested_cache_limit, 0);
+        assert_eq!(grant.effective_cache_limit, 0);
+        assert_eq!(
+            grant.full_envelope,
+            grant.active_envelope + grant.nonallocator_overhead
+        );
+        assert!(grant.full_envelope < ceiling);
+
+        let with_existing_cache = Host {
+            cache_limit: reserve * 2,
+            ..host()
+        };
+        let (ceiling, grant) =
+            admit_numeric_scoped(with_existing_cache, active, reserve, Some(100_000_000_000))
+                .unwrap();
+        assert_eq!(grant.requested_cache_limit, reserve);
+        assert_eq!(grant.effective_cache_limit, reserve);
+        assert_eq!(grant.full_envelope, ceiling);
     }
     #[test]
     fn every_headroom_boundary_caps_cache_allowance_independently() {
