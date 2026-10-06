@@ -518,7 +518,6 @@ fn run(binding: Binding) -> Result<()> {
     let _owner = crate::q4_diagnostic::production_owner_scope();
     assert!(mlx_rs::task_local_default_stream().is_none());
     assert!(mlx_rs::Stream::new() == mlx_rs::Stream::gpu());
-    let _retire_on_drop = RetireOnDrop;
     let source = &prepared_binding.source_candidate;
     let manifest_path = &prepared_binding.manifest_path;
     let manifest = &prepared_binding.manifest;
@@ -543,6 +542,11 @@ fn run(binding: Binding) -> Result<()> {
         active_limit - math::FREE_CACHE,
         math::FREE_CACHE,
     );
+    // Declared after every admission/policy guard and before all native model/
+    // array locals. Reverse local drop order retires native values first, then
+    // synchronizes/clears on this owner thread while the bounds, cache grant,
+    // and physical watchdog are still active.
+    let _retire_on_drop = RetireOnDrop;
     let mut cache = math::Cache::default();
     // Retained masks/layout, serialized metadata, position ids, and small receipt
     // buffers are charged in addition to every copied full tensor below.

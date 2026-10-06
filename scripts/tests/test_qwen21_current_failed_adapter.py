@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -105,6 +107,43 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             with self.subTest(jobs=jobs), self.assertRaises(ValueError):
                 current.validate_live(candidate_run, {"jobs": jobs}, self.cfg, candidate_context)
 
+    def test_shallow_checkout_acquires_exact_base_without_moving_head_or_ref(self):
+        def run(root, *args, check=True):
+            return subprocess.run(["git", *args], cwd=root, check=check, text=True,
+                                  encoding="utf-8",
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            origin = root / "origin"
+            run(root, "init", "-b", "main", str(origin))
+            run(origin, "config", "user.name", "fixture")
+            run(origin, "config", "user.email", "fixture@example.invalid")
+            (origin / "base.txt").write_text("base\n", encoding="utf-8")
+            run(origin, "add", "base.txt"); run(origin, "commit", "-m", "base")
+            base = run(origin, "rev-parse", "HEAD").stdout.strip()
+            base_tree = run(origin, "rev-parse", "HEAD^{tree}").stdout.strip()
+            (origin / "head.txt").write_text("head\n", encoding="utf-8")
+            run(origin, "add", "head.txt"); run(origin, "commit", "-m", "head")
+            checkout = root / "checkout"
+            run(root, "clone", "--depth=1", "--branch", "main", origin.as_uri(), str(checkout))
+            head = run(checkout, "rev-parse", "HEAD").stdout.strip()
+            ref = run(checkout, "symbolic-ref", "-q", "HEAD").stdout.strip()
+            self.assertNotEqual(run(checkout, "cat-file", "-e", base + "^{commit}",
+                                    check=False).returncode, 0)
+
+            cfg = {"source": {"baseCommit": base, "baseTree": base_tree}}
+            current.acquire_source_base(checkout, head, cfg)
+            self.assertEqual(run(checkout, "rev-parse", "HEAD").stdout.strip(), head)
+            self.assertEqual(run(checkout, "symbolic-ref", "-q", "HEAD").stdout.strip(), ref)
+            self.assertEqual(run(checkout, "rev-parse", base + "^{tree}").stdout.strip(),
+                             base_tree)
+
+            mutant = copy.deepcopy(cfg)
+            mutant["source"]["baseTree"] = "0" * 40
+            with self.assertRaises(ValueError):
+                current.acquire_source_base(checkout, head, mutant)
+
     def test_zip_checks_complete_digest_and_extracts_only_fixed_members(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -169,8 +208,26 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                               receipt["replayCount"]), (0, 0, 0))
             self.assertIs(receipt["accepted"], False)
             current.finish(type("Args", (), {"output": output, "selector_exit": 101})())
-            self.assertEqual(json.loads(current.receipt_path(output).read_text())["status"],
+            self.assertEqual(json.loads(current.receipt_path(output).read_text(
+                encoding="utf-8"))["status"],
                              "DIAGNOSTIC_FAILED")
+
+    def test_cli_rejects_empty_and_relative_output_before_writing(self):
+        repository = Path(__file__).resolve().parents[2]
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(repository)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for raw in ("", "relative"):
+                result = subprocess.run([
+                    sys.executable, "-m", "scripts.ci.qwen21_current_failed_adapter",
+                    "seal", "--output", raw,
+                ], cwd=root, env=environment, text=True, encoding="utf-8",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("absolute evidence path required", result.stderr)
+            self.assertFalse((root / "current-diagnostic").exists())
 
     def test_build_identity_and_selector_output_mutations_are_rejected(self):
         build = {"lockedMlxRsRevision": self.cfg["mlxBuild"]["mlxRsRevision"],
@@ -247,6 +304,10 @@ class CurrentFailedAdapterTests(unittest.TestCase):
 
 
 class CurrentDiagnosticWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def embedded_python(command):
+        return command.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
     def test_current_phase_is_opt_in_bounded_and_failure_preserving(self):
         workflow = yaml.safe_load(inline_text())
         inputs = workflow[True]["workflow_dispatch"]["inputs"]
@@ -258,6 +319,7 @@ class CurrentDiagnosticWorkflowTests(unittest.TestCase):
         self.assertEqual(job["permissions"], {"actions": "read", "contents": "read"})
         self.assertEqual(job["runs-on"], ["self-hosted", "macOS", "ARM64",
                                           "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"])
+        self.assertNotIn("QWEN_IMAGE_2_1_RENDER_OUT", job["env"])
         self.assertEqual(workflow["concurrency"]["cancel-in-progress"], False)
         self.assertIn("inference-real-weights-physical-host", workflow["concurrency"]["group"])
         steps = {row.get("name"): row for row in job["steps"]}
@@ -265,11 +327,55 @@ class CurrentDiagnosticWorkflowTests(unittest.TestCase):
                          "inputs.qwen_image_2_1_lora_phase != 'current-diagnostic'")
         self.assertEqual(steps["Bind live job and materialize the exact current failed adapter"]["if"],
                          "inputs.qwen_image_2_1_lora_phase == 'current-diagnostic'")
-        self.assertEqual(steps["Keep the Qwen-Image 2.1 MLX evidence"]["if"], "${{ !cancelled() }}")
+        self.assertEqual(steps["Keep the Qwen-Image 2.1 MLX evidence"]["if"],
+                         "${{ always() && (inputs.qwen_image_2_1_lora_phase == "
+                         "'current-diagnostic' || !cancelled()) }}")
+        names = [row.get("name") for row in job["steps"]]
+        fallback = steps["Initialize current diagnostic fallback before checkout"]
+        self.assertLess(names.index(fallback["name"]),
+                        next(index for index, row in enumerate(job["steps"])
+                             if str(row.get("uses", "")).startswith("actions/checkout@")))
+        self.assertNotIn("scripts/", fallback["run"])
+        self.assertIn('$RUNNER_TEMP/qwen-image-2-1-mlx-evidence', fallback["run"])
+        self.assertIn('QWEN_IMAGE_2_1_RENDER_OUT=$output', fallback["run"])
+        seal = steps["Seal a current diagnostic refusal if the selector never started"]
+        self.assertNotIn("scripts/", seal["run"])
+        self.assertIn('$RUNNER_TEMP/qwen-image-2-1-mlx-evidence', seal["run"])
         run = steps["Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates"]["run"]
         self.assertEqual(run.count(current.config()["selector"]), 1)
         self.assertIn('if [[ "$phase" == current-diagnostic ]]', run)
         self.assertNotIn("current-diagnostic ||", run)
+
+    def test_checkout_independent_fallback_initializes_and_seals_absolute_output(self):
+        workflow = yaml.safe_load(inline_text())
+        steps = {row.get("name"): row for row in workflow["jobs"]["mlx-qwen-image-2-1"]["steps"]}
+        initialize = self.embedded_python(
+            steps["Initialize current diagnostic fallback before checkout"]["run"])
+        seal = self.embedded_python(
+            steps["Seal a current diagnostic refusal if the selector never started"]["run"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "evidence"
+            started = subprocess.run([sys.executable, "-", str(root)], input=initialize,
+                                     text=True, encoding="utf-8", stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE)
+            self.assertEqual(started.returncode, 0, started.stderr)
+            receipt = root / "current-diagnostic" / "DIAGNOSTIC_ONLY.json"
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["status"],
+                             "EARLY_INITIALIZED")
+            finished = subprocess.run([sys.executable, "-", str(root)], input=seal,
+                                      text=True, encoding="utf-8", stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+            self.assertEqual(finished.returncode, 0, finished.stderr)
+            row = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual((row["status"], row["refusal"]),
+                             ("REFUSED", "selector_not_started"))
+
+            relative = subprocess.run([sys.executable, "-", "relative"], input=seal,
+                                      cwd=Path(directory), text=True, encoding="utf-8",
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+            self.assertNotEqual(relative.returncode, 0)
+            self.assertFalse((Path(directory) / "relative").exists())
 
 
 if __name__ == "__main__":

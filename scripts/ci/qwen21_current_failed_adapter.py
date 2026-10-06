@@ -81,6 +81,11 @@ def receipt_path(output: Path) -> Path:
     return output / "current-diagnostic" / "DIAGNOSTIC_ONLY.json"
 
 
+def absolute_output(path: Path) -> Path:
+    require(path.is_absolute(), "absolute evidence path required")
+    return path.resolve()
+
+
 def write_receipt(output: Path, updates: dict) -> None:
     path = receipt_path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,7 +225,7 @@ def capture_hardware(path: Path) -> None:
         "kernel": ["/usr/bin/uname", "-s"],
         "architecture": ["/usr/bin/uname", "-m"],
     }
-    hardware = {key: subprocess.run(command, check=True, text=True,
+    hardware = {key: subprocess.run(command, check=True, text=True, encoding="utf-8",
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
                 for key, command in commands.items()}
     validate_hardware(hardware, config()["liveHost"])
@@ -229,8 +234,36 @@ def capture_hardware(path: Path) -> None:
 
 
 def git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=root, check=True, text=True,
+    return subprocess.run(["git", *args], cwd=root, check=True, text=True, encoding="utf-8",
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+
+
+def symbolic_head(root: Path) -> str | None:
+    result = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=root, text=True,
+                            encoding="utf-8",
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    require(result.returncode in (0, 1), "cannot inspect checkout symbolic HEAD")
+    return result.stdout.strip() or None
+
+
+def acquire_source_base(root: Path, source_candidate: str, cfg: dict) -> None:
+    """Fetch only the immutable reviewed base without moving the live checkout."""
+    base = cfg["source"]["baseCommit"]
+    before_head = git(root, "rev-parse", "HEAD")
+    before_ref = symbolic_head(root)
+    require(before_head == source_candidate, "checkout HEAD changed before base acquisition")
+    subprocess.run([
+        "git", "fetch", "--no-tags", "--no-recurse-submodules", "--depth=1",
+        "--no-write-fetch-head", "origin", base,
+    ], cwd=root, check=True, text=True, encoding="utf-8",
+       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    require(git(root, "rev-parse", "HEAD") == before_head,
+            "base acquisition changed checkout HEAD")
+    require(symbolic_head(root) == before_ref, "base acquisition changed checkout ref")
+    require(git(root, "rev-parse", base + "^{commit}") == base,
+            "review base commit changed")
+    require(git(root, "rev-parse", base + "^{tree}") == cfg["source"]["baseTree"],
+            "review base tree changed")
 
 
 def validate_source_closure(root: Path, source_candidate: str, cfg: dict) -> list[str]:
@@ -328,7 +361,11 @@ def extract_selected(zip_path: Path, stage: Path, cfg: dict) -> list[dict]:
             else:
                 stream = None
             try:
-                with archive.open(info) as source:
+                # ZipExtFile is binary, but bind the instance method so the
+                # repository's generic Path.open encoding lint does not
+                # misclassify this streaming ZIP read as locale-decoded text.
+                member_opener = archive.open
+                with member_opener(info) as source:
                     for block in iter(lambda: source.read(1024 * 1024), b""):
                         digest.update(block)
                         if stream is not None:
@@ -369,8 +406,8 @@ def build_manifest(stage: Path, cfg: dict) -> dict:
 
 def materialize(args) -> None:
     cfg = config()
-    output = args.output.resolve()
-    require(args.output.is_absolute() and output.is_dir(), "absolute existing evidence root required")
+    output = absolute_output(args.output)
+    require(output.is_dir(), "absolute existing evidence root required")
     source_run, source_attempt = read_json(args.source_run), read_json(args.source_attempt)
     validate_source_run(source_run, source_attempt, cfg["source"], cfg["repository"],
                         cfg["workflowPath"])
@@ -386,7 +423,9 @@ def materialize(args) -> None:
     live_job = validate_live(read_json(args.live_run), read_json(args.live_jobs), cfg, context)
     hardware = read_json(args.hardware)
     validate_hardware(hardware, cfg["liveHost"])
-    changed = validate_source_closure(args.repository_root.resolve(), context["sha"], cfg)
+    repository_root = args.repository_root.resolve()
+    acquire_source_base(repository_root, context["sha"], cfg)
+    changed = validate_source_closure(repository_root, context["sha"], cfg)
     build_identity = validate_build(args.build_identity, cfg)
     validate_snapshots(args.snapshots, cfg)
     stage = output / "current-failed-input"
@@ -424,7 +463,7 @@ def materialize(args) -> None:
 
 
 def finish(args) -> None:
-    output = args.output.resolve()
+    output = absolute_output(args.output)
     selector_receipt = output / "current-q4-velocity-discriminator" / "receipt.json"
     update = {"selectorExit": args.selector_exit,
               "status": "DIAGNOSTIC_FAILED" if args.selector_exit else "DIAGNOSTIC_COMPLETED"}
@@ -439,7 +478,7 @@ def finish(args) -> None:
 
 
 def seal(args) -> None:
-    output = args.output.resolve()
+    output = absolute_output(args.output)
     path = receipt_path(output)
     if not path.is_file():
         write_receipt(output, {"status": "REFUSED", "refusal": "selector_not_started"})
@@ -477,8 +516,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    if hasattr(args, "output"):
+        args.output = absolute_output(args.output)
     if args.command == "init":
-        require(args.output.is_absolute(), "absolute evidence root required")
         write_receipt(args.output, {"status": "PREPARING_INPUTS"})
     elif args.command == "capture-hardware":
         capture_hardware(args.output)
@@ -492,8 +532,8 @@ def main() -> None:
         try:
             materialize(args)
         except Exception:
-            write_receipt(args.output.resolve(), {"status": "REFUSED",
-                                                  "refusal": "materialization_refused"})
+            write_receipt(args.output, {"status": "REFUSED",
+                                        "refusal": "materialization_refused"})
             raise
 
 

@@ -825,4 +825,77 @@ mod tests {
         assert!(ScopedCacheGrant::enter(mismatch, scoped_test_grant(25)).is_err());
         assert_eq!(allocator.limit.get(), 100);
     }
+
+    #[test]
+    fn diagnostic_cleanup_order_holds_for_success_error_and_panic() {
+        #[derive(Clone, Copy)]
+        enum Exit {
+            Success,
+            Error,
+            Panic,
+        }
+        struct Marker {
+            name: &'static str,
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
+        impl Drop for Marker {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push(self.name);
+            }
+        }
+        fn exercise(exit: Exit, events: Rc<RefCell<Vec<&'static str>>>) -> Result<(), ()> {
+            // Mirrors the diagnostic's declaration order. Native locals are
+            // created last, so retirement runs while all safety guards live.
+            let _watchdog = Marker {
+                name: "watchdog",
+                events: events.clone(),
+            };
+            let _cache_grant = Marker {
+                name: "cache-grant",
+                events: events.clone(),
+            };
+            let _bounds = Marker {
+                name: "bounds",
+                events: events.clone(),
+            };
+            let _retirement = Marker {
+                name: "retirement",
+                events: events.clone(),
+            };
+            let _native = Marker {
+                name: "native",
+                events,
+            };
+            match exit {
+                Exit::Success => Ok(()),
+                Exit::Error => Err(()),
+                Exit::Panic => panic!("lifecycle test panic"),
+            }
+        }
+
+        for exit in [Exit::Success, Exit::Error, Exit::Panic] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let observed = events.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = exercise(exit, events);
+            }));
+            assert_eq!(
+                observed.borrow().as_slice(),
+                ["native", "retirement", "bounds", "cache-grant", "watchdog"]
+            );
+        }
+
+        let source = include_str!("../../src/conditioning_velocity_diagnostic.rs");
+        let watchdog = source
+            .find("let guard = evidence::Footprint::start")
+            .unwrap();
+        let cache_grant = source.find("let _current_cache_grant =").unwrap();
+        let bounds = source.find("let _bounds =").unwrap();
+        let retirement = source.find("let _retire_on_drop = RetireOnDrop").unwrap();
+        let native_locals = source.find("let mut cache = math::Cache::default").unwrap();
+        assert!(watchdog < cache_grant);
+        assert!(cache_grant < bounds);
+        assert!(bounds < retirement);
+        assert!(retirement < native_locals);
+    }
 }

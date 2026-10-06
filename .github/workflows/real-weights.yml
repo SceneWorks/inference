@@ -5085,6 +5085,35 @@ jobs:
       # ceiling explicitly for this profile, in addition to the existing host reserves.
       QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB: "100"
     steps:
+      - name: Initialize current diagnostic fallback before checkout
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic'
+        shell: bash
+        run: |
+          output="$RUNNER_TEMP/qwen-image-2-1-mlx-evidence"
+          echo "QWEN_IMAGE_2_1_RENDER_OUT=$output" >> "$GITHUB_ENV"
+          python3.12 - "$output" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          output = Path(sys.argv[1])
+          if not output.is_absolute():
+              raise SystemExit("absolute current diagnostic evidence root required")
+          receipt = output / "current-diagnostic" / "DIAGNOSTIC_ONLY.json"
+          receipt.parent.mkdir(parents=True, exist_ok=True)
+          body = {
+              "schemaVersion": 1, "kind": "DIAGNOSTIC_ONLY",
+              "purpose": "DIAGNOSTIC_ONLY", "accepted": False,
+              "acceptanceEvidence": False, "trainingSteps": 0,
+              "renderCount": 0, "replayCount": 0, "qualityAcceptance": None,
+              "status": "EARLY_INITIALIZED",
+          }
+          temporary = receipt.with_name(".DIAGNOSTIC_ONLY.json.tmp")
+          temporary.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n",
+                               encoding="utf-8")
+          os.replace(temporary, receipt)
+          PY
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Resolve runner-local snapshot paths
         run: >-
@@ -5132,9 +5161,39 @@ jobs:
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh
       - name: Seal a current diagnostic refusal if the selector never started
         if: ${{ always() && inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' }}
-        run: python3.12 -m scripts.ci.qwen21_current_failed_adapter seal --output "$QWEN_IMAGE_2_1_RENDER_OUT"
+        shell: bash
+        run: |
+          # Repository-independent: this still runs when checkout never made
+          # scripts.ci available. It preserves a completed/failed selector row.
+          python3.12 - "$RUNNER_TEMP/qwen-image-2-1-mlx-evidence" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          output = Path(sys.argv[1])
+          if not output.is_absolute():
+              raise SystemExit("absolute current diagnostic evidence root required")
+          receipt = output / "current-diagnostic" / "DIAGNOSTIC_ONLY.json"
+          receipt.parent.mkdir(parents=True, exist_ok=True)
+          try:
+              body = json.loads(receipt.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              body = {
+                  "schemaVersion": 1, "kind": "DIAGNOSTIC_ONLY",
+                  "purpose": "DIAGNOSTIC_ONLY", "accepted": False,
+                  "acceptanceEvidence": False, "trainingSteps": 0,
+                  "renderCount": 0, "replayCount": 0, "qualityAcceptance": None,
+              }
+          if body.get("status") not in ("DIAGNOSTIC_COMPLETED", "DIAGNOSTIC_FAILED"):
+              body.update({"status": "REFUSED", "refusal": "selector_not_started"})
+          temporary = receipt.with_name(".DIAGNOSTIC_ONLY.json.tmp")
+          temporary.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n",
+                               encoding="utf-8")
+          os.replace(temporary, receipt)
+          PY
       - name: Keep the Qwen-Image 2.1 MLX evidence
-        if: ${{ !cancelled() }}
+        if: ${{ always() && (inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || !cancelled()) }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qwen-image-2-1-mlx-evidence
