@@ -135,12 +135,23 @@ class TrajectoryTests(unittest.TestCase):
             sigmas = [1 - i / 8 for i in range(9)]
             row = {"inputs": {"sigmas": sigmas, "referenceOrder": ["source99", "palette"],
                               "fit": [[1024, 1024], [1024, 1024]],
+                              "conditioningDenseVsQ4": {"meanAbsoluteDifference": 0,
+                                                        "rootMeanSquareDifference": 0,
+                                                        "maxAbsoluteDifference": 0},
                               "x0": vector("x0", shape), "noise": vector("noise", shape),
                               "conditioning": [vector(f"cond{i}", [1, 1]) for i in range(2)],
                               "references": [{"pixels": vector(f"pixels{i}", [1, 1]),
                                               "latents": vector(f"refs{i}", [1, 4096, 64])} for i in range(2)]},
                    "activePeakBytes": 1, "activeEnvelopeBytes": 2, "physicalPeakBytes": 3, "cpuCachePeakBytes": 4,
-                   "trajectories": []}
+                   "trajectories": [], "comparisons": []}
+            comparison_keys = ("denseQ4BaseTrajectoryDriftMse", "denseQ4AdaptedTrajectoryDriftMse",
+                               "denseAdapterTrajectoryDifferenceMse", "q4AdapterTrajectoryDifferenceMse",
+                               "denseTargetErrorGain", "q4TargetErrorGain")
+            estimate_keys = ("denseDenoisedEstimateErrorGain", "q4DenoisedEstimateErrorGain")
+            for step in range(9):
+                row["comparisons"].append({"step": step,
+                    **dict.fromkeys(comparison_keys, 0),
+                    **dict.fromkeys(estimate_keys, None if step == 8 else 0)})
             for i in range(4):
                 endpoint = root / f"endpoint{i}.png"; endpoint.write_bytes(b"identity mismatch fixture")
                 row["trajectories"].append({"trajectory": i, "adapted": bool(i % 2),
@@ -150,10 +161,47 @@ class TrajectoryTests(unittest.TestCase):
                     "metrics": [{"step": s, "nativeArithmeticPass": False, "targetPathError": 0,
                                  "denoisedEstimateError": 0, "updateToTargetProjection": 0,
                                  "updateNorm2": 0, "eulerUpdateResidualMax": 0} for s in range(8)],
-                    "finalLatent": vector(f"t{i}-final", shape),
+                    "finalLatent": vector(f"t{i}-final", shape), "finalLatentTargetError": 0,
                     "endpoint": {"file": endpoint.name, "sha256": current.sha256_file(endpoint),
                                  "expectedSha256": current.TRAJECTORY_ENDPOINTS[i], "exactHistoricalPngMatch": False}})
             current.validate_trajectory_files(root, row)
+            # The original validator accepted the first missing-final mutation. Every
+            # defined scalar must now be present/finite, with null only at final sigma zero.
+            mutations = []
+            for i in range(4):
+                for value in ("MISSING", float("nan"), float("inf"), None, True):
+                    mutant = copy.deepcopy(row)
+                    if value == "MISSING": del mutant["trajectories"][i]["finalLatentTargetError"]
+                    else: mutant["trajectories"][i]["finalLatentTargetError"] = value
+                    mutations.append((f"final-error-{i}-{value}", mutant))
+            for key in row["inputs"]["conditioningDenseVsQ4"]:
+                for value in ("MISSING", float("nan"), float("inf"), None, True):
+                    mutant = copy.deepcopy(row)
+                    if value == "MISSING": del mutant["inputs"]["conditioningDenseVsQ4"][key]
+                    else: mutant["inputs"]["conditioningDenseVsQ4"][key] = value
+                    mutations.append((f"conditioning-{key}-{value}", mutant))
+            for step in range(9):
+                for key in comparison_keys + estimate_keys:
+                    invalid = ("MISSING", float("nan"), float("inf"), True,
+                               0 if step == 8 and key in estimate_keys else None)
+                    for value in invalid:
+                        mutant = copy.deepcopy(row)
+                        if value == "MISSING": del mutant["comparisons"][step][key]
+                        else: mutant["comparisons"][step][key] = value
+                        mutations.append((f"comparison-{step}-{key}-{value}", mutant))
+            for value in (None, [], row["comparisons"][:8], row["comparisons"] + [row["comparisons"][-1]],
+                          list(reversed(row["comparisons"]))):
+                mutant = copy.deepcopy(row); mutant["comparisons"] = value
+                mutations.append(("comparison-inventory-or-order", mutant))
+            mutant = copy.deepcopy(row); del mutant["comparisons"]
+            mutations.append(("comparisons-missing", mutant))
+            mutant = copy.deepcopy(row); mutant["comparisons"][1]["step"] = 0
+            mutations.append(("comparison-duplicate-step", mutant))
+            mutant = copy.deepcopy(row); mutant["comparisons"][0]["step"] = 0.0
+            mutations.append(("comparison-noninteger-step", mutant))
+            for name, mutant in mutations:
+                with self.assertRaisesRegex(ValueError, "metric", msg=name):
+                    current.validate_trajectory_files(root, mutant)
             vector_row = row["trajectories"][0]["steps"][0]["velocity"]
             path = root / vector_row["file"]
             original = path.read_bytes(); path.write_bytes(struct.pack("<f", float("nan")) + original[4:])

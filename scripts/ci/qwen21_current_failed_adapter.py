@@ -556,6 +556,7 @@ def validate_trajectory_receipt(row: dict) -> None:
 
 def validate_trajectory_files(directory: Path, row: dict) -> None:
     """Validate actual finite little-endian captures, not producer constants."""
+    validate_trajectory_metrics(row)
     seen = set()
 
     def physical(facts: dict) -> Path:
@@ -627,6 +628,37 @@ def validate_trajectory_files(directory: Path, row: dict) -> None:
             type(row.get("physicalPeakBytes")) is int and row["physicalPeakBytes"] <= 100_000_000_000 and
             type(row.get("cpuCachePeakBytes")) is int and row["cpuCachePeakBytes"] <= 67_108_864,
             "trajectory memory envelope evidence is incomplete")
+
+
+def validate_trajectory_metrics(row: dict) -> None:
+    """Require every emitted observation, without imposing a quality/effect floor."""
+    def finite(facts, keys):
+        require(isinstance(facts, dict) and
+                all(type(facts.get(key)) in (int, float) and math.isfinite(facts[key])
+                    for key in keys), "trajectory metric is incomplete or nonfinite")
+
+    finite(row.get("inputs", {}).get("conditioningDenseVsQ4"),
+           ("meanAbsoluteDifference", "rootMeanSquareDifference", "maxAbsoluteDifference"))
+    trajectories = row.get("trajectories")
+    require(isinstance(trajectories, list) and len(trajectories) == 4,
+            "trajectory final metric inventory is incomplete")
+    for trajectory in trajectories:
+        finite(trajectory, ("finalLatentTargetError",))
+    comparisons = row.get("comparisons")
+    require(isinstance(comparisons, list) and len(comparisons) == 9,
+            "trajectory comparison metric inventory is incomplete")
+    estimate_keys = ("denseDenoisedEstimateErrorGain", "q4DenoisedEstimateErrorGain")
+    for step, comparison in enumerate(comparisons):
+        finite(comparison, ("denseQ4BaseTrajectoryDriftMse", "denseQ4AdaptedTrajectoryDriftMse",
+                            "denseAdapterTrajectoryDifferenceMse", "q4AdapterTrajectoryDifferenceMse",
+                            "denseTargetErrorGain", "q4TargetErrorGain"))
+        require(type(comparison.get("step")) is int and comparison["step"] == step,
+                "trajectory comparison metric steps are unordered")
+        if step < 8:
+            finite(comparison, estimate_keys)
+        else:
+            require(all(key in comparison and comparison[key] is None for key in estimate_keys),
+                    "trajectory final estimate metric must be explicit null at sigma zero")
 
 
 def seal(args) -> None:
