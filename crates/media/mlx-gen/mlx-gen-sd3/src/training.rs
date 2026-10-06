@@ -2961,9 +2961,9 @@ mod depth_anchoring_tests {
         assert!(err.contains("[depth]"), "{err}");
     }
 
-    /// Round-robin over N = 2 images (one bucket): a global-step key would lock image 0 to odd
-    /// (diffusion) steps forever; per-image keys give each image both kinds within 2·N steps.
-    /// Mutation: key the plan on the global step ⇒ red.
+    /// Round-robin over N = 2 images (one bucket): a bare global-step key would lock image 0 to
+    /// odd (diffusion) steps forever; the period-drifting window key gives each image both kinds
+    /// within 3 periods (6 steps). Mutation: drop the period drift ⇒ red.
     #[test]
     fn round_robin_images_each_get_depth_steps() {
         let cfg = cfg();
@@ -2978,7 +2978,7 @@ mod depth_anchoring_tests {
             &Default::default(),
         )
         .unwrap();
-        let kinds: Vec<(usize, bool)> = (1..=4)
+        let kinds: Vec<(usize, bool)> = (1..=6)
             .map(|n| {
                 let (l, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), n, false);
                 (schedule.sample((n - 1) as usize).0, l.aux.is_some())
