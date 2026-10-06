@@ -56,18 +56,24 @@
 //!     latent caching — converting the otherwise-uncatchable SIGKILL into a recommendation to enable
 //!     the toggle. The default-off functional path is unaffected.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core;
+use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
-    TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, LoraParams, TrainAdapter,
+};
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
+use mlx_gen::train::perceptual::{
+    combine_step_loss, step_sample, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::tae::TinyDecoderSpec;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Error, LoadSpec, Modality, NetworkType, Precision, Quant, Result, TrainOptimizer, Trainer,
@@ -77,7 +83,6 @@ use mlx_gen::{
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{add, multiply, ones, split_sections, subtract};
-use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -166,22 +171,70 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): honors `resolution_buckets` — one cached latent (+ its own latent
+        // grid) per item per bucket edge, walked through a `BucketSchedule`; the pre-flight guard
+        // and the preview render size for the largest edge.
+        // sc-24828 (epic 2123): honors `subject_mask_loss` on its one (LoRA/LoKr, dense or
+        // block-checkpointed) loss path; each (item, bucket) entry's weight is packed exactly like
+        // that entry's latent.
+        // sc-24830 (epic 2123): depth anchoring — the shared decoded-x0 perceptual path (TAEF2
+        // decode of the unpacked flow x0 estimate → Depth-Anything-V2 → cached round-trip
+        // reference) on the dense and block-checkpointed forwards.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps) through
+        // the shared aux-loss builder this trainer already drives. No E-LatentLPIPS: no published
+        // weights match this latent family, so `latent_lpips_loss` stays false (refused).
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            subject_mask_loss: true,
+            depth_anchoring: true,
+            // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
+            identity_loss: true,
+            face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
+            vae_anchor_loss: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
 /// Construct the trainer from a `microsoft/Lens` snapshot directory (the diffusers multi-component
 /// tree: `tokenizer/ text_encoder/ transformer/ vae/`). The DiT is loaded **dense** (the adapter host);
 /// the encoder is Q8. `spec.precision` selects the compute dtype (bf16 default / f32 tight-gate).
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p.clone(),
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "lens trainer expects a snapshot directory (tokenizer/ text_encoder/ transformer/ \
-                 vae/), not a single .safetensors file"
-                    .into(),
-            )),
-        };
+    snapshot_root(spec)?;
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor(), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        })
+        .validating_on_base_when(mlx_gen::train::lazy::custom_targets),
+    ))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(
+            "lens trainer expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+             not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
+fn load_weights(spec: &LoadSpec) -> Result<LensTrainer> {
+    let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
         Precision::Bf16 => Dtype::Bfloat16,
         Precision::Fp32 => Dtype::Float32,
@@ -196,15 +249,15 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     let transformer = LensTransformer::from_weights(&dit_w, &dit_cfg, dtype)?;
     // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
     dit_w.materialize_accessed()?;
-    let vae = load_vae(&root)?;
-    Ok(Box::new(LensTrainer {
+    let vae = load_vae(root)?;
+    Ok(LensTrainer {
         descriptor: trainer_descriptor(),
         tokenizer,
         encoder: Some(encoder),
         transformer,
         vae,
         dtype,
-    }))
+    })
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -271,20 +324,29 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for LensTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would train zero
         // parameters yet "succeed". Catch it here, where the loaded DiT is available to match against.
         if resolve_target_paths(&self.transformer, &req.config).is_empty() {
@@ -303,6 +365,9 @@ impl Trainer for LensTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
+        // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -356,10 +421,11 @@ impl LensTrainer {
         let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
 
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
-        // Lens latent grid: a cell maps to a 16×16 pixel tile (Flux.2 8× VAE ∘ 2× DiT patchify). The
-        // ÷32 bucket guarantees the VAE-encoded `edge/8` is even, so the 2×2 patchify divides cleanly.
-        let latent = (edge / VAE_SCALE_FACTOR) as usize; // latent_h == latent_w (square)
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). The pre-flight guard and the preview render use the largest (epic 2123 E7); each
+        // cached latent carries its OWN grid (see `latent_grid`) for the DiT's img ids.
+        let edges = bucket_edges(cfg);
+        let edge = preflight_edge(&edges);
 
         // sc-5170 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
         // materializes the whole forward graph in one MLX `eval`; at high resolution that working set
@@ -371,14 +437,21 @@ impl LensTrainer {
         // regardless of the toggle.
         let will_checkpoint =
             matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
-        if !will_checkpoint {
-            preflight_memory_guard(edge, want_bf16)?;
-        }
+        // Epic 2123 E7: the training-time aux models (TAEF2 + Depth-Anything-V2) count against the
+        // budget on BOTH paths; one cached reference per (item, bucket) entry, sized at the largest
+        // edge. A checkpointed run with no aux models stays unguarded (see the guard).
+        let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
+        preflight_memory_guard(cfg, edge, want_bf16, aux_gb, will_checkpoint)?;
+
+        // Epic 2123 depth anchoring: load the frozen decoder + aux models before the caching pass,
+        // so a missing/corrupt aux checkpoint fails fast.
+        let mut perceptual = load_perceptual_path(cfg)?;
 
         // --- prepare → load → cache: VAE-latents + 4-layer caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Vec<Array>, Array)> = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). See [`CacheEntry`].
+        let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -388,7 +461,12 @@ impl LensTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
-            let x0 = encode_latents(&self.vae, &img, edge)?; // [1, seq, 128]
+            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
+            let subject_mask = PreparedSubjectMask::load_if_enabled(
+                "lens trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
             let encoder = self.encoder.as_ref().ok_or_else(|| {
                 Error::Msg(
                     "lens trainer: text encoder already freed (caching after train loop)".into(),
@@ -396,12 +474,26 @@ impl LensTrainer {
             })?;
             let (features, mask) =
                 encode_caption(&self.tokenizer, encoder, &item.caption, compute_dtype)?;
-            let mut to_eval: Vec<&Array> = Vec::with_capacity(features.len() + 2);
-            to_eval.push(&x0);
+            let mut to_eval: Vec<&Array> = Vec::with_capacity(features.len() + 1);
             to_eval.push(&mask);
             to_eval.extend(features.iter());
             eval(to_eval)?;
-            cache.push((x0, features, mask));
+            // The caption features + mask are resolution-independent: encode them once, then one
+            // latent per bucket edge, each tagged with its own grid side and (sc-24828) paired with
+            // its own packed subject-mask weight.
+            for (&edge, (x0, mask_weight)) in edges.iter().zip(encode_buckets(
+                &edges,
+                subject_mask.as_ref(),
+                |edge| encode_latents(&self.vae, &img, edge), // [1, seq, 128]
+            )?) {
+                cache.push((
+                    x0,
+                    features.clone(),
+                    mask.clone(),
+                    latent_grid(edge),
+                    mask_weight,
+                ));
+            }
         }
         if cache.is_empty() {
             // A cancel mid-cache is a genuine cancellation → typed `Error::Canceled`; an empty cache
@@ -410,6 +502,20 @@ impl LensTrainer {
                 return Err(Error::Canceled);
             }
             return Err("lens trainer: no usable dataset items".into());
+        }
+
+        // Epic 2123 E8: each (item, bucket) entry's perceptual reference is computed exactly once
+        // per job, by the `AuxDriver` before the loop.
+        if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "lens trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
         }
 
         // sc-5637 — pre-encode the preview-sample prompts into the conditioning batch the preview
@@ -550,6 +656,24 @@ impl LensTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items for
+        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on
+        // the real dataset item (not the (item, bucket) entry). A resumed run replays the skipped
+        // prefix so the phase matches.
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                &schedule,
+                accum,
+                start_step,
+                &req.cancel,
+            )?),
+            None => None,
+        };
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -557,38 +681,21 @@ impl LensTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, features, mask) = &cache[((step - 1) as usize) % cache.len()];
-            let t = sample_sigma(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            )?;
-            let noise = random::normal::<f32>(
-                x0.shape(),
-                None,
-                None,
-                Some(&random::key(
-                    cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                )?),
-            )?;
-            let (loss, grads) = compute_loss_grads(
+            let (losses, grads) = run_train_step(
                 &mut self.transformer,
                 &params,
                 &adapter,
-                alpha,
-                rank,
-                x0,
-                features,
-                mask,
-                t,
-                &noise,
+                cfg,
+                &cache,
+                &schedule,
+                aux_driver.as_mut(),
+                step,
                 mae,
                 compute_dtype,
                 lora_dtype,
-                latent,
                 checkpoint_blocks,
             )?;
-            last_loss = loss;
+            last_loss = losses.total;
             steps_run = step;
             accumulate_grads(&mut accumulated, grads)?;
 
@@ -610,13 +717,8 @@ impl LensTrainer {
                         .expect("an update fires only after accumulation"),
                     window,
                 )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
             }
 
@@ -754,34 +856,104 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
 const PREFLIGHT_F32: (f64, f64, f64) = (15.43, 6.618e-3, 1.308e-7);
 const PREFLIGHT_BF16: (f64, f64, f64) = (7.875, 3.266e-3, 7.666e-8);
 
+/// The edge the pre-flight guard (and the preview render) sizes for: the LARGEST bucket edge (epic
+/// 2123 E7) — the dense first step's working set is set by the biggest latent the run will ever train
+/// on, whichever bucket the schedule happens to draw first.
+fn preflight_edge(edges: &[u32]) -> u32 {
+    edges.iter().copied().max().unwrap_or(0)
+}
+
+/// The Lens latent grid side for a training `edge`: a cell maps to a 16×16 pixel tile (Flux.2 8× VAE ∘
+/// 2× DiT patchify), so an `edge`-square image packs to `[1, grid², 128]` and the DiT's img ids span a
+/// `grid × grid` lattice. The ÷32 bucket guarantees the VAE-encoded `edge/8` is even, so the 2×2
+/// patchify divides cleanly. Per bucket (sc-2127): every cached latent carries the grid of the edge
+/// it was encoded at.
+fn latent_grid(edge: u32) -> usize {
+    (edge / VAE_SCALE_FACTOR) as usize // latent_h == latent_w (square)
+}
+
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
 /// SIGKILLed), returning a catchable, actionable error instead. The budget is MLX's own reported
 /// memory limit (≈ the device's recommended working set); the rest is [`check_preflight_budget`].
-/// Only consulted when gradient checkpointing is OFF (LoKr, or LoRA with the toggle off).
-fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
+/// Consulted when gradient checkpointing is OFF (LoKr, or LoRA with the toggle off), and — whenever
+/// the training-time aux models add memory (`extra_gb`, epic 2123 E7) — when it is on too.
+fn preflight_memory_guard(
+    cfg: &TrainingConfig,
+    edge: u32,
+    bf16: bool,
+    extra_gb: f64,
+    checkpointed: bool,
+) -> Result<()> {
     let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
-    check_preflight_budget(edge, bf16, budget_gb)
+    check_preflight_budget_with_aux(cfg, edge, bf16, budget_gb, extra_gb, checkpointed)
 }
 
 /// The pure guard logic (no MLX global state, so it is unit-testable): refuse if the projected dense
 /// first-step peak exceeds `budget_gb × 0.85`. `edge` is the bucketed training edge; the unified token
 /// count is `(edge/16)²` (latent /8, patch 2) plus a representative caption block. The 0.85 leaves
 /// headroom for the worker/host — exceeding it is the regime where the dense run was observed to die.
+#[cfg(test)]
 fn check_preflight_budget(edge: u32, bf16: bool, budget_gb: f64) -> Result<()> {
+    check_preflight_budget_with_aux(
+        &TrainingConfig::default(),
+        edge,
+        bf16,
+        budget_gb,
+        0.0,
+        false,
+    )
+}
+
+/// [`check_preflight_budget`] plus the epic-2123 aux models (`extra_gb`, [`perceptual_footprint_gb`])
+/// on top of the DiT projection. With `checkpointed`, the projection is the resident base
+/// (`projected_dense_peak_gb(0)`: no fitted checkpointed curve exists, so the resident DiT is the
+/// lower bound the aux models stack on), and a checkpointed run with no aux models is not guarded.
+/// A checkpointed refusal goes through the shared [`mlx_gen_perceptual::check_aux_memory`],
+/// naming `cfg`'s enabled aux losses.
+fn check_preflight_budget_with_aux(
+    cfg: &TrainingConfig,
+    edge: u32,
+    bf16: bool,
+    budget_gb: f64,
+    extra_gb: f64,
+    checkpointed: bool,
+) -> Result<()> {
+    if checkpointed && extra_gb <= 0.0 {
+        return Ok(());
+    }
     let tokens_per_side = (edge as f64 / 16.0).ceil();
     let s = tokens_per_side * tokens_per_side + PREFLIGHT_TXT_TOKENS;
-    let projected = projected_dense_peak_gb(s, bf16);
+    let projected = if checkpointed {
+        projected_dense_peak_gb(0.0, bf16)
+    } else {
+        projected_dense_peak_gb(s, bf16)
+    } + extra_gb;
     let safe = budget_gb * 0.85;
+    if checkpointed {
+        return mlx_gen_perceptual::check_aux_memory(
+            "lens trainer",
+            cfg,
+            &format!("a checkpointed training step at resolution {edge}"),
+            extra_gb,
+            projected,
+            safe,
+            &format!("{budget_gb:.0} GB MLX limit × 0.85"),
+        );
+    }
     if projected > safe {
-        return Err(format!(
-            "lens trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
-             (the forward working set materializes in one allocation), exceeding this machine's \
-             ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS \
-             would hard-kill the worker (SIGKILL) at the first step with no recoverable error \
-             (sc-4874/sc-5170). Enable Gradient Checkpointing (recomputes block activations in the \
-             backward) or reduce the training resolution."
-        )
-        .into());
+        return Err(mlx_gen_perceptual::name_aux_losses(
+            format!(
+                "lens trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+                 (the forward working set materializes in one allocation), exceeding this machine's \
+                 ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS \
+                 would hard-kill the worker (SIGKILL) at the first step with no recoverable error \
+                 (sc-4874/sc-5170). Enable Gradient Checkpointing (recomputes block activations in the \
+                 backward) or reduce the training resolution."
+            )
+            .into(),
+            cfg,
+            extra_gb,
+        ));
     }
     Ok(())
 }
@@ -836,6 +1008,36 @@ fn encode_latents(vae: &Flux2Vae, image: &Image, edge: u32) -> Result<Array> {
     let patchified = patchify_latents(&enc)?; // [1, 128, edge/16, edge/16]
     let normed = vae.bn_normalize_nchw(&patchified)?; // (x − mean)/std on the packed 128-ch
     pack_latents(&normed) // [1, latent·latent, 128]
+}
+
+/// Lay a latent-grid tensor `[1, C, H, W]` out EXACTLY like [`encode_latents`] lays out the VAE
+/// latent: 2×2 `patchify_latents` → `pack_latents`, so element `[0, tok, feat]` of the result sits
+/// over the same latent cell as `x0[0, tok, feat]`. (The bn-normalize between the two is a
+/// per-channel affine on VALUES, not a layout op, so a weight map skips it.)
+fn pack_like_latent(grid: &Array) -> Result<Array> {
+    pack_latents(&patchify_latents(grid)?)
+}
+
+/// The subject-mask loss weight (sc-24828) for one cached (item, bucket) latent `x0`, packed like it
+/// (`[1, seq, 4·C]`, `seq = (H/2)·(W/2)` on the square bucket): the item's already-loaded mask is
+/// center-cropped like the image, area-averaged onto THIS bucket's UNPACKED `[1, C, H, W]` latent
+/// grid, then run through [`pack_like_latent`]. `None` when the technique is off.
+fn latent_subject_mask_weight(
+    mask: Option<&PreparedSubjectMask>,
+    x0: &Array,
+) -> Result<Option<Array>> {
+    let sh = x0.shape();
+    let (seq, feat) = (sh[1], sh[2]);
+    let side = (seq as f64).sqrt().round() as i32;
+    if sh.len() != 3 || side * side != seq || feat % 4 != 0 {
+        return Err(Error::Msg(format!(
+            "lens trainer: subject mask needs a square packed latent, got {sh:?}"
+        )));
+    }
+    let unpacked = [1, feat / 4, side * 2, side * 2];
+    prepared_subject_mask_weight("lens trainer", mask, CropBox::center_square, &unpacked)?
+        .map(|w| pack_like_latent(&w))
+        .transpose()
 }
 
 /// Encode a caption into its per-layer DiT text features (sliced at [`TXT_OFFSET`]) + the valid mask —
@@ -913,6 +1115,7 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
 /// to the gradient-checkpointed path (sc-5170) — each block recomputes its activations in the backward
 /// instead of retaining them. `None` runs the dense (activation-retaining) forward. Either way the
 /// per-block SDPA-segment checkpointing flag is the caller's responsibility (set on `transformer`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     transformer: &mut LensTransformer,
@@ -926,13 +1129,114 @@ fn compute_loss_grads(
     t: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     dtype: Dtype,
     lora_dtype: Option<Dtype>,
     latent: usize,
     checkpoint_blocks: Option<&[Vec<String>]>,
 ) -> Result<(f32, LoraParams)> {
-    let (x_t, target) = build_batch(x0, noise, t)?;
-    let x_t = x_t.as_dtype(dtype)?; // no-op in f32 mode
+    let (losses, grads) = compute_step_loss_grads(
+        transformer,
+        params,
+        adapter,
+        alpha,
+        rank,
+        x0,
+        features,
+        mask,
+        t,
+        noise,
+        mae,
+        mask_weight,
+        dtype,
+        lora_dtype,
+        latent,
+        checkpoint_blocks,
+        None,
+    )?;
+    Ok((losses.total, grads))
+}
+
+/// The per-step loss breakdown [`compute_step_loss_grads`] returns (epic 2123 E8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepLosses {
+    /// The differentiated step loss.
+    total: f32,
+    /// The diffusion (velocity-regression) term, `None` on an aux-only step (it contributed zero).
+    diffusion: Option<f32>,
+    /// The weighted aux-loss term, `None` when no aux loss contributed this step.
+    aux: Option<f32>,
+}
+
+/// One aux-loss step's view of the trainer's [`PerceptualPath`].
+struct AuxStep<'a> {
+    path: &'a PerceptualPath,
+    plan: &'a StepPlan,
+    /// The step's reference key — its (item, bucket) cache entry.
+    entry: usize,
+}
+
+/// A packed Lens latent `[1, grid², 4·C]` (the [`encode_latents`] layout: `patchify_latents` →
+/// `pack_latents`) back to the unpatchified NCHW grid `[1, C, 2·grid, 2·grid]` — the exact inverse
+/// of those two reshapes. The values stay batch-normalized: TAEF2 decodes the FLUX.2 transformer's
+/// (batch-normalized) latent unpatchified (its published diffusers wrapper swaps the VAE's latent
+/// batch-norm for an identity one), so no de-normalization is applied.
+fn unpack_to_decoder_layout(packed: &Array, grid: usize) -> Result<Array> {
+    let sh = packed.shape();
+    let g = grid as i32;
+    if sh.len() != 3 || sh[1] != g * g || sh[2] % 4 != 0 {
+        return Err(Error::Msg(format!(
+            "lens trainer: expected a packed [B, {}, 4·C] latent, got {sh:?}",
+            g * g
+        )));
+    }
+    let (b, c4) = (sh[0], sh[2]);
+    let c = c4 / 4;
+    // Inverse pack: [B, g·g, 4C] → [B, 4C, g, g].
+    let grid_nchw = packed
+        .reshape(&[b, g, g, c4])?
+        .transpose_axes(&[0, 3, 1, 2])?;
+    // Inverse patchify: channel `c·4 + i·2 + j` at `(h, w)` → pixel `(2h + i, 2w + j)` of `c`.
+    Ok(grid_nchw
+        .reshape(&[b, c, 2, 2, g, g])?
+        .transpose_axes(&[0, 1, 4, 2, 5, 3])?
+        .reshape(&[b, c, 2 * g, 2 * g])?)
+}
+
+/// [`compute_loss_grads`] with the step's perceptual plan (epic 2123 E8): on an aux-only step the
+/// diffusion term is not computed (it contributes zero) and the loss is the weighted perceptual term
+/// on the model's x0 estimate `x0 = x_t − t·v` (the raw Lens velocity regresses `noise − x0` with
+/// `x_t = (1−t)·x0 + t·noise`), unpacked to TAEF2's `[1, 32, h/8, w/8]` layout
+/// ([`unpack_to_decoder_layout`]). With `aux = None` (or a diffusion-only plan with no aux loss) the
+/// traced graph is exactly the pre-epic-2123 one; both the dense and the block-checkpointed forwards
+/// carry the aux term.
+#[allow(clippy::too_many_arguments)]
+fn compute_step_loss_grads(
+    transformer: &mut LensTransformer,
+    params: &LoraParams,
+    adapter: &TrainAdapter,
+    alpha: f32,
+    rank: f32,
+    x0: &Array,
+    features: &[Array],
+    mask: &Array,
+    t: f32,
+    noise: &Array,
+    mae: bool,
+    mask_weight: Option<&Array>,
+    dtype: Dtype,
+    lora_dtype: Option<Dtype>,
+    latent: usize,
+    checkpoint_blocks: Option<&[Vec<String>]>,
+    aux: Option<AuxStep<'_>>,
+) -> Result<(StepLosses, LoraParams)> {
+    let (x_t_f32, target) = build_batch(x0, noise, t)?;
+    let mask_weight = mask_weight.cloned();
+    let x_t = x_t_f32.as_dtype(dtype)?; // no-op in f32 mode
+    let (diffusion_on, aux_on) = match &aux {
+        Some(a) => (a.plan.diffusion, !a.plan.aux.is_empty()),
+        None => (true, false),
+    };
     let timestep = Array::from_slice(&[t], &[1]);
     let feats: Vec<Array> = features
         .iter()
@@ -963,18 +1267,166 @@ fn compute_loss_grads(
                 .forward(&x_t, &feats, Some(&mask), &timestep, 1, latent, latent)
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
-        let diff = subtract(&v, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
+        let diffusion = if diffusion_on {
+            let diff = subtract(&v, &target)?;
+            // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+            // requires a scalar cotangent).
+            Some(reduce_loss(&diff, mask_weight.as_ref(), mae)?)
         } else {
-            diff.square()?.mean(None)?
+            None
         };
-        Ok(vec![loss])
+        let aux_term = match &aux {
+            Some(a) if aux_on => {
+                // x0 estimate in f32 from the raw velocity (x0 = x_t − t·v), unpacked for TAEF2.
+                let x0_hat = Parameterization::FlowNoiseMinusX0 { sigma: t }
+                    .recover_x0(&x_t_f32, &v.as_dtype(Dtype::Float32)?)
+                    .and_then(|x| unpack_to_decoder_layout(&x, latent))
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                a.path
+                    .aux_loss(a.plan, a.entry, &x0_hat)
+                    .map_err(|e| Exception::custom(e.to_string()))?
+                    .map(|t| t.weighted)
+            }
+            _ => None,
+        };
+        // Only the first output is differentiated; the other two are reported terms.
+        let zero = || Array::from_f32(0.0);
+        let d_out = diffusion.clone().unwrap_or_else(zero);
+        let a_out = aux_term.clone().unwrap_or_else(zero);
+        let total =
+            combine_step_loss(diffusion, aux_term).map_err(|e| Exception::custom(e.to_string()))?;
+        Ok(vec![total, d_out, a_out])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
-    Ok((val[0].item::<f32>(), grads))
+    let losses = StepLosses {
+        total: val[0].item::<f32>(),
+        diffusion: diffusion_on.then(|| val[1].item::<f32>()),
+        aux: aux_on.then(|| val[2].item::<f32>()),
+    };
+    Ok((losses, grads))
+}
+
+/// Lens's x0 decoder for the shared aux-loss builder (epic 2123 E8): TAEF2 (`madebyollin/taef2`,
+/// the FLUX.2 32-channel latent API — the Lens latent space IS the FLUX.2 one).
+fn taef2_decoder() -> mlx_gen_perceptual::DecoderSpec {
+    mlx_gen_perceptual::DecoderSpec::Tiny {
+        name: "TAEF2",
+        config: TinyDecoderSpec::taef2(),
+    }
+}
+
+/// Build the epic-2123 perceptual path through the shared builder: `None` when no aux loss is
+/// enabled (nothing loads; every step is the plain diffusion step).
+fn load_perceptual_path(cfg: &TrainingConfig) -> Result<Option<PerceptualPath>> {
+    mlx_gen_perceptual::build_perceptual_path(
+        cfg,
+        &mlx_gen_perceptual::AuxLossContext {
+            label: "lens trainer",
+            decoder: taef2_decoder(),
+            latent_lpips: None,
+        },
+    )
+}
+
+/// Extra training memory (GB) the enabled aux losses add at the bucketed `edge` with `entries`
+/// cached references (epic 2123 E7). `0` when no aux loss is enabled.
+fn perceptual_footprint_gb(cfg: &TrainingConfig, edge: u32, entries: usize) -> f64 {
+    mlx_gen_perceptual::perceptual_footprint_gb(
+        cfg,
+        &taef2_decoder(),
+        mlx_gen_perceptual::AuxGeometry::image(edge, entries),
+    )
+}
+
+/// The loop's [`AuxDriver`] (epic 2123 E8): every cache entry's perceptual reference computed once
+/// (its clean packed latent, unpacked to the decoder layout at the entry's own grid), keyed per
+/// (item, bucket) entry; the alternation keyed on the schedule's items with `accum` micro-steps
+/// per update, and a resumed prefix `1..=start_step` replayed.
+fn aux_driver(
+    path: PerceptualPath,
+    cache: &[CacheEntry],
+    schedule: &BucketSchedule,
+    accum: u32,
+    start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
+) -> Result<AuxDriver> {
+    AuxDriver::prepare(
+        path,
+        cache.len(),
+        |i| unpack_to_decoder_layout(&cache[i].0, cache[i].3),
+        schedule,
+        accum,
+        start_step,
+        cancel,
+    )
+}
+
+/// One training micro-step on the 1-based `step`: pick the step's cached (item, bucket) entry,
+/// sample its `t` and noise (seeded, exactly as before epic 2123), plan the step's loss terms through
+/// the perceptual path (when one is configured: the alternation key comes from the item's own update
+/// count, and an aux-only step trains at `t` remapped into the loss window), and run
+/// [`compute_step_loss_grads`]. With no perceptual path every step is the plain diffusion step,
+/// bit-identical to the pre-epic-2123 loop.
+#[allow(clippy::too_many_arguments)]
+fn run_train_step(
+    transformer: &mut LensTransformer,
+    params: &LoraParams,
+    adapter: &TrainAdapter,
+    cfg: &TrainingConfig,
+    cache: &[CacheEntry],
+    schedule: &BucketSchedule,
+    perceptual: Option<&mut AuxDriver>,
+    step: u32,
+    mae: bool,
+    dtype: Dtype,
+    lora_dtype: Option<Dtype>,
+    checkpoint_blocks: Option<&[Vec<String>]>,
+) -> Result<(StepLosses, LoraParams)> {
+    let sample = step_sample(perceptual, step, schedule);
+    let entry = sample.entry;
+    let (x0, features, mask, latent, mask_weight) = &cache[entry];
+    let mut t = sample_sigma(
+        &cfg.timestep_type,
+        &cfg.timestep_bias,
+        cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
+    )?;
+    let noise = random::normal::<f32>(
+        x0.shape(),
+        None,
+        None,
+        Some(&random::key(
+            cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
+        )?),
+    )?;
+    let planned = sample.plan(t)?;
+    if let Some(p) = &planned {
+        t = p.plan.noise_level;
+    }
+    let aux = planned.as_ref().map(|p| AuxStep {
+        path: p.path,
+        plan: &p.plan,
+        entry: p.entry,
+    });
+    compute_step_loss_grads(
+        transformer,
+        params,
+        adapter,
+        cfg.alpha,
+        cfg.rank as f32,
+        x0,
+        features,
+        mask,
+        t,
+        &noise,
+        mae,
+        mask_weight.as_ref(),
+        dtype,
+        lora_dtype,
+        *latent,
+        checkpoint_blocks,
+        aux,
+    )
 }
 
 // ===========================================================================================
@@ -990,6 +1442,32 @@ fn compute_loss_grads(
 //   cargo test -p mlx-gen-lens --release --lib first_step -- --ignored --nocapture
 //   cargo test -p mlx-gen-lens --release --lib grads_match -- --ignored --nocapture
 // ===========================================================================================
+/// One `train_impl` cache entry (item-major, `cache[item * n_buckets + bucket]`, sc-2127): packed
+/// clean latent, caption features, caption mask, that latent's grid side, and — subject-masked loss
+/// on (sc-24828) — that bucket's packed latent loss-weight map (`None` when off).
+type CacheEntry = (Array, Vec<Array>, Array, usize, Option<Array>);
+
+/// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
+/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
+/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
+/// and laid out like that latent. Packed like the latent by
+/// [`latent_subject_mask_weight`]. `None` weights when masked loss is off.
+fn encode_buckets(
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    mut encode: impl FnMut(u32) -> Result<Array>,
+) -> Result<Vec<(Array, Option<Array>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let x0 = encode(edge)?;
+            let mask_weight = latent_subject_mask_weight(mask, &x0)?;
+            eval([&x0])?;
+            Ok((x0, mask_weight))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod first_step_repro {
     use super::*;
@@ -1139,6 +1617,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             dtype,
             lora_dtype,
             latent,
@@ -1194,6 +1673,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             Dtype::Float32,
             None,
             latent,
@@ -1523,6 +2003,62 @@ mod tests {
     use mlx_gen::CancelFlag;
     use std::path::PathBuf;
 
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
+    /// bucket's latent shape, and the background (right half of the center-square crop, with
+    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
+    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
+    /// Packed latent `[1, (g/2)², 4·C]`, C = 2: cell `(y, x)` sits at token
+    /// `(y/2)·(g/2) + x/2`, feature `c·4 + (y%2)·2 + x%2`.
+    #[test]
+    fn subject_mask_weight_is_computed_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (iw, ih) = (48u32, 32u32);
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::new(iw, ih).save(&image_path).unwrap();
+        let mask_path = tmp.path().join("a_mask.png");
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = gen_core::TrainingItem {
+            image_path,
+            caption: "a".into(),
+            subject_mask_path: Some(mask_path),
+            ..Default::default()
+        };
+        let mask_cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask =
+            mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
+        let entries = encode_buckets(&[32, 48], Some(&mask), |edge| {
+            let g = (edge / 8) as i32;
+            Ok(Array::zeros::<f32>(&[1, (g / 2) * (g / 2), 8])?)
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((x0, w), g) in entries.iter().zip([4usize, 6]) {
+            let w = w.as_ref().expect("mask loss on ⇒ a weight map");
+            assert_eq!(
+                w.shape(),
+                x0.shape(),
+                "weight must match its own bucket's latent"
+            );
+            let dense = mlx_rs::ops::multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = dense.as_slice::<f32>();
+            for y in 0..g {
+                for x in 0..g {
+                    let val = v[((y / 2) * (g / 2) + x / 2) * 8 + (y % 2) * 2 + x % 2];
+                    if x < g / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                    } else {
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                    }
+                }
+            }
+        }
+    }
+
     fn base_config() -> TrainingConfig {
         TrainingConfig {
             rank: 8,
@@ -1539,6 +2075,7 @@ mod tests {
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
+                subject_mask_path: None,
             }],
             config,
             output_dir: PathBuf::from("/tmp/lens_unused"),
@@ -1556,6 +2093,309 @@ mod tests {
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.supports_lora && d.supports_lokr);
+        // sc-24828: the one loss path (dense + block-checkpointed) reduces through the packed
+        // subject-mask weight.
+        assert!(d.techniques.subject_mask_loss);
+    }
+
+    /// sc-24828: the subject-mask weight reaches BOTH backward paths (dense + block-checkpointed) of
+    /// [`compute_loss_grads`] on a tiny synthetic Lens DiT (seeded random weights for every tensor
+    /// `LensTransformer::from_weights` reads — the `tests/cfg_gate_equivalence.rs` geometry). The
+    /// weight is built on the unpacked `[1, C, 2·L, 2·L]` grid and packed by [`pack_like_latent`].
+    /// An all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0 and all-zero
+    /// adapter grads on both paths; a half map lands strictly between and agrees across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        use mlx_gen::train::loss::subject_mask_weight;
+        use std::collections::HashMap;
+        let dcfg = LensDitConfig {
+            patch_size: 2,
+            in_channels: 8,
+            out_channels: 2,
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 8,
+            inner_dim: 16,
+            enc_hidden_dim: 6,
+            axes_dims_rope: [2, 2, 4],
+            num_text_layers: 2,
+        };
+        let (dim, hidden) = (dcfg.inner_dim, 32);
+        let txt_in = dcfg.enc_hidden_dim * dcfg.num_text_layers as i32;
+        let out_w = dcfg.patch_size * dcfg.patch_size * dcfg.out_channels;
+        let mut shapes: Vec<(String, Vec<i32>)> = vec![
+            ("img_in.weight".into(), vec![dim, dcfg.in_channels]),
+            ("img_in.bias".into(), vec![dim]),
+            ("txt_in.weight".into(), vec![dim, txt_in]),
+            ("txt_in.bias".into(), vec![dim]),
+            (
+                "time_text_embed.timestep_embedder.linear_1.weight".into(),
+                vec![dim, 256],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_1.bias".into(),
+                vec![dim],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2.weight".into(),
+                vec![dim, dim],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2.bias".into(),
+                vec![dim],
+            ),
+            ("norm_out.linear.weight".into(), vec![2 * dim, dim]),
+            ("norm_out.linear.bias".into(), vec![2 * dim]),
+            ("proj_out.weight".into(), vec![out_w, dim]),
+            ("proj_out.bias".into(), vec![out_w]),
+        ];
+        for i in 0..dcfg.num_text_layers {
+            shapes.push((format!("txt_norm.{i}.weight"), vec![dcfg.enc_hidden_dim]));
+        }
+        for b in 0..dcfg.num_layers {
+            let p = format!("transformer_blocks.{b}");
+            for m in ["img_mod.1", "txt_mod.1"] {
+                shapes.push((format!("{p}.{m}.weight"), vec![6 * dim, dim]));
+                shapes.push((format!("{p}.{m}.bias"), vec![6 * dim]));
+            }
+            for n in ["img_norm1", "img_norm2", "txt_norm1", "txt_norm2"] {
+                shapes.push((format!("{p}.{n}.weight"), vec![dim]));
+            }
+            for n in ["img_qkv", "txt_qkv"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![3 * dim, dim]));
+                shapes.push((format!("{p}.attn.{n}.bias"), vec![3 * dim]));
+            }
+            for n in ["to_out.0", "to_add_out"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![dim, dim]));
+                shapes.push((format!("{p}.attn.{n}.bias"), vec![dim]));
+            }
+            for n in ["norm_q", "norm_k", "norm_added_q", "norm_added_k"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![dcfg.head_dim]));
+            }
+            for m in ["img_mlp", "txt_mlp"] {
+                shapes.push((format!("{p}.{m}.w1.weight"), vec![hidden, dim]));
+                shapes.push((format!("{p}.{m}.w3.weight"), vec![hidden, dim]));
+                shapes.push((format!("{p}.{m}.w2.weight"), vec![dim, hidden]));
+            }
+        }
+        let draw = |shape: &[i32], k: u64| {
+            random::normal::<f32>(shape, None, None, Some(&random::key(k).unwrap())).unwrap()
+        };
+        let map: HashMap<String, Array> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (n, sh))| (n.clone(), draw(sh, i as u64 + 1)))
+            .collect();
+        let mut dit =
+            LensTransformer::from_weights(&Weights::from_map(map), &dcfg, Dtype::Float32).unwrap();
+        let cfg = TrainingConfig {
+            rank: 4,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&dit, &cfg);
+        assert!(!target_paths.is_empty());
+        let (targets, params) = build_lora_targets(&mut dit, &target_paths, 4, 7).unwrap();
+        // Non-zero factors on both sides (lora_b inits at zero, which would zero the lora_a grads
+        // trivially).
+        let scale = Array::from_slice(&[0.05f32], &[1]);
+        let params: LoraParams = params
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                (
+                    k.clone(),
+                    multiply(draw(v.shape(), 100 + i as u64), &scale).unwrap(),
+                )
+            })
+            .collect();
+        let adapter = TrainAdapter::Lora { targets };
+        let mut locals: Vec<Vec<String>> = vec![Vec::new(); dcfg.num_layers];
+        for path in &target_paths {
+            if let Some((idx, local)) = path
+                .strip_prefix("transformer_blocks.")
+                .and_then(|rest| rest.split_once('.'))
+            {
+                if let Ok(i) = idx.parse::<usize>() {
+                    locals[i].push(local.to_string());
+                }
+            }
+        }
+        assert!(locals.iter().any(|l| !l.is_empty()));
+
+        // Packed latent `[1, L·L, 4·C]` (L = 2 patch cells, C = 2 unpacked channels).
+        let latent = 2usize;
+        let unpacked = [1i32, 2, 2 * latent as i32, 2 * latent as i32];
+        let x0 = pack_like_latent(&draw(&unpacked, 201)).unwrap();
+        let noise = draw(x0.shape(), 202);
+        let feats: Vec<Array> = (0..dcfg.num_text_layers)
+            .map(|i| draw(&[1, 3, dcfg.enc_hidden_dim], 300 + i as u64))
+            .collect();
+        let mask = Array::ones::<f32>(&[1, 3]).unwrap();
+        let side = 2 * latent;
+        let wmap = |v: &[f32]| {
+            pack_like_latent(&subject_mask_weight(v, side, side, &unpacked).unwrap()).unwrap()
+        };
+        let mut run = |weight: Option<&Array>, ckpt: bool| {
+            let (l, g) = compute_loss_grads(
+                &mut dit,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &feats,
+                &mask,
+                0.5,
+                &noise,
+                false,
+                weight,
+                Dtype::Float32,
+                None,
+                latent,
+                ckpt.then_some(locals.as_slice()),
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            (l, g)
+        };
+        let n = side * side;
+        let (plain, _) = run(None, false);
+        let ones = wmap(&vec![1.0; n]);
+        assert!((run(Some(&ones), false).0 - plain).abs() < 1e-6);
+        let zeros = wmap(&vec![0.0; n]);
+        for ckpt in [false, true] {
+            let (loss, grads) = run(Some(&zeros), ckpt);
+            assert_eq!(
+                loss, 0.0,
+                "ckpt={ckpt}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty());
+            for (k, g) in &grads {
+                let m = g.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert_eq!(m, 0.0, "ckpt={ckpt}: nonzero adapter grad on {k}");
+            }
+        }
+        let half: Vec<f32> = (0..n)
+            .map(|i| if i % side < side / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let half = wmap(&half);
+        let (dense, _) = run(Some(&half), false);
+        let (ckpt, _) = run(Some(&half), true);
+        assert!(dense > 0.0 && dense < plain, "{dense} vs {plain}");
+        assert!(
+            (dense - ckpt).abs() < 1e-4,
+            "dense {dense} vs checkpoint {ckpt}"
+        );
+    }
+
+    /// sc-24828: the subject-mask weight is packed EXACTLY like the training latent. A 16×16 mask whose
+    /// 4×4 pixel blocks each carry a distinct grey level area-averages onto a 4×4 unpacked latent
+    /// grid (cell `(y, x)` = that block's level); `latent_subject_mask_weight` must then put cell
+    /// `(2i+dy, 2j+dx)` at packed token `i·2 + j`, feature `c·4 + dy·2 + dx` for every channel `c` —
+    /// the 2×2 `patchify_latents` → `pack_latents` order `encode_latents` applies to `x0`.
+    #[test]
+    fn subject_mask_weight_is_packed_like_the_latent() {
+        let level = |y: u32, x: u32| 10 + (y * 4 + x) * 15;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mask.png");
+        image::GrayImage::from_fn(16, 16, |px, py| image::Luma([level(py / 4, px / 4) as u8]))
+            .save(&path)
+            .unwrap();
+        let mut cfg = base_config();
+        cfg.subject_mask_loss = Some(gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        });
+        let mut item = req_with(base_config()).items.remove(0);
+        item.image_path = path.clone();
+        item.subject_mask_path = Some(path);
+        // Packed latent `[1, (4/2)·(4/2), 4·C]` with C = 2 unpacked channels.
+        let x0 = Array::zeros::<f32>(&[1, 4, 8]).unwrap();
+        let prepared =
+            PreparedSubjectMask::load_if_enabled("t", &item, cfg.subject_mask_loss.as_ref())
+                .unwrap();
+        let w = latent_subject_mask_weight(prepared.as_ref(), &x0)
+            .unwrap()
+            .expect("technique on ⇒ a weight");
+        assert_eq!(w.shape(), x0.shape());
+        let w = multiply(&w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+        let v = w.as_slice::<f32>();
+        for (i, j) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+            for c in 0..2u32 {
+                for (dy, dx) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+                    let tok = (i * 2 + j) as usize;
+                    let feat = (c * 4 + dy * 2 + dx) as usize;
+                    let got = v[tok * 8 + feat];
+                    let want = level(2 * i + dy, 2 * j + dx) as f32 / 255.0;
+                    assert!(
+                        (got - want).abs() < 1e-6,
+                        "token {tok} feature {feat}: {got} != cell ({}, {}) = {want}",
+                        2 * i + dy,
+                        2 * j + dx
+                    );
+                }
+            }
+        }
+        // Off ⇒ no weight (and no file read).
+        let off = PreparedSubjectMask::load_if_enabled(
+            "t",
+            &item,
+            base_config().subject_mask_loss.as_ref(),
+        )
+        .unwrap();
+        assert!(off.is_none());
+        assert!(latent_subject_mask_weight(off.as_ref(), &x0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn descriptor_declares_resolution_buckets() {
+        // sc-2127: the shared technique floor only lets `resolution_buckets` through when declared.
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+    }
+
+    #[test]
+    fn preflight_sizes_for_the_largest_bucket_edge() {
+        let rb = |resolution, repeats| gen_core::ResolutionBucket {
+            resolution,
+            repeats,
+        };
+        // Buckets off: the guard edge is the single legacy edge.
+        let mut cfg = TrainingConfig {
+            resolution: 512,
+            ..base_config()
+        };
+        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 512);
+        // Buckets [512, 1024] with `resolution` 512: the guard must size for 1024 (epic 2123 E7).
+        cfg.resolution_buckets = vec![rb(512, 16), rb(1024, 1)];
+        let edges = bucket_edges(&cfg);
+        assert_eq!(edges, vec![512, 1024]);
+        assert_eq!(preflight_edge(&edges), 1024);
+        // A 24 GB-class budget (safe ≈ 20.4 GB): dense bf16 fits 512 (~11.5 GB) but not 1024
+        // (~22.8 GB) — so the bucketed run is refused even though `resolution` alone would pass.
+        assert!(check_preflight_budget(512, true, 24.0).is_ok());
+        assert!(check_preflight_budget(preflight_edge(&edges), true, 24.0).is_err());
+    }
+
+    #[test]
+    fn latent_grid_is_per_bucket_edge() {
+        // sc-2127: each cached latent carries the grid of ITS edge — the DiT's img ids span
+        // `grid × grid`, and `grid²` must equal the packed latent's token count `(edge/16)²`.
+        let rb = |resolution, repeats| gen_core::ResolutionBucket {
+            resolution,
+            repeats,
+        };
+        let cfg = TrainingConfig {
+            resolution_buckets: vec![rb(512, 16), rb(770, 4), rb(1024, 1)],
+            ..base_config()
+        };
+        let grids: Vec<usize> = bucket_edges(&cfg).into_iter().map(latent_grid).collect();
+        assert_eq!(grids, vec![32, 48, 64]);
+        for edge in bucket_edges(&cfg) {
+            let tokens = (edge as usize / 16).pow(2);
+            assert_eq!(latent_grid(edge).pow(2), tokens, "edge {edge}");
+        }
     }
 
     #[test]
@@ -1667,5 +2507,587 @@ mod tests {
             sample_sigma("sigmoid", "high", 7).unwrap()
                 > sample_sigma("sigmoid", "low", 7).unwrap()
         );
+    }
+}
+
+/// sc-24830 (epic 2123 depth anchoring) — the Lens step seam ([`run_train_step`] /
+/// [`compute_step_loss_grads`]) on a tiny random-init Lens DiT (the `tests/cfg_gate_equivalence.rs`
+/// geometry: 2 blocks, packed 8-channel latent = 2 unpacked channels), a random-init tiny 2-channel
+/// TAESD decoder and a random-init tiny Depth-Anything-V2. Seconds; no weights downloaded.
+#[cfg(test)]
+mod depth_anchoring_tests {
+    use super::*;
+    use mlx_gen::train::perceptual::AuxLossSchedule;
+    use std::collections::HashMap;
+
+    fn tiny_dit() -> LensTransformer {
+        let dcfg = LensDitConfig {
+            patch_size: 2,
+            in_channels: 8,
+            out_channels: 2,
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 8,
+            inner_dim: 16,
+            enc_hidden_dim: 6,
+            axes_dims_rope: [2, 2, 4],
+            num_text_layers: 2,
+        };
+        let (dim, hidden) = (dcfg.inner_dim, 32);
+        let txt_in = dcfg.enc_hidden_dim * dcfg.num_text_layers as i32;
+        let out_w = dcfg.patch_size * dcfg.patch_size * dcfg.out_channels;
+        let mut shapes: Vec<(String, Vec<i32>)> = vec![
+            ("img_in.weight".into(), vec![dim, dcfg.in_channels]),
+            ("img_in.bias".into(), vec![dim]),
+            ("txt_in.weight".into(), vec![dim, txt_in]),
+            ("txt_in.bias".into(), vec![dim]),
+            (
+                "time_text_embed.timestep_embedder.linear_1.weight".into(),
+                vec![dim, 256],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_1.bias".into(),
+                vec![dim],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2.weight".into(),
+                vec![dim, dim],
+            ),
+            (
+                "time_text_embed.timestep_embedder.linear_2.bias".into(),
+                vec![dim],
+            ),
+            ("norm_out.linear.weight".into(), vec![2 * dim, dim]),
+            ("norm_out.linear.bias".into(), vec![2 * dim]),
+            ("proj_out.weight".into(), vec![out_w, dim]),
+            ("proj_out.bias".into(), vec![out_w]),
+        ];
+        for i in 0..dcfg.num_text_layers {
+            shapes.push((format!("txt_norm.{i}.weight"), vec![dcfg.enc_hidden_dim]));
+        }
+        for b in 0..dcfg.num_layers {
+            let p = format!("transformer_blocks.{b}");
+            for m in ["img_mod.1", "txt_mod.1"] {
+                shapes.push((format!("{p}.{m}.weight"), vec![6 * dim, dim]));
+                shapes.push((format!("{p}.{m}.bias"), vec![6 * dim]));
+            }
+            for n in ["img_norm1", "img_norm2", "txt_norm1", "txt_norm2"] {
+                shapes.push((format!("{p}.{n}.weight"), vec![dim]));
+            }
+            for n in ["img_qkv", "txt_qkv"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![3 * dim, dim]));
+                shapes.push((format!("{p}.attn.{n}.bias"), vec![3 * dim]));
+            }
+            for n in ["to_out.0", "to_add_out"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![dim, dim]));
+                shapes.push((format!("{p}.attn.{n}.bias"), vec![dim]));
+            }
+            for n in ["norm_q", "norm_k", "norm_added_q", "norm_added_k"] {
+                shapes.push((format!("{p}.attn.{n}.weight"), vec![dcfg.head_dim]));
+            }
+            for m in ["img_mlp", "txt_mlp"] {
+                shapes.push((format!("{p}.{m}.w1.weight"), vec![hidden, dim]));
+                shapes.push((format!("{p}.{m}.w3.weight"), vec![hidden, dim]));
+                shapes.push((format!("{p}.{m}.w2.weight"), vec![dim, hidden]));
+            }
+        }
+        let scale = Array::from_slice(&[0.3f32], &[1]);
+        let map: HashMap<String, Array> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (n, sh))| {
+                let a = random::normal::<f32>(
+                    sh,
+                    None,
+                    None,
+                    Some(&random::key(i as u64 + 1).unwrap()),
+                )
+                .unwrap();
+                (n.clone(), multiply(&a, &scale).unwrap())
+            })
+            .collect();
+        LensTransformer::from_weights(&Weights::from_map(map), &dcfg, Dtype::Float32).unwrap()
+    }
+
+    fn aux_sched() -> AuxLossSchedule {
+        AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        }
+    }
+
+    fn path_with(s: AuxLossSchedule) -> PerceptualPath {
+        mlx_gen_perceptual::testing::tiny_depth_path(2, s).unwrap()
+    }
+
+    fn cfg() -> TrainingConfig {
+        let mut cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            ..Default::default()
+        };
+        cfg.depth_anchoring.schedule = aux_sched();
+        cfg
+    }
+
+    fn rnd(shape: &[i32], k: u64) -> Array {
+        let a = random::normal::<f32>(shape, None, None, Some(&random::key(k).unwrap())).unwrap();
+        eval([&a]).unwrap();
+        a
+    }
+
+    /// One cache entry at latent grid `g`: a packed `[1, g², 8]` clean latent (laid out by the real
+    /// `pack_like_latent` from an unpacked `[1, 2, 2g, 2g]` grid) + tiny caption features.
+    fn entry(g: usize, k: u64) -> CacheEntry {
+        let side = 2 * g as i32;
+        let x0 = pack_like_latent(&rnd(&[1, 2, side, side], k)).unwrap();
+        let feats = (0..2).map(|i| rnd(&[1, 3, 6], 300 + k + i)).collect();
+        (x0, feats, Array::ones::<f32>(&[1, 3]).unwrap(), g, None)
+    }
+
+    struct Fixture {
+        dit: LensTransformer,
+        adapter: TrainAdapter,
+        params: LoraParams,
+        locals: Vec<Vec<String>>,
+    }
+
+    fn fixture(cfg: &TrainingConfig) -> Fixture {
+        let mut dit = tiny_dit();
+        let paths = resolve_target_paths(&dit, cfg);
+        let (targets, params) =
+            build_lora_targets(&mut dit, &paths, cfg.rank as i32, cfg.seed).unwrap();
+        let mut locals: Vec<Vec<String>> = vec![Vec::new(); 2];
+        for p in &paths {
+            if let Some((idx, local)) = p
+                .strip_prefix("transformer_blocks.")
+                .and_then(|r| r.split_once('.'))
+            {
+                locals[idx.parse::<usize>().unwrap()].push(local.to_string());
+            }
+        }
+        Fixture {
+            dit,
+            adapter: TrainAdapter::Lora { targets },
+            params,
+            locals,
+        }
+    }
+
+    fn single_bucket(n: usize) -> BucketSchedule {
+        BucketSchedule::new(
+            n,
+            &[gen_core::ResolutionBucket {
+                resolution: 32,
+                repeats: 1,
+            }],
+            7,
+        )
+    }
+
+    fn step(
+        f: &mut Fixture,
+        cfg: &TrainingConfig,
+        cache: &[CacheEntry],
+        schedule: &BucketSchedule,
+        path: Option<&mut AuxDriver>,
+        n: u32,
+        ckpt: bool,
+    ) -> (StepLosses, LoraParams) {
+        let locals = f.locals.clone();
+        let (l, g) = run_train_step(
+            &mut f.dit,
+            &f.params,
+            &f.adapter,
+            cfg,
+            cache,
+            schedule,
+            path,
+            n,
+            false,
+            Dtype::Float32,
+            None,
+            ckpt.then_some(locals.as_slice()),
+        )
+        .unwrap();
+        eval(g.values()).unwrap();
+        (l, g)
+    }
+
+    /// `unpack_to_decoder_layout` exactly inverts `patchify_latents` → `pack_latents` (so TAEF2
+    /// sees the 32-channel grid the VAE produced, cell for cell). Mutation: swap the `i`/`j` axes
+    /// in the inverse patchify ⇒ red.
+    #[test]
+    fn unpack_inverts_the_lens_packing() {
+        let sq = rnd(&[1, 3, 6, 6], 6);
+        let packed = pack_like_latent(&sq).unwrap();
+        let back = unpack_to_decoder_layout(&packed, 3).unwrap();
+        assert_eq!(back.shape(), sq.shape());
+        let err = back
+            .subtract(&sq)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert_eq!(err, 0.0);
+        assert!(unpack_to_decoder_layout(&packed, 2).is_err());
+    }
+
+    /// AC (a)/(b), dense and block-checkpointed. Mutation: force `diffusion_on = true` ⇒ red.
+    #[test]
+    fn depth_step_trains_the_lora_through_depth_only() {
+        for ckpt in [false, true] {
+            let cfg = cfg();
+            let mut f = fixture(&cfg);
+            let cache = vec![entry(2, 100)];
+            let schedule = single_bucket(1);
+            let mut d = aux_driver(
+                path_with(aux_sched()),
+                &cache,
+                &schedule,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
+            let (diff, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, ckpt);
+            assert_eq!(diff.aux, None, "ckpt={ckpt}");
+            assert_eq!(Some(diff.total), diff.diffusion);
+            let (depth, g) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, ckpt);
+            assert_eq!(depth.diffusion, None, "ckpt={ckpt}");
+            let aux = depth.aux.expect("depth term");
+            assert!(aux > 0.0 && aux.is_finite(), "ckpt={ckpt}: {aux}");
+            assert_eq!(depth.total, aux);
+            let gb: f32 = g
+                .iter()
+                .filter(|(k, _)| k.ends_with(".lora_b"))
+                .map(|(_, v)| v.abs().unwrap().sum(None).unwrap().item::<f32>())
+                .sum();
+            assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B |Σ| = {gb}");
+        }
+    }
+
+    /// The aux step trains at `t` remapped into `[0.6, 0.8]`, and its depth term is the depth loss
+    /// of the explicitly recovered and unpacked `x_t − t·v`. Mutations: keep the sampled `t` ⇒ red;
+    /// recover with the opposite flow sign ⇒ red.
+    #[test]
+    fn aux_step_trains_at_the_remapped_noise_level() {
+        let mut cfg = cfg();
+        let window = AuxLossSchedule {
+            t_min: 0.6,
+            t_max: 0.8,
+            ..aux_sched()
+        };
+        cfg.depth_anchoring.schedule = window;
+        let mut f = fixture(&cfg);
+        let cache = vec![entry(2, 100)];
+        let schedule = single_bucket(1);
+        let mut d = aux_driver(
+            path_with(window),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
+        step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, false);
+        let (depth, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, false);
+        let raw = sample_sigma(
+            &cfg.timestep_type,
+            &cfg.timestep_bias,
+            cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(2),
+        )
+        .unwrap();
+        let plan = d.path().plan(2, 0, raw).unwrap();
+        let t = plan.noise_level;
+        assert!((0.6..=0.8).contains(&t) && t != raw, "{t} vs {raw}");
+        let (x0, feats, mask, g, _) = &cache[0];
+        let noise = random::normal::<f32>(
+            x0.shape(),
+            None,
+            None,
+            Some(&random::key(cfg.seed.wrapping_add(2).wrapping_mul(2) + 1).unwrap()),
+        )
+        .unwrap();
+        f.adapter
+            .install_as(&mut f.dit, &f.params, 4.0, 4.0, None, LOKR_DTYPE)
+            .unwrap();
+        let (x_t, _) = build_batch(x0, &noise, t).unwrap();
+        let v = f
+            .dit
+            .forward(
+                &x_t,
+                feats,
+                Some(mask),
+                &Array::from_slice(&[t], &[1]),
+                1,
+                *g,
+                *g,
+            )
+            .unwrap();
+        let x0_hat = subtract(&x_t, multiply(&v, Array::from_f32(t)).unwrap()).unwrap();
+        let want = d
+            .path()
+            .aux_loss(&plan, 0, &unpack_to_decoder_layout(&x0_hat, *g).unwrap())
+            .unwrap()
+            .unwrap()
+            .weighted
+            .item::<f32>();
+        let got = depth.aux.expect("depth step");
+        assert!(
+            (want - got).abs() <= 1e-5 * want.abs().max(1.0),
+            "{want} vs {got}"
+        );
+    }
+
+    /// Per-image alternation (round-robin N = 2) and per-entry references across two buckets of
+    /// different grids. Mutations: key the plan on the global step ⇒ red; pass the item as the
+    /// `AuxStep` entry ⇒ a bucket-1 depth step compares against bucket 0's reference ⇒ red.
+    #[test]
+    fn alternation_is_per_image_with_per_entry_references() {
+        let cfg = cfg();
+        let mut f = fixture(&cfg);
+        // Round-robin, one bucket.
+        let cache = vec![entry(2, 100), entry(2, 101)];
+        let schedule = single_bucket(2);
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
+        let kinds: Vec<(usize, bool)> = (1..=4)
+            .map(|n| {
+                let (l, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), n, false);
+                (schedule.sample((n - 1) as usize).0, l.aux.is_some())
+            })
+            .collect();
+        for image in 0..2 {
+            let mine: Vec<bool> = kinds.iter().filter(|k| k.0 == image).map(|k| k.1).collect();
+            assert!(mine.contains(&true) && mine.contains(&false), "{kinds:?}");
+        }
+        // Two buckets: grid 2 and grid 3, item-major.
+        let cache = vec![entry(2, 110), entry(3, 111), entry(2, 112), entry(3, 113)];
+        let schedule = BucketSchedule::new(
+            2,
+            &[
+                gen_core::ResolutionBucket {
+                    resolution: 32,
+                    repeats: 1,
+                },
+                gen_core::ResolutionBucket {
+                    resolution: 48,
+                    repeats: 1,
+                },
+            ],
+            7,
+        );
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
+        let mut replay = mlx_gen::train::perceptual::AuxAlternation::new(2, 1);
+        let mut depth_off_item = false;
+        for n in 1..=2 * schedule.epoch_len() as u32 {
+            let (l, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), n, false);
+            // Recompute the step against the SCHEDULED entry's latent and reference.
+            let k = (n - 1) as usize;
+            let (item, entry) = (schedule.sample(k).0, schedule.cache_index(k));
+            let raw = sample_sigma(
+                &cfg.timestep_type,
+                &cfg.timestep_bias,
+                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
+            )
+            .unwrap();
+            let plan = d.path().plan(replay.key(n, item), entry, raw).unwrap();
+            let (x0, feats, mask, g, _) = &cache[entry];
+            let noise = random::normal::<f32>(
+                x0.shape(),
+                None,
+                None,
+                Some(&random::key(cfg.seed.wrapping_add(n as u64).wrapping_mul(2) + 1).unwrap()),
+            )
+            .unwrap();
+            let (expected, _) = compute_step_loss_grads(
+                &mut f.dit,
+                &f.params,
+                &f.adapter,
+                cfg.alpha,
+                cfg.rank as f32,
+                x0,
+                feats,
+                mask,
+                plan.noise_level,
+                &noise,
+                false,
+                None,
+                Dtype::Float32,
+                None,
+                *g,
+                None,
+                Some(AuxStep {
+                    path: d.path(),
+                    plan: &plan,
+                    entry,
+                }),
+            )
+            .unwrap();
+            assert_eq!(l, expected, "step {n} (item {item}, entry {entry})");
+            depth_off_item |= l.aux.is_some() && entry != item;
+        }
+        assert!(depth_off_item, "no depth step on an entry != its item");
+        assert_eq!(d.path().reference_computations(), cache.len());
+    }
+
+    /// E1: depth off ⇒ nothing loaded, no footprint, and the step is bit-identical to the
+    /// pre-epic-2123 closure; a diffusion-only step of an enabled path is bit-identical too.
+    /// Mutation: flip MAE/MSE in the diffusion term ⇒ red.
+    #[test]
+    fn everything_off_is_bit_identical_to_the_legacy_step() {
+        assert!(load_perceptual_path(&TrainingConfig::default())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            perceptual_footprint_gb(&TrainingConfig::default(), 1024, 10),
+            0.0
+        );
+        let off_cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let mut f = fixture(&off_cfg);
+        let cache = vec![entry(2, 100), entry(2, 101)];
+        let schedule = single_bucket(2);
+        let (off, g_off) = step(&mut f, &off_cfg, &cache, &schedule, None, 1, false);
+        assert_eq!(off.aux, None);
+        let (x0, feats, mask, g, _) = &cache[0];
+        let t = sample_sigma(
+            &off_cfg.timestep_type,
+            &off_cfg.timestep_bias,
+            off_cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),
+        )
+        .unwrap();
+        let noise = random::normal::<f32>(
+            x0.shape(),
+            None,
+            None,
+            Some(&random::key(off_cfg.seed.wrapping_add(1).wrapping_mul(2) + 1).unwrap()),
+        )
+        .unwrap();
+        let (x_t, target) = build_batch(x0, &noise, t).unwrap();
+        let timestep = Array::from_slice(&[t], &[1]);
+        let (feats, mask, g) = (feats.clone(), mask.clone(), *g);
+        let dit = &mut f.dit;
+        let adapter = &f.adapter;
+        let legacy = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+            adapter.install_as(dit, &p, 4.0, 4.0, None, LOKR_DTYPE)?;
+            let v = dit
+                .forward(&x_t, &feats, Some(&mask), &timestep, 1, g, g)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            Ok(vec![reduce_loss(&subtract(&v, &target)?, None, false)?])
+        };
+        let (val, g_legacy) = keyed_value_and_grad(legacy)(f.params.clone(), 0).unwrap();
+        eval(g_legacy.values()).unwrap();
+        assert_eq!(off.total, val[0].item::<f32>());
+        let bits =
+            |a: &Array| -> Vec<u32> { a.as_slice::<f32>().iter().map(|x| x.to_bits()).collect() };
+        for (k, v) in &g_legacy {
+            assert_eq!(bits(v), bits(&g_off[k]), "{k}");
+        }
+        let on_cfg = cfg();
+        let mut f2 = fixture(&on_cfg);
+        let mut d = aux_driver(
+            path_with(aux_sched()),
+            &cache,
+            &schedule,
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap();
+        let (on1, g_on1) = step(&mut f2, &on_cfg, &cache, &schedule, Some(&mut d), 1, false);
+        let mut f3 = fixture(&on_cfg);
+        let (none1, g_none1) = step(&mut f3, &on_cfg, &cache, &schedule, None, 1, false);
+        assert_eq!(on1, none1);
+        for (k, v) in &g_none1 {
+            assert_eq!(bits(v), bits(&g_on1[k]), "{k}");
+        }
+    }
+
+    /// E7: the estimate grows by TAEF2 + DA2 (more for Large); the guard refuses at a synthetic
+    /// budget between the DiT projection and projection + aux on the dense and the checkpointed
+    /// path; a checkpointed run without aux is unguarded. Mutations: drop `+ extra_gb` ⇒ red;
+    /// return early for every checkpointed run ⇒ red.
+    #[test]
+    fn memory_estimate_includes_the_aux_models() {
+        let mut on = TrainingConfig::default();
+        on.depth_anchoring.schedule = aux_sched();
+        let small = perceptual_footprint_gb(&on, 1024, 10);
+        on.depth_anchoring.model_size = gen_core::train::DepthModelSize::Large;
+        let large = perceptual_footprint_gb(&on, 1024, 10);
+        assert!(small > 0.0 && large - small > 1.0, "{small} / {large}");
+        // TAEF2 (pooled, 32ch) costs more than a plain TAEF1 decoder would.
+        assert!(
+            TinyDecoderSpec::taef2().footprint(1024, 1024).param_bytes
+                > TinyDecoderSpec::taef1().footprint(1024, 1024).param_bytes
+        );
+        let tokens = (1024.0f64 / 16.0).powi(2) + PREFLIGHT_TXT_TOKENS;
+        for (checkpointed, base) in [
+            (false, projected_dense_peak_gb(tokens, true)),
+            (true, projected_dense_peak_gb(0.0, true)),
+        ] {
+            let budget = (base + large / 2.0) / 0.85;
+            assert!(
+                check_preflight_budget_with_aux(&on, 1024, true, budget, 0.0, checkpointed).is_ok()
+            );
+            assert!(
+                check_preflight_budget_with_aux(&on, 1024, true, budget, large, checkpointed)
+                    .is_err(),
+                "checkpointed={checkpointed}"
+            );
+        }
+        assert!(check_preflight_budget_with_aux(&on, 1024, true, 0.001, 0.0, true).is_ok());
+        // The checkpointed refusal names the enabled aux losses (the shared E7 guard).
+        let budget = (projected_dense_peak_gb(0.0, true) + large / 2.0) / 0.85;
+        let err = check_preflight_budget_with_aux(&on, 1024, true, budget, large, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[depth]"), "{err}");
+    }
+
+    /// E3: Lens declares depth anchoring.
+    #[test]
+    fn descriptor_declares_depth_anchoring() {
+        assert!(trainer_descriptor().techniques.depth_anchoring);
+    }
+
+    /// A missing decoder is a named error (TAEF2).
+    #[test]
+    fn missing_aux_weights_are_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.perceptual_decoder_dir = Some(tmp.path().join("no-taef2"));
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let err = load_perceptual_path(&c)
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(err.contains("TAEF2"), "{err}");
     }
 }

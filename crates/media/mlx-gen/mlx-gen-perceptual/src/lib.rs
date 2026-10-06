@@ -1,0 +1,1302 @@
+//! `mlx-gen-perceptual` — the **one seam** between an MLX trainer and the auxiliary perceptual
+//! losses of epic 2123 (E8). The MLX twin of `candle-gen-perceptual`.
+//!
+//! A trainer never assembles losses itself. It describes its latent family in an
+//! [`AuxLossContext`] (its x0 decoder and error label) and calls:
+//!
+//! - [`perceptual_footprint`] in its memory preflight (E7) — the decoder (only when an enabled loss
+//!   decodes pixels) plus every enabled loss, from configs, before anything loads;
+//! - [`build_perceptual_path`] before latent caching — `None` when no aux loss is enabled (nothing
+//!   loads; the step is the plain diffusion step), else a ready [`PerceptualPath`];
+//!
+//! then drives the path as the kit documents ([`mlx_gen::train::perceptual`]): an
+//! [`AuxDriver`](mlx_gen::train::perceptual::AuxDriver) builds references per (item, bucket) cache
+//! entry and keys the alternation on the real item index (replaying a resumed prefix), then
+//! `plan` / `aux_loss` / `combine_step_loss` in the step.
+//!
+//! ## Adding a loss (S10 identity/face, S11 body, S12 latent losses …)
+//! Append one [`AuxArm`] to [`ARMS`]: its name, whether `cfg` enables it, its [`PerceptualInput`]
+//! (pixel losses get the family decoder; latent losses run even on a family with no decoder), its
+//! [`AuxModelFootprint`] at a training geometry, and its `build` (load the frozen model from the
+//! config's model dir). No trainer loop changes: every trainer that calls this builder picks the new
+//! loss up; a trainer declares it by setting the technique flag in its `TrainerDescriptor` (the
+//! gen-core floor refuses it elsewhere).
+//!
+//! **Twin-crate rule.** `mlx-gen-perceptual` and `candle-gen-perceptual` are twins: add an arm (and
+//! any new [`DecoderSpec`] variant) to BOTH crates in the same PR. `scripts/check-workspace.py`'s
+//! cross-backend comparison reads same-named `pub const` items in the two crates, so it flags an
+//! `ARMS` slice whose text differs (route crate-specific calls through a same-named private fn, as
+//! `depth_footprint` does); it does not compare enums or functions, so a `DecoderSpec` variant
+//! or a builder change must be mirrored by hand.
+
+use std::path::Path;
+
+use mlx_gen::gen_core;
+use mlx_gen::gen_core::train::{IdentityLossConfig, TrainingConfig};
+use mlx_gen::train::perceptual::{
+    perceptual_footprint_bytes, AuxLoss, AuxModelFootprint, PerceptualInput, PerceptualPath,
+    X0Decoder,
+};
+use mlx_gen::train::tae::{TinyDecoder, TinyDecoderSpec};
+use mlx_gen::train::taehv::{TaehvConfig, TaehvDecoder};
+use mlx_gen::{Error, Result};
+
+/// A decoder a trainer supplies itself (a video tiny decoder run per frame, or a full-VAE
+/// fallback for a family with no tiny decoder). Loaded only when an enabled loss decodes pixels.
+pub trait CustomDecoder {
+    /// Human name for errors (e.g. `"TAEW2_1"`, `"Mage VAE decoder"`).
+    fn name(&self) -> &'static str;
+    /// Pre-load memory figures of one differentiable decode to an `h × w` frame.
+    fn footprint(&self, h: u32, w: u32) -> AuxModelFootprint;
+    /// Load the decoder; `dir` is `TrainingConfig::perceptual_decoder_dir`.
+    fn load(&self, dir: Option<&Path>) -> Result<Box<dyn X0Decoder>>;
+}
+
+/// The trainer's x0 decoder for its latent family.
+pub enum DecoderSpec {
+    /// No pixel decoder: pixel losses are refused with a typed error; latent losses still run.
+    None,
+    /// A TAESD-family tiny decoder loaded from `TrainingConfig::perceptual_decoder_dir`.
+    Tiny {
+        /// Display name for errors (e.g. `"TAEF1"`).
+        name: &'static str,
+        /// The decoder structure (`TinyDecoderConfig::taef1().into()`, `TinyDecoderSpec::taef2()`,
+        /// …).
+        config: TinyDecoderSpec,
+    },
+    /// A TAEHV tiny video decoder (`taew2_1` / `taew2_2` / `taeltx2_3`) loaded from
+    /// `TrainingConfig::perceptual_decoder_dir`, decoding each latent frame as a `T = 1` clip.
+    Taehv {
+        /// Display name for errors (e.g. `"TAEW2.1"`).
+        name: &'static str,
+        config: TaehvConfig,
+    },
+    /// A trainer-built decoder.
+    Custom(Box<dyn CustomDecoder>),
+}
+
+impl DecoderSpec {
+    /// The decoder's display name (`None` for [`DecoderSpec::None`]).
+    pub fn name(&self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Tiny { name, .. } | Self::Taehv { name, .. } => Some(name),
+            Self::Custom(c) => Some(c.name()),
+        }
+    }
+
+    fn footprint(&self, h: u32, w: u32) -> Option<AuxModelFootprint> {
+        match self {
+            Self::None => None,
+            Self::Tiny { config, .. } => Some(config.footprint(h, w)),
+            Self::Taehv { config, .. } => Some(config.footprint(h, w)),
+            Self::Custom(c) => Some(c.footprint(h, w)),
+        }
+    }
+}
+
+/// What the builder needs to know about the calling trainer.
+pub struct AuxLossContext<'a> {
+    /// Error-message prefix (e.g. `"sdxl trainer"`).
+    pub label: &'a str,
+    /// The family's x0 decoder.
+    pub decoder: DecoderSpec,
+    /// The family's E-LatentLPIPS weight set (`None`: no E-LatentLPIPS weights for this latent
+    /// space).
+    pub latent_lpips: Option<gen_core::train::LatentLpipsFamily>,
+}
+
+/// The training geometry a footprint is sized for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuxGeometry {
+    /// Decoded image height / width (the largest bucket).
+    pub height: u32,
+    pub width: u32,
+    /// Frames decoded per aux step (1 for images; the per-step frame subset for video).
+    pub frames: u32,
+    /// Cached reference entries (items × buckets).
+    pub entries: usize,
+}
+
+impl AuxGeometry {
+    /// A square single-frame image geometry.
+    pub fn image(edge: u32, entries: usize) -> Self {
+        Self {
+            height: edge,
+            width: edge,
+            frames: 1,
+            entries,
+        }
+    }
+}
+
+/// One auxiliary loss arm of the builder.
+pub struct AuxArm {
+    /// Short name (matches the loss's `PerceptualLoss::name`).
+    pub name: &'static str,
+    /// Whether `cfg` enables this loss.
+    pub enabled: fn(&TrainingConfig) -> bool,
+    /// What the loss consumes.
+    pub input: PerceptualInput,
+    /// Its pre-load memory figures for one `h × w` frame.
+    pub footprint: fn(&TrainingConfig, u32, u32) -> AuxModelFootprint,
+    /// Load the frozen model and wrap it as a scheduled [`AuxLoss`].
+    pub build: fn(&TrainingConfig, &AuxLossContext<'_>) -> Result<AuxLoss>,
+}
+
+/// Depth anchoring (sc-2125 / sc-24830): Depth-Anything-V2 on the decoded x0.
+fn build_depth(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let depth = &cfg.depth_anchoring;
+    let dir = depth.model_dir.as_ref().ok_or_else(|| {
+        Error::Msg(format!(
+            "{}: depth anchoring needs the Depth-Anything-V2 {} checkpoint \
+             (depth_anchoring.model_dir)",
+            ctx.label,
+            depth.model_size.as_str()
+        ))
+    })?;
+    let loss =
+        mlx_gen_depth::anchor::DepthAnchorLoss::from_dir(dir, depth.model_size).map_err(|e| {
+            Error::Msg(format!(
+                "{}: could not load Depth-Anything-V2 {} from {}: {e}",
+                ctx.label,
+                depth.model_size.as_str(),
+                dir.display()
+            ))
+        })?;
+    Ok(AuxLoss {
+        schedule: depth.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// Depth anchoring's pre-load footprint at one `h × w` frame.
+fn depth_footprint(cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
+    mlx_gen_depth::anchor::depth_anchor_footprint(cfg.depth_anchoring.model_size, h, w)
+}
+
+/// The face-analysis stack dir both face arms detect with (`face_analysis_dir`).
+fn face_dir<'a>(cfg: &'a TrainingConfig, ctx: &AuxLossContext<'_>, loss: &str) -> Result<&'a Path> {
+    cfg.face_analysis_dir.as_deref().ok_or_else(|| {
+        Error::Msg(format!(
+            "{}: the {loss} needs the SCRFD + ArcFace face-analysis stack (face_analysis_dir)",
+            ctx.label
+        ))
+    })
+}
+
+/// ArcFace identity loss (sc-24831): SCRFD box at reference time, ArcFace on the decoded x0 crop.
+fn build_identity(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let dir = face_dir(cfg, ctx, "identity loss")?;
+    let loss = mlx_gen_face::train::load_identity_loss(dir, &cfg.identity_loss)
+        .map_err(|e| Error::Msg(format!("{}: {e}", ctx.label)))?;
+    Ok(AuxLoss {
+        schedule: cfg.identity_loss.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// The identity loss's pre-load footprint (fixed 112² crop; the shipped glintr100 checkpoint).
+fn identity_footprint(_cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_face::train::identity_loss_footprint(mlx_gen_face::iresnet::IRESNET100_LAYERS)
+}
+
+/// The identity loss's config when it is enabled: upstream gates the landmark loss on the identity
+/// cosine only then (the two arms share one identity scorer).
+fn identity_gate(cfg: &TrainingConfig) -> Option<&IdentityLossConfig> {
+    cfg.identity_loss
+        .schedule
+        .is_enabled()
+        .then_some(&cfg.identity_loss)
+}
+
+/// FaceMesh landmark loss (sc-24831): SCRFD box at reference time, FaceMesh-v2 on the x0 crop.
+fn build_landmark(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let dir = face_dir(cfg, ctx, "face-landmark loss")?;
+    let mesh = cfg.face_landmark_loss.model_dir.as_deref().ok_or_else(|| {
+        Error::Msg(format!(
+            "{}: the face-landmark loss needs the MediaPipe FaceMesh-v2 checkpoint \
+             (face_landmark_loss.model_dir)",
+            ctx.label
+        ))
+    })?;
+    let loss = mlx_gen_face::train::load_face_landmark_loss(dir, mesh, identity_gate(cfg))
+        .map_err(|e| Error::Msg(format!("{}: {e}", ctx.label)))?;
+    Ok(AuxLoss {
+        schedule: cfg.face_landmark_loss.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// The landmark loss's pre-load footprint (fixed 256² crop).
+fn landmark_footprint(_cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_face::train::face_landmark_loss_footprint()
+}
+
+/// Body losses (sc-24832): one arm per loss; the three share one ViTPose (loaded once, budgeted on
+/// the first enabled arm — see `mlx_gen_body::arm_footprint`).
+fn body_arm(
+    ctx: &AuxLossContext<'_>,
+    schedule: mlx_gen::gen_core::train::AuxLossSchedule,
+    loss: Result<Box<dyn mlx_gen::train::perceptual::PerceptualLoss>>,
+) -> Result<AuxLoss> {
+    Ok(AuxLoss {
+        schedule,
+        loss: loss.map_err(|e| Error::Msg(format!("{}: {e}", ctx.label)))?,
+    })
+}
+
+/// The body-proportion arm's model (ViTPose+, shared).
+fn build_body_proportion(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let b = &cfg.body_losses;
+    body_arm(ctx, b.proportion, mlx_gen_body::proportion_loss(b))
+}
+
+/// The body-shape arm's model (HybrIK + the shared ViTPose).
+fn build_body_shape(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let b = &cfg.body_losses;
+    body_arm(ctx, b.shape, mlx_gen_body::shape_loss(b))
+}
+
+/// The normal arm's model (Sapiens + the shared ViTPose).
+fn build_normal(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let b = &cfg.body_losses;
+    body_arm(ctx, b.normal, mlx_gen_body::normal_loss(b))
+}
+
+/// Body-proportion pre-load footprint (frame-size independent: the models run at fixed inputs).
+fn body_proportion_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Proportion)
+}
+
+/// Body-shape pre-load footprint.
+fn body_shape_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
+    mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Shape)
+}
+
+/// Normal-loss pre-load footprint.
+/// Restricted to the subject, each cache entry also holds the job's subject mask on its decoded
+/// grid (E7).
+fn normal_footprint(cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
+    let mut f = mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Normal);
+    f.reference_bytes_per_image +=
+        gen_core::train::subject_mask::PerceptualSubjectMasks::bytes_per_entry(cfg, h, w);
+    f
+}
+
+/// The VAE perceptual anchor (sc-24833): a frozen FLUX.2 VAE encoder's multi-scale features on the
+/// decoded x0.
+fn build_vae_anchor(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let va = &cfg.vae_anchor;
+    let dir = va.model_dir.as_ref().ok_or_else(|| {
+        Error::Msg(format!(
+            "{}: the VAE anchor loss needs the FLUX.2 VAE (vae_anchor.model_dir)",
+            ctx.label
+        ))
+    })?;
+    let loss = mlx_gen::train::vae_anchor::VaeAnchorLoss::from_dir(dir).map_err(|e| {
+        Error::Msg(format!(
+            "{}: could not load the FLUX.2 VAE encoder from {}: {e}",
+            ctx.label,
+            dir.display()
+        ))
+    })?;
+    Ok(AuxLoss {
+        schedule: va.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// E-LatentLPIPS (sc-24833) on the x0 latent, with the weights of the trainer's latent family
+/// (`ctx.latent_lpips`; `None` ⇒ no published weights match ⇒ a named error — the descriptor flag
+/// is false there too, so the floor refuses first).
+fn build_latent_lpips(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxLoss> {
+    let lp = &cfg.latent_lpips;
+    let family = ctx.latent_lpips.ok_or_else(|| {
+        Error::Msg(format!(
+            "{}: no E-LatentLPIPS weights match this trainer's latent family",
+            ctx.label
+        ))
+    })?;
+    let dir = lp.model_dir.as_ref().ok_or_else(|| {
+        Error::Msg(format!(
+            "{}: the E-LatentLPIPS loss needs its weights (latent_lpips.model_dir)",
+            ctx.label
+        ))
+    })?;
+    let loss =
+        mlx_gen::train::latent_lpips::LatentLpipsLoss::from_dir(dir, family).map_err(|e| {
+            Error::Msg(format!(
+                "{}: could not load E-LatentLPIPS ({}) from {}: {e}",
+                ctx.label,
+                family.as_str(),
+                dir.display()
+            ))
+        })?;
+    Ok(AuxLoss {
+        schedule: lp.schedule,
+        loss: Box::new(loss),
+    })
+}
+
+/// The VAE anchor's pre-load footprint at one `h × w` frame (the FLUX.2 encoder; the decoder that
+/// feeds it is counted by the builder).
+fn vae_anchor_footprint(_cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
+    mlx_gen::train::vae_anchor::vae_anchor_footprint(h, w)
+}
+
+/// E-LatentLPIPS's pre-load footprint at one `h × w` frame: every published family has an 8×
+/// VAE, so the latent is `h/8 × w/8`; the footprint fn has no trainer context, so it is sized for
+/// the 16-channel families (an upper bound for the 4-channel ones — the trunk is identical past the
+/// first conv).
+fn latent_lpips_footprint(_cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
+    mlx_gen::train::latent_lpips::latent_lpips_footprint(
+        gen_core::train::LatentLpipsFamily::Flux,
+        h.div_ceil(8),
+        w.div_ceil(8),
+    )
+}
+
+/// Every auxiliary loss, in loss-index order. **Extension point**: later stories append an arm.
+pub const ARMS: &[AuxArm] = &[
+    AuxArm {
+        name: "depth",
+        enabled: |cfg| cfg.depth_anchoring.schedule.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: depth_footprint,
+        build: build_depth,
+    },
+    AuxArm {
+        name: "identity",
+        enabled: |cfg| cfg.identity_loss.schedule.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: identity_footprint,
+        build: build_identity,
+    },
+    AuxArm {
+        name: "face-landmark",
+        enabled: |cfg| cfg.face_landmark_loss.schedule.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: landmark_footprint,
+        build: build_landmark,
+    },
+    AuxArm {
+        name: "body-proportion",
+        enabled: |cfg| cfg.body_losses.proportion.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: body_proportion_footprint,
+        build: build_body_proportion,
+    },
+    AuxArm {
+        name: "body-shape",
+        enabled: |cfg| cfg.body_losses.shape.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: body_shape_footprint,
+        build: build_body_shape,
+    },
+    AuxArm {
+        name: "normal",
+        enabled: |cfg| cfg.body_losses.normal.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: normal_footprint,
+        build: build_normal,
+    },
+    AuxArm {
+        name: "vae_anchor",
+        enabled: |cfg| cfg.vae_anchor.schedule.is_enabled(),
+        input: PerceptualInput::DecodedPixels,
+        footprint: vae_anchor_footprint,
+        build: build_vae_anchor,
+    },
+    AuxArm {
+        name: "latent_lpips",
+        enabled: |cfg| cfg.latent_lpips.schedule.is_enabled(),
+        input: PerceptualInput::Latents,
+        footprint: latent_lpips_footprint,
+        build: build_latent_lpips,
+    },
+];
+
+/// Whether any auxiliary loss is enabled in `cfg`.
+pub fn any_aux_loss(cfg: &TrainingConfig) -> bool {
+    ARMS.iter().any(|a| (a.enabled)(cfg))
+}
+
+/// The names of the enabled auxiliary losses that decode x0 to pixels (depth, identity,
+/// face-landmark, …), in arm order — what a trainer whose decode can be unavailable for a request
+/// (e.g. an LTX-2.5 workflow that generates no video) refuses by name. Empty when none is on.
+pub fn enabled_pixel_aux_losses(cfg: &TrainingConfig) -> Vec<&'static str> {
+    ARMS.iter()
+        .filter(|a| a.input == PerceptualInput::DecodedPixels && (a.enabled)(cfg))
+        .map(|a| a.name)
+        .collect()
+}
+
+fn enabled_arms<'a>(arms: &'a [AuxArm], cfg: &TrainingConfig) -> Vec<&'a AuxArm> {
+    arms.iter().filter(|a| (a.enabled)(cfg)).collect()
+}
+
+/// Every enabled loss of `cfg`, loaded, in arm order. Empty when none is enabled.
+pub fn build_aux_losses(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<Vec<AuxLoss>> {
+    build_aux_losses_with(ARMS, cfg, ctx)
+}
+
+fn build_aux_losses_with(
+    arms: &[AuxArm],
+    cfg: &TrainingConfig,
+    ctx: &AuxLossContext<'_>,
+) -> Result<Vec<AuxLoss>> {
+    enabled_arms(arms, cfg)
+        .into_iter()
+        .map(|a| (a.build)(cfg, ctx))
+        .collect()
+}
+
+/// The trainer's perceptual path for `cfg`: `None` when no aux loss is enabled (nothing loads);
+/// else the family decoder (loaded only when an enabled loss decodes pixels — a family with
+/// [`DecoderSpec::None`] gets a typed error for a pixel loss) plus every enabled loss. Call before
+/// latent caching so a missing checkpoint fails fast.
+pub fn build_perceptual_path(
+    cfg: &TrainingConfig,
+    ctx: &AuxLossContext<'_>,
+) -> Result<Option<PerceptualPath>> {
+    build_perceptual_path_with(ARMS, cfg, ctx)
+}
+
+fn build_perceptual_path_with(
+    arms: &[AuxArm],
+    cfg: &TrainingConfig,
+    ctx: &AuxLossContext<'_>,
+) -> Result<Option<PerceptualPath>> {
+    let enabled = enabled_arms(arms, cfg);
+    if enabled.is_empty() {
+        return Ok(None);
+    }
+    let pixel_arm = enabled
+        .iter()
+        .find(|a| a.input == PerceptualInput::DecodedPixels);
+    let decoder: Option<Box<dyn X0Decoder>> = match (pixel_arm, &ctx.decoder) {
+        (None, _) => None,
+        (Some(a), DecoderSpec::None) => {
+            return Err(Error::Msg(format!(
+                "{}: the '{}' loss decodes x0 to pixels, but this trainer's latent family has no \
+                 x0 decoder",
+                ctx.label, a.name
+            )))
+        }
+        (Some(_), DecoderSpec::Tiny { name, config }) => {
+            let dir = cfg.perceptual_decoder_dir.as_ref().ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: the perceptual losses need the {name} decoder (perceptual_decoder_dir)",
+                    ctx.label
+                ))
+            })?;
+            let dec = TinyDecoder::from_dir(dir, config.clone()).map_err(|e| {
+                Error::Msg(format!(
+                    "{}: could not load the {name} decoder from {}: {e}",
+                    ctx.label,
+                    dir.display()
+                ))
+            })?;
+            Some(Box::new(dec))
+        }
+        (Some(_), DecoderSpec::Taehv { name, config }) => {
+            let dir = cfg.perceptual_decoder_dir.as_ref().ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: the perceptual losses need the {name} decoder (perceptual_decoder_dir)",
+                    ctx.label
+                ))
+            })?;
+            let dec = TaehvDecoder::from_path(dir, config.clone()).map_err(|e| {
+                Error::Msg(format!(
+                    "{}: could not load the {name} decoder from {}: {e}",
+                    ctx.label,
+                    dir.display()
+                ))
+            })?;
+            Some(Box::new(dec))
+        }
+        (Some(_), DecoderSpec::Custom(c)) => {
+            Some(c.load(cfg.perceptual_decoder_dir.as_deref()).map_err(|e| {
+                Error::Msg(format!(
+                    "{}: could not load the {} decoder: {e}",
+                    ctx.label,
+                    c.name()
+                ))
+            })?)
+        }
+    };
+    let losses = build_aux_losses_with(arms, cfg, ctx)?;
+    Ok(Some(PerceptualPath::new(decoder, losses)?))
+}
+
+/// The extra training memory (bytes) the enabled aux losses add at `geom` (epic 2123 E7): the
+/// decoder when any enabled loss decodes pixels, plus every enabled loss, with per-frame working
+/// sets and references scaled by `geom.frames`. `0` when nothing is enabled.
+pub fn perceptual_footprint(cfg: &TrainingConfig, decoder: &DecoderSpec, geom: AuxGeometry) -> u64 {
+    perceptual_footprint_with(ARMS, cfg, decoder, geom)
+}
+
+fn perceptual_footprint_with(
+    arms: &[AuxArm],
+    cfg: &TrainingConfig,
+    decoder: &DecoderSpec,
+    geom: AuxGeometry,
+) -> u64 {
+    let enabled = enabled_arms(arms, cfg);
+    if enabled.is_empty() {
+        return 0;
+    }
+    let frames = geom.frames.max(1) as u64;
+    let scale = |f: AuxModelFootprint| AuxModelFootprint {
+        param_bytes: f.param_bytes,
+        working_set_bytes: f.working_set_bytes * frames,
+        reference_bytes_per_image: f.reference_bytes_per_image * frames,
+    };
+    let dec = if enabled
+        .iter()
+        .any(|a| a.input == PerceptualInput::DecodedPixels)
+    {
+        decoder.footprint(geom.height, geom.width).map(scale)
+    } else {
+        None
+    };
+    let losses: Vec<AuxModelFootprint> = enabled
+        .iter()
+        .map(|a| scale((a.footprint)(cfg, geom.height, geom.width)))
+        .collect();
+    perceptual_footprint_bytes(dec, &losses, geom.entries)
+}
+
+/// [`perceptual_footprint`] in GiB (the unit most trainer preflights use).
+pub fn perceptual_footprint_gb(
+    cfg: &TrainingConfig,
+    decoder: &DecoderSpec,
+    geom: AuxGeometry,
+) -> f64 {
+    perceptual_footprint(cfg, decoder, geom) as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// The names of every enabled auxiliary loss (pixel and latent arms), in arm order — what the
+/// aux-memory refusal ([`check_aux_memory`]) names. Empty when none is on.
+pub fn enabled_aux_losses(cfg: &TrainingConfig) -> Vec<&'static str> {
+    enabled_arms(ARMS, cfg)
+        .into_iter()
+        .map(|a| a.name)
+        .collect()
+}
+
+/// The shared MLX aux-memory guard (epic 2123 E7): refuse when the trainer's projected training
+/// step `projected_gb` — its own base projection plus `extra_gb`, the enabled aux models'
+/// footprint ([`perceptual_footprint_gb`]) — exceeds `safe_gb` (or the safe budget is not a
+/// positive finite number). The refusal names the enabled aux losses so the user knows which to
+/// turn off. `label` is the trainer's error label (e.g. `"krea trainer"`), `step` describes the
+/// admitted step (e.g. `"a checkpointed training step at resolution 1024"`), and `budget` how
+/// `safe_gb` was derived (e.g. `"128 GB MLX limit × 0.85"`; empty to omit). The arithmetic is the
+/// caller's: this compares and words the refusal only.
+pub fn check_aux_memory(
+    label: &str,
+    cfg: &TrainingConfig,
+    step: &str,
+    extra_gb: f64,
+    projected_gb: f64,
+    safe_gb: f64,
+    budget: &str,
+) -> Result<()> {
+    if safe_gb.is_finite() && safe_gb > 0.0 && projected_gb <= safe_gb {
+        return Ok(());
+    }
+    let arms = enabled_aux_losses(cfg);
+    let arms = if arms.is_empty() {
+        "none".to_string()
+    } else {
+        arms.join(", ")
+    };
+    let budget = if budget.is_empty() {
+        String::new()
+    } else {
+        format!(" ({budget})")
+    };
+    Err(Error::Msg(format!(
+        "{label}: {step} with the enabled auxiliary losses [{arms}] (~{extra_gb:.1} GB of \
+         training-time models) needs at least ~{projected_gb:.1} GB, exceeding this machine's \
+         ~{safe_gb:.1} GB safe budget{budget}. Disable one of these losses, choose a smaller \
+         auxiliary model (e.g. a smaller depth model), or reduce the training resolution (or a \
+         video trainer's selected frame count)."
+    )))
+}
+
+/// The dense-path twin of [`check_aux_memory`]'s naming (epic 2123 E7): the sentence a trainer's
+/// own dense-step refusal appends when the enabled aux models (`extra_gb > 0`) are part of what it
+/// refused — naming them so the user knows which to turn off. Empty when `extra_gb` is not positive
+/// or no aux loss is enabled.
+pub fn aux_losses_note(cfg: &TrainingConfig, extra_gb: f64) -> String {
+    let arms = enabled_aux_losses(cfg);
+    if extra_gb.is_nan() || extra_gb <= 0.0 || arms.is_empty() {
+        return String::new();
+    }
+    format!(
+        " The enabled auxiliary losses [{}] add ~{extra_gb:.1} GB of training-time models to that \
+         figure; disabling one of them (or choosing a smaller auxiliary model) also lowers it.",
+        arms.join(", ")
+    )
+}
+
+/// [`aux_losses_note`] appended to a trainer's dense-step refusal `err` (a [`Error::Msg`]; any other
+/// error passes through unchanged).
+pub fn name_aux_losses(err: Error, cfg: &TrainingConfig, extra_gb: f64) -> Error {
+    match err {
+        Error::Msg(m) => Error::Msg(m + &aux_losses_note(cfg, extra_gb)),
+        other => other,
+    }
+}
+
+/// Test fixtures for trainers on this seam.
+pub mod testing {
+    use std::path::Path;
+
+    use mlx_gen::gen_core::train::AuxLossSchedule;
+    use mlx_gen::train::perceptual::{AuxLoss, PerceptualPath};
+    use mlx_gen::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder, TinyDecoderConfig};
+    use mlx_gen::Result;
+    use mlx_gen_depth::anchor::{synthetic_weights, tiny_config, DepthAnchorLoss};
+    use mlx_gen_depth::DepthAnythingV2;
+
+    /// The tiny TAESD-shaped decoder config tests use (`latent_channels` channels, width 8).
+    pub fn tiny_decoder_config(latent_channels: i32) -> TinyDecoderConfig {
+        TinyDecoderConfig {
+            latent_channels,
+            channels: 8,
+            blocks: [3, 3, 3, 1],
+        }
+    }
+
+    /// A ready depth-anchoring [`PerceptualPath`] with a random-init tiny decoder for
+    /// `latent_channels` + a random-init tiny DA2, scheduled by `schedule` — for trainer step tests
+    /// (what [`super::build_perceptual_path`] returns for a depth job, minus the checkpoint reads).
+    pub fn tiny_depth_path(
+        latent_channels: i32,
+        schedule: AuxLossSchedule,
+    ) -> Result<PerceptualPath> {
+        let cfg = tiny_decoder_config(latent_channels);
+        let dec = TinyDecoder::from_weights(&synthetic_tiny_decoder_weights(&cfg, 11)?, cfg)?;
+        let da2 = tiny_config();
+        let depth = DepthAnchorLoss::new(DepthAnythingV2::from_weights(
+            &synthetic_weights(&da2, 12)?,
+            da2,
+        )?);
+        PerceptualPath::new(
+            Some(Box::new(dec)),
+            vec![AuxLoss {
+                schedule,
+                loss: Box::new(depth),
+            }],
+        )
+    }
+
+    /// Write a random-init tiny decoder checkpoint (`diffusion_pytorch_model.safetensors`) to `dir`.
+    pub fn write_tiny_decoder(dir: &Path, cfg: &TinyDecoderConfig, seed: u64) -> Result<()> {
+        std::fs::create_dir_all(dir).map_err(|e| mlx_gen::Error::Msg(e.to_string()))?;
+        let w = synthetic_tiny_decoder_weights(cfg, seed)?;
+        let pairs: Vec<(String, mlx_rs::Array)> = w
+            .keys()
+            .map(|k| Ok((k.to_string(), w.require(k)?.clone())))
+            .collect::<Result<_>>()?;
+        let refs: Vec<(&str, &mlx_rs::Array)> =
+            pairs.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        mlx_rs::Array::save_safetensors(
+            refs,
+            None,
+            dir.join("diffusion_pytorch_model.safetensors"),
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
+    use mlx_gen::train::perceptual::{reference_as, LossReference, PerceptualLoss};
+    use mlx_gen::train::tae::TinyDecoderConfig;
+    use mlx_rs::Array;
+    use std::any::Any;
+
+    fn on() -> TrainingConfig {
+        let mut cfg = TrainingConfig::default();
+        cfg.depth_anchoring.schedule = AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        };
+        cfg
+    }
+
+    fn taef1() -> DecoderSpec {
+        DecoderSpec::Tiny {
+            name: "TAEF1",
+            config: TinyDecoderConfig::taef1().into(),
+        }
+    }
+
+    /// E7 (epic 2123 feature-end review): the normal loss restricted to the subject budgets the
+    /// subject mask each cache entry holds on its decoded grid, on top of Sapiens' own reference
+    /// mask. Mutation: drop the `bytes_per_entry` term from `normal_footprint` ⇒ red.
+    #[test]
+    fn a_subject_restricted_normal_loss_budgets_its_masks() {
+        let mut open = TrainingConfig::default();
+        open.body_losses.normal.weight = 0.1;
+        let mut restricted = open.clone();
+        restricted.body_losses.normal_restrict_to_subject = true;
+        let (edge, entries) = (512u32, 3usize);
+        let g = AuxGeometry::image(edge, entries);
+        let sapiens = |c: &TrainingConfig| {
+            mlx_gen_body::arm_footprint(&c.body_losses, mlx_gen_body::BodyArm::Normal)
+                .reference_bytes_per_image
+        };
+        let extra = perceptual_footprint(&restricted, &taef1(), g)
+            - perceptual_footprint(&open, &taef1(), g);
+        let mask = u64::from(edge) * u64::from(edge) * 4;
+        assert_eq!(
+            extra,
+            entries as u64 * (sapiens(&restricted) - sapiens(&open) + mask)
+        );
+    }
+
+    /// E7 (feature-end review round 2): a dense-step refusal names the enabled aux losses when their
+    /// models are part of the refused figure, and nothing when none is on or `extra_gb` is zero.
+    /// Mutation: return the error unchanged from `name_aux_losses` ⇒ red.
+    #[test]
+    fn a_dense_refusal_names_the_enabled_aux_losses() {
+        let e = name_aux_losses(
+            Error::Msg("t trainer: dense step too big.".into()),
+            &on(),
+            2.0,
+        );
+        let e = e.to_string();
+        assert!(
+            e.starts_with("t trainer: dense step too big.") && e.contains("[depth]"),
+            "{e}"
+        );
+        let plain = TrainingConfig::default();
+        assert_eq!(aux_losses_note(&plain, 2.0), "");
+        assert_eq!(aux_losses_note(&on(), 0.0), "");
+    }
+
+    /// E7 messaging: the shared aux-memory refusal names EVERY enabled aux loss (pixel and latent
+    /// arms) and no disabled one, and refuses exactly past the safe budget. Mutations: name only
+    /// the pixel arms (`enabled_pixel_aux_losses`) ⇒ `latent_lpips` missing ⇒ red; compare
+    /// `extra_gb` alone against the budget ⇒ the over-budget case passes ⇒ red.
+    #[test]
+    fn aux_memory_refusal_names_each_enabled_arm() {
+        let sched = AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        };
+        let mut all = TrainingConfig::default();
+        all.depth_anchoring.schedule = sched;
+        all.identity_loss.schedule = sched;
+        all.face_landmark_loss.schedule = sched;
+        all.body_losses.proportion.weight = 0.1;
+        all.body_losses.shape.weight = 0.1;
+        all.body_losses.normal.weight = 0.1;
+        all.vae_anchor.schedule = sched;
+        all.latent_lpips.schedule = sched;
+        assert_eq!(enabled_aux_losses(&all).len(), ARMS.len());
+        assert!(check_aux_memory("t trainer", &all, "a step", 2.0, 10.0, 10.0, "").is_ok());
+        let e = check_aux_memory("t trainer", &all, "a step", 2.0, 10.0, 9.0, "x")
+            .unwrap_err()
+            .to_string();
+        for arm in ARMS {
+            assert!(e.contains(arm.name), "{} missing: {e}", arm.name);
+        }
+        assert!(
+            e.starts_with("t trainer: a step") && e.contains("(x)"),
+            "{e}"
+        );
+
+        // Only the enabled arms are named.
+        let e = check_aux_memory("t trainer", &on(), "a step", 2.0, 10.0, 9.0, "")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[depth]"), "{e}");
+        assert!(
+            !e.contains("identity") && !e.contains("latent_lpips"),
+            "{e}"
+        );
+        // A non-positive or non-finite safe budget refuses.
+        assert!(check_aux_memory("t", &on(), "s", 1.0, 1.0, 0.0, "").is_err());
+        assert!(check_aux_memory("t", &on(), "s", 1.0, 1.0, f64::NAN, "").is_err());
+    }
+
+    /// E3 (feature-end review round 2): gen-core's `enabled_aux_losses` — what the shared floor's
+    /// full-fine-tune refusal reads — names every arm of this kit's `ARMS`, so a new arm cannot skip
+    /// that refusal. A new arm reds here until it is enabled below AND added to gen-core's list.
+    /// Mutation: drop an arm from `gen_core::train::enabled_aux_losses` ⇒ red.
+    #[test]
+    fn gen_core_names_every_aux_arm() {
+        fn enable(cfg: &mut TrainingConfig, arm: &str) {
+            let on = AuxLossSchedule {
+                weight: 0.1,
+                t_min: 0.0,
+                t_max: 1.0,
+                every_n: 2,
+            };
+            match arm {
+                "depth" => cfg.depth_anchoring.schedule = on,
+                "identity" => cfg.identity_loss.schedule = on,
+                "face-landmark" => cfg.face_landmark_loss.schedule = on,
+                "body-proportion" => cfg.body_losses.proportion = on,
+                "body-shape" => cfg.body_losses.shape = on,
+                "normal" => cfg.body_losses.normal = on,
+                "vae_anchor" => cfg.vae_anchor.schedule = on,
+                "latent_lpips" => cfg.latent_lpips.schedule = on,
+                other => panic!(
+                    "new aux arm `{other}`: enable it here and add it to \
+                     gen_core::train::enabled_aux_losses (the full-fine-tune refusal reads it)"
+                ),
+            }
+        }
+        let mut all = TrainingConfig::default();
+        for arm in ARMS {
+            let mut cfg = TrainingConfig::default();
+            enable(&mut cfg, arm.name);
+            assert!(
+                (arm.enabled)(&cfg),
+                "{}: the enabler does not enable it",
+                arm.name
+            );
+            assert_eq!(
+                gen_core::train::enabled_aux_losses(&cfg),
+                vec![arm.name],
+                "gen-core does not name the `{}` arm",
+                arm.name
+            );
+            enable(&mut all, arm.name);
+        }
+        assert_eq!(gen_core::train::enabled_aux_losses(&all).len(), ARMS.len());
+    }
+
+    /// sc-24832: the body arms are on the seam — ViTPose budgeted once across the three arms, the
+    /// decoder counted, and a missing checkpoint named with the trainer label. Mutations: drop
+    /// an arm from `ARMS` ⇒ its footprint is missing ⇒ red; build the arm without the label ⇒ red.
+    #[test]
+    fn body_arms_are_on_the_seam() {
+        let mut cfg = TrainingConfig::default();
+        cfg.body_losses.proportion.weight = 0.1;
+        cfg.body_losses.shape.weight = 0.1;
+        cfg.body_losses.normal.weight = 0.1;
+        assert!(any_aux_loss(&cfg));
+        // One LTX-2.5 refusal mechanism: the body arms decode x0 to pixels, so the no-video
+        // refusal names them. Mutation: declare a body arm `PerceptualInput::Latents` ⇒ red.
+        assert_eq!(
+            enabled_pixel_aux_losses(&cfg),
+            ["body-proportion", "body-shape", "normal"]
+        );
+        let g = AuxGeometry::image(512, 3);
+        let dec = TinyDecoderConfig::taef1().footprint(512, 512);
+        let models: Vec<AuxModelFootprint> = [
+            mlx_gen_body::BodyArm::Proportion,
+            mlx_gen_body::BodyArm::Shape,
+            mlx_gen_body::BodyArm::Normal,
+        ]
+        .into_iter()
+        .map(|a| mlx_gen_body::arm_footprint(&cfg.body_losses, a))
+        .collect();
+        assert_eq!(
+            perceptual_footprint(&cfg, &taef1(), g),
+            perceptual_footprint_bytes(Some(dec), &models, 3)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dec_dir = tmp.path().join("tae");
+        let cfg4 = testing::tiny_decoder_config(4);
+        testing::write_tiny_decoder(&dec_dir, &cfg4, 1).unwrap();
+        let mut c = TrainingConfig::default();
+        c.body_losses.shape.weight = 0.1;
+        c.perceptual_decoder_dir = Some(dec_dir);
+        let ctx = AuxLossContext {
+            label: "fam trainer",
+            decoder: DecoderSpec::Tiny {
+                name: "TINY",
+                config: cfg4.into(),
+            },
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&c, &ctx).err().unwrap().to_string();
+        assert!(e.contains("fam trainer") && e.contains("HybrIK"), "{e}");
+    }
+
+    /// E1: nothing enabled ⇒ no path, nothing loaded, zero footprint. Mutation: return
+    /// `Some(empty path)` ⇒ red.
+    #[test]
+    fn everything_off_builds_nothing() {
+        let ctx = AuxLossContext {
+            label: "t",
+            decoder: taef1(),
+            latent_lpips: None,
+        };
+        let cfg = TrainingConfig::default();
+        assert!(!any_aux_loss(&cfg));
+        assert!(build_perceptual_path(&cfg, &ctx).unwrap().is_none());
+        assert!(build_aux_losses(&cfg, &ctx).unwrap().is_empty());
+        assert_eq!(
+            perceptual_footprint(&cfg, &taef1(), AuxGeometry::image(1024, 4)),
+            0
+        );
+    }
+
+    /// E7: depth on adds the decoder + DA2 (larger for Large); frames scale the per-frame terms.
+    /// Mutations: drop the decoder term ⇒ red; drop the `frames` scaling ⇒ red.
+    #[test]
+    fn footprint_counts_decoder_losses_and_frames() {
+        let mut cfg = on();
+        let g = AuxGeometry::image(1024, 4);
+        let small = perceptual_footprint(&cfg, &taef1(), g);
+        let dec = TinyDecoderConfig::taef1().footprint(1024, 1024);
+        let da2 = mlx_gen_depth::anchor::depth_anchor_footprint(DepthModelSize::Small, 1024, 1024);
+        assert_eq!(small, perceptual_footprint_bytes(Some(dec), &[da2], 4));
+        cfg.depth_anchoring.model_size = DepthModelSize::Large;
+        assert!(perceptual_footprint(&cfg, &taef1(), g) > small + 1_000_000_000);
+        cfg.depth_anchoring.model_size = DepthModelSize::Small;
+        let video = perceptual_footprint(&cfg, &taef1(), AuxGeometry { frames: 3, ..g });
+        let ws = dec.working_set_bytes + da2.working_set_bytes;
+        assert_eq!(
+            video - small,
+            2 * ws + 2 * 4 * da2.reference_bytes_per_image
+        );
+    }
+
+    /// A pixel loss on a family with no decoder is a typed error naming the loss; a missing
+    /// decoder dir names the decoder. Mutation: skip the `DecoderSpec::None` arm ⇒ red.
+    #[test]
+    fn missing_decoders_are_named() {
+        let none = AuxLossContext {
+            label: "fam trainer",
+            decoder: DecoderSpec::None,
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&on(), &none)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("depth") && e.contains("no x0 decoder"), "{e}");
+        let tiny = AuxLossContext {
+            label: "fam trainer",
+            decoder: taef1(),
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&on(), &tiny)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("TAEF1"), "{e}");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = on();
+        c.perceptual_decoder_dir = Some(tmp.path().join("nope"));
+        let e = build_perceptual_path(&c, &tiny).err().unwrap().to_string();
+        assert!(e.contains("TAEF1"), "{e}");
+    }
+
+    /// The real load path: a tiny decoder checkpoint on disk loads, then a missing DA2 checkpoint
+    /// is a named error (the decoder loaded first).
+    #[test]
+    fn decoder_loads_from_disk_before_the_losses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dec_dir = tmp.path().join("tae");
+        let cfg4 = testing::tiny_decoder_config(4);
+        testing::write_tiny_decoder(&dec_dir, &cfg4, 1).unwrap();
+        let mut c = on();
+        c.perceptual_decoder_dir = Some(dec_dir);
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let ctx = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::Tiny {
+                name: "TINY",
+                config: cfg4.into(),
+            },
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&c, &ctx).err().unwrap().to_string();
+        assert!(e.contains("Depth-Anything-V2"), "{e}");
+    }
+
+    /// sc-24831: the identity and face-landmark arms build from their checkpoint dirs into the path
+    /// (after the decoder), in arm order; their footprints join the estimate; a missing face stack
+    /// is a named error. Mutations: drop either arm from `ARMS` ⇒ the loss names / footprint go red;
+    /// enable the identity arm on the landmark knob ⇒ red.
+    #[test]
+    fn face_arms_build_and_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dec_dir = tmp.path().join("tae");
+        let cfg4 = testing::tiny_decoder_config(4);
+        testing::write_tiny_decoder(&dec_dir, &cfg4, 1).unwrap();
+        let face = tmp.path().join("face");
+        let mesh = tmp.path().join("mesh");
+        mlx_gen_face::train::testing::write_face_stack(&face).unwrap();
+        mlx_gen_face::train::testing::write_facemesh(&mesh).unwrap();
+        let sched = AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        };
+        let mut c = TrainingConfig {
+            perceptual_decoder_dir: Some(dec_dir),
+            face_analysis_dir: Some(face),
+            ..TrainingConfig::default()
+        };
+        c.identity_loss.schedule = sched;
+        let ctx = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::Tiny {
+                name: "TINY",
+                config: cfg4.clone().into(),
+            },
+            latent_lpips: None,
+        };
+        let g = AuxGeometry::image(512, 3);
+        let id_only = perceptual_footprint(&c, &ctx.decoder, g);
+        let id_fp =
+            mlx_gen_face::train::identity_loss_footprint(mlx_gen_face::iresnet::IRESNET100_LAYERS);
+        assert_eq!(
+            id_only,
+            perceptual_footprint_bytes(Some(cfg4.footprint(512, 512)), &[id_fp], 3)
+        );
+        c.face_landmark_loss.schedule = sched;
+        c.face_landmark_loss.model_dir = Some(mesh);
+        assert!(any_aux_loss(&c));
+        let path = build_perceptual_path(&c, &ctx).unwrap().unwrap();
+        let names: Vec<&str> = path.losses().iter().map(|l| l.loss.name()).collect();
+        assert_eq!(names, ["identity", "face-landmark"]);
+        let both = perceptual_footprint(&c, &ctx.decoder, g);
+        let lm_fp = mlx_gen_face::train::face_landmark_loss_footprint();
+        assert_eq!(
+            both,
+            perceptual_footprint_bytes(Some(cfg4.footprint(512, 512)), &[id_fp, lm_fp], 3)
+        );
+
+        let mut no_face = c.clone();
+        no_face.face_analysis_dir = None;
+        let e = build_perceptual_path(&no_face, &ctx)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("face_analysis_dir"), "{e}");
+    }
+
+    /// A latent-input arm (the shape of S12's E-LatentLPIPS) runs on a family with no decoder.
+    /// Mutation: require a decoder for any enabled arm ⇒ red.
+    #[test]
+    fn a_latent_arm_runs_without_a_decoder() {
+        struct L;
+        impl PerceptualLoss for L {
+            fn name(&self) -> &'static str {
+                "latent"
+            }
+            fn input(&self) -> PerceptualInput {
+                PerceptualInput::Latents
+            }
+            fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
+                let m = clean.mean(None)?;
+                m.eval()?;
+                Ok(Some(Box::new(m)))
+            }
+            fn loss(&self, live: &Array, r: &dyn Any) -> Result<Array> {
+                let r = reference_as::<Array>("latent", r)?;
+                Ok(live.mean(None)?.subtract(r)?.square()?)
+            }
+        }
+        let arms = [AuxArm {
+            name: "latent",
+            enabled: |_| true,
+            input: PerceptualInput::Latents,
+            footprint: |_, _, _| AuxModelFootprint {
+                param_bytes: 5,
+                working_set_bytes: 0,
+                reference_bytes_per_image: 0,
+            },
+            build: |_, _| {
+                Ok(AuxLoss {
+                    schedule: AuxLossSchedule {
+                        weight: 1.0,
+                        t_min: 0.0,
+                        t_max: 1.0,
+                        every_n: 1,
+                    },
+                    loss: Box::new(L),
+                })
+            },
+        }];
+        let ctx = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::None,
+            latent_lpips: None,
+        };
+        let cfg = TrainingConfig::default();
+        let mut path = build_perceptual_path_with(&arms, &cfg, &ctx)
+            .unwrap()
+            .unwrap();
+        let z = Array::ones::<f32>(&[1, 4, 2, 2]).unwrap();
+        path.ensure_reference(0, &z).unwrap();
+        let plan = path.plan(1, 0, 0.5).unwrap();
+        assert!(path.aux_loss(&plan, 0, &z).unwrap().is_some());
+        assert_eq!(
+            perceptual_footprint_with(&arms, &cfg, &taef1(), AuxGeometry::image(64, 1)),
+            5
+        );
+    }
+
+    fn latent_on(model_dir: Option<std::path::PathBuf>) -> TrainingConfig {
+        let mut cfg = TrainingConfig::default();
+        cfg.latent_lpips.schedule = AuxLossSchedule {
+            weight: 0.5,
+            ..gen_core::train::LATENT_PERCEPTUAL_SCHEDULE
+        };
+        cfg.latent_lpips.model_dir = model_dir;
+        cfg
+    }
+
+    fn vae_anchor_on() -> TrainingConfig {
+        let mut cfg = TrainingConfig::default();
+        cfg.vae_anchor.schedule = AuxLossSchedule {
+            weight: 0.5,
+            ..gen_core::train::LATENT_PERCEPTUAL_SCHEDULE
+        };
+        cfg
+    }
+
+    /// sc-24833: the E-LatentLPIPS arm builds on a family with NO x0 decoder (it is a latent
+    /// loss), loads the family's checkpoint from `latent_lpips.model_dir`, and trains: zero at the
+    /// clean latent, positive off it. A context naming no family is a named error. Mutations: give
+    /// the arm `PerceptualInput::DecodedPixels` ⇒ the `DecoderSpec::None` build errors ⇒ red; ignore
+    /// `ctx.latent_lpips` ⇒ the no-family build succeeds ⇒ red.
+    #[test]
+    fn the_latent_lpips_arm_runs_without_a_decoder_on_its_family_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_lpips_checkpoint(&tmp.path().join("sdxl_latest_vgg16_tuned.safetensors"));
+        let cfg = latent_on(Some(tmp.path().to_path_buf()));
+        assert!(any_aux_loss(&cfg));
+        let ctx = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::None,
+            latent_lpips: Some(gen_core::train::LatentLpipsFamily::Sdxl),
+        };
+        let mut path = build_perceptual_path(&cfg, &ctx).unwrap().unwrap();
+        assert_eq!(path.losses()[0].loss.name(), "latent_lpips");
+        let clean = mlx_rs::random::normal::<f32>(
+            &[1, 4, 8, 8],
+            None,
+            None,
+            Some(&mlx_rs::random::key(2).unwrap()),
+        )
+        .unwrap();
+        path.ensure_reference(0, &clean).unwrap();
+        let plan = path.plan(1, 0, 0.25).unwrap();
+        assert!(plan.diffusion && plan.aux == vec![0], "{plan:?}");
+        assert_eq!(
+            mlx_scalar(path.aux_loss(&plan, 0, &clean).unwrap().unwrap().weighted),
+            0.0
+        );
+        let off = mlx_rs::ops::add(&clean, Array::from_f32(0.2)).unwrap();
+        assert!(mlx_scalar(path.aux_loss(&plan, 0, &off).unwrap().unwrap().weighted) > 0.0);
+        let none = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::None,
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&cfg, &none)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("no E-LatentLPIPS weights match"), "{e}");
+        let e = build_perceptual_path(&latent_on(None), &ctx)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("latent_lpips.model_dir"), "{e}");
+    }
+
+    /// sc-24833: the VAE anchor is a decoded-x0 loss — a family with no decoder gets a typed error
+    /// naming it, and a missing FLUX.2 VAE dir is named (after the decoder loads). E7: enabling it
+    /// adds the decoder + the FLUX.2 encoder footprint; E-LatentLPIPS adds its own and no decoder.
+    /// Mutations: drop the arm's `footprint` term ⇒ red; mark it `Latents` ⇒ the no-decoder build
+    /// succeeds ⇒ red.
+    #[test]
+    fn the_vae_anchor_arm_is_a_pixel_loss_with_its_own_footprint() {
+        let none = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::None,
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&vae_anchor_on(), &none)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("vae_anchor") && e.contains("no x0 decoder"),
+            "{e}"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dec_dir = tmp.path().join("tae");
+        let cfg4 = testing::tiny_decoder_config(4);
+        testing::write_tiny_decoder(&dec_dir, &cfg4, 1).unwrap();
+        let mut c = vae_anchor_on();
+        c.perceptual_decoder_dir = Some(dec_dir);
+        let tiny = AuxLossContext {
+            label: "t",
+            decoder: DecoderSpec::Tiny {
+                name: "TINY",
+                config: cfg4.into(),
+            },
+            latent_lpips: None,
+        };
+        let e = build_perceptual_path(&c, &tiny).err().unwrap().to_string();
+        assert!(e.contains("FLUX.2 VAE"), "{e}");
+        c.vae_anchor.model_dir = Some(tmp.path().join("no-vae"));
+        let e = build_perceptual_path(&c, &tiny).err().unwrap().to_string();
+        assert!(e.contains("FLUX.2 VAE encoder"), "{e}");
+
+        let g = AuxGeometry::image(512, 3);
+        let dec = TinyDecoderConfig::taef1().footprint(512, 512);
+        let va = mlx_gen::train::vae_anchor::vae_anchor_footprint(512, 512);
+        assert_eq!(
+            perceptual_footprint(&vae_anchor_on(), &taef1(), g),
+            perceptual_footprint_bytes(Some(dec), &[va], 3)
+        );
+        // sc-24833 review: the VAE-anchor references spill to disk, so the footprint does not
+        // scale with the cached-entry count (a 50-image × 3-bucket job admits like a 1-entry one).
+        assert_eq!(
+            perceptual_footprint(&vae_anchor_on(), &taef1(), AuxGeometry::image(512, 150)),
+            perceptual_footprint(&vae_anchor_on(), &taef1(), g)
+        );
+        let lp = mlx_gen::train::latent_lpips::latent_lpips_footprint(
+            gen_core::train::LatentLpipsFamily::Flux,
+            64,
+            64,
+        );
+        assert_eq!(
+            perceptual_footprint(&latent_on(None), &taef1(), g),
+            perceptual_footprint_bytes(None, &[lp], 3)
+        );
+    }
+
+    fn mlx_scalar(a: Array) -> f32 {
+        a.eval().unwrap();
+        a.item::<f32>()
+    }
+
+    fn write_lpips_checkpoint(path: &std::path::Path) {
+        let w = mlx_gen::train::latent_lpips::formula_weights(4).into_tensors();
+        let mut named: Vec<(&String, &Array)> = w.iter().collect();
+        named.sort_unstable_by_key(|(k, _)| *k);
+        Array::save_safetensors(
+            named.into_iter().map(|(k, v)| (k.as_str(), v)),
+            None::<&std::collections::HashMap<String, String>>,
+            path,
+        )
+        .unwrap();
+    }
+}

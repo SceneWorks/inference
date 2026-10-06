@@ -15,11 +15,20 @@
 
 // The pure LR-schedule policy lives here (gen-core); the MLX training kernels
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.
+pub mod aux_schedule;
+pub mod body;
+pub mod face_loss;
 pub mod resume;
 pub mod schedule;
+pub mod subject_mask;
 
 use std::path::PathBuf;
 
+pub use aux_schedule::{
+    combine_step_terms, perceptual_footprint_bytes, plan_in_band, plan_step, AuxAlternation,
+    AuxModelFootprint, StepPlan,
+};
+pub use body::BodyLossesConfig;
 pub use schedule::LrSchedule;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -156,6 +165,494 @@ pub struct TrainingConfig {
     /// optimizer-update boundary (always for `gradient_accumulation = 1`; for `> 1`, use a `save_every`
     /// that is a multiple of it) — the in-flight accumulation buffer is not snapshotted.
     pub resume: bool,
+    /// **Weight noising** (epic 2123, sc-24826) — relative-mode perturbation of the trainable
+    /// adapter factors, ported from ai-toolkit-perceptual. After every **real optimizer update**
+    /// (not every gradient-accumulation micro-step) each adapter tensor `w` (LoRA A/B, LoKr
+    /// factors — never a base weight) is permanently perturbed by
+    /// `w += N(0, 1) · weight_noise_sigma · rms(w)`, with the noise drawn from an RNG derived from
+    /// [`seed`](Self::seed) and the update index, so a seeded run is reproducible (and resume is
+    /// bit-exact). The upstream suggested strength when enabled is `0.0125`.
+    ///
+    /// `0.0` (the default) is **off**: the trainer takes no extra RNG draws and produces exactly the
+    /// adapter it did before this field existed. A non-zero sigma is refused (typed
+    /// [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`weight_noise`](TrainingTechniques::weight_noise), and by every trainer for a
+    /// [`full_finetune`](Self::full_finetune) run — see [`validate_training_techniques`].
+    pub weight_noise_sigma: f32,
+    /// **Gradient noise** (epic 2123, sc-24827) — annealed Gaussian noise on the trainable adapter
+    /// gradients, the `neelakantan` mode of ai-toolkit-perceptual (Neelakantan et al. 2015). On
+    /// every **real optimizer update** `t` (0-based update index, not the micro-step), after the
+    /// window's gradients are averaged and globally norm-clipped and **before** the optimizer step
+    /// (upstream's placement: "after clip so the clip doesn't eat the noise"), every adapter gradient
+    /// `g` gets `g += N(0, 1) · σ_t` with `σ_t = gradient_noise_eta / (1 + t)^gradient_noise_gamma`
+    /// (see [`gradient_noise_std`]). The noise is drawn from an RNG derived from
+    /// [`seed`](Self::seed) and the update index on a stream independent of weight noising (E4).
+    /// Upstream's suggested strength when enabled is `0.01`.
+    ///
+    /// `0.0` (the default) is **off**: no extra RNG draws, the adapter is exactly the pre-sc-24827
+    /// one. A non-zero eta is refused (typed [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`gradient_noise`](TrainingTechniques::gradient_noise), and for a
+    /// [`full_finetune`](Self::full_finetune) run (it perturbs adapter gradients only) — see
+    /// [`validate_training_techniques`].
+    pub gradient_noise_eta: f32,
+    /// Annealing exponent `γ` of [`gradient_noise_eta`](Self::gradient_noise_eta)'s schedule
+    /// `σ_t = η / (1 + t)^γ`. Default `0.55` (the paper's / upstream's default). Must be finite and
+    /// `>= 0` (a negative exponent would grow the noise without bound); ignored while eta is `0`.
+    pub gradient_noise_gamma: f32,
+    /// **Multi-resolution buckets with per-bucket repeat counts** (epic 2123, sc-2127), ported from
+    /// ai-toolkit-perceptual's dataset `resolution: [..]` + `num_repeats: [..]` lists. Each dataset
+    /// item is cached once **per bucket** (square-cropped to that bucket's edge, which the trainer
+    /// floors to its latent stride exactly as it does [`resolution`](Self::resolution)), and every
+    /// epoch visits each item `repeats` times per bucket — so buckets `512/768/1024` with repeats
+    /// `16/4/1` train on a `16:4:1` per-image sample mix at those three latent sizes. The order is
+    /// a shuffle seeded from [`seed`](Self::seed) and the epoch index (E4), see [`BucketSchedule`].
+    ///
+    /// Empty (the default) is **off**: the trainer caches one latent per item at
+    /// [`resolution`](Self::resolution) and walks the cache round-robin exactly as before. A single
+    /// bucket is never shuffled, so a single bucket equal to today's resolution reproduces today's
+    /// sample order. A non-empty list is refused (typed [`crate::Error::Unsupported`]) by any
+    /// trainer whose [`TrainerDescriptor::techniques`] does not declare
+    /// [`resolution_buckets`](TrainingTechniques::resolution_buckets); a malformed list (a zero
+    /// resolution or repeat count, a resolution off the [`RESOLUTION_BUCKET_STRIDE`], a duplicate
+    /// resolution, more than [`MAX_RESOLUTION_BUCKETS`]) is
+    /// refused by [`validate_training_techniques`]. Memory pre-flights size for
+    /// [`max_training_resolution`](Self::max_training_resolution) (E7).
+    pub resolution_buckets: Vec<ResolutionBucket>,
+    /// **Depth anchoring** (epic 2123, sc-2125) — an auxiliary perceptual loss that keeps the
+    /// adapter's predicted geometry consistent with the training image: the model's x0 prediction
+    /// is decoded with the family's small differentiable decoder, run through a frozen
+    /// Depth-Anything-V2, and compared (scale-and-shift-invariant L1 + multi-scale gradient
+    /// matching) against the depth of the training image's own encode→decode round trip, cached
+    /// once per image. Off by default ([`AuxLossSchedule::weight`] `0`); refused (typed
+    /// [`crate::Error::Unsupported`]) by any trainer whose [`TrainerDescriptor::techniques`] does
+    /// not declare [`depth_anchoring`](TrainingTechniques::depth_anchoring) — see
+    /// [`validate_training_techniques`].
+    pub depth_anchoring: DepthAnchoringConfig,
+    /// Directory holding the family's **small differentiable x0 decoder** (TAEF1 for the Flux-VAE
+    /// 16-channel families, TAESD/TAESDXL for SD/SDXL, …) — the decoder every decoded-x0
+    /// perceptual loss (depth anchoring, and the identity/body losses that reuse the same shared
+    /// path) runs the model's x0 prediction through. Required (a typed refusal otherwise) whenever
+    /// such a loss is enabled; ignored when none is. `None` by default.
+    pub perceptual_decoder_dir: Option<PathBuf>,
+    /// **Subject-masked loss weighting** (epic 2123, sc-24828) — weight the per-element training
+    /// loss by each item's subject mask ([`TrainingItem::subject_mask_path`]), ported from
+    /// ai-toolkit-perceptual. The mask is cropped/resized exactly like its image, area-averaged
+    /// down to the latent grid (so a latent cell straddling the subject edge gets a fractional
+    /// mask value `m`), and turned into the weight map
+    /// `w = background_weight + (subject_weight − background_weight) · m`, which multiplies the
+    /// per-element loss **before** the mean reduction (see [`subject_mask`]).
+    /// The divisor stays the full element count, so the gradient (and effective learning rate)
+    /// scales by about `background_weight + (subject_weight − background_weight) · coverage`
+    /// — with `background_weight = 0` and a small subject, proportionally lower.
+    ///
+    /// `None` (the default) is **off**: no mask is read and the loss is exactly the unweighted
+    /// mean it was before this field existed. `Some` is refused (typed
+    /// [`crate::Error::Unsupported`]) by a trainer whose [`TrainerDescriptor::techniques`] does not
+    /// declare [`subject_mask_loss`](TrainingTechniques::subject_mask_loss), and refused when any
+    /// item lacks a mask — see [`validate_training_techniques`].
+    pub subject_mask_loss: Option<SubjectMaskLoss>,
+    /// **Body losses** (epic 2123, sc-24832) — three decoded-x0 auxiliary perceptual losses on the
+    /// shared path: ViTPose+ bone-length **proportions**, HybrIK SMPL-beta **shape**, and Sapiens
+    /// surface **normals**, each with its own [`AuxLossSchedule`] (see [`body`]). Every loss is
+    /// off by default; each is refused (typed [`crate::Error::Unsupported`]) by a trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare its flag
+    /// ([`body_proportion_loss`](TrainingTechniques::body_proportion_loss),
+    /// [`body_shape_loss`](TrainingTechniques::body_shape_loss),
+    /// [`normal_loss`](TrainingTechniques::normal_loss)) — see [`validate_training_techniques`].
+    /// An image with no detected person is skipped by all three.
+    pub body_losses: BodyLossesConfig,
+    /// **ArcFace identity loss** (epic 2123, sc-24831) — an auxiliary perceptual loss on the shared
+    /// decoded-x0 path: the face of the decoded x0 prediction (cropped with the box SCRFD found on
+    /// the image's own encode→decode round trip, once per image) is embedded by a frozen ArcFace and
+    /// pulled toward the image's reference embedding (or the dataset mean): upstream's bias-centred
+    /// cosine (both embeddings minus the mean embedding of 200 noise images, re-normalized),
+    /// `loss = max(0, 1 − cos / clean)` (`clean` = 1 per-image, the image's own clean score in
+    /// dataset-average mode), scaled by the step's noise level. An image with no detected face is
+    /// skipped; a step whose live cosine is at or below [`IdentityLossConfig::min_cos`]
+    /// contributes zero (no push on a hallucinated non-face). Off by
+    /// default ([`AuxLossSchedule::weight`] `0`); refused (typed [`crate::Error::Unsupported`]) by a
+    /// trainer whose [`TrainerDescriptor::techniques`] does not declare
+    /// [`identity_loss`](TrainingTechniques::identity_loss).
+    pub identity_loss: IdentityLossConfig,
+    /// **Face-landmark loss** (epic 2123, sc-24831) — an auxiliary perceptual loss on the shared
+    /// decoded-x0 path: a frozen MediaPipe FaceMesh-v2 predicts the 478 landmarks of the decoded x0
+    /// face crop (same reference-time SCRFD box as the identity loss) and the region-weighted
+    /// (jaw ×3, lips ×2, eyes+nose ×1) mean landmark distance to the reference's normalized
+    /// landmarks is the loss, scaled by the step's noise level and — when the identity loss is on
+    /// — gated by its cosine (a frame at or below `min_cos` contributes zero). Off by default;
+    /// refused by a trainer that does not declare
+    /// [`face_landmark_loss`](TrainingTechniques::face_landmark_loss).
+    pub face_landmark_loss: FaceLandmarkLossConfig,
+    /// Directory holding the **face-analysis stack** both face losses detect with —
+    /// `scrfd_10g.safetensors` (SCRFD detector) and `arcface_iresnet100.safetensors` (the ArcFace
+    /// embedder the identity loss runs), the SceneWorks `instantid_face_stack` bundle. Required (a
+    /// typed refusal otherwise) whenever [`identity_loss`](Self::identity_loss) or
+    /// [`face_landmark_loss`](Self::face_landmark_loss) is enabled. `None` by default.
+    pub face_analysis_dir: Option<PathBuf>,
+    /// **VAE perceptual anchor** (epic 2123, sc-24833) — an auxiliary perceptual loss ported from
+    /// ai-toolkit-perceptual `toolkit/vae_anchor.py`: the model's x0 prediction is decoded with the
+    /// family's small differentiable decoder (the shared decoded-x0 path, E8), re-encoded by a
+    /// frozen **FLUX.2 VAE encoder**, and its multi-scale encoder features (the output of each of
+    /// the four resolution levels' last resnet and of the mid block's second resnet) are compared
+    /// with a per-level `1 - cosine` against the same features of the training image's clean round
+    /// trip, cached once per image. Off by default ([`AuxLossSchedule::weight`] `0`); refused
+    /// (typed [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`vae_anchor_loss`](TrainingTechniques::vae_anchor_loss) — see
+    /// [`validate_training_techniques`].
+    pub vae_anchor: VaeAnchorConfig,
+    /// **E-LatentLPIPS** (epic 2123, sc-24833) — the learned latent-space perceptual metric of
+    /// Kang et al. (ECCV 2024, `mingukkang/elatentlpips`) between the model's x0 prediction and the
+    /// training image's clean latent, ported from ai-toolkit-perceptual's
+    /// `latent_perceptual_loss_weight`. It runs on the latent directly (no decode) with the weights
+    /// calibrated for the trainer's latent family ([`LatentLpipsFamily`]). Off by default; refused
+    /// (typed [`crate::Error::Unsupported`]) by any trainer whose
+    /// [`TrainerDescriptor::techniques`] does not declare
+    /// [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss) — which no trainer whose latent
+    /// family has no published E-LatentLPIPS weights declares.
+    pub latent_lpips: LatentLpipsConfig,
+}
+
+/// Where [`IdentityLossConfig`]'s per-image target embedding comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IdentityReferenceMode {
+    /// Every image's target is the L2-normalized mean of all face-bearing images' reference
+    /// embeddings (upstream `identity_loss_use_average`, its default) — pulls each sample toward
+    /// the subject's identity rather than toward one photo's pose/lighting.
+    #[default]
+    DatasetAverage,
+    /// Every image's target is its own reference embedding.
+    PerImage,
+}
+
+impl IdentityReferenceMode {
+    /// Parse the contract string (`dataset_average`/`per_image`, case-insensitive); `None` otherwise.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "dataset_average" => Some(Self::DatasetAverage),
+            "per_image" => Some(Self::PerImage),
+            _ => None,
+        }
+    }
+
+    /// The contract string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DatasetAverage => "dataset_average",
+            Self::PerImage => "per_image",
+        }
+    }
+}
+
+/// [`TrainingConfig::identity_loss`] — the ArcFace identity loss schedule and its gate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdentityLossConfig {
+    /// Weight / window / alternation. Off by default.
+    pub schedule: AuxLossSchedule,
+    /// A step whose live cosine `cos(embed(x0_face), reference)` is `<= min_cos` contributes zero
+    /// identity loss (upstream `identity_loss_min_cos`, default `0.2`). In `[-1, 1]`.
+    pub min_cos: f32,
+    /// Per-image or dataset-average target embedding.
+    pub reference_mode: IdentityReferenceMode,
+}
+
+impl IdentityLossConfig {
+    /// Upstream `identity_loss_min_cos` default.
+    pub const DEFAULT_MIN_COS: f32 = 0.2;
+    /// Inclusive bounds of [`min_cos`](Self::min_cos).
+    pub const MIN_COS_RANGE: (f32, f32) = (-1.0, 1.0);
+}
+
+impl Default for IdentityLossConfig {
+    fn default() -> Self {
+        Self {
+            schedule: AuxLossSchedule::OFF,
+            min_cos: Self::DEFAULT_MIN_COS,
+            reference_mode: IdentityReferenceMode::default(),
+        }
+    }
+}
+
+/// [`TrainingConfig::face_landmark_loss`] — the FaceMesh landmark loss schedule plus the frozen
+/// FaceMesh-v2 checkpoint it runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FaceLandmarkLossConfig {
+    /// Weight / window / alternation. Off by default.
+    pub schedule: AuxLossSchedule,
+    /// Directory holding the converted FaceMesh-v2 program checkpoint
+    /// (`face_landmarks_detector.safetensors`). Required (a typed refusal otherwise) when the loss is
+    /// enabled.
+    pub model_dir: Option<PathBuf>,
+}
+
+/// The weights of [`TrainingConfig::subject_mask_loss`] (epic 2123, sc-24828). A latent cell with
+/// mask value `m ∈ [0, 1]` (1 = subject) weighs `background_weight + (subject_weight −
+/// background_weight) · m` in the loss. `background_weight = 0` drops the background from the loss
+/// (and from the gradient) entirely; `background_weight = subject_weight = 1` is the unweighted loss.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubjectMaskLoss {
+    /// Weight of a pure-background latent cell, in `[0, 1]`.
+    pub background_weight: f32,
+    /// Weight of a pure-subject latent cell, in `(0, 1]`.
+    pub subject_weight: f32,
+}
+
+impl SubjectMaskLoss {
+    /// Inclusive bounds of [`background_weight`](Self::background_weight).
+    pub const BACKGROUND_WEIGHT_RANGE: (f32, f32) = (0.0, 1.0);
+    /// Bounds of [`subject_weight`](Self::subject_weight): exclusive lower, inclusive upper (a
+    /// zero subject weight would train on nothing but background — the inverse of the technique).
+    pub const SUBJECT_WEIGHT_RANGE: (f32, f32) = (0.0, 1.0);
+
+    /// The loss weight of a latent cell whose (area-averaged) mask value is `m`.
+    pub fn weight(&self, m: f32) -> f32 {
+        self.background_weight + (self.subject_weight - self.background_weight) * m
+    }
+
+    /// Refuse malformed weights with a message naming the field.
+    pub fn validate(&self, label: &str) -> crate::Result<()> {
+        let (bg_lo, bg_hi) = Self::BACKGROUND_WEIGHT_RANGE;
+        let bg = self.background_weight;
+        if !bg.is_finite() || bg < bg_lo || bg > bg_hi {
+            return Err(crate::Error::Msg(format!(
+                "{label}: subject_mask_loss.background_weight must be in [{bg_lo}, {bg_hi}], got {bg}"
+            )));
+        }
+        let (s_lo, s_hi) = Self::SUBJECT_WEIGHT_RANGE;
+        let s = self.subject_weight;
+        if !s.is_finite() || s <= s_lo || s > s_hi {
+            return Err(crate::Error::Msg(format!(
+                "{label}: subject_mask_loss.subject_weight must be in ({s_lo}, {s_hi}], got {s}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Schedule of one **auxiliary perceptual loss** (epic 2123 E8: depth anchoring here; the
+/// identity, landmark, body and latent losses reuse it): its weight, the noise-level window it
+/// fires in, and how it alternates with the diffusion loss.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AuxLossSchedule {
+    /// Loss weight. `0` (the default) is **off** — the loss is never computed and the run trains
+    /// exactly as it would without it.
+    pub weight: f32,
+    /// Inclusive lower bound of the noise-level window the loss fires in — the flow-match `σ`
+    /// (or the normalized timestep `t / T` for ε/v-prediction families): `0` = clean, `1` = pure
+    /// noise.
+    pub t_min: f32,
+    /// Inclusive upper bound of the noise-level window (see [`t_min`](Self::t_min)).
+    pub t_max: f32,
+    /// Alternation period, counted per image and per optimizer update (see
+    /// [`aux_schedule::AuxAlternation`]):
+    /// - `1` — the weighted aux loss is **added** to the diffusion loss on every in-window step;
+    /// - `n ≥ 2` — every `n`-th update of each image is an **aux-only** update on which the
+    ///   diffusion loss contributes **zero**; the others are diffusion-only. An aux-only update
+    ///   samples its noise level inside `[t_min, t_max]`, so no step is wasted. `2` (the default)
+    ///   is the upstream strict alternation.
+    pub every_n: u32,
+}
+
+impl AuxLossSchedule {
+    /// The off schedule: weight `0`, full window `[0, 1]`, strict alternation.
+    pub const OFF: Self = Self {
+        weight: 0.0,
+        t_min: 0.0,
+        t_max: 1.0,
+        every_n: 2,
+    };
+
+    /// Whether the loss is turned on (`weight > 0`).
+    pub fn is_enabled(&self) -> bool {
+        self.weight > 0.0
+    }
+
+    /// Whether noise level `t` lies inside the inclusive window.
+    pub fn in_window(&self, t: f32) -> bool {
+        t >= self.t_min && t <= self.t_max
+    }
+
+    /// Reject a malformed schedule: a non-finite or negative weight, a window outside `[0, 1]` or
+    /// with `t_min > t_max`, or `every_n == 0`. `name` labels the error.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        if !self.weight.is_finite() || self.weight < 0.0 {
+            return Err(format!(
+                "{name} weight must be a finite value >= 0, got {}",
+                self.weight
+            ));
+        }
+        let unit = |v: f32| v.is_finite() && (0.0..=1.0).contains(&v);
+        if !unit(self.t_min) || !unit(self.t_max) || self.t_min > self.t_max {
+            return Err(format!(
+                "{name} timestep window [{}, {}] must satisfy 0 <= t_min <= t_max <= 1",
+                self.t_min, self.t_max
+            ));
+        }
+        if self.every_n == 0 {
+            return Err(format!("{name} alternation period every_n must be >= 1"));
+        }
+        Ok(())
+    }
+}
+
+impl Default for AuxLossSchedule {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
+/// Which E-LatentLPIPS weight set matches a trainer's latent space (epic 2123, the latent
+/// perceptual loss): the trainer names its family in the aux-loss builder context; `None` there
+/// means no E-LatentLPIPS weights exist for that latent space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatentLpipsFamily {
+    Sd15,
+    Sd21,
+    Sdxl,
+    Sd3,
+    Flux,
+}
+
+/// Which Depth-Anything-V2 checkpoint depth anchoring runs (all three share one module graph).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DepthModelSize {
+    /// ViT-S/14 (~25M params) — the default and the upstream-calibrated choice.
+    #[default]
+    Small,
+    /// ViT-B/14 (~98M params).
+    Base,
+    /// ViT-L/14 (~335M params) — much larger gradients; upstream suggests a far smaller weight.
+    Large,
+}
+
+impl DepthModelSize {
+    /// Parse the contract string (`small`/`base`/`large`, case-insensitive); `None` otherwise.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "small" => Some(Self::Small),
+            "base" => Some(Self::Base),
+            "large" => Some(Self::Large),
+            _ => None,
+        }
+    }
+
+    /// The contract string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Base => "base",
+            Self::Large => "large",
+        }
+    }
+}
+
+/// [`TrainingConfig::depth_anchoring`] — the depth-anchoring loss schedule plus the frozen
+/// Depth-Anything-V2 checkpoint it runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DepthAnchoringConfig {
+    /// Weight / window / alternation. Off by default.
+    pub schedule: AuxLossSchedule,
+    /// Which DA2 checkpoint [`model_dir`](Self::model_dir) holds.
+    pub model_size: DepthModelSize,
+    /// Directory holding the DA2 `*-hf` checkpoint (`model.safetensors`). Required (a typed
+    /// refusal otherwise) when the loss is enabled.
+    pub model_dir: Option<PathBuf>,
+}
+
+/// The upstream (ai-toolkit-perceptual) default schedule of the two latent-space perceptual losses
+/// (sc-24833) once given a weight: window `[0, 0.5]` (`*_loss_min_t` / `*_loss_max_t`) and
+/// **additive** (`every_n = 1`) — upstream adds both terms to the diffusion loss on every in-window
+/// step rather than alternating. Weight `0` ⇒ off.
+pub const LATENT_PERCEPTUAL_SCHEDULE: AuxLossSchedule = AuxLossSchedule {
+    weight: 0.0,
+    t_min: 0.0,
+    t_max: 0.5,
+    every_n: 1,
+};
+
+/// [`TrainingConfig::vae_anchor`] — the VAE-anchor loss schedule plus the frozen FLUX.2 VAE whose
+/// encoder it runs (sc-24833).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaeAnchorConfig {
+    /// Weight / window / alternation. Off by default ([`LATENT_PERCEPTUAL_SCHEDULE`]).
+    pub schedule: AuxLossSchedule,
+    /// Directory holding the FLUX.2 VAE in the diffusers layout
+    /// (`diffusion_pytorch_model.safetensors`; only `encoder.*` tensors are read). Required (a
+    /// typed refusal otherwise) when the loss is enabled.
+    pub model_dir: Option<PathBuf>,
+}
+
+impl Default for VaeAnchorConfig {
+    fn default() -> Self {
+        Self {
+            schedule: LATENT_PERCEPTUAL_SCHEDULE,
+            model_dir: None,
+        }
+    }
+}
+
+/// [`TrainingConfig::latent_lpips`] — the E-LatentLPIPS loss schedule plus the directory holding the
+/// published weights (sc-24833). The trainer picks the file for its own [`LatentLpipsFamily`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LatentLpipsConfig {
+    /// Weight / window / alternation. Off by default ([`LATENT_PERCEPTUAL_SCHEDULE`]).
+    pub schedule: AuxLossSchedule,
+    /// Directory holding the E-LatentLPIPS checkpoints (a `Mingguksky/elatentlpips` snapshot — see
+    /// [`LatentLpipsFamily::checkpoint_file`]). Required (a typed refusal otherwise) when the loss
+    /// is enabled.
+    pub model_dir: Option<PathBuf>,
+}
+
+impl Default for LatentLpipsConfig {
+    fn default() -> Self {
+        Self {
+            schedule: LATENT_PERCEPTUAL_SCHEDULE,
+            model_dir: None,
+        }
+    }
+}
+
+/// [`LatentLpipsFamily`] — the latent spaces E-LatentLPIPS publishes calibrated weights for (`Mingguksky/elatentlpips`,
+/// sc-24833). A trainer whose VAE latent space is none of these (FLUX.2, Qwen-Image / Wan, LTX
+/// latents) has no matching weights and does not declare
+/// [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss), so the floor refuses the loss.
+///
+/// | family | latent | model-space latent | trainers |
+/// |---|---|---|---|
+/// | `Sd15` | SD 1.x VAE, 4 ch | `z * 0.18215` | none |
+/// | `Sd21` | SD 2.x VAE, 4 ch | `z * 0.18215` | none |
+/// | `Sdxl` | SDXL VAE, 4 ch | `z * 0.13025` | SDXL / Illustrious, Kolors |
+/// | `Sd3` | SD3 VAE, 16 ch | `(z - 0.0609) * 1.5305` | SD3.5 |
+/// | `Flux` | FLUX.1 VAE, 16 ch | `(z - 0.1159) * 0.3611` | Z-Image |
+///
+/// The network consumes the **model-space** latent the diffusion model trains on (upstream calls it
+/// with `normalize=False` on exactly those latents).
+impl LatentLpipsFamily {
+    /// The upstream encoder name (`sd15` / `sd21` / `sdxl` / `sd3` / `flux`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sd15 => "sd15",
+            Self::Sd21 => "sd21",
+            Self::Sdxl => "sdxl",
+            Self::Sd3 => "sd3",
+            Self::Flux => "flux",
+        }
+    }
+
+    /// Latent channels the network's first convolution consumes.
+    pub fn latent_channels(self) -> usize {
+        match self {
+            Self::Sd15 | Self::Sd21 | Self::Sdxl => 4,
+            Self::Sd3 | Self::Flux => 16,
+        }
+    }
+
+    /// The published checkpoint's path relative to [`LatentLpipsConfig::model_dir`].
+    pub fn checkpoint_file(self) -> String {
+        format!("elatentlpips_ckpt/{}_latest_vgg16_tuned.pth", self.as_str())
+    }
 }
 
 impl Default for TrainingConfig {
@@ -198,8 +695,203 @@ impl Default for TrainingConfig {
             // Resume is OFF by default (F-125): a caller that does not opt in trains from scratch,
             // exactly as before. The worker sets it from the plan when re-running an interrupted job.
             resume: false,
+            // Weight noising is OFF by default (epic 2123 E1): a caller that does not opt in trains
+            // exactly as before.
+            weight_noise_sigma: 0.0,
+            // Depth anchoring is OFF by default (epic 2123 E1): weight 0, no aux model loaded.
+            depth_anchoring: DepthAnchoringConfig::default(),
+            perceptual_decoder_dir: None,
+            // Gradient noise is OFF by default (epic 2123 E1); gamma carries the upstream default
+            // so turning eta on alone gives the paper's schedule.
+            gradient_noise_eta: 0.0,
+            gradient_noise_gamma: DEFAULT_GRADIENT_NOISE_GAMMA,
+            // Resolution buckets are OFF by default (epic 2123 E1): one bucket at `resolution`,
+            // walked round-robin exactly as before.
+            resolution_buckets: Vec::new(),
+            // Subject-masked loss is OFF by default (epic 2123 E1): no mask is read and the loss is
+            // the plain unweighted mean.
+            subject_mask_loss: None,
+            // Identity / face-landmark losses are OFF by default (epic 2123 E1): weight 0, no face
+            // model loaded.
+            identity_loss: IdentityLossConfig::default(),
+            face_landmark_loss: FaceLandmarkLossConfig::default(),
+            face_analysis_dir: None,
+            // Body losses are OFF by default (epic 2123 E1): all three weights 0, no model loaded.
+            body_losses: BodyLossesConfig::default(),
+            // The latent-space perceptual losses are OFF by default (epic 2123 E1, sc-24833).
+            vae_anchor: VaeAnchorConfig::default(),
+            latent_lpips: LatentLpipsConfig::default(),
         }
     }
+}
+
+/// Most resolution buckets one training run may declare (epic 2123 sc-2127). Each bucket adds one
+/// cached latent per dataset item and one more latent size the trainer must fit, so the list is
+/// kept short; SceneWorks validates the same bound at submit time.
+pub const MAX_RESOLUTION_BUCKETS: usize = 8;
+
+/// Every [`ResolutionBucket::resolution`] must be a multiple of this (sc-2127): the trainers floor
+/// each training edge to a multiple of 32, so an off-stride bucket would silently train at another
+/// size — and two buckets that floor to the same edge (e.g. 512 and 520) would cache the same
+/// latent twice and silently double that size's weight. SceneWorks validates the same stride.
+pub const RESOLUTION_BUCKET_STRIDE: u32 = 32;
+
+/// One training resolution bucket (see [`TrainingConfig::resolution_buckets`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolutionBucket {
+    /// Square training edge in pixels, floored to the trainer's latent stride exactly like
+    /// [`TrainingConfig::resolution`].
+    pub resolution: u32,
+    /// How many times each item is visited at this resolution per epoch (`>= 1`).
+    pub repeats: u32,
+}
+
+impl TrainingConfig {
+    /// The buckets this run trains on: [`resolution_buckets`](Self::resolution_buckets) when set,
+    /// otherwise the single legacy bucket `{ resolution, repeats: 1 }`. Every trainer caches one
+    /// latent per item per returned bucket, in this order.
+    pub fn training_buckets(&self) -> Vec<ResolutionBucket> {
+        if self.resolution_buckets.is_empty() {
+            vec![ResolutionBucket {
+                resolution: self.resolution,
+                repeats: 1,
+            }]
+        } else {
+            self.resolution_buckets.clone()
+        }
+    }
+
+    /// The largest training edge of [`training_buckets`](Self::training_buckets) — the resolution
+    /// every memory pre-flight / estimate must size for (epic 2123 E7).
+    pub fn max_training_resolution(&self) -> u32 {
+        self.training_buckets()
+            .iter()
+            .map(|b| b.resolution)
+            .max()
+            .unwrap_or(self.resolution)
+    }
+}
+
+/// The per-step sample order over a bucketed latent cache (epic 2123 sc-2127).
+///
+/// Trainers cache `n_items × n_buckets` latents laid out item-major (`item * n_buckets + bucket`,
+/// buckets in [`TrainingConfig::training_buckets`] order) and ask
+/// [`cache_index`](Self::cache_index) which entry the `k`-th sample (0-based; usually `step - 1`)
+/// reads.
+///
+/// - **One bucket** — `k % n_items`, unshuffled: exactly the round-robin walk every trainer used
+///   before buckets existed, so a single bucket at today's resolution gives today's order. (A lone
+///   bucket's repeat count cannot change a one-bucket per-image mix, so it is not consulted.)
+/// - **Several buckets** — each epoch holds every `(item, bucket)` pair `repeats[bucket]` times
+///   (`epoch_len = n_items · Σ repeats`), shuffled with a Fisher–Yates permutation whose RNG is
+///   derived from the job seed and the epoch index (E4): reproducible, and a fresh order each
+///   epoch.
+#[derive(Clone, Debug)]
+pub struct BucketSchedule {
+    n_items: usize,
+    n_buckets: usize,
+    seed: u64,
+    /// One epoch's unshuffled `(item, bucket)` multiset (empty for the single-bucket walk).
+    epoch: Vec<(usize, usize)>,
+    /// The most recently shuffled epoch `(epoch index, order)`, so consecutive steps reuse one
+    /// permutation instead of reshuffling the whole epoch per sample.
+    shuffled: std::cell::RefCell<Option<ShuffledEpoch>>,
+}
+
+/// A shuffled epoch: `(epoch index, (item, bucket) order)`.
+type ShuffledEpoch = (usize, Vec<(usize, usize)>);
+
+impl BucketSchedule {
+    /// Build the schedule for `n_items` cached items over `buckets` (from
+    /// [`TrainingConfig::training_buckets`]).
+    pub fn new(n_items: usize, buckets: &[ResolutionBucket], seed: u64) -> Self {
+        let n_buckets = buckets.len().max(1);
+        let mut epoch = Vec::new();
+        if n_buckets > 1 {
+            for (b, bucket) in buckets.iter().enumerate() {
+                for item in 0..n_items {
+                    for _ in 0..bucket.repeats {
+                        epoch.push((item, b));
+                    }
+                }
+            }
+        }
+        Self {
+            n_items,
+            n_buckets,
+            seed,
+            epoch,
+            shuffled: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Number of buckets each item is cached at (the cache stride).
+    pub fn n_buckets(&self) -> usize {
+        self.n_buckets
+    }
+
+    /// Samples per epoch (`n_items` for one bucket; `n_items · Σ repeats` otherwise).
+    pub fn epoch_len(&self) -> usize {
+        if self.n_buckets == 1 {
+            self.n_items
+        } else {
+            self.epoch.len()
+        }
+    }
+
+    /// The `(item, bucket)` the `k`-th sample (0-based) trains on.
+    ///
+    /// # Panics
+    /// When the schedule is empty (no items); every trainer refuses an empty cache before looping.
+    pub fn sample(&self, k: usize) -> (usize, usize) {
+        let len = self.epoch_len();
+        assert!(len > 0, "BucketSchedule::sample on an empty schedule");
+        if self.n_buckets == 1 {
+            return (k % len, 0);
+        }
+        let (epoch_idx, pos) = (k / len, k % len);
+        let mut shuffled = self.shuffled.borrow_mut();
+        if let Some((cached_epoch, order)) = shuffled.as_ref() {
+            if *cached_epoch == epoch_idx {
+                return order[pos];
+            }
+        }
+        let order = self.shuffle_epoch(epoch_idx);
+        let sample = order[pos];
+        *shuffled = Some((epoch_idx, order));
+        sample
+    }
+
+    /// Epoch `epoch_idx`'s order: Fisher–Yates over a splitmix64 stream seeded from (job seed,
+    /// epoch index) — a pure function of both, so resume and re-runs see the same order.
+    fn shuffle_epoch(&self, epoch_idx: usize) -> Vec<(usize, usize)> {
+        let mut order = self.epoch.clone();
+        let mut state = self
+            .seed
+            .wrapping_add(0x5EED_B0C4_E7A0_0001)
+            .wrapping_add((epoch_idx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93));
+        for i in (1..order.len()).rev() {
+            let j = (splitmix64_next(&mut state) % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        order
+    }
+
+    /// The cache entry (`item * n_buckets + bucket`) the `k`-th sample (0-based) reads.
+    pub fn cache_index(&self, k: usize) -> usize {
+        let (item, bucket) = self.sample(k);
+        item * self.n_buckets + bucket
+    }
+}
+
+/// One step of a splitmix64 *stream* (advances `state`) — the bucket shuffle's RNG; the stateless
+/// [`splitmix64`] hash serves the technique-noise keys.
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// One training example. Paths are resolved by the caller (the worker resolves the dataset's
@@ -246,6 +938,11 @@ pub struct TrainingItem {
     /// ([`TrainerDescriptor::max_reference_images`] `> 0`) accepts — and then only up to that cap;
     /// see [`validate_edit_request`].
     pub reference_image_paths: Vec<PathBuf>,
+    /// The item's **subject mask** (epic 2123, sc-24828): a single-channel image the same size as
+    /// [`image_path`](Self::image_path), white (255) = subject, black (0) = background, with soft
+    /// edges in between. Read only when [`TrainingConfig::subject_mask_loss`] is on — then every
+    /// item must carry one (an edit pair's mask covers its **target**); `None` otherwise.
+    pub subject_mask_path: Option<PathBuf>,
 }
 
 impl TrainingItem {
@@ -258,6 +955,7 @@ impl TrainingItem {
             control_image_path: None,
             model_options: JsonMap::new(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         }
     }
 
@@ -269,6 +967,7 @@ impl TrainingItem {
             control_image_path: Some(control_image_path),
             model_options: JsonMap::new(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         }
     }
 
@@ -286,6 +985,7 @@ impl TrainingItem {
             control_image_path: None,
             model_options: JsonMap::new(),
             reference_image_paths,
+            subject_mask_path: None,
         }
     }
 
@@ -393,6 +1093,551 @@ pub struct TrainerDescriptor {
     /// [`crate::Error::Unsupported`] instead of silently training a text-to-image adapter on the
     /// targets (the F-055 class). `0` for every trainer shipped before sc-24161.
     pub max_reference_images: u32,
+    /// Which optional **training techniques** (epic 2123) this trainer actually implements. The
+    /// shared [`validate_training_techniques`] floor refuses a request that turns on a technique
+    /// the trainer does not declare — a typed [`crate::Error::Unsupported`] before any work, never a
+    /// silently ignored knob. [`TrainingTechniques::NONE`] for a trainer that implements none.
+    pub techniques: TrainingTechniques,
+}
+
+/// Per-technique support flags for the optional training techniques of epic 2123 (weight noising
+/// weight noising, gradient noise, resolution buckets and depth anchoring today; masked loss and
+/// the perceptual identity/body/latent losses join here as their stories land). Each flag gates one
+/// technique's [`TrainingConfig`] knob(s) through [`validate_training_techniques`].
+///
+/// Non-supporting descriptors spell [`TrainingTechniques::NONE`], so a new flag defaults to
+/// *unsupported* everywhere without touching them; a supporting descriptor names the flags it
+/// implements (and, once more than one flag exists, completes the rest with `..NONE`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrainingTechniques {
+    /// Honors [`TrainingConfig::weight_noise_sigma`] (relative-mode adapter weight noising).
+    pub weight_noise: bool,
+    /// Honors [`TrainingConfig::depth_anchoring`] (decoded-x0 Depth-Anything-V2 anchoring loss).
+    pub depth_anchoring: bool,
+    /// Honors [`TrainingConfig::gradient_noise_eta`] / [`TrainingConfig::gradient_noise_gamma`]
+    /// (annealed adapter gradient noise, sc-24827).
+    pub gradient_noise: bool,
+    /// Honors [`TrainingConfig::resolution_buckets`] (multi-resolution buckets with per-bucket
+    /// repeat counts, sc-2127).
+    pub resolution_buckets: bool,
+    /// Honors [`TrainingConfig::subject_mask_loss`] (subject-masked loss weighting, sc-24828).
+    pub subject_mask_loss: bool,
+    /// Honors [`TrainingConfig::identity_loss`] (decoded-x0 ArcFace identity loss, sc-24831).
+    pub identity_loss: bool,
+    /// Honors [`TrainingConfig::face_landmark_loss`] (decoded-x0 FaceMesh landmark loss, sc-24831).
+    pub face_landmark_loss: bool,
+    /// Honors [`BodyLossesConfig::proportion`] (ViTPose+ bone-length-ratio loss, sc-24832).
+    pub body_proportion_loss: bool,
+    /// Honors [`BodyLossesConfig::shape`] (HybrIK SMPL-beta loss, sc-24832).
+    pub body_shape_loss: bool,
+    /// Honors [`BodyLossesConfig::normal`] (Sapiens surface-normal loss, sc-24832).
+    pub normal_loss: bool,
+    /// Honors [`TrainingConfig::vae_anchor`] (decoded-x0 FLUX.2-VAE-encoder anchor loss, sc-24833).
+    pub vae_anchor_loss: bool,
+    /// Honors [`TrainingConfig::latent_lpips`] (E-LatentLPIPS on the x0 latent, sc-24833) — only a
+    /// trainer whose latent family has published weights ([`LatentLpipsFamily`]) declares it.
+    pub latent_lpips_loss: bool,
+    /// Not a technique knob: the trainer's aux-loss builder supplies its **own x0 decoder** (e.g.
+    /// Mage decodes through its full VAE), so the decoded-x0 losses do not need
+    /// [`TrainingConfig::perceptual_decoder_dir`] and the shared floor does not require it.
+    pub builtin_x0_decoder: bool,
+}
+
+impl TrainingTechniques {
+    /// No optional technique supported — every technique knob must stay at its off value.
+    pub const NONE: Self = Self {
+        weight_noise: false,
+        subject_mask_loss: false,
+        depth_anchoring: false,
+        gradient_noise: false,
+        resolution_buckets: false,
+        identity_loss: false,
+        face_landmark_loss: false,
+        body_proportion_loss: false,
+        body_shape_loss: false,
+        normal_loss: false,
+        vae_anchor_loss: false,
+        latent_lpips_loss: false,
+        builtin_x0_decoder: false,
+    };
+
+    /// The adapter-noise pair every LoRA/LoKr trainer implements at its optimizer step (epic 2123
+    /// S2, sc-24827): weight noising after the update and gradient noise between clip and step.
+    pub const ADAPTER_NOISE: Self = Self {
+        weight_noise: true,
+        gradient_noise: true,
+        resolution_buckets: false,
+        depth_anchoring: false,
+        subject_mask_loss: false,
+        identity_loss: false,
+        face_landmark_loss: false,
+        body_proportion_loss: false,
+        body_shape_loss: false,
+        normal_loss: false,
+        vae_anchor_loss: false,
+        latent_lpips_loss: false,
+        builtin_x0_decoder: false,
+    };
+}
+
+/// Upstream / Neelakantan et al. (2015) default annealing exponent for gradient noise.
+pub const DEFAULT_GRADIENT_NOISE_GAMMA: f32 = 0.55;
+
+/// The gradient-noise standard deviation at optimizer update `update_idx` (0-based):
+/// `σ_t = eta / (1 + t)^gamma` — upstream ai-toolkit-perceptual's `neelakantan` mode, the one
+/// formula both backends' gradient-noise kernels share. `eta == 0` ⇒ `0` (off).
+pub fn gradient_noise_std(eta: f32, gamma: f32, update_idx: u32) -> f32 {
+    if eta == 0.0 {
+        return 0.0;
+    }
+    (eta as f64 / (1.0 + update_idx as f64).powf(gamma as f64)) as f32
+}
+
+/// Domain-separation salt for the **weight-noise** RNG stream (epic 2123, sc-24826).
+pub const WEIGHT_NOISE_SALT: u64 = 0x5745_4947_4854_4E5A; // "WEIGHTNZ"
+/// Domain-separation salt for the **gradient-noise** RNG stream (sc-24827) — independent of the
+/// weight-noise stream so turning one technique on never shifts the other's draws.
+pub const GRADIENT_NOISE_SALT: u64 = 0x4752_4144_4E4F_4953; // "GRADNOIS"
+
+/// SplitMix64 finalizer — a bijective 64-bit mix, so distinct inputs map to well-separated keys.
+pub fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The RNG seed for one adapter tensor's technique-noise draw (epic 2123 E4): derived only from
+/// the job `seed`, the technique's stream `salt` ([`WEIGHT_NOISE_SALT`] / [`GRADIENT_NOISE_SALT`]),
+/// the 0-based optimizer `update_idx`, and the tensor's index in **sorted key order** — so a
+/// seeded run (or a resumed one) reproduces the same noise on either backend's kernel, and
+/// `HashMap` iteration order can never leak in.
+pub fn technique_noise_key(seed: u64, salt: u64, update_idx: u32, tensor_idx: usize) -> u64 {
+    let stream = splitmix64(seed ^ salt).wrapping_add(update_idx as u64);
+    splitmix64(splitmix64(stream) ^ tensor_idx as u64)
+}
+
+/// The enabled **auxiliary (perceptual) losses** of `cfg`, by name, in loss-index order — the
+/// same arms both backends' shared aux-loss builders drive (depth, identity, face-landmark, the
+/// three body losses, the VAE anchor, E-LatentLPIPS). Empty when none is on.
+pub fn enabled_aux_losses(cfg: &TrainingConfig) -> Vec<&'static str> {
+    [
+        ("depth", cfg.depth_anchoring.schedule.is_enabled()),
+        ("identity", cfg.identity_loss.schedule.is_enabled()),
+        (
+            "face-landmark",
+            cfg.face_landmark_loss.schedule.is_enabled(),
+        ),
+        ("body-proportion", cfg.body_losses.proportion.is_enabled()),
+        ("body-shape", cfg.body_losses.shape.is_enabled()),
+        ("normal", cfg.body_losses.normal.is_enabled()),
+        ("vae_anchor", cfg.vae_anchor.schedule.is_enabled()),
+        ("latent_lpips", cfg.latent_lpips.schedule.is_enabled()),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect()
+}
+
+/// Whether a decoded-x0 loss lacks its x0 decoder: [`TrainingConfig::perceptual_decoder_dir`] is
+/// unset and the trainer does not build its own decoder
+/// ([`TrainingTechniques::builtin_x0_decoder`]).
+fn lacks_x0_decoder(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> bool {
+    cfg.perceptual_decoder_dir.is_none() && !desc.techniques.builtin_x0_decoder
+}
+
+/// The shared **training-technique floor** (epic 2123 E3/E5) — every trainer's `validate` *and*
+/// `train` entry point calls it before any expensive work, so a requested technique the trainer
+/// does not implement is refused instead of silently ignored.
+///
+/// - `weight_noise_sigma` / `gradient_noise_eta` / `gradient_noise_gamma` not finite or negative
+///   ⇒ [`crate::Error::Msg`] (malformed request).
+/// - `weight_noise_sigma > 0` on a trainer whose [`TrainerDescriptor::techniques`] lacks
+///   [`weight_noise`](TrainingTechniques::weight_noise) ⇒ typed [`crate::Error::Unsupported`];
+///   likewise `gradient_noise_eta > 0` without
+///   [`gradient_noise`](TrainingTechniques::gradient_noise).
+/// - either noise technique with [`TrainingConfig::full_finetune`] ⇒ typed
+///   [`crate::Error::Unsupported`]: both perturb adapter factors / adapter gradients only and must
+///   never touch base weights (E5).
+/// - any auxiliary loss ([`enabled_aux_losses`]) with [`TrainingConfig::full_finetune`] ⇒ typed
+///   [`crate::Error::Unsupported`]: the aux losses train the adapter surface only.
+/// - `resolution_buckets` non-empty but malformed (a zero resolution or repeat count, a resolution
+///   off the [`RESOLUTION_BUCKET_STRIDE`], a duplicate resolution, more than
+///   [`MAX_RESOLUTION_BUCKETS`]) ⇒ [`crate::Error::Msg`]; well formed on a
+///   trainer that lacks [`resolution_buckets`](TrainingTechniques::resolution_buckets) ⇒ typed
+///   [`crate::Error::Unsupported`].
+/// - a malformed [`TrainingConfig::depth_anchoring`] schedule ⇒ [`crate::Error::Msg`].
+/// - depth anchoring enabled on a trainer whose descriptor lacks
+///   [`depth_anchoring`](TrainingTechniques::depth_anchoring) ⇒ typed [`crate::Error::Unsupported`].
+/// - depth anchoring enabled without a [`DepthAnchoringConfig::model_dir`] or a
+///   [`TrainingConfig::perceptual_decoder_dir`] ⇒ [`crate::Error::Msg`] naming the missing model.
+/// - `subject_mask_loss` set with malformed weights ⇒ [`crate::Error::Msg`] naming the field.
+/// - `subject_mask_loss` set on a trainer whose [`TrainerDescriptor::techniques`] lacks
+///   [`subject_mask_loss`](TrainingTechniques::subject_mask_loss) ⇒ typed
+///   [`crate::Error::Unsupported`].
+/// - `subject_mask_loss` set while any item has no
+///   [`subject_mask_path`](TrainingItem::subject_mask_path) ⇒ [`crate::Error::Msg`] naming the
+///   images that lack one (defence in depth behind the product-layer preflight).
+/// - a malformed identity / face-landmark schedule, or `identity_loss.min_cos` outside `[-1, 1]`
+///   ⇒ [`crate::Error::Msg`]; either loss enabled on a trainer that lacks
+///   [`identity_loss`](TrainingTechniques::identity_loss) /
+///   [`face_landmark_loss`](TrainingTechniques::face_landmark_loss) ⇒ typed
+///   [`crate::Error::Unsupported`]; enabled without [`TrainingConfig::face_analysis_dir`], the
+///   x0 decoder, or (landmarks) [`FaceLandmarkLossConfig::model_dir`] ⇒ [`crate::Error::Msg`].
+/// - a malformed [`TrainingConfig::vae_anchor`] / [`TrainingConfig::latent_lpips`] schedule ⇒
+///   [`crate::Error::Msg`]; either loss enabled on a trainer lacking
+///   [`vae_anchor_loss`](TrainingTechniques::vae_anchor_loss) /
+///   [`latent_lpips_loss`](TrainingTechniques::latent_lpips_loss) ⇒ typed
+///   [`crate::Error::Unsupported`]; enabled without its model directory (or, for the VAE anchor,
+///   without [`TrainingConfig::perceptual_decoder_dir`]) ⇒ [`crate::Error::Msg`].
+/// - every technique off ⇒ no-op.
+pub fn validate_training_techniques(
+    desc: &TrainerDescriptor,
+    req: &TrainingRequest,
+) -> crate::Result<()> {
+    let cfg = &req.config;
+    for (name, value) in [
+        ("weight_noise_sigma", cfg.weight_noise_sigma),
+        ("gradient_noise_eta", cfg.gradient_noise_eta),
+        ("gradient_noise_gamma", cfg.gradient_noise_gamma),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: {name} must be a finite value >= 0, got {value}",
+                desc.id
+            )));
+        }
+    }
+    let sigma = cfg.weight_noise_sigma;
+    if sigma > 0.0 {
+        if cfg.full_finetune {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: weight noising (weight_noise_sigma {sigma}) perturbs adapter factors only and \
+                 cannot be combined with a full base fine-tune",
+                desc.id
+            )));
+        }
+        if !desc.techniques.weight_noise {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: weight noising (weight_noise_sigma {sigma}) is not supported by this trainer",
+                desc.id
+            )));
+        }
+    }
+    let eta = cfg.gradient_noise_eta;
+    if eta > 0.0 {
+        if cfg.full_finetune {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: gradient noise (gradient_noise_eta {eta}) perturbs adapter gradients only and \
+                 cannot be combined with a full base fine-tune",
+                desc.id
+            )));
+        }
+        if !desc.techniques.gradient_noise {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: gradient noise (gradient_noise_eta {eta}) is not supported by this trainer",
+                desc.id
+            )));
+        }
+    }
+    let aux = enabled_aux_losses(cfg);
+    if cfg.full_finetune && !aux.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: the auxiliary losses ({}) train a LoRA/LoKr adapter only and cannot be combined \
+             with a full base fine-tune",
+            desc.id,
+            aux.join(", ")
+        )));
+    }
+    let depth = &req.config.depth_anchoring;
+    depth
+        .schedule
+        .validate("depth anchoring")
+        .map_err(|m| crate::Error::Msg(format!("{}: {m}", desc.id)))?;
+    if depth.schedule.is_enabled() {
+        if !desc.techniques.depth_anchoring {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: depth anchoring (weight {}) is not supported by this trainer",
+                desc.id, depth.schedule.weight
+            )));
+        }
+        if depth.model_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: depth anchoring needs the Depth-Anything-V2 {} checkpoint \
+                 (depth_anchoring.model_dir is unset)",
+                desc.id,
+                depth.model_size.as_str()
+            )));
+        }
+        if lacks_x0_decoder(desc, &req.config) {
+            return Err(crate::Error::Msg(format!(
+                "{}: depth anchoring needs the family's small x0 decoder \
+                 (perceptual_decoder_dir is unset)",
+                desc.id
+            )));
+        }
+    }
+    validate_face_losses(desc, &req.config)?;
+    validate_latent_perceptual_losses(desc, req)?;
+    if let Some(mask_loss) = &req.config.subject_mask_loss {
+        mask_loss.validate(desc.id)?;
+        if !desc.techniques.subject_mask_loss {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: subject-masked loss weighting is not supported by this trainer",
+                desc.id
+            )));
+        }
+        subject_mask::require_subject_masks(desc.id, &req.items)?;
+    }
+    validate_body_losses(desc, req)?;
+    validate_resolution_buckets(desc, &cfg.resolution_buckets)?;
+    Ok(())
+}
+
+/// Body-loss half of [`validate_training_techniques`] (sc-24832): a malformed schedule/knob is a
+/// `Msg`; an enabled loss the trainer does not declare is `Unsupported`; an enabled loss without
+/// its checkpoint (or the x0 decoder, or — normal restricted to the subject — every item's mask)
+/// is a `Msg` naming what is missing.
+fn validate_body_losses(desc: &TrainerDescriptor, req: &TrainingRequest) -> crate::Result<()> {
+    let body = &req.config.body_losses;
+    body.validate(desc.id).map_err(crate::Error::Msg)?;
+    let losses = [
+        (
+            "body proportion loss",
+            &body.proportion,
+            desc.techniques.body_proportion_loss,
+        ),
+        (
+            "body shape loss",
+            &body.shape,
+            desc.techniques.body_shape_loss,
+        ),
+        ("normal loss", &body.normal, desc.techniques.normal_loss),
+    ];
+    for (name, schedule, declared) in losses {
+        if schedule.is_enabled() && !declared {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: the {name} (weight {}) is not supported by this trainer",
+                desc.id, schedule.weight
+            )));
+        }
+    }
+    if !body.any_enabled() {
+        return Ok(());
+    }
+    let missing = |what: &str| {
+        Err(crate::Error::Msg(format!(
+            "{}: the body losses need {what}",
+            desc.id
+        )))
+    };
+    if body.pose_model_dir.is_none() {
+        return missing(
+            "the ViTPose+ base checkpoint — the proportion encoder and every body loss's person \
+             detector (body_losses.pose_model_dir is unset)",
+        );
+    }
+    if body.shape.is_enabled() && body.shape_model_dir.is_none() {
+        return missing("the HybrIK checkpoint (body_losses.shape_model_dir is unset)");
+    }
+    if body.normal.is_enabled() && body.normal_model_dir.is_none() {
+        return missing("the Sapiens normal checkpoint (body_losses.normal_model_dir is unset)");
+    }
+    if lacks_x0_decoder(desc, &req.config) {
+        return missing("the family's small x0 decoder (perceptual_decoder_dir is unset)");
+    }
+    if body.normal.is_enabled() && body.normal_restrict_to_subject {
+        let lacking: Vec<String> = req
+            .items
+            .iter()
+            .filter(|i| i.subject_mask_path.is_none())
+            .map(|i| {
+                i.image_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| i.image_path.display().to_string())
+            })
+            .collect();
+        if !lacking.is_empty() {
+            return Err(crate::Error::Msg(format!(
+                "{}: the normal loss restricted to the subject needs a subject mask for every \
+                 dataset image; {} of {} have none: {}",
+                desc.id,
+                lacking.len(),
+                req.items.len(),
+                subject_mask::name_list(&lacking)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Face-loss half of [`validate_training_techniques`] (sc-24831): malformed schedules / `min_cos`
+/// ⇒ `Msg`; an enabled loss the trainer does not declare ⇒ `Unsupported`; an enabled loss without
+/// its models (the face-analysis stack, the FaceMesh checkpoint, the x0 decoder) ⇒ `Msg` naming the
+/// missing one.
+fn validate_face_losses(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> crate::Result<()> {
+    let id = &cfg.identity_loss;
+    let lm = &cfg.face_landmark_loss;
+    let msg = |m: String| crate::Error::Msg(format!("{}: {m}", desc.id));
+    id.schedule.validate("identity loss").map_err(msg)?;
+    lm.schedule.validate("face-landmark loss").map_err(msg)?;
+    let (lo, hi) = IdentityLossConfig::MIN_COS_RANGE;
+    if !id.min_cos.is_finite() || id.min_cos < lo || id.min_cos > hi {
+        return Err(crate::Error::Msg(format!(
+            "{}: identity_loss.min_cos must be in [{lo}, {hi}], got {}",
+            desc.id, id.min_cos
+        )));
+    }
+    let checks = [
+        (
+            id.schedule.is_enabled(),
+            desc.techniques.identity_loss,
+            "the ArcFace identity loss",
+            id.schedule.weight,
+        ),
+        (
+            lm.schedule.is_enabled(),
+            desc.techniques.face_landmark_loss,
+            "the face-landmark loss",
+            lm.schedule.weight,
+        ),
+    ];
+    for (enabled, declared, name, weight) in checks {
+        if !enabled {
+            continue;
+        }
+        if !declared {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: {name} (weight {weight}) is not supported by this trainer",
+                desc.id
+            )));
+        }
+        if cfg.face_analysis_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: {name} needs the SCRFD + ArcFace face-analysis stack \
+                 (face_analysis_dir is unset)",
+                desc.id
+            )));
+        }
+        if lacks_x0_decoder(desc, cfg) {
+            return Err(crate::Error::Msg(format!(
+                "{}: {name} needs the family's small x0 decoder (perceptual_decoder_dir is unset)",
+                desc.id
+            )));
+        }
+    }
+    if lm.schedule.is_enabled() && lm.model_dir.is_none() {
+        return Err(crate::Error::Msg(format!(
+            "{}: the face-landmark loss needs the MediaPipe FaceMesh-v2 checkpoint \
+             (face_landmark_loss.model_dir is unset)",
+            desc.id
+        )));
+    }
+    Ok(())
+}
+
+/// Latent-perceptual half of [`validate_training_techniques`] (sc-24833): each loss's schedule must
+/// be well formed (`Msg`), and when enabled the trainer must declare it (`Unsupported`) and its
+/// frozen model (plus, for the decoded-x0 VAE anchor, the family's small decoder) must be named
+/// (`Msg`).
+fn validate_latent_perceptual_losses(
+    desc: &TrainerDescriptor,
+    req: &TrainingRequest,
+) -> crate::Result<()> {
+    let cfg = &req.config;
+    let va = &cfg.vae_anchor;
+    va.schedule
+        .validate("VAE anchor")
+        .map_err(|m| crate::Error::Msg(format!("{}: {m}", desc.id)))?;
+    if va.schedule.is_enabled() {
+        if !desc.techniques.vae_anchor_loss {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: the VAE anchor loss (weight {}) is not supported by this trainer",
+                desc.id, va.schedule.weight
+            )));
+        }
+        if va.model_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: the VAE anchor loss needs the FLUX.2 VAE (vae_anchor.model_dir is unset)",
+                desc.id
+            )));
+        }
+        if lacks_x0_decoder(desc, cfg) {
+            return Err(crate::Error::Msg(format!(
+                "{}: the VAE anchor loss needs the family's small x0 decoder \
+                 (perceptual_decoder_dir is unset)",
+                desc.id
+            )));
+        }
+    }
+    let lp = &cfg.latent_lpips;
+    lp.schedule
+        .validate("E-LatentLPIPS")
+        .map_err(|m| crate::Error::Msg(format!("{}: {m}", desc.id)))?;
+    if lp.schedule.is_enabled() {
+        if !desc.techniques.latent_lpips_loss {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: the E-LatentLPIPS loss (weight {}) is not supported by this trainer (no \
+                 E-LatentLPIPS weights match its latent family)",
+                desc.id, lp.schedule.weight
+            )));
+        }
+        if lp.model_dir.is_none() {
+            return Err(crate::Error::Msg(format!(
+                "{}: the E-LatentLPIPS loss needs its weights (latent_lpips.model_dir is unset)",
+                desc.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolution-bucket half of [`validate_training_techniques`] (sc-2127): an empty list is off; a
+/// non-empty one must be well formed (`Msg`) and declared by the trainer (`Unsupported`).
+fn validate_resolution_buckets(
+    desc: &TrainerDescriptor,
+    buckets: &[ResolutionBucket],
+) -> crate::Result<()> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    if buckets.len() > MAX_RESOLUTION_BUCKETS {
+        return Err(crate::Error::Msg(format!(
+            "{}: resolution_buckets has {} buckets; at most {MAX_RESOLUTION_BUCKETS} are allowed",
+            desc.id,
+            buckets.len()
+        )));
+    }
+    for (i, b) in buckets.iter().enumerate() {
+        if b.resolution == 0 || b.repeats == 0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets[{i}] needs a resolution and a repeat count >= 1, got \
+                 resolution {} repeats {}",
+                desc.id, b.resolution, b.repeats
+            )));
+        }
+        if b.resolution % RESOLUTION_BUCKET_STRIDE != 0 {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets[{i}] resolution {} is not a multiple of \
+                 {RESOLUTION_BUCKET_STRIDE} (the trainers' latent stride)",
+                desc.id, b.resolution
+            )));
+        }
+        if buckets[..i].iter().any(|p| p.resolution == b.resolution) {
+            return Err(crate::Error::Msg(format!(
+                "{}: resolution_buckets lists resolution {} twice",
+                desc.id, b.resolution
+            )));
+        }
+    }
+    if !desc.techniques.resolution_buckets {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: multi-resolution buckets (resolution_buckets) are not supported by this trainer",
+            desc.id
+        )));
+    }
+    Ok(())
 }
 
 /// The shared control-training validation floor (F-006) — the training analog of
@@ -724,6 +1969,823 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_training_techniques_floor() {
+        // sc-24826 (epic 2123 E3/E5): weight noising is refused unless the descriptor declares it,
+        // refused with a full fine-tune, and malformed sigmas are refused outright.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut noisy_desc = trainer_desc_with(false, true);
+        noisy_desc.techniques.weight_noise = true;
+
+        // Off (the default) ⇒ no-op everywhere.
+        let off = train_req(None, items);
+        assert_eq!(off.config.weight_noise_sigma, 0.0);
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+        assert!(validate_training_techniques(&noisy_desc, &off).is_ok());
+
+        // On ⇒ typed Unsupported on a trainer that does not declare it; accepted where declared.
+        let mut on = off.clone();
+        on.config.weight_noise_sigma = 0.0125;
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("weight noising")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&noisy_desc, &on).is_ok());
+
+        // On + full fine-tune ⇒ refused even where weight noise is declared (E5).
+        let mut full = on.clone();
+        full.config.full_finetune = true;
+        let err = validate_training_techniques(&noisy_desc, &full).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("full base fine-tune")),
+            "{err:?}"
+        );
+
+        // Malformed ⇒ Msg, regardless of support.
+        for bad in [-0.01f32, f32::NAN, f32::INFINITY] {
+            let mut r = off.clone();
+            r.config.weight_noise_sigma = bad;
+            let err = validate_training_techniques(&noisy_desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn validate_training_techniques_gates_gradient_noise() {
+        // sc-24827 (epic 2123 E3/E5): gradient noise is refused unless declared, refused with a
+        // full fine-tune, and malformed eta/gamma are refused outright. Independent of weight noise.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut wn_only = trainer_desc_with(false, true);
+        wn_only.techniques.weight_noise = true;
+        let mut both = trainer_desc_with(false, true);
+        both.techniques = TrainingTechniques::ADAPTER_NOISE;
+
+        let off = train_req(None, items);
+        assert_eq!(off.config.gradient_noise_eta, 0.0, "off by default (E1)");
+        assert_eq!(
+            off.config.gradient_noise_gamma,
+            DEFAULT_GRADIENT_NOISE_GAMMA
+        );
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.gradient_noise_eta = 0.01;
+        for desc in [&plain, &wn_only] {
+            let err = validate_training_techniques(desc, &on).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m) if m.contains("gradient noise")),
+                "{err:?}"
+            );
+        }
+        assert!(validate_training_techniques(&both, &on).is_ok());
+
+        let mut full = on.clone();
+        full.config.full_finetune = true;
+        let err = validate_training_techniques(&both, &full).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("full base fine-tune")),
+            "{err:?}"
+        );
+
+        for bad in [-0.01f32, f32::NAN, f32::INFINITY] {
+            let mut r = off.clone();
+            r.config.gradient_noise_eta = bad;
+            let err = validate_training_techniques(&both, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("gradient_noise_eta")));
+            let mut r = off.clone();
+            r.config.gradient_noise_gamma = bad;
+            let err = validate_training_techniques(&both, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("gradient_noise_gamma")));
+        }
+    }
+
+    #[test]
+    fn gradient_noise_std_anneals_per_the_neelakantan_formula() {
+        // sc-24827: σ_t = η / (1 + t)^γ, t the 0-based optimizer update.
+        assert_eq!(gradient_noise_std(0.0, 0.55, 0), 0.0, "eta 0 is off");
+        assert_eq!(gradient_noise_std(0.01, 0.55, 0), 0.01, "σ_0 = η");
+        for t in [1u32, 9, 99, 999] {
+            let want = 0.01 / (1.0 + t as f64).powf(0.55);
+            let got = gradient_noise_std(0.01, 0.55, t) as f64;
+            assert!((got - want).abs() <= want * 1e-6, "t={t}: {got} vs {want}");
+            assert!(
+                got < gradient_noise_std(0.01, 0.55, t - 1) as f64,
+                "shrinks with t"
+            );
+        }
+        // γ = 0 is constant noise.
+        assert_eq!(gradient_noise_std(0.02, 0.0, 500), 0.02);
+    }
+
+    #[test]
+    fn technique_noise_keys_separate_streams_updates_and_tensors() {
+        let k = |salt, u, i| technique_noise_key(7, salt, u, i);
+        assert_eq!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 3, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(GRADIENT_NOISE_SALT, 3, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 4, 2));
+        assert_ne!(k(WEIGHT_NOISE_SALT, 3, 2), k(WEIGHT_NOISE_SALT, 3, 1));
+        assert_ne!(
+            technique_noise_key(7, WEIGHT_NOISE_SALT, 0, 0),
+            technique_noise_key(8, WEIGHT_NOISE_SALT, 0, 0)
+        );
+    }
+
+    fn rb(resolution: u32, repeats: u32) -> ResolutionBucket {
+        ResolutionBucket {
+            resolution,
+            repeats,
+        }
+    }
+
+    #[test]
+    fn validate_resolution_buckets_floor() {
+        // sc-2127 (epic 2123 E3): buckets are refused unless declared; malformed lists are refused
+        // regardless of support; an empty list is off everywhere.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut bucketed = trainer_desc(false);
+        bucketed.techniques.resolution_buckets = true;
+
+        let off = train_req(None, items);
+        assert!(off.config.resolution_buckets.is_empty());
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.resolution_buckets = vec![rb(512, 16), rb(768, 4), rb(1024, 1)];
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("resolution_buckets")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&bucketed, &on).is_ok());
+
+        let too_many: Vec<_> = (1..=MAX_RESOLUTION_BUCKETS as u32 + 1)
+            .map(|i| rb(256 * i, 1))
+            .collect();
+        for bad in [
+            vec![rb(512, 0)],
+            vec![rb(0, 1)],
+            vec![rb(512, 1), rb(512, 2)],
+            // 520 floors to the 512 edge: it would cache 512 twice and double its weight.
+            vec![rb(512, 1), rb(520, 1)],
+            vec![rb(520, 1)],
+            too_many,
+        ] {
+            let mut r = off.clone();
+            r.config.resolution_buckets = bad.clone();
+            let err = validate_training_techniques(&bucketed, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad:?}: {err:?}");
+        }
+        // The cap itself is accepted.
+        let mut at_cap = off.clone();
+        at_cap.config.resolution_buckets = (1..=MAX_RESOLUTION_BUCKETS as u32)
+            .map(|i| rb(256 * i, 1))
+            .collect();
+        assert!(validate_training_techniques(&bucketed, &at_cap).is_ok());
+    }
+
+    #[test]
+    fn training_buckets_default_to_the_legacy_resolution() {
+        let mut cfg = TrainingConfig {
+            resolution: 768,
+            ..TrainingConfig::default()
+        };
+        assert_eq!(cfg.training_buckets(), vec![rb(768, 1)]);
+        assert_eq!(cfg.max_training_resolution(), 768);
+        cfg.resolution_buckets = vec![rb(512, 16), rb(1024, 1), rb(768, 4)];
+        assert_eq!(cfg.training_buckets(), cfg.resolution_buckets);
+        assert_eq!(cfg.max_training_resolution(), 1024);
+    }
+
+    #[test]
+    fn single_bucket_schedule_is_the_legacy_round_robin() {
+        // AC: a single bucket equal to today's resolution gives today's sample order — the exact
+        // `cache[(step - 1) % cache.len()]` walk — whatever its repeat count.
+        for repeats in [1, 3] {
+            let s = BucketSchedule::new(5, &[rb(1024, repeats)], 42);
+            assert_eq!(s.n_buckets(), 1);
+            for k in 0..37 {
+                assert_eq!(s.cache_index(k), k % 5, "repeats {repeats} k {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_bucket_schedule_mixes_16_4_1_per_image() {
+        // AC: buckets 512/768/1024 with repeats 16/4/1 ⇒ each image is sampled 16:4:1 across the
+        // three buckets every epoch.
+        let buckets = [rb(512, 16), rb(768, 4), rb(1024, 1)];
+        let n_items = 3;
+        let s = BucketSchedule::new(n_items, &buckets, 7);
+        assert_eq!(s.epoch_len(), n_items * 21);
+        for epoch in 0..3 {
+            let mut counts = vec![[0usize; 3]; n_items];
+            for k in epoch * s.epoch_len()..(epoch + 1) * s.epoch_len() {
+                let (item, bucket) = s.sample(k);
+                counts[item][bucket] += 1;
+                assert_eq!(s.cache_index(k), item * 3 + bucket);
+            }
+            for (item, c) in counts.iter().enumerate() {
+                assert_eq!(*c, [16, 4, 1], "epoch {epoch} item {item}");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_bucket_schedule_is_seeded_and_reshuffled_per_epoch() {
+        // E4: the order is a pure function of the job seed; a different seed reorders; each epoch
+        // gets its own permutation.
+        let buckets = [rb(512, 2), rb(1024, 1)];
+        let order = |seed: u64, range: std::ops::Range<usize>| {
+            let s = BucketSchedule::new(4, &buckets, seed);
+            range.map(|k| s.sample(k)).collect::<Vec<_>>()
+        };
+        assert_eq!(order(11, 0..24), order(11, 0..24));
+        // The memoized epoch never leaks across epochs: random access matches a sequential walk.
+        let s = BucketSchedule::new(4, &buckets, 11);
+        let mut backwards: Vec<_> = (0..24).rev().map(|k| s.sample(k)).collect();
+        backwards.reverse();
+        assert_eq!(backwards, order(11, 0..24));
+        assert_ne!(order(11, 0..12), order(12, 0..12));
+        assert_ne!(order(11, 0..12), order(11, 12..24));
+        // Not the unshuffled multiset order.
+        let unshuffled: Vec<_> = (0..2)
+            .flat_map(|b| (0..4).flat_map(move |i| std::iter::repeat_n((i, b), [2, 1][b])))
+            .collect();
+        assert_ne!(order(11, 0..12), unshuffled);
+    }
+
+    /// Epic 2123 E3 (feature-end review): the shared floor refuses EVERY auxiliary loss combined
+    /// with a full base fine-tune — even on a trainer that declares the loss and supports full
+    /// fine-tunes (the aux losses train the adapter surface only) — and a trainer that builds its
+    /// own x0 decoder (`builtin_x0_decoder`) is never asked for `perceptual_decoder_dir`.
+    /// Mutations: drop the full-fine-tune + aux check ⇒ the full request passes ⇒ red; drop an arm
+    /// from `enabled_aux_losses` ⇒ red; ignore `builtin_x0_decoder` in `lacks_x0_decoder` ⇒ red.
+    #[test]
+    fn aux_losses_refuse_full_finetune_and_a_builtin_decoder_needs_no_dir() {
+        let items = vec![TrainingItem::captioned(PathBuf::from("a.png"), "a".into())];
+        let mut desc = trainer_desc_with(false, true);
+        desc.techniques = TrainingTechniques {
+            depth_anchoring: true,
+            identity_loss: true,
+            face_landmark_loss: true,
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
+            ..TrainingTechniques::NONE
+        };
+        let dir = |p: &str| Some(PathBuf::from(p));
+        type Enable = fn(&mut TrainingConfig);
+        let arms: [(&str, Enable); 8] = [
+            ("depth", |c| {
+                c.depth_anchoring.schedule.weight = 0.1;
+                c.depth_anchoring.model_dir = Some(PathBuf::from("/m/da2"));
+            }),
+            ("identity", |c| {
+                c.identity_loss.schedule.weight = 0.1;
+                c.face_analysis_dir = Some(PathBuf::from("/m/face"));
+            }),
+            ("face-landmark", |c| {
+                c.face_landmark_loss.schedule.weight = 0.1;
+                c.face_landmark_loss.model_dir = Some(PathBuf::from("/m/mesh"));
+                c.face_analysis_dir = Some(PathBuf::from("/m/face"));
+            }),
+            ("body-proportion", |c| {
+                c.body_losses.proportion.weight = 0.1;
+                c.body_losses.pose_model_dir = Some(PathBuf::from("/m/vitpose"));
+            }),
+            ("body-shape", |c| {
+                c.body_losses.shape.weight = 0.1;
+                c.body_losses.pose_model_dir = Some(PathBuf::from("/m/vitpose"));
+                c.body_losses.shape_model_dir = Some(PathBuf::from("/m/hybrik"));
+            }),
+            ("normal", |c| {
+                c.body_losses.normal.weight = 0.1;
+                c.body_losses.pose_model_dir = Some(PathBuf::from("/m/vitpose"));
+                c.body_losses.normal_model_dir = Some(PathBuf::from("/m/sapiens"));
+            }),
+            ("vae_anchor", |c| {
+                c.vae_anchor.schedule.weight = 0.5;
+                c.vae_anchor.model_dir = Some(PathBuf::from("/m/flux2-vae"));
+            }),
+            ("latent_lpips", |c| {
+                c.latent_lpips.schedule.weight = 0.5;
+                c.latent_lpips.model_dir = Some(PathBuf::from("/m/elpips"));
+            }),
+        ];
+        assert!(enabled_aux_losses(&TrainingConfig::default()).is_empty());
+        for (name, enable) in arms {
+            let mut on = train_req(None, items.clone());
+            enable(&mut on.config);
+            on.config.perceptual_decoder_dir = dir("/m/taef1");
+            assert_eq!(enabled_aux_losses(&on.config), vec![name]);
+            validate_training_techniques(&desc, &on).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut full = on.clone();
+            full.config.full_finetune = true;
+            let err = validate_training_techniques(&desc, &full).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m)
+                    if m.contains("full base fine-tune") && m.contains(name)),
+                "{name}: {err:?}"
+            );
+            // The decoded-x0 losses need the decoder dir — unless the trainer builds its own.
+            let mut no_dec = on.clone();
+            no_dec.config.perceptual_decoder_dir = None;
+            if name != "latent_lpips" {
+                let err = validate_training_techniques(&desc, &no_dec).unwrap_err();
+                assert!(
+                    matches!(err, crate::Error::Msg(ref m) if m.contains("perceptual_decoder_dir")),
+                    "{name}: {err:?}"
+                );
+            }
+            let mut builtin = desc;
+            builtin.techniques.builtin_x0_decoder = true;
+            validate_training_techniques(&builtin, &no_dec)
+                .unwrap_or_else(|e| panic!("{name} (builtin decoder): {e}"));
+        }
+    }
+
+    /// sc-24832 (epic 2123 E3): each body loss is refused unless its own flag is declared, needs
+    /// ViTPose (every loss's person detector), its own checkpoint and the x0 decoder, and the
+    /// subject-restricted normal loss needs every item's mask. Mutations: check
+    /// `body_proportion_loss` for the shape loss ⇒ the shape-only descriptor passes ⇒ red; drop the
+    /// `pose_model_dir` requirement ⇒ red.
+    #[test]
+    fn validate_training_techniques_body_loss_floor() {
+        let items = vec![TrainingItem::captioned(PathBuf::from("a.png"), "a".into())];
+        let off = train_req(None, items);
+        assert!(!off.config.body_losses.any_enabled());
+        assert!(validate_training_techniques(&trainer_desc(false), &off).is_ok());
+        let full = |r: &mut TrainingRequest| {
+            r.config.body_losses.pose_model_dir = Some(PathBuf::from("/m/vitpose"));
+            r.config.body_losses.shape_model_dir = Some(PathBuf::from("/m/hybrik"));
+            r.config.body_losses.normal_model_dir = Some(PathBuf::from("/m/sapiens"));
+            r.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
+        };
+        type Pick = fn(&mut TrainingRequest);
+        type Flag = fn(&mut TrainingTechniques);
+        let cases: [(&str, Pick, Flag); 3] = [
+            (
+                "proportion",
+                |r| r.config.body_losses.proportion.weight = 0.1,
+                |t| t.body_proportion_loss = true,
+            ),
+            (
+                "shape",
+                |r| r.config.body_losses.shape.weight = 0.1,
+                |t| t.body_shape_loss = true,
+            ),
+            (
+                "normal",
+                |r| r.config.body_losses.normal.weight = 0.1,
+                |t| t.normal_loss = true,
+            ),
+        ];
+        for (name, enable, declare) in cases {
+            let mut on = off.clone();
+            enable(&mut on);
+            full(&mut on);
+            // Declaring every OTHER body flag is not enough.
+            let mut others = trainer_desc(false);
+            for (n2, _, d2) in cases {
+                if n2 != name {
+                    d2(&mut others.techniques);
+                }
+            }
+            let err = validate_training_techniques(&others, &on).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m) if m.contains(name)),
+                "{name}: {err:?}"
+            );
+            let mut desc = trainer_desc(false);
+            declare(&mut desc.techniques);
+            validate_training_techniques(&desc, &on).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut no_pose = on.clone();
+            no_pose.config.body_losses.pose_model_dir = None;
+            let err = validate_training_techniques(&desc, &no_pose).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Msg(ref m) if m.contains("ViTPose")),
+                "{err:?}"
+            );
+            let mut no_dec = on.clone();
+            no_dec.config.perceptual_decoder_dir = None;
+            let err = validate_training_techniques(&desc, &no_dec).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")),
+                "{err:?}"
+            );
+        }
+        let mut shape = off.clone();
+        shape.config.body_losses.shape.weight = 0.1;
+        full(&mut shape);
+        shape.config.body_losses.shape_model_dir = None;
+        let mut d = trainer_desc(false);
+        d.techniques.body_shape_loss = true;
+        let err = validate_training_techniques(&d, &shape).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Msg(ref m) if m.contains("HybrIK")),
+            "{err:?}"
+        );
+        let mut normal = off.clone();
+        normal.config.body_losses.normal.weight = 0.1;
+        full(&mut normal);
+        let mut d = trainer_desc(false);
+        d.techniques.normal_loss = true;
+        assert!(validate_training_techniques(&d, &normal).is_ok());
+        // Subject-restricted normals need every item's mask (named when missing). Mutation: drop
+        // the `lacking` refusal ⇒ the unmasked request passes ⇒ red.
+        let mut restricted = normal.clone();
+        restricted.config.body_losses.normal_restrict_to_subject = true;
+        let err = validate_training_techniques(&d, &restricted).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Msg(ref m) if m.contains("subject mask") && m.contains("a.png")),
+            "{err:?}"
+        );
+        restricted.items[0].subject_mask_path = Some(PathBuf::from("a.mask.png"));
+        assert!(validate_training_techniques(&d, &restricted).is_ok());
+        normal.config.body_losses.normal_model_dir = None;
+        let err = validate_training_techniques(&d, &normal).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Msg(ref m) if m.contains("Sapiens")),
+            "{err:?}"
+        );
+        // A malformed knob is a Msg regardless of support.
+        let mut bad = off.clone();
+        bad.config.body_losses.shape_min_cos = f32::NAN;
+        let err = validate_training_techniques(&trainer_desc(false), &bad).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Msg(ref m) if m.contains("shape_min_cos")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_training_techniques_depth_anchoring_floor() {
+        // sc-2125 (epic 2123 E3): depth anchoring is refused unless the descriptor declares it,
+        // needs both aux models named, and a malformed schedule is refused outright.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut depth_desc = trainer_desc(false);
+        depth_desc.techniques.depth_anchoring = true;
+
+        // Off (the default) ⇒ no-op everywhere.
+        let off = train_req(None, items);
+        assert_eq!(off.config.depth_anchoring.schedule, AuxLossSchedule::OFF);
+        assert!(!off.config.depth_anchoring.schedule.is_enabled());
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.depth_anchoring.schedule.weight = 0.1;
+        on.config.depth_anchoring.model_dir = Some(PathBuf::from("/m/da2"));
+        on.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("depth anchoring")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&depth_desc, &on).is_ok());
+
+        // Missing aux models ⇒ a message naming the missing model.
+        let mut no_da2 = on.clone();
+        no_da2.config.depth_anchoring.model_dir = None;
+        let err = validate_training_techniques(&depth_desc, &no_da2).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("Depth-Anything-V2")));
+        let mut no_dec = on.clone();
+        no_dec.config.perceptual_decoder_dir = None;
+        let err = validate_training_techniques(&depth_desc, &no_dec).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")));
+
+        // Malformed schedules ⇒ Msg, regardless of support.
+        let bad = [
+            AuxLossSchedule {
+                weight: -0.1,
+                ..AuxLossSchedule::OFF
+            },
+            AuxLossSchedule {
+                weight: f32::NAN,
+                ..AuxLossSchedule::OFF
+            },
+            AuxLossSchedule {
+                t_min: 0.6,
+                t_max: 0.4,
+                ..AuxLossSchedule::OFF
+            },
+            AuxLossSchedule {
+                t_max: 1.5,
+                ..AuxLossSchedule::OFF
+            },
+            AuxLossSchedule {
+                every_n: 0,
+                ..AuxLossSchedule::OFF
+            },
+        ];
+        for schedule in bad {
+            let mut r = on.clone();
+            r.config.depth_anchoring.schedule = AuxLossSchedule {
+                weight: if schedule.weight == 0.0 {
+                    0.1
+                } else {
+                    schedule.weight
+                },
+                ..schedule
+            };
+            let err = validate_training_techniques(&depth_desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{schedule:?}: {err:?}");
+        }
+    }
+
+    /// sc-24831 (epic 2123 E3): the identity / face-landmark losses are refused unless declared,
+    /// need their models named, and malformed schedules / min_cos are refused outright.
+    /// Mutations: skip `validate_face_losses` ⇒ the Unsupported/Msg asserts go red; drop the
+    /// `min_cos` range check ⇒ the bad-gate loop goes red.
+    #[test]
+    fn validate_training_techniques_face_loss_floor() {
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let mut face_desc = trainer_desc(false);
+        face_desc.techniques.identity_loss = true;
+        face_desc.techniques.face_landmark_loss = true;
+
+        let off = train_req(None, items);
+        assert_eq!(off.config.identity_loss.schedule, AuxLossSchedule::OFF);
+        assert_eq!(off.config.face_landmark_loss.schedule, AuxLossSchedule::OFF);
+        assert_eq!(off.config.identity_loss.min_cos, 0.2);
+        assert_eq!(
+            off.config.identity_loss.reference_mode,
+            IdentityReferenceMode::DatasetAverage
+        );
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        let mut on = off.clone();
+        on.config.identity_loss.schedule.weight = 0.1;
+        on.config.face_landmark_loss.schedule.weight = 0.05;
+        on.config.face_landmark_loss.model_dir = Some(PathBuf::from("/m/facemesh"));
+        on.config.face_analysis_dir = Some(PathBuf::from("/m/face"));
+        on.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
+        assert!(validate_training_techniques(&face_desc, &on).is_ok());
+        for (identity, name) in [(true, "identity loss"), (false, "face-landmark loss")] {
+            let mut d = face_desc;
+            if identity {
+                d.techniques.identity_loss = false;
+            } else {
+                d.techniques.face_landmark_loss = false;
+            }
+            let err = validate_training_techniques(&d, &on).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported(ref m) if m.contains(name)),
+                "{name}: {err:?}"
+            );
+        }
+
+        let mut no_face = on.clone();
+        no_face.config.face_analysis_dir = None;
+        let err = validate_training_techniques(&face_desc, &no_face).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("face_analysis_dir")));
+        let mut no_dec = on.clone();
+        no_dec.config.perceptual_decoder_dir = None;
+        let err = validate_training_techniques(&face_desc, &no_dec).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")));
+        let mut no_mesh = on.clone();
+        no_mesh.config.face_landmark_loss.model_dir = None;
+        let err = validate_training_techniques(&face_desc, &no_mesh).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("FaceMesh")));
+
+        for bad in [f32::NAN, -1.01, 1.5] {
+            let mut r = on.clone();
+            r.config.identity_loss.min_cos = bad;
+            let err = validate_training_techniques(&face_desc, &r).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Msg(ref m) if m.contains("min_cos")),
+                "{bad}"
+            );
+        }
+        let mut bad_sched = on.clone();
+        bad_sched.config.face_landmark_loss.schedule.every_n = 0;
+        assert!(matches!(
+            validate_training_techniques(&face_desc, &bad_sched).unwrap_err(),
+            crate::Error::Msg(_)
+        ));
+        assert_eq!(
+            IdentityReferenceMode::parse("Per_Image"),
+            Some(IdentityReferenceMode::PerImage)
+        );
+        assert_eq!(IdentityReferenceMode::parse("mean"), None);
+    }
+
+    #[test]
+    fn validate_training_techniques_latent_perceptual_floor() {
+        // sc-24833 (epic 2123 E3): the VAE anchor and E-LatentLPIPS are each refused unless the
+        // descriptor declares them, need their models named, and a malformed schedule is refused.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let plain = trainer_desc(false);
+        let off = train_req(None, items);
+        assert_eq!(off.config.vae_anchor.schedule, LATENT_PERCEPTUAL_SCHEDULE);
+        assert_eq!(off.config.latent_lpips.schedule, LATENT_PERCEPTUAL_SCHEDULE);
+        assert!(!off.config.vae_anchor.schedule.is_enabled());
+        assert!(!off.config.latent_lpips.schedule.is_enabled());
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+
+        // VAE anchor.
+        let mut va_desc = trainer_desc(false);
+        va_desc.techniques.vae_anchor_loss = true;
+        let mut va = off.clone();
+        va.config.vae_anchor.schedule.weight = 0.5;
+        va.config.vae_anchor.model_dir = Some(PathBuf::from("/m/flux2-vae"));
+        va.config.perceptual_decoder_dir = Some(PathBuf::from("/m/taef1"));
+        let err = validate_training_techniques(&plain, &va).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("VAE anchor")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&va_desc, &va).is_ok());
+        let mut no_vae = va.clone();
+        no_vae.config.vae_anchor.model_dir = None;
+        let err = validate_training_techniques(&va_desc, &no_vae).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("FLUX.2 VAE")));
+        let mut no_dec = va.clone();
+        no_dec.config.perceptual_decoder_dir = None;
+        let err = validate_training_techniques(&va_desc, &no_dec).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("decoder")));
+        // The VAE-anchor flag does not license E-LatentLPIPS.
+        let mut lp = off.clone();
+        lp.config.latent_lpips.schedule.weight = 0.5;
+        lp.config.latent_lpips.model_dir = Some(PathBuf::from("/m/elatentlpips"));
+        let err = validate_training_techniques(&va_desc, &lp).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("E-LatentLPIPS")),
+            "{err:?}"
+        );
+
+        // E-LatentLPIPS (no decoder needed: it runs on the latent).
+        let mut lp_desc = trainer_desc(false);
+        lp_desc.techniques.latent_lpips_loss = true;
+        assert!(validate_training_techniques(&lp_desc, &lp).is_ok());
+        let mut no_w = lp.clone();
+        no_w.config.latent_lpips.model_dir = None;
+        let err = validate_training_techniques(&lp_desc, &no_w).unwrap_err();
+        assert!(matches!(err, crate::Error::Msg(ref m) if m.contains("weights")));
+        assert!(validate_training_techniques(&lp_desc, &va).is_err());
+
+        // Malformed schedules ⇒ Msg even on a declaring trainer.
+        for bad in [
+            AuxLossSchedule {
+                weight: -1.0,
+                ..LATENT_PERCEPTUAL_SCHEDULE
+            },
+            AuxLossSchedule {
+                weight: 0.5,
+                t_min: 0.6,
+                t_max: 0.4,
+                every_n: 1,
+            },
+            AuxLossSchedule {
+                weight: 0.5,
+                every_n: 0,
+                ..LATENT_PERCEPTUAL_SCHEDULE
+            },
+        ] {
+            let mut r = lp.clone();
+            r.config.latent_lpips.schedule = bad;
+            let err = validate_training_techniques(&lp_desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad:?}: {err:?}");
+            let mut r = va.clone();
+            r.config.vae_anchor.schedule = bad;
+            let err = validate_training_techniques(&va_desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bad:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn latent_lpips_family_table() {
+        use LatentLpipsFamily::*;
+        let rows: Vec<_> = [Sd15, Sd21, Sdxl, Sd3, Flux]
+            .iter()
+            .map(|f| (f.as_str(), f.latent_channels(), f.checkpoint_file()))
+            .collect();
+        assert_eq!(
+            rows[2],
+            (
+                "sdxl",
+                4,
+                "elatentlpips_ckpt/sdxl_latest_vgg16_tuned.pth".into()
+            )
+        );
+        assert_eq!(rows[3].1, 16);
+        assert_eq!(
+            rows[4],
+            (
+                "flux",
+                16,
+                "elatentlpips_ckpt/flux_latest_vgg16_tuned.pth".into()
+            )
+        );
+    }
+
+    #[test]
+    fn aux_loss_schedule_window_is_inclusive() {
+        let s = AuxLossSchedule {
+            weight: 1.0,
+            t_min: 0.2,
+            t_max: 0.8,
+            every_n: 2,
+        };
+        assert!(s.in_window(0.2) && s.in_window(0.8) && s.in_window(0.5));
+        assert!(!s.in_window(0.19) && !s.in_window(0.81));
+    }
+
+    #[test]
+    fn depth_model_size_round_trips() {
+        for size in [
+            DepthModelSize::Small,
+            DepthModelSize::Base,
+            DepthModelSize::Large,
+        ] {
+            assert_eq!(DepthModelSize::parse(size.as_str()), Some(size));
+        }
+        assert_eq!(
+            DepthModelSize::parse(" LARGE "),
+            Some(DepthModelSize::Large)
+        );
+        assert_eq!(DepthModelSize::parse("giant"), None);
+        assert_eq!(DepthModelSize::default(), DepthModelSize::Small);
+    }
+
+    #[test]
+    fn validate_training_techniques_subject_mask_loss_floor() {
+        // sc-24828 (epic 2123 E3): masked loss is refused unless declared, with malformed weights,
+        // and when any item lacks a mask (naming it); off is a no-op everywhere.
+        let mut masked = TrainingItem::captioned(PathBuf::from("a.png"), "a cat".into());
+        masked.subject_mask_path = Some(PathBuf::from("masks/a.png"));
+        let bare = TrainingItem::captioned(PathBuf::from("b.png"), "a dog".into());
+        let plain = trainer_desc(false);
+        let mut desc = trainer_desc(false);
+        desc.techniques.subject_mask_loss = true;
+
+        let off = train_req(None, vec![masked.clone(), bare.clone()]);
+        assert_eq!(off.config.subject_mask_loss, None);
+        assert!(validate_training_techniques(&plain, &off).is_ok());
+        assert!(validate_training_techniques(&desc, &off).is_ok());
+
+        let mut on = train_req(None, vec![masked.clone()]);
+        on.config.subject_mask_loss = Some(SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        });
+        let err = validate_training_techniques(&plain, &on).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("subject-masked loss")),
+            "{err:?}"
+        );
+        assert!(validate_training_techniques(&desc, &on).is_ok());
+
+        let mut missing = on.clone();
+        missing.items.push(bare);
+        let err = validate_training_techniques(&desc, &missing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 of 2 have none: b.png"), "{err}");
+
+        for (bg, subj) in [
+            (-0.1, 1.0),
+            (1.1, 1.0),
+            (f32::NAN, 1.0),
+            (0.0, 0.0),
+            (0.0, 1.5),
+            (0.0, f32::INFINITY),
+        ] {
+            let mut r = on.clone();
+            r.config.subject_mask_loss = Some(SubjectMaskLoss {
+                background_weight: bg,
+                subject_weight: subj,
+            });
+            let err = validate_training_techniques(&desc, &r).unwrap_err();
+            assert!(matches!(err, crate::Error::Msg(_)), "{bg}/{subj}: {err:?}");
+        }
+    }
+
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {
         trainer_desc_with(supports_control, false)
     }
@@ -742,6 +2804,7 @@ mod tests {
             supports_control,
             supports_full_finetune,
             max_reference_images: 0,
+            techniques: TrainingTechniques::NONE,
         }
     }
 

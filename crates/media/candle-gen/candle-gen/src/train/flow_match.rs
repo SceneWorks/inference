@@ -47,17 +47,19 @@ use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::gen_core::train::{
-    NetworkType, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    NetworkType, ResolutionBucket, TrainingConfig, TrainingOutput, TrainingProgress,
+    TrainingRequest,
 };
-use crate::gen_core::Image;
+use crate::gen_core::{BucketSchedule, Image};
 use crate::train::checkpoint::{
     checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
 };
 use crate::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
-    LoraSet,
+    adapter_optimizer_step, build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft,
+    AdapterKind, LoraHost, LoraSet,
 };
-use crate::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use crate::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
+use crate::train::perceptual::{combine_step_loss, AuxAlternation, PerceptualPath, StepPlan};
 use crate::train::schedule::{lr_multiplier, schedule_updates};
 use crate::{CandleError, Result};
 
@@ -197,6 +199,117 @@ pub fn velocity_loss(v: &Tensor, target: &Tensor, mae: bool) -> candle_core::Res
     }
 }
 
+/// [`velocity_loss`] with optional **subject-mask loss weighting** (epic 2123, sc-24828): with
+/// `weight = None` it IS [`velocity_loss`] (bit-identical); with a weight map `w` (broadcastable to
+/// `v`, built at cache time by [`subject_mask_weight`]) the per-element loss is multiplied by `w`
+/// **before** the mean — `mean(w ⊙ ℓ)`, the convention of
+/// [`gen_core::train::subject_mask`] shared with the MLX
+/// trainers — so an element with `w = 0` contributes zero loss and zero gradient. The same weighting
+/// serves an ε-prediction loss (the "velocity" is then the predicted noise and `target` the noise).
+pub fn weighted_velocity_loss(
+    v: &Tensor,
+    target: &Tensor,
+    weight: Option<&Tensor>,
+    mae: bool,
+) -> candle_core::Result<Tensor> {
+    let Some(weight) = weight else {
+        return velocity_loss(v, target, mae);
+    };
+    let diff = (v.to_dtype(DType::F32)? - target)?;
+    let per = if mae { diff.abs()? } else { diff.sqr()? };
+    per.broadcast_mul(weight)?.mean_all()
+}
+
+/// Turn a row-major `[grid_h, grid_w]` latent weight map (from
+/// [`subject_mask_latent_weights`](crate::gen_core::train::subject_mask::subject_mask_latent_weights))
+/// into an f32 tensor on `device` broadcast to `latent_shape`, whose **last two axes** are the latent
+/// `(H, W)` grid — the shape of the cached clean latent, so a trainer that packs its latent into
+/// tokens packs this tensor with the very same function.
+pub fn subject_mask_weight(
+    weights: &[f32],
+    grid_h: usize,
+    grid_w: usize,
+    latent_shape: &[usize],
+    device: &Device,
+) -> Result<Tensor> {
+    let n = latent_shape.len();
+    if n < 2
+        || latent_shape[n - 2] != grid_h
+        || latent_shape[n - 1] != grid_w
+        || weights.len() != grid_h * grid_w
+    {
+        return Err(CandleError::Msg(format!(
+            "subject mask weight map {grid_h}x{grid_w} ({} values) does not match latent shape \
+             {latent_shape:?}",
+            weights.len()
+        )));
+    }
+    let mut lead = vec![1usize; n - 2];
+    lead.extend([grid_h, grid_w]);
+    let w = Tensor::from_vec(weights.to_vec(), lead, &Device::Cpu)?;
+    Ok(w.broadcast_as(latent_shape)?
+        .contiguous()?
+        .to_device(device)?)
+}
+
+/// The cache-time entry point every candle trainer calls once per item (sc-24828): `None` when
+/// subject-masked loss is off (no file is read), else the item's latent weight map — its mask
+/// cropped with `crop_of(image_w, image_h)` (the trainer's own crop rule, e.g.
+/// [`CropBox::center_square`](crate::gen_core::train::subject_mask::CropBox::center_square)),
+/// area-averaged onto the last two axes of `latent_shape` and broadcast to `latent_shape` on
+/// `device` (see [`subject_mask_weight`]). Refusals (missing / mis-sized / empty mask) name the
+/// image.
+pub fn item_subject_mask_weight(
+    label: &str,
+    item: &crate::gen_core::TrainingItem,
+    cfg: Option<&crate::gen_core::SubjectMaskLoss>,
+    crop_of: impl FnOnce(u32, u32) -> crate::gen_core::train::subject_mask::CropBox,
+    latent_shape: &[usize],
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    let n = latent_shape.len();
+    if n < 2 {
+        return Err(CandleError::Msg(format!(
+            "{label}: subject mask needs a latent with a spatial grid, got shape {latent_shape:?}"
+        )));
+    }
+    let (grid_h, grid_w) = (latent_shape[n - 2], latent_shape[n - 1]);
+    let weights = crate::gen_core::train::subject_mask::subject_mask_latent_weights(
+        label, item, cfg, crop_of, grid_w, grid_h,
+    )?;
+    subject_mask_weight(&weights, grid_h, grid_w, latent_shape, device).map(Some)
+}
+
+/// Per-bucket entry point (sc-24828 × sc-2127): the weight map of one cached latent from an item's
+/// already-loaded [`PreparedSubjectMask`](crate::gen_core::train::subject_mask::PreparedSubjectMask)
+/// — load it once per item with
+/// [`PreparedSubjectMask::load_if_enabled`](crate::gen_core::train::subject_mask::PreparedSubjectMask::load_if_enabled),
+/// then call this once per resolution bucket with that bucket's crop rule and clean-latent shape
+/// (last two axes = the latent grid). `None` in, `None` out.
+pub fn prepared_subject_mask_weight(
+    label: &str,
+    mask: Option<&crate::gen_core::train::subject_mask::PreparedSubjectMask>,
+    crop_of: impl FnOnce(u32, u32) -> crate::gen_core::train::subject_mask::CropBox,
+    latent_shape: &[usize],
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    let Some(mask) = mask else {
+        return Ok(None);
+    };
+    let n = latent_shape.len();
+    if n < 2 {
+        return Err(CandleError::Msg(format!(
+            "{label}: subject mask needs a latent with a spatial grid, got shape {latent_shape:?}"
+        )));
+    }
+    let (grid_h, grid_w) = (latent_shape[n - 2], latent_shape[n - 1]);
+    let weights = mask.latent_weights(label, crop_of, grid_w, grid_h)?;
+    subject_mask_weight(&weights, grid_h, grid_w, latent_shape, device).map(Some)
+}
+
 /// Deterministic `N(0, 1)` noise of the given shape, drawn from a seeded CPU `StdRng` then moved to
 /// `device` (sc-3673 launch-portable discipline). The flow-match prior + the regression target.
 pub fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
@@ -333,8 +446,9 @@ pub fn install_adapters(
     }
 }
 
-/// Fire one optimizer update: LR-schedule, average the accumulated grads by `1/micro_count`, grad-norm
-/// clip, step. `micro_count` is the ACTUAL number of micro-grads accumulated into this window — for a
+/// Fire one optimizer update: LR-schedule, average the accumulated grads by `1/micro_count`, then the
+/// shared [`adapter_optimizer_step`] — grad-norm clip, epic 2123 gradient noise, step, weight noise
+/// (sc-24827), seeded by `noise_seed` (the job seed; Wan passes its per-expert seed). `micro_count` is the ACTUAL number of micro-grads accumulated into this window — for a
 /// full window that equals `gradient_accumulation`, but for the final partial flush (when
 /// `steps % accum != 0`, or a mid-window cancel) it is the sub-`accum` remainder, so the tail update is
 /// a true mean of the `k` grads it holds rather than a `k/accum`-scaled underweighted step (F-034,
@@ -350,6 +464,7 @@ pub fn apply_update(
     update_idx: u32,
     total_updates: u32,
     warmup_updates: u32,
+    noise_seed: u64,
 ) -> Result<()> {
     assert!(
         micro_count > 0,
@@ -361,9 +476,7 @@ pub fn apply_update(
         .take()
         .expect("apply_update called with a pending accumulation");
     scale_grads(&mut avg, &set.vars, 1.0 / micro_count as f64)?;
-    clip_grad_norm(&mut avg, &set.vars, 1.0)?;
-    opt.step(&avg)?;
-    Ok(())
+    adapter_optimizer_step(opt, &mut avg, set, cfg, update_idx, noise_seed)
 }
 
 /// The preview-sample plan a [`FlowMatchTrainer::cache`] builds while the text encoder (and any VAE
@@ -405,6 +518,251 @@ pub fn sample_seed(base: u64, step: u32, index: usize) -> u64 {
         .wrapping_add(index as u64)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Epic 2123 E8 — the step-level glue between a trainer loop and its `PerceptualPath`. Used by the
+// driver below AND by the trainers with their own loop (SDXL, Kolors, SD3, Qwen-Image 2.1), so
+// every Candle trainer drives the shared path the same way.
+// ---------------------------------------------------------------------------------------------
+
+/// A trainer's perceptual path plus its per-item alternation, ready for the loop: every cache
+/// entry's reference is built, and on resume the skipped prefix's alternation keys are replayed.
+pub struct AuxDriver {
+    path: PerceptualPath,
+    alternation: AuxAlternation,
+}
+
+impl AuxDriver {
+    /// Build each of the `n_entries` item-major cache entries' references from `clean(entry)` (the
+    /// entry's clean latent in the path's NCHW model-space layout, once per entry, before the loop),
+    /// key the alternation on the `schedule`'s items with `accum` micro-steps per update, and replay
+    /// micro-steps `1..=start_step` so a resumed run continues the same phase. A tripped `cancel`
+    /// stops the reference build between entries with `Canceled`.
+    pub fn prepare(
+        mut path: PerceptualPath,
+        n_entries: usize,
+        mut clean: impl FnMut(usize) -> Result<Tensor>,
+        schedule: &BucketSchedule,
+        accum: u32,
+        start_step: u32,
+        cancel: &crate::gen_core::runtime::CancelFlag,
+    ) -> Result<Self> {
+        for entry in 0..n_entries {
+            // A cancel during the (per-entry decode + frozen-model) reference build stops here,
+            // before any DiT work.
+            if cancel.is_cancelled() {
+                return Err(crate::CandleError::Canceled);
+            }
+            path.ensure_reference(entry, &clean(entry)?)?;
+        }
+        let mut alternation = AuxAlternation::new(n_entries / schedule.n_buckets().max(1), accum);
+        for step in 1..=start_step {
+            alternation.key(step, schedule.sample((step - 1) as usize).0);
+        }
+        Ok(Self { path, alternation })
+    }
+
+    /// The shared path.
+    pub fn path(&self) -> &PerceptualPath {
+        &self.path
+    }
+
+    /// Feed micro-step `step` (1-based) to the alternation and return its [`StepSample`] — call for
+    /// every micro-step, in order.
+    pub fn sample(&mut self, step: u32, schedule: &BucketSchedule) -> StepSample<'_> {
+        let k = (step - 1) as usize;
+        let (item, _) = schedule.sample(k);
+        let key = self.alternation.key(step, item);
+        StepSample {
+            item,
+            entry: schedule.cache_index(k),
+            perceptual: Some((&self.path, key)),
+        }
+    }
+}
+
+/// Micro-step `step`'s sample: its [`AuxDriver::sample`] when the trainer has a perceptual path,
+/// else the plain (item, entry) of the bucket schedule.
+pub fn step_sample<'a>(
+    aux: Option<&'a mut AuxDriver>,
+    step: u32,
+    schedule: &BucketSchedule,
+) -> StepSample<'a> {
+    match aux {
+        Some(a) => a.sample(step, schedule),
+        None => {
+            let k = (step - 1) as usize;
+            StepSample::plain(schedule.sample(k).0, schedule.cache_index(k))
+        }
+    }
+}
+
+/// What one micro-step trains on: the real dataset item (alternation key), the item-major cache
+/// entry (reference key), and — perceptual losses on — the shared path with the step's
+/// alternation key.
+#[derive(Clone, Copy)]
+pub struct StepSample<'a> {
+    /// The real dataset item index (`schedule.sample(k).0`).
+    pub item: usize,
+    /// The cache entry (`schedule.cache_index(k)`).
+    pub entry: usize,
+    perceptual: Option<(&'a PerceptualPath, u32)>,
+}
+
+impl<'a> StepSample<'a> {
+    /// A sample with no perceptual path: every step is the plain diffusion step.
+    pub fn plain(item: usize, entry: usize) -> Self {
+        Self {
+            item,
+            entry,
+            perceptual: None,
+        }
+    }
+
+    /// Plan the step at the sampled noise level `raw_t` (the trainer's `σ`/`t ∈ [0, 1]`, `1` =
+    /// pure noise). `None` without a perceptual path — the trainer then runs its legacy step.
+    pub fn plan(&self, raw_t: f32) -> Result<Option<AuxStep<'a>>> {
+        let Some((path, key)) = self.perceptual else {
+            return Ok(None);
+        };
+        Ok(Some(AuxStep {
+            path,
+            plan: path.plan(key, self.entry, raw_t)?,
+            entry: self.entry,
+        }))
+    }
+}
+
+/// One planned perceptual step: the [`StepPlan`] and the path to evaluate its aux term on.
+pub struct AuxStep<'a> {
+    path: &'a PerceptualPath,
+    /// The step's plan (aux-only steps carry the remapped noise level).
+    pub plan: StepPlan,
+    entry: usize,
+}
+
+impl AuxStep<'_> {
+    /// Whether the diffusion term contributes (`false` ⇒ aux-only step: do not compute it).
+    pub fn diffusion(&self) -> bool {
+        self.plan.diffusion
+    }
+
+    /// Whether any aux loss contributes.
+    pub fn has_aux(&self) -> bool {
+        !self.plan.aux.is_empty()
+    }
+
+    /// The noise level the step trains at, in the same `[0, 1]` convention as `raw_t`.
+    pub fn noise_level(&self) -> f32 {
+        self.plan.noise_level
+    }
+
+    /// The weighted aux term on the live x0 latent (NCHW, model space, f32), differentiable in
+    /// `x0`; `None` when the plan has no aux loss.
+    pub fn aux_loss(&self, x0: &Tensor) -> Result<Option<Tensor>> {
+        Ok(self
+            .path
+            .aux_loss(&self.plan, self.entry, x0)?
+            .map(|t| t.weighted))
+    }
+}
+
+/// `(diffusion term contributes, aux term contributes)` for an optional planned step — `(true,
+/// false)` without one (the legacy step).
+pub fn step_terms(aux: Option<&AuxStep<'_>>) -> (bool, bool) {
+    aux.map_or((true, false), |a| (a.diffusion(), a.has_aux()))
+}
+
+/// One step's loss breakdown (epic 2123 E8): the differentiated total, the diffusion term (`None`
+/// on an aux-only step — it was not computed) and the weighted aux term (`None` when none
+/// contributed).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepLosses {
+    pub total: f32,
+    pub diffusion: Option<f32>,
+    pub aux: Option<f32>,
+}
+
+/// Sum a step's terms ([`combine_step_loss`]) into the differentiated loss + its [`StepLosses`].
+pub fn combine_terms(
+    diffusion: Option<Tensor>,
+    aux: Option<Tensor>,
+) -> Result<(Tensor, StepLosses)> {
+    let scalar = |t: &Tensor| -> Result<f32> { Ok(t.to_dtype(DType::F32)?.to_scalar::<f32>()?) };
+    let d = diffusion.as_ref().map(scalar).transpose()?;
+    let a = aux.as_ref().map(scalar).transpose()?;
+    let total = combine_step_loss(diffusion, aux)?;
+    let losses = StepLosses {
+        total: scalar(&total)?,
+        diffusion: d,
+        aux: a,
+    };
+    Ok((total, losses))
+}
+
+/// The engine-wide safe fraction of a device's effective free memory a training run may plan for
+/// (15 % headroom) — the `0.85` the candle decode tilers and the Qwen-Image 2.1 preflight use.
+pub const TRAIN_SAFE_FRAC: f64 = 0.85;
+
+/// This device's training memory budget in bytes: a CUDA device's effective free memory ×
+/// [`TRAIN_SAFE_FRAC`]; `u64::MAX` (nothing to compare against) on CPU/Metal or when free memory
+/// cannot be read (logged — a candle OOM is a catchable error, not a process kill).
+pub fn device_training_budget_bytes(device: &Device, label: &str) -> u64 {
+    if !device.is_cuda() {
+        return u64::MAX;
+    }
+    match crate::gpu::rendered_effective_free_gib() {
+        Some(free) => (free * TRAIN_SAFE_FRAC * 1024.0 * 1024.0 * 1024.0) as u64,
+        None => {
+            eprintln!(
+                "{label}: could not read the device's free memory; the auxiliary-model memory \
+                 preflight cannot refuse this run"
+            );
+            u64::MAX
+        }
+    }
+}
+
+/// On-disk bytes of a snapshot component's `.safetensors` (the trained model's resident weights —
+/// the lower bound the training-time auxiliary models stack on when a trainer has no fitted
+/// activation model).
+pub fn component_bytes(root: &Path, sub: &str, label: &str) -> Result<u64> {
+    component_files(root, sub, label)?
+        .iter()
+        .map(|f| {
+            std::fs::metadata(f)
+                .map(|m| m.len())
+                .map_err(|e| CandleError::Msg(format!("{label}: stat {}: {e}", f.display())))
+        })
+        .sum()
+}
+
+/// Epic 2123 E7: refuse a run whose base estimate plus its training-time auxiliary models
+/// (`aux_bytes`, e.g. `candle_gen_perceptual::perceptual_footprint`) exceeds `budget_bytes`, with
+/// a catchable error naming both. A trainer calls this on every path (checkpointed or dense) when
+/// `aux_bytes > 0`.
+pub fn check_aux_memory(
+    label: &str,
+    base_bytes: u64,
+    aux_bytes: u64,
+    budget_bytes: u64,
+) -> Result<()> {
+    let need = base_bytes.saturating_add(aux_bytes);
+    if need <= budget_bytes {
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    Err(CandleError::Msg(format!(
+        "{label}: this run needs ~{:.1} GiB (trained model ~{:.1} GiB + perceptual auxiliary \
+         models ~{:.1} GiB), which exceeds this device's ~{:.1} GiB training budget. Refusing \
+         before training: lower the resolution, use the Small depth model, or turn off the \
+         perceptual losses.",
+        gib(need),
+        gib(base_bytes),
+        gib(aux_bytes),
+        gib(budget_bytes)
+    )))
+}
+
 /// The per-model hooks the single-model [`run_flow_match_training`] driver calls. A flow-match trainer
 /// with one DiT, one optimizer, and one adapter set (Z-Image, Lens, Krea) implements this; the driver
 /// owns the cache → loop → save scaffolding around it. (Wan's dual-expert loop does not use this — it
@@ -437,6 +795,28 @@ pub trait FlowMatchTrainer {
         Ok(())
     }
 
+    /// Epic 2123 E8: the trainer's auxiliary perceptual path (via `candle_gen_perceptual::
+    /// build_perceptual_path`), built after [`preflight`](Self::preflight) and BEFORE caching so a
+    /// missing checkpoint fails fast. `None` (the default, and whenever no aux loss is enabled)
+    /// leaves every step the plain diffusion step.
+    fn perceptual_path(
+        &self,
+        _req: &TrainingRequest,
+        _device: &Device,
+    ) -> Result<Option<PerceptualPath>> {
+        Ok(None)
+    }
+
+    /// A cache entry's clean latent in the perceptual path's NCHW model-space layout (unpacked /
+    /// un-patchified). Called once per entry, only when [`perceptual_path`](Self::perceptual_path)
+    /// returned a path.
+    fn reference_latent(&self, _cached: &Self::Cached, _aux: &Self::Aux) -> Result<Tensor> {
+        Err(CandleError::Msg(format!(
+            "{}: reference_latent not implemented",
+            Self::LABEL
+        )))
+    }
+
     /// Cache the dataset: encode each item's latent + conditioning (reporting
     /// [`TrainingProgress::Caching`]) and return the per-sample cache plus any run-derived `Aux` and a
     /// [`SamplePlan`]. Honors `req.cancel` (a cancel mid-cache yields a short/empty cache; the driver maps
@@ -461,7 +841,9 @@ pub trait FlowMatchTrainer {
 
     /// One micro-step's forward+backward: build the noised latent for `cached` at the sampled timestep,
     /// predict + regress the velocity through `dit` (the per-model sign / timestep / checkpoint
-    /// convention lives here), and return `(loss, grads)` keyed by `vars`.
+    /// convention lives here), and return `(loss, grads)` keyed by `vars`. `sample` is the step's
+    /// (item, entry) and — perceptual losses on — its [`StepSample::plan`]; a trainer without a
+    /// perceptual path gets [`StepSample::plain`] (its `plan` is `None`).
     #[allow(clippy::too_many_arguments)]
     fn micro_step(
         &self,
@@ -471,6 +853,7 @@ pub trait FlowMatchTrainer {
         aux: &Self::Aux,
         cfg: &TrainingConfig,
         step: u32,
+        sample: StepSample<'_>,
         device: &Device,
     ) -> Result<(f32, GradStore)>;
 
@@ -516,6 +899,32 @@ fn validate_resume_step(label: &str, restored: u32, requested: u32) -> Result<()
     Ok(())
 }
 
+/// The sample schedule over an **item-major** cache of `cache_len` entries
+/// (`cache[item * buckets.len() + bucket]`, buckets in
+/// [`TrainingConfig::training_buckets`] order) — sc-2127. The cache must hold a whole number of
+/// items; anything else is a typed error prefixed with `label`. For one bucket (the buckets-off
+/// default, and every trainer that does not declare
+/// [`resolution_buckets`](crate::gen_core::train::TrainingTechniques::resolution_buckets)) the
+/// schedule's `cache_index(k)` is exactly the pre-bucket round-robin `k % cache_len`.
+///
+/// [`run_flow_match_training`] walks its cache through this; trainers with their own loop call it
+/// with their cache length and `cfg.training_buckets()`.
+pub fn item_major_schedule(
+    label: &str,
+    cache_len: usize,
+    buckets: &[ResolutionBucket],
+    seed: u64,
+) -> Result<BucketSchedule> {
+    let n_buckets = buckets.len().max(1);
+    if !cache_len.is_multiple_of(n_buckets) {
+        return Err(CandleError::Msg(format!(
+            "{label}: cache holds {cache_len} entries, not a whole number of items over \
+             {n_buckets} resolution buckets"
+        )));
+    }
+    Ok(BucketSchedule::new(cache_len / n_buckets, buckets, seed))
+}
+
 /// Drive a single-model flow-match trainer end to end: cache → install adapters → train loop → save.
 ///
 /// Owns the loop scaffolding every single-model trainer shared verbatim — optimizer + LR-schedule
@@ -538,6 +947,8 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         return Err(CandleError::Canceled);
     }
     let fingerprint = request_fingerprint(req)?;
+    // Epic 2123 E8: the frozen perceptual models load before the (minutes-long) caching pass.
+    let perceptual = model.perceptual_path(req, device)?;
 
     // --- cache (latents + conditioning); the encoders load and drop inside the hook ---
     on_progress(TrainingProgress::LoadingModel);
@@ -594,12 +1005,42 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // A PEFT checkpoint cadence may fall mid-accumulation. Delay the corresponding resume bundle
     // until the next completed optimizer boundary instead of snapshotting without pending grads.
     let mut resume_due = false;
+    let schedule = item_major_schedule(T::LABEL, cache.len(), &cfg.training_buckets(), cfg.seed)?;
+    // Epic 2123 E8: references per (item, bucket) entry once, alternation keyed on the real item.
+    // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+    // cropped like the image and resampled onto its decoded size.
+    let mut perceptual = perceptual;
+    if let Some(path) = perceptual.as_mut() {
+        path.attach_subject_masks(
+            crate::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
+                T::LABEL,
+                &req.items,
+                cfg,
+                schedule.n_buckets(),
+                crate::gen_core::train::subject_mask::CropBox::center_square,
+            )?,
+        );
+    }
+    let mut aux_driver = match perceptual {
+        Some(path) => Some(AuxDriver::prepare(
+            path,
+            cache.len(),
+            |i| model.reference_latent(&cache[i], &aux),
+            &schedule,
+            accum,
+            start_step,
+            &req.cancel,
+        )?),
+        None => None,
+    };
     for step in start_step.saturating_add(1)..=cfg.steps {
         if req.cancel.is_cancelled() {
             break;
         }
-        let cached = &cache[((step - 1) as usize) % cache.len()];
-        let (loss, grads) = model.micro_step(&dit, &set.vars, cached, &aux, cfg, step, device)?;
+        let sample = step_sample(aux_driver.as_mut(), step, &schedule);
+        let cached = &cache[sample.entry];
+        let (loss, grads) =
+            model.micro_step(&dit, &set.vars, cached, &aux, cfg, step, sample, device)?;
         last_loss = loss;
         steps_run = step;
         accumulate_grads(&mut accumulated, grads, &set.vars)?;
@@ -617,6 +1058,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                 update_idx,
                 total_updates,
                 warmup_updates,
+                cfg.seed,
             )?;
             pending = 0;
             update_idx += 1;
@@ -723,6 +1165,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             update_idx,
             total_updates,
             warmup_updates,
+            cfg.seed,
         )?;
         if resume_due {
             save_resume(
@@ -882,6 +1325,140 @@ mod tests {
         assert!((mae - 1.5).abs() < 1e-6, "mae {mae}"); // (1+2)/2
     }
 
+    /// AC (sc-24828): with background weight 0, latent elements outside the mask contribute zero
+    /// loss AND zero gradient w.r.t. the prediction (the gradient tensor is checked per element).
+    #[test]
+    fn zero_background_weight_zeroes_loss_and_gradient_outside_the_mask() {
+        let dev = Device::Cpu;
+        let (h, w) = (4usize, 4usize);
+        let shape = [2usize, h, w];
+        let weights: Vec<f32> = (0..h * w)
+            .map(|i| if i % w < 2 { 1.0 } else { 0.0 })
+            .collect();
+        let wmap = subject_mask_weight(&weights, h, w, &shape, &dev).unwrap();
+        let pred_data = sample_noise(&shape, 1, &dev).unwrap();
+        let target = sample_noise(&shape, 2, &dev).unwrap();
+        let p = pred_data.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let t = target.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for mae in [false, true] {
+            let pred = candle_core::Var::from_tensor(&pred_data).unwrap();
+            let loss = weighted_velocity_loss(pred.as_tensor(), &target, Some(&wmap), mae).unwrap();
+            let grads = loss.backward().unwrap();
+            let grad = grads
+                .get(pred.as_tensor())
+                .expect("prediction gradient")
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut expected = 0f32;
+            for (i, g) in grad.iter().enumerate() {
+                let d = p[i] - t[i];
+                if i % w >= 2 {
+                    assert_eq!(
+                        *g, 0.0,
+                        "mae={mae}: background element {i} has gradient {g}"
+                    );
+                } else {
+                    assert_ne!(*g, 0.0, "mae={mae}: subject element {i} has no gradient");
+                    expected += if mae { d.abs() } else { d * d };
+                }
+            }
+            expected /= grad.len() as f32;
+            let loss = loss.to_scalar::<f32>().unwrap();
+            assert!(
+                (loss - expected).abs() < 1e-5,
+                "mae={mae}: {loss} != {expected}"
+            );
+        }
+    }
+
+    /// sc-24828 × sc-2127: with two resolution buckets and masked loss on, the item's mask is
+    /// loaded once and resampled per bucket — each weight map has exactly that bucket's latent
+    /// shape, and the masked-out region (the right half of the centre crop) is zero in each.
+    #[test]
+    fn prepared_subject_mask_weight_follows_each_bucket_latent() {
+        use crate::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
+        let dev = Device::Cpu;
+        let dir = tempfile::tempdir().unwrap();
+        // A 48x32 landscape image: centre crop x in [8, 40); subject = crop's left half [8, 24).
+        let img = dir.path().join("img.png");
+        image::RgbImage::new(48, 32).save(&img).unwrap();
+        let mask = dir.path().join("mask.png");
+        image::GrayImage::from_fn(48, 32, |x, _| {
+            image::Luma([if (8..24).contains(&x) { 255 } else { 0 }])
+        })
+        .save(&mask)
+        .unwrap();
+        let mut item = crate::gen_core::TrainingItem::captioned(img, "c".into());
+        item.subject_mask_path = Some(mask);
+        let cfg = crate::gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let prepared = PreparedSubjectMask::load_if_enabled("t", &item, Some(&cfg))
+            .unwrap()
+            .expect("on");
+        // Two buckets (e.g. edges 32 and 64 → latent grids 4 and 8 at an 8x VAE).
+        for grid in [4usize, 8] {
+            let shape = [1usize, 16, grid, grid];
+            let w = prepared_subject_mask_weight(
+                "t",
+                Some(&prepared),
+                CropBox::center_square,
+                &shape,
+                &dev,
+            )
+            .unwrap()
+            .expect("weight");
+            assert_eq!(w.dims(), &shape, "bucket grid {grid}");
+            let v = w.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (i, x) in v.iter().enumerate() {
+                let col = i % grid;
+                if col < grid / 2 {
+                    assert_eq!(*x, 1.0, "grid {grid}: subject cell {i}");
+                } else {
+                    assert_eq!(*x, 0.0, "grid {grid}: masked-out cell {i}");
+                }
+            }
+        }
+        assert!(prepared_subject_mask_weight(
+            "t",
+            None,
+            CropBox::center_square,
+            &[1, 16, 4, 4],
+            &dev
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// Mask off ⇒ exactly `velocity_loss`; an all-ones map gives the same value.
+    #[test]
+    fn weighted_velocity_loss_without_weight_is_velocity_loss() {
+        let dev = Device::Cpu;
+        let v = sample_noise(&[3, 2, 5], 3, &dev).unwrap();
+        let target = sample_noise(&[3, 2, 5], 4, &dev).unwrap();
+        let ones = subject_mask_weight(&[1.0; 10], 2, 5, &[3, 2, 5], &dev).unwrap();
+        for mae in [false, true] {
+            let legacy = velocity_loss(&v, &target, mae)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let off = weighted_velocity_loss(&v, &target, None, mae)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert_eq!(off.to_bits(), legacy.to_bits());
+            let on = weighted_velocity_loss(&v, &target, Some(&ones), mae)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!((on - legacy).abs() < 1e-6);
+        }
+        assert!(subject_mask_weight(&[0.0; 4], 2, 2, &[3, 2, 3], &dev).is_err());
+    }
+
     /// `sample_noise` is deterministic in its seed and shaped as requested.
     #[test]
     fn sample_noise_deterministic() {
@@ -910,6 +1487,53 @@ mod tests {
         validate_resume_step("mock", 4, 4).unwrap();
         let err = validate_resume_step("mock", 5, 4).unwrap_err().to_string();
         assert!(err.contains("exceeds requested total steps"), "{err}");
+    }
+
+    /// sc-2127: with buckets off the driver's schedule is exactly the pre-bucket `(step-1) % len`
+    /// round-robin; with buckets on, each item is visited at each bucket `repeats` times per epoch
+    /// (item-major indices), and a cache that is not a whole number of items is refused.
+    #[test]
+    fn driver_cache_schedule_matches_round_robin_and_mixes_buckets() {
+        let off = TrainingConfig::default();
+        for len in [1usize, 2, 3, 7] {
+            let s = item_major_schedule("mock", len, &off.training_buckets(), off.seed).unwrap();
+            for step in 1u32..=50 {
+                assert_eq!(
+                    s.cache_index((step - 1) as usize),
+                    ((step - 1) as usize) % len
+                );
+            }
+        }
+
+        let on = TrainingConfig {
+            resolution_buckets: vec![
+                ResolutionBucket {
+                    resolution: 512,
+                    repeats: 16,
+                },
+                ResolutionBucket {
+                    resolution: 768,
+                    repeats: 4,
+                },
+                ResolutionBucket {
+                    resolution: 1024,
+                    repeats: 1,
+                },
+            ],
+            ..TrainingConfig::default()
+        };
+        // 2 items × 3 buckets = 6 cache entries; one epoch = 2 · (16+4+1) = 42 samples.
+        let s = item_major_schedule("mock", 6, &on.training_buckets(), on.seed).unwrap();
+        let mut counts = [0u32; 6];
+        for k in 0..42 {
+            counts[s.cache_index(k)] += 1;
+        }
+        assert_eq!(counts, [16, 4, 1, 16, 4, 1]);
+
+        let err = item_major_schedule("mock", 7, &on.training_buckets(), on.seed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a whole number of items"), "{err}");
     }
 
     // --- A mock single-model trainer exercising the Tier-2 driver (the loop scaffolding that had no
@@ -983,6 +1607,7 @@ mod tests {
             _aux: &(),
             _cfg: &TrainingConfig,
             _step: u32,
+            _sample: StepSample<'_>,
             _device: &Device,
         ) -> Result<(f32, GradStore)> {
             unreachable!("the driver must stop before building or training the DiT")
@@ -1035,6 +1660,7 @@ mod tests {
             _aux: &(),
             _cfg: &TrainingConfig,
             step: u32,
+            _sample: StepSample<'_>,
             _device: &Device,
         ) -> Result<(f32, GradStore)> {
             self.steps_seen.set(step);
@@ -1051,6 +1677,339 @@ mod tests {
             self.saves.set(self.saves.get() + 1);
             Ok(())
         }
+    }
+
+    /// A [`MockTrainer`] whose cache entries are their own indices, recording which entry each
+    /// micro-step trains on (sc-2127 — the driver's bucket schedule).
+    struct IndexRecordingTrainer {
+        inner: MockTrainer,
+        seen: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl FlowMatchTrainer for IndexRecordingTrainer {
+        type Dit = MockDit;
+        type Cached = usize;
+        type Aux = ();
+        type SampleState = ();
+        const LABEL: &'static str = "index-recording trainer";
+
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn default_targets(&self) -> &'static [&'static str] {
+            self.inner.default_targets()
+        }
+        fn cache(
+            &self,
+            req: &TrainingRequest,
+            device: &Device,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<usize>, (), SamplePlan<()>)> {
+            let (cache, (), plan) = self.inner.cache(req, device, on_progress)?;
+            Ok(((0..cache.len()).collect(), (), plan))
+        }
+        fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<MockDit> {
+            self.inner.build_dit(req, device)
+        }
+        fn micro_step(
+            &self,
+            dit: &MockDit,
+            vars: &[Var],
+            cached: &usize,
+            aux: &(),
+            cfg: &TrainingConfig,
+            step: u32,
+            sample: StepSample<'_>,
+            device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            self.seen.borrow_mut().push(*cached);
+            self.inner
+                .micro_step(dit, vars, &(), aux, cfg, step, sample, device)
+        }
+        fn save(&self, set: &LoraSet, path: &Path) -> Result<()> {
+            self.inner.save(set, path)
+        }
+    }
+
+    /// sc-2127: the driver walks its cache through the bucket schedule — the plain round-robin with
+    /// buckets off, the item-major `(item, bucket)` mix with buckets on.
+    #[test]
+    fn driver_walks_the_cache_through_the_bucket_schedule() {
+        let recording = |cache_len| IndexRecordingTrainer {
+            inner: MockTrainer {
+                device: Device::Cpu,
+                steps_seen: Cell::new(0),
+                saves: Cell::new(0),
+                cache_len,
+            },
+            seen: Default::default(),
+        };
+        let model = recording(3);
+        let (_fixture, req) = mock_request(3, 7, 1, 0, CancelFlag::new());
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        assert_eq!(*model.seen.borrow(), vec![0, 1, 2, 0, 1, 2, 0]);
+
+        // 2 items × 2 buckets (repeats 3 and 1) = 4 entries; one epoch = 2 · (3 + 1) = 8 steps.
+        let model = recording(4);
+        let (_fixture, mut req) = mock_request(2, 8, 1, 0, CancelFlag::new());
+        req.config.resolution_buckets = vec![
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 3,
+            },
+            ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+        ];
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let mut counts = [0u32; 4];
+        for &i in model.seen.borrow().iter() {
+            counts[i] += 1;
+        }
+        assert_eq!(counts, [3, 1, 3, 1]);
+    }
+
+    /// A latent-input toy aux loss (epic 2123 E8 driver tests): reference = the clean latent's mean.
+    struct ToyLatentLoss;
+    impl crate::train::perceptual::PerceptualLoss for ToyLatentLoss {
+        fn name(&self) -> &'static str {
+            "toy"
+        }
+        fn input(&self) -> crate::train::perceptual::PerceptualInput {
+            crate::train::perceptual::PerceptualInput::Latents
+        }
+        fn reference(
+            &self,
+            clean: &Tensor,
+        ) -> Result<Option<crate::train::perceptual::LossReference>> {
+            Ok(Some(Box::new(clean.mean_all()?)))
+        }
+        fn loss(&self, live: &Tensor, r: &dyn std::any::Any) -> Result<Tensor> {
+            let r = crate::train::perceptual::reference_as::<Tensor>("toy", r)?;
+            Ok((live.mean_all()? - r)?.sqr()?)
+        }
+    }
+
+    /// A toy path claiming every 2nd optimizer window of each item.
+    fn toy_path() -> PerceptualPath {
+        PerceptualPath::new(
+            None,
+            vec![crate::train::perceptual::AuxLoss {
+                schedule: crate::train::perceptual::AuxLossSchedule {
+                    weight: 1.0,
+                    t_min: 0.0,
+                    t_max: 1.0,
+                    every_n: 2,
+                },
+                loss: Box::new(ToyLatentLoss),
+            }],
+        )
+        .unwrap()
+    }
+
+    /// A [`MockTrainer`] with a perceptual path: records each step's (item, entry, aux-only) and
+    /// counts reference builds.
+    struct PerceptualTrainer {
+        inner: MockTrainer,
+        references: Cell<usize>,
+        seen: std::cell::RefCell<Vec<(usize, usize, bool)>>,
+    }
+
+    impl FlowMatchTrainer for PerceptualTrainer {
+        type Dit = MockDit;
+        type Cached = usize;
+        type Aux = ();
+        type SampleState = ();
+        const LABEL: &'static str = "perceptual trainer";
+
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn default_targets(&self) -> &'static [&'static str] {
+            self.inner.default_targets()
+        }
+        fn perceptual_path(
+            &self,
+            _req: &TrainingRequest,
+            _device: &Device,
+        ) -> Result<Option<PerceptualPath>> {
+            Ok(Some(toy_path()))
+        }
+        fn reference_latent(&self, cached: &usize, _aux: &()) -> Result<Tensor> {
+            self.references.set(self.references.get() + 1);
+            Ok(Tensor::full(*cached as f32, (1, 1, 1, 1), &Device::Cpu)?)
+        }
+        fn cache(
+            &self,
+            req: &TrainingRequest,
+            device: &Device,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<usize>, (), SamplePlan<()>)> {
+            let (cache, (), plan) = self.inner.cache(req, device, on_progress)?;
+            Ok(((0..cache.len()).collect(), (), plan))
+        }
+        fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<MockDit> {
+            self.inner.build_dit(req, device)
+        }
+        fn micro_step(
+            &self,
+            dit: &MockDit,
+            vars: &[Var],
+            cached: &usize,
+            aux: &(),
+            cfg: &TrainingConfig,
+            step: u32,
+            sample: StepSample<'_>,
+            device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            assert_eq!(*cached, sample.entry, "the driver hands the sampled entry");
+            let planned = sample
+                .plan(0.5)?
+                .expect("a perceptual path plans every step");
+            self.seen
+                .borrow_mut()
+                .push((sample.item, sample.entry, !planned.diffusion()));
+            self.inner
+                .micro_step(dit, vars, &(), aux, cfg, step, sample, device)
+        }
+        fn save(&self, set: &LoraSet, path: &Path) -> Result<()> {
+            self.inner.save(set, path)
+        }
+    }
+
+    /// Epic 2123 E8 through the driver: each (item, bucket) entry's reference is built exactly once,
+    /// every step is planned, and the alternation is keyed on the REAL item (an item alternates
+    /// across its buckets). Mutations: build the reference per step (count ≠ 4) ⇒ red; key the
+    /// alternation on the cache entry instead of the item ⇒ the aux-only pattern diverges ⇒ red.
+    #[test]
+    fn driver_plans_perceptual_steps_per_item_with_references_once() {
+        let model = PerceptualTrainer {
+            inner: MockTrainer {
+                device: Device::Cpu,
+                steps_seen: Cell::new(0),
+                saves: Cell::new(0),
+                cache_len: 4,
+            },
+            references: Cell::new(0),
+            seen: Default::default(),
+        };
+        let (_fixture, mut req) = mock_request(2, 16, 1, 0, CancelFlag::new());
+        req.config.resolution_buckets = vec![
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 1,
+            },
+            ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+        ];
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        assert_eq!(model.references.get(), 4);
+        let seen = model.seen.borrow();
+        assert_eq!(seen.len(), 16);
+        let mut visits = [0u32; 2];
+        let mut both_buckets_aux = false;
+        for &(item, entry, aux_only) in seen.iter() {
+            assert_eq!(item, entry / 2, "item-major entry of the sampled item");
+            visits[item] += 1;
+            assert_eq!(
+                aux_only,
+                visits[item] % 2 == 0,
+                "item {item} visit {}",
+                visits[item]
+            );
+            both_buckets_aux |= aux_only && entry % 2 == 1;
+        }
+        assert!(
+            both_buckets_aux,
+            "the alternation must span an item's buckets"
+        );
+    }
+
+    /// A cancel tripped during the reference build stops it between entries with a typed
+    /// `Canceled` — no further entry is decoded, so no DiT work follows (feature-end review round
+    /// 2). Mutation: drop the per-entry `cancel` check ⇒ all 6 entries build and `prepare` succeeds
+    /// ⇒ red.
+    #[test]
+    fn aux_driver_prepare_stops_on_cancel_between_entries() {
+        let schedule = BucketSchedule::new(6, &[], 7);
+        let cancel = CancelFlag::default();
+        let calls = Cell::new(0);
+        let result = AuxDriver::prepare(
+            toy_path(),
+            6,
+            |i| {
+                calls.set(calls.get() + 1);
+                cancel.cancel();
+                Ok(Tensor::full(i as f32, (1, 1, 1, 1), &Device::Cpu)?)
+            },
+            &schedule,
+            1,
+            0,
+            &cancel,
+        );
+        assert!(
+            matches!(result, Err(crate::CandleError::Canceled)),
+            "{:?}",
+            result.err().map(|e| e.to_string())
+        );
+        assert_eq!(calls.get(), 1, "the build stopped at the next entry");
+    }
+
+    /// Resume replays the skipped prefix: an [`AuxDriver`] prepared at `start_step = 5` plans steps
+    /// 6.. exactly as one walked from step 1. Mutation: drop the replay loop ⇒ red.
+    #[test]
+    fn aux_driver_resume_replays_the_alternation_prefix() {
+        let buckets = [
+            ResolutionBucket {
+                resolution: 512,
+                repeats: 1,
+            },
+            ResolutionBucket {
+                resolution: 768,
+                repeats: 2,
+            },
+        ];
+        let schedule = BucketSchedule::new(3, &buckets, 7);
+        let clean = |i: usize| Ok(Tensor::full(i as f32, (1, 1, 1, 1), &Device::Cpu)?);
+        let plans = |start: u32| {
+            let mut d = AuxDriver::prepare(
+                toy_path(),
+                6,
+                clean,
+                &schedule,
+                2,
+                start,
+                &Default::default(),
+            )
+            .unwrap();
+            (start + 1..=24)
+                .map(|step| {
+                    let s = d.sample(step, &schedule);
+                    let p = s.plan(0.3).unwrap().unwrap();
+                    (s.item, s.entry, p.plan.diffusion, p.plan.aux.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let full = plans(0);
+        assert!(full.iter().any(|p| !p.2) && full.iter().any(|p| p.2));
+        assert_eq!(plans(5), full[5..].to_vec());
+    }
+
+    /// The aux-memory guard refuses only past the budget, naming both terms; the plain sample has no
+    /// plan. Mutation: compare `base` alone ⇒ the in-between budget passes ⇒ red.
+    #[test]
+    fn aux_memory_guard_counts_the_aux_models() {
+        let gib = 1u64 << 30;
+        assert!(check_aux_memory("t", 10 * gib, 2 * gib, 12 * gib).is_ok());
+        let e = check_aux_memory("t", 10 * gib, 2 * gib, 11 * gib)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("perceptual") && e.contains("~12.0 GiB"), "{e}");
+        assert!(StepSample::plain(1, 2).plan(0.5).unwrap().is_none());
+        assert_eq!(step_terms(None), (true, false));
     }
 
     /// Build a driver request over a throwaway on-disk dataset.
@@ -1096,6 +2055,7 @@ mod tests {
                         control_image_path: None,
                         model_options: Default::default(),
                         reference_image_paths: Vec::new(),
+                        subject_mask_path: None,
                     }
                 })
                 .collect(),
@@ -1441,6 +2401,7 @@ mod tests {
             _aux: &(),
             _cfg: &TrainingConfig,
             _step: u32,
+            _sample: StepSample<'_>,
             _device: &Device,
         ) -> Result<(f32, GradStore)> {
             let mut loss = vars[0].as_tensor().sqr()?.sum_all()?;
@@ -1557,5 +2518,172 @@ mod tests {
             !frozen_after.get(),
             "the thaw pass must still run after a freeze failure so no adapter is left frozen"
         );
+    }
+
+    /// Epic 2123 (sc-24827): a `MockTrainer` that snapshots the adapter factors at the final save,
+    /// so a test can compare what the driver actually trained.
+    struct CaptureTrainer {
+        inner: MockTrainer,
+        saved: std::cell::RefCell<Vec<(String, Vec<f32>)>>,
+    }
+
+    impl FlowMatchTrainer for CaptureTrainer {
+        type Dit = MockDit;
+        type Cached = ();
+        type Aux = ();
+        type SampleState = ();
+        const LABEL: &'static str = "capture trainer";
+
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+        fn default_targets(&self) -> &'static [&'static str] {
+            self.inner.default_targets()
+        }
+        fn cache(
+            &self,
+            req: &TrainingRequest,
+            device: &Device,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<()>, (), SamplePlan<()>)> {
+            self.inner.cache(req, device, on_progress)
+        }
+        fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<MockDit> {
+            // A non-zero base so both LoRA factors receive gradients.
+            let w = Tensor::from_vec(
+                (0..16)
+                    .map(|i| 0.1 * (i as f32 - 7.5))
+                    .collect::<Vec<f32>>(),
+                (4, 4),
+                device,
+            )?;
+            let _ = req;
+            Ok(MockDit(LoraLinear::from_linear(
+                Linear::new(w, None),
+                4,
+                4,
+                "to_q".into(),
+            )))
+        }
+        fn micro_step(
+            &self,
+            dit: &MockDit,
+            vars: &[Var],
+            cached: &(),
+            aux: &(),
+            cfg: &TrainingConfig,
+            step: u32,
+            _sample: StepSample<'_>,
+            device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            // Loss through the adapted forward so B (zero-init) gets a gradient too.
+            let x = Tensor::from_vec(vec![1.0f32, -2.0, 0.5, 3.0], (1, 4), device)?;
+            let y = candle_core::Module::forward(&dit.0, &x)?;
+            let target = Tensor::from_vec(vec![0.3f32, 0.1, -0.2, 0.4], (1, 4), device)?;
+            let loss = (y - target)?.sqr()?.sum_all()?;
+            let _ = (vars, cached, aux, cfg, step);
+            self.inner.steps_seen.set(step);
+            Ok((loss.to_scalar::<f32>()?, loss.backward()?))
+        }
+        fn save(&self, set: &LoraSet, _path: &Path) -> Result<()> {
+            let mut named = set.named_vars();
+            named.sort_by(|a, b| a.0.cmp(&b.0));
+            *self.saved.borrow_mut() = named
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        v.as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            Ok(())
+        }
+    }
+
+    fn capture_run(
+        weight_sigma: f32,
+        grad_eta: f32,
+        steps: u32,
+        accum: u32,
+    ) -> Vec<(String, Vec<f32>)> {
+        let model = CaptureTrainer {
+            inner: MockTrainer {
+                device: Device::Cpu,
+                steps_seen: Cell::new(0),
+                saves: Cell::new(0),
+                cache_len: 1,
+            },
+            saved: Default::default(),
+        };
+        let (_fixture, mut req) = mock_request(1, steps, accum, 0, CancelFlag::new());
+        req.config.seed = 11;
+        req.config.rank = 2;
+        req.config.alpha = 2.0;
+        req.config.weight_noise_sigma = weight_sigma;
+        req.config.gradient_noise_eta = grad_eta;
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let saved = model.saved.borrow().clone();
+        assert!(!saved.is_empty());
+        saved
+    }
+
+    /// Call site (epic 2123, sc-24827): the shared driver invokes weight noise exactly once per
+    /// REAL optimizer update, after the step, with that update's index — never on the
+    /// gradient-accumulation micro-steps. One update (steps = accum = 2): the noisy run's adapter is
+    /// bit-identical to the clean run's adapter plus `apply_weight_noise(.., update 0)`. Noise on
+    /// micro-step 1 would perturb micro-step 2's gradient (and add a second draw); a wrong index
+    /// draws different noise — either breaks the equality.
+    ///
+    /// *Mutation that reds this:* calling the update (or the weight-noise kernel) on every
+    /// micro-step, or `apply_update` dropping the noise call.
+    #[test]
+    fn driver_applies_weight_noise_once_per_real_update() {
+        let sigma = 0.05f32;
+        let clean = capture_run(0.0, 0.0, 2, 2);
+        let noisy = capture_run(sigma, 0.0, 2, 2);
+        assert_ne!(clean, noisy, "weight noise must reach the trained adapter");
+        // Rebuild a set holding the clean factors and noise it as update 0 would.
+        let mut host = MockDit(LoraLinear::from_linear(
+            Linear::new(
+                Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap(),
+                None,
+            ),
+            4,
+            4,
+            "to_q".into(),
+        ));
+        let set =
+            build_lora_targets(&mut host, &["to_q".to_string()], 2, 2.0, 0, &Device::Cpu).unwrap();
+        let mut named = set.named_vars();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((name, var), (cname, values)) in named.iter().zip(&clean) {
+            assert_eq!(name, cname);
+            var.set(&Tensor::from_vec(values.clone(), var.dims(), &Device::Cpu).unwrap())
+                .unwrap();
+        }
+        crate::train::lora::apply_weight_noise(&set, sigma, 11, 0).unwrap();
+        let mut named = set.named_vars();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected: Vec<(String, Vec<f32>)> = named
+            .into_iter()
+            .map(|(k, v)| (k, v.as_tensor().flatten_all().unwrap().to_vec1().unwrap()))
+            .collect();
+        assert_eq!(noisy, expected);
+    }
+
+    /// Call site: gradient noise reaches the driver's optimizer step (the adapter differs from the
+    /// clean run) and is seeded (two runs agree), including the final partial-window flush.
+    #[test]
+    fn driver_applies_gradient_noise_reproducibly() {
+        let clean = capture_run(0.0, 0.0, 3, 2);
+        let a = capture_run(0.0, 0.05, 3, 2);
+        let b = capture_run(0.0, 0.05, 3, 2);
+        assert_ne!(clean, a, "gradient noise must reach the trained adapter");
+        assert_eq!(a, b, "seeded gradient noise must reproduce");
     }
 }

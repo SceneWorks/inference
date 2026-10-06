@@ -54,15 +54,21 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core;
+use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
-    TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, LoraParams, TrainAdapter,
+};
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
+use mlx_gen::train::perceptual::{
+    combine_step_loss, step_sample, AuxDriver, AuxModelFootprint, Parameterization, PerceptualPath,
+    StepPlan, X0Decoder,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
@@ -74,7 +80,7 @@ use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
-use crate::config::{MageFlowConfig, FAMILY, LATENT_CHANNELS, VAE_DOWNSAMPLE_FACTOR};
+use crate::config::{MageFlowConfig, FAMILY, VAE_DOWNSAMPLE_FACTOR};
 use crate::latent::GsKey;
 use crate::pipeline::{denoise, encode_noise_tokens, generation_layout, mage_flow_sigmas};
 use crate::rope_embedder::{ImgShape, MsRope, PackContext, PackLayout};
@@ -122,13 +128,50 @@ fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f
     Ok((x_t, target, sigma))
 }
 
-/// A cached training sample: the clean VAE-latent tokens `[1, gh·gw, 128]`, the encoded conditioning
-/// `[1, txt_tokens, hidden]`, and its post-drop token count (native-resolution packing is per-sample,
-/// so each caption keeps its own length).
+/// A cached training sample: the clean VAE-latent tokens `[1, grid·grid, 128]`, the encoded
+/// conditioning `[1, txt_tokens, hidden]`, its post-drop token count, the square latent `grid` the
+/// tokens were encoded at (native-resolution packing is per-sample, so each caption keeps its own
+/// length and — with resolution buckets, sc-2127 — each sample its own grid), and (subject-masked
+/// loss, sc-24828) that bucket's latent loss-weight map in the same token layout as `latent_tokens`
+/// — `None` when the technique is off.
 struct CachedSample {
     latent_tokens: Array,
     txt: Array,
     txt_tokens: i32,
+    grid: i32,
+    mask_weight: Option<Array>,
+}
+
+/// The Mage latent token layout: an NCHW latent grid `[1, C, gh, gw]` → `[1, gh·gw, C]` (one token
+/// per latent cell, row-major; `patch_size == 1`). Shared by the clean latent and its subject-mask
+/// weight so the two line up element-for-element.
+fn latent_grid_to_tokens(grid_nchw: &Array, grid: i32) -> Result<Array> {
+    let channels = grid_nchw.shape()[1]; // LATENT_CHANNELS in production
+    Ok(grid_nchw
+        .transpose_axes(&[0, 2, 3, 1])?
+        .reshape(&[1, grid * grid, channels])?)
+}
+
+/// The square latent grid side for a training `edge` (`patch_size == 1`, so this is also the image
+/// token side).
+fn latent_grid(edge: u32) -> i32 {
+    (edge / VAE_DOWNSAMPLE_FACTOR) as i32
+}
+
+/// The one-segment pack layout of a cached sample: its own latent grid + its caption tokens. Shared
+/// by the adapter and full fine-tune steps so a bucketed sample is always packed at the grid it was
+/// cached at (sc-2127).
+fn sample_layout(sample: &CachedSample) -> Result<PackLayout> {
+    PackLayout::generation(
+        vec![ImgShape::latent(sample.grid, sample.grid)],
+        vec![sample.txt_tokens],
+    )
+}
+
+/// The cache entry the 1-based training `step` reads (sc-2127). One bucket ⇒ `(step - 1) % items`,
+/// the pre-bucket round-robin.
+fn step_cache_index(schedule: &BucketSchedule, step: u32) -> usize {
+    schedule.cache_index((step - 1) as usize)
 }
 
 /// One pre-encoded preview-sample prompt — `(prompt, txt embedding [1, tokens, hidden], token count)`.
@@ -162,6 +205,9 @@ pub struct MageFlowTrainer {
     /// encoder and VAE are shared co-requisites staged from elsewhere, so re-deriving it from the
     /// snapshot root would read the wrong (or a nonexistent) checkpoint.
     transformer_dir: PathBuf,
+    /// The **resolved** VAE directory (a co-requisite under the split-tier mirror). Depth anchoring's
+    /// full-decoder fallback ([`MageX0Decoder`]) loads its f32 decoder from here (sc-24830).
+    vae_dir: PathBuf,
 }
 
 fn trainer_descriptor() -> TrainerDescriptor {
@@ -178,13 +224,209 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // every DiT weight and writes a full checkpoint rather than an adapter.
         supports_full_finetune: true,
         max_reference_images: 0,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): multi-resolution buckets — one cached latent per item per bucket
+        // (each carrying its own latent grid), sampled by `BucketSchedule`, on both the adapter and
+        // the full fine-tune paths.
+        // sc-24828 (epic 2123): honors `subject_mask_loss` on BOTH loss paths (LoRA/LoKr and the full
+        // base fine-tune); each (item, bucket) entry's weight is laid out in the same
+        // `[1, grid·grid, 128]` token order as that entry's latent.
+        // sc-24830 (epic 2123): depth anchoring on the LoRA/LoKr path through the shared
+        // perceptual builder. Mage-VAE has no tiny decoder, so x0 decodes through the full Mage-VAE
+        // decoder (gradient-checkpointed, [`MageX0Decoder`]); the full base fine-tune refuses it.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps) through
+        // the shared aux-loss builder this trainer already drives. No E-LatentLPIPS: no published
+        // weights match this latent family, so `latent_lpips_loss` stays false (refused).
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            subject_mask_loss: true,
+            depth_anchoring: true,
+            // sc-24831: the ArcFace identity + FaceMesh landmark losses, picked up through the
+            // same shared perceptual builder arms (no trainer-loop change).
+            identity_loss: true,
+            face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
+            vae_anchor_loss: true,
+            // The x0 decoder is the trainer's own Mage-VAE decoder (`MageDecoderSpec`), not a
+            // separately cataloged one, so `perceptual_decoder_dir` is not required.
+            builtin_x0_decoder: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
+}
+
+/// The full Mage-VAE decoder as the perceptual path's x0 decoder (epic 2123 E8, sc-24830): Mage's
+/// 128-channel / 16× latent space has no tiny decoder, so the shared path falls back to the real
+/// one-step decoder. The decode is wrapped in an MLX gradient checkpoint, so the backward
+/// recomputes it rather than reading retained activations; since the aux backward follows the
+/// forward immediately, the saving is modest (the recompute still materializes the decode's
+/// activations once). Its weights are captured constants (frozen). Output: NHWC pixels in `[0, 1]` (the decoder's raw
+/// `[-1, 1]` RGB mapped and clamped).
+pub struct MageX0Decoder {
+    vae: MageVae,
+}
+
+impl MageX0Decoder {
+    /// Wrap a loaded Mage-VAE (its decoder half is used).
+    pub fn new(vae: MageVae) -> Self {
+        Self { vae }
+    }
+}
+
+impl X0Decoder for MageX0Decoder {
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        let vae = &self.vae;
+        let mut ckpt =
+            mlx_rs::transforms::checkpoint(move |xs: &[Array]| -> MlxResult<Vec<Array>> {
+                let rgb = vae
+                    .decode(&xs[0])
+                    .map_err(|e| Exception::custom(e.to_string()))?
+                    .as_dtype(Dtype::Float32)?;
+                let unit = mlx_rs::ops::multiply(
+                    &mlx_rs::ops::add(&rgb, Array::from_f32(1.0))?,
+                    Array::from_f32(0.5),
+                )?;
+                let unit =
+                    mlx_rs::ops::clip(&unit, (&Array::from_f32(0.0), &Array::from_f32(1.0)))?;
+                Ok(vec![unit.transpose_axes(&[0, 2, 3, 1])?])
+            });
+        let out = ckpt(std::slice::from_ref(latents))?;
+        Ok(out.into_iter().next().expect("one output"))
+    }
+}
+
+/// [`MageX0Decoder`] for the shared aux-loss builder, loaded (f32) from the trainer's own resolved
+/// VAE directory only when an enabled loss decodes pixels. Mage has no separately cataloged x0
+/// decoder, so the descriptor declares `builtin_x0_decoder` and the shared floor does not require
+/// `TrainingConfig::perceptual_decoder_dir` (never read here) — the split-tier mirror can stage the VAE elsewhere, and the
+/// trainer already resolved where.
+struct MageDecoderSpec {
+    vae_dir: PathBuf,
+}
+
+impl mlx_gen_perceptual::CustomDecoder for MageDecoderSpec {
+    fn name(&self) -> &'static str {
+        "Mage-VAE decoder"
+    }
+
+    /// Conservative pre-load figures from Mage's measured inference decode curve
+    /// ([`crate::memory::vae_peak_gb`], decimal GB, bf16): f32 weights at twice the measured fixed
+    /// term, and a training working set of 3× the f32 decode peak (the checkpointed backward
+    /// recomputes the decode and holds its cotangents). Not a measured training value.
+    fn footprint(&self, h: u32, w: u32) -> AuxModelFootprint {
+        let gb = |v: f64| (v * 1e9) as u64;
+        AuxModelFootprint {
+            param_bytes: gb(2.0 * crate::memory::VAE_FIXED_GB),
+            working_set_bytes: gb(3.0 * 2.0 * crate::memory::vae_peak_gb(w, h)),
+            reference_bytes_per_image: 0,
+        }
+    }
+
+    fn load(&self, _dir: Option<&Path>) -> Result<Box<dyn X0Decoder>> {
+        Ok(Box::new(MageX0Decoder::new(crate::vae::load(
+            &self.vae_dir,
+            VaePart::Decode,
+            Dtype::Float32,
+        )?)))
+    }
+}
+
+/// Mage's latent family for the shared aux-loss builder (epic 2123 E8).
+fn aux_loss_context(vae_dir: &Path) -> mlx_gen_perceptual::AuxLossContext<'static> {
+    mlx_gen_perceptual::AuxLossContext {
+        label: "mage_flow_base trainer",
+        decoder: mlx_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
+            vae_dir: vae_dir.to_path_buf(),
+        })),
+        latent_lpips: None,
+    }
+}
+
+/// Extra training memory (decimal GB, the unit of [`crate::memory`]) the enabled aux losses add at
+/// the largest bucket `edge` over `entries` cached (item, bucket) references (epic 2123 E7). `0`
+/// when none is enabled.
+fn perceptual_footprint_gb(cfg: &TrainingConfig, edge: u32, entries: usize) -> f64 {
+    mlx_gen_perceptual::perceptual_footprint(
+        cfg,
+        &mlx_gen_perceptual::DecoderSpec::Custom(Box::new(MageDecoderSpec {
+            vae_dir: PathBuf::new(),
+        })),
+        mlx_gen_perceptual::AuxGeometry::image(edge, entries),
+    ) as f64
+        / 1e9
+}
+
+/// Projected LoRA training-step memory (decimal GB) at the square `edge` WITHOUT auxiliary models:
+/// the dense base's measured resident peak ([`crate::memory::generation_resident_gb`]) plus an
+/// ESTIMATE of the DiT backward's retained activations — per double-stream block ~24
+/// `tokens × hidden` f32 tensors (both streams' norms, QKV, attention output, MLP hidden at 4×,
+/// residuals) plus the `heads × tokens²` attention probabilities, ×2 for the backward's cotangents.
+/// Tokens = the image grid `(edge/16)²` plus the full caption cap. Not a measured value; Mage has no
+/// fitted training curve.
+fn projected_training_step_gb(edge: u32) -> f64 {
+    let cfg = MageFlowConfig::mage_flow();
+    let image = (edge / VAE_DOWNSAMPLE_FACTOR) as f64;
+    let tokens =
+        image * image + crate::config::max_prompt_tokens(crate::config::DROP_IDX_GEN) as f64;
+    let hidden = cfg.hidden_size as f64;
+    let heads = cfg.num_heads as f64;
+    let per_block = 24.0 * tokens * hidden + heads * tokens * tokens;
+    let activations = per_block * cfg.depth as f64 * 4.0 * 2.0 / 1e9;
+    crate::memory::generation_resident_gb(None) + activations
+}
+
+/// Refuse a run whose auxiliary training models do not fit (epic 2123 E7): the projected training
+/// step at `edge` ([`projected_training_step_gb`]) plus `extra_gb` (the aux models) against
+/// `safe_gb` (the live safe budget in production — injected for tests). Consulted only when an aux
+/// loss is enabled, so a plain run's admission is unchanged. The refusal goes through the shared
+/// [`mlx_gen_perceptual::check_aux_memory`], naming `cfg`'s enabled aux losses.
+fn preflight_aux_memory(
+    cfg: &TrainingConfig,
+    edge: u32,
+    extra_gb: f64,
+    safe_gb: f64,
+) -> Result<()> {
+    let base = projected_training_step_gb(edge);
+    let projected = base + extra_gb;
+    mlx_gen_perceptual::check_aux_memory(
+        "mage_flow_base trainer",
+        cfg,
+        &format!("the ~{base:.1} GB estimated training step at resolution {edge}"),
+        extra_gb,
+        projected,
+        safe_gb,
+        "",
+    )
 }
 
 /// Construct the trainer from a diffusers snapshot directory (`text_encoder/ transformer/ vae/`). No
 /// quantization — training needs the dense base. The VAE is loaded with its **encoder** (latent prep)
 /// and decoder (preview samples). Registered via [`mlx_gen::register_trainer`].
+///
+/// The weights load lazily (sc-2124): construction resolves and checks the component dirs (config
+/// files only), so `validate` and `train`'s refusal floors never read weights; see
+/// [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    component_dirs(spec)?;
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor(), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        })
+        .validating_on_base_when(|r| {
+            !r.config.full_finetune && mlx_gen::train::lazy::custom_targets(r)
+        }),
+    ))
+}
+
+/// The dense component dirs a trainer spec resolves to — a single file, an unknown component and a
+/// pre-quantized tier are refused (`config.json` reads only, no weights).
+fn component_dirs(spec: &LoadSpec) -> Result<crate::MageComponentDirs> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
@@ -219,10 +461,17 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             )));
         }
     }
-    Ok(Box::new(MageFlowTrainer {
+    Ok(dirs)
+}
+
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
+fn load_weights(spec: &LoadSpec) -> Result<MageFlowTrainer> {
+    let dirs = component_dirs(spec)?;
+    Ok(MageFlowTrainer {
         descriptor: trainer_descriptor(),
         text_encoder: Some(crate::text_encoder::load_dir(&dirs.text_encoder)?),
         vae: crate::vae::load(&dirs.vae, VaePart::Both, Dtype::Bfloat16)?,
+        vae_dir: dirs.vae.clone(),
         transformer: Some(MageTransformer::load(&dirs.transformer)?),
         // The full base fine-tune path (sc-14056) re-reads this exact checkpoint to seed its f32
         // master weights, so keep the RESOLVED directory rather than re-deriving `root/transformer`
@@ -230,7 +479,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         // encoder and VAE are shared co-requisites staged from elsewhere, so `root` alone no longer
         // determines where the checkpoint lives.
         transformer_dir: dirs.transformer,
-    }))
+    })
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -332,22 +581,31 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor: a LoRA-only trainer must reject a control-branch request
+    // (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056). This trainer advertises
+    // `supports_full_finetune`, so the floor is a pass-through here — it is routed through
+    // anyway so the capability claim and the acceptance stay one fact (and the conformance
+    // suite's validate-honesty check exercises the same seam for every family).
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for MageFlowTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor: a LoRA-only trainer must reject a control-branch request
-        // (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056). This trainer advertises
-        // `supports_full_finetune`, so the floor is a pass-through here — it is routed through
-        // anyway so the capability claim and the acceptance stay one fact (and the conformance
-        // suite's validate-honesty check exercises the same seam for every family).
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         // `lora_target_modules` only scopes the LoRA/LoKr adapter; a full base fine-tune trains every
         // DiT weight, so the target-resolution guard below does not apply to it.
         if !req.config.full_finetune {
@@ -370,6 +628,9 @@ impl Trainer for MageFlowTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
+        // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -407,11 +668,12 @@ impl MageFlowTrainer {
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);
 
-        // Training resolution → square latent grid. `bucket_resolution` floors to a multiple of 32
-        // (a subset of Mage's 16× stride, so the latent tiles cleanly). `patch_size == 1`, so the
-        // token count is exactly the latent grid.
-        let edge = bucket_resolution(cfg.resolution);
-        let grid = (edge / VAE_DOWNSAMPLE_FACTOR) as i32;
+        // Training resolutions → square latent grids, one edge per resolution bucket (sc-2127; just
+        // `[resolution]` when buckets are off). `bucket_edges` floors each to a multiple of 32 (a
+        // subset of Mage's 16× stride, so the latent tiles cleanly). `patch_size == 1`, so each
+        // sample's token count is exactly its latent grid. Previews render at the largest edge.
+        let edges = bucket_edges(cfg);
+        let preview_edge = edges.iter().copied().max().unwrap_or(0);
 
         let compute_dtype = resolve_compute_dtype(&cfg.train_dtype);
 
@@ -419,13 +681,40 @@ impl MageFlowTrainer {
         // below (which casts the frozen base and builds adapter factors). The full path seeds its own
         // f32 master weights from the raw checkpoint instead of freezing `self.transformer`.
         if cfg.full_finetune {
-            return self.train_full_impl(req, edge, grid, compute_dtype, on_progress);
+            return self.train_full_impl(req, &edges, preview_edge, compute_dtype, on_progress);
         }
+
+        // Epic 2123 E7: the auxiliary perceptual models count against the budget before anything
+        // heavy runs (one cached reference per (item, bucket) entry, sized at the largest edge).
+        let aux_gb = perceptual_footprint_gb(cfg, preview_edge, req.items.len() * edges.len());
+        if aux_gb > 0.0 {
+            preflight_aux_memory(
+                cfg,
+                preview_edge,
+                aux_gb,
+                crate::memory::production_safe_budget_gb()?,
+            )?;
+        }
+        // Epic 2123 E8: the shared builder loads the decoder + enabled losses before caching, so a
+        // missing checkpoint fails fast; `None` (nothing loaded) when no aux loss is enabled.
+        let mut perceptual =
+            mlx_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context(&self.vae_dir))?;
 
         self.transformer_mut()?.cast_weights(compute_dtype)?;
 
         // --- prepare → cache: VAE-latents + prompt-embeds into memory before the loop ---
-        let (cache, sample_caps) = self.prepare_caches(req, edge, grid, on_progress)?;
+        let (cache, sample_caps) = self.prepare_caches(req, &edges, on_progress)?;
+        if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "mage_flow_base trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
+        }
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let target_paths = resolve_target_paths(self.transformer_ref()?, cfg);
@@ -488,6 +777,24 @@ impl MageFlowTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) sample each step trains on (round-robin over items for
+        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: every entry's perceptual reference built once, per-image, per-update
+        // alternation keyed on the real dataset item; a resumed run replays the skipped prefix so
+        // the phase matches.
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                &schedule,
+                accum,
+                start_step,
+                &req.cancel,
+            )?),
+            None => None,
+        };
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -495,36 +802,21 @@ impl MageFlowTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[((step - 1) as usize) % cache.len()];
-            let sigma = sample_sigma(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            )?;
-            let noise = random::normal::<f32>(
-                sample.latent_tokens.shape(),
-                None,
-                None,
-                Some(&random::key(
-                    cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                )?),
-            )?;
-            let (loss, grads) = compute_loss_grads(
+            let (losses, grads) = run_train_step(
                 self.transformer.as_mut().ok_or_else(|| {
                     mlx_gen::Error::Msg("mage_flow_base trainer: DiT was freed".into())
                 })?,
                 &params,
                 &adapter,
-                alpha,
-                rank,
-                sample,
-                grid,
-                sigma,
-                &noise,
+                cfg,
+                &cache,
+                &schedule,
+                aux_driver.as_mut(),
+                step,
                 mae,
                 compute_dtype,
             )?;
-            last_loss = loss;
+            last_loss = losses.total;
             steps_run = step;
             accumulate_grads(&mut accumulated, grads)?;
 
@@ -545,13 +837,8 @@ impl MageFlowTrainer {
                         .expect("an update fires only after accumulation"),
                     window,
                 )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
+                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
                 update_idx += 1;
             }
 
@@ -607,7 +894,7 @@ impl MageFlowTrainer {
                         &self.vae,
                         txt,
                         *txt_tokens,
-                        edge,
+                        preview_edge,
                         cfg.sample_steps.max(1) as usize,
                         cfg.sample_guidance_scale,
                         sample_seed as i64,
@@ -659,18 +946,19 @@ impl MageFlowTrainer {
     /// Cache the whole dataset (Mage-VAE latents + Qwen3-VL prompt embeddings) into memory, pre-encode
     /// the preview-sample prompts, then **drop the Qwen encoder** before the memory-heavy train loop —
     /// the prepare→cache lifecycle shared by the LoRA/LoKr and full base fine-tune paths (sc-14056).
-    /// Returns the per-sample cache and the pre-encoded preview prompts (empty when sampling is off).
+    /// Returns the per-sample cache — item-major, one entry per `edges` bucket
+    /// (`cache[item * edges.len() + bucket]`, sc-2127) — and the pre-encoded preview prompts (empty
+    /// when sampling is off).
     fn prepare_caches(
         &mut self,
         req: &TrainingRequest,
-        edge: u32,
-        grid: i32,
+        edges: &[u32],
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<(Vec<CachedSample>, Vec<SamplePrompt>)> {
         let cfg = &req.config;
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
-        let mut cache: Vec<CachedSample> = Vec::with_capacity(req.items.len());
+        let mut cache: Vec<CachedSample> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -680,27 +968,37 @@ impl MageFlowTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
-            let nchw = preprocess_to_nchw(&img, edge)?;
-            // Mage-VAE encode at t = 0 → posterior **mean** (`sample_posterior = false`), no latent
-            // scale/shift. `[1, 128, gh, gw]` → token layout `[1, gh·gw, 128]`.
-            let latent_tokens = self
-                .vae
-                .encode_mean(&nchw)?
-                .transpose_axes(&[0, 2, 3, 1])?
-                .reshape(&[1, grid * grid, LATENT_CHANNELS])?;
+            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
+            let mask = PreparedSubjectMask::load_if_enabled(
+                "mage_flow_base trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
             let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "mage_flow_base trainer: text encoder already freed (caching after loop)"
                         .into(),
                 )
             })?;
+            // The caption is encoded once per item and shared (refcounted) by every bucket entry.
             let (txt, txt_tokens) = encode_caption(text_encoder, &item.caption)?;
-            eval([&latent_tokens, &txt])?;
-            cache.push(CachedSample {
-                latent_tokens,
-                txt,
-                txt_tokens,
-            });
+            eval([&txt])?;
+            for (grid, latent_tokens, mask_weight) in
+                encode_buckets(edges, mask.as_ref(), |edge| {
+                    let nchw = preprocess_to_nchw(&img, edge)?;
+                    // Mage-VAE encode at t = 0 → posterior **mean** (`sample_posterior = false`), no
+                    // latent scale/shift. `[1, 128, gh, gw]`.
+                    self.vae.encode_mean(&nchw)
+                })?
+            {
+                cache.push(CachedSample {
+                    latent_tokens,
+                    txt: txt.clone(),
+                    txt_tokens,
+                    grid,
+                    mask_weight,
+                });
+            }
         }
         if cache.is_empty() {
             // Disambiguate cancel-during-caching (typed `Canceled`) from a genuinely unusable dataset.
@@ -758,8 +1056,8 @@ impl MageFlowTrainer {
     fn train_full_impl(
         &mut self,
         req: &TrainingRequest,
-        edge: u32,
-        grid: i32,
+        edges: &[u32],
+        preview_edge: u32,
         compute_dtype: Dtype,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<TrainingOutput> {
@@ -787,7 +1085,7 @@ impl MageFlowTrainer {
         let rope = MsRope::from_config(&dit_cfg)?;
 
         // Cache the dataset + drop the text encoder (shared with the LoRA path).
-        let (cache, sample_caps) = self.prepare_caches(req, edge, grid, on_progress)?;
+        let (cache, sample_caps) = self.prepare_caches(req, edges, on_progress)?;
 
         let mae = {
             let lt = normalize_cfg(&cfg.loss_type);
@@ -826,6 +1124,9 @@ impl MageFlowTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: the same bucket schedule as the adapter path.
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -833,7 +1134,7 @@ impl MageFlowTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[((step - 1) as usize) % cache.len()];
+            let sample = &cache[step_cache_index(&schedule, step)];
             let sigma = sample_sigma(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -847,12 +1148,9 @@ impl MageFlowTrainer {
                     cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
                 )?),
             )?;
-            // One packed segment: this image's latent grid + its caption tokens (native-res per-sample).
-            let layout = PackLayout::generation(
-                vec![ImgShape::latent(grid, grid)],
-                vec![sample.txt_tokens],
-            )?;
-            let ctx = PackContext::new(layout, &rope)?;
+            // One packed segment: this sample's own latent grid + its caption tokens (native-res
+            // per-sample; the grid is the sample's bucket, sc-2127).
+            let ctx = PackContext::new(sample_layout(sample)?, &rope)?;
             let (loss, grads) = compute_full_loss_grads(
                 &dit_cfg,
                 &params,
@@ -929,7 +1227,7 @@ impl MageFlowTrainer {
                                 &self.vae,
                                 txt,
                                 *txt_tokens,
-                                edge,
+                                preview_edge,
                                 cfg.sample_steps.max(1) as usize,
                                 cfg.sample_guidance_scale,
                                 sample_seed as i64,
@@ -1049,6 +1347,7 @@ fn compute_full_loss_grads(
     let (x_t, target, _timestep) = build_batch(&sample.latent_tokens, noise, sigma)?;
     let sigma_arr = Array::from_slice(&[sigma], &[1]); // one entry per packed segment
     let txt = sample.txt.clone();
+    let mask_weight = sample.mask_weight.clone();
     let ctx = ctx.clone();
     let cfg = cfg.clone();
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
@@ -1063,14 +1362,10 @@ fn compute_full_loss_grads(
             .forward_train(&x_t, &txt, &sigma_arr, &ctx)
             .map_err(|e| Exception::custom(e.to_string()))?;
         let diff = subtract(&v, &target)?;
-        // `mean(None)` → 0-d scalar (grad needs a scalar cotangent). v(bf16 on the bf16 path) − target
-        // (f32) promotes to f32, so the loss/grads are f32 (master weights).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
-        } else {
-            diff.square()?.mean(None)?
-        };
-        Ok(vec![loss])
+        // MSE / MAE, subject-mask weighted when on (sc-24828) → 0-d scalar (grad needs a scalar
+        // cotangent). v(bf16 on the bf16 path) − target (f32) promotes to f32, so the loss/grads are
+        // f32 (master weights).
+        Ok(vec![reduce_loss(&diff, mask_weight.as_ref(), mae)?])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
@@ -1208,9 +1503,116 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
     Ok(t.clamp(1e-3, 1.0 - 1e-3))
 }
 
-/// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), pack the
-/// single training sample, run the DiT training forward, regress the velocity toward `noise − x0`,
-/// return `(loss, grads)`.
+/// The per-step loss breakdown [`compute_loss_grads`] returns (epic 2123 E8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepLosses {
+    /// The differentiated step loss.
+    total: f32,
+    /// The diffusion (velocity) term; `None` on an aux-only step (it contributed zero).
+    diffusion: Option<f32>,
+    /// The weighted aux term; `None` when no aux loss contributed.
+    aux: Option<f32>,
+}
+
+/// One aux step's view of the trainer's [`PerceptualPath`].
+struct AuxStep<'a> {
+    path: &'a PerceptualPath,
+    plan: &'a StepPlan,
+    /// The (item, bucket) cache entry — selects the cached reference.
+    entry: usize,
+}
+
+/// Mage latent tokens `[1, g·g, C]` → the decoder's NCHW grid `[1, C, g, g]` (inverse of
+/// [`latent_grid_to_tokens`]).
+fn tokens_to_latent_grid(tokens: &Array, grid: i32) -> Result<Array> {
+    let channels = tokens.shape()[2];
+    Ok(tokens
+        .reshape(&[1, grid, grid, channels])?
+        .transpose_axes(&[0, 3, 1, 2])?)
+}
+
+/// The loop's [`AuxDriver`] (epic 2123 E8): every cache entry's perceptual reference, once per job
+/// (keyed per (item, bucket) entry); the alternation keyed on the schedule's items with `accum`
+/// micro-steps per update, and a resumed prefix `1..=start_step` replayed.
+fn aux_driver(
+    path: PerceptualPath,
+    cache: &[CachedSample],
+    schedule: &BucketSchedule,
+    accum: u32,
+    start_step: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
+) -> Result<AuxDriver> {
+    AuxDriver::prepare(
+        path,
+        cache.len(),
+        |i| tokens_to_latent_grid(&cache[i].latent_tokens, cache[i].grid),
+        schedule,
+        accum,
+        start_step,
+        cancel,
+    )
+}
+
+/// One LoRA/LoKr micro-step on the 1-based `step`: the step's (item, bucket) entry from the bucket
+/// schedule, its seeded σ + noise (exactly as before epic 2123), the perceptual plan when a path is
+/// configured (alternation keyed on the real item; an aux-only step trains at σ remapped into the
+/// loss window), then [`compute_loss_grads`]. With no path the step is bit-identical to before.
+#[allow(clippy::too_many_arguments)]
+fn run_train_step(
+    transformer: &mut MageTransformer,
+    params: &LoraParams,
+    adapter: &TrainAdapter,
+    cfg: &TrainingConfig,
+    cache: &[CachedSample],
+    schedule: &BucketSchedule,
+    perceptual: Option<&mut AuxDriver>,
+    step: u32,
+    mae: bool,
+    dtype: Dtype,
+) -> Result<(StepLosses, LoraParams)> {
+    let picked = step_sample(perceptual, step, schedule);
+    let sample = &cache[picked.entry];
+    let mut sigma = sample_sigma(
+        &cfg.timestep_type,
+        &cfg.timestep_bias,
+        cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
+    )?;
+    let noise = random::normal::<f32>(
+        sample.latent_tokens.shape(),
+        None,
+        None,
+        Some(&random::key(
+            cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
+        )?),
+    )?;
+    let planned = picked.plan(sigma)?;
+    if let Some(p) = &planned {
+        sigma = p.plan.noise_level;
+    }
+    let aux = planned.as_ref().map(|p| AuxStep {
+        path: p.path,
+        plan: &p.plan,
+        entry: p.entry,
+    });
+    compute_loss_grads(
+        transformer,
+        params,
+        adapter,
+        cfg.alpha,
+        cfg.rank as f32,
+        sample,
+        sigma,
+        &noise,
+        mae,
+        dtype,
+        aux,
+    )
+}
+
+/// One forward+backward over the adapter factors. `aux` (epic 2123 E8) carries the step's plan: on
+/// an aux-only step the diffusion term is not computed and the loss is the weighted aux term on the
+/// x0 estimate `x_t − σ·v` (Mage regresses `noise − x0`); with `aux = None` the traced graph is the
+/// pre-epic-2123 one.
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     transformer: &mut MageTransformer,
@@ -1219,20 +1621,24 @@ fn compute_loss_grads(
     alpha: f32,
     rank: f32,
     sample: &CachedSample,
-    grid: i32,
     sigma: f32,
     noise: &Array,
     mae: bool,
     dtype: Dtype,
-) -> Result<(f32, LoraParams)> {
+    aux: Option<AuxStep<'_>>,
+) -> Result<(StepLosses, LoraParams)> {
     let (x_t, target, _timestep) = build_batch(&sample.latent_tokens, noise, sigma)?;
-    // One packed segment: this image's latent grid + its caption tokens.
-    let layout =
-        PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![sample.txt_tokens])?;
-    let ctx = transformer.pack_context(layout)?;
+    // One packed segment: this sample's own latent grid (its bucket) + its caption tokens.
+    let ctx = transformer.pack_context(sample_layout(sample)?)?;
     let sigma_arr = Array::from_slice(&[sigma], &[1]); // one entry per packed segment
     let txt = sample.txt.clone();
+    let mask_weight = sample.mask_weight.clone();
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
+    let (diffusion_on, aux_on) = match &aux {
+        Some(a) => (a.plan.diffusion, !a.plan.aux.is_empty()),
+        None => (true, false),
+    };
+    let grid = sample.grid;
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
         // NEVER check the cancel flag inside this traced grad closure — it returns `MlxResult`, so an
         // early-out would be stringified through `Exception::custom` and lose the typed `Canceled`.
@@ -1241,19 +1647,43 @@ fn compute_loss_grads(
         let v = transformer
             .forward_train(&x_t, &txt, &sigma_arr, &ctx)
             .map_err(|e| Exception::custom(e.to_string()))?;
-        let diff = subtract(&v, &target)?;
-        // `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent). The v(bf16 on the
-        // bf16 path) − target(f32) subtract promotes to f32, so the loss/grads are f32 (master weights).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
+        let diffusion = if diffusion_on {
+            let diff = subtract(&v, &target)?;
+            // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+            // requires a scalar cotangent). The v(bf16 on the bf16 path) − target(f32) subtract
+            // promotes to f32, so the loss/grads are f32 (master weights).
+            Some(reduce_loss(&diff, mask_weight.as_ref(), mae)?)
         } else {
-            diff.square()?.mean(None)?
+            None
         };
-        Ok(vec![loss])
+        let aux_term = match &aux {
+            Some(a) if aux_on => {
+                let x0_hat = Parameterization::FlowNoiseMinusX0 { sigma }
+                    .recover_x0(&x_t.as_dtype(Dtype::Float32)?, &v.as_dtype(Dtype::Float32)?)
+                    .and_then(|x| tokens_to_latent_grid(&x, grid))
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                a.path
+                    .aux_loss(a.plan, a.entry, &x0_hat)
+                    .map_err(|e| Exception::custom(e.to_string()))?
+                    .map(|t| t.weighted)
+            }
+            _ => None,
+        };
+        let zero = || Array::from_f32(0.0);
+        let d_out = diffusion.clone().unwrap_or_else(zero);
+        let a_out = aux_term.clone().unwrap_or_else(zero);
+        let total =
+            combine_step_loss(diffusion, aux_term).map_err(|e| Exception::custom(e.to_string()))?;
+        Ok(vec![total, d_out, a_out])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
-    Ok((val[0].item::<f32>(), grads))
+    let losses = StepLosses {
+        total: val[0].item::<f32>(),
+        diffusion: diffusion_on.then(|| val[1].item::<f32>()),
+        aux: aux_on.then(|| val[2].item::<f32>()),
+    };
+    Ok((losses, grads))
 }
 
 /// Render one preview image from the in-progress adapter (already installed on `transformer`): a
@@ -1271,7 +1701,7 @@ fn render_sample(
     guidance: f32,
     seed: i64,
 ) -> Result<Image> {
-    let grid = (edge / VAE_DOWNSAMPLE_FACTOR) as i32;
+    let grid = latent_grid(edge);
     let key = GsKey::default();
     let tokens = encode_noise_tokens(grid, grid, seed, &key, Dtype::Bfloat16)?;
     let cond = cond_txt.as_dtype(Dtype::Bfloat16)?;
@@ -1308,9 +1738,42 @@ fn render_sample(
     })
 }
 
+/// sc-2127 × sc-24828: one item's cache entries, one per bucket edge (item-major order) — the
+/// bucket's latent grid, its clean latent (`encode(edge)` = `[1, C, grid, grid]`) laid out as
+/// tokens by [`latent_grid_to_tokens`], and its subject-mask loss weight: the item's already-loaded
+/// mask cropped with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's
+/// UNPACKED latent grid and laid out into tokens by the SAME [`latent_grid_to_tokens`]. `None`
+/// weights when masked loss is off.
+#[allow(clippy::type_complexity)]
+fn encode_buckets(
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    mut encode: impl FnMut(u32) -> Result<Array>,
+) -> Result<Vec<(i32, Array, Option<Array>)>> {
+    edges
+        .iter()
+        .map(|&edge| {
+            let grid = latent_grid(edge);
+            let latent = encode(edge)?;
+            let mask_weight = prepared_subject_mask_weight(
+                "mage_flow_base trainer",
+                mask,
+                CropBox::center_square,
+                latent.shape(),
+            )?
+            .map(|w| latent_grid_to_tokens(&w, grid))
+            .transpose()?;
+            let latent_tokens = latent_grid_to_tokens(&latent, grid)?;
+            eval([&latent_tokens])?;
+            Ok((grid, latent_tokens, mask_weight))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LATENT_CHANNELS;
     use mlx_gen::{CancelFlag, TrainingItem};
 
     fn base_request(
@@ -1479,6 +1942,8 @@ mod tests {
             latent_tokens,
             txt,
             txt_tokens,
+            grid,
+            mask_weight: None,
         };
         let noise = random::normal::<f32>(
             &[1, grid * grid, LATENT_CHANNELS],
@@ -1515,13 +1980,14 @@ mod tests {
                 8.0,
                 8.0,
                 &sample,
-                grid,
                 sigma,
                 &noise,
                 false,
                 Dtype::Bfloat16,
+                None,
             )
             .unwrap();
+            let loss = loss.total;
             losses.push(loss);
             opt.step(&mut params, &grads).unwrap();
             eval(params.values()).unwrap();
@@ -1555,6 +2021,323 @@ mod tests {
         // the shared `validate_full_finetune_request` floor turns a `false` here into a typed reject of
         // every full-tune request, which would strand the capability behind its own capability flag.
         assert!(d.supports_full_finetune);
+        // sc-2127: multi-resolution buckets are honored (adapter + full paths share the cache).
+        assert!(d.techniques.resolution_buckets);
+        // sc-24828: subject-masked loss is wired into BOTH loss paths (LoRA/LoKr and full fine-tune).
+        assert!(d.techniques.subject_mask_loss);
+    }
+
+    /// sc-24828: the subject-mask weight reaches BOTH Mage loss paths — the LoRA
+    /// [`compute_loss_grads`] and the full fine-tune [`compute_full_loss_grads`] — on the checked-in
+    /// tiny `mage_flow_small` fixture DiT (no real weights). The weight is built on the unpacked
+    /// `[1, C, g, g]` grid and laid into tokens by the SAME [`latent_grid_to_tokens`] as the latent.
+    /// Per path: an all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0 and
+    /// all-zero grads; a half map lands strictly between. The half map's token layout is checked too
+    /// (token `y·g + x` carries the weight of latent cell `(y, x)` on every channel).
+    #[test]
+    fn subject_mask_weight_reaches_both_loss_paths() {
+        use mlx_gen::train::loss::subject_mask_weight;
+        let fx = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mage_flow_small.safetensors"
+        ))
+        .unwrap();
+        let mut model_w = Weights::empty();
+        for key in fx.keys().map(str::to_string).collect::<Vec<_>>() {
+            if let Some(rest) = key.strip_prefix("model.") {
+                model_w.insert(
+                    rest,
+                    fx.require(&key).unwrap().as_dtype(Dtype::Float32).unwrap(),
+                );
+            }
+        }
+        let c = fx
+            .require("config")
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()
+            .to_vec();
+        let dit_cfg = MageFlowConfig {
+            in_channels: c[0],
+            out_channels: c[1],
+            context_in_dim: c[2],
+            hidden_size: c[3],
+            num_heads: c[4],
+            depth: c[5] as usize,
+            patch_size: c[6],
+            axes_dim: c[7..10].to_vec(),
+            checkpoint: false,
+        };
+        dit_cfg.validate().unwrap();
+
+        let g = 4i32;
+        let n = (g * g) as usize;
+        let grid_shape = [1, dit_cfg.in_channels, g, g];
+        let latent =
+            random::normal::<f32>(&grid_shape, None, None, Some(&random::key(1).unwrap())).unwrap();
+        let latent_tokens = latent_grid_to_tokens(&latent, g).unwrap();
+        let txt_tokens = 3;
+        let txt = random::normal::<f32>(
+            &[1, txt_tokens, dit_cfg.context_in_dim],
+            None,
+            None,
+            Some(&random::key(2).unwrap()),
+        )
+        .unwrap();
+        let noise = random::normal::<f32>(
+            latent_tokens.shape(),
+            None,
+            None,
+            Some(&random::key(3).unwrap()),
+        )
+        .unwrap();
+        let sample_with = |v: Option<&[f32]>| CachedSample {
+            latent_tokens: latent_tokens.clone(),
+            txt: txt.clone(),
+            txt_tokens,
+            grid: g,
+            mask_weight: v.map(|v| {
+                latent_grid_to_tokens(
+                    &subject_mask_weight(v, g as usize, g as usize, &grid_shape).unwrap(),
+                    g,
+                )
+                .unwrap()
+            }),
+        };
+        let half: Vec<f32> = (0..n)
+            .map(|i| if (i as i32) % g < g / 2 { 1.0 } else { 0.0 })
+            .collect();
+        // Token layout of the half map: token `y·g + x`, every channel, = cell (y, x).
+        {
+            let w = sample_with(Some(&half)).mask_weight.unwrap();
+            assert_eq!(w.shape(), latent_tokens.shape());
+            let w = multiply(&w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = w.as_slice::<f32>();
+            let ch = dit_cfg.in_channels as usize;
+            for tok in 0..n {
+                for k in 0..ch {
+                    assert_eq!(v[tok * ch + k], half[tok], "token {tok} channel {k}");
+                }
+            }
+        }
+        let ones = vec![1.0f32; n];
+        let zeros = vec![0.0f32; n];
+
+        // Generic check of one path: `run(map) -> (loss, grads)`.
+        type Run<'a> = dyn FnMut(Option<&[f32]>) -> (f32, LoraParams) + 'a;
+        let check = |label: &str, run: &mut Run<'_>| {
+            let (plain, _) = run(None);
+            assert!(plain > 0.0, "{label}: plain loss {plain}");
+            assert!(
+                (run(Some(&ones)).0 - plain).abs() < 1e-6,
+                "{label}: all-ones map must equal the unweighted loss"
+            );
+            let (loss, grads) = run(Some(&zeros));
+            assert_eq!(
+                loss, 0.0,
+                "{label}: an all-background map must zero the loss"
+            );
+            assert!(!grads.is_empty());
+            for (k, gr) in &grads {
+                let m = gr.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert_eq!(m, 0.0, "{label}: nonzero grad on {k}");
+            }
+            let (h, _) = run(Some(&half));
+            assert!(h > 0.0 && h < plain, "{label}: half {h} vs plain {plain}");
+        };
+
+        // LoRA path.
+        let mut model = MageTransformer::from_weights(&model_w, dit_cfg.clone()).unwrap();
+        let tcfg = TrainingConfig {
+            rank: 4,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&model, &tcfg);
+        assert!(!target_paths.is_empty());
+        let (targets, params) = build_lora_targets(&mut model, &target_paths, 4, 7).unwrap();
+        let scale = Array::from_slice(&[0.05f32], &[1]);
+        let params: LoraParams = params
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let r = random::normal::<f32>(
+                    v.shape(),
+                    None,
+                    None,
+                    Some(&random::key(100 + i as u64).unwrap()),
+                )
+                .unwrap();
+                (k.clone(), multiply(&r, &scale).unwrap())
+            })
+            .collect();
+        let adapter = TrainAdapter::Lora { targets };
+        check("lora", &mut |v| {
+            let (l, gr) = compute_loss_grads(
+                &mut model,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &sample_with(v),
+                0.5,
+                &noise,
+                false,
+                Dtype::Float32,
+                None,
+            )
+            .unwrap();
+            eval(gr.values()).unwrap();
+            (l.total, gr)
+        });
+
+        // Full fine-tune path (every DiT weight a master param).
+        let master: LoraParams = model_w
+            .keys()
+            .map(|k| (Rc::from(k), model_w.require(k).unwrap().clone()))
+            .collect();
+        let rope = MsRope::from_config(&dit_cfg).unwrap();
+        let ctx = PackContext::new(
+            PackLayout::generation(vec![ImgShape::latent(g, g)], vec![txt_tokens]).unwrap(),
+            &rope,
+        )
+        .unwrap();
+        check("full", &mut |v| {
+            let (l, gr) = compute_full_loss_grads(
+                &dit_cfg,
+                &master,
+                &sample_with(v),
+                &ctx,
+                0.5,
+                &noise,
+                false,
+                Dtype::Float32,
+            )
+            .unwrap();
+            eval(gr.values()).unwrap();
+            (l, gr)
+        });
+    }
+
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
+    /// bucket's latent token shape `[1, grid², C]`, and the background (right half of the
+    /// center-square crop, with `background_weight` 0) is zero at both grids. The 48×32 image's
+    /// center square is x ∈ [8, 40); the subject is x < 24 — the crop's left half. Token
+    /// `y·grid + x`, every channel, carries latent cell `(y, x)`.
+    #[test]
+    fn subject_mask_weight_is_computed_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (iw, ih) = (48u32, 32u32);
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::new(iw, ih).save(&image_path).unwrap();
+        let mask_path = tmp.path().join("a_mask.png");
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = gen_core::TrainingItem {
+            image_path,
+            caption: "a".into(),
+            subject_mask_path: Some(mask_path),
+            ..Default::default()
+        };
+        let mask_cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask =
+            mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
+        let edges = [4 * VAE_DOWNSAMPLE_FACTOR, 6 * VAE_DOWNSAMPLE_FACTOR];
+        let ch = 8usize;
+        let entries = encode_buckets(&edges, Some(&mask), |edge| {
+            let g = latent_grid(edge);
+            Ok(Array::zeros::<f32>(&[1, ch as i32, g, g])?)
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        for ((grid, x0, w), want) in entries.iter().zip([4i32, 6]) {
+            assert_eq!(*grid, want);
+            let w = w.as_ref().expect("mask loss on ⇒ a weight map");
+            assert_eq!(
+                w.shape(),
+                x0.shape(),
+                "weight must match its own bucket's latent"
+            );
+            assert_eq!(x0.shape(), &[1, want * want, ch as i32]);
+            let g = want as usize;
+            let dense = multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = dense.as_slice::<f32>();
+            for y in 0..g {
+                for x in 0..g {
+                    for k in 0..ch {
+                        let val = v[(y * g + x) * ch + k];
+                        if x < g / 2 {
+                            assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                        } else {
+                            assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn rb(resolution: u32, repeats: u32) -> gen_core::ResolutionBucket {
+        gen_core::ResolutionBucket {
+            resolution,
+            repeats,
+        }
+    }
+
+    /// sc-2127: with buckets off the step → cache index is exactly the pre-bucket
+    /// `(step - 1) % items`; with buckets [512×16, 1024×1] every epoch visits each item 16:1.
+    #[test]
+    fn step_cache_index_matches_legacy_round_robin_and_mixes_buckets() {
+        let off = TrainingConfig {
+            resolution: 768,
+            ..Default::default()
+        };
+        let one = BucketSchedule::new(5, &off.training_buckets(), 7);
+        for step in 1..=200u32 {
+            assert_eq!(step_cache_index(&one, step), ((step - 1) as usize) % 5);
+        }
+        let on = TrainingConfig {
+            resolution_buckets: vec![rb(512, 16), rb(1024, 1)],
+            ..Default::default()
+        };
+        let sched = BucketSchedule::new(3, &on.training_buckets(), 7);
+        let epoch = sched.epoch_len();
+        assert_eq!(epoch, 3 * 17);
+        let mut counts = [[0u32; 2]; 3];
+        for step in 1..=epoch as u32 {
+            let idx = step_cache_index(&sched, step);
+            counts[idx / 2][idx % 2] += 1;
+        }
+        assert_eq!(counts, [[16, 1]; 3]);
+    }
+
+    /// sc-2127: each bucket edge gets its own latent grid, and a cached sample is packed at the grid
+    /// it carries (not a run-wide one) — so a 512 and a 1024 entry pack 32² vs 64² image tokens.
+    #[test]
+    fn bucketed_samples_pack_at_their_own_grid() {
+        let cfg = TrainingConfig {
+            resolution_buckets: vec![rb(512, 1), rb(1024, 1)],
+            ..Default::default()
+        };
+        let grids: Vec<i32> = bucket_edges(&cfg).into_iter().map(latent_grid).collect();
+        assert_eq!(grids, vec![32, 64]);
+        for g in grids {
+            let sample = CachedSample {
+                latent_tokens: Array::zeros::<f32>(&[1, g * g, LATENT_CHANNELS]).unwrap(),
+                txt: Array::zeros::<f32>(&[1, 7, 8]).unwrap(),
+                txt_tokens: 7,
+                grid: g,
+                mask_weight: None,
+            };
+            assert_eq!(
+                sample_layout(&sample).unwrap(),
+                PackLayout::generation(vec![ImgShape::latent(g, g)], vec![7]).unwrap()
+            );
+        }
     }
 
     /// The capability claim and the acceptance must be one fact: because this trainer advertises
@@ -1758,14 +2541,13 @@ mod tests {
             latent_tokens,
             txt,
             txt_tokens,
+            grid,
+            mask_weight: None,
         };
 
         // A FIXED sigma + noise ⇒ a stationary objective. Build the pack context once.
         let rope = MsRope::from_config(&dit_cfg).unwrap();
-        let layout =
-            PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![sample.txt_tokens])
-                .unwrap();
-        let ctx = PackContext::new(layout, &rope).unwrap();
+        let ctx = PackContext::new(sample_layout(&sample).unwrap(), &rope).unwrap();
         let noise = random::normal::<f32>(
             &[1, grid * grid, LATENT_CHANNELS],
             None,
@@ -1937,5 +2719,433 @@ mod tests {
             max_abs > 0.0 && max_abs.is_finite(),
             "a full fine-tune must move the DiT: reloaded velocity == base (max_abs {max_abs})"
         );
+    }
+}
+
+/// sc-24830 (epic 2123 depth anchoring) — the Mage LoRA step seam on the committed tiny fixtures:
+/// the 2-block `mage_flow_small` DiT, a random-init tiny TAESD-shaped decoder + tiny DA2 (the
+/// builder's `testing::tiny_depth_path`) for the step tests, and the tiny committed Mage-VAE for the
+/// full-decoder fallback. Seconds, a few MB; no weights downloaded.
+#[cfg(test)]
+mod depth_anchoring_tests {
+    use super::*;
+    use mlx_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
+
+    fn fixture_model() -> (MageTransformer, MageFlowConfig) {
+        let fx = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mage_flow_small.safetensors"
+        ))
+        .unwrap();
+        let mut model_w = Weights::empty();
+        for key in fx.keys().map(str::to_string).collect::<Vec<_>>() {
+            if let Some(rest) = key.strip_prefix("model.") {
+                model_w.insert(
+                    rest,
+                    fx.require(&key).unwrap().as_dtype(Dtype::Float32).unwrap(),
+                );
+            }
+        }
+        let c = fx
+            .require("config")
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()
+            .to_vec();
+        let dit_cfg = MageFlowConfig {
+            in_channels: c[0],
+            out_channels: c[1],
+            context_in_dim: c[2],
+            hidden_size: c[3],
+            num_heads: c[4],
+            depth: c[5] as usize,
+            patch_size: c[6],
+            axes_dim: c[7..10].to_vec(),
+            checkpoint: false,
+        };
+        (
+            MageTransformer::from_weights(&model_w, dit_cfg.clone()).unwrap(),
+            dit_cfg,
+        )
+    }
+
+    fn schedule() -> AuxLossSchedule {
+        AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        }
+    }
+
+    fn cfg() -> TrainingConfig {
+        let mut cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            train_dtype: "f32".into(),
+            ..Default::default()
+        };
+        cfg.depth_anchoring.schedule = schedule();
+        cfg
+    }
+
+    /// `n` cached samples at grid 4 (64×64 decoded by the 16×… tiny decoder upsamples 8×, so 32×32).
+    fn cache_n(dit: &MageFlowConfig, n: u64) -> Vec<CachedSample> {
+        (0..n)
+            .map(|i| {
+                let g = 4;
+                let latent = random::normal::<f32>(
+                    &[1, dit.in_channels, g, g],
+                    None,
+                    None,
+                    Some(&random::key(100 + i).unwrap()),
+                )
+                .unwrap();
+                let txt = random::normal::<f32>(
+                    &[1, 3, dit.context_in_dim],
+                    None,
+                    None,
+                    Some(&random::key(200 + i).unwrap()),
+                )
+                .unwrap();
+                let latent_tokens = latent_grid_to_tokens(&latent, g).unwrap();
+                eval([&latent_tokens, &txt]).unwrap();
+                CachedSample {
+                    latent_tokens,
+                    txt,
+                    txt_tokens: 3,
+                    grid: g,
+                    mask_weight: None,
+                }
+            })
+            .collect()
+    }
+
+    fn single_bucket(n: usize) -> BucketSchedule {
+        BucketSchedule::new(
+            n,
+            &[gen_core::train::ResolutionBucket {
+                resolution: 64,
+                repeats: 1,
+            }],
+            7,
+        )
+    }
+
+    fn adapter(dit: &mut MageTransformer, cfg: &TrainingConfig) -> (TrainAdapter, LoraParams) {
+        let paths = resolve_target_paths(dit, cfg);
+        assert!(!paths.is_empty());
+        let (targets, params) = build_lora_targets(dit, &paths, cfg.rank as i32, cfg.seed).unwrap();
+        (TrainAdapter::Lora { targets }, params)
+    }
+
+    fn prepared(cache: &[CachedSample], channels: i32) -> AuxDriver {
+        let p = mlx_gen_perceptual::testing::tiny_depth_path(channels, schedule()).unwrap();
+        aux_driver(
+            p,
+            cache,
+            &single_bucket(cache.len()),
+            1,
+            0,
+            &Default::default(),
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        dit: &mut MageTransformer,
+        params: &LoraParams,
+        adapter: &TrainAdapter,
+        cfg: &TrainingConfig,
+        cache: &[CachedSample],
+        path: Option<&mut AuxDriver>,
+        n: u32,
+    ) -> (StepLosses, LoraParams) {
+        let (l, g) = run_train_step(
+            dit,
+            params,
+            adapter,
+            cfg,
+            cache,
+            &single_bucket(cache.len()),
+            path,
+            n,
+            false,
+            Dtype::Float32,
+        )
+        .unwrap();
+        eval(g.values()).unwrap();
+        (l, g)
+    }
+
+    fn abs_sum(g: &LoraParams, filter: &str) -> f32 {
+        let picked: Vec<f32> = g
+            .iter()
+            .filter(|(k, _)| k.ends_with(filter))
+            .map(|(_, v)| v.abs().unwrap().sum(None).unwrap().item::<f32>())
+            .collect();
+        assert!(!picked.is_empty(), "no '{filter}' grads");
+        picked.iter().sum()
+    }
+
+    /// AC1: a depth step has no diffusion term, its total IS the weighted depth term, and the LoRA
+    /// B factors get a nonzero gradient; a diffusion step carries no depth term. Mutation: force
+    /// `diffusion_on = true` in `compute_loss_grads` ⇒ red.
+    #[test]
+    fn depth_step_trains_the_lora_through_depth_only() {
+        let (mut dit, dcfg) = fixture_model();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(&dcfg, 1);
+        let mut d = prepared(&cache, dcfg.in_channels);
+        let (diff, _) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), 1);
+        assert_eq!(diff.aux, None);
+        assert_eq!(Some(diff.total), diff.diffusion);
+        let (depth, g) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), 2);
+        assert_eq!(
+            depth.diffusion, None,
+            "depth step computes no diffusion loss"
+        );
+        let aux = depth.aux.expect("depth term");
+        assert!(aux > 0.0 && aux.is_finite(), "depth term {aux}");
+        assert_eq!(depth.total, aux);
+        let gb = abs_sum(&g, ".lora_b");
+        assert!(gb > 0.0 && gb.is_finite(), "LoRA-B grad |Σ| = {gb}");
+    }
+
+    /// Alternation keys on the real item and references are built once per entry. Mutations: key
+    /// the plan on the global step ⇒ with 2 round-robin items each item is locked to one kind ⇒
+    /// red; build the references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
+    #[test]
+    fn every_item_alternates_and_references_are_built_once() {
+        let (mut dit, dcfg) = fixture_model();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(&dcfg, 2);
+        let mut d = prepared(&cache, dcfg.in_channels);
+        let mut kinds = vec![Vec::new(), Vec::new()];
+        for n in 1..=8u32 {
+            let (l, _) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), n);
+            kinds[((n - 1) % 2) as usize].push(l.aux.is_some());
+        }
+        for k in &kinds {
+            assert_eq!(k, &vec![false, true, false, true], "{kinds:?}");
+        }
+        assert_eq!(d.path().reference_computations(), cache.len());
+    }
+
+    /// E1: with no aux loss nothing is built and the step is bit-identical to the pre-epic-2123
+    /// LoRA step (its loss closure reproduced verbatim). Mutation: perturb the off-path diffusion
+    /// graph (scale `diff` by 1.0001 before `reduce_loss`) ⇒ red.
+    #[test]
+    fn everything_off_is_bit_identical_to_the_legacy_step() {
+        assert!(mlx_gen_perceptual::build_perceptual_path(
+            &TrainingConfig::default(),
+            &aux_loss_context(Path::new("/nonexistent"))
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            perceptual_footprint_gb(&TrainingConfig::default(), 1024, 10),
+            0.0
+        );
+        let (mut dit, dcfg) = fixture_model();
+        let cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(&dcfg, 1);
+        let (off, g_off) = step(&mut dit, &params, &adapter, &cfg, &cache, None, 1);
+        assert_eq!(off.aux, None);
+
+        let sample = &cache[0];
+        let sigma = sample_sigma(
+            &cfg.timestep_type,
+            &cfg.timestep_bias,
+            cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),
+        )
+        .unwrap();
+        let noise = random::normal::<f32>(
+            sample.latent_tokens.shape(),
+            None,
+            None,
+            Some(&random::key(cfg.seed.wrapping_add(1).wrapping_mul(2) + 1).unwrap()),
+        )
+        .unwrap();
+        let (x_t, target, _) = build_batch(&sample.latent_tokens, &noise, sigma).unwrap();
+        let ctx = dit.pack_context(sample_layout(sample).unwrap()).unwrap();
+        let sigma_arr = Array::from_slice(&[sigma], &[1]);
+        let txt = sample.txt.clone();
+        let dit_ref = &mut dit;
+        let adapter_ref = &adapter;
+        let legacy = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+            adapter_ref.install_as(dit_ref, &p, 4.0, 4.0, None, LOKR_DTYPE)?;
+            let v = dit_ref
+                .forward_train(&x_t, &txt, &sigma_arr, &ctx)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            Ok(vec![reduce_loss(&subtract(&v, &target)?, None, false)?])
+        };
+        let (val, g_legacy) = keyed_value_and_grad(legacy)(params.clone(), 0).unwrap();
+        eval(g_legacy.values()).unwrap();
+        assert_eq!(off.total, val[0].item::<f32>());
+        let bits =
+            |a: &Array| -> Vec<u32> { a.as_slice::<f32>().iter().map(|x| x.to_bits()).collect() };
+        for (k, v) in &g_legacy {
+            assert_eq!(bits(v), bits(&g_off[k]), "{k}");
+        }
+    }
+
+    /// E7: depth grows the estimate by the decoder + DA2 (more for Large), and the guard refuses at
+    /// a synthetic budget between base and base + aux (never the host's). Mutation: drop
+    /// `+ extra_gb` in `preflight_aux_memory` ⇒ red.
+    #[test]
+    fn memory_estimate_includes_the_aux_models() {
+        let mut on = TrainingConfig::default();
+        on.depth_anchoring.schedule = schedule();
+        let small = perceptual_footprint_gb(&on, 1024, 10);
+        on.depth_anchoring.model_size = DepthModelSize::Large;
+        let large = perceptual_footprint_gb(&on, 1024, 10);
+        assert!(
+            small > 0.0 && large - small > 1.0,
+            "small {small}, large {large}"
+        );
+        // Review fix: the base is the projected training step (resident + DiT activations), which
+        // grows with resolution. Mutation: drop the activation term from
+        // `projected_training_step_gb` ⇒ the 1024 base equals the resident peak ⇒ red.
+        let resident = crate::memory::generation_resident_gb(None);
+        let base = projected_training_step_gb(1024);
+        assert!(base > resident && projected_training_step_gb(512) < base);
+        let between = base + large / 2.0;
+        assert!(preflight_aux_memory(&on, 1024, 0.0, between).is_ok());
+        let err = preflight_aux_memory(&on, 1024, large, between)
+            .unwrap_err()
+            .to_string();
+        // The refusal names the enabled aux losses (the shared E7 guard).
+        assert!(err.contains("[depth]"), "{err}");
+        assert!(preflight_aux_memory(&on, 1024, large, (base + large) * 2.0).is_ok());
+        // A budget the resident peak + aux would fit but the training step + aux does not.
+        assert!(
+            preflight_aux_memory(&on, 1024, large, resident + large + (base - resident) / 2.0)
+                .is_err()
+        );
+    }
+
+    /// E3: declared; the full base fine-tune refuses it (typed); a missing decoder dir is named.
+    #[test]
+    fn descriptor_and_refusals() {
+        assert!(trainer_descriptor().techniques.depth_anchoring);
+        // sc-24831: the face losses ride the same builder arms.
+        assert!(trainer_descriptor().techniques.identity_loss);
+        assert!(trainer_descriptor().techniques.face_landmark_loss);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut req = TrainingRequest {
+            items: vec![mlx_gen::TrainingItem::captioned("a.png".into(), "c".into())],
+            config: cfg(),
+            output_dir: tmp.path().to_path_buf(),
+            file_name: "x.safetensors".into(),
+            trigger_words: vec![],
+            cancel: mlx_gen::CancelFlag::new(),
+        };
+        // The shared floor (gen-core) owns the full-fine-tune + aux refusal; the builtin decoder
+        // means no `perceptual_decoder_dir` is needed for the aux request to pass on LoRA.
+        req.config.depth_anchoring.model_dir = Some(tmp.path().join("da2"));
+        req.config.perceptual_decoder_dir = None;
+        let floor = |r: &TrainingRequest| {
+            gen_core::train::validate_training_techniques(&trainer_descriptor(), r)
+        };
+        assert!(floor(&req).is_ok(), "{:?}", floor(&req));
+        req.config.full_finetune = true;
+        assert!(matches!(floor(&req), Err(gen_core::Error::Unsupported(_))));
+        let mut c = cfg();
+        c.perceptual_decoder_dir = Some(tmp.path().join("no-vae"));
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let e = mlx_gen_perceptual::build_perceptual_path(
+            &c,
+            &aux_loss_context(&tmp.path().join("no-vae")),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("Mage-VAE decoder"), "{e}");
+    }
+
+    fn tiny_vae() -> MageVae {
+        let w = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mage_vae_tiny.safetensors"
+        ))
+        .unwrap();
+        let v: Vec<i32> = w
+            .require("fixture.shape")
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()
+            .to_vec();
+        let shape = crate::vae::denoiser::MageVaeShape {
+            patch: v[0],
+            hidden: v[1],
+            hidden_x: v[2],
+            in_channels: v[3],
+            bottleneck: v[4],
+            num_cond_blocks: v[5] as usize,
+            num_mlp_blocks: v[6] as usize,
+            max_freqs: v[7] as usize,
+            attn_tile: v[8],
+        };
+        MageVae::from_weights_with_shape(&w, Dtype::Float32, true, shape, "pipeline").unwrap()
+    }
+
+    /// The full-decoder fallback: the checkpointed Mage-VAE decode equals the plain decode mapped
+    /// to NHWC `[0, 1]`, and is differentiable in the latent. Mutations: drop the `(x+1)/2` map ⇒
+    /// values differ ⇒ red; `stop_gradient` the decode input ⇒ zero gradient ⇒ red.
+    #[test]
+    fn mage_vae_fallback_decoder_matches_the_plain_decode_and_flows_gradient() {
+        let vae = tiny_vae();
+        let bottleneck = vae.shape().bottleneck;
+        let z = random::normal::<f32>(
+            &[1, bottleneck, 2, 2],
+            None,
+            None,
+            Some(&random::key(9).unwrap()),
+        )
+        .unwrap();
+        let plain = vae.decode(&z).unwrap();
+        let expect = mlx_rs::ops::clip(
+            mlx_rs::ops::multiply(
+                mlx_rs::ops::add(&plain, Array::from_f32(1.0)).unwrap(),
+                Array::from_f32(0.5),
+            )
+            .unwrap(),
+            (&Array::from_f32(0.0), &Array::from_f32(1.0)),
+        )
+        .unwrap()
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
+        let dec = MageX0Decoder::new(vae);
+        let got = X0Decoder::decode(&dec, &z).unwrap();
+        assert_eq!(got.shape(), expect.shape());
+        let d = subtract(&got, &expect)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(d < 1e-6, "{d}");
+        let f = |x: &Array| -> MlxResult<Array> {
+            X0Decoder::decode(&dec, x)
+                .map_err(|e| Exception::custom(e.to_string()))?
+                .sum(None)
+        };
+        let g = mlx_rs::transforms::grad(f)(&z).unwrap();
+        let mag = g.abs().unwrap().sum(None).unwrap().item::<f32>();
+        assert!(mag > 0.0 && mag.is_finite(), "latent gradient {mag}");
     }
 }

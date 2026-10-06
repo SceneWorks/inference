@@ -10,6 +10,9 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+# Epic 2123 auxiliary perceptual losses (sc-24830): the shared builder every trainer calls
+# (depth anchoring today). Depends only on core + the aux-model crates (acyclic).
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
 mlx-gen = { path = ".." }
 # E2 (sc-7861) REUSES sibling encoder crates — SD3.5 ships no net-new text encoder:
 #   * mlx-gen-sdxl: the CLIP text encoder, loaded twice (CLIP-L `text_encoder` + CLIP-G/OpenCLIP

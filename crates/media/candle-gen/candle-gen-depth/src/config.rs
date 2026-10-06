@@ -80,6 +80,105 @@ impl DepthAnythingConfig {
         }
     }
 
+    /// `depth-anything/Depth-Anything-V2-Base-hf` (ViT-B/14): same graph, wider (the published
+    /// `config.json`; identical to the MLX twin's).
+    pub fn base() -> Self {
+        Self {
+            hidden_size: 768,
+            num_attention_heads: 12,
+            neck_hidden_sizes: [96, 192, 384, 768],
+            fusion_hidden_size: 128,
+            ..Self::small()
+        }
+    }
+
+    /// `depth-anything/Depth-Anything-V2-Large-hf` (ViT-L/14): 24 layers, captures layers
+    /// `[5, 12, 18, 24]`.
+    pub fn large() -> Self {
+        Self {
+            hidden_size: 1024,
+            num_hidden_layers: 24,
+            num_attention_heads: 16,
+            out_indices: [5, 12, 18, 24],
+            neck_hidden_sizes: [256, 512, 1024, 1024],
+            fusion_hidden_size: 256,
+            ..Self::small()
+        }
+    }
+
+    /// The config for a [`candle_gen::gen_core::train::DepthModelSize`].
+    pub fn for_size(size: candle_gen::gen_core::train::DepthModelSize) -> Self {
+        use candle_gen::gen_core::train::DepthModelSize;
+        match size {
+            DepthModelSize::Small => Self::small(),
+            DepthModelSize::Base => Self::base(),
+            DepthModelSize::Large => Self::large(),
+        }
+    }
+
+    /// Exact parameter count of the module graph `DepthAnythingV2::from_weights` loads (backbone +
+    /// neck + head) — for the trainer memory estimate (epic 2123 E7).
+    pub fn param_count(&self) -> u64 {
+        let h = self.hidden_size as u64;
+        let inter = self.intermediate_size() as u64;
+        let p = self.patch_size as u64;
+        let tokens = (self.grid() as u64).pow(2) + 1;
+        let mut n = h * 3 * p * p + h + h + tokens * h; // patch embed, cls, pos
+        let layer = 4 * h + 4 * (h * h + h) + 2 * h + (inter * h + inter) + (h * inter + h);
+        n += layer * self.num_hidden_layers as u64 + 2 * h;
+        let fh = self.fusion_hidden_size as u64;
+        for i in 0..4 {
+            let nh = self.neck_hidden_sizes[i] as u64;
+            n += nh * h + nh;
+            let f = self.reassemble_factors[i];
+            if f > 1.0 {
+                let k = f as u64;
+                n += nh * nh * k * k + nh;
+            } else if f < 1.0 {
+                n += nh * nh * 9 + nh;
+            }
+            n += fh * nh * 9;
+            n += 4 * (fh * fh * 9 + fh) + fh * fh + fh;
+        }
+        let half = fh / 2;
+        let hh = self.head_hidden_size as u64;
+        n += half * fh * 9 + half + hh * half * 9 + hh + hh + 1;
+        n
+    }
+
+    /// Conservative training working set of one differentiable forward + backward at the native
+    /// square [`image_size`](Self::image_size), in bytes (f32, x2 for cotangents) — the same
+    /// accounting as the MLX twin; not a measured value.
+    pub fn training_working_set_bytes(&self) -> u64 {
+        let tokens = (self.grid() as u64).pow(2) + 1;
+        let h = self.hidden_size as u64;
+        let heads = self.num_attention_heads as u64;
+        let per_layer = 2 * heads * tokens * tokens + (12 + 2 * self.mlp_ratio as u64) * tokens * h;
+        let backbone = per_layer * self.num_hidden_layers as u64;
+        let g = self.grid() as u64;
+        let fh = self.fusion_hidden_size as u64;
+        let fusion: u64 = (0..4).map(|k| 12 * fh * (g * (2 << k)).pow(2)).sum();
+        let full = (self.image_size as u64).pow(2);
+        let head = 6 * (fh / 2 + self.head_hidden_size as u64) * full;
+        (backbone + fusion + head) * 4 * 2
+    }
+
+    /// The aspect-preserving model input size for an `h x w` image (upstream
+    /// `DifferentiableDepthEncoder._aspect_preserving_hw`): long side -> [`image_size`](Self::image_size),
+    /// short side scaled and rounded to a multiple of the patch size (at least one patch).
+    pub fn input_hw(&self, h: usize, w: usize) -> (usize, usize) {
+        let (s, p) = (self.image_size, self.patch_size);
+        let short = |short: usize, long: usize| -> usize {
+            let scaled = (short as f64 * s as f64 / long as f64 / p as f64).round() as usize * p;
+            scaled.max(p)
+        };
+        if h >= w {
+            (s, short(w, h))
+        } else {
+            (short(h, w), s)
+        }
+    }
+
     /// `head_dim = hidden_size / num_attention_heads`.
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
@@ -110,6 +209,42 @@ impl DepthAnythingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Aspect-preserving model input: long side 518, short side a multiple of 14 (same sizes as
+    /// the MLX twin). Mutation: return `(s, s)` => red.
+    #[test]
+    fn input_hw_preserves_aspect_on_the_patch_grid() {
+        let c = DepthAnythingConfig::small();
+        assert_eq!(c.input_hw(1024, 1024), (518, 518));
+        assert_eq!(c.input_hw(768, 1024), (392, 518));
+        assert_eq!(c.input_hw(1024, 576), (518, 294));
+        assert_eq!(c.input_hw(10, 1000), (14, 518));
+        let (h, w) = c.input_hw(832, 1216);
+        assert_eq!((h % 14, w), (0, 518));
+    }
+
+    #[test]
+    fn sizes_grow_and_large_captures_its_published_layers() {
+        let (s, b, l) = (
+            DepthAnythingConfig::small(),
+            DepthAnythingConfig::base(),
+            DepthAnythingConfig::large(),
+        );
+        assert!(s.param_count() < b.param_count() && b.param_count() < l.param_count());
+        assert!(s.training_working_set_bytes() < l.training_working_set_bytes());
+        assert_eq!(l.capture_layers(), [4, 11, 17, 23]);
+        // ~24.8M (S) / ~335M (L) published parameter counts.
+        assert!(
+            (24_000_000..26_000_000).contains(&s.param_count()),
+            "{}",
+            s.param_count()
+        );
+        assert!(
+            (330_000_000..340_000_000).contains(&l.param_count()),
+            "{}",
+            l.param_count()
+        );
+    }
 
     #[test]
     fn small_geometry_is_the_shipped_vits() {

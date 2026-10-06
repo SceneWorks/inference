@@ -1,0 +1,70 @@
+//! Weights-free gen-core **Trainer contract** conformance for the candle SD3.5 trainers — both
+//! registered ids, `sd3_5_large` and `sd3_5_medium` (epic 2123 AT1) — runs on every CPU lane.
+//!
+//! Each trainer is loaded through the crate's registered `load_trainer` (the production path), which
+//! only probes `transformer/config.json` for a packed tier (absent ⇒ dense) and records the snapshot
+//! root. `validate` and the `train` refusal floors run before any weight is read, so an empty
+//! per-process snapshot dir drives `check_trainer_validate` and `check_trainer_technique_refusal`.
+
+use std::path::Path;
+
+use candle_gen::gen_core::{LoadSpec, Trainer, TrainingItem, WeightsSource};
+use gen_core_testkit::TrainerProfile;
+
+/// Two small swatch PNGs + captions in `dir`.
+fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
+    std::fs::create_dir_all(dir).unwrap();
+    [[200u8, 40, 40], [40, 80, 200]]
+        .iter()
+        .enumerate()
+        .map(|(i, color)| {
+            let path = dir.join(format!("img{i}.png"));
+            image::RgbImage::from_pixel(32, 32, image::Rgb(*color))
+                .save(&path)
+                .unwrap();
+            TrainingItem::captioned(path, format!("a solid colour swatch number {i}"))
+        })
+        .collect()
+}
+
+/// A per-process temp root (CI shares `$TMPDIR` across processes).
+fn temp_root(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("{tag}_trainer_wf_{}_", std::process::id()))
+        .tempdir()
+        .unwrap()
+}
+
+fn load_trainer(id: &str, snapshot: &Path) -> Box<dyn Trainer> {
+    candle_gen_sd3::provider_registry()
+        .unwrap()
+        .load_trainer(
+            id,
+            &LoadSpec::new(WeightsSource::Dir(snapshot.to_path_buf())),
+        )
+        .unwrap_or_else(|e| panic!("load the {id} trainer: {e}"))
+}
+
+#[test]
+fn sd3_trainers_validate_and_refuse_without_weights() {
+    let tmp = temp_root("sd3");
+    let snapshot = tmp.path().join("snapshot");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    let mut profile = TrainerProfile::cheap(
+        make_dataset(&tmp.path().join("data")),
+        tmp.path().join("out"),
+    );
+    // The default (bf16) load trains at bf16; `validate` refuses a mismatched train dtype.
+    profile.config.train_dtype = "bf16".to_owned();
+    for id in [candle_gen_sd3::MODEL_ID, candle_gen_sd3::MODEL_ID_MEDIUM] {
+        gen_core_testkit::check_trainer_validate(load_trainer(id, &snapshot).as_ref(), &profile)
+            .unwrap();
+        gen_core_testkit::check_trainer_technique_refusal(
+            &|| load_trainer(id, &snapshot),
+            &profile,
+        )
+        .unwrap();
+        gen_core_testkit::check_trainer_train_floors(&|| load_trainer(id, &snapshot), &profile)
+            .unwrap();
+    }
+}

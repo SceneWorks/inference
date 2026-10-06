@@ -88,29 +88,36 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
+use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
     TrainingRequest,
 };
 use candle_gen::gen_core::{
-    self, CancelFlag, Image, LoadSpec, Modality, NetworkType, Precision, Progress, RgbaImage,
+    self, BucketSchedule, CancelFlag, Image, LoadSpec, Modality, NetworkType, Precision, Progress,
+    RgbaImage,
 };
 use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{
     checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
 };
-use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
 use candle_gen::train::flow_match::{
-    self, apply_update, create_output_dir, effective_weight_decay, request_fingerprint,
-    sample_seed, save_adapter, validate_flow_match_request, velocity_loss,
+    self, apply_update, combine_terms, create_output_dir, effective_weight_decay,
+    prepared_subject_mask_weight, request_fingerprint, sample_seed, save_adapter, step_sample,
+    step_terms, validate_flow_match_request, weighted_velocity_loss, AuxDriver, AuxStep,
+    StepLosses, StepSample,
 };
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward_with_input_grad, Segment};
 use candle_gen::train::lora::{
     build_adapt_lokr_targets_peft, build_adapt_lora_targets, factorization, AdaptLoraHost, LoraSet,
 };
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
+use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
 use candle_gen::train::schedule::schedule_updates;
+use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError as Error, Result};
+use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
 
 use crate::config::{
     SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
@@ -118,7 +125,7 @@ use crate::config::{
 };
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decode_rgb, denoise, encode_references, joint_branch, joint_images,
+    create_noise, decode_rgb, denoise, encode_references, joint_branch, joint_images, joint_layout,
     missing_vision_tower, pack_latents, prepare_conditioning_references, DenoiseInputs,
     JointBranch, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
 };
@@ -431,12 +438,17 @@ pub struct AdapterFootprint {
 /// The shape of one training run, as far as memory is concerned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingShape {
-    /// Bucketed square training edge, in pixels.
+    /// Bucketed square training edge, in pixels — the **largest** resolution bucket's edge when
+    /// the run trains several (sc-2127, epic 2123 E7).
     pub edge: u32,
     /// Latent tokens of the largest **target**. `0` means the square `edge × edge` target every
     /// text-to-image item trains at; an edit run keeps each target's aspect ratio
     /// (`edit_target_size`), so it prices its largest target explicitly.
     pub target_tokens: u64,
+    /// Target latent tokens cached across the whole dataset — every item at every resolution
+    /// bucket (sc-2127). `0` means one target per item at [`target_tokens`](Self::target_tokens)
+    /// (the single-bucket cache).
+    pub target_cache_tokens: u64,
     /// The longest conditioning sequence (caption or preview prompt), in **text** tokens — the
     /// vision slots of an edit prompt are counted by [`reference_tokens`](Self::reference_tokens).
     pub caption_tokens: u64,
@@ -464,7 +476,8 @@ pub struct TrainingShape {
     /// of the keys and values up to its end and of those keys transposed, and the graph retains those
     /// copies. `0` falls back to `4 ·` the prefix.
     pub prefix_copy_rows: u64,
-    /// Dataset items (each caches one caption feature and one latent).
+    /// Dataset items (each caches one caption feature, and one target latent per resolution
+    /// bucket — [`target_cache_tokens`](Self::target_cache_tokens)).
     pub items: u64,
     /// Bytes per element of the DiT compute dtype (2 for bf16, 4 for f32). The text encoder's
     /// and the VAE's widths are already folded into [`FootprintFacts`]' byte counts.
@@ -476,6 +489,11 @@ pub struct TrainingShape {
     pub checkpointed: bool,
     /// Whether preview samples are rendered (keeps the VAE decoder resident).
     pub sampling: bool,
+    /// Epic 2123 E7: the training-time perceptual models' bytes (TAEQI2.1 + every enabled aux
+    /// loss + the cached per-entry references, from `candle_gen_perceptual::perceptual_footprint`),
+    /// resident through the train phase on the checkpointed and dense paths alike. `0` when no aux
+    /// loss is on.
+    pub perceptual_bytes: u64,
 }
 
 /// The derived peak of each stage of a run, in bytes. The stages never overlap (each drops its
@@ -538,11 +556,16 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
         .max(image_tokens * token_pixels)
         .max(shape.largest_reference_tokens * token_pixels);
 
-    // Caches (f32): caption text rows and packed latents (targets + edit references), per item.
+    // Caches (f32): caption text rows (shared by an item's bucket entries) and packed latents
+    // (targets at every bucket + edit references).
     let caption_cache = shape.items * text * facts.text_hidden * F32_WIDTH;
-    let latent_cache = (shape.items * image_tokens + shape.reference_cache_tokens)
-        * facts.latent_channels
-        * F32_WIDTH;
+    let target_cache = if shape.target_cache_tokens > 0 {
+        shape.target_cache_tokens
+    } else {
+        shape.items * image_tokens
+    };
+    let latent_cache =
+        (target_cache + shape.reference_cache_tokens) * facts.latent_channels * F32_WIDTH;
 
     // 1. captions: the language tower + one caption's per-layer live set. An edit caption also
     //    runs the vision tower (resident, plus one reference's patch stream and its full patch
@@ -662,6 +685,7 @@ pub fn training_footprint(facts: &FootprintFacts, shape: &TrainingShape) -> Trai
         (0, 0)
     };
     let train_phase = facts.dit_elements * w
+        + shape.perceptual_bytes
         + decoder_resident
         + shape.adapter.trainable_params
             * (TRAINABLE_BASE_BUFFERS + shape.optimizer_state_per_param)
@@ -687,6 +711,18 @@ pub fn check_training_footprint(
     facts: &FootprintFacts,
     shape: &TrainingShape,
     budget_bytes: u64,
+) -> Result<()> {
+    check_training_footprint_with(facts, shape, budget_bytes, &[])
+}
+
+/// [`check_training_footprint`] naming the run's enabled auxiliary losses (`aux_losses`, epic 2123
+/// E7 — `gen_core::train::enabled_aux_losses`) in the advice when their models are part of the
+/// refused figure, so the user knows which to turn off.
+pub fn check_training_footprint_with(
+    facts: &FootprintFacts,
+    shape: &TrainingShape,
+    budget_bytes: u64,
+    aux_losses: &[&str],
 ) -> Result<()> {
     let fp = training_footprint(facts, shape);
     let peak = fp.peak();
@@ -730,6 +766,18 @@ pub fn check_training_footprint(
     }
     if shape.sampling {
         advice.push("turn off preview samples (frees the VAE decoder)".to_string());
+    }
+    if shape.perceptual_bytes > 0 {
+        let named = if aux_losses.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", aux_losses.join(", "))
+        };
+        advice.push(format!(
+            "turn off the perceptual losses{named} or use the Small depth model (~{:.1} GiB of \
+             auxiliary models)",
+            gib(shape.perceptual_bytes)
+        ));
     }
     advice.push("lower the rank".to_string());
     Err(Error::Msg(format!(
@@ -837,6 +885,31 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Instruction-edit datasets (sc-24162), capped at the render path's own reference limit —
         // the one constant `collect_references`/`validate_reference_count` enforce.
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
+        // Epic 2123 S2 (sc-24827): weight noise + gradient noise at the adapter optimizer
+        // update.
+        // sc-2127 (epic 2123): honors `resolution_buckets` — every item (captioned or edit pair)
+        // is cached once per bucket edge and the loop walks a `BucketSchedule`.
+        // Subject-masked loss (sc-24828) on the target latent of both t2i and edit items.
+        // sc-24830 (epic 2123): depth anchoring through the shared perceptual path (TAEQI2.1 +
+        // Depth-Anything-V2) on the target latent of t2i and edit items, dense and checkpointed.
+        // sc-24833 (epic 2123): the VAE anchor (same family decoder → FLUX.2 encoder taps) through
+        // the shared aux-loss builder this trainer already drives. No E-LatentLPIPS: no published
+        // weights match this latent family, so `latent_lpips_loss` stays false (refused).
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            subject_mask_loss: true,
+            depth_anchoring: true,
+            // sc-24831: the face losses ride the same shared builder arms + x0 decoder.
+            identity_loss: true,
+            face_landmark_loss: true,
+            // sc-24832: the body losses ride the same builder arms as depth anchoring
+            // (decoded-x0 pixel losses through this trainer's x0 decoder).
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
+            vae_anchor_loss: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
@@ -1151,13 +1224,6 @@ fn caption_tokens(tokenizer: &TextTokenizer, drop: usize, caption: &str) -> Resu
     Ok(tokens.ids.len().saturating_sub(drop) as u64)
 }
 
-/// Encode a dataset image into the packed denoiser-space latent the DiT trains on: centre-crop +
-/// resize to `[1, 3, edge, edge]` in `[−1, 1]`, then [`encode_rgb_latents`] →
-/// `[1, (edge/16)², z_dim]` (f32).
-fn encode_latents(vae: &QwenImage21Vae, path: &Path, edge: u32, device: &Device) -> Result<Tensor> {
-    encode_rgb_latents(vae, load_image_tensor(path, edge, device)?)
-}
-
 /// An RGB NCHW `[1, 3, h, w]` image in `[−1, 1]` → its packed latent: widen to opaque RGBA (a
 /// constant `+1` alpha plane) when the VAE takes four channels, take the posterior **mode**,
 /// normalise `(z − mean)/std`, and flatten unpatched to `[1, (h/16)·(w/16), z_dim]` (f32).
@@ -1173,17 +1239,28 @@ fn encode_rgb_latents(vae: &QwenImage21Vae, rgb: Tensor) -> Result<Tensor> {
     Ok(pack_latents(&vae.normalize(&mode)?)?.detach())
 }
 
-/// Decode `path` and resize the **whole** picture (no crop) to `width × height` (Lanczos, the
-/// dataset loader's filter) → RGB NCHW `[1, 3, height, width]` in `[−1, 1]` (`px/127.5 − 1`, the
-/// dataset loader's normalisation) on `device`. An edit target's encode input.
-fn load_image_resized(path: &Path, width: u32, height: u32, device: &Device) -> Result<Tensor> {
-    let img = image::open(path)
+/// Decode `path` as RGB8 — the **whole** picture, no crop: an edit target's encode source, decoded
+/// once however many bucket edges it trains at (sc-2127).
+fn decode_target_picture(path: &Path) -> Result<image::RgbImage> {
+    Ok(image::open(path)
         .map_err(|e| Error::Msg(format!("{LABEL}: open image {}: {e}", path.display())))?
-        .to_rgb8();
+        .to_rgb8())
+}
+
+/// Resize a [`decode_target_picture`] picture to `width × height` (Lanczos, the dataset loader's
+/// filter) → RGB NCHW `[1, 3, height, width]` in `[−1, 1]` (`px/127.5 − 1`, the dataset loader's
+/// normalisation)
+/// on `device`. An edit target's encode input at one bucket edge.
+fn rgb_resized_tensor(
+    img: &image::RgbImage,
+    width: u32,
+    height: u32,
+    device: &Device,
+) -> Result<Tensor> {
     let resized = if img.dimensions() == (width, height) {
-        img
+        img.clone()
     } else {
-        image::imageops::resize(&img, width, height, image::imageops::FilterType::Lanczos3)
+        image::imageops::resize(img, width, height, image::imageops::FilterType::Lanczos3)
     };
     let (w, h) = (width as usize, height as usize);
     let mut data = vec![0f32; 3 * h * w];
@@ -1439,23 +1516,118 @@ fn target_tokens((width, height): (u32, u32)) -> u64 {
     (width / VAE_SCALE_FACTOR) as u64 * (height / VAE_SCALE_FACTOR) as u64
 }
 
-/// An item's packed target latent at [`edit_target_size`]: a captioned item's centre-cropped square
-/// (unchanged), an edit pair's whole picture at its aspect-preserving fit.
-fn encode_item_target(
+/// The target-latent sizing of a bucketed run (sc-2127): the latent tokens of the single largest
+/// target (every item at its [`edit_target_size`] for every bucket edge — the largest edge decides
+/// it, epic 2123 E7) and the target tokens the latent cache holds across the dataset (every item
+/// once per edge). With one edge the cache total is the per-item sum the single-bucket cache held.
+/// Reads only image headers.
+fn bucketed_target_tokens(items: &[TrainingItem], edges: &[u32]) -> Result<(u64, u64)> {
+    let (mut largest, mut cached) = (0u64, 0u64);
+    for item in items {
+        for &edge in edges {
+            let tokens = target_tokens(edit_target_size(item, edge)?);
+            largest = largest.max(tokens);
+            cached += tokens;
+        }
+    }
+    Ok((largest, cached))
+}
+
+/// An item's packed target latents, one per bucket edge in `edges` order (sc-2127), each at
+/// [`edit_target_size`] for that edge: a captioned item's centre-cropped square (unchanged), an
+/// edit pair's whole picture at its aspect-preserving fit. The image is decoded ONCE (the dataset
+/// kit's decode + centre crop for a captioned item, the whole picture for an edit pair) and resized
+/// per edge, so every bucket entry is exactly the single-bucket latent at that edge.
+fn encode_item_targets(
     vae: &QwenImage21Vae,
     item: &TrainingItem,
-    edge: u32,
+    edges: &[u32],
     device: &Device,
-) -> Result<Tensor> {
+) -> Result<Vec<Tensor>> {
     if item.is_edit_pair() {
-        let (width, height) = edit_target_size(item, edge)?;
-        encode_rgb_latents(
-            vae,
-            load_image_resized(&item.image_path, width, height, device)?,
-        )
+        let picture = decode_target_picture(&item.image_path)?;
+        edges
+            .iter()
+            .map(|&edge| {
+                let (width, height) = edit_target_size(item, edge)?;
+                encode_rgb_latents(vae, rgb_resized_tensor(&picture, width, height, device)?)
+            })
+            .collect()
     } else {
-        encode_latents(vae, &item.image_path, edge, device)
+        let square = decode_square(&item.image_path)?;
+        edges
+            .iter()
+            .map(|&edge| encode_rgb_latents(vae, square_image_tensor(&square, edge, device)?))
+            .collect()
     }
+}
+
+/// An item's subject-mask loss weight (sc-24828) at one bucket `edge`, from its already-loaded
+/// `mask` ([`PreparedSubjectMask::load_if_enabled`]), aligned token-for-token with that bucket's
+/// packed target latent `x0` (`[1, h·w, C]`): `None` when subject-masked loss is off. The mask is
+/// cropped exactly as [`encode_item_targets`] crops the target — a captioned item's centre square
+/// ([`CropBox::center_square`]), an edit pair's whole picture ([`CropBox::full`], the target is
+/// resized without a crop) — area-averaged onto the target's unpacked `[1, 1, h, w]` latent grid,
+/// then flattened by the target's own [`pack_latents`] to `[1, h·w, 1]` (broadcast over `C`). Only
+/// target tokens enter the loss (the DiT returns the target block), so references stay unweighted
+/// and excluded, as before.
+fn item_target_mask_weight(
+    item: &TrainingItem,
+    mask: Option<&PreparedSubjectMask>,
+    edge: u32,
+    x0: &Tensor,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    if mask.is_none() {
+        return Ok(None);
+    }
+    let edit = item.is_edit_pair();
+    let (width, height) = edit_target_size(item, edge)?;
+    let grid = [
+        1,
+        1,
+        (height / VAE_SCALE_FACTOR) as usize,
+        (width / VAE_SCALE_FACTOR) as usize,
+    ];
+    let crop = move |w, h| {
+        if edit {
+            CropBox::full(w, h)
+        } else {
+            CropBox::center_square(w, h)
+        }
+    };
+    let Some(weight) = prepared_subject_mask_weight(LABEL, mask, crop, &grid, device)? else {
+        return Ok(None);
+    };
+    let packed = pack_latents(&weight)?;
+    if packed.dim(1)? != x0.dim(1)? {
+        return Err(Error::Msg(format!(
+            "{LABEL}: subject mask grid {}x{} ({} tokens) does not match the packed target latent \
+             {:?}",
+            grid[2],
+            grid[3],
+            packed.dim(1)?,
+            x0.dims()
+        )));
+    }
+    Ok(Some(packed))
+}
+
+/// [`item_target_mask_weight`] for every bucket of one item (sc-24828 × sc-2127): `targets` are the
+/// item's packed target latents from [`encode_item_targets`] in `edges` order, and entry `b` is the
+/// weight of `targets[b]` at `edges[b]` — the same cache slot as its latent.
+fn bucket_target_mask_weights(
+    item: &TrainingItem,
+    mask: Option<&PreparedSubjectMask>,
+    edges: &[u32],
+    targets: &[Tensor],
+    device: &Device,
+) -> Result<Vec<Option<Tensor>>> {
+    edges
+        .iter()
+        .zip(targets)
+        .map(|(&edge, x0)| item_target_mask_weight(item, mask, edge, x0, device))
+        .collect()
 }
 
 /// One prompt's [`JointBranch`] through the render path's own assembly — the tower's
@@ -1479,20 +1651,40 @@ fn encode_branch(
 }
 
 /// One dataset item's text side, exactly as phase 1 caches it: its ordered references
-/// host-preprocessed by [`prepare_conditioning_references`], then [`encode_branch`] at the item's
-/// target size ([`edit_target_size`]). Returns the branch and the prepared references (the first
-/// item's also condition edit previews).
-fn item_branch(
+/// host-preprocessed by [`prepare_conditioning_references`], the conditioning encoded **once**,
+/// then one [`JointBranch`] per bucket edge in `edges` order (sc-2127) at the item's target size
+/// for that edge ([`edit_target_size`]). The branches share one detached f32 text-row tensor; only
+/// the layout (the target block's grid) differs per edge. With one edge this is exactly
+/// [`encode_branch`]. Returns the branches and the prepared references (the first item's also
+/// condition edit previews).
+fn item_branches(
     encoder: &QwenImage21TextEncoder,
     tokenizer: &TextTokenizer,
     drop: usize,
     item: &TrainingItem,
-    edge: u32,
-) -> Result<(JointBranch, Vec<PreparedReference>)> {
+    edges: &[u32],
+) -> Result<(Vec<JointBranch>, Vec<PreparedReference>)> {
     let references = prepare_conditioning_references(encoder, &decode_references(item)?)?;
-    let size = edit_target_size(item, edge)?;
-    let branch = encode_branch(encoder, tokenizer, drop, &item.caption, &references, size)?;
-    Ok((branch, references))
+    let conditioning = encoder.encode_conditioning(tokenizer, &item.caption, drop, &references)?;
+    let mut branches: Vec<JointBranch> = Vec::with_capacity(edges.len());
+    for &edge in edges {
+        let (width, height) = edit_target_size(item, edge)?;
+        let branch = match branches.first() {
+            None => {
+                let branch = joint_branch(&conditioning, &references, width, height)?;
+                JointBranch {
+                    text: branch.text.to_dtype(DType::F32)?.detach(),
+                    layout: branch.layout,
+                }
+            }
+            Some(first) => JointBranch {
+                text: first.text.clone(),
+                layout: joint_layout(&conditioning.image_pad_mask, &references, width, height)?,
+            },
+        };
+        branches.push(branch);
+    }
+    Ok((branches, references))
 }
 
 /// An edit item's reference latents, in reference order, through the render path's own host
@@ -1529,11 +1721,115 @@ struct Cached {
     layout: JointLayout,
     /// Packed reference latents, in reference order (empty for text-to-image).
     references: Vec<Tensor>,
+    /// Subject-mask loss weight `[1, h·w, 1]` over the target tokens (sc-24828); `None` when off.
+    mask_weight: Option<Tensor>,
 }
 
 /// `candle_core::Error` from the crate error, for the checkpoint segments' closures.
 fn to_core(e: Error) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
+}
+
+/// Qwen-Image 2.1's latent family for the shared aux-loss builder (epic 2123 E8): the RGBA
+/// autoencoder's 64-channel 16× latent, normalised `(z − mean)/std`, decoded by TAEQI2.1 (its
+/// wrapper sets `latents_mean = 0 / latents_std = 1`: it decodes that normalised latent directly).
+/// No latent-LPIPS family.
+fn aux_loss_context(device: &Device) -> AuxLossContext<'_> {
+    AuxLossContext {
+        label: LABEL,
+        decoder: taeqi_decoder(),
+        latent_lpips: None,
+        device,
+    }
+}
+
+fn taeqi_decoder() -> DecoderSpec {
+    DecoderSpec::Tiny {
+        name: "TAEQI2.1",
+        config: TinyDecoderSpec::taeqi2_1(),
+    }
+}
+
+/// The epic-2123 perceptual path for `cfg`: `None` when no aux loss is enabled (nothing loads).
+fn load_perceptual_path(cfg: &TrainingConfig, device: &Device) -> Result<Option<PerceptualPath>> {
+    candle_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context(device))
+}
+
+/// Extra training memory (bytes) of the enabled perceptual losses for a run whose largest decoded
+/// target is the square `edge` or (edit) `target_tokens` latent cells: TAEQI2.1 + each loss sized
+/// at the square of equal area, plus one reference per (item, bucket) cache entry (epic 2123 E7) —
+/// the same sizing as the MLX trainer. `0` when no aux loss is on.
+fn perceptual_footprint_bytes(
+    cfg: &TrainingConfig,
+    edge: u32,
+    target_tokens: u64,
+    entries: usize,
+) -> u64 {
+    let token_pixels = (VAE_SCALE_FACTOR * VAE_SCALE_FACTOR) as u64;
+    let pixels = (edge as u64 * edge as u64).max(target_tokens * token_pixels);
+    let side = (pixels as f64).sqrt().ceil() as u32;
+    candle_gen_perceptual::perceptual_footprint(
+        cfg,
+        &taeqi_decoder(),
+        AuxGeometry::image(side, entries),
+    )
+}
+
+/// A packed target latent `[1, h·w, C]` → the `[1, C, h, w]` grid TAEQI2.1 decodes (the inverse of
+/// [`pack_latents`]), with `(h, w)` the layout's target block (the last segment).
+fn target_decoder_latent(x0: &Tensor, layout: &JointLayout) -> Result<Tensor> {
+    let (h, w) = match layout.segments.last() {
+        Some(crate::transformer::Segment::Image { height, width }) => (*height, *width),
+        _ => {
+            return Err(Error::Msg(format!(
+                "{LABEL}: the joint layout must end with the target image block"
+            )))
+        }
+    };
+    let (b, _, c) = x0.dims3()?;
+    Ok(x0.transpose(1, 2)?.reshape((b, c, h, w))?.contiguous()?)
+}
+
+/// Epic 2123 E8: plan the step on the sampled `t` (the flow-match noise level, 1 = pure noise); an
+/// aux-only step trains at the plan's remapped `t`. `(t, None)` without a perceptual path.
+fn plan_t<'a>(sample: &StepSample<'a>, t: f32) -> Result<(f32, Option<AuxStep<'a>>)> {
+    let aux = sample.plan(t)?;
+    // Always the plan's level: an aux-only step's remapped `t`, and also a claimed step that
+    // `StepPlan::without_skipped` reverted to diffusion (it still trains at the remapped `t`).
+    let t = aux.as_ref().map_or(t, |a| a.noise_level());
+    Ok((t, aux))
+}
+
+/// The step's loss on the target block's velocity `v`: the flow-match regression and — epic 2123
+/// E8, when `aux` plans one — the weighted perceptual term on the model's x0 estimate `x_t − t·v`
+/// (the velocity target is `noise − x0`), unpacked to TAEQI2.1's grid. On an aux-only step the
+/// diffusion term is not computed; `aux = None` is exactly the pre-epic-2123 loss.
+#[allow(clippy::too_many_arguments)]
+fn target_step_loss(
+    v: &Tensor,
+    target: &Tensor,
+    x_t_f32: &Tensor,
+    t: f32,
+    layout: &JointLayout,
+    mask_weight: Option<&Tensor>,
+    mae: bool,
+    aux: Option<&AuxStep<'_>>,
+) -> Result<(Tensor, StepLosses)> {
+    let (diffusion_on, aux_on) = step_terms(aux);
+    let diffusion = if diffusion_on {
+        Some(weighted_velocity_loss(v, target, mask_weight, mae)?)
+    } else {
+        None
+    };
+    let aux_term = match aux {
+        Some(a) if aux_on => {
+            let x0_hat = Parameterization::FlowNoiseMinusX0 { sigma: t }
+                .recover_x0(x_t_f32, &v.to_dtype(DType::F32)?)?;
+            a.aux_loss(&target_decoder_latent(&x0_hat, layout)?)?
+        }
+        _ => None,
+    };
+    combine_terms(diffusion, aux_term)
 }
 
 /// The per-step inputs of one loss evaluation.
@@ -1548,14 +1844,20 @@ struct StepInputs<'a> {
     references: &'a [Tensor],
     noise: &'a Tensor,
     t: f32,
+    /// Subject-mask loss weight over the target tokens (sc-24828); `None` = unweighted.
+    mask_weight: Option<&'a Tensor>,
+    /// Epic 2123 E8: the step's planned perceptual step ([`target_step_loss`]); `None` = the plain
+    /// diffusion step.
+    aux: Option<&'a AuxStep<'a>>,
 }
 
 /// One micro-step's forward+backward over the trainable factors: build `x_t` at flow-match `t`,
 /// predict the velocity through [`QwenImage21Transformer::forward_train_joint`] over the joint
 /// sequence — the denoise loop's own image stream ([`joint_images`]: references in order, then the
 /// noised target) on the step's layout, raw `t`, no sign flip — regress the **target block's**
-/// velocity onto `noise − x0` in f32, and return `(loss, grads)` keyed by `vars`. The DiT returns
-/// the target block only, so the condition tokens never enter the loss.
+/// velocity onto `noise − x0` in f32 (plus the planned perceptual term, [`target_step_loss`]), and
+/// return the step's [`StepLosses`] + grads keyed by `vars`. The DiT returns the target block only,
+/// so the condition tokens never enter the loss.
 ///
 /// `checkpoint` selects the gradient-checkpointed backward: the retained pre-block forward
 /// ([`QwenImage21Transformer::train_prelude`] — the global projections, so a global target trains
@@ -1570,7 +1872,7 @@ fn compute_loss_grads(
     step: &StepInputs<'_>,
     mae: bool,
     checkpoint: bool,
-) -> Result<(f32, GradStore)> {
+) -> Result<(StepLosses, GradStore)> {
     let StepInputs {
         x0,
         text,
@@ -1578,15 +1880,17 @@ fn compute_loss_grads(
         references,
         noise,
         t,
+        mask_weight,
+        aux,
     } = *step;
-    let (x_t, target) = flow_match::build_batch(x0, noise, t as f64)?;
-    let x_t = x_t.to_dtype(dit.compute_dtype())?;
+    let (x_t_f32, target) = flow_match::build_batch(x0, noise, t as f64)?;
+    let x_t = x_t_f32.to_dtype(dit.compute_dtype())?;
     let images = joint_images(references, &x_t);
     if !checkpoint {
         let v = dit.forward_train_joint(text, &images, t, layout)?;
-        let loss = velocity_loss(&v, &target, mae)?;
-        let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-        return Ok((value, loss.backward()?));
+        let (loss, losses) =
+            target_step_loss(&v, &target, &x_t_f32, t, layout, mask_weight, mae, aux)?;
+        return Ok((losses, loss.backward()?));
     }
 
     let prelude = dit.train_prelude_joint(text, &images, t, layout)?;
@@ -1597,6 +1901,9 @@ fn compute_loss_grads(
         prelude.out_rows.clone(),
     ];
     let inputs: Vec<Tensor> = retained.iter().map(Tensor::detach).collect();
+    // The final segment's loss breakdown is read back through `parts` (declared before the
+    // segments, which borrow it).
+    let parts = std::cell::Cell::new(None);
     let mut segments: Vec<Segment> = Vec::with_capacity(dit.num_blocks() + 1);
     for index in 0..dit.num_blocks() {
         segments.push(Box::new(move |state: &[Tensor]| {
@@ -1606,16 +1913,23 @@ fn compute_loss_grads(
             Ok(vec![x, state[1].clone(), state[2].clone()])
         }));
     }
-    let target_ref = &target;
+    let (target_ref, x_t_ref, parts_ref) = (&target, &x_t_f32, &parts);
     segments.push(Box::new(move |state: &[Tensor]| {
         let v = dit
             .train_head(&state[0], &state[2], geometry)
             .map_err(to_core)?;
-        Ok(vec![velocity_loss(&v, target_ref, mae)?])
+        let (loss, losses) =
+            target_step_loss(&v, target_ref, x_t_ref, t, layout, mask_weight, mae, aux)
+                .map_err(to_core)?;
+        parts_ref.set(Some(losses));
+        Ok(vec![loss])
     }));
-    let (loss, mut grads, cotangents) =
+    let (_, mut grads, cotangents) =
         checkpointed_backward_with_input_grad(&segments, &inputs, vars)?;
     drop(segments);
+    let losses = parts
+        .take()
+        .ok_or_else(|| Error::Msg(format!("{LABEL}: the checkpointed loss segment never ran")))?;
 
     // Continue the chain rule into the retained pre-block forward: `s = Σ ⟨retainedₖ, cotₖ⟩`, then
     // `s.backward()` delivers the global adapters' grads (the cotangents are detached constants).
@@ -1640,7 +1954,7 @@ fn compute_loss_grads(
             }
         }
     }
-    Ok((loss, grads))
+    Ok((losses, grads))
 }
 
 /// Render a preview from the in-progress (frozen — graph-free) adapter through the crate's own
@@ -1707,6 +2021,9 @@ impl Trainer for QwenImage21Trainer {
         // trainer is a typed `Unsupported`, never a silently trained plain adapter.
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+        // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         // Instruction-edit datasets: the shared floor caps references at this descriptor's
         // `max_reference_images` (the render path's own cap) and refuses mixed or hybrid
         // datasets; the snapshot must also carry the vision tower the references go through.
@@ -1732,6 +2049,9 @@ impl Trainer for QwenImage21Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
+        // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
@@ -1779,7 +2099,11 @@ impl QwenImage21Trainer {
         };
 
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). Every item trains at each edge; the preflight and the previews size for the
+        // largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
+        let edge = edges.iter().copied().max().unwrap_or(0);
 
         // --- preflight: the derived peak against this device, before any weight is read ---
         // Edit previews condition on the first item's references (see `render_sample`). A bad
@@ -1792,11 +2116,8 @@ impl QwenImage21Trainer {
         let mut longest = 0u64;
         let (mut reference_tokens, mut largest_reference_tokens, mut reference_cache_tokens) =
             (0u64, 0u64, 0u64);
-        let mut largest_target_tokens = 0u64;
-        for item in &req.items {
-            largest_target_tokens =
-                largest_target_tokens.max(target_tokens(edit_target_size(item, edge)?));
-        }
+        let (largest_target_tokens, target_cache_tokens) =
+            bucketed_target_tokens(&req.items, &edges)?;
         let (mut prefix_scores, mut largest_prefix_call, mut prefix_copy_rows) = (0u64, 0u64, 0u64);
         let mut prompts: Vec<PreflightPrompt<'_>> = Vec::new();
         for item in &req.items {
@@ -1852,6 +2173,7 @@ impl QwenImage21Trainer {
         let shape = TrainingShape {
             edge,
             target_tokens: largest_target_tokens,
+            target_cache_tokens,
             caption_tokens: longest,
             reference_tokens,
             largest_reference_tokens,
@@ -1865,14 +2187,28 @@ impl QwenImage21Trainer {
             optimizer_state_per_param: optimizer_state_per_param(&cfg.optimizer),
             checkpointed,
             sampling: sampling_requested,
+            perceptual_bytes: perceptual_footprint_bytes(
+                cfg,
+                edge,
+                largest_target_tokens,
+                req.items.len() * edges.len(),
+            ),
         };
         let budget = self
             .memory_budget_override
             .unwrap_or_else(|| device_budget_bytes(&device));
-        check_training_footprint(&self.facts, &shape, budget)?;
+        check_training_footprint_with(
+            &self.facts,
+            &shape,
+            budget,
+            &gen_core::train::enabled_aux_losses(cfg),
+        )?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // Epic 2123 E8: the frozen perceptual models load before the (minutes-long) caching, so a
+        // missing checkpoint fails fast (`None` — nothing loaded — when no aux loss is on).
+        let perceptual = load_perceptual_path(cfg, &device)?;
         // Every input that selects the cached data, so a resume against a changed dataset is
         // refused rather than continued on different data.
         let fingerprint = request_fingerprint(req)?;
@@ -1901,15 +2237,16 @@ impl QwenImage21Trainer {
                     (edge, edge),
                 )
             };
-            let mut branches: Vec<JointBranch> = Vec::with_capacity(req.items.len());
+            // One `Vec` of per-edge branches per item (sc-2127), in `edges` order.
+            let mut branches: Vec<Vec<JointBranch>> = Vec::with_capacity(req.items.len());
             let mut sample_references = Vec::new();
             for (i, item) in req.items.iter().enumerate() {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
-                let (branch, references) =
-                    item_branch(&encoder, &self.tokenizer, self.drop_count, item, edge)?;
-                branches.push(branch);
+                let (per_edge, references) =
+                    item_branches(&encoder, &self.tokenizer, self.drop_count, item, &edges)?;
+                branches.push(per_edge);
                 if i == 0 && edit && sampling_requested {
                     sample_references = references;
                 }
@@ -1932,8 +2269,10 @@ impl QwenImage21Trainer {
         //        is then dropped ---
         let mut vae = loader::load_vae(&self.root, &device)?;
         let total = req.items.len() as u32;
-        let mut cache: Vec<Cached> = Vec::with_capacity(req.items.len());
-        for (i, (item, branch)) in req.items.iter().zip(branches).enumerate() {
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). An item's bucket entries
+        // share its text rows and reference latents (refcounted clones).
+        let mut cache: Vec<Cached> = Vec::with_capacity(req.items.len() * edges.len());
+        for (i, (item, per_edge)) in req.items.iter().zip(branches).enumerate() {
             if req.cancel.is_cancelled() {
                 break;
             }
@@ -1941,14 +2280,23 @@ impl QwenImage21Trainer {
                 current: i as u32 + 1,
                 total,
             });
-            let x0 = encode_item_target(&vae, item, edge, &device)?;
+            let targets = encode_item_targets(&vae, item, &edges, &device)?;
+            // The item's subject mask, read + checked once (None when masked loss is off), then
+            // weighted onto each bucket's own packed target (sc-24828 × sc-2127).
+            let mask =
+                PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
+            let mask_weights =
+                bucket_target_mask_weights(item, mask.as_ref(), &edges, &targets, &device)?;
             let references = encode_item_references(&vae, vision.as_ref(), item, &device)?;
-            cache.push(Cached {
-                x0,
-                text: branch.text,
-                layout: branch.layout,
-                references,
-            });
+            for ((x0, branch), mask_weight) in targets.into_iter().zip(per_edge).zip(mask_weights) {
+                cache.push(Cached {
+                    x0,
+                    text: branch.text,
+                    layout: branch.layout,
+                    references: references.clone(),
+                    mask_weight,
+                });
+            }
         }
         // Cancelled during caching: nothing has trained, so write nothing (and skip the DiT load).
         if req.cancel.is_cancelled() {
@@ -2017,6 +2365,44 @@ impl QwenImage21Trainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) entry each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: each (item, bucket) entry's reference once (its packed target unpacked to
+        // the decoder grid), alternation keyed on the real item, the resumed prefix replayed.
+        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+        // cropped like the image and resampled onto its decoded size.
+        let mut perceptual = perceptual;
+        if let Some(path) = perceptual.as_mut() {
+            path.attach_subject_masks(
+                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load_with(
+                    "qwen_image_2_1 trainer",
+                    &req.items,
+                    cfg,
+                    edges.len(),
+                    |item| {
+                        if item.is_edit_pair() {
+                            CropBox::full
+                        } else {
+                            CropBox::center_square
+                        }
+                    },
+                )?,
+            );
+        }
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(AuxDriver::prepare(
+                path,
+                cache.len(),
+                |i| target_decoder_latent(&cache[i].x0, &cache[i].layout),
+                &schedule,
+                accum,
+                start_step,
+                &req.cancel,
+            )?),
+            None => None,
+        };
         let mut accumulated: Option<GradStore> = None;
         let mut pending = 0u32;
         let mut last_loss = 0.0f32;
@@ -2028,7 +2414,8 @@ impl QwenImage21Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let sample = &cache[((step - 1) as usize) % cache.len()];
+            let picked = step_sample(aux_driver.as_mut(), step, &schedule);
+            let sample = &cache[picked.entry];
             let t = flow_match::sample_unit_timestep(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
@@ -2039,7 +2426,8 @@ impl QwenImage21Trainer {
                 flow_match::noise_seed(cfg.seed, step),
                 &device,
             )?;
-            let (loss, grads) = compute_loss_grads(
+            let (t, aux) = plan_t(&picked, t)?;
+            let (losses, grads) = compute_loss_grads(
                 &dit,
                 &set.vars,
                 &StepInputs {
@@ -2049,11 +2437,13 @@ impl QwenImage21Trainer {
                     references: &sample.references,
                     noise: &noise,
                     t,
+                    mask_weight: sample.mask_weight.as_ref(),
+                    aux: aux.as_ref(),
                 },
                 mae,
                 checkpointed,
             )?;
-            last_loss = loss;
+            last_loss = losses.total;
             steps_run = step;
             accumulate_grads(&mut accumulated, grads, &set.vars)?;
             pending += 1;
@@ -2067,6 +2457,7 @@ impl QwenImage21Trainer {
                     update_idx,
                     total_updates,
                     warmup_updates,
+                    cfg.seed,
                 )?;
                 pending = 0;
                 update_idx += 1;
@@ -2160,6 +2551,7 @@ impl QwenImage21Trainer {
                 update_idx,
                 total_updates,
                 warmup_updates,
+                cfg.seed,
             )?;
             if resume_due {
                 save_resume(
@@ -2197,6 +2589,28 @@ mod tests {
     fn tiny_snapshot() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/tiny-snapshot")
+    }
+
+    /// The single-bucket branch of [`item_branches`] (the pre-bucket `item_branch`).
+    fn item_branch(
+        encoder: &QwenImage21TextEncoder,
+        tokenizer: &TextTokenizer,
+        drop: usize,
+        item: &TrainingItem,
+        edge: u32,
+    ) -> Result<(JointBranch, Vec<PreparedReference>)> {
+        let (mut branches, references) = item_branches(encoder, tokenizer, drop, item, &[edge])?;
+        Ok((branches.remove(0), references))
+    }
+
+    /// The single-bucket latent of [`encode_item_targets`] (the pre-bucket `encode_item_target`).
+    fn encode_item_target(
+        vae: &QwenImage21Vae,
+        item: &TrainingItem,
+        edge: u32,
+        device: &Device,
+    ) -> Result<Tensor> {
+        Ok(encode_item_targets(vae, item, &[edge], device)?.remove(0))
     }
 
     /// A per-process scratch directory, removed on drop.
@@ -2288,6 +2702,9 @@ mod tests {
         assert!(d.supports_lora && d.supports_lokr);
         assert!(!d.supports_control && !d.supports_full_finetune);
         assert_eq!(d.max_reference_images as usize, MAX_REFERENCE_IMAGES);
+        // sc-2127: multi-resolution buckets are honored (the shared floor would refuse them
+        // otherwise).
+        assert!(d.techniques.resolution_buckets);
     }
 
     #[test]
@@ -2705,6 +3122,7 @@ mod tests {
         TrainingShape {
             edge,
             target_tokens: 0,
+            target_cache_tokens: 0,
             caption_tokens: 64,
             reference_tokens: 0,
             largest_reference_tokens: 0,
@@ -2718,6 +3136,7 @@ mod tests {
             optimizer_state_per_param: 2,
             checkpointed,
             sampling: false,
+            perceptual_bytes: 0,
         }
     }
 
@@ -2808,6 +3227,7 @@ mod tests {
         let base = TrainingShape {
             edge,
             target_tokens: side * side,
+            target_cache_tokens: 0,
             caption_tokens: 25,
             reference_tokens: 0,
             largest_reference_tokens: 0,
@@ -2821,6 +3241,7 @@ mod tests {
             optimizer_state_per_param: 2,
             checkpointed: true,
             sampling: true,
+            perceptual_bytes: 0,
         };
         match edit {
             None => base,
@@ -3099,6 +3520,85 @@ mod tests {
         assert_eq!(many - few, 1000 * per_item);
     }
 
+    /// sc-2127 (epic 2123 E7): a bucketed run's preflight prices its **largest** target (the
+    /// largest edge decides it) and a latent cache that holds every item at every bucket; one
+    /// bucket is exactly the single-bucket cache.
+    ///
+    /// *Mutations that red this:* `bucketed_target_tokens` sizing `largest` from the first edge,
+    /// or caching only one edge per item; `training_footprint` ignoring `target_cache_tokens`.
+    #[test]
+    fn bucketed_preflight_sizes_for_the_largest_edge_and_caches_every_bucket() {
+        let captioned = |n: usize| -> Vec<TrainingItem> {
+            (0..n)
+                .map(|i| {
+                    TrainingItem::captioned(
+                        PathBuf::from(format!("/nonexistent/{i}.png")),
+                        "x".into(),
+                    )
+                })
+                .collect()
+        };
+        let (t512, t1024) = ((512 / 16) * (512 / 16), (1024 / 16) * (1024 / 16));
+        assert_eq!(
+            bucketed_target_tokens(&captioned(3), &[512, 1024]).unwrap(),
+            (t1024, 3 * (t512 + t1024))
+        );
+        assert_eq!(
+            bucketed_target_tokens(&captioned(3), &[1024, 512]).unwrap(),
+            (t1024, 3 * (t512 + t1024)),
+            "order-independent"
+        );
+        assert_eq!(
+            bucketed_target_tokens(&captioned(3), &[1024]).unwrap(),
+            (t1024, 3 * t1024)
+        );
+
+        // An edit pair's aspect-preserving target is priced per edge too.
+        let tmp = scratch("bucket_tokens");
+        let wide = write_png(tmp.path(), "wide.png", 256, 128, 1);
+        let reference = write_png(tmp.path(), "ref.png", 64, 64, 2);
+        let pair = [TrainingItem::edit_pair(wide, "w".into(), vec![reference])];
+        let (small, large) = (
+            target_tokens(edit_target_size(&pair[0], 64).unwrap()),
+            target_tokens(edit_target_size(&pair[0], 128).unwrap()),
+        );
+        assert_eq!(large, (192 / 16) * (96 / 16));
+        assert!(small < large);
+        assert_eq!(
+            bucketed_target_tokens(&pair, &[64, 128]).unwrap(),
+            (large, small + large)
+        );
+
+        // The footprint: buckets [512, 1024] price the 1024 step plus the 512 latents cached on
+        // top; an explicit single-bucket cache equals the `0` default.
+        let facts = production_facts();
+        let at_1024 = training_footprint(&facts, &shape(1024, true));
+        let at_512 = training_footprint(&facts, &shape(512, true));
+        let (largest, cached) = bucketed_target_tokens(&captioned(20), &[512, 1024]).unwrap();
+        let bucketed = training_footprint(
+            &facts,
+            &TrainingShape {
+                target_tokens: largest,
+                target_cache_tokens: cached,
+                ..shape(1024, true)
+            },
+        );
+        let extra = 20 * t512 * facts.latent_channels * F32_WIDTH;
+        assert_eq!(bucketed.latent_phase - at_1024.latent_phase, extra);
+        assert_eq!(bucketed.train_phase - at_1024.train_phase, extra);
+        assert!(bucketed.peak() > at_512.peak());
+        assert_eq!(
+            training_footprint(
+                &facts,
+                &TrainingShape {
+                    target_cache_tokens: 20 * t1024,
+                    ..shape(1024, true)
+                }
+            ),
+            at_1024
+        );
+    }
+
     /// The preflight's adapter sizing on the tiny DiT, against the factors the install really
     /// makes: LoRA `rank·(in+out)`; LoKr the PEFT `use_w2` surface.
     #[test]
@@ -3188,6 +3688,17 @@ mod tests {
 
     // ── the step itself, on the tiny DiT ─────────────────────────────────────────────────────
 
+    /// The pre-epic-2123 call shape (the step's total loss) for the legacy tests.
+    fn compute_loss_grads(
+        dit: &QwenImage21Transformer,
+        vars: &[Var],
+        step: &StepInputs<'_>,
+        mae: bool,
+        checkpoint: bool,
+    ) -> Result<(f32, GradStore)> {
+        super::compute_loss_grads(dit, vars, step, mae, checkpoint).map(|(l, g)| (l.total, g))
+    }
+
     fn randn(shape: &[usize], seed: u64) -> Tensor {
         flow_match::sample_noise(shape, seed, &Device::Cpu).unwrap()
     }
@@ -3242,6 +3753,8 @@ mod tests {
                 references: &self.references,
                 noise: &self.noise,
                 t,
+                mask_weight: None,
+                aux: None,
             }
         }
     }
@@ -3301,6 +3814,8 @@ mod tests {
                 references: &[],
                 noise,
                 t,
+                mask_weight: None,
+                aux: None,
             },
             mae,
             checkpoint,
@@ -4294,6 +4809,122 @@ mod tests {
         assert_eq!(square.dim(1).unwrap(), (128 / 16) * (128 / 16));
     }
 
+    /// sc-2127: each item caches one branch and one target latent per bucket edge, in edge order —
+    /// the conditioning encoded once (shared text rows), the target block / latent sized for that
+    /// edge — and each bucket entry is bit-identical to a single-bucket run at that edge. Covers
+    /// a captioned item (square) and an edit pair (aspect-preserving per edge).
+    ///
+    /// *Mutations that red this:* `item_branches` building every layout at the first edge;
+    /// `encode_item_targets` encoding every latent at one edge.
+    #[test]
+    fn an_item_caches_one_branch_and_latent_per_bucket_edge() {
+        use crate::transformer::Segment as S;
+        let root = tiny_snapshot();
+        let tmp = scratch("per_bucket");
+        let square = write_png(tmp.path(), "sq.png", 160, 160, 3);
+        let wide = write_png(tmp.path(), "wide.png", 256, 128, 5);
+        let reference = write_png(tmp.path(), "ref.png", 64, 64, 9);
+        let dev = Device::Cpu;
+        let tokenizer = loader::load_tokenizer(&root).unwrap();
+        let drop = system_prompt_drop_count(&tokenizer).unwrap();
+        let encoder = loader::load_text_encoder(&root, &dev).unwrap();
+        let vae = loader::load_vae(&root, &dev).unwrap();
+        let edges = [64u32, 128];
+        for item in [
+            TrainingItem::captioned(square, "a swatch".into()),
+            TrainingItem::edit_pair(wide, "widen it".into(), vec![reference]),
+        ] {
+            let (branches, _) = item_branches(&encoder, &tokenizer, drop, &item, &edges).unwrap();
+            let targets = encode_item_targets(&vae, &item, &edges, &dev).unwrap();
+            assert_eq!((branches.len(), targets.len()), (2, 2));
+            for (b, &edge) in edges.iter().enumerate() {
+                let (w, h) = edit_target_size(&item, edge).unwrap();
+                let (gw, gh) = ((w / 16) as usize, (h / 16) as usize);
+                assert_eq!(
+                    branches[b].layout.segments.last(),
+                    Some(&S::Image {
+                        height: gh,
+                        width: gw
+                    }),
+                    "bucket {b} (edge {edge}) target block"
+                );
+                assert_eq!(targets[b].dim(1).unwrap(), gw * gh, "bucket {b} latent");
+                let (single, _) = item_branch(&encoder, &tokenizer, drop, &item, edge).unwrap();
+                assert_eq!(branches[b].layout, single.layout);
+                assert_bit_equal("text rows", &branches[b].text, &single.text);
+                assert_bit_equal(
+                    "target latent",
+                    &targets[b],
+                    &encode_item_target(&vae, &item, edge, &dev).unwrap(),
+                );
+            }
+            assert_ne!(
+                branches[0].layout, branches[1].layout,
+                "the two buckets train different grids"
+            );
+        }
+    }
+
+    /// sc-2127: a bucketed run trains end-to-end on the tiny snapshot — every step's cached entry
+    /// (latent, layout, text rows) agrees on its bucket's grid, so a 32 px and a 64 px bucket both
+    /// reach the DiT — with ONE `Caching` event per item, and the extra bucket changes the trained
+    /// factors versus the single-bucket run at the smaller edge.
+    ///
+    /// *Mutations that red this:* `item_branches` building every layout at the first edge (the
+    /// 64 px latent then meets a 32 px layout and the step errors); caching only the first edge
+    /// (the adapter equals the single-bucket run's).
+    #[test]
+    fn a_bucketed_run_trains_every_bucket_end_to_end() {
+        use candle_gen::gen_core::ResolutionBucket;
+        let dir = scratch("buckets");
+        let items = dataset(dir.path(), 2);
+        let bucketed_cfg = TrainingConfig {
+            steps: 6,
+            resolution_buckets: vec![
+                ResolutionBucket {
+                    resolution: 32,
+                    repeats: 2,
+                },
+                ResolutionBucket {
+                    resolution: 64,
+                    repeats: 1,
+                },
+            ],
+            ..base_config()
+        };
+        let mut caching = Vec::new();
+        let mut req = request(dir.path(), items.clone(), bucketed_cfg.clone());
+        req.output_dir = dir.path().join("bucketed");
+        let out = trainer()
+            .train(&req, &mut |p| {
+                if let TrainingProgress::Caching { current, total } = p {
+                    caching.push((current, total));
+                }
+            })
+            .unwrap();
+        assert_eq!(out.steps, 6);
+        assert_eq!(caching, vec![(1, 2), (2, 2)], "one Caching event per item");
+        let bucketed = tensors(&req.output_dir.join(&req.file_name));
+
+        let mut single = request(
+            dir.path(),
+            items,
+            TrainingConfig {
+                resolution_buckets: Vec::new(),
+                ..bucketed_cfg
+            },
+        );
+        single.output_dir = dir.path().join("single");
+        trainer().train(&single, &mut |_| {}).unwrap();
+        let single = tensors(&single.output_dir.join(&single.file_name));
+        assert_eq!(bucketed.len(), single.len());
+        let f32 = |t: &Tensor| t.to_dtype(DType::F32).unwrap();
+        let differs = bucketed
+            .iter()
+            .any(|(k, t)| max_abs(&(f32(t) - f32(&single[k])).unwrap()) > 0.0);
+        assert!(differs, "the 64 px bucket must change the trained factors");
+    }
+
     /// A reference the Qwen3-VL processor would rebind (its fit leaves the pixel budget) is refused
     /// by the header-only preflight with the render path's own `Unsupported` — before the text
     /// encoder or vision tower load — and `prepare_reference` refuses the same picture identically.
@@ -4580,6 +5211,213 @@ mod tests {
                 "ckpt={checkpoint}: the windowed edit loss must fall under varying noise/t: \
                  {losses:?}"
             );
+        }
+    }
+
+    /// sc-24828: subject-masked loss reaches both backward paths for text-to-image AND edit steps.
+    /// An all-ones map is the unweighted loss; an all-zero map zeroes the loss and every adapter
+    /// gradient (dense and checkpointed — a path that dropped the weight would train on the
+    /// background); a half map is strictly between and matches across paths.
+    #[test]
+    fn subject_mask_weight_reaches_both_backward_paths() {
+        let mut dit = dit_at(DType::F32);
+        let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
+        perturb(&set);
+        let (x0, ctx, noise) = fixed_batch(&dit);
+        let layout = t2i_layout();
+        let edit = fixed_edit_batch(&dit);
+        // The packed target weight `[1, 16, 1]` of a 4×4 latent grid, built as production does.
+        let map = |w: &[f32]| {
+            let grid =
+                flow_match::subject_mask_weight(w, 4, 4, &[1, 1, 4, 4], &Device::Cpu).unwrap();
+            pack_latents(&grid).unwrap()
+        };
+        for is_edit in [false, true] {
+            let run = |weight: Option<&Tensor>, checkpoint: bool| {
+                let step = if is_edit {
+                    StepInputs {
+                        mask_weight: weight,
+                        ..edit.step(0.4)
+                    }
+                } else {
+                    StepInputs {
+                        x0: &x0,
+                        text: &ctx,
+                        layout: &layout,
+                        references: &[],
+                        noise: &noise,
+                        t: 0.4,
+                        mask_weight: weight,
+                        aux: None,
+                    }
+                };
+                compute_loss_grads(&dit, &set.vars, &step, false, checkpoint).unwrap()
+            };
+            let (plain, _) = run(None, false);
+            let ones = map(&[1.0; 16]);
+            assert!((run(Some(&ones), false).0 - plain).abs() <= 1e-6 * plain.max(1.0));
+            let zeros = map(&[0.0; 16]);
+            for checkpoint in [false, true] {
+                let (loss, grads) = run(Some(&zeros), checkpoint);
+                assert_eq!(
+                    loss, 0.0,
+                    "edit={is_edit} ckpt={checkpoint}: loss must be zero"
+                );
+                for v in &set.vars {
+                    if let Some(g) = grads.get(v.as_tensor()) {
+                        let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                        assert!(
+                            g.iter().all(|x| *x == 0.0),
+                            "edit={is_edit} ckpt={checkpoint}: nonzero adapter grad"
+                        );
+                    }
+                }
+            }
+            let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
+            let half = map(&half);
+            let (dense, _) = run(Some(&half), false);
+            let (ckpt, _) = run(Some(&half), true);
+            assert!(
+                dense > 0.0 && dense < plain,
+                "edit={is_edit}: {dense} vs {plain}"
+            );
+            assert!(
+                (dense - ckpt).abs() <= 1e-5 * dense.max(1.0),
+                "edit={is_edit}: dense {dense} vs checkpoint {ckpt}"
+            );
+        }
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-24828: the cached weight lines up token-for-token with the packed target latent, cropped
+    /// the way the target is — a captioned item's centre square, an edit pair's whole (uncropped,
+    /// aspect-fit) picture on a non-square latent grid — and is `None` (no file read) when off.
+    #[test]
+    fn subject_mask_weight_is_cropped_and_packed_like_the_target() {
+        let dir = scratch("subject_mask");
+        let cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.25,
+            subject_weight: 1.0,
+        };
+        let write = |name: &str, w: u32, h: u32, subject_x: u32| {
+            let img = dir.path().join(format!("{name}.png"));
+            image::RgbImage::from_pixel(w, h, image::Rgb([90, 120, 150]))
+                .save(&img)
+                .unwrap();
+            let mask = dir.path().join(format!("{name}_mask.png"));
+            image::GrayImage::from_fn(w, h, |x, _| {
+                image::Luma([if x < subject_x { 255 } else { 0 }])
+            })
+            .save(&mask)
+            .unwrap();
+            (img, mask)
+        };
+        let values = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let close = |got: &[f32], want: &[f32]| {
+            assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 1e-5, "{got:?} vs {want:?}");
+            }
+        };
+
+        // Captioned 40×36 at edge 32: centre square x∈[2, 38) on a 2×2 grid. Subject x < 11 covers
+        // 9 of column 0's 18 px ⇒ m = 0.5 ⇒ w = 0.625 (a stretched full frame would give 0.6625).
+        let (img, mask) = write("t2i", 40, 36, 11);
+        let mut item = TrainingItem::captioned(img, "a swatch".into());
+        item.subject_mask_path = Some(mask);
+        let x0 = Tensor::zeros((1, 4, 3), DType::F32, &Device::Cpu).unwrap();
+        assert!(item_target_mask_weight(&item, None, 32, &x0, &Device::Cpu)
+            .unwrap()
+            .is_none());
+        let prepared = PreparedSubjectMask::load(LABEL, &item, &cfg).unwrap();
+        let w = item_target_mask_weight(&item, Some(&prepared), 32, &x0, &Device::Cpu)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.dims(), &[1, 4, 1]);
+        close(&values(&w), &[0.625, 0.25, 0.625, 0.25]);
+
+        // Edit pair 64×32 at edge 64: aspect fit 96×32 ⇒ a 2×6 grid (12 tokens, row-major), the
+        // whole picture stretched. Subject x < 16: column 0 (x∈[0, 10.67)) is all subject, column 1
+        // half ⇒ 0.625; a centre-square crop (x∈[16, 48)) would hold no subject at all.
+        let (img, mask) = write("edit", 64, 32, 16);
+        let mut item = TrainingItem::edit_pair(img, "make it blue".into(), vec!["ref.png".into()]);
+        item.subject_mask_path = Some(mask);
+        assert_eq!(edit_target_size(&item, 64).unwrap(), (96, 32));
+        let x0 = Tensor::zeros((1, 12, 3), DType::F32, &Device::Cpu).unwrap();
+        let prepared = PreparedSubjectMask::load(LABEL, &item, &cfg).unwrap();
+        let w = item_target_mask_weight(&item, Some(&prepared), 64, &x0, &Device::Cpu)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.dims(), &[1, 12, 1]);
+        let row = [1.0, 0.625, 0.25, 0.25, 0.25, 0.25];
+        close(&values(&w), &[row, row].concat());
+        // A target latent of another token count is refused rather than misaligned.
+        let wrong = Tensor::zeros((1, 16, 3), DType::F32, &Device::Cpu).unwrap();
+        assert!(item_target_mask_weight(&item, Some(&prepared), 64, &wrong, &Device::Cpu).is_err());
+    }
+
+    /// sc-24828 × sc-2127: with masked loss on and two buckets, each bucket's weight lines up with
+    /// THAT bucket's packed target (its own token count), and the masked-out region is zero — for
+    /// a captioned (centre-square) item and an edit pair (whole picture, aspect fit).
+    #[test]
+    fn subject_mask_weight_follows_each_buckets_packed_target() {
+        let dir = scratch("subject_mask_buckets");
+        let cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let write = |name: &str, w: u32, h: u32, subject_x: u32| {
+            let img = dir.path().join(format!("{name}.png"));
+            image::RgbImage::from_pixel(w, h, image::Rgb([90, 120, 150]))
+                .save(&img)
+                .unwrap();
+            let mask = dir.path().join(format!("{name}_mask.png"));
+            image::GrayImage::from_fn(w, h, |x, _| {
+                image::Luma([if x < subject_x { 255 } else { 0 }])
+            })
+            .save(&mask)
+            .unwrap();
+            (img, mask)
+        };
+        let dev = Device::Cpu;
+        let edges = [32u32, 64];
+        // Packed `[1, h·w, C]` stand-ins at each bucket's target size.
+        let targets = |item: &TrainingItem| -> Vec<Tensor> {
+            edges
+                .iter()
+                .map(|&e| {
+                    let tokens = target_tokens(edit_target_size(item, e).unwrap()) as usize;
+                    Tensor::zeros((1, tokens, 3), DType::F32, &dev).unwrap()
+                })
+                .collect()
+        };
+        // Captioned 48×32: centre square x ∈ [8, 40); subject = its left half (x < 24).
+        let (img, mask) = write("t2i", 48, 32, 24);
+        let mut captioned = TrainingItem::captioned(img, "a swatch".into());
+        captioned.subject_mask_path = Some(mask);
+        // Edit pair 64×32: whole picture; subject = its left half (x < 32).
+        let (img, mask) = write("edit", 64, 32, 32);
+        let mut edit = TrainingItem::edit_pair(img, "make it blue".into(), vec!["ref.png".into()]);
+        edit.subject_mask_path = Some(mask);
+        for item in [&captioned, &edit] {
+            let prepared = PreparedSubjectMask::load(LABEL, item, &cfg).unwrap();
+            let xs = targets(item);
+            assert_ne!(xs[0].dims(), xs[1].dims());
+            let ws = bucket_target_mask_weights(item, Some(&prepared), &edges, &xs, &dev).unwrap();
+            assert_eq!(ws.len(), 2);
+            for ((w, x0), &edge) in ws.iter().zip(&xs).zip(&edges) {
+                let w = w.as_ref().expect("masked loss is on");
+                assert_eq!(w.dims(), &[1, x0.dim(1).unwrap(), 1], "edge {edge}");
+                let (width, _) = edit_target_size(item, edge).unwrap();
+                let grid_w = (width / VAE_SCALE_FACTOR) as usize;
+                let values = w.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                for (i, v) in values.into_iter().enumerate() {
+                    let want = if i % grid_w < grid_w / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "edge {edge}: token {i}");
+                }
+            }
+            let off = bucket_target_mask_weights(item, None, &edges, &xs, &dev).unwrap();
+            assert!(off.iter().all(Option::is_none));
         }
     }
 
@@ -4902,5 +5740,370 @@ mod tests {
             effect_gap > 0,
             "the adapter's effect on the render must depend on the references"
         );
+    }
+
+    /// Epic 2123 depth anchoring (sc-24830) on the candle Qwen-Image 2.1 trainer: the tiny-snapshot
+    /// DiT + a random-init tiny decoder for its latent channels + tiny DA2, on the text-to-image AND
+    /// edit steps, dense and checkpointed.
+    mod depth_anchoring {
+        use super::*;
+        use candle_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
+
+        fn schedule() -> AuxLossSchedule {
+            AuxLossSchedule {
+                weight: 0.5,
+                t_min: 0.6,
+                t_max: 0.9,
+                every_n: 2,
+            }
+        }
+
+        /// Step 1 = diffusion step, step 2 = the item's 2nd window ⇒ aux-only; the reference is the
+        /// target latent unpacked on `layout`.
+        fn driver(
+            x0: &Tensor,
+            layout: &JointLayout,
+            channels: usize,
+        ) -> (AuxDriver, BucketSchedule) {
+            let path =
+                candle_gen_perceptual::testing::tiny_depth_path(channels, schedule(), &Device::Cpu)
+                    .unwrap();
+            let sched = BucketSchedule::new(1, &[], 3);
+            let clean = target_decoder_latent(x0, layout).unwrap();
+            let d = AuxDriver::prepare(
+                path,
+                1,
+                |_| Ok(clean.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
+            (d, sched)
+        }
+
+        fn grad_bits(g: &GradStore, v: &Var) -> Vec<u32> {
+            g.get(v.as_tensor())
+                .map(|t| {
+                    t.flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        fn depth_on() -> TrainingConfig {
+            let mut cfg = base_config();
+            cfg.depth_anchoring.schedule = schedule();
+            cfg
+        }
+
+        /// The decoder layout is the inverse of the cache packing on the layout's target grid
+        /// (non-square too). Mutation: swap `(h, w)` in `target_decoder_latent` ⇒ red.
+        #[test]
+        fn target_latent_unpacks_on_the_layout_grid() {
+            let grid = Tensor::arange(0f32, (3 * 2 * 4) as f32, &Device::Cpu)
+                .unwrap()
+                .reshape((1, 3, 2, 4))
+                .unwrap();
+            let packed = pack_latents(&grid).unwrap();
+            let back =
+                target_decoder_latent(&packed, &JointLayout::text_to_image(5, 2, 4)).unwrap();
+            assert_eq!(
+                back.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                grid.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+            assert_eq!(back.dims(), &[1, 3, 2, 4]);
+        }
+
+        /// (a)/(b) on the t2i and edit steps, dense and checkpointed: the diffusion step has no aux
+        /// term; the aux-only step (trained at the remapped `t`) has no diffusion term, total ==
+        /// aux, and a nonzero finite LoRA B gradient. Mutations: compute the diffusion term
+        /// unconditionally ⇒ red; drop `aux` in the checkpointed segment ⇒ red; keep the sampled
+        /// `t` in `plan_t` on an aux step ⇒ red.
+        #[test]
+        fn aux_only_step_trains_the_adapter_through_depth_alone() {
+            let mut dit = dit_at(DType::F32);
+            let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
+            perturb(&set);
+            let channels = dit.config().in_channels;
+            let (x0, ctx, noise) = fixed_batch(&dit);
+            let t2i = t2i_layout();
+            let edit = fixed_edit_batch(&dit);
+            for is_edit in [false, true] {
+                let layout = if is_edit { &edit.layout } else { &t2i };
+                let x0 = if is_edit { &edit.x0 } else { &x0 };
+                let (mut d, sched) = driver(x0, layout, channels);
+                let run = |t: f32, aux: Option<&AuxStep<'_>>, checkpoint: bool| {
+                    let step = if is_edit {
+                        StepInputs {
+                            aux,
+                            ..edit.step(t)
+                        }
+                    } else {
+                        StepInputs {
+                            x0,
+                            text: &ctx,
+                            layout: &t2i,
+                            references: &[],
+                            noise: &noise,
+                            t,
+                            mask_weight: None,
+                            aux,
+                        }
+                    };
+                    super::super::compute_loss_grads(&dit, &set.vars, &step, false, checkpoint)
+                        .unwrap()
+                };
+                {
+                    let (t1, s1) = plan_t(&d.sample(1, &sched), 0.3).unwrap();
+                    let s1 = s1.unwrap();
+                    assert_eq!(t1, 0.3);
+                    assert!(s1.diffusion() && !s1.has_aux());
+                    for checkpoint in [false, true] {
+                        let (l, _) = run(t1, Some(&s1), checkpoint);
+                        assert!(
+                            l.diffusion.is_some() && l.aux.is_none(),
+                            "edit={is_edit} ckpt={checkpoint}: {l:?}"
+                        );
+                        assert_eq!(l.total, l.diffusion.unwrap());
+                    }
+                }
+                let (t2, s2) = plan_t(&d.sample(2, &sched), 0.3).unwrap();
+                let s2 = s2.unwrap();
+                assert!(!s2.diffusion() && s2.has_aux());
+                assert!((0.6..=0.9).contains(&t2), "remapped into the window: {t2}");
+                for checkpoint in [false, true] {
+                    let tag = format!("edit={is_edit} ckpt={checkpoint}");
+                    let (l, g) = run(t2, Some(&s2), checkpoint);
+                    assert!(l.diffusion.is_none(), "{tag}: {l:?}");
+                    let aux = l.aux.expect("aux term");
+                    assert!(aux.is_finite() && aux > 0.0, "{tag}: {aux}");
+                    assert_eq!(l.total, aux, "{tag}");
+                    let mut nonzero_b = false;
+                    for (i, v) in set.vars.iter().enumerate() {
+                        let gv: Vec<f32> =
+                            grad_bits(&g, v).into_iter().map(f32::from_bits).collect();
+                        assert!(gv.iter().all(|x| x.is_finite()), "{tag} var {i}");
+                        nonzero_b |= i % 2 == 1 && gv.iter().any(|x| *x != 0.0);
+                    }
+                    assert!(nonzero_b, "{tag}: no LoRA B gradient from the depth term");
+                }
+            }
+            assert_eq!(plan_t(&StepSample::plain(0, 0), 0.3).unwrap().0, 0.3);
+        }
+
+        /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
+        /// reference) is reverted to diffusion by `StepPlan::without_skipped` — and still trains at the
+        /// plan's remapped level, never the raw sampled one. Mutation: guard the remap on
+        /// `!a.diffusion()` (the pre-fix code) ⇒ the reverted step trains at the raw level ⇒ red.
+        #[test]
+        fn a_reverted_aux_step_trains_at_the_remapped_level() {
+            let path = candle_gen_perceptual::testing::skipping_path(AuxLossSchedule {
+                weight: 0.5,
+                t_min: 0.6,
+                t_max: 0.9,
+                every_n: 2,
+            })
+            .unwrap();
+            let sched = BucketSchedule::new(1, &[], 3);
+            let clean = Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu).unwrap();
+            let mut d = AuxDriver::prepare(
+                path,
+                1,
+                |_| Ok(clean.clone()),
+                &sched,
+                1,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
+            let _ = d.sample(1, &sched);
+            let (got, aux) = plan_t(&d.sample(2, &sched), 0.1).unwrap();
+            let aux = aux.expect("a perceptual path plans the step");
+            assert!(
+                aux.diffusion() && !aux.has_aux(),
+                "reverted to a diffusion step"
+            );
+            assert_eq!(got, aux.noise_level());
+            assert_ne!(got, 0.1, "the remapped level, not the sampled one");
+        }
+
+        /// The aux term is the depth loss of THE trainer's x0 estimate `x_t − t·v` on the target
+        /// block, recomputed independently (edit step). Mutation: `FlowX0MinusNoise` in
+        /// `target_step_loss` ⇒ red.
+        #[test]
+        fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
+            let mut dit = dit_at(DType::F32);
+            let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
+            perturb(&set);
+            let edit = fixed_edit_batch(&dit);
+            let (mut d, sched) = driver(&edit.x0, &edit.layout, dit.config().in_channels);
+            let _ = d.sample(1, &sched);
+            let s2 = d.sample(2, &sched).plan(0.3).unwrap().unwrap();
+            let t = s2.noise_level();
+            let (l, _) = super::super::compute_loss_grads(
+                &dit,
+                &set.vars,
+                &StepInputs {
+                    aux: Some(&s2),
+                    ..edit.step(t)
+                },
+                false,
+                false,
+            )
+            .unwrap();
+            let (x_t, _) = flow_match::build_batch(&edit.x0, &edit.noise, t as f64).unwrap();
+            let images = joint_images(&edit.references, &x_t);
+            let v = dit
+                .forward_train_joint(&edit.text, &images, t, &edit.layout)
+                .unwrap();
+            let x0 = (&x_t - (v * t as f64).unwrap()).unwrap();
+            let x0 = target_decoder_latent(&x0, &edit.layout).unwrap();
+            let want = s2
+                .aux_loss(&x0)
+                .unwrap()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert_eq!(l.aux.unwrap().to_bits(), want.to_bits());
+        }
+
+        /// (c) Depth off is bit-identical to the pre-epic-2123 dense step (reproduced verbatim).
+        /// Mutation: perturb the `None` combine ⇒ red.
+        #[test]
+        fn depth_off_is_bit_identical_to_the_legacy_step() {
+            let mut dit = dit_at(DType::F32);
+            let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
+            perturb(&set);
+            let edit = fixed_edit_batch(&dit);
+            let (l, g) =
+                super::super::compute_loss_grads(&dit, &set.vars, &edit.step(0.4), false, false)
+                    .unwrap();
+            assert_eq!((l.diffusion, l.aux), (Some(l.total), None));
+            let (x_t, target) = flow_match::build_batch(&edit.x0, &edit.noise, 0.4).unwrap();
+            let images = joint_images(&edit.references, &x_t);
+            let v = dit
+                .forward_train_joint(&edit.text, &images, 0.4, &edit.layout)
+                .unwrap();
+            let loss = weighted_velocity_loss(&v, &target, None, false).unwrap();
+            let legacy = loss.to_scalar::<f32>().unwrap();
+            let lg = loss.backward().unwrap();
+            assert_eq!(l.total.to_bits(), legacy.to_bits());
+            for v in &set.vars {
+                assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
+            }
+        }
+
+        /// (d) E7: the perceptual footprint is 0 off and larger for Large DA2; it adds exactly to
+        /// the train phase on the checkpointed AND dense paths, and the guard refuses at a budget
+        /// between base and base + aux. Mutation: drop `shape.perceptual_bytes` from the train
+        /// phase ⇒ red.
+        #[test]
+        fn footprint_counts_the_perceptual_models() {
+            assert_eq!(perceptual_footprint_bytes(&base_config(), 1024, 0, 20), 0);
+            let mut cfg = depth_on();
+            let small = perceptual_footprint_bytes(&cfg, 1024, 0, 20);
+            assert!(small > 0);
+            cfg.depth_anchoring.model_size = DepthModelSize::Large;
+            let large = perceptual_footprint_bytes(&cfg, 1024, 0, 20);
+            assert!(large > small);
+            // An edit target with more latent cells than the square edge prices a larger decode
+            // (the MLX sizing). Mutation: price at `edge` only (ignore `target_tokens`) ⇒ red.
+            assert!(perceptual_footprint_bytes(&cfg, 1024, 4 * 64 * 64, 20) > large);
+            let facts = production_facts();
+            for checkpointed in [false, true] {
+                let base = shape(1024, checkpointed);
+                let with = TrainingShape {
+                    perceptual_bytes: small,
+                    ..base
+                };
+                let b = training_footprint(&facts, &base);
+                let w = training_footprint(&facts, &with);
+                assert_eq!(w.train_phase, b.train_phase + small, "ckpt={checkpointed}");
+                let budget = w.peak() - 1;
+                assert!(budget >= b.peak(), "ckpt={checkpointed}");
+                assert!(check_training_footprint(&facts, &base, budget).is_ok());
+                let e = check_training_footprint(&facts, &with, budget)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("perceptual losses"), "ckpt={checkpointed}: {e}");
+                // E7 (feature-end review round 2): the advice names the enabled aux losses.
+                // Mutation: drop the `named` list from the advice ⇒ red.
+                let e = check_training_footprint_with(&facts, &with, budget, &["depth"])
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("[depth]"), "ckpt={checkpointed}: {e}");
+            }
+        }
+
+        /// The production preflight prices the perceptual models and refuses BEFORE any load: a
+        /// depth job with Large DA2 at a budget the depth-off job passes is refused with the
+        /// perceptual advice and no load/caching event. Mutation: `perceptual_bytes: 0` in the
+        /// production shape ⇒ red.
+        #[test]
+        fn preflight_refuses_the_perceptual_models_before_any_load() {
+            let budget = 1u64 << 30;
+            let mut t = trainer();
+            t.set_memory_budget_override(Some(budget));
+            let mut cfg = depth_on();
+            cfg.depth_anchoring.model_size = DepthModelSize::Large;
+            let mut events = Vec::new();
+            let err = t
+                .train_impl(&req_with(cfg), &mut |p| events.push(format!("{p:?}")))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("exceeds") && err.contains("perceptual losses"),
+                "{err}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e.starts_with("Caching") || e.starts_with("LoadingModel")),
+                "{events:?}"
+            );
+            let off = t
+                .train_impl(&req_with(base_config()), &mut |_| {})
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !off.contains("exceeds"),
+                "depth off fits this budget: {off}"
+            );
+        }
+
+        /// (e) The descriptor declares depth anchoring; depth off builds no path; with depth on a
+        /// missing decoder dir is an error naming TAEQI2.1, raised by `train_impl` before caching.
+        /// Mutation: `depth_anchoring: false` ⇒ red.
+        #[test]
+        fn descriptor_and_loader_errors() {
+            assert!(trainer_descriptor().techniques.depth_anchoring);
+            let dev = Device::Cpu;
+            assert!(load_perceptual_path(&base_config(), &dev)
+                .unwrap()
+                .is_none());
+            let tmp = tempfile::tempdir().unwrap();
+            let mut cfg = depth_on();
+            cfg.depth_anchoring.model_dir = Some(tmp.path().join("da2"));
+            let e = load_perceptual_path(&cfg, &dev).err().unwrap().to_string();
+            assert!(e.contains("TAEQI2.1"), "{e}");
+            cfg.perceptual_decoder_dir = Some(tmp.path().join("no-taeqi"));
+            let mut events = Vec::new();
+            let e = trainer()
+                .train_impl(&req_with(cfg), &mut |p| events.push(format!("{p:?}")))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("TAEQI2.1"), "{e}");
+            assert!(
+                !events.iter().any(|e| e.starts_with("Caching")),
+                "{events:?}"
+            );
+        }
     }
 }

@@ -33,6 +33,9 @@ struct Behavior {
     /// `Some(text)` replaces the shared edit floor's refusal with `Error::Msg(text)` — the
     /// flattened-variant / wrong-message class the edit honesty check must catch (sc-24161).
     edit_refusal_override: Option<&'static str>,
+    /// Routes `validate` (and so `train`) through the shared technique floor
+    /// (`validate_training_techniques`, epic 2123) vs. silently ignoring technique knobs.
+    honor_techniques: bool,
 }
 
 impl Behavior {
@@ -43,6 +46,7 @@ impl Behavior {
             honor_cancel: true,
             typed_cancel: true,
             edit_refusal_override: None,
+            honor_techniques: true,
         }
     }
 }
@@ -65,6 +69,7 @@ fn stub_desc(id: &'static str) -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        techniques: gen_core::TrainingTechniques::NONE,
     }
 }
 
@@ -103,6 +108,9 @@ impl Trainer for StubTrainer {
         // Route through the shared capability floors (F-006), like a real family trainer.
         gen_core::train::validate_control_request(&self.desc, req)?;
         gen_core::train::validate_full_finetune_request(&self.desc, req)?;
+        if self.behavior.honor_techniques {
+            gen_core::train::validate_training_techniques(&self.desc, req)?;
+        }
         gen_core::train::validate_edit_request(&self.desc, req).map_err(|e| {
             match self.behavior.edit_refusal_override {
                 Some(text) => Error::Msg(text.to_owned()),
@@ -213,6 +221,7 @@ fn item(name: &str) -> TrainingItem {
         control_image_path: None,
         model_options: Default::default(),
         reference_image_paths: Vec::new(),
+        subject_mask_path: None,
     }
 }
 
@@ -241,6 +250,7 @@ fn good_stub_passes_every_check_individually() {
     check_trainer_validate(&g, &profile(&tmp)).unwrap();
     check_trainer_progress(&mut g, &profile(&tmp)).unwrap();
     check_trainer_cancellation(&make_good, &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make_good, &profile(&tmp)).unwrap();
     check_trainer_registry(&registry(), &g).unwrap();
 }
 
@@ -380,4 +390,456 @@ fn an_over_cap_refusal_that_does_not_name_the_cap_fails_the_validate_check() {
     );
     let err = check_trainer_validate(&stub, &profile(&tmp)).unwrap_err();
     assert!(err.contains("at most 3"), "got: {err}");
+}
+
+fn ignores_techniques() -> Behavior {
+    Behavior {
+        honor_techniques: false,
+        ..Behavior::good()
+    }
+}
+
+/// sc-24826: a trainer that does not declare weight noise but silently accepts it fails the
+/// validate check AND the train-entry refusal check.
+#[test]
+fn silently_ignored_weight_noise_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let err = check_trainer_validate(
+        &StubTrainer::new(STUB_ID, ignores_techniques()),
+        &profile(&tmp),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("techniques.weight_noise == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(
+        &|| StubTrainer::boxed(STUB_ID, ignores_techniques()),
+        &profile(&tmp),
+    )
+    .unwrap_err();
+    assert!(err.contains("silently ignored"), "got: {err}");
+}
+
+/// sc-24826: a trainer that declares weight noise passes both checks (accepts the knob, still
+/// refuses it with a full fine-tune).
+#[test]
+fn declared_weight_noise_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.weight_noise = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+    trainer_conformance(make, &profile(&tmp));
+}
+
+/// sc-24826: a declared-weight-noise trainer that rejects the knob anyway fails the validate check.
+#[test]
+fn declared_but_rejected_weight_noise_fails_the_validate_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Declares weight noise but routes through a descriptor copy that does not — the floor refuses.
+    struct Liar(StubTrainer, TrainerDescriptor);
+    impl Trainer for Liar {
+        fn descriptor(&self) -> &TrainerDescriptor {
+            &self.1
+        }
+        fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+            self.0.validate(req)
+        }
+        fn train(
+            &mut self,
+            req: &TrainingRequest,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> gen_core::Result<TrainingOutput> {
+            self.0.train(req, on_progress)
+        }
+    }
+    let inner = StubTrainer::new(STUB_ID, Behavior::good());
+    let mut claimed = stub_desc(STUB_ID);
+    claimed.techniques.weight_noise = true;
+    let err = check_trainer_validate(&Liar(inner, claimed), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.weight_noise == true"),
+        "got: {err}"
+    );
+}
+
+/// sc-24827: a trainer that declares weight noise but silently accepts an undeclared gradient-noise
+/// request fails the validate check AND the train-entry refusal check (the gradient probe runs
+/// independently of the weight-noise one).
+#[test]
+fn silently_ignored_gradient_noise_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques.weight_noise = true;
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.gradient_noise == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("gradient_noise_eta > 0") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-24827: a trainer declaring the full adapter-noise pair passes every technique check and the
+/// whole conformance suite.
+#[test]
+fn declared_adapter_noise_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques = gen_core::TrainingTechniques::ADAPTER_NOISE;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+    trainer_conformance(make, &profile(&tmp));
+}
+
+/// sc-2127: a trainer that does not declare resolution buckets but silently accepts them (it
+/// rubber-stamps every technique knob; both noise techniques are declared so those probes pass)
+/// fails the
+/// validate check AND the train-entry refusal check, naming the bucket flag.
+#[test]
+fn silently_ignored_resolution_buckets_fail_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        // Every probed technique but buckets is declared, so only the bucket probe can fail.
+        stub.desc.techniques = gen_core::TrainingTechniques {
+            depth_anchoring: true,
+            subject_mask_loss: true,
+            identity_loss: true,
+            face_landmark_loss: true,
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
+            ..gen_core::TrainingTechniques::ADAPTER_NOISE
+        };
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.resolution_buckets == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("resolution_buckets set") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-2127: a trainer that declares resolution buckets passes the technique checks and the
+/// bucketed progress run.
+#[test]
+fn declared_resolution_buckets_pass_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.resolution_buckets = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+    check_trainer_bucketed_progress(&make, &profile(&tmp)).unwrap();
+    trainer_conformance(make, &profile(&tmp));
+}
+
+/// sc-2127: a bucket-capable trainer whose bucketed run does not stream training progress is caught
+/// by the bucketed progress check (the positive path is a real run, not just a validate stamp).
+#[test]
+fn declared_resolution_buckets_that_break_training_fail_the_bucketed_progress_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(
+            STUB_ID,
+            Behavior {
+                emit_progress: false,
+                ..Behavior::good()
+            },
+        );
+        stub.desc.techniques.resolution_buckets = true;
+        Box::new(stub)
+    };
+    let err = check_trainer_bucketed_progress(&make, &profile(&tmp)).unwrap_err();
+    assert!(err.contains("Training"), "got: {err}");
+}
+
+/// sc-2125: a trainer that declares both noise techniques but silently accepts an undeclared
+/// depth-anchoring request fails the validate check and the train-entry refusal check on the depth
+/// probe. Mutation: drop the depth probe from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_depth_anchoring_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques = gen_core::TrainingTechniques::ADAPTER_NOISE;
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.depth_anchoring == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("depth_anchoring") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-2125: a trainer that declares depth anchoring (and routes through the floor) passes the
+/// technique checks — depth anchoring is not adapter-only, so no full-fine-tune refusal is demanded.
+#[test]
+fn declared_depth_anchoring_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.depth_anchoring = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-24832: for each body loss, a trainer that declares every other probed technique but
+/// silently accepts that loss fails both technique checks on its probe; declaring it passes.
+/// Mutation: drop any body probe row from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn each_body_loss_probe_catches_a_silently_ignored_loss() {
+    type Flag = fn(&mut gen_core::TrainingTechniques);
+    let flags: [(&str, Flag); 3] = [
+        ("body_proportion_loss", |t| t.body_proportion_loss = true),
+        ("body_shape_loss", |t| t.body_shape_loss = true),
+        ("normal_loss", |t| t.normal_loss = true),
+    ];
+    for (name, _) in flags {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = || -> Box<dyn Trainer> {
+            let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+            let mut t = gen_core::TrainingTechniques {
+                depth_anchoring: true,
+                subject_mask_loss: true,
+                resolution_buckets: true,
+                identity_loss: true,
+                face_landmark_loss: true,
+                // The sc-24833 latent-loss probes run first; declare them so the miss is the body's.
+                vae_anchor_loss: true,
+                latent_lpips_loss: true,
+                ..gen_core::TrainingTechniques::ADAPTER_NOISE
+            };
+            for (other, set) in flags {
+                if other != name {
+                    set(&mut t);
+                }
+            }
+            stub.desc.techniques = t;
+            Box::new(stub)
+        };
+        let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(&format!("techniques.{name} == false")),
+            "{name}: {err}"
+        );
+        let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(name) && err.contains("silently ignored"),
+            "{name}: {err}"
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.body_proportion_loss = true;
+        stub.desc.techniques.body_shape_loss = true;
+        stub.desc.techniques.normal_loss = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-24828: a trainer that declares every other probed technique but silently accepts an
+/// undeclared subject-masked-loss request fails the validate check and the train-entry refusal
+/// check on the masked-loss probe. Mutation: drop the probe from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_subject_mask_loss_fails_both_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+        stub.desc.techniques = gen_core::TrainingTechniques {
+            depth_anchoring: true,
+            identity_loss: true,
+            face_landmark_loss: true,
+            ..gen_core::TrainingTechniques::ADAPTER_NOISE
+        };
+        Box::new(stub)
+    };
+    let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("techniques.subject_mask_loss == false"),
+        "got: {err}"
+    );
+    let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+    assert!(
+        err.contains("subject_mask_loss") && err.contains("silently ignored"),
+        "got: {err}"
+    );
+}
+
+/// sc-24828: a trainer that declares subject-masked loss passes the technique checks — accepted on
+/// a fully masked request, refused (through the shared floor) when an item has no mask, and not
+/// required to refuse a full fine-tune (a loss term, not adapter-only).
+#[test]
+fn declared_subject_mask_loss_passes_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.subject_mask_loss = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-24831: a trainer that declares every other probed technique but silently accepts an
+/// undeclared identity / face-landmark request fails the validate check and the train-entry refusal
+/// check on that probe. Mutation: drop either probe from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_face_losses_fail_both_technique_checks() {
+    for (flag, declare_other) in [("identity_loss", false), ("face_landmark_loss", true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = move || -> Box<dyn Trainer> {
+            let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+            stub.desc.techniques = gen_core::TrainingTechniques {
+                depth_anchoring: true,
+                subject_mask_loss: true,
+                resolution_buckets: true,
+                identity_loss: declare_other,
+                face_landmark_loss: false,
+                ..gen_core::TrainingTechniques::ADAPTER_NOISE
+            };
+            Box::new(stub)
+        };
+        let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(&format!("techniques.{flag} == false")),
+            "{flag}: {err}"
+        );
+        let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(flag) && err.contains("silently ignored"),
+            "{flag}: {err}"
+        );
+    }
+}
+
+/// sc-24831: a trainer that declares both face losses passes the technique checks (loss terms, not
+/// adapter-only, so no full-fine-tune refusal is demanded).
+#[test]
+fn declared_face_losses_pass_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.identity_loss = true;
+        stub.desc.techniques.face_landmark_loss = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
+}
+
+/// sc-24828: a trainer that declares subject-masked loss but trains an item without its mask
+/// (its `validate` papers over a missing mask) fails the validate check. Mutation: drop
+/// `check_subject_mask_missing_refused` from `check_trainer_validate` ⇒ red.
+#[test]
+fn declared_subject_mask_loss_that_ignores_missing_masks_fails_the_validate_check() {
+    struct MaskForger(StubTrainer);
+    impl Trainer for MaskForger {
+        fn descriptor(&self) -> &TrainerDescriptor {
+            &self.0.desc
+        }
+        fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+            let mut forged = req.clone();
+            if forged.config.subject_mask_loss.is_some() {
+                for item in &mut forged.items {
+                    item.subject_mask_path
+                        .get_or_insert_with(|| item.image_path.clone());
+                }
+            }
+            self.0.validate(&forged)
+        }
+        fn train(
+            &mut self,
+            req: &TrainingRequest,
+            on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> gen_core::Result<TrainingOutput> {
+            self.0.train(req, on_progress)
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+    stub.desc.techniques.subject_mask_loss = true;
+    let err = check_trainer_validate(&MaskForger(stub), &profile(&tmp)).unwrap_err();
+    assert!(err.contains("lacking its mask"), "got: {err}");
+}
+
+/// sc-24833: a trainer that declares every earlier probed technique but silently accepts an
+/// undeclared VAE-anchor (then E-LatentLPIPS) request fails the validate check and the train-entry
+/// refusal check on that probe. Mutation: drop the probe's row from `TECHNIQUE_PROBES` ⇒ red.
+#[test]
+fn silently_ignored_latent_perceptual_losses_fail_both_technique_checks() {
+    for (declare_va, missing) in [(false, "vae_anchor_loss"), (true, "latent_lpips_loss")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = move || -> Box<dyn Trainer> {
+            let mut stub = StubTrainer::new(STUB_ID, ignores_techniques());
+            stub.desc.techniques = gen_core::TrainingTechniques {
+                depth_anchoring: true,
+                subject_mask_loss: true,
+                // The sc-24831 face-loss probes run first; declare them so the miss is S12's.
+                identity_loss: true,
+                face_landmark_loss: true,
+                vae_anchor_loss: declare_va,
+                ..gen_core::TrainingTechniques::ADAPTER_NOISE
+            };
+            Box::new(stub)
+        };
+        let err = check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(&format!("techniques.{missing} == false")),
+            "got: {err}"
+        );
+        let err = check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap_err();
+        assert!(
+            err.contains(missing) && err.contains("silently ignored"),
+            "got: {err}"
+        );
+    }
+}
+
+/// sc-24833: a trainer that declares both latent-space perceptual losses (and routes through the
+/// floor) passes the technique checks — neither is adapter-only.
+#[test]
+fn declared_latent_perceptual_losses_pass_the_technique_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let make = || -> Box<dyn Trainer> {
+        let mut stub = StubTrainer::new(STUB_ID, Behavior::good());
+        stub.desc.techniques.vae_anchor_loss = true;
+        stub.desc.techniques.latent_lpips_loss = true;
+        Box::new(stub)
+    };
+    check_trainer_validate(make().as_ref(), &profile(&tmp)).unwrap();
+    check_trainer_technique_refusal(&make, &profile(&tmp)).unwrap();
 }
