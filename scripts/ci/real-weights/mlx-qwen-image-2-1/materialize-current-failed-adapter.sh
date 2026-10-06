@@ -1,7 +1,7 @@
 set -euo pipefail
 
-if [[ "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" != current-diagnostic ]]; then
-  echo "current failed adapter materializer is restricted to current-diagnostic" >&2
+if [[ "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" != current-diagnostic && "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" != current-trajectory ]]; then
+  echo "current failed adapter materializer is restricted to current-diagnostic/current-trajectory" >&2
   exit 1
 fi
 if [[ "${GITHUB_REPOSITORY:-}" != SceneWorks/inference || "${GITHUB_JOB:-}" != mlx-qwen-image-2-1 ]]; then
@@ -15,7 +15,7 @@ if [[ ! "${GITHUB_RUN_ID:-}" =~ ^[1-9][0-9]*$ || ! "${GITHUB_RUN_ATTEMPT:-}" =~ 
 fi
 
 out="$QWEN_IMAGE_2_1_RENDER_OUT"
-api="$out/current-diagnostic/api"
+api="$out/${QWEN_IMAGE_2_1_LORA_PHASE}/api"
 mkdir -p "$api"
 python3.12 -m scripts.ci.qwen21_current_failed_adapter init --output "$out"
 refuse() {

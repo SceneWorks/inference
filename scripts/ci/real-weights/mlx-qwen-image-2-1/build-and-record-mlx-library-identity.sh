@@ -1,5 +1,5 @@
 set -o pipefail
-if [[ "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" == current-diagnostic ]]; then
+if [[ "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" == current-diagnostic || "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" == current-trajectory ]]; then
   # The current route compiles only the reviewed family-local cfg(test) selector binary.
   cargo test --locked --release -p mlx-gen-qwen-image-2-1 --lib --no-run --message-format=json 2>&1 | tee "$QWEN_IMAGE_2_1_RENDER_OUT/lib-build-messages.jsonl"
   python3.12 scripts/ci/qwen21_mlx_build_identity.py --messages "$QWEN_IMAGE_2_1_RENDER_OUT/lib-build-messages.jsonl" --test-target lib --out "$QWEN_IMAGE_2_1_RENDER_OUT/mlx-lib-test-build-identity.json"

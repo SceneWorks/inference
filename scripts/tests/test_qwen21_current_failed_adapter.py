@@ -319,7 +319,7 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                                         check=False).returncode, 0)
             ensure_exact_base(fixture, fixture_head)
             expected = run(fixture, "diff", "--name-only", base, fixture_head).splitlines()
-            self.assertEqual(len(expected), 16)
+            self.assertEqual(len(expected), 19)
             self.assertIn("scripts/tests/test_ci_workflow_policy.py", expected)
             self.assertEqual(run(fixture, "diff", "--name-only", base,
                                  fixture_head).splitlines(), expected)
@@ -612,12 +612,15 @@ class CurrentDiagnosticWorkflowTests(unittest.TestCase):
         self.assertIn("inference-real-weights-physical-host", workflow["concurrency"]["group"])
         steps = {row.get("name"): row for row in job["steps"]}
         self.assertEqual(steps["Prove trained velocity survives adapter save and reload"]["if"],
-                         "inputs.qwen_image_2_1_lora_phase != 'current-diagnostic'")
+                         "inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && "
+                         "inputs.qwen_image_2_1_lora_phase != 'current-trajectory'")
         self.assertEqual(steps["Bind live job and materialize the exact current failed adapter"]["if"],
-                         "inputs.qwen_image_2_1_lora_phase == 'current-diagnostic'")
+                         "inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || "
+                         "inputs.qwen_image_2_1_lora_phase == 'current-trajectory'")
         self.assertEqual(steps["Keep the Qwen-Image 2.1 MLX evidence"]["if"],
                          "${{ always() && (inputs.qwen_image_2_1_lora_phase == "
-                         "'current-diagnostic' || !cancelled()) }}")
+                         "'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == "
+                         "'current-trajectory' || !cancelled()) }}")
         names = [row.get("name") for row in job["steps"]]
         fallback = steps["Initialize current diagnostic fallback before checkout"]
         self.assertLess(names.index(fallback["name"]),

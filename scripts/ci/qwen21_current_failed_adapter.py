@@ -7,10 +7,12 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,14 @@ import zipfile
 
 
 CONFIG = Path(__file__).with_suffix(".json")
+TRAJECTORY_SELECTOR = ("conditioning_velocity_diagnostic::trajectory::"
+                       "diagnostic_current_failed_adapter_actual_dense_q4_trajectory")
+TRAJECTORY_ENDPOINTS = (
+    "b0eda194bc37877a9ee186d51a7945d388ff331628f2c11b9f5cdb35a4645ef4",
+    "5a2a5ac175fa9ba63549b34bd40e2c8e7571409ad5efae0d2e5590643654136b",
+    "34617ede5c4635bf40cb59e441b11075381b42b8459c888c42b771d453d37e14",
+    "c15998cea7be72d8685ffce248ad3c34483512883869c0833e425b0e7189f6d5",
+)
 ALLOWED_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 PRODUCTION_BLOBS = {
     "Cargo.lock": "951f40f3dbdbb8af3eb0f34de369b9a75829cea1",
@@ -36,6 +46,8 @@ ALLOWED_DIFF = {
     "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/conditioning_velocity_current_inputs.rs",
     "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/conditioning_velocity_diagnostic.rs",
     "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/conditioning_velocity_math.rs",
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/conditioning_trajectory_math.rs",
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/conditioning_velocity_trajectory.rs",
     "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/q4_diagnostic.rs",
     "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs",
     "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/support/physical_watchdog.rs",
@@ -47,6 +59,7 @@ ALLOWED_DIFF = {
     "scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh",
     "scripts/tests/test_ci_workflow_policy.py",
     "scripts/tests/test_qwen21_current_failed_adapter.py",
+    "scripts/tests/test_qwen21_trajectory.py",
     "scripts/tests/test_qwen21_direction_protocol.py",
     "scripts/tests/test_qwen21_q4_replay.py",
 }
@@ -75,11 +88,19 @@ def parse_time(value: object) -> dt.datetime:
 
 
 def config() -> dict:
-    return read_json(CONFIG)
+    row = read_json(CONFIG)
+    if trajectory_selected():
+        row["selector"] = TRAJECTORY_SELECTOR
+    return row
+
+
+def trajectory_selected() -> bool:
+    return os.environ.get("QWEN_IMAGE_2_1_LORA_PHASE") == "current-trajectory"
 
 
 def receipt_path(output: Path) -> Path:
-    return output / "current-diagnostic" / "DIAGNOSTIC_ONLY.json"
+    phase = "current-trajectory" if trajectory_selected() else "current-diagnostic"
+    return output / phase / "DIAGNOSTIC_ONLY.json"
 
 
 def absolute_output(path: Path) -> Path:
@@ -283,7 +304,15 @@ def validate_source_closure(root: Path, source_candidate: str, cfg: dict) -> lis
     selector_source = git(root, "show", source_candidate + ":crates/media/mlx-gen/"
                           "mlx-gen-qwen-image-2-1/src/conditioning_velocity_diagnostic.rs")
     selector_module, separator, selector_name = cfg["selector"].rpartition("::")
-    require(separator == "::" and selector_module == "conditioning_velocity_diagnostic" and
+    expected_module = "conditioning_velocity_diagnostic"
+    if cfg["selector"] == TRAJECTORY_SELECTOR:
+        require(trajectory_selected(), "trajectory selector requires its exact named phase")
+        require('#[path = "conditioning_velocity_trajectory.rs"]\nmod trajectory;' in selector_source,
+                "trajectory child module binding is absent")
+        selector_source = git(root, "show", source_candidate + ":crates/media/mlx-gen/"
+                              "mlx-gen-qwen-image-2-1/src/conditioning_velocity_trajectory.rs")
+        expected_module += "::trajectory"
+    require(separator == "::" and selector_module == expected_module and
             re.search(rf"\bfn\s+{re.escape(selector_name)}\s*\(", selector_source) is not None,
             "reviewed current selector is absent")
     return changed
@@ -468,17 +497,136 @@ def materialize(args) -> None:
 
 def finish(args) -> None:
     output = absolute_output(args.output)
-    selector_receipt = output / "current-q4-velocity-discriminator" / "receipt.json"
+    directory = "current-q4-trajectory" if trajectory_selected() else "current-q4-velocity-discriminator"
+    selector_receipt = output / directory / "receipt.json"
     update = {"selectorExit": args.selector_exit,
               "status": "DIAGNOSTIC_FAILED" if args.selector_exit else "DIAGNOSTIC_COMPLETED"}
     if args.selector_exit == 0:
         row = read_json(selector_receipt)
         require(row.get("kind") == "DIAGNOSTIC_ONLY" and row.get("accepted") is False and
                 row.get("acceptanceEvidence") is False and row.get("trainingSteps") == 0 and
-                row.get("renderCount") == 0, "selector receipt lost diagnostic-only semantics")
+                row.get("renderCount") == (4 if trajectory_selected() else 0),
+                "selector receipt lost diagnostic-only semantics")
+        if trajectory_selected():
+            validate_trajectory_receipt(row)
+            validate_trajectory_files(selector_receipt.parent, row)
         update.update({"selectorReceipt": str(selector_receipt),
                        "selectorReceiptSha256": sha256_file(selector_receipt)})
+        if trajectory_selected():
+            update.update({"renderCount": 4, "endpointDecodeCount": 4, "forwardCount": 32,
+                           "historicalEndpointIdentity": row["historicalEndpointIdentity"],
+                           "trajectoryQualification": row["trajectoryQualification"]})
     write_receipt(output, update)
+
+
+def validate_trajectory_receipt(row: dict) -> None:
+    require(row.get("status") == "DIAGNOSTIC_COMPLETED" and
+            row.get("qualityAcceptance") is None and row.get("donorAccepted") is False and
+            row.get("forwardCount") == 32 and row.get("trajectoryCount") == 4 and
+            row.get("endpointDecodeCount") == 4 and row.get("steps") == 8 and
+            row.get("seed") == 24163 and row.get("guidance") == 1 and
+            row.get("negativeBranch") is False and row.get("sampler") == "Euler",
+            "trajectory counts, frozen request or diagnostic scope changed")
+    require(row.get("sourceCandidate") == os.environ.get("GITHUB_SHA") and
+            row.get("runId") == int(os.environ["GITHUB_RUN_ID"]) and
+            row.get("runAttempt") == int(os.environ["GITHUB_RUN_ATTEMPT"]),
+            "trajectory live source/run binding changed")
+    cleanup = row.get("cleanup", {})
+    require(all(cleanup.get(key) is True for key in
+                ("nativeRetired", "watchdogJoined", "postDropReadback")) and
+            cleanup.get("previousMemoryLimitBytes") == cleanup.get("restoredMemoryLimitBytes") and
+            cleanup.get("previousCacheLimitBytes") == cleanup.get("restoredCacheLimitBytes") and
+            isinstance(cleanup.get("previousMemoryLimitBytes"), int) and
+            isinstance(cleanup.get("previousCacheLimitBytes"), int),
+            "trajectory actual allocator restoration is incomplete")
+    trajectories = row.get("trajectories", [])
+    require(len(trajectories) == 4 and
+            [(t.get("tier"), t.get("adapted")) for t in trajectories] ==
+            [("denseBF16", False), ("denseBF16", True), ("Q4", False), ("Q4", True)] and
+            all(len(t.get("steps", [])) == 8 and len(t.get("metrics", [])) == 8
+                for t in trajectories), "trajectory inventory is incomplete")
+    identity = all(t.get("endpoint", {}).get("exactHistoricalPngMatch") is True
+                   for t in trajectories)
+    require(row.get("historicalEndpointIdentity") is identity and
+            row.get("trajectoryQualification") ==
+            ("EXACT_FOUR_PRIOR_PNG_ENDPOINTS" if identity else
+             "SOURCE_EQUIVALENT_RECONSTRUCTION_ONLY_ENDPOINT_MISMATCH"),
+            "trajectory endpoint identity qualification changed")
+
+
+def validate_trajectory_files(directory: Path, row: dict) -> None:
+    """Validate actual finite little-endian captures, not producer constants."""
+    seen = set()
+
+    def physical(facts: dict) -> Path:
+        relative = facts.get("file")
+        require(isinstance(relative, str) and "\\" not in relative and
+                not PurePosixPath(relative).is_absolute() and
+                not any(p in ("..", ".") for p in relative.split("/")),
+                "trajectory physical path is unsafe")
+        require(relative not in seen, "trajectory physical file is repeated")
+        seen.add(relative)
+        path = directory / relative
+        require(path.is_file() and not path.is_symlink() and
+                directory.resolve() in path.resolve().parents,
+                "trajectory physical file is missing or escaped")
+        require(sha256_file(path) == facts.get("sha256"), "trajectory physical digest changed")
+        return path
+
+    def vector(facts: dict, fixed_shape=None):
+        shape = facts.get("shape", [])
+        require(isinstance(shape, list) and shape and
+                all(type(s) is int and s > 0 for s in shape) and
+                (fixed_shape is None or shape == fixed_shape) and facts.get("dtype") == "Float32" and
+                facts.get("elements") == math.prod(shape) and
+                facts.get("bytes") == math.prod(shape) * 4,
+                "trajectory vector shape/dtype/count changed")
+        path = physical(facts)
+        require(path.stat().st_size == facts["bytes"], "trajectory vector length changed")
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(65536), b""):
+                require(all(math.isfinite(v[0]) for v in struct.iter_unpack("<f", block)),
+                        "trajectory vector contains nonfinite values")
+
+    inputs = row.get("inputs", {})
+    sigmas = inputs.get("sigmas", [])
+    require(len(sigmas) == 9 and sigmas[0] == 1 and sigmas[-1] == 0 and
+            all(type(s) in (int, float) and math.isfinite(s) for s in sigmas) and
+            all(a > b for a, b in zip(sigmas, sigmas[1:])), "trajectory schedule changed")
+    require(inputs.get("referenceOrder") == ["source99", "palette"] and
+            inputs.get("fit") == [[1024, 1024], [1024, 1024]], "trajectory reference binding changed")
+    for key in ("x0", "noise"): vector(inputs[key], [1, 2304, 64])
+    require(len(inputs.get("conditioning", [])) == 2 and len(inputs.get("references", [])) == 2,
+            "trajectory conditioning/reference inventory changed")
+    for facts in inputs["conditioning"]: vector(facts)
+    for reference in inputs["references"]:
+        vector(reference["pixels"]); vector(reference["latents"], [1, 4096, 64])
+    for index, trajectory in enumerate(row["trajectories"]):
+        require(trajectory.get("trajectory") == index and
+                trajectory.get("rawMasterVerifiedTensors") == (672 if trajectory["adapted"] else 0),
+                "trajectory route or adapter installation changed")
+        for step, capture in enumerate(trajectory["steps"]):
+            require(capture.get("step") == step and capture.get("sigma") == sigmas[step] and
+                    capture.get("nextSigma") == sigmas[step + 1], "trajectory step schedule changed")
+            vector(capture["x"], [1, 2304, 64]); vector(capture["velocity"], [1, 2304, 64])
+            metric = trajectory["metrics"][step]
+            require(metric.get("step") == step and metric.get("nativeArithmeticPass") is False and
+                    all(type(metric.get(k)) in (int, float) and math.isfinite(metric[k]) for k in
+                        ("targetPathError", "denoisedEstimateError", "updateToTargetProjection",
+                         "updateNorm2", "eulerUpdateResidualMax")), "trajectory metric is incomplete or nonfinite")
+        vector(trajectory["finalLatent"], [1, 2304, 64])
+        endpoint = trajectory["endpoint"]
+        require(endpoint.get("expectedSha256") == TRAJECTORY_ENDPOINTS[index] and
+                endpoint.get("exactHistoricalPngMatch") is
+                (endpoint.get("sha256") == TRAJECTORY_ENDPOINTS[index]),
+                "trajectory endpoint control was misqualified")
+        physical(endpoint)
+    require(len(seen) == 80, "trajectory physical capture inventory changed")
+    require(type(row.get("activePeakBytes")) is int and
+            row["activePeakBytes"] <= row.get("activeEnvelopeBytes", 0) and
+            type(row.get("physicalPeakBytes")) is int and row["physicalPeakBytes"] <= 100_000_000_000 and
+            type(row.get("cpuCachePeakBytes")) is int and row["cpuCachePeakBytes"] <= 67_108_864,
+            "trajectory memory envelope evidence is incomplete")
 
 
 def seal(args) -> None:

@@ -144,11 +144,11 @@ on:
         default: rw-mage
         options: [rw-mage, rw-starvector]
       qwen_image_2_1_lora_phase:
-        description: "MLX 2.1 LoRA: probe, historical diagnostics, current-diagnostic, edit, imports, or full"
+        description: "MLX 2.1 LoRA: probe, historical diagnostics, current-diagnostic, current-trajectory, edit, imports, or full"
         type: choice
         required: false
         default: full
-        options: [probe, diagnostic, q4-numeric, direction-protocol, current-diagnostic, edit, imports, full]
+        options: [probe, diagnostic, q4-numeric, direction-protocol, current-diagnostic, current-trajectory, edit, imports, full]
       profile:
         description: Real-weight profile to run
         type: choice
@@ -5086,7 +5086,7 @@ jobs:
       QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB: "100"
     steps:
       - name: Initialize current diagnostic fallback before checkout
-        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic'
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory'
         shell: bash
         run: |
           output="$RUNNER_TEMP/qwen-image-2-1-mlx-evidence"
@@ -5100,7 +5100,8 @@ jobs:
           output = Path(sys.argv[1])
           if not output.is_absolute():
               raise SystemExit("absolute current diagnostic evidence root required")
-          receipt = output / "current-diagnostic" / "DIAGNOSTIC_ONLY.json"
+          phase = "current-trajectory" if os.environ.get("QWEN_IMAGE_2_1_LORA_PHASE") == "current-trajectory" else "current-diagnostic"
+          receipt = output / phase / "DIAGNOSTIC_ONLY.json"
           receipt.parent.mkdir(parents=True, exist_ok=True)
           body = {
               "schemaVersion": 1, "kind": "DIAGNOSTIC_ONLY",
@@ -5124,7 +5125,7 @@ jobs:
       - name: Require the resolved snapshot paths and initialize evidence
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/require-the-resolved-snapshot-paths-and-initialize-evidence.sh
       - name: Initialize the current diagnostic-only receipt
-        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic'
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory'
         run: python3.12 -m scripts.ci.qwen21_current_failed_adapter init --output "$QWEN_IMAGE_2_1_RENDER_OUT"
       - name: Report runner disk headroom
         continue-on-error: true
@@ -5143,24 +5144,24 @@ jobs:
       - name: Build the Qwen-Image 2.1 MLX test binary
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/build-and-record-mlx-library-identity.sh
       - name: Prove trained velocity survives adapter save and reload
-        if: inputs.qwen_image_2_1_lora_phase != 'current-diagnostic'
+        if: inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
       - name: Materialize and verify immutable snapshots
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
       - name: Materialize hash-pinned transferred adapters
-        if: inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic'
+        if: inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
         env:
           GH_TOKEN: ${{ github.token }}
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-hash-pinned-transferred-adapters.sh
       - name: Bind live job and materialize the exact current failed adapter
-        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic'
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory'
         env:
           GH_TOKEN: ${{ github.token }}
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-current-failed-adapter.sh
       - name: Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh
       - name: Seal a current diagnostic refusal if the selector never started
-        if: ${{ always() && inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' }}
+        if: ${{ always() && (inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory') }}
         shell: bash
         run: |
           # Repository-independent: this still runs when checkout never made
@@ -5174,7 +5175,8 @@ jobs:
           output = Path(sys.argv[1])
           if not output.is_absolute():
               raise SystemExit("absolute current diagnostic evidence root required")
-          receipt = output / "current-diagnostic" / "DIAGNOSTIC_ONLY.json"
+          phase = "current-trajectory" if os.environ.get("QWEN_IMAGE_2_1_LORA_PHASE") == "current-trajectory" else "current-diagnostic"
+          receipt = output / phase / "DIAGNOSTIC_ONLY.json"
           receipt.parent.mkdir(parents=True, exist_ok=True)
           try:
               body = json.loads(receipt.read_text(encoding="utf-8"))
@@ -5193,7 +5195,7 @@ jobs:
           os.replace(temporary, receipt)
           PY
       - name: Keep the Qwen-Image 2.1 MLX evidence
-        if: ${{ always() && (inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || !cancelled()) }}
+        if: ${{ always() && (inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory' || !cancelled()) }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qwen-image-2-1-mlx-evidence

@@ -4534,7 +4534,8 @@ class WindowsBashSelectionTests(unittest.TestCase):
             errors.append("the evidence artifact is not `qwen-image-2-1-mlx-evidence`")
         if upload.get("if") != (
             "${{ always() && (inputs.qwen_image_2_1_lora_phase == "
-            "'current-diagnostic' || !cancelled()) }}"
+            "'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == "
+            "'current-trajectory' || !cancelled()) }}"
         ):
             errors.append("the evidence upload must survive a failed gate")
         if upload.get("with", {}).get("if-no-files-found") != "error":

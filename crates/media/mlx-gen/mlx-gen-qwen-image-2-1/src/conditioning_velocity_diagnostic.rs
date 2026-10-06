@@ -22,6 +22,8 @@ mod math;
 mod current_inputs;
 #[path = "conditioning_velocity_inputs.rs"]
 mod inputs;
+#[path = "conditioning_velocity_trajectory.rs"]
+mod trajectory;
 use inputs::header;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
