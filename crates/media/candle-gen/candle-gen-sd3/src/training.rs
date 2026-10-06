@@ -544,7 +544,7 @@ impl Sd3Trainer {
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
         // Epic 2123 E8: references per (item, bucket) entry once (the cached latent is already
-        // TAESD3's NCHW input), alternation keyed on the real item.
+        // TAESD3's NCHW input), the alternation over the schedule's windows.
         // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
         // cropped like the image and resampled onto its decoded size.
         let mut perceptual = perceptual;
@@ -566,7 +566,6 @@ impl Sd3Trainer {
                 |i| Ok(cache[i].0.clone()),
                 &schedule,
                 accum,
-                0,
                 &req.cancel,
             )?),
             None => None,
@@ -1014,16 +1013,8 @@ mod tests {
                     .unwrap();
             let sched = BucketSchedule::new(1, &[], 3);
             let x0 = f.x0.clone();
-            let d = AuxDriver::prepare(
-                path,
-                1,
-                |_| Ok(x0.clone()),
-                &sched,
-                1,
-                0,
-                &Default::default(),
-            )
-            .unwrap();
+            let d = AuxDriver::prepare(path, 1, |_| Ok(x0.clone()), &sched, 1, &Default::default())
+                .unwrap();
             (d, sched)
         }
 
@@ -1117,7 +1108,6 @@ mod tests {
                 |_| Ok(clean.clone()),
                 &sched,
                 1,
-                0,
                 &Default::default(),
             )
             .unwrap();

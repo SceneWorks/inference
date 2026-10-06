@@ -5116,7 +5116,6 @@ mod depth_anchoring_tests {
             |_| ltx23_latent_nchw(&f.clean),
             &sched,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -5514,7 +5513,6 @@ mod ltx25_depth_anchoring_tests {
             |_| ltx25_depth_nchw(&clean, GEOM, &frames),
             &sched,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();

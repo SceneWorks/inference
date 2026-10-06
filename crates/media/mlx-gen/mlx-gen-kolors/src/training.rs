@@ -881,7 +881,7 @@ mod depth_anchoring_tests {
     use super::*;
     use mlx_gen::train::lora::{build_lora_targets, TrainAdapter};
     use mlx_gen::train::perceptual::{
-        AuxAlternation, AuxLossSchedule, Parameterization, PerceptualPath,
+        AltKey, AuxAlternation, AuxLossSchedule, Parameterization, PerceptualPath,
     };
     use mlx_gen::TrainingConfig;
     use mlx_gen_sdxl::training::family::test_support::{
@@ -1003,9 +1003,9 @@ mod depth_anchoring_tests {
             let mut p = path();
             p.ensure_reference(0, &x0.transpose_axes(&[0, 3, 1, 2]).unwrap())
                 .unwrap();
-            let mut alt = AuxAlternation::new(1, 1);
+            let alt = AuxAlternation::new(1, 1);
             let raw = TrainTimestep::Index(321);
-            let run = |unet: &mut UNet2DConditionModel, key: u32, p: &PerceptualPath| {
+            let run = |unet: &mut UNet2DConditionModel, key: AltKey, p: &PerceptualPath| {
                 let plan = p.plan(key, 0, h.noise_level(raw)).unwrap();
                 let t = if plan.diffusion {
                     raw
@@ -1039,7 +1039,7 @@ mod depth_anchoring_tests {
                 eval(g.values()).unwrap();
                 (l, g, t)
             };
-            let (diff, g_diff, _) = run(&mut unet, alt.key(1, 0), &p);
+            let (diff, g_diff, _) = run(&mut unet, alt.key(1), &p);
             assert_eq!(diff.aux, None, "ckpt={ckpt}");
             assert_eq!(Some(diff.total), diff.diffusion);
             let (plain, g_plain) = compute_loss_grads(
@@ -1073,7 +1073,7 @@ mod depth_anchoring_tests {
                 assert_eq!(a, b, "ckpt={ckpt}: {k}");
             }
 
-            let (depth, g, t) = run(&mut unet, alt.key(2, 0), &p);
+            let (depth, g, t) = run(&mut unet, alt.key(2), &p);
             assert_eq!(depth.diffusion, None, "ckpt={ckpt}");
             let aux = depth.aux.expect("depth step carries the depth term");
             assert!(aux > 0.0 && aux.is_finite(), "ckpt={ckpt}: {aux}");

@@ -59,7 +59,9 @@ use crate::train::lora::{
     AdapterKind, LoraHost, LoraSet,
 };
 use crate::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
-use crate::train::perceptual::{combine_step_loss, AuxAlternation, PerceptualPath, StepPlan};
+use crate::train::perceptual::{
+    combine_step_loss, AltKey, AuxAlternation, PerceptualPath, StepPlan,
+};
 use crate::train::schedule::{lr_multiplier, schedule_updates};
 use crate::{CandleError, Result};
 
@@ -524,8 +526,9 @@ pub fn sample_seed(base: u64, step: u32, index: usize) -> u64 {
 // every Candle trainer drives the shared path the same way.
 // ---------------------------------------------------------------------------------------------
 
-/// A trainer's perceptual path plus its per-item alternation, ready for the loop: every cache
-/// entry's reference is built, and on resume the skipped prefix's alternation keys are replayed.
+/// A trainer's perceptual path plus its alternation, ready for the loop: every cache entry's
+/// reference is built. The alternation is a pure function of the step, so a resumed run needs no
+/// replay.
 pub struct AuxDriver {
     path: PerceptualPath,
     alternation: AuxAlternation,
@@ -533,17 +536,15 @@ pub struct AuxDriver {
 
 impl AuxDriver {
     /// Build each of the `n_entries` item-major cache entries' references from `clean(entry)` (the
-    /// entry's clean latent in the path's NCHW model-space layout, once per entry, before the loop),
-    /// key the alternation on the `schedule`'s items with `accum` micro-steps per update, and replay
-    /// micro-steps `1..=start_step` so a resumed run continues the same phase. A tripped `cancel`
-    /// stops the reference build between entries with `Canceled`.
+    /// entry's clean latent in the path's NCHW model-space layout, once per entry, before the loop)
+    /// and alternate over the `schedule`'s epochs with `accum` micro-steps per update. A tripped
+    /// `cancel` stops the reference build between entries with `Canceled`.
     pub fn prepare(
         mut path: PerceptualPath,
         n_entries: usize,
         mut clean: impl FnMut(usize) -> Result<Tensor>,
         schedule: &BucketSchedule,
         accum: u32,
-        start_step: u32,
         cancel: &crate::gen_core::runtime::CancelFlag,
     ) -> Result<Self> {
         for entry in 0..n_entries {
@@ -554,11 +555,10 @@ impl AuxDriver {
             }
             path.ensure_reference(entry, &clean(entry)?)?;
         }
-        let mut alternation = AuxAlternation::new(n_entries / schedule.n_buckets().max(1), accum);
-        for step in 1..=start_step {
-            alternation.key(step, schedule.sample((step - 1) as usize).0);
-        }
-        Ok(Self { path, alternation })
+        Ok(Self {
+            path,
+            alternation: AuxAlternation::new(schedule.epoch_len(), accum),
+        })
     }
 
     /// The shared path.
@@ -566,12 +566,11 @@ impl AuxDriver {
         &self.path
     }
 
-    /// Feed micro-step `step` (1-based) to the alternation and return its [`StepSample`] — call for
-    /// every micro-step, in order.
+    /// Micro-step `step`'s (1-based) [`StepSample`].
     pub fn sample(&mut self, step: u32, schedule: &BucketSchedule) -> StepSample<'_> {
         let k = (step - 1) as usize;
         let (item, _) = schedule.sample(k);
-        let key = self.alternation.key(step, item);
+        let key = self.alternation.key(step);
         StepSample {
             item,
             entry: schedule.cache_index(k),
@@ -605,7 +604,7 @@ pub struct StepSample<'a> {
     pub item: usize,
     /// The cache entry (`schedule.cache_index(k)`).
     pub entry: usize,
-    perceptual: Option<(&'a PerceptualPath, u32)>,
+    perceptual: Option<(&'a PerceptualPath, AltKey)>,
 }
 
 impl<'a> StepSample<'a> {
@@ -1006,8 +1005,8 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // until the next completed optimizer boundary instead of snapshotting without pending grads.
     let mut resume_due = false;
     let schedule = item_major_schedule(T::LABEL, cache.len(), &cfg.training_buckets(), cfg.seed)?;
-    // Epic 2123 E8: references per (item, bucket) entry once, alternation keyed on the real item.
-    // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+    // Epic 2123 E8: references per (item, bucket) entry once, the alternation over the schedule's
+    // windows. sc-24832: the job's subject masks (restricted normal loss) reach every reference,
     // cropped like the image and resampled onto its decoded size.
     let mut perceptual = perceptual;
     if let Some(path) = perceptual.as_mut() {
@@ -1028,7 +1027,6 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             |i| model.reference_latent(&cache[i], &aux),
             &schedule,
             accum,
-            start_step,
             &req.cancel,
         )?),
         None => None,
@@ -1879,11 +1877,12 @@ mod tests {
     }
 
     /// Epic 2123 E8 through the driver: each (item, bucket) entry's reference is built exactly once,
-    /// every step is planned, and the alternation is keyed on the REAL item (an item alternates
-    /// across its buckets). Mutations: build the reference per step (count ≠ 4) ⇒ red; key the
-    /// alternation on the cache entry instead of the item ⇒ the aux-only pattern diverges ⇒ red.
+    /// every step is planned with the gen-core alternation over the schedule's epochs (sc-2124: no
+    /// two aux-only steps in a row, every item both kinds, an aux step on both buckets).
+    /// Mutations: build the reference per step (count ≠ 4) ⇒ red; build the alternation over the
+    /// item count instead of `schedule.epoch_len()` ⇒ the aux-only pattern diverges ⇒ red.
     #[test]
-    fn driver_plans_perceptual_steps_per_item_with_references_once() {
+    fn driver_plans_interleaved_perceptual_steps_with_references_once() {
         let model = PerceptualTrainer {
             inner: MockTrainer {
                 device: Device::Cpu,
@@ -1909,18 +1908,25 @@ mod tests {
         assert_eq!(model.references.get(), 4);
         let seen = model.seen.borrow();
         assert_eq!(seen.len(), 16);
-        let mut visits = [0u32; 2];
+        let expected = AuxAlternation::new(4, 1);
+        let mut kinds = [Vec::new(), Vec::new()];
         let mut both_buckets_aux = false;
-        for &(item, entry, aux_only) in seen.iter() {
+        for (k, &(item, entry, aux_only)) in seen.iter().enumerate() {
             assert_eq!(item, entry / 2, "item-major entry of the sampled item");
-            visits[item] += 1;
-            assert_eq!(
-                aux_only,
-                visits[item] % 2 == 0,
-                "item {item} visit {}",
-                visits[item]
-            );
+            let step = k as u32 + 1;
+            assert_eq!(aux_only, expected.key(step).claims(2), "step {step}");
+            kinds[item].push(aux_only);
             both_buckets_aux |= aux_only && entry % 2 == 1;
+        }
+        assert!(
+            seen.windows(2).all(|w| !(w[0].2 && w[1].2)),
+            "two aux-only steps in a row: {seen:?}"
+        );
+        for (item, k) in kinds.iter().enumerate() {
+            assert!(
+                k.contains(&true) && k.contains(&false),
+                "item {item}: {k:?}"
+            );
         }
         assert!(
             both_buckets_aux,
@@ -1947,7 +1953,6 @@ mod tests {
             },
             &schedule,
             1,
-            0,
             &cancel,
         );
         assert!(
@@ -1958,10 +1963,11 @@ mod tests {
         assert_eq!(calls.get(), 1, "the build stopped at the next entry");
     }
 
-    /// Resume replays the skipped prefix: an [`AuxDriver`] prepared at `start_step = 5` plans steps
-    /// 6.. exactly as one walked from step 1. Mutation: drop the replay loop ⇒ red.
+    /// Resume needs no replay (sc-2124): the alternation is a pure function of the step, so an
+    /// [`AuxDriver`] first sampled at step 6 plans steps 6.. exactly as one walked from step 1.
+    /// Mutation: make the key depend on how many steps were sampled ⇒ red.
     #[test]
-    fn aux_driver_resume_replays_the_alternation_prefix() {
+    fn aux_driver_resume_plans_like_a_full_walk() {
         let buckets = [
             ResolutionBucket {
                 resolution: 512,
@@ -1975,16 +1981,8 @@ mod tests {
         let schedule = BucketSchedule::new(3, &buckets, 7);
         let clean = |i: usize| Ok(Tensor::full(i as f32, (1, 1, 1, 1), &Device::Cpu)?);
         let plans = |start: u32| {
-            let mut d = AuxDriver::prepare(
-                toy_path(),
-                6,
-                clean,
-                &schedule,
-                2,
-                start,
-                &Default::default(),
-            )
-            .unwrap();
+            let mut d = AuxDriver::prepare(toy_path(), 6, clean, &schedule, 2, &Default::default())
+                .unwrap();
             (start + 1..=24)
                 .map(|step| {
                     let s = d.sample(step, &schedule);

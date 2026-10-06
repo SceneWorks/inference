@@ -12,7 +12,7 @@
 //!
 //! then drives the path as the kit documents ([`candle_gen::train::perceptual`]): references per
 //! (item, bucket) cache entry, [`AuxAlternation`](candle_gen::train::perceptual::AuxAlternation)
-//! keyed on the real item index, `plan` / `aux_loss` / `combine_step_loss` in the step.
+//! over the schedule's optimizer windows, `plan` / `aux_loss` / `combine_step_loss` in the step.
 //!
 //! ## Adding a loss (S10 identity/face, S11 body, S12 latent losses …)
 //! Append one [`AuxArm`] to [`ARMS`]: its name, whether `cfg` enables it, its

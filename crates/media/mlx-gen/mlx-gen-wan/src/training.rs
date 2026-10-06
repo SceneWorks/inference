@@ -754,11 +754,11 @@ impl WanMoeTrainer {
         // decoupled round-robin for a single bucket; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: per-image alternation keys for the perceptual losses, keyed on the real
-        // dataset item. A window is one optimizer update of EVERY expert (`accum` micro-steps per
-        // expert, the experts interleaving ⇒ `accum · n_experts` global steps), so no expert ever
-        // averages a diffusion and an aux micro-step into one update. A resumed run replays the
-        // skipped prefix so the phase matches.
+        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows (sc-2124). A
+        // window is one optimizer update of EVERY expert (`accum` micro-steps per expert, the
+        // experts interleaving ⇒ `accum · n_experts` global steps), so no expert ever averages a
+        // diffusion and an aux micro-step into one update. The key is a pure function of the step,
+        // so a resumed run needs no replay.
         let mut aux_driver = match perceptual {
             Some(path) => Some(aux_driver(
                 path,
@@ -766,7 +766,6 @@ impl WanMoeTrainer {
                 &schedule,
                 accum,
                 dual,
-                start_step,
                 &req.cancel,
             )?),
             None => None,
@@ -792,12 +791,12 @@ impl WanMoeTrainer {
                 band,
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
             )?;
-            // Epic 2123 E8: plan the step's loss terms (alternation keyed on the real item, the aux
-            // windows confined to this expert's band); an aux-only step trains at the remapped
+            // Epic 2123 E8: plan the step's loss terms (alternation keyed on the step's window, the
+            // aux windows confined to this expert's band); an aux-only step trains at the remapped
             // noise level.
             let plan = match aux_driver.as_mut() {
                 Some(driver) => {
-                    let key = driver.key(step, step_item(step, dual, &schedule));
+                    let key = driver.key(step);
                     let path = driver.path();
                     let plan = plan_in_band(path, key, entry, band, t)?;
                     t = plan.noise_level;
@@ -1030,26 +1029,18 @@ fn expert_item_index(step: u32, dual: bool, schedule: &BucketSchedule) -> usize 
     schedule.cache_index(((step - 1) as usize) / n_experts)
 }
 
-/// The dataset item `step` trains on (the item half of [`expert_item_index`]'s `(item, bucket)`)
-/// — what the perceptual alternation keys on (epic 2123 E8).
-fn step_item(step: u32, dual: bool, schedule: &BucketSchedule) -> usize {
-    let n_experts: usize = if dual { 2 } else { 1 };
-    schedule.sample(((step - 1) as usize) / n_experts).0
-}
-
 /// The loop's [`AuxDriver`] (epic 2123 E8): every (item, bucket) cache entry's perceptual
-/// reference computed once from its clean latent, and the alternation over the schedule's dataset
-/// items keyed on [`step_item`], with one window per optimizer update of every expert — `accum`
+/// reference computed once from its clean latent, and the alternation over the loop's visit order
+/// — one schedule epoch per `n_experts` global steps (each expert sweeps the schedule, see
+/// [`expert_item_index`]) — with one window per optimizer update of every expert: `accum`
 /// micro-steps per expert, the experts interleaving by step parity, so `accum · n_experts` global
-/// micro-steps — so each expert's update is all diffusion or all aux. A resumed prefix
-/// `1..=start_step` is replayed.
+/// micro-steps, and each expert's update is all diffusion or all aux.
 fn aux_driver(
     path: PerceptualPath,
     cache: &[(Array, Vec<Array>, Option<Array>)],
     schedule: &BucketSchedule,
     accum: u32,
     dual: bool,
-    start_step: u32,
     cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     let n_experts: u32 = if dual { 2 } else { 1 };
@@ -1057,10 +1048,8 @@ fn aux_driver(
         path,
         cache.len(),
         |i| latent_frames_nchw(&cache[i].0),
-        cache.len() / schedule.n_buckets().max(1),
+        schedule.epoch_len() * n_experts as usize,
         accum * n_experts,
-        start_step,
-        |s| step_item(s, dual, schedule),
         cancel,
     )
 }
@@ -1154,7 +1143,7 @@ fn latent_frames_nchw(latent: &Array) -> Result<Array> {
 /// [`PerceptualPath::plan`].
 fn plan_in_band(
     path: &PerceptualPath,
-    key: u32,
+    key: impl Into<mlx_gen::train::perceptual::AltKey>,
     entry: usize,
     band: (f32, f32),
     t: f32,
@@ -2723,7 +2712,6 @@ mod depth_anchoring_tests {
             &one_item(),
             1,
             false,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -2826,7 +2814,6 @@ mod depth_anchoring_tests {
             &one_item(),
             1,
             false,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -2866,7 +2853,6 @@ mod depth_anchoring_tests {
             &one_item(),
             1,
             false,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -2887,7 +2873,6 @@ mod depth_anchoring_tests {
             &one_item(),
             1,
             false,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -2906,7 +2891,6 @@ mod depth_anchoring_tests {
             &one_item(),
             1,
             false,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -2923,9 +2907,10 @@ mod depth_anchoring_tests {
     }
 
     /// With the dual MoE and gradient accumulation 2, every expert's optimizer window (its own
-    /// `accum` routed micro-steps) is one step kind, and depth windows still happen. Mutation:
-    /// build the driver's window with `accum` alone (not `accum · n_experts`) in `aux_driver` ⇒ an
-    /// expert's window mixes kinds ⇒ red.
+    /// `accum` routed micro-steps) is one step kind, depth windows still happen, and an expert's
+    /// consecutive updates never both train aux-only (sc-2124). Mutation: build the driver's
+    /// window with `accum` alone (not `accum · n_experts`) in `aux_driver` ⇒ an expert's window
+    /// mixes kinds ⇒ red.
     #[test]
     fn every_experts_update_window_is_one_step_kind() {
         let f = fixture();
@@ -2943,10 +2928,8 @@ mod depth_anchoring_tests {
             7,
         );
         let accum = 2u32;
-        let mut d = aux_driver(p, &cache, &schedule, accum, true, 0, &Default::default()).unwrap();
-        let keys: Vec<u32> = (1..=24u32)
-            .map(|step| d.key(step, step_item(step, true, &schedule)))
-            .collect();
+        let d = aux_driver(p, &cache, &schedule, accum, true, &Default::default()).unwrap();
+        let keys: Vec<_> = (1..=24u32).map(|step| d.key(step)).collect();
         let p = d.into_path();
         // expert -> per-window kinds
         let mut kinds: [Vec<bool>; 2] = [Vec::new(), Vec::new()];
@@ -2965,6 +2948,11 @@ mod depth_anchoring_tests {
             assert!(
                 k.contains(&true) && k.contains(&false),
                 "expert {ei}: {k:?}"
+            );
+            let updates: Vec<bool> = k.chunks(accum as usize).map(|w| w[0]).collect();
+            assert!(
+                updates.windows(2).all(|u| !(u[0] && u[1])),
+                "expert {ei}: two aux-only updates in a row {updates:?}"
             );
         }
     }

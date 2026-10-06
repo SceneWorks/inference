@@ -578,15 +578,14 @@ fn step_cache_index(schedule: &BucketSchedule, step: u32) -> usize {
 }
 
 /// The loop's [`AuxDriver`] (epic 2123 E8): every cache entry's perceptual reference computed once
-/// (its clean NHWC latent, transposed to the decoder's NCHW), keyed per (item, bucket) entry —
-/// each bucket's latent decodes to its own size — the alternation keyed on the schedule's items
-/// with `accum` micro-steps per update, and a resumed prefix `1..=start_step` replayed.
+/// (its clean NHWC latent, transposed to the decoder's NCHW), keyed per (item, bucket) entry — each
+/// bucket's latent decodes to its own size — the alternation over the schedule's epochs with
+/// `accum` micro-steps per update.
 pub(crate) fn aux_driver(
     path: PerceptualPath,
     cache: &[CachedSample],
     schedule: &BucketSchedule,
     accum: u32,
-    start_step: u32,
     cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
@@ -595,7 +594,6 @@ pub(crate) fn aux_driver(
         |i| nchw(&cache[i].x0),
         schedule,
         accum,
-        start_step,
         cancel,
     )
 }
@@ -617,11 +615,11 @@ pub(crate) fn trained_timestep<H: SdxlFamilyHooks>(
 
 /// One training micro-step on the 1-based `step`: pick the step's cached (item, bucket) entry,
 /// sample its timestep and noise (seeded, exactly as before epic 2123), plan the step's loss terms
-/// through the perceptual path (when one is configured: the alternation key comes from the item's
-/// own update count, and an aux-only step trains at the sampled noise level remapped into the loss
-/// window, mapped back onto the family's timestep table), and run [`compute_step_loss_grads`].
-/// With no perceptual path every step is the plain diffusion step, bit-identical to the
-/// pre-epic-2123 loop.
+/// through the perceptual path (when one is configured: the alternation key comes from the step's
+/// optimizer window, and an aux-only step trains at the sampled noise level remapped into the loss
+/// window, mapped back onto the family's timestep table), and run [`compute_step_loss_grads`]. With
+/// no perceptual path every step is the plain diffusion step, bit-identical to the pre-epic-2123
+/// loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_train_step<H: SdxlFamilyHooks>(
     hooks: &H,
@@ -950,18 +948,10 @@ pub fn train_family<H: SdxlFamilyHooks>(
     // single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
     let schedule =
         BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-    // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on the
-    // real dataset item (not the (item, bucket) cache entry) so an image alternates across its
-    // buckets. A resumed run replays the skipped prefix so the phase matches.
+    // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the schedule's
+    // epochs (sc-2124) — a pure function of the step, so a resumed run needs no replay.
     let mut aux_driver = match perceptual {
-        Some(path) => Some(aux_driver(
-            path,
-            &cache,
-            &schedule,
-            accum,
-            start_step,
-            &req.cancel,
-        )?),
+        Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
         None => None,
     };
     let mut accumulated: Option<LoraParams> = None;

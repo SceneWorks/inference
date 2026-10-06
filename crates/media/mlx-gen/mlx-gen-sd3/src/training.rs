@@ -698,18 +698,11 @@ impl Sd3LoraTrainer {
         // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: per-image, per-update alternation keys for the perceptual losses, keyed on
-        // the real dataset item (not the (item, bucket) entry). A resumed run replays the skipped
-        // prefix so the phase matches.
+        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
+        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
+        // replay.
         let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(
-                path,
-                &cache,
-                &schedule,
-                accum,
-                start_step,
-                &req.cancel,
-            )?),
+            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
             None => None,
         };
         let mut accumulated: Option<LoraParams> = None;
@@ -1285,14 +1278,12 @@ type CacheEntry = (Array, Sd3Conditioning, Option<Array>);
 
 /// The loop's [`AuxDriver`] (epic 2123 E8): every cache entry's perceptual reference computed once
 /// (its clean NCHW latent), keyed per (item, bucket) entry — each bucket's latent decodes to its
-/// own size — the alternation keyed on the schedule's items with `accum` micro-steps per update,
-/// and a resumed prefix `1..=start_step` replayed.
+/// own size — the alternation over the schedule's epochs with `accum` micro-steps per update.
 fn aux_driver(
     path: PerceptualPath,
     cache: &[CacheEntry],
     schedule: &BucketSchedule,
     accum: u32,
-    start_step: u32,
     cancel: &mlx_gen::gen_core::runtime::CancelFlag,
 ) -> Result<AuxDriver> {
     AuxDriver::prepare(
@@ -1301,15 +1292,14 @@ fn aux_driver(
         |i| Ok(cache[i].0.clone()),
         schedule,
         accum,
-        start_step,
         cancel,
     )
 }
 
 /// One training micro-step on the 1-based `step`: pick the step's cached (item, bucket) entry,
-/// sample its `t` and noise (seeded, exactly as before epic 2123), plan the step's loss terms through
-/// the perceptual path (when one is configured: the alternation key comes from the item's own update
-/// count, and an aux-only step trains at `t` remapped into the loss window), and run
+/// sample its `t` and noise (seeded, exactly as before epic 2123), plan the step's loss terms
+/// through the perceptual path (when one is configured: the alternation key comes from the step's
+/// optimizer window, and an aux-only step trains at `t` remapped into the loss window), and run
 /// [`compute_step_loss_grads`]. With no perceptual path every step is the plain diffusion step,
 /// bit-identical to the pre-epic-2123 loop.
 #[allow(clippy::too_many_arguments)]
@@ -2683,7 +2673,6 @@ mod depth_anchoring_tests {
                 &cache,
                 &schedule,
                 1,
-                0,
                 &Default::default(),
             )
             .unwrap();
@@ -2716,15 +2705,8 @@ mod depth_anchoring_tests {
         let mut f = fixture(&cfg);
         let cache = cache_n(1, 6, 4);
         let schedule = single_bucket(1);
-        let mut d = aux_driver(
-            path_with(window),
-            &cache,
-            &schedule,
-            1,
-            0,
-            &Default::default(),
-        )
-        .unwrap();
+        let mut d =
+            aux_driver(path_with(window), &cache, &schedule, 1, &Default::default()).unwrap();
         step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, false);
         let (depth, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, false);
         assert!(depth.aux.is_some());
@@ -2800,13 +2782,14 @@ mod depth_anchoring_tests {
         );
     }
 
-    /// Alternation per image (N = 2, every image gets both kinds in 2·N steps) and per-entry
-    /// references across two buckets of different latent sizes (every depth step on bucket 1 uses
-    /// bucket 1's reference; one reference per entry). Mutations: key the plan on the global step
-    /// ⇒ red; pass the item as the `AuxStep` entry ⇒ a bucket-1 depth step compares against
-    /// bucket 0's reference ⇒ red.
+    /// Interleaved alternation (N = 2, two buckets: never two depth steps in a row, every image
+    /// both kinds, sc-2124) and per-entry references across two buckets of different latent sizes
+    /// (every depth step on bucket 1 uses bucket 1's reference; one reference per entry).
+    /// Mutations: key the alternation per epoch (`AuxAlternation::new(1, epoch_len)` in
+    /// `AuxDriver::prepare_keyed`) ⇒ a depth run ⇒ red; pass the item as the `AuxStep` entry ⇒ a
+    /// bucket-1 depth step compares against bucket 0's reference ⇒ red.
     #[test]
-    fn alternation_is_per_image_with_per_entry_references() {
+    fn alternation_interleaves_with_per_entry_references() {
         let cfg = cfg();
         let mut f = fixture(&cfg);
         let items = 2usize;
@@ -2835,7 +2818,6 @@ mod depth_anchoring_tests {
             &cache,
             &schedule,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -2848,11 +2830,16 @@ mod depth_anchoring_tests {
             kinds.push((schedule.sample(k).0, l.aux.is_some()));
             depth_on_bucket1 |= l.aux.is_some() && schedule.cache_index(k) % 2 == 1;
         }
+        assert!(
+            kinds.windows(2).all(|w| !(w[0].1 && w[1].1)),
+            "two depth steps in a row: {kinds:?}"
+        );
         for image in 0..items {
             let mine: Vec<bool> = kinds.iter().filter(|k| k.0 == image).map(|k| k.1).collect();
-            // Each image strictly alternates diffusion / depth across its own visits.
-            let alternating: Vec<bool> = (0..mine.len()).map(|v| v % 2 == 1).collect();
-            assert_eq!(mine, alternating, "image {image}: {kinds:?}");
+            assert!(
+                mine.contains(&true) && mine.contains(&false),
+                "image {image}: {kinds:?}"
+            );
         }
         assert!(depth_on_bucket1, "{kinds:?}");
         assert_eq!(d.path().reference_computations(), cache.len());
@@ -2924,7 +2911,6 @@ mod depth_anchoring_tests {
             &cache,
             &schedule,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();
@@ -2989,7 +2975,6 @@ mod depth_anchoring_tests {
             &cache,
             &schedule,
             1,
-            0,
             &Default::default(),
         )
         .unwrap();
