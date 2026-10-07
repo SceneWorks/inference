@@ -62,6 +62,7 @@ use mlx_rs::{random, Array, Dtype};
 use crate::model::{MODEL_ID, SCHEDULE_SHIFT};
 use crate::pipeline::encode_init_latents;
 use crate::text_encoder::TextEncoder;
+use crate::training_adapter::{merge_training_adapter, MergedTrainingAdapter};
 use crate::transformer::ZImageTransformer;
 use crate::vae::Vae;
 
@@ -104,6 +105,10 @@ pub struct ZImageTurboTrainer {
     text_encoder: Option<TextEncoder>,
     vae: Vae,
     transformer: ZImageTransformer,
+    /// The training adapter (sc-25213) merged into `transformer`'s base by a run on this instance.
+    /// The merge is destructive (the bare weights are not kept), so a later run on the same instance
+    /// may only reuse the same adapter — anything else must reload the trainer.
+    training_adapter: Option<MergedTrainingAdapter>,
 }
 
 fn trainer_descriptor() -> TrainerDescriptor {
@@ -142,6 +147,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
             normal_loss: true,
             vae_anchor_loss: true,
             latent_lpips_loss: true,
+            // sc-25213: the de-distill training adapter, merged into the frozen base for the
+            // training forward/backward and cancelled for previews (`crate::training_adapter`).
+            training_adapter: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -184,6 +192,7 @@ fn load_weights(spec: &LoadSpec) -> Result<ZImageTurboTrainer> {
         text_encoder: Some(crate::loader::load_text_encoder(root)?),
         vae: crate::loader::load_vae(root)?,
         transformer: crate::loader::load_transformer(root)?,
+        training_adapter: None,
     })
 }
 
@@ -369,14 +378,22 @@ impl ZImageTurboTrainer {
         // against the budget on BOTH paths — the default Z-Image preset trains checkpointed, so a
         // dense-only check would let a depth job skip admission entirely.
         // One cached depth reference per (item, bucket) entry, sized here at the largest edge.
-        let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
+        // sc-25213: the training adapter's preview-cancel factors stay resident once the first
+        // preview renders, so they count too (0 without an adapter or without previews).
+        let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len())
+            + training_adapter_preview_gb(cfg)?;
         if !will_checkpoint || aux_gb > 0.0 {
             preflight_memory_guard(cfg, edge, use_bf16, aux_gb, will_checkpoint)?;
         }
 
-        if use_bf16 {
-            self.transformer.cast_weights(Dtype::Bfloat16)?;
-        }
+        // sc-25213: merge the training adapter (before any caching, so an unreadable adapter fails
+        // fast), then cast to the compute dtype. Off ⇒ exactly the pre-sc-25213 cast.
+        prepare_training_base(
+            &mut self.training_adapter,
+            &mut self.transformer,
+            cfg,
+            use_bf16,
+        )?;
 
         // Epic 2123 depth anchoring (sc-2125): load the frozen TAEF1 decoder + Depth-Anything-V2
         // before the (minutes-long) caching pass, so a missing/corrupt aux checkpoint fails fast.
@@ -702,6 +719,12 @@ impl ZImageTurboTrainer {
                         lora_dtype,
                         LOKR_DTYPE,
                     )?;
+                    // sc-25213: previews render as the user will see the LoRA — on the bare
+                    // distilled base, so the merged training adapter is cancelled for the render
+                    // and restored before the next step.
+                    if let Some(merged) = self.training_adapter.as_mut() {
+                        merged.push_cancel(&mut self.transformer)?;
+                    }
                     let total = sample_caps.len() as u32;
                     for (i, (prompt, cap)) in sample_caps.iter().enumerate() {
                         if req.cancel.is_cancelled() {
@@ -741,6 +764,9 @@ impl ZImageTurboTrainer {
                             ),
                         }
                     }
+                    if let Some(merged) = &self.training_adapter {
+                        merged.pop_cancel(&mut self.transformer)?;
+                    }
                 }
             }
         }
@@ -772,6 +798,73 @@ impl ZImageTurboTrainer {
             steps: steps_run,
             final_loss: last_loss,
         })
+    }
+}
+
+/// The frozen base a run trains on (sc-25213): the training adapter merged in at its loaded
+/// precision (one rounding of `W + Δ`, see [`merge_training_adapter`]), THEN the bf16 compute cast
+/// — ai-toolkit's order. Merging after the cast would round the delta, and the sum, onto an
+/// already-rounded bf16 weight, losing sub-half-ulp delta entries. Without an adapter this is
+/// exactly the pre-sc-25213 cast.
+fn prepare_training_base(
+    merged: &mut Option<MergedTrainingAdapter>,
+    transformer: &mut ZImageTransformer,
+    cfg: &TrainingConfig,
+    use_bf16: bool,
+) -> Result<()> {
+    apply_training_adapter(merged, transformer, cfg)?;
+    if use_bf16 {
+        transformer.cast_weights(Dtype::Bfloat16)?;
+    }
+    Ok(())
+}
+
+/// Resident memory (GB) the training adapter's preview-cancel factors hold once previews render
+/// (sc-25213, epic 2123 E7): the adapter file's size when the run has both an adapter and preview
+/// sampling, else `0`. An unreadable adapter file is an error naming it.
+fn training_adapter_preview_gb(cfg: &TrainingConfig) -> Result<f64> {
+    let previews = cfg.sample_every > 0 && !cfg.sample_prompts.is_empty();
+    match (&cfg.training_adapter, previews) {
+        (Some(file), true) => {
+            let bytes = std::fs::metadata(file)
+                .map_err(|e| {
+                    mlx_gen::Error::Msg(format!(
+                        "training adapter {} could not be read: {e}",
+                        file.display()
+                    ))
+                })?
+                .len();
+            Ok(bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        }
+        _ => Ok(0.0),
+    }
+}
+
+/// Bring the DiT's frozen base in line with `cfg.training_adapter` (sc-25213): merge it on the
+/// first run that names it; a later run on the same trainer instance must name the same file (the
+/// merge cannot be undone without the bare weights, which are not kept) — anything else is refused
+/// with a reload instruction. `None` on an unmerged instance is a no-op: the base is untouched.
+fn apply_training_adapter(
+    merged: &mut Option<MergedTrainingAdapter>,
+    transformer: &mut ZImageTransformer,
+    cfg: &TrainingConfig,
+) -> Result<()> {
+    match (merged.as_ref(), &cfg.training_adapter) {
+        (None, None) => Ok(()),
+        (None, Some(file)) => {
+            *merged = Some(merge_training_adapter(transformer, file)?);
+            Ok(())
+        }
+        (Some(m), Some(file)) if &m.file == file => Ok(()),
+        (Some(m), requested) => Err(format!(
+            "z_image_turbo trainer: this trainer instance's base already carries the training \
+             adapter {} from a previous run, but this run asks for {}; reload the trainer",
+            m.file.display(),
+            requested
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |p| p.display().to_string())
+        )
+        .into()),
     }
 }
 
@@ -1419,6 +1512,7 @@ mod first_step_repro {
             text_encoder: Some(crate::loader::load_text_encoder(&root).unwrap()),
             vae: crate::loader::load_vae(&root).unwrap(),
             transformer: crate::loader::load_transformer(&root).unwrap(),
+            training_adapter: None,
         };
         let cfg = TrainingConfig {
             rank: 16,
@@ -3149,5 +3243,605 @@ mod subject_mask_reference_tests {
         )
         .unwrap();
         assert!(none.is_none());
+    }
+}
+
+/// sc-25213 — the training adapter (ai-toolkit `assistant_lora_path`) on the tiny synthetic DiT
+/// fixture: merged into the frozen base for training, cancelled for previews, never saved, and a
+/// strict no-op when unset. Seconds, a few MB; no weights downloaded.
+#[cfg(test)]
+mod training_adapter_tests {
+    use super::*;
+    use mlx_gen::weights::Weights;
+    use mlx_rs::ops::array_eq;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/z_transformer.safetensors"
+    );
+
+    fn tiny_dit() -> ZImageTransformer {
+        let cfg = crate::ZImageTransformerConfig {
+            patch_size: 2,
+            f_patch_size: 1,
+            in_channels: 4,
+            dim: 96,
+            n_layers: 2,
+            n_refiner_layers: 1,
+            n_heads: 4,
+            norm_eps: 1e-5,
+            cap_feat_dim: 32,
+            rope_theta: 256.0,
+            t_scale: 1000.0,
+            axes_dims: vec![8, 8, 8],
+            axes_lens: vec![64, 64, 64],
+            frequency_embedding_size: 256,
+        };
+        ZImageTransformer::from_weights(&Weights::from_file(FIXTURE).unwrap(), "w", cfg).unwrap()
+    }
+
+    /// The ai-toolkit de-distill adapter's module families (main layers: attention, FFN, AdaLN),
+    /// plus a refiner projection, each spelled as the shipped files spell them.
+    const TARGETS: [&str; 4] = [
+        "layers.0.attention.to_k",
+        "layers.1.feed_forward.w2",
+        "layers.0.adaLN_modulation.0",
+        "noise_refiner.0.attention.to_out.0",
+    ];
+
+    fn lin<'a>(
+        dit: &'a mut ZImageTransformer,
+        path: &str,
+    ) -> &'a mut mlx_gen::adapters::AdaptableLinear {
+        let parts: Vec<&str> = path.split('.').collect();
+        dit.adaptable_mut(&parts).unwrap()
+    }
+
+    fn weight(dit: &mut ZImageTransformer, path: &str) -> Array {
+        lin(dit, path).dense_weight().unwrap().0.clone()
+    }
+
+    /// Write an ai-toolkit-format adapter (`diffusion_model.<path>.lora_{A,B}.weight`, no `.alpha`
+    /// ⇒ strength `B·A`) over `targets`; returns the file and each target's `[out, in]` delta.
+    fn write_adapter(
+        dir: &Path,
+        name: &str,
+        targets: &[&str],
+        seed: u64,
+    ) -> (PathBuf, BTreeMap<String, Array>) {
+        let mut dit = tiny_dit();
+        let mut owned: Vec<(String, Array)> = Vec::new();
+        let mut deltas = BTreeMap::new();
+        for (i, t) in targets.iter().enumerate() {
+            let shape = lin(&mut dit, t).base_shape();
+            let (out, inp) = (shape[0], shape[1]);
+            let key = |k: u64| random::key(seed * 100 + i as u64 * 2 + k).unwrap();
+            let a = random::normal::<f32>(&[4, inp], None, Some(0.05), Some(&key(0))).unwrap();
+            let b = random::normal::<f32>(&[out, 4], None, Some(0.05), Some(&key(1))).unwrap();
+            deltas.insert(t.to_string(), mlx_rs::ops::matmul(&b, &a).unwrap());
+            owned.push((format!("diffusion_model.{t}.lora_A.weight"), a));
+            owned.push((format!("diffusion_model.{t}.lora_B.weight"), b));
+        }
+        let entries: Vec<(String, &Array)> = owned.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let path = dir.join(name);
+        Array::save_safetensors(entries, None::<&HashMap<String, String>>, &path).unwrap();
+        (path, deltas)
+    }
+
+    fn cfg_with(adapter: Option<PathBuf>) -> TrainingConfig {
+        TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            train_dtype: "f32".into(),
+            training_adapter: adapter,
+            ..Default::default()
+        }
+    }
+
+    fn cache() -> Vec<CacheEntry> {
+        let x0 = random::normal::<f32>(&[4, 1, 4, 4], None, None, Some(&random::key(100).unwrap()))
+            .unwrap();
+        let cap =
+            random::normal::<f32>(&[8, 32], None, None, Some(&random::key(200).unwrap())).unwrap();
+        eval([&x0, &cap]).unwrap();
+        vec![(x0, cap, None)]
+    }
+
+    fn one_step(
+        dit: &mut ZImageTransformer,
+        cfg: &TrainingConfig,
+    ) -> (f32, LoraParams, TrainAdapter, LoraParams) {
+        one_step_at(dit, cfg, Dtype::Float32)
+    }
+
+    fn one_step_at(
+        dit: &mut ZImageTransformer,
+        cfg: &TrainingConfig,
+        compute: Dtype,
+    ) -> (f32, LoraParams, TrainAdapter, LoraParams) {
+        let paths = resolve_target_paths(dit, cfg);
+        let (targets, params) = build_lora_targets(dit, &paths, 4, cfg.seed).unwrap();
+        let adapter = TrainAdapter::Lora { targets };
+        let cache = cache();
+        let schedule = BucketSchedule::new(
+            1,
+            &[gen_core::train::ResolutionBucket {
+                resolution: 32,
+                repeats: 1,
+            }],
+            7,
+        );
+        let (l, g) = run_train_step(
+            dit, &params, &adapter, cfg, &cache, &schedule, None, 1, false, None, compute,
+        )
+        .unwrap();
+        eval(g.values()).unwrap();
+        (l.total, g, adapter, params)
+    }
+
+    fn bits(a: &Array) -> Vec<u32> {
+        a.as_slice::<f32>().iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// (a) The merged base differs from the bare base by EXACTLY the adapter delta on each targeted
+    /// linear, and is bit-identical everywhere else; no residual is left on any stack.
+    /// Mutations: skip `merge_dense_delta` ⇒ the targeted assert fails; merge at scale 2 (or fold
+    /// `a·b` untransposed) ⇒ the delta assert fails; merge every candidate ⇒ the untouched assert fails.
+    #[test]
+    fn the_merge_adds_exactly_the_adapter_delta_to_the_targeted_base_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, deltas) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 1);
+        let mut bare = tiny_dit();
+        let mut dit = tiny_dit();
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut dit, &cfg_with(Some(file.clone()))).unwrap();
+        let merged = slot.expect("an adapter run records its merge");
+        assert_eq!(merged.file, file);
+        assert_eq!(
+            merged.paths.iter().cloned().collect::<BTreeSet<_>>(),
+            TARGETS
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        for path in AdaptableHost::adaptable_paths(&dit) {
+            let (before, after) = (weight(&mut bare, &path), weight(&mut dit, &path));
+            assert!(
+                lin(&mut dit, &path).adapters().is_empty(),
+                "{path}: stack left behind"
+            );
+            match deltas.get(&path) {
+                Some(delta) => {
+                    // Judged against the delta's own size: MLX's f32 GPU GEMM carries ~1e-3
+                    // relative error, so `B·A` here and in the merge may round differently.
+                    let max_abs = |a: &Array| -> f32 { a.abs().unwrap().max(None).unwrap().item() };
+                    let got = mlx_rs::ops::subtract(&after, &before).unwrap();
+                    let off = max_abs(&mlx_rs::ops::subtract(&got, delta).unwrap());
+                    assert!(
+                        off <= 0.01 * max_abs(delta),
+                        "{path}: merged weight is not base + B·A (off by {off})"
+                    );
+                    assert!(
+                        !array_eq(&after, &before, None).unwrap().item::<bool>(),
+                        "{path}"
+                    );
+                }
+                None => assert_eq!(
+                    bits(&after),
+                    bits(&before),
+                    "{path}: untargeted weight changed"
+                ),
+            }
+        }
+    }
+
+    /// Previews render without the adapter: the -1.0 cancel brings each merged linear back to the
+    /// bare forward, and popping it restores the merged forward bit-for-bit (with the trainable
+    /// adapter installed underneath, as during a real preview).
+    /// Mutations: push the cancel at +1.0 ⇒ the bare-forward assert fails; skip `pop_cancel` ⇒ the
+    /// restored assert fails.
+    #[test]
+    fn the_preview_cancel_renders_the_bare_base_and_pops_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 2);
+        let mut bare = tiny_dit();
+        let mut dit = tiny_dit();
+        let cfg = cfg_with(Some(file));
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut dit, &cfg).unwrap();
+        let mut merged = slot.unwrap();
+        // The trainable adapter sits on the attention targets underneath, as `install_as` leaves it.
+        let paths = resolve_target_paths(&dit, &cfg);
+        let (targets, params) = build_lora_targets(&mut dit, &paths, 4, 7).unwrap();
+        let train = TrainAdapter::Lora { targets };
+        train
+            .install_as(&mut dit, &params, 4.0, 4.0, None, LOKR_DTYPE)
+            .unwrap();
+        train
+            .install_as(&mut bare, &params, 4.0, 4.0, None, LOKR_DTYPE)
+            .unwrap();
+        for path in TARGETS {
+            let inp = lin(&mut dit, path).base_shape()[1];
+            let x = random::normal::<f32>(&[3, inp], None, None, Some(&random::key(9).unwrap()))
+                .unwrap();
+            let y_bare = lin(&mut bare, path).forward(&x).unwrap();
+            let y_merged = lin(&mut dit, path).forward(&x).unwrap();
+            // MLX's f32 GPU GEMM carries ~1e-3 relative error on this hardware, so the cancel is
+            // judged against the adapter's own contribution: the preview forward must sit within 2%
+            // of it from the bare forward (a missing or sign-flipped cancel is off by 100% / 200%).
+            let max_abs = |a: &Array, b: &Array| -> f32 {
+                mlx_rs::ops::subtract(a, b)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(None)
+                    .unwrap()
+                    .item()
+            };
+            let contribution = max_abs(&y_merged, &y_bare);
+            assert!(contribution > 1e-3, "{path}: the adapter changed nothing");
+            merged.push_cancel(&mut dit).unwrap();
+            let y_cancel = lin(&mut dit, path).forward(&x).unwrap();
+            assert!(
+                max_abs(&y_cancel, &y_bare) <= 0.02 * contribution,
+                "{path}: the preview forward is not the bare base"
+            );
+            merged.pop_cancel(&mut dit).unwrap();
+            let y_back = lin(&mut dit, path).forward(&x).unwrap();
+            assert_eq!(
+                bits(&y_back),
+                bits(&y_merged),
+                "{path}: pop did not restore"
+            );
+        }
+    }
+
+    /// (b) + training: a step on the merged base trains against base + adapter (its loss and
+    /// gradients differ from the bare base's), and the saved adapter holds ONLY the trainable
+    /// targets' `lora_A`/`lora_B`/`alpha` — no de-distill key, no `diffusion_model.` prefix.
+    /// Mutations: drop the `apply_training_adapter` call's merge ⇒ the loss assert fails; save the
+    /// training adapter's keys alongside ⇒ the key-set assert fails.
+    #[test]
+    fn training_runs_on_the_merged_base_and_saves_only_the_trainable_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 3);
+        let mut bare = tiny_dit();
+        let mut dit = tiny_dit();
+        let cfg = cfg_with(Some(file));
+        apply_training_adapter(&mut None, &mut dit, &cfg).unwrap();
+        let (loss_bare, g_bare, _, _) = one_step(&mut bare, &cfg_with(None));
+        let (loss, g, adapter, params) = one_step(&mut dit, &cfg);
+        assert_ne!(
+            loss.to_bits(),
+            loss_bare.to_bits(),
+            "the step ignored the merged adapter"
+        );
+        assert!(g.keys().any(|k| bits(&g[k]) != bits(&g_bare[k])));
+
+        let out = tmp.path().join("lora.safetensors");
+        adapter.save(&params, 4.0, 4.0, -1, "", &out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let saved = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let keys: BTreeSet<String> = saved.names().into_iter().map(String::from).collect();
+        let want: BTreeSet<String> = adapter
+            .paths()
+            .iter()
+            .flat_map(|p| ["lora_A.weight", "lora_B.weight", "alpha"].map(|s| format!("{p}.{s}")))
+            .collect();
+        assert_eq!(keys, want);
+        assert!(keys
+            .iter()
+            .all(|k| !k.starts_with("diffusion_model.") && !k.contains("feed_forward")));
+    }
+
+    /// (c) E1: with no training adapter the trainer's base preparation is exactly the pre-sc-25213
+    /// path — the bf16 compute cast and nothing else (f32: nothing at all). Every adaptable weight
+    /// and a seeded step's loss and gradients are compared bit-for-bit against a DiT taken through
+    /// that reference path by hand.
+    /// Mutations: make `prepare_training_base` skip (or repeat with another dtype) the cast, or touch
+    /// the base in the `(None, None)` arm (e.g. a stray f32 round trip that is lossy, or a merge) ⇒ red.
+    #[test]
+    fn no_training_adapter_prepares_exactly_the_pre_change_base() {
+        for (use_bf16, compute) in [(false, Dtype::Float32), (true, Dtype::Bfloat16)] {
+            let cfg = TrainingConfig {
+                train_dtype: if use_bf16 { "bf16" } else { "f32" }.into(),
+                ..cfg_with(None)
+            };
+            let mut reference = tiny_dit();
+            if use_bf16 {
+                reference.cast_weights(Dtype::Bfloat16).unwrap();
+            }
+            let mut dit = tiny_dit();
+            let mut slot = None;
+            prepare_training_base(&mut slot, &mut dit, &cfg, use_bf16).unwrap();
+            assert!(slot.is_none());
+            for path in AdaptableHost::adaptable_paths(&dit) {
+                let (got, want) = (weight(&mut dit, &path), weight(&mut reference, &path));
+                assert_eq!(got.dtype(), want.dtype(), "{path}");
+                assert_eq!(
+                    bits32(&got),
+                    bits32(&want),
+                    "{path}: base differs from the pre-change path (bf16={use_bf16})"
+                );
+            }
+            let (l0, g0, _, _) = one_step_at(&mut reference, &cfg, compute);
+            let (l1, g1, _, _) = one_step_at(&mut dit, &cfg, compute);
+            assert_eq!(l0.to_bits(), l1.to_bits(), "bf16={use_bf16}");
+            for (k, v) in &g0 {
+                assert_eq!(bits32(v), bits32(&g1[k]), "{k} (bf16={use_bf16})");
+            }
+        }
+    }
+
+    /// Any-dtype bit view (an f32 copy of a bf16 array is exact, so equal bits ⇔ equal values).
+    fn bits32(a: &Array) -> Vec<u32> {
+        bits(&a.as_dtype(Dtype::Float32).unwrap())
+    }
+
+    /// An ai-toolkit-format adapter whose `B·A` is EXACT in f32 (power-of-two factors, at most four
+    /// terms per entry), so the expected merged weight can be formed independently of the GEMM.
+    /// Entries reach ~2^-9 and carry more mantissa than bf16 holds — around a bf16 ulp of the
+    /// fixture's weights, where the rounding order decides the result. Returns the file and each target's exact `[out, in]` delta.
+    fn write_exact_adapter(dir: &Path, targets: &[&str]) -> (PathBuf, BTreeMap<String, Array>) {
+        let mut dit = tiny_dit();
+        let mut owned: Vec<(String, Array)> = Vec::new();
+        let mut deltas = BTreeMap::new();
+        for t in targets {
+            let shape = lin(&mut dit, t).base_shape();
+            let (out, inp) = (shape[0] as usize, shape[1] as usize);
+            let a: Vec<f32> = (0..4 * inp)
+                .map(|k| {
+                    let (r, i) = (k / inp, k % inp);
+                    if (r + i) % 3 == 0 {
+                        // 1..=256 × 2^-16: products with ±2^-4 stay exact in f32 but need more
+                        // mantissa than bf16 holds, so rounding Δ itself changes the result.
+                        (1 + (i * 31 + r * 17) % 256) as f32 * 2f32.powi(-16)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let b: Vec<f32> = (0..out * 4)
+                .map(|k| {
+                    if (k / 4 * 7 + k % 4) % 2 == 0 {
+                        2f32.powi(-4)
+                    } else {
+                        -(2f32.powi(-4))
+                    }
+                })
+                .collect();
+            let mut d = vec![0f32; out * inp];
+            for o in 0..out {
+                for i in 0..inp {
+                    d[o * inp + i] = (0..4).map(|r| b[o * 4 + r] * a[r * inp + i]).sum();
+                }
+            }
+            deltas.insert(
+                t.to_string(),
+                Array::from_slice(&d, &[out as i32, inp as i32]),
+            );
+            owned.push((
+                format!("diffusion_model.{t}.lora_A.weight"),
+                Array::from_slice(&a, &[4, inp as i32]),
+            ));
+            owned.push((
+                format!("diffusion_model.{t}.lora_B.weight"),
+                Array::from_slice(&b, &[out as i32, 4]),
+            ));
+        }
+        let entries: Vec<(String, &Array)> = owned.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let path = dir.join("exact.safetensors");
+        Array::save_safetensors(entries, None::<&HashMap<String, String>>, &path).unwrap();
+        (path, deltas)
+    }
+
+    /// Finding 1: the merge rounds `W + Δ` ONCE, before the bf16 compute cast — for an f32-loaded
+    /// base (the trainer's merge-then-cast order) and for a bf16-loaded base (the per-linear f32
+    /// widen-merge-narrow). The f32-base case also proves the assertion can tell: the old
+    /// cast-then-merge order (bf16 weight + bf16-rounded delta, summed in bf16) gives different bits.
+    /// Mutation: merge after the cast in `prepare_training_base` ⇒ the f32-base single-rounding
+    /// assert fails.
+    #[test]
+    fn the_merge_rounds_once_before_the_compute_cast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, deltas) = write_exact_adapter(tmp.path(), &TARGETS);
+        for bf16_loaded in [false, true] {
+            let mut bare = tiny_dit();
+            let mut dit = tiny_dit();
+            if bf16_loaded {
+                bare.cast_weights(Dtype::Bfloat16).unwrap();
+                dit.cast_weights(Dtype::Bfloat16).unwrap();
+            }
+            let cfg = TrainingConfig {
+                train_dtype: "bf16".into(),
+                ..cfg_with(Some(file.clone()))
+            };
+            prepare_training_base(&mut None, &mut dit, &cfg, true).unwrap();
+            let mut discriminates = false;
+            for (path, delta) in &deltas {
+                let w = weight(&mut bare, path).as_dtype(Dtype::Float32).unwrap();
+                let once = mlx_rs::ops::add(&w, delta)
+                    .unwrap()
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap();
+                let twice = mlx_rs::ops::add(
+                    w.as_dtype(Dtype::Bfloat16).unwrap(),
+                    delta.as_dtype(Dtype::Bfloat16).unwrap(),
+                )
+                .unwrap();
+                let got = weight(&mut dit, path);
+                assert_eq!(got.dtype(), Dtype::Bfloat16, "{path}");
+                assert_eq!(
+                    bits32(&got),
+                    bits32(&once),
+                    "{path}: merged weight is not ONE rounding of W + Δ (bf16_loaded={bf16_loaded})"
+                );
+                discriminates |= bits32(&once) != bits32(&twice);
+            }
+            // f32-loaded base: the old cast-then-merge order rounds twice and gives different bits
+            // on some entry — so this case proves the order. (On a bf16-loaded base the two orders
+            // differ only at rare near-ties; that case pins the single-rounding result itself.)
+            if !bf16_loaded {
+                assert!(
+                    discriminates,
+                    "the f32-base case cannot discriminate the merge order"
+                );
+            }
+        }
+    }
+
+    /// Finding 2: the preview cancel reads the adapter file once. After the first push/pop the file
+    /// is deleted; every later preview still cancels to the same bits (built residuals reused).
+    /// Mutation: re-run the loader on every `push_cancel` ⇒ the second push fails (file gone) ⇒ red.
+    #[test]
+    fn the_preview_cancel_is_built_once_and_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 8);
+        let mut dit = tiny_dit();
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut dit, &cfg_with(Some(file.clone()))).unwrap();
+        let mut merged = slot.unwrap();
+        assert!(!merged.cancel_built());
+        let path = TARGETS[1];
+        let inp = lin(&mut dit, path).base_shape()[1];
+        let x =
+            random::normal::<f32>(&[3, inp], None, None, Some(&random::key(11).unwrap())).unwrap();
+        merged.push_cancel(&mut dit).unwrap();
+        let first = lin(&mut dit, path).forward(&x).unwrap();
+        merged.pop_cancel(&mut dit).unwrap();
+        assert!(merged.cancel_built());
+        std::fs::remove_file(&file).unwrap();
+        for _ in 0..2 {
+            merged.push_cancel(&mut dit).unwrap();
+            let again = lin(&mut dit, path).forward(&x).unwrap();
+            assert_eq!(bits(&again), bits(&first));
+            merged.pop_cancel(&mut dit).unwrap();
+            assert!(lin(&mut dit, path).adapters().is_empty());
+        }
+    }
+
+    /// E7 for the cached cancel: it counts only with an adapter AND previews; a missing file is a
+    /// named error. Mutation: return 0 always ⇒ red.
+    #[test]
+    fn the_preview_cancel_residency_is_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 9);
+        let size = std::fs::metadata(&file).unwrap().len() as f64 / (1024.0 * 1024.0 * 1024.0);
+        let previews = |cfg: TrainingConfig| TrainingConfig {
+            sample_every: 10,
+            sample_prompts: vec!["p".into()],
+            ..cfg
+        };
+        assert_eq!(
+            training_adapter_preview_gb(&cfg_with(Some(file.clone()))).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            training_adapter_preview_gb(&previews(cfg_with(None))).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            training_adapter_preview_gb(&previews(cfg_with(Some(file.clone())))).unwrap(),
+            size
+        );
+        let err = training_adapter_preview_gb(&previews(cfg_with(Some(
+            tmp.path().join("gone.safetensors"),
+        ))))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gone.safetensors"), "{err}");
+    }
+
+    /// The merge is destructive, so a reused trainer instance accepts only the same adapter again
+    /// (without merging it twice) and refuses a different one or none with a reload instruction.
+    /// Mutation: drop the same-file arm ⇒ the second merge doubles the delta / errors.
+    #[test]
+    fn a_reused_trainer_never_merges_twice_or_silently_swaps_adapters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 4);
+        let (b, _) = write_adapter(tmp.path(), "b.safetensors", &TARGETS, 5);
+        let mut dit = tiny_dit();
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut dit, &cfg_with(Some(a.clone()))).unwrap();
+        let once = weight(&mut dit, TARGETS[0]);
+        apply_training_adapter(&mut slot, &mut dit, &cfg_with(Some(a))).unwrap();
+        assert_eq!(bits(&weight(&mut dit, TARGETS[0])), bits(&once));
+        for other in [Some(b), None] {
+            let err = apply_training_adapter(&mut slot, &mut dit, &cfg_with(other))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reload the trainer"), "{err}");
+        }
+    }
+
+    /// A target the DiT does not have, or an unreadable file, is a named error — never a silent
+    /// partial merge or a bare-base run.
+    #[test]
+    fn a_bad_training_adapter_is_a_named_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 6);
+        // Re-key one target onto a layer the 2-layer fixture does not have.
+        let bytes = std::fs::read(&file).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mut owned: Vec<(String, Array)> = Vec::new();
+        for name in st.names() {
+            let view = st.tensor(name).unwrap();
+            let data: Vec<f32> = view
+                .data()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let shape: Vec<i32> = view.shape().iter().map(|&d| d as i32).collect();
+            owned.push((
+                name.replace("layers.1.", "layers.7."),
+                Array::from_slice(&data, &shape),
+            ));
+        }
+        let entries: Vec<(String, &Array)> = owned.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let bad = tmp.path().join("bad.safetensors");
+        Array::save_safetensors(entries, None::<&HashMap<String, String>>, &bad).unwrap();
+        let err = apply_training_adapter(&mut None, &mut tiny_dit(), &cfg_with(Some(bad)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("layers.7.feed_forward.w2"), "{err}");
+
+        let missing = tmp.path().join("missing.safetensors");
+        let err = apply_training_adapter(&mut None, &mut tiny_dit(), &cfg_with(Some(missing)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing.safetensors"), "{err}");
+    }
+
+    /// Key format of the shipped ostris adapters (`zimage_turbo_training_adapter_v{1,2}`, inspected
+    /// at revision 654cd1bf: 480 keys = 30 main layers × these 8 modules × `lora_{A,B}.weight`, all
+    /// with the `diffusion_model.` prefix and no `.alpha`): every module family merges on a layer.
+    /// Mutation: drop `feed_forward`/`adaLN_modulation` routing from the DiT host ⇒ red.
+    #[test]
+    fn every_module_family_of_the_shipped_ostris_adapters_merges() {
+        const OSTRIS_MODULES: [&str; 8] = [
+            "attention.to_q",
+            "attention.to_k",
+            "attention.to_v",
+            "attention.to_out.0",
+            "feed_forward.w1",
+            "feed_forward.w2",
+            "feed_forward.w3",
+            "adaLN_modulation.0",
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let targets: Vec<String> = OSTRIS_MODULES
+            .iter()
+            .map(|m| format!("layers.1.{m}"))
+            .collect();
+        let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+        let (file, _) = write_adapter(tmp.path(), "ostris.safetensors", &refs, 7);
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut tiny_dit(), &cfg_with(Some(file))).unwrap();
+        assert_eq!(
+            slot.unwrap().paths.into_iter().collect::<BTreeSet<_>>(),
+            targets.into_iter().collect::<BTreeSet<_>>()
+        );
     }
 }

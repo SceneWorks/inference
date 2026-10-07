@@ -390,10 +390,11 @@ fn perceptual_footprint_bytes(cfg: &TrainingConfig, items: usize) -> u64 {
     )
 }
 
-/// Epic 2123 E7 preflight: when a perceptual loss is on, the trained DiT's resident weights (its
-/// `transformer/` safetensors — the lower bound; no fitted activation model exists for this
-/// trainer, so the same base applies checkpointed or dense) plus the aux footprint must fit
-/// `budget_bytes`. Depth off ⇒ no check (unchanged behavior).
+/// Epic 2123 E7 preflight: when a perceptual loss or the training adapter (sc-25213) is on, the
+/// trained DiT's resident weights (its `transformer/` safetensors — the lower bound; no fitted
+/// activation model exists for this trainer, so the same base applies checkpointed or dense) plus
+/// the training adapter's resident factors plus the aux footprint must fit `budget_bytes`. Both off
+/// ⇒ no check (unchanged behavior).
 fn aux_memory_preflight(
     root: &Path,
     cfg: &TrainingConfig,
@@ -401,11 +402,15 @@ fn aux_memory_preflight(
     budget_bytes: u64,
 ) -> Result<()> {
     let aux = perceptual_footprint_bytes(cfg, items);
-    if aux == 0 {
+    let adapter = crate::training_adapter::training_adapter_bytes(
+        cfg.training_adapter.as_deref(),
+        flow_match::parse_compute_dtype(&cfg.train_dtype),
+    )?;
+    if aux == 0 && adapter == 0 {
         return Ok(());
     }
     let base = flow_match::component_bytes(root, "transformer", LABEL)?;
-    flow_match::check_aux_memory(LABEL, base, aux, budget_bytes)
+    flow_match::check_aux_memory(LABEL, base + adapter, aux, budget_bytes)
 }
 
 /// Identity + capabilities of the candle Z-Image trainer: LoRA + LoKr, `backend = "candle"`.
@@ -449,6 +454,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
             normal_loss: true,
             vae_anchor_loss: true,
             latent_lpips_loss: true,
+            // sc-25213: the de-distill training adapter, a frozen residual on every projection it
+            // targets for training and switched off for previews (`crate::training_adapter`).
+            training_adapter: true,
             ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -672,11 +680,14 @@ impl FlowMatchTrainer for ZImageTrainer {
         req: &TrainingRequest,
         device: &Device,
     ) -> Result<ZImageTransformer2DModel> {
-        build_trainable_dit(
-            &self.root,
-            device,
-            flow_match::parse_compute_dtype(&req.config.train_dtype),
-        )
+        let dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
+        let mut dit = build_trainable_dit(&self.root, device, dtype)?;
+        // sc-25213: the training adapter rides every projection it targets as a frozen residual for
+        // the training forward/backward (off for previews, see `render_sample`). None ⇒ untouched.
+        if let Some(file) = &req.config.training_adapter {
+            crate::training_adapter::install_training_adapter(&mut dit, file, dtype, device)?;
+        }
+        Ok(dit)
     }
 
     fn micro_step(
@@ -737,71 +748,95 @@ impl FlowMatchTrainer for ZImageTrainer {
         cfg: &TrainingConfig,
         seed: u64,
     ) -> Result<Image> {
-        let device = self.device();
-        let cap = state.caps.get(index).ok_or_else(|| {
-            CandleError::Msg(format!(
-                "z_image trainer: preview prompt index {index} out of range"
-            ))
-        })?;
-        let steps = (cfg.sample_steps as usize).max(1);
-        let lat = (state.edge / SPATIAL_SCALE) as usize;
-        // The DiT is built at the bf16 compute dtype (`build_dit`); the inference forward does NOT cast
-        // its inputs (unlike Krea's), so feed bf16 latents + conditioning — exactly as `compute_loss_grads`
-        // does (`x_t`/`cap_feats` → `compute_dtype`) — or the first matmul hits an F32×BF16 mismatch.
-        let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
-
-        // Seeded launch-portable prior at the training resolution (square `edge`). `prepare_inputs`
-        // pads `cap` to SEQ_MULTI_OF (+ mask) and adds the singleton frame axis to the latents →
-        // (1, 16, 1, lat, lat) — the exact tensor surface train + infer feed the DiT.
-        let noise = sample_noise_latent(state.edge, seed, device)?;
-        let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), device)?;
-        let cap_feats = prepared.cap_feats.to_dtype(compute_dtype)?;
-        let cap_mask = prepared.cap_mask;
-
-        // Distilled flow-match Euler schedule — pass `Some(mu)` (the resolution-dependent shift) so the
-        // σ table stays consistent with the `1 − σ` conditioning (the `None` arm desyncs them and
-        // speckles; see `pipeline::Pipeline::render`). `mu` is derived from the post-patchify seq len.
-        let image_seq_len = ((lat as u32 / PATCH_SIZE) * (lat as u32 / PATCH_SIZE)) as usize;
-        let mu = calculate_shift(
-            image_seq_len,
-            BASE_IMAGE_SEQ_LEN,
-            MAX_IMAGE_SEQ_LEN,
-            BASE_SHIFT,
-            MAX_SHIFT,
+        // sc-25213: previews render as the user will see the LoRA — on the bare distilled base — so
+        // the training adapter's residual is switched off for the render and back on afterwards,
+        // whether or not the render succeeded. A no-op without one.
+        crate::training_adapter::set_training_adapter_pass(
+            dit,
+            crate::training_adapter::PREVIEW_PASS,
         );
-        let mut scheduler = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
-        scheduler.set_timesteps(steps, Some(mu));
-        // `TrainingConfig` carries no sampler/scheduler knob — preview uses the native distilled σ table
-        // verbatim (`None` ⇒ the scheduler's own schedule) and the default `euler` sampler (the N1 no-op
-        // = the legacy Euler step), exactly the Z-Image inference default.
-        let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
-        let sigmas = candle_gen::resolve_flow_schedule(None, 0.0, steps, &native);
-
-        // A preview never honors mid-denoise cancel; a fresh never-cancelled token suffices.
-        let nocancel = CancelFlag::new();
-        let latents = candle_gen::run_flow_sampler(
-            None,
-            TimestepConvention::OneMinusSigma,
-            &sigmas,
-            prepared.latents.to_dtype(compute_dtype)?,
-            seed,
-            &nocancel,
-            &mut |_| {},
-            None,
-            |latents, t| -> Result<Tensor> {
-                // `t` is the `1 − σ` conditioning the DiT embeds; the raw velocity is NEGATED to match
-                // inference's `noise_pred.neg()` (the Z-Image sign convention).
-                let t_tensor = Tensor::from_vec(vec![t], (1,), device)?;
-                let velocity = dit
-                    .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
-                    .neg()?;
-                Ok(velocity)
-            },
-        )?;
-
-        // The denoise ran in `compute_dtype`; the resident VAE is F32 → cast back before decode.
-        decode_preview(&state.vae, &latents.to_dtype(DType::F32)?)
+        let image = render_preview(self.device(), dit, state, index, cfg, seed);
+        crate::training_adapter::set_training_adapter_pass(
+            dit,
+            crate::training_adapter::TRAIN_PASS,
+        );
+        image
     }
+}
+
+/// The preview denoise + decode behind [`FlowMatchTrainer::render_sample`] (sc-8650), on whatever
+/// residual pass the caller selected.
+fn render_preview(
+    device: &Device,
+    dit: &ZImageTransformer2DModel,
+    state: &ZImageSampleState,
+    index: usize,
+    cfg: &TrainingConfig,
+    seed: u64,
+) -> Result<Image> {
+    let cap = state.caps.get(index).ok_or_else(|| {
+        CandleError::Msg(format!(
+            "z_image trainer: preview prompt index {index} out of range"
+        ))
+    })?;
+    let steps = (cfg.sample_steps as usize).max(1);
+    let lat = (state.edge / SPATIAL_SCALE) as usize;
+    // The DiT is built at the bf16 compute dtype (`build_dit`); the inference forward does NOT cast
+    // its inputs (unlike Krea's), so feed bf16 latents + conditioning — exactly as `compute_loss_grads`
+    // does (`x_t`/`cap_feats` → `compute_dtype`) — or the first matmul hits an F32×BF16 mismatch.
+    let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
+
+    // Seeded launch-portable prior at the training resolution (square `edge`). `prepare_inputs`
+    // pads `cap` to SEQ_MULTI_OF (+ mask) and adds the singleton frame axis to the latents →
+    // (1, 16, 1, lat, lat) — the exact tensor surface train + infer feed the DiT.
+    let noise = sample_noise_latent(state.edge, seed, device)?;
+    let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), device)?;
+    let cap_feats = prepared.cap_feats.to_dtype(compute_dtype)?;
+    let cap_mask = prepared.cap_mask;
+
+    // Distilled flow-match Euler schedule — pass `Some(mu)` (the resolution-dependent shift) so the
+    // σ table stays consistent with the `1 − σ` conditioning (the `None` arm desyncs them and
+    // speckles; see `pipeline::Pipeline::render`). `mu` is derived from the post-patchify seq len.
+    let image_seq_len = ((lat as u32 / PATCH_SIZE) * (lat as u32 / PATCH_SIZE)) as usize;
+    let mu = calculate_shift(
+        image_seq_len,
+        BASE_IMAGE_SEQ_LEN,
+        MAX_IMAGE_SEQ_LEN,
+        BASE_SHIFT,
+        MAX_SHIFT,
+    );
+    let mut scheduler = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
+    scheduler.set_timesteps(steps, Some(mu));
+    // `TrainingConfig` carries no sampler/scheduler knob — preview uses the native distilled σ table
+    // verbatim (`None` ⇒ the scheduler's own schedule) and the default `euler` sampler (the N1 no-op
+    // = the legacy Euler step), exactly the Z-Image inference default.
+    let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+    let sigmas = candle_gen::resolve_flow_schedule(None, 0.0, steps, &native);
+
+    // A preview never honors mid-denoise cancel; a fresh never-cancelled token suffices.
+    let nocancel = CancelFlag::new();
+    let latents = candle_gen::run_flow_sampler(
+        None,
+        TimestepConvention::OneMinusSigma,
+        &sigmas,
+        prepared.latents.to_dtype(compute_dtype)?,
+        seed,
+        &nocancel,
+        &mut |_| {},
+        None,
+        |latents, t| -> Result<Tensor> {
+            // `t` is the `1 − σ` conditioning the DiT embeds; the raw velocity is NEGATED to match
+            // inference's `noise_pred.neg()` (the Z-Image sign convention).
+            let t_tensor = Tensor::from_vec(vec![t], (1,), device)?;
+            let velocity = dit
+                .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
+                .neg()?;
+            Ok(velocity)
+        },
+    )?;
+
+    // The denoise ran in `compute_dtype`; the resident VAE is F32 → cast back before decode.
+    decode_preview(&state.vae, &latents.to_dtype(DType::F32)?)
 }
 
 #[cfg(test)]
@@ -1543,5 +1578,427 @@ mod tests {
             let e = load_perceptual_path(&cfg, &dev).err().unwrap().to_string();
             assert!(e.contains("TAEF1"), "{e}");
         }
+    }
+}
+
+/// sc-25213 — the training adapter (ai-toolkit `assistant_lora_path`) on the tiny CPU DiT: a frozen
+/// residual on exactly the projections it names for training, off for previews, never trainable or
+/// saved, refused when it does not fit the DiT, and counted by the memory preflight.
+#[cfg(test)]
+mod training_adapter_tests {
+    use super::*;
+    use crate::training_adapter::{
+        install_training_adapter, set_training_adapter_pass, training_adapter_bytes, PREVIEW_PASS,
+        TRAIN_PASS,
+    };
+    use candle_gen::train::lora::build_lora_targets;
+    use candle_nn::{VarBuilder, VarMap};
+    use candle_transformers::models::z_image::transformer::Config;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    /// The ai-toolkit de-distill adapter's module families (main layer: attention, FFN, AdaLN) plus
+    /// a refiner projection, spelled as the shipped files spell them.
+    const TARGETS: [&str; 4] = [
+        "layers.0.attention.to_k",
+        "layers.0.feed_forward.w2",
+        "layers.0.adaLN_modulation.0",
+        "noise_refiner.0.attention.to_out.0",
+    ];
+
+    fn tiny_cfg() -> Config {
+        let mut cfg = Config::z_image_turbo();
+        cfg.dim = 128;
+        cfg.n_heads = 1;
+        cfg.n_kv_heads = 1;
+        cfg.n_layers = 1;
+        cfg.n_refiner_layers = 1;
+        cfg.cap_feat_dim = 64;
+        cfg
+    }
+
+    /// Two DiTs over ONE set of base weights (the same `VarMap`), so any output difference between
+    /// them is the training adapter.
+    fn twin_dits() -> (ZImageTransformer2DModel, ZImageTransformer2DModel, Config) {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let a = ZImageTransformer2DModel::new(&cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))
+            .unwrap();
+        let b = ZImageTransformer2DModel::new(&cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))
+            .unwrap();
+        (a, b, cfg)
+    }
+
+    fn shapes(dit: &ZImageTransformer2DModel) -> BTreeMap<String, (usize, usize)> {
+        let mut out = BTreeMap::new();
+        dit.visit_block_linears(&mut |l| {
+            out.insert(l.path().to_string(), (l.in_features(), l.out_features()));
+        });
+        out
+    }
+
+    /// Write an ai-toolkit-format adapter (`diffusion_model.<path>.lora_{A,B}.weight`, no `.alpha`)
+    /// over `targets`; returns the file and each target's `[out, in]` delta `B·A`.
+    fn write_adapter(
+        dir: &Path,
+        dit: &ZImageTransformer2DModel,
+        targets: &[&str],
+        std: f32,
+    ) -> (PathBuf, BTreeMap<String, Tensor>) {
+        let dev = Device::Cpu;
+        let shapes = shapes(dit);
+        let mut tensors = HashMap::new();
+        let mut deltas = BTreeMap::new();
+        for t in targets {
+            let (inp, out) = shapes[*t];
+            let a = Tensor::randn(0f32, std, (4, inp), &dev).unwrap();
+            let b = Tensor::randn(0f32, std, (out, 4), &dev).unwrap();
+            deltas.insert(t.to_string(), b.matmul(&a).unwrap());
+            tensors.insert(format!("diffusion_model.{t}.lora_A.weight"), a);
+            tensors.insert(format!("diffusion_model.{t}.lora_B.weight"), b);
+        }
+        let path = dir.join("training_adapter.safetensors");
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+        (path, deltas)
+    }
+
+    /// Every block projection's output on a fixed input.
+    fn outputs(dit: &ZImageTransformer2DModel) -> BTreeMap<String, (Tensor, Tensor)> {
+        let mut out = BTreeMap::new();
+        dit.visit_block_linears(&mut |l| {
+            let x = Tensor::ones((2, l.in_features()), DType::F32, &Device::Cpu)
+                .unwrap()
+                .affine(0.01, -0.3)
+                .unwrap();
+            let y = candle_core::Module::forward(l, &x).unwrap();
+            out.insert(l.path().to_string(), (x, y));
+        });
+        out
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    fn max_abs(t: &Tensor) -> f32 {
+        t.abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap()
+    }
+
+    /// (a) The effective weight of each targeted projection is base + `B·A` exactly (its output moves
+    /// by `x·(B·A)ᵀ`), every other projection is bit-identical; the preview pass is bit-identical to
+    /// the bare base on EVERY projection and the training pass comes back bit-for-bit.
+    /// Mutations: install at strength 2 / swap `a`,`b` ⇒ the delta assert fails; skip a target ⇒ the
+    /// count assert fails; preview scale 1.0 ⇒ the preview assert fails.
+    #[test]
+    fn the_adapter_adds_exactly_its_delta_and_the_preview_pass_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, bare, _) = twin_dits();
+        let (file, deltas) = write_adapter(tmp.path(), &dit, &TARGETS, 0.05);
+        let before = outputs(&bare);
+        let n = install_training_adapter(&mut dit, &file, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(n, TARGETS.len());
+        let trained = outputs(&dit);
+        for (path, (x, y0)) in &before {
+            let y = &trained[path].1;
+            match deltas.get(path) {
+                Some(delta) => {
+                    let want = (y0 + x.matmul(&delta.t().unwrap()).unwrap()).unwrap();
+                    let off = max_abs(&(y - &want).unwrap());
+                    assert!(
+                        off < 1e-5,
+                        "{path}: effective weight is not base + B·A ({off})"
+                    );
+                    assert!(max_abs(&(y - y0).unwrap()) > 1e-3, "{path}: adapter inert");
+                }
+                None => assert_eq!(bits(y), bits(y0), "{path}: untargeted projection changed"),
+            }
+        }
+        set_training_adapter_pass(&dit, PREVIEW_PASS);
+        for (path, (_, y)) in outputs(&dit) {
+            assert_eq!(
+                bits(&y),
+                bits(&before[&path].1),
+                "{path}: preview is not the bare base"
+            );
+        }
+        set_training_adapter_pass(&dit, TRAIN_PASS);
+        for (path, (_, y)) in outputs(&dit) {
+            assert_eq!(
+                bits(&y),
+                bits(&trained[&path].1),
+                "{path}: training pass not restored"
+            );
+        }
+    }
+
+    /// (b) + training: the adapter adds no trainable `Var`, a training step on the adapted DiT runs
+    /// against base + adapter (loss and grads differ from the bare DiT's), and the saved adapter holds
+    /// only the trainable targets' keys.
+    /// Mutations: skip the install ⇒ the loss assert fails; make the residual a `Var` collected into
+    /// the set ⇒ the var-count assert fails.
+    #[test]
+    fn training_runs_against_the_adapter_and_saves_only_the_trainable_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = Device::Cpu;
+        let (mut dit, mut bare, cfg) = twin_dits();
+        let (file, _) = write_adapter(tmp.path(), &dit, &TARGETS, 0.1);
+        install_training_adapter(&mut dit, &file, DType::F32, &dev).unwrap();
+        let suffixes: Vec<String> = Z_IMAGE_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 4.0, 7, &dev).unwrap();
+        let set_bare = build_lora_targets(&mut bare, &suffixes, 4, 4.0, 7, &dev).unwrap();
+        assert_eq!(set.vars.len(), set_bare.vars.len());
+        for (v, w) in set.vars.iter().zip(&set_bare.vars) {
+            let t = Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap();
+            v.set(&t).unwrap();
+            w.set(&t).unwrap();
+        }
+        let x0 = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let step = |d: &ZImageTransformer2DModel, vars: &[Var]| {
+            compute_loss_grads(
+                d,
+                vars,
+                &x0,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                None,
+                DType::F32,
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        let (l, g) = step(&dit, &set.vars);
+        let (l0, g0) = step(&bare, &set_bare.vars);
+        assert_ne!(
+            l.total.to_bits(),
+            l0.total.to_bits(),
+            "the step ignored the adapter"
+        );
+        let differs = set.vars.iter().zip(&set_bare.vars).any(|(v, w)| {
+            bits(g.get(v.as_tensor()).unwrap()) != bits(g0.get(w.as_tensor()).unwrap())
+        });
+        assert!(differs, "the adapter did not reach the backward");
+
+        let out = tmp.path().join("lora.safetensors");
+        flow_match::save_adapter(&set, &HashMap::new(), &out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let saved = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let keys: BTreeSet<String> = saved.names().into_iter().map(String::from).collect();
+        let mut trainable = BTreeSet::new();
+        dit.visit_block_linears(&mut |l| {
+            if Z_IMAGE_ATTN_TARGETS.iter().any(|s| l.path().ends_with(s)) {
+                for s in ["lora_A.weight", "lora_B.weight", "alpha"] {
+                    trainable.insert(format!("{}.{s}", l.path()));
+                }
+            }
+        });
+        assert_eq!(keys, trainable);
+    }
+
+    /// Previews render as the user will see the LoRA: `render_sample` on the adapted DiT produces
+    /// the very image the bare DiT does, and leaves the DiT on the training pass. The control render
+    /// with the adapter left on proves the comparison can tell them apart.
+    /// Mutation: drop the `PREVIEW_PASS` switch in `render_sample` ⇒ the image assert fails; drop
+    /// the `TRAIN_PASS` restore ⇒ the restored assert fails.
+    #[test]
+    fn render_sample_renders_without_the_adapter_and_restores_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = Device::Cpu;
+        let (mut dit, bare, cfg) = twin_dits();
+        let (file, _) = write_adapter(tmp.path(), &dit, &TARGETS, 0.5);
+        install_training_adapter(&mut dit, &file, DType::F32, &dev).unwrap();
+        let trained = outputs(&dit);
+        let vm = VarMap::new();
+        let vae = AutoEncoderKL::new(
+            &VaeConfig::z_image(),
+            VarBuilder::from_varmap(&vm, DType::F32, &dev),
+        )
+        .unwrap();
+        let state = ZImageSampleState {
+            caps: vec![Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap()],
+            vae: Arc::new(vae),
+            edge: 16,
+        };
+        let tcfg = TrainingConfig {
+            sample_steps: 2,
+            train_dtype: "f32".into(),
+            ..Default::default()
+        };
+        let trainer = ZImageTrainer {
+            descriptor: trainer_descriptor(),
+            root: PathBuf::new(),
+            device: dev.clone(),
+        };
+        let with_adapter = render_preview(&dev, &dit, &state, 0, &tcfg, 3).unwrap();
+        let bare_img = trainer.render_sample(&bare, &state, 0, &tcfg, 3).unwrap();
+        assert_ne!(
+            with_adapter.pixels, bare_img.pixels,
+            "control: adapter invisible"
+        );
+        let preview = trainer.render_sample(&dit, &state, 0, &tcfg, 3).unwrap();
+        assert_eq!(
+            preview.pixels, bare_img.pixels,
+            "the preview rendered the adapter"
+        );
+        for (path, (_, y)) in outputs(&dit) {
+            assert_eq!(
+                bits(&y),
+                bits(&trained[&path].1),
+                "{path}: not back on the training pass"
+            );
+        }
+    }
+
+    /// A module the DiT does not have, a non-LoRA key, or a missing file is a named error — never a
+    /// partial install or a bare-base run.
+    #[test]
+    fn a_bad_training_adapter_is_a_named_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = Device::Cpu;
+        let (mut dit, _, _) = twin_dits();
+        let (file, _) = write_adapter(tmp.path(), &dit, &TARGETS, 0.05);
+        let mut tensors = candle_core::safetensors::load(&file, &dev).unwrap();
+        let a = tensors
+            .remove("diffusion_model.layers.0.feed_forward.w2.lora_A.weight")
+            .unwrap();
+        let b = tensors
+            .remove("diffusion_model.layers.0.feed_forward.w2.lora_B.weight")
+            .unwrap();
+        tensors.insert(
+            "diffusion_model.layers.5.feed_forward.w2.lora_A.weight".into(),
+            a,
+        );
+        tensors.insert(
+            "diffusion_model.layers.5.feed_forward.w2.lora_B.weight".into(),
+            b,
+        );
+        let unknown = tmp.path().join("unknown.safetensors");
+        candle_core::safetensors::save(&tensors, &unknown).unwrap();
+        let err = install_training_adapter(&mut dit, &unknown, DType::F32, &dev)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("layers.5.feed_forward.w2"), "{err}");
+
+        let mut tensors = candle_core::safetensors::load(&file, &dev).unwrap();
+        tensors.insert(
+            "diffusion_model.layers.0.attention.norm_q.weight".into(),
+            Tensor::ones(4, DType::F32, &dev).unwrap(),
+        );
+        let stray = tmp.path().join("stray.safetensors");
+        candle_core::safetensors::save(&tensors, &stray).unwrap();
+        let (mut fresh, _, _) = twin_dits();
+        let err = install_training_adapter(&mut fresh, &stray, DType::F32, &dev)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("stray.safetensors") && err.contains("partial"),
+            "{err}"
+        );
+
+        // Finding 4: one module keyed twice under two prefixes is a named error, never "last wins".
+        let mut tensors = candle_core::safetensors::load(&file, &dev).unwrap();
+        let dup = tensors["diffusion_model.layers.0.attention.to_k.lora_A.weight"].clone();
+        tensors.insert(
+            "transformer.layers.0.attention.to_k.lora_A.weight".into(),
+            dup,
+        );
+        let twice = tmp.path().join("twice.safetensors");
+        candle_core::safetensors::save(&tensors, &twice).unwrap();
+        let err = install_training_adapter(&mut fresh, &twice, DType::F32, &dev)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("spelled twice") && err.contains("layers.0.attention.to_k"),
+            "{err}"
+        );
+
+        let missing = tmp.path().join("missing.safetensors");
+        let err = install_training_adapter(&mut fresh, &missing, DType::F32, &dev)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing.safetensors"), "{err}");
+    }
+
+    /// E7: the training adapter's resident factors join the memory preflight (in the compute dtype),
+    /// so a budget that fits the DiT alone but not DiT + adapter is refused only with the adapter;
+    /// no adapter and no aux loss ⇒ no check at all (unchanged behavior).
+    /// Mutation: drop `adapter` from the preflight sum ⇒ the refusal assert fails.
+    #[test]
+    fn the_memory_preflight_counts_the_training_adapter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, _, _) = twin_dits();
+        let (file, _) = write_adapter(tmp.path(), &dit, &TARGETS, 0.05);
+        let root = tmp.path().join("snapshot");
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/diffusion_pytorch_model.safetensors"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        let f32_bytes = training_adapter_bytes(Some(&file), DType::F32).unwrap();
+        let bf16_bytes = training_adapter_bytes(Some(&file), DType::BF16).unwrap();
+        assert!(f32_bytes > 0 && f32_bytes == 2 * bf16_bytes);
+        assert_eq!(training_adapter_bytes(None, DType::F32).unwrap(), 0);
+
+        let off = TrainingConfig {
+            train_dtype: "f32".into(),
+            ..Default::default()
+        };
+        let on = TrainingConfig {
+            training_adapter: Some(file),
+            ..off.clone()
+        };
+        let budget = 4096 + f32_bytes - 1;
+        assert!(
+            aux_memory_preflight(&root, &off, 1, 1).is_ok(),
+            "off ⇒ no check"
+        );
+        assert!(aux_memory_preflight(&root, &on, 1, budget).is_err());
+        assert!(aux_memory_preflight(&root, &on, 1, budget + 1).is_ok());
+    }
+
+    /// Key format of the shipped ostris adapters (`zimage_turbo_training_adapter_v{1,2}`, inspected
+    /// at revision 654cd1bf: 480 keys = 30 main layers × these 8 modules × `lora_{A,B}.weight`, all
+    /// with the `diffusion_model.` prefix and no `.alpha`): every module family installs on a layer.
+    /// Mutation: leave the FFN or AdaLN projections out of `visit_block_linears` ⇒ red.
+    #[test]
+    fn every_module_family_of_the_shipped_ostris_adapters_installs() {
+        const OSTRIS_MODULES: [&str; 8] = [
+            "attention.to_q",
+            "attention.to_k",
+            "attention.to_v",
+            "attention.to_out.0",
+            "feed_forward.w1",
+            "feed_forward.w2",
+            "feed_forward.w3",
+            "adaLN_modulation.0",
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, _, _) = twin_dits();
+        let targets: Vec<String> = OSTRIS_MODULES
+            .iter()
+            .map(|m| format!("layers.0.{m}"))
+            .collect();
+        let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+        let (file, _) = write_adapter(tmp.path(), &dit, &refs, 0.05);
+        let n = install_training_adapter(&mut dit, &file, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(n, OSTRIS_MODULES.len());
     }
 }

@@ -360,6 +360,18 @@ const TECHNIQUE_PROBES: &[TechniqueProbe] = &[
         declared: |t| t.normal_loss,
         adapter_only: false,
     },
+    TechniqueProbe {
+        name: "training_adapter",
+        knob: "training_adapter",
+        // The frozen de-distill / assistant LoRA (sc-25213) only needs to be named — validate never
+        // reads it. Applied to the base of an adapter run, so a full fine-tune must refuse it.
+        enable: |r| {
+            r.config.training_adapter =
+                Some(PathBuf::from("/conformance/training-adapter.safetensors"))
+        },
+        declared: |t| t.training_adapter,
+        adapter_only: true,
+    },
 ];
 
 /// Name every body-loss checkpoint and the x0 decoder (sc-24832) — validate never loads them, so a
