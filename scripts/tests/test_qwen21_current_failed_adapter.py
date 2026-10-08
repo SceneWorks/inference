@@ -58,9 +58,27 @@ def diagnostic_candidate_head(repository, environment, expected_repository):
         def in_checkout(command, **kwargs):
             return subprocess.run(command, cwd=repository, **kwargs)
 
+        base_ref = pull_request["base"]["ref"]
+        canonical_base = feature_epic_policy.resolve_remote_base_branch(
+            base_ref, runner=in_checkout)
+        shallow = current.git(repository, "rev-parse", "--is-shallow-repository") == "true"
+        fetch = ["git", "fetch", "--no-tags", "--no-recurse-submodules",
+                 "--no-write-fetch-head"]
+        if shallow:
+            fetch.append("--unshallow")
+        fetch.extend(("origin", f"refs/heads/{base_ref}"))
+        fetched = in_checkout(fetch, check=False, capture_output=True, text=True,
+                              encoding="utf-8", timeout=120)
+        current.require(fetched.returncode == 0,
+                        "canonical base history could not be materialized: "
+                        + (fetched.stderr or "git fetch failed").strip())
+
+        def bound_base(branch):
+            current.require(branch == base_ref, "canonical base ref changed")
+            return canonical_base
+
         policy_arguments.update(
-            base_branch_resolver=lambda branch: feature_epic_policy.resolve_remote_base_branch(
-                branch, runner=in_checkout),
+            base_branch_resolver=bound_base,
             commit_ancestry_resolver=lambda ancestor, descendant:
                 feature_epic_policy.resolve_local_commit_ancestry(
                     ancestor, descendant, runner=in_checkout),
@@ -223,12 +241,12 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             checkout = root / "checkout"
             git(root, "clone", "--depth=1", "--branch", "pr-merge", origin.as_uri(), str(checkout))
             git(checkout, "checkout", "--detach", "HEAD")
-            # The current workflow fetches branch history for the canonical ancestry proof while
-            # the synthetic test merge itself remains the shallow boundary whose raw headers are
-            # inspected below.
-            git(checkout, "fetch", "--depth=3", "origin", "main")
             self.assertEqual(git(checkout, "rev-parse", "--is-shallow-repository"), "true")
             self.assertEqual(git(checkout, "show", "-s", "--format=%P", "HEAD"), "")
+            for absent in (advanced, frozen):
+                self.assertNotEqual(subprocess.run(
+                    ["git", "cat-file", "-e", absent + "^{commit}"], cwd=checkout,
+                    check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode, 0)
             repository = self.cfg["repository"]
             canonical_base_policy = "base_branch_resolver" in inspect.signature(
                 feature_epic_policy.validate_event).parameters
@@ -239,6 +257,30 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                                         "base": {"sha": frozen if canonical_base_policy else advanced,
                                                  "ref": "main",
                                                  "repo": {"full_name": repository}}}}
+            exact_checkout = root / "exact-checkout"
+            git(root, "clone", "--depth=1", "--branch", "pr-merge", origin.as_uri(),
+                str(exact_checkout))
+            git(exact_checkout, "checkout", "--detach", "HEAD")
+            self.assertEqual(git(exact_checkout, "rev-parse", "--is-shallow-repository"), "true")
+            self.assertNotEqual(subprocess.run(
+                ["git", "cat-file", "-e", advanced + "^{commit}"], cwd=exact_checkout,
+                check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode, 0)
+            exact_payload = copy.deepcopy(payload)
+            exact_payload["pull_request"]["base"]["sha"] = advanced
+            exact_event_path = root / "exact-event.json"
+            exact_event_path.write_text(json.dumps(exact_payload), encoding="utf-8")
+            exact_environment = {
+                "GITHUB_EVENT_NAME": "pull_request", "GITHUB_SHA": merge,
+                "GITHUB_REPOSITORY": repository, "GITHUB_EVENT_PATH": str(exact_event_path),
+            }
+            exact_before = (git(exact_checkout, "rev-parse", "HEAD"),
+                            current.symbolic_head(exact_checkout),
+                            git(exact_checkout, "status", "--porcelain"))
+            self.assertEqual(diagnostic_candidate_head(
+                exact_checkout, exact_environment, repository), candidate)
+            self.assertEqual((git(exact_checkout, "rev-parse", "HEAD"),
+                              current.symbolic_head(exact_checkout),
+                              git(exact_checkout, "status", "--porcelain")), exact_before)
             event_path = root / "event.json"
             environment = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_SHA": merge,
                            "GITHUB_REPOSITORY": repository, "GITHUB_EVENT_PATH": str(event_path)}
