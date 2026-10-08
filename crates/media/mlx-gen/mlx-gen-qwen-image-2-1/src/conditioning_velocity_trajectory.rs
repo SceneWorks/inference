@@ -126,7 +126,9 @@ fn run() -> Result<()> {
     );
     let retire = RetireOnDrop; // native locals retire before bounds/cache grant/watchdog on all exits
     let mut cache = math::Cache::default();
-    cache.reserve(2 * 1024 * 1024 + trajectory_math::CPU_SCRATCH)?;
+    // The analysis scratch is not live while VAE/reference CPU copies are
+    // retained. Charge it only after those large pixel copies are retired.
+    trajectory_math::reserve_preparation_cache(&mut cache)?;
     let mut trace = Vec::new();
     let mut receipt = json!({"kind":"DIAGNOSTIC_ONLY","acceptanceEvidence":false,"accepted":false,
         "qualityAcceptance":null,"donorAccepted":false,"status":"RUNNING",
@@ -289,6 +291,7 @@ fn run() -> Result<()> {
         r.pixels.values.clear();
         r.pixels.values.shrink_to_fit();
     }
+    trajectory_math::reserve_analysis_cache(&mut cache)?;
 
     let mut trajectories = Vec::new();
     let mut forward_count = 0usize;
@@ -485,6 +488,7 @@ fn run() -> Result<()> {
         }
     }
     // CPU vectors are released before the retirement/bounds/cache restoration receipt.
+    cache.release(trajectory_math::CPU_SCRATCH);
     for t in conditioning {
         let bytes = t.bytes();
         drop(t);

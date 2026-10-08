@@ -2,6 +2,17 @@
 pub const STEPS: usize = 8;
 pub const TRAJECTORIES: usize = 4;
 pub const CPU_SCRATCH: u64 = 8 * 1024 * 1024;
+pub const RETAINED_METADATA: u64 = 2 * 1024 * 1024;
+
+pub fn reserve_preparation_cache(
+    cache: &mut super::super::math::Cache,
+) -> Result<(), &'static str> {
+    cache.reserve(RETAINED_METADATA)
+}
+
+pub fn reserve_analysis_cache(cache: &mut super::super::math::Cache) -> Result<(), &'static str> {
+    cache.reserve(CPU_SCRATCH)
+}
 
 pub fn validate_schedule(sigmas: &[f32]) -> Result<(), &'static str> {
     if sigmas.len() != STEPS + 1
@@ -106,7 +117,55 @@ pub fn update_residual(x: &[f32], v: &[f32], next: &[f32], dt: f32) -> Result<f6
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::math::{Cache, CACHE_CAP};
     use super::*;
+
+    #[test]
+    fn native_reference_copies_stage_analysis_scratch_after_pixels_retire() {
+        const IMAGE_BYTES: u64 = 4_325_376;
+        const LATENT_BYTES: u64 = 589_824;
+        const REFERENCE_LATENT_BYTES: u64 = 1_048_576;
+        const REFERENCE_PIXEL_BYTES: u64 = 25_165_824;
+        const CONDITIONING_BYTES: u64 = 1_425_408;
+
+        let mut cache = Cache::default();
+        reserve_preparation_cache(&mut cache).unwrap();
+        cache.reserve(IMAGE_BYTES).unwrap();
+        cache.reserve(LATENT_BYTES).unwrap();
+        for _ in 0..2 {
+            cache.reserve(REFERENCE_LATENT_BYTES).unwrap();
+            cache.reserve(REFERENCE_PIXEL_BYTES).unwrap();
+        }
+        assert_eq!(cache.live, 59_441_152);
+        assert!(cache.live <= CACHE_CAP);
+
+        cache.release(IMAGE_BYTES);
+        cache.reserve(LATENT_BYTES).unwrap();
+        cache.reserve(CONDITIONING_BYTES).unwrap();
+        cache.reserve(CONDITIONING_BYTES).unwrap();
+        cache.release(2 * REFERENCE_PIXEL_BYTES);
+        reserve_analysis_cache(&mut cache).unwrap();
+
+        assert_eq!(cache.live, 16_613_376);
+        assert_eq!(cache.peak, 59_441_152);
+        assert!(cache.peak <= CACHE_CAP);
+
+        let mut eager = Cache::default();
+        reserve_preparation_cache(&mut eager).unwrap();
+        reserve_analysis_cache(&mut eager).unwrap();
+        eager.reserve(IMAGE_BYTES).unwrap();
+        eager.reserve(LATENT_BYTES).unwrap();
+        eager.reserve(REFERENCE_LATENT_BYTES).unwrap();
+        eager.reserve(REFERENCE_PIXEL_BYTES).unwrap();
+        eager.reserve(REFERENCE_LATENT_BYTES).unwrap();
+        assert_eq!(eager.live, 42_663_936);
+        assert_eq!(
+            eager.reserve(REFERENCE_PIXEL_BYTES),
+            Err("CPU cache cap exceeded before copy")
+        );
+        assert_eq!(eager.live + REFERENCE_PIXEL_BYTES - CACHE_CAP, 720_896);
+    }
+
     #[test]
     fn exact_target_path_and_velocity_have_zero_estimate_error() {
         let m = step_metrics(
