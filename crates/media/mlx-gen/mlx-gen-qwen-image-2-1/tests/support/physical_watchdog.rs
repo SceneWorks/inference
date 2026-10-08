@@ -50,16 +50,29 @@ impl<A: CacheAllocator> ScopedCacheGrant<A> {
                 grant.effective_cache_limit
             )
         })?;
-        let previous = allocator.set_cache_limit(requested);
+        // Tighten to zero while discovering the inherited limit, so a caller
+        // which was already stricter is never raised even for one API call.
+        let previous = allocator.set_cache_limit(0);
         let effective = previous.min(requested);
-        if effective != requested {
-            allocator.set_cache_limit(effective);
+        let zero = allocator.set_cache_limit(effective);
+        if zero != 0 {
+            allocator.set_cache_limit(previous);
+            return Err(format!(
+                "allocator zero clamp read-back mismatch: expected 0, observed {zero}"
+            ));
         }
-        let observed = allocator.set_cache_limit(effective);
+        let observed = allocator.set_cache_limit(0);
         if observed != effective {
             allocator.set_cache_limit(previous);
             return Err(format!(
                 "allocator cache grant read-back mismatch: requested {effective}, observed {observed}"
+            ));
+        }
+        let zero = allocator.set_cache_limit(effective);
+        if zero != 0 {
+            allocator.set_cache_limit(previous);
+            return Err(format!(
+                "allocator final cache grant install mismatch: expected previous 0, observed {zero}"
             ));
         }
         let guard = Self {
@@ -197,32 +210,25 @@ pub fn admit_numeric_full(
     admit_full(host, envelope, explicit_cap)
 }
 
-/// Reserve the diagnostic's entire frozen free-cache allowance, then derive the
-/// typed allocator grant from the actual current cache policy. The reservation
-/// cannot shrink merely because a previous task left the process cache lower.
+/// Derive a diagnostic-only cache grant from the frozen allowance and current
+/// host headroom. The active envelope and every host reserve stay unchanged;
+/// only freed-buffer retention may be clamped. The typed allocator guard still
+/// refuses a mismatched read-back and restores the caller's policy on exit.
 pub fn admit_numeric_scoped(
     host: Host,
     envelope: u64,
     frozen_free_cache: u64,
     explicit_cap: Option<u64>,
 ) -> Result<(u64, AdmissionGrant), String> {
-    let reserved_ceiling = admit_numeric_full(host, envelope, frozen_free_cache, explicit_cap)?;
-    let mut installed_host = host;
-    installed_host.cache_limit = host.cache_limit.min(frozen_free_cache);
-    let installed = admit(installed_host, envelope, Some(reserved_ceiling))?;
-    if installed.full_envelope > reserved_ceiling {
-        return Err(format!(
-            "installed numeric cache grant {} exceeds reserved physical ceiling {reserved_ceiling}",
-            installed.full_envelope
-        ));
+    if frozen_free_cache == 0 {
+        return Err("numeric diagnostic free-cache allowance is zero".into());
     }
-    Ok((
-        reserved_ceiling,
-        AdmissionGrant {
-            physical_ceiling: reserved_ceiling,
-            ..installed
-        },
-    ))
+    let mut scoped_host = host;
+    // Price the frozen request, rather than the process's inherited setting.
+    // ScopedCacheGrant independently refuses to raise a tighter inherited cap.
+    scoped_host.cache_limit = frozen_free_cache;
+    let grant = admit(scoped_host, envelope, explicit_cap)?;
+    Ok((grant.physical_ceiling, grant))
 }
 
 /// Parse the printed `vm_stat` snapshot, whose "Pages free" excludes speculative
@@ -358,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_scoped_reserves_frozen_allowance_and_types_actual_cache() {
+    fn numeric_scoped_clamps_only_free_cache_and_types_the_grant() {
         let measured = Host {
             cache_limit: 0,
             ..host()
@@ -369,13 +375,9 @@ mod tests {
             admit_numeric_scoped(measured, active, reserve, Some(100_000_000_000)).unwrap();
         assert_eq!(ceiling, 80_222_535_099 + GIB / 2);
         assert_eq!(grant.physical_ceiling, ceiling);
-        assert_eq!(grant.requested_cache_limit, 0);
-        assert_eq!(grant.effective_cache_limit, 0);
-        assert_eq!(
-            grant.full_envelope,
-            grant.active_envelope + grant.nonallocator_overhead
-        );
-        assert!(grant.full_envelope < ceiling);
+        assert_eq!(grant.requested_cache_limit, reserve);
+        assert_eq!(grant.effective_cache_limit, reserve);
+        assert_eq!(grant.full_envelope, ceiling);
 
         let with_existing_cache = Host {
             cache_limit: reserve * 2,
@@ -387,6 +389,52 @@ mod tests {
         assert_eq!(grant.requested_cache_limit, reserve);
         assert_eq!(grant.effective_cache_limit, reserve);
         assert_eq!(grant.full_envelope, ceiling);
+    }
+
+    #[test]
+    fn fresh_mac2_numeric_scope_preserves_active_budget_and_clamps_cache_exactly() {
+        let measured = Host {
+            total: 137_438_953_472,
+            available: 98_274_099_200,
+            recommended: 115_448_725_504,
+            mlx_limit: 130_566_995_968,
+            pressure: 1,
+            baseline_physical: 25_526_824,
+            baseline_active: 0,
+            baseline_cache: 0,
+            cache_limit: 48_819_791_680,
+        };
+        let active = 86_762_446_731;
+        let frozen = 11_142_168_576;
+        let (ceiling, grant) =
+            admit_numeric_scoped(measured, active, frozen, Some(100_000_000_000)).unwrap();
+        assert_eq!(ceiling, 93_385_921_064);
+        assert_eq!(grant.active_envelope, active);
+        assert_eq!(grant.nonallocator_overhead, 25_526_824);
+        assert_eq!(grant.requested_cache_limit, frozen);
+        assert_eq!(grant.effective_cache_limit, 6_597_947_509);
+        assert_eq!(grant.full_envelope, ceiling);
+        assert_eq!(frozen - grant.effective_cache_limit, 4_544_221_067);
+
+        assert!(admit_numeric_scoped(
+            measured,
+            ceiling - grant.nonallocator_overhead + 1,
+            frozen,
+            Some(100_000_000_000)
+        )
+        .is_err());
+        assert!(admit_numeric_scoped(measured, active, 0, Some(100_000_000_000)).is_err());
+        assert!(admit_numeric_scoped(
+            Host {
+                pressure: 2,
+                ..measured
+            },
+            active,
+            frozen,
+            Some(100_000_000_000)
+        )
+        .is_err());
+        assert!(admit_numeric_scoped(measured, u64::MAX, frozen, None).is_err());
     }
     #[test]
     fn every_headroom_boundary_caps_cache_allowance_independently() {
@@ -719,7 +767,7 @@ mod tests {
             let observed = self.inner.set_cache_limit(limit);
             let call = self.calls.get() + 1;
             self.calls.set(call);
-            if call == 2 {
+            if call == 3 {
                 observed.saturating_sub(1)
             } else {
                 observed
@@ -775,13 +823,16 @@ mod tests {
         assert_eq!(
             allocator.events.borrow().as_slice(),
             [
-                "set:48819791680->36833648208",
-                "set:36833648208->36833648208",
+                "set:48819791680->0",
+                "set:0->36833648208",
+                "set:36833648208->0",
+                "set:0->36833648208",
                 "clear",
                 "load:36833648208",
-                "set:36833648208->48819791680",
-                "set:48819791680->36833648208",
-                "set:36833648208->36833648208",
+                "set:36833648208->0",
+                "set:0->36833648208",
+                "set:36833648208->0",
+                "set:0->36833648208",
                 "clear",
                 "train:36833648208",
                 "set:36833648208->36833648208",

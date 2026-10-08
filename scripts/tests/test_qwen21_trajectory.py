@@ -20,6 +20,26 @@ PHASE = {"QWEN_IMAGE_2_1_LORA_PHASE": "current-trajectory"}
 
 
 class TrajectoryTests(unittest.TestCase):
+    @staticmethod
+    def write_admission(root: Path) -> dict:
+        active, overhead, frozen, admitted, installed = (
+            86_762_446_731, 25_526_824, 11_142_168_576, 6_597_947_509, 6_597_947_509)
+        row = {"kind": "DIAGNOSTIC_ONLY", "refusal": None,
+               "policy": "unchanged_active_envelope_plus_dynamic_free_cache_clamp_and_typed_scoped_grant",
+               "activeEnvelopeBytes": active, "nonallocatorOverheadBytes": overhead,
+               "frozenFreeCacheAllowanceBytes": frozen,
+               "actualAllocatorCacheLimitBytes": 48_819_791_680,
+               "previousCacheLimitBytes": 48_819_791_680,
+               "admittedCacheLimitBytes": admitted, "effectiveCacheLimitBytes": installed,
+               "cacheClampBytes": frozen - admitted,
+               "reservedPhysicalCeilingBytes": active + overhead + admitted,
+               "predictedMaxFullEnvelopeBytes": active + overhead + admitted,
+               "installedFullEnvelopeBytes": active + overhead + installed,
+               "activeAndHostReservesUnchanged": True, "cacheGrantReadBack": True,
+               "typedNativeCacheGrantRequired": True, "cacheGrantRestoresOnDrop": True}
+        (root / "numeric-physical-admission.json").write_text(json.dumps(row), encoding="utf-8")
+        return row
+
     def test_actual_trajectory_source_closure_and_production_mutants(self):
         from scripts.tests.test_qwen21_current_failed_adapter import CurrentFailedAdapterTests
         with mock.patch.dict(os.environ, PHASE):
@@ -125,6 +145,7 @@ class TrajectoryTests(unittest.TestCase):
     def test_physical_capture_digest_finiteness_inventory_and_endpoint_qualification(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            admission = self.write_admission(root)
             def vector(name, shape):
                 elements = __import__("math").prod(shape)
                 payload = b"\0" * (elements * 4)
@@ -165,6 +186,16 @@ class TrajectoryTests(unittest.TestCase):
                     "endpoint": {"file": endpoint.name, "sha256": current.sha256_file(endpoint),
                                  "expectedSha256": current.TRAJECTORY_ENDPOINTS[i], "exactHistoricalPngMatch": False}})
             current.validate_trajectory_files(root, row)
+            for key, value in (("admittedCacheLimitBytes", admission["frozenFreeCacheAllowanceBytes"]),
+                               ("predictedMaxFullEnvelopeBytes", admission["reservedPhysicalCeilingBytes"] - 1),
+                               ("cacheGrantReadBack", False),
+                               ("typedNativeCacheGrantRequired", False),
+                               ("cacheGrantRestoresOnDrop", False)):
+                mutant = copy.deepcopy(admission); mutant[key] = value
+                (root / "numeric-physical-admission.json").write_text(json.dumps(mutant), encoding="utf-8")
+                with self.subTest(admission=key), self.assertRaisesRegex(ValueError, "cache|admission"):
+                    current.validate_trajectory_files(root, row)
+            (root / "numeric-physical-admission.json").write_text(json.dumps(admission), encoding="utf-8")
             # The original validator accepted the first missing-final mutation. Every
             # defined scalar must now be present/finite, with null only at final sigma zero.
             mutations = []

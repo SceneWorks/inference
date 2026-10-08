@@ -557,6 +557,7 @@ def validate_trajectory_receipt(row: dict) -> None:
 def validate_trajectory_files(directory: Path, row: dict) -> None:
     """Validate actual finite little-endian captures, not producer constants."""
     validate_trajectory_metrics(row)
+    validate_numeric_admission(directory)
     seen = set()
 
     def physical(facts: dict) -> Path:
@@ -628,6 +629,40 @@ def validate_trajectory_files(directory: Path, row: dict) -> None:
             type(row.get("physicalPeakBytes")) is int and row["physicalPeakBytes"] <= 100_000_000_000 and
             type(row.get("cpuCachePeakBytes")) is int and row["cpuCachePeakBytes"] <= 67_108_864,
             "trajectory memory envelope evidence is incomplete")
+
+
+def validate_numeric_admission(directory: Path) -> None:
+    """Bind the trajectory to its actual typed, dynamically clamped cache grant."""
+    admission = read_json(directory / "numeric-physical-admission.json")
+    active = admission.get("activeEnvelopeBytes")
+    overhead = admission.get("nonallocatorOverheadBytes")
+    frozen = admission.get("frozenFreeCacheAllowanceBytes")
+    inherited = admission.get("actualAllocatorCacheLimitBytes")
+    previous = admission.get("previousCacheLimitBytes")
+    admitted = admission.get("admittedCacheLimitBytes")
+    installed = admission.get("effectiveCacheLimitBytes")
+    clamp = admission.get("cacheClampBytes")
+    ceiling = admission.get("reservedPhysicalCeilingBytes")
+    predicted = admission.get("predictedMaxFullEnvelopeBytes")
+    actual = admission.get("installedFullEnvelopeBytes")
+    require(admission.get("kind") == "DIAGNOSTIC_ONLY" and
+            admission.get("refusal") is None and
+            admission.get("policy") ==
+            "unchanged_active_envelope_plus_dynamic_free_cache_clamp_and_typed_scoped_grant" and
+            all(type(value) is int and value >= 0 for value in
+                (active, overhead, frozen, inherited, previous, admitted, installed,
+                 clamp, ceiling, predicted, actual)),
+            "trajectory numeric admission receipt is incomplete")
+    require(admission.get("activeAndHostReservesUnchanged") is True and
+            admission.get("cacheGrantReadBack") is True and
+            admission.get("typedNativeCacheGrantRequired") is True and
+            admission.get("cacheGrantRestoresOnDrop") is True,
+            "trajectory typed cache grant safety contract changed")
+    require(previous == inherited and admitted <= frozen and installed <= admitted and
+            clamp == frozen - admitted and
+            predicted == active + overhead + admitted == ceiling and
+            actual == active + overhead + installed <= ceiling,
+            "trajectory cache clamp or full-envelope arithmetic changed")
 
 
 def validate_trajectory_metrics(row: dict) -> None:
