@@ -26,12 +26,18 @@ class TrajectoryTests(unittest.TestCase):
             86_762_446_731, 25_526_824, 11_142_168_576, 6_597_947_509, 6_597_947_509)
         row = {"kind": "DIAGNOSTIC_ONLY", "refusal": None,
                "policy": "unchanged_active_envelope_plus_dynamic_free_cache_clamp_and_typed_scoped_grant",
+               "host": {"totalBytes": 137_438_953_472, "reclaimableBytes": 98_274_099_200,
+                        "recommendedWorkingSetBytes": 115_448_725_504,
+                        "mlxMemoryLimitBytes": 130_566_995_968, "pressureLevel": 1,
+                        "baselinePhysBytes": 25_526_824, "baselineActiveBytes": 0,
+                        "baselineCacheBytes": 0, "initialCacheLimitBytes": 48_819_791_680},
                "activeEnvelopeBytes": active, "nonallocatorOverheadBytes": overhead,
                "frozenFreeCacheAllowanceBytes": frozen,
                "actualAllocatorCacheLimitBytes": 48_819_791_680,
                "previousCacheLimitBytes": 48_819_791_680,
                "admittedCacheLimitBytes": admitted, "effectiveCacheLimitBytes": installed,
                "cacheClampBytes": frozen - admitted,
+               "explicitOrDefaultCapBytes": 100_000_000_000,
                "reservedPhysicalCeilingBytes": active + overhead + admitted,
                "predictedMaxFullEnvelopeBytes": active + overhead + admitted,
                "installedFullEnvelopeBytes": active + overhead + installed,
@@ -186,6 +192,29 @@ class TrajectoryTests(unittest.TestCase):
                     "endpoint": {"file": endpoint.name, "sha256": current.sha256_file(endpoint),
                                  "expectedSha256": current.TRAJECTORY_ENDPOINTS[i], "exactHistoricalPngMatch": False}})
             current.validate_trajectory_files(root, row)
+            coherent_no_clamp = copy.deepcopy(admission)
+            required = (admission["activeEnvelopeBytes"] + admission["nonallocatorOverheadBytes"])
+            coherent_no_clamp.update({"admittedCacheLimitBytes": admission["frozenFreeCacheAllowanceBytes"],
+                                      "effectiveCacheLimitBytes": admission["frozenFreeCacheAllowanceBytes"],
+                                      "cacheClampBytes": 0,
+                                      "reservedPhysicalCeilingBytes": required + admission["frozenFreeCacheAllowanceBytes"],
+                                      "predictedMaxFullEnvelopeBytes": required + admission["frozenFreeCacheAllowanceBytes"],
+                                      "installedFullEnvelopeBytes": required + admission["frozenFreeCacheAllowanceBytes"]})
+            overflow = copy.deepcopy(admission)
+            huge = 1 << 64
+            overflow["host"]["initialCacheLimitBytes"] = huge
+            overflow.update({"actualAllocatorCacheLimitBytes": huge, "previousCacheLimitBytes": huge,
+                             "frozenFreeCacheAllowanceBytes": huge, "admittedCacheLimitBytes": huge,
+                             "effectiveCacheLimitBytes": huge, "cacheClampBytes": 0,
+                             "reservedPhysicalCeilingBytes": required + huge,
+                             "predictedMaxFullEnvelopeBytes": required + huge,
+                             "installedFullEnvelopeBytes": required + huge})
+            for name, mutant in (("coherent-no-clamp", coherent_no_clamp),
+                                 ("coherent-u64-overflow", overflow)):
+                (root / "numeric-physical-admission.json").write_text(json.dumps(mutant), encoding="utf-8")
+                with self.subTest(admission=name), self.assertRaisesRegex(ValueError, "cache|admission"):
+                    current.validate_trajectory_files(root, row)
+            (root / "numeric-physical-admission.json").write_text(json.dumps(admission), encoding="utf-8")
             for key, value in (("admittedCacheLimitBytes", admission["frozenFreeCacheAllowanceBytes"]),
                                ("predictedMaxFullEnvelopeBytes", admission["reservedPhysicalCeilingBytes"] - 1),
                                ("cacheGrantReadBack", False),

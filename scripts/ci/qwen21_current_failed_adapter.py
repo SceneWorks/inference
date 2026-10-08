@@ -634,6 +634,7 @@ def validate_trajectory_files(directory: Path, row: dict) -> None:
 def validate_numeric_admission(directory: Path) -> None:
     """Bind the trajectory to its actual typed, dynamically clamped cache grant."""
     admission = read_json(directory / "numeric-physical-admission.json")
+    host = admission.get("host", {})
     active = admission.get("activeEnvelopeBytes")
     overhead = admission.get("nonallocatorOverheadBytes")
     frozen = admission.get("frozenFreeCacheAllowanceBytes")
@@ -645,23 +646,54 @@ def validate_numeric_admission(directory: Path) -> None:
     ceiling = admission.get("reservedPhysicalCeilingBytes")
     predicted = admission.get("predictedMaxFullEnvelopeBytes")
     actual = admission.get("installedFullEnvelopeBytes")
+    explicit = admission.get("explicitOrDefaultCapBytes")
+    u64_max = (1 << 64) - 1
+    values = (active, overhead, frozen, inherited, previous, admitted, installed,
+              clamp, ceiling, predicted, actual, explicit)
+    host_values = tuple(host.get(key) for key in
+                        ("totalBytes", "reclaimableBytes", "recommendedWorkingSetBytes",
+                         "mlxMemoryLimitBytes", "baselinePhysBytes", "baselineActiveBytes",
+                         "baselineCacheBytes", "initialCacheLimitBytes", "pressureLevel"))
     require(admission.get("kind") == "DIAGNOSTIC_ONLY" and
             admission.get("refusal") is None and
             admission.get("policy") ==
             "unchanged_active_envelope_plus_dynamic_free_cache_clamp_and_typed_scoped_grant" and
-            all(type(value) is int and value >= 0 for value in
-                (active, overhead, frozen, inherited, previous, admitted, installed,
-                 clamp, ceiling, predicted, actual)),
+            all(type(value) is int and 0 <= value <= u64_max
+                for value in values + host_values),
             "trajectory numeric admission receipt is incomplete")
     require(admission.get("activeAndHostReservesUnchanged") is True and
             admission.get("cacheGrantReadBack") is True and
             admission.get("typedNativeCacheGrantRequired") is True and
             admission.get("cacheGrantRestoresOnDrop") is True,
             "trajectory typed cache grant safety contract changed")
-    require(previous == inherited and admitted <= frozen and installed <= admitted and
-            clamp == frozen - admitted and
-            predicted == active + overhead + admitted == ceiling and
-            actual == active + overhead + installed <= ceiling,
+    total, available, recommended, mlx_limit, baseline_physical, baseline_active, \
+        baseline_cache, initial_cache, pressure = host_values
+    require(total > 0 and 0 < available <= total and recommended > 0 and mlx_limit > 0 and
+            active > 0 and frozen > 0 and explicit > 0 and pressure == 1,
+            "trajectory numeric host census is incomplete or unsafe")
+
+    def checked_add(*items: int) -> int:
+        value = sum(items)
+        require(value <= u64_max, "trajectory numeric admission arithmetic overflows u64")
+        return value
+
+    overhead_expected = max(0, baseline_physical - checked_add(baseline_active, baseline_cache))
+    required = checked_add(active, overhead_expected)
+    fraction = lambda value, numerator: (value // 100) * numerator
+    safe_cap = min(fraction(total, 85),
+                   checked_add(baseline_physical, fraction(available, 95)),
+                   checked_add(recommended, overhead_expected),
+                   checked_add(fraction(mlx_limit, 85), overhead_expected),
+                   explicit)
+    require(required <= safe_cap, "trajectory active envelope exceeds recomputed host cap")
+    admitted_expected = min(frozen, safe_cap - required)
+    ceiling_expected = min(checked_add(required, frozen), safe_cap)
+    installed_expected = min(previous, admitted_expected)
+    require(inherited == initial_cache and previous == inherited and
+            overhead == overhead_expected and admitted == admitted_expected and
+            installed == installed_expected and clamp == frozen - admitted_expected and
+            ceiling == ceiling_expected and predicted == checked_add(required, admitted) == ceiling and
+            actual == checked_add(required, installed) <= ceiling,
             "trajectory cache clamp or full-envelope arithmetic changed")
 
 
