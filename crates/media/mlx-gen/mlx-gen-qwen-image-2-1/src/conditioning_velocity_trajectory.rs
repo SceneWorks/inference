@@ -286,12 +286,14 @@ fn run() -> Result<()> {
             "maxAbsoluteDifference":conditioning_max
         });
     }
-    for r in &mut references {
-        cache.release(r.pixels.bytes());
-        r.pixels.values.clear();
-        r.pixels.values.shrink_to_fit();
-    }
-    trajectory_math::reserve_analysis_cache(&mut cache)?;
+    let (first_reference, remaining_references) = references.split_at_mut(1);
+    trajectory_math::retire_reference_pixels_and_reserve_analysis(
+        &mut cache,
+        [
+            &mut first_reference[0].pixels.values,
+            &mut remaining_references[0].pixels.values,
+        ],
+    )?;
 
     let mut trajectories = Vec::new();
     let mut forward_count = 0usize;

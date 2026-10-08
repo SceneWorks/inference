@@ -14,6 +14,32 @@ pub fn reserve_analysis_cache(cache: &mut super::super::math::Cache) -> Result<(
     cache.reserve(CPU_SCRATCH)
 }
 
+pub fn retire_reference_pixels_and_reserve_analysis(
+    cache: &mut super::super::math::Cache,
+    pixels: [&mut Vec<f32>; 2],
+) -> Result<(), &'static str> {
+    let [first, second] = pixels;
+    let first_bytes = (first.len() as u64)
+        .checked_mul(4)
+        .ok_or("CPU cache overflow")?;
+    let second_bytes = (second.len() as u64)
+        .checked_mul(4)
+        .ok_or("CPU cache overflow")?;
+    let retired_first = std::mem::take(first);
+    let retired_second = std::mem::take(second);
+    assert!(first.is_empty() && first.capacity() == 0);
+    assert!(second.is_empty() && second.capacity() == 0);
+
+    drop(retired_first);
+    drop(retired_second);
+    cache.release(first_bytes);
+    cache.release(second_bytes);
+
+    assert!(first.is_empty() && first.capacity() == 0);
+    assert!(second.is_empty() && second.capacity() == 0);
+    reserve_analysis_cache(cache)
+}
+
 pub fn validate_schedule(sigmas: &[f32]) -> Result<(), &'static str> {
     if sigmas.len() != STEPS + 1
         || sigmas[0] != 1.0
@@ -143,9 +169,17 @@ mod tests {
         cache.reserve(LATENT_BYTES).unwrap();
         cache.reserve(CONDITIONING_BYTES).unwrap();
         cache.reserve(CONDITIONING_BYTES).unwrap();
-        cache.release(2 * REFERENCE_PIXEL_BYTES);
-        reserve_analysis_cache(&mut cache).unwrap();
+        let pixel_elements = (REFERENCE_PIXEL_BYTES / 4) as usize;
+        let mut first_pixels = vec![0.0_f32; pixel_elements];
+        let mut second_pixels = vec![0.0_f32; pixel_elements];
+        retire_reference_pixels_and_reserve_analysis(
+            &mut cache,
+            [&mut first_pixels, &mut second_pixels],
+        )
+        .unwrap();
 
+        assert!(first_pixels.is_empty() && first_pixels.capacity() == 0);
+        assert!(second_pixels.is_empty() && second_pixels.capacity() == 0);
         assert_eq!(cache.live, 16_613_376);
         assert_eq!(cache.peak, 59_441_152);
         assert!(cache.peak <= CACHE_CAP);
