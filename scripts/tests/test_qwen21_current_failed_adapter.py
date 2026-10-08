@@ -1,6 +1,7 @@
 import copy
 import datetime as dt
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -43,11 +44,28 @@ def diagnostic_candidate_head(repository, environment, expected_repository):
     parents = tuple(line.removeprefix("parent ") for line in headers.splitlines()
                     if line.startswith("parent "))
     current.require(len(parents) == 2, "CI checkout must be an exact two-parent test merge")
-    feature_epic_policy.validate_event(
-        "pull_request", payload, repository=expected_repository, active_sha=checkout,
-        feature_resolver=feature_epic_policy.resolve_remote_feature_branch,
-        commit_parent_resolver=lambda revision: parents if revision == checkout else (),
-    )
+    policy_arguments = {
+        "repository": expected_repository,
+        "active_sha": checkout,
+        "feature_resolver": feature_epic_policy.resolve_remote_feature_branch,
+        "commit_parent_resolver": lambda revision: parents if revision == checkout else (),
+    }
+    # The frozen diagnostic producer predates the canonical-base policy.  A GitHub test merge
+    # combines these source bytes with the current policy, so supply that policy's resolvers when
+    # its API is present while keeping the producer checkout independently reproducible.
+    if "base_branch_resolver" in inspect.signature(
+            feature_epic_policy.validate_event).parameters:
+        def in_checkout(command, **kwargs):
+            return subprocess.run(command, cwd=repository, **kwargs)
+
+        policy_arguments.update(
+            base_branch_resolver=lambda branch: feature_epic_policy.resolve_remote_base_branch(
+                branch, runner=in_checkout),
+            commit_ancestry_resolver=lambda ancestor, descendant:
+                feature_epic_policy.resolve_local_commit_ancestry(
+                    ancestor, descendant, runner=in_checkout),
+        )
+    feature_epic_policy.validate_event("pull_request", payload, **policy_arguments)
     return pull_request["head"]["sha"]
 
 
@@ -198,20 +216,28 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             (origin / "production.txt").write_text("advanced AB\n", encoding="utf-8")
             git(origin, "add", "."); git(origin, "commit", "-m", "advanced production")
             advanced = git(origin, "rev-parse", "HEAD")
+            git(origin, "branch", "-f", "main", advanced)
             merge = git(origin, "commit-tree", "HEAD^{tree}", "-p", advanced,
                         "-p", candidate, "-m", "CI test merge")
             git(origin, "update-ref", "refs/heads/pr-merge", merge)
             checkout = root / "checkout"
             git(root, "clone", "--depth=1", "--branch", "pr-merge", origin.as_uri(), str(checkout))
             git(checkout, "checkout", "--detach", "HEAD")
+            # The current workflow fetches branch history for the canonical ancestry proof while
+            # the synthetic test merge itself remains the shallow boundary whose raw headers are
+            # inspected below.
+            git(checkout, "fetch", "--depth=3", "origin", "main")
             self.assertEqual(git(checkout, "rev-parse", "--is-shallow-repository"), "true")
             self.assertEqual(git(checkout, "show", "-s", "--format=%P", "HEAD"), "")
             repository = self.cfg["repository"]
+            canonical_base_policy = "base_branch_resolver" in inspect.signature(
+                feature_epic_policy.validate_event).parameters
             payload = {"action": "synchronize", "repository": {"full_name": repository},
                        "pull_request": {"merge_commit_sha": merge,
                                         "head": {"sha": candidate, "ref": "codex/diagnostic",
                                                  "repo": {"full_name": repository}},
-                                        "base": {"sha": advanced, "ref": "main",
+                                        "base": {"sha": frozen if canonical_base_policy else advanced,
+                                                 "ref": "main",
                                                  "repo": {"full_name": repository}}}}
             event_path = root / "event.json"
             environment = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_SHA": merge,
@@ -223,7 +249,8 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             event_path.write_text(json.dumps(payload), encoding="utf-8")
             self.assertEqual(diagnostic_candidate_head(checkout, environment, repository), candidate)
             mutants = []
-            for side, sha in (("head", advanced), ("base", frozen)):
+            for side, sha in (("head", advanced),
+                              ("base", candidate if canonical_base_policy else frozen)):
                 changed = copy.deepcopy(payload); changed["pull_request"][side]["sha"] = sha
                 mutants.append((changed, environment))
             foreign = copy.deepcopy(payload)
