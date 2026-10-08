@@ -30,8 +30,10 @@ jobs:
           import os
           from pathlib import Path
           import plistlib
+          import re
           import subprocess
           import sys
+          import tempfile
           import urllib.request
 
           def utc():
@@ -103,9 +105,43 @@ jobs:
                       raise ValueError("existing nonsymlink protocol directory required: " + str(directory))
                   if directory.resolve(strict=True) != directory or directory.stat().st_dev != home.stat().st_dev:
                       raise ValueError("protocol cache must remain on the home Data volume")
-              disk_result = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", str(root)],
-                                           capture_output=True, check=True, timeout=10)
-              volume = plistlib.loads(disk_result.stdout)
+              receipt["diskQueries"] = {}
+              def bounded_disk_query(label, command):
+                  with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                      timed_out = False
+                      try:
+                          result = subprocess.run(command, stdout=stdout, stderr=stderr,
+                                                  check=False, timeout=10)
+                          returncode = result.returncode
+                      except subprocess.TimeoutExpired:
+                          timed_out, returncode = True, None
+                      stdout.seek(0)
+                      stderr.seek(0)
+                      raw_stdout, raw_stderr = stdout.read(65537), stderr.read(65537)
+                  truncated = len(raw_stdout) > 65536 or len(raw_stderr) > 65536
+                  receipt["diskQueries"][label] = {
+                      "argv": command, "returncode": returncode, "timedOut": timed_out,
+                      "truncated": truncated, "outputLimitBytesPerStream": 65536,
+                      "stdoutBase64": base64.b64encode(raw_stdout[:65536]).decode("ascii"),
+                      "stderrBase64": base64.b64encode(raw_stderr[:65536]).decode("ascii"),
+                  }
+                  save()
+                  if timed_out or truncated or returncode != 0:
+                      raise ValueError("disk query refused or failed: " + label)
+                  return raw_stdout
+              df_output = bounded_disk_query("df", ["/bin/df", "-kP", str(root)])
+              df_lines = df_output.decode("utf-8", errors="strict").splitlines()
+              if len(df_lines) != 2:
+                  raise ValueError("exact single cache filesystem row required")
+              df_row = df_lines[1].split(None, 5)
+              if len(df_row) != 6 or not re.fullmatch(r"/dev/disk[0-9]+(?:s[0-9]+)*", df_row[0]):
+                  raise ValueError("cache filesystem must name a numeric local disk device")
+              device = df_row[0]
+              receipt["cacheFilesystemDevice"] = device
+              volume = plistlib.loads(bounded_disk_query(
+                  "diskutil", ["/usr/sbin/diskutil", "info", "-plist", device]))
+              if volume.get("DeviceIdentifier") != device.removeprefix("/dev/") or volume.get("MountPoint") != df_row[5]:
+                  raise ValueError("df/diskutil device or mountpoint mismatch")
               if volume.get("Internal") is not True or volume.get("FilesystemType") != "apfs":
                   raise ValueError("internal APFS cache volume required")
               receipt["localVolume"] = {key: volume.get(key) for key in
