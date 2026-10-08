@@ -30,6 +30,7 @@ jobs:
           from pathlib import Path
           import subprocess
           import sys
+          import tempfile
           import urllib.request
 
           def utc():
@@ -63,6 +64,52 @@ jobs:
           identity_path = output / "control-identity.json"
           identity_path.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
           try:
+              def bounded_disk_query(command):
+                  with tempfile.TemporaryFile() as query_output:
+                      result = subprocess.run(command, stdout=query_output,
+                                              stderr=subprocess.DEVNULL, timeout=5, check=False)
+                      query_output.seek(0)
+                      raw_output = query_output.read(2 * 1024 * 1024 + 1)
+                  if len(raw_output) > 2 * 1024 * 1024:
+                      raise ValueError("disk query exceeded 2 MiB output bound")
+                  if result.returncode:
+                      raise ValueError("disk query returned a nonzero exit status")
+                  return raw_output.decode("utf-8", errors="strict")
+
+              home = Path.home().resolve(strict=True)
+              runner_temporary = temporary.resolve(strict=True)
+              proposed_hub = home / "Library/Caches/SceneWorks/sc-24163/huggingface"
+              disk = {
+                  "kind": "READ_ONLY_LOCAL_DISK_CENSUS", "utc": utc(),
+                  "homePath": str(home), "runnerTempPath": str(runner_temporary),
+                  "proposedHuggingFaceCache": str(proposed_hub),
+                  "proposedHuggingFaceCacheResolved": str(proposed_hub.resolve(strict=False)),
+                  "cacheCreated": False, "modelDownloadBytes": 0,
+                  "localFilesystemQualification": "pending interpretation of df and mount readback",
+                  "filesystems": {}, "errors": {},
+              }
+              for label, directory in (("home", home), ("runnerTemp", runner_temporary)):
+                  try:
+                      stats = os.statvfs(directory)
+                      block_bytes = stats.f_frsize or stats.f_bsize
+                      disk["filesystems"][label] = {
+                          "resolvedPath": str(directory), "deviceId": directory.stat().st_dev,
+                          "blockBytes": block_bytes, "totalBytes": stats.f_blocks * block_bytes,
+                          "freeBytes": stats.f_bfree * block_bytes,
+                          "availableBytes": stats.f_bavail * block_bytes,
+                      }
+                  except Exception as error:
+                      disk["errors"][label] = type(error).__name__
+              for label, command in (
+                  ("dfKiB", ["/bin/df", "-kP", str(home), str(runner_temporary)]),
+                  ("mountSummary", ["/sbin/mount"]),
+              ):
+                  try:
+                      disk[label] = bounded_disk_query(command)
+                  except Exception as error:
+                      disk["errors"][label] = type(error).__name__
+              (output / "disk-local.json").write_text(
+                  json.dumps(disk, indent=2) + "\n", encoding="utf-8")
               request = urllib.request.Request(
                   "https://api.github.com/repos/SceneWorks/inference/git/blobs/" + blob_sha,
                   headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
@@ -110,6 +157,8 @@ jobs:
                   raise ValueError("Mac-2 hardware qualification failed; receipt preserved")
               if qualification["queryErrors"]:
                   raise ValueError("host census query incomplete; receipt preserved")
+              if disk["errors"]:
+                  raise ValueError("disk census query incomplete; receipt preserved")
               identity["status"] = "CENSUS_COMPLETED"
           except Exception as error:
               identity["status"] = "CENSUS_FAILED"
