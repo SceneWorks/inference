@@ -5116,6 +5116,16 @@ jobs:
           os.replace(temporary, receipt)
           PY
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Initialize isolated Qwen-Image 2.1 Cargo target
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_TEMP" = /* ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          target="$RUNNER_TEMP/qwen-image-2-1-cargo-target-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$target"
+          printf 'CARGO_TARGET_DIR=%s\n' "$target" >> "$GITHUB_ENV"
       - name: Resolve runner-local snapshot paths
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
