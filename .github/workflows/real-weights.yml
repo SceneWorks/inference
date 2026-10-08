@@ -1,4 +1,4 @@
-name: Mac2 proc-macro build health
+name: Mac2 proc-macro strip confirmation
 
 on:
   workflow_dispatch:
@@ -7,12 +7,12 @@ on:
         description: Exact diagnostic transport to run
         type: choice
         required: true
-        options: [mac2-proc-macro-health]
+        options: [mac2-proc-macro-strip]
 
 jobs:
-  mac2-proc-macro-health:
-    name: Mac2 fresh proc-macro build health
-    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'mac2-proc-macro-health'
+  mac2-proc-macro-strip:
+    name: Mac2 proc-macro strip confirmation
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'mac2-proc-macro-strip'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     timeout-minutes: 10
     permissions:
@@ -28,33 +28,33 @@ jobs:
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
-          out="$RUNNER_TEMP/mac2-proc-macro-health-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          out="$RUNNER_TEMP/mac2-proc-macro-strip-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           test ! -e "$out"
           mkdir "$out"
           fetch_raw() {
             gh api -H 'Accept: application/vnd.github.raw+json' \
               "repos/SceneWorks/inference/contents/$1?ref=$2" > "$3"
           }
-          fetch_raw scripts/ci/mac2_proc_macro_health.py "$GITHUB_SHA" "$out/probe.py"
+          fetch_raw scripts/ci/mac2_proc_macro_strip.py "$GITHUB_SHA" "$out/probe.py"
           fetch_raw Cargo.lock 68b925baa5746281d47af9342cdcc28bc54d2ad0 "$out/source-Cargo.lock"
           fetch_raw .cargo/config.toml 68b925baa5746281d47af9342cdcc28bc54d2ad0 "$out/source-config.toml"
           printf '%s  %s\n' \
-            93fa6750a85dd7856acc108b27956c38a08402dfe47b9060941c20cc966cd70a "$out/probe.py" \
+            129023147d56bcce58f6ce08ac3f8afd074702aaaa8640c844c44acae1549a4e "$out/probe.py" \
             fc1126df4459c673bbeddcf0945e3de571ee1adfafe9e35a135a81b98b077c52 "$out/source-Cargo.lock" \
             0e60a7ec5c6bd200df30aa1a844ae66c7e6615c05af9f6c3321af96300dc0b9c "$out/source-config.toml" \
             | shasum -a 256 -c -
-          printf 'PROC_MACRO_HEALTH_OUT=%s\n' "$out" >> "$GITHUB_ENV"
+          printf 'PROC_MACRO_STRIP_OUT=%s\n' "$out" >> "$GITHUB_ENV"
           printf 'PROC_MACRO_SOURCE_LOCK=%s\n' "$out/source-Cargo.lock" >> "$GITHUB_ENV"
           printf 'PROC_MACRO_SOURCE_CONFIG=%s\n' "$out/source-config.toml" >> "$GITHUB_ENV"
           printf 'PROC_MACRO_PROBE=%s\n' "$out/probe.py" >> "$GITHUB_ENV"
-      - name: Compare inherited and direct rustc proc-macro loading
+      - name: Compare baseline and no-strip proc-macro loading
         shell: bash
-        run: python3.12 "$PROC_MACRO_PROBE" "$PROC_MACRO_HEALTH_OUT/evidence"
-      - name: Keep the complete proc-macro build-health evidence
+        run: python3.12 "$PROC_MACRO_PROBE" "$PROC_MACRO_STRIP_OUT/evidence"
+      - name: Keep the complete proc-macro strip evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: mac2-proc-macro-health-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/mac2-proc-macro-health-${{ github.run_id }}-${{ github.run_attempt }}
+          name: mac2-proc-macro-strip-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mac2-proc-macro-strip-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 30
