@@ -1303,10 +1303,12 @@ mod tests {
         };
         let cached = file_cache(290);
         let request = new_request();
+        let mut success_policy = policy();
+        success_policy.deadline = Duration::from_secs(2);
         let status = run_guarded(
             Command::new("/bin/sleep").arg("0.1"),
             &request,
-            &policy(),
+            &success_policy,
             &mut FakeProbe::hosts((0..1000).map(|_| Ok(cached.clone()))),
         )
         .unwrap();
