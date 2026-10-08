@@ -45,6 +45,9 @@ PULL_REQUEST_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
 FeatureBranchResolver = Callable[[int], str]
 CommitParentResolver = Callable[[str], tuple[str, str]]
 CommitPeeler = Callable[[str], str]
+BaseBranchResolver = Callable[[str], str]
+CommitAncestryResolver = Callable[[str, str], bool]
+EffectiveBaseWriter = Callable[[str], None]
 
 
 class PolicyError(ValueError):
@@ -224,6 +227,56 @@ def resolve_local_commit(
     return _commit_sha((result.stdout or "").strip(), f"commit peeled from {obj}")
 
 
+def resolve_local_commit_ancestry(
+    ancestor: str,
+    descendant: str,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> bool:
+    """Return whether two locally available commits have the requested ancestry."""
+
+    ancestor = _commit_sha(ancestor, "ancestor commit")
+    descendant = _commit_sha(descendant, "descendant commit")
+    command = ["git", "merge-base", "--is-ancestor", ancestor, descendant]
+    try:
+        result = runner(
+            command, check=False, capture_output=True, text=True, encoding="utf-8", timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PolicyError(f"could not inspect commit ancestry: {error}") from error
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    detail = (result.stderr or "git merge-base failed").strip()
+    raise PolicyError(f"could not inspect commit ancestry: {detail}")
+
+
+def resolve_remote_base_branch(
+    branch: str,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> str:
+    """Resolve one exact base branch from the fixed canonical ``origin`` remote."""
+
+    branch = _string(branch, "pull_request.base.ref")
+    expected_ref = f"refs/heads/{branch}"
+    command = ["git", "ls-remote", "--heads", "origin", expected_ref]
+    try:
+        result = runner(
+            command, check=False, capture_output=True, text=True, encoding="utf-8", timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PolicyError(f"could not resolve canonical base branch {branch!r}: {error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or "git ls-remote failed").strip()
+        raise PolicyError(f"could not resolve canonical base branch {branch!r}: {detail}")
+    rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != expected_ref:
+        raise PolicyError(f"origin did not return exactly canonical base ref {expected_ref!r}")
+    return _commit_sha(rows[0][0], f"canonical base branch {branch!r}")
+
+
 def _active_tag_revision(
     active_sha: str | None,
     after: str,
@@ -261,7 +314,9 @@ def _active_pull_request_revision(
     base_sha: str,
     head_sha: str,
     commit_parent_resolver: CommitParentResolver | None,
-) -> None:
+    canonical_base_sha: str,
+    commit_ancestry_resolver: CommitAncestryResolver | None,
+) -> str:
     if "merge_commit_sha" not in pull_request:
         raise PolicyError("pull_request.merge_commit_sha is missing")
     merge_commit_sha = pull_request["merge_commit_sha"]
@@ -280,11 +335,25 @@ def _active_pull_request_revision(
             "was provided"
         )
     parents = commit_parent_resolver(active_sha)
-    if parents != (base_sha, head_sha):
+    merge_base_sha, merge_head_sha = parents
+    if merge_head_sha != head_sha:
         raise PolicyError(
-            "checked-out pull-request test merge must have the exact payload base/head parents; "
-            f"expected {(base_sha, head_sha)!r}, found {parents!r}"
+            "checked-out pull-request test merge must have the exact payload head as its second "
+            f"parent; expected {head_sha}, found {merge_head_sha}"
         )
+    if commit_ancestry_resolver is None:
+        raise PolicyError("no commit ancestry resolver was provided")
+    if not commit_ancestry_resolver(base_sha, merge_base_sha):
+        raise PolicyError(
+            "checked-out pull-request base parent must descend from the payload base; "
+            f"payload {base_sha}, parent {merge_base_sha}"
+        )
+    if not commit_ancestry_resolver(merge_base_sha, canonical_base_sha):
+        raise PolicyError(
+            "checked-out pull-request base parent must belong to the canonical base branch; "
+            f"parent {merge_base_sha}, canonical tip {canonical_base_sha}"
+        )
+    return merge_base_sha
 
 
 def _canonical_feature_branch(
@@ -374,6 +443,9 @@ def _validate_pull_request(
     active_sha: str | None,
     feature_resolver: FeatureBranchResolver | None,
     commit_parent_resolver: CommitParentResolver | None,
+    base_branch_resolver: BaseBranchResolver | None,
+    commit_ancestry_resolver: CommitAncestryResolver | None,
+    effective_base_writer: EffectiveBaseWriter | None,
 ) -> str:
     action = _nested_string(payload, "action")
     if action not in PULL_REQUEST_ACTIONS:
@@ -389,13 +461,24 @@ def _validate_pull_request(
     base_ref = _nested_string(base, "ref")
     head_sha = _commit_sha(_nested_string(head, "sha"), "pull_request.head.sha")
     base_sha = _commit_sha(_nested_string(base, "sha"), "pull_request.base.sha")
-    _active_pull_request_revision(
+    base_repository = _nested_string(base, "repo", "full_name")
+    _same_repository(base_repository, repository, "pull_request.base.repo.full_name")
+    if base_branch_resolver is None:
+        raise PolicyError("a canonical base-branch resolver is required for pull requests")
+    canonical_base_sha = _commit_sha(
+        base_branch_resolver(base_ref), f"canonical base branch {base_ref!r}"
+    )
+    effective_base_sha = _active_pull_request_revision(
         pull_request,
         active_sha,
         base_sha,
         head_sha,
         commit_parent_resolver,
+        canonical_base_sha,
+        commit_ancestry_resolver,
     )
+    if effective_base_writer is not None:
+        effective_base_writer(effective_base_sha)
 
     head_train = _parse_train_branch(head_ref)
     base_train = _parse_train_branch(base_ref)
@@ -404,9 +487,7 @@ def _validate_pull_request(
         return f"ordinary pull request {head_ref!r} -> {base_ref!r}; no feature-epic policy applies"
 
     head_repository = _nested_string(head, "repo", "full_name")
-    base_repository = _nested_string(base, "repo", "full_name")
     _same_repository(head_repository, repository, "pull_request.head.repo.full_name")
-    _same_repository(base_repository, repository, "pull_request.base.repo.full_name")
 
     if head_train is None:
         raise PolicyError(
@@ -544,6 +625,9 @@ def validate_event(
     feature_resolver: FeatureBranchResolver | None = None,
     commit_parent_resolver: CommitParentResolver | None = None,
     commit_peeler: CommitPeeler | None = None,
+    base_branch_resolver: BaseBranchResolver | None = None,
+    commit_ancestry_resolver: CommitAncestryResolver | None = None,
+    effective_base_writer: EffectiveBaseWriter | None = None,
 ) -> str:
     """Validate a GitHub event and return a human-readable acceptance reason."""
 
@@ -558,6 +642,9 @@ def validate_event(
             active_sha,
             feature_resolver,
             commit_parent_resolver,
+            base_branch_resolver,
+            commit_ancestry_resolver,
+            effective_base_writer,
         )
     if event_name == "merge_group":
         return _validate_merge_group(payload, active_sha, feature_resolver)
@@ -591,6 +678,12 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("GITHUB_SHA"),
         help="Checked-out revision (defaults to GITHUB_SHA)",
     )
+    parser.add_argument(
+        "--github-output",
+        type=Path,
+        default=os.environ.get("GITHUB_OUTPUT"),
+        help="GitHub step output file (defaults to GITHUB_OUTPUT)",
+    )
     args = parser.parse_args(argv)
 
     if args.event_name is None:
@@ -603,6 +696,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with args.event_path.open(encoding="utf-8") as event_file:
             payload = json.load(event_file)
+        def write_effective_base(sha: str) -> None:
+            if args.github_output is not None:
+                with args.github_output.open("a", encoding="utf-8", newline="\n") as output:
+                    output.write(f"effective_base_sha={sha}\n")
+
         reason = validate_event(
             args.event_name,
             payload,
@@ -611,6 +709,9 @@ def main(argv: list[str] | None = None) -> int:
             feature_resolver=resolve_remote_feature_branch,
             commit_parent_resolver=resolve_local_merge_parents,
             commit_peeler=resolve_local_commit,
+            base_branch_resolver=resolve_remote_base_branch,
+            commit_ancestry_resolver=resolve_local_commit_ancestry,
+            effective_base_writer=write_effective_base,
         )
     except (OSError, json.JSONDecodeError, PolicyError) as error:
         print(f"::error title=Feature epic branch policy::{error}")

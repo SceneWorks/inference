@@ -4030,6 +4030,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             1,
             "the feature-epic policy must run exactly once in the always-created changes job",
         )
+        self.assertEqual(policy_steps[0].get("id"), "topology")
         self.assertNotIn(
             "if",
             policy_steps[0],
@@ -4062,6 +4063,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         triggers = workflow[True]
         self.assertIn("pull_request", triggers)
         self.assertIn("merge_group", triggers)
+
+    def test_pull_request_diff_consumers_use_the_validated_merge_base_parent(self) -> None:
+        workflow_text = WORKFLOW.read_text(encoding="utf-8")
+        base_assignments = [
+            line.strip()
+            for line in workflow_text.splitlines()
+            if line.strip().startswith("BASE_SHA:")
+        ]
+        self.assertTrue(base_assignments)
+        for assignment in base_assignments:
+            with self.subTest(assignment=assignment):
+                self.assertIn("steps.topology.outputs.effective_base_sha", assignment)
+                self.assertNotIn("github.event.pull_request.base.sha", assignment)
 
     def test_gate_aggregates_every_lane_and_runs_when_they_fail(self) -> None:
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
