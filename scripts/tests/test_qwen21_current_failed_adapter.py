@@ -31,6 +31,36 @@ def is_known_diagnostic_producer(payload):
         pull_request.get("head", {}).get("ref") == PRODUCER_BRANCH
 
 
+def validate_generic_ci_context(event_name, payload, environment, expected_repository,
+                                checkout):
+    current.require(environment.get("GITHUB_REPOSITORY") == expected_repository,
+                    f"{event_name} repository context changed")
+    current.require(environment.get("GITHUB_SHA") == checkout,
+                    f"{event_name} active revision differs from checkout")
+    if event_name == "push":
+        ref = environment.get("GITHUB_REF", "")
+        current.require(ref == "refs/heads/main" or ref.startswith("refs/tags/runtime-"),
+                        "source-closure fixture is limited to CI push refs")
+    elif event_name == "merge_group":
+        ref = environment.get("GITHUB_REF", "")
+        current.require(ref.startswith("refs/heads/gh-readonly-queue/main/"),
+                        "merge-group checkout ref changed")
+        feature_epic_policy.validate_event(
+            event_name, payload, repository=expected_repository, active_sha=checkout)
+        current.require(payload["merge_group"]["head_ref"] == ref,
+                        "merge-group event ref differs from checkout ref")
+    elif event_name == "workflow_dispatch":
+        ref = environment.get("GITHUB_REF", "")
+        current.require(ref.startswith("refs/heads/") or ref.startswith("refs/tags/"),
+                        "workflow-dispatch checkout ref must be a full branch or tag ref")
+        feature_epic_policy.validate_event(
+            event_name, payload, repository=expected_repository, active_sha=checkout)
+        current.require(payload.get("ref") == ref.removeprefix("refs/heads/").removeprefix(
+            "refs/tags/"), "workflow-dispatch event ref differs from checkout ref")
+    else:
+        raise ValueError(f"unsupported source-closure test event {event_name!r}")
+
+
 def diagnostic_candidate_head(repository, environment, expected_repository):
     """Bind a frozen diagnostic candidate without treating the CI merge as that candidate."""
     checkout = current.git(repository, "rev-parse", "HEAD")
@@ -233,6 +263,43 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                        {"number": PRODUCER_PR, "pull_request": {}}):
             self.assertFalse(is_known_diagnostic_producer(mutant))
 
+    def test_registered_generic_ci_events_use_only_exact_checkout_contexts(self):
+        repository = self.cfg["repository"]
+        sha = "a" * 40
+        cases = [
+            ("push", {}, {"GITHUB_REPOSITORY": repository, "GITHUB_SHA": sha,
+                          "GITHUB_REF": "refs/heads/main"}),
+            ("push", {}, {"GITHUB_REPOSITORY": repository, "GITHUB_SHA": sha,
+                          "GITHUB_REF": "refs/tags/runtime-1.2.3"}),
+            ("merge_group", {"action": "checks_requested",
+                             "repository": {"full_name": repository},
+                             "merge_group": {
+                                 "head_ref": "refs/heads/gh-readonly-queue/main/pr-1203-" + sha,
+                                 "base_ref": "refs/heads/main", "head_sha": sha,
+                                 "base_sha": "b" * 40}},
+             {"GITHUB_REPOSITORY": repository, "GITHUB_SHA": sha,
+              "GITHUB_REF": "refs/heads/gh-readonly-queue/main/pr-1203-" + sha}),
+            ("workflow_dispatch", {"repository": {"full_name": repository}, "ref": "main"},
+             {"GITHUB_REPOSITORY": repository, "GITHUB_SHA": sha,
+              "GITHUB_REF": "refs/heads/main"}),
+        ]
+        for event_name, payload, environment in cases:
+            validate_generic_ci_context(event_name, payload, environment, repository, sha)
+            for key, value in (("GITHUB_REPOSITORY", "foreign/inference"),
+                               ("GITHUB_SHA", "b" * 40)):
+                mutant = dict(environment); mutant[key] = value
+                with self.assertRaises(ValueError):
+                    validate_generic_ci_context(event_name, payload, mutant, repository, sha)
+        for index, bad_ref in ((0, "refs/heads/feature"),
+                               (2, "refs/heads/gh-readonly-queue/main/pr-9999-" + sha),
+                               (3, "main")):
+            event_name, payload, environment = cases[index]
+            mutant = dict(environment); mutant["GITHUB_REF"] = bad_ref
+            with self.assertRaises(ValueError):
+                validate_generic_ci_context(event_name, payload, mutant, repository, sha)
+        with self.assertRaises(ValueError):
+            validate_generic_ci_context("schedule", {}, cases[0][2], repository, sha)
+
     def test_pull_request_candidate_binding_preserves_merge_checkout_and_rejects_mutants(self):
         def git(root, *args):
             return current.git(root, *args)
@@ -396,15 +463,11 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             known_producer = is_known_diagnostic_producer(payload)
             head = bound_head
             fixture_candidate = not known_producer
-        elif event_name == "push":
-            current.require(os.environ.get("GITHUB_REPOSITORY") == self.cfg["repository"],
-                            "push repository context changed")
-            push_ref = os.environ.get("GITHUB_REF", "")
-            current.require(push_ref == "refs/heads/main" or
-                            push_ref.startswith("refs/tags/runtime-"),
-                            "source-closure fixture is limited to CI push refs")
-            current.require(os.environ.get("GITHUB_SHA") == live_identity[0],
-                            "main-push active revision differs from checkout")
+        elif event_name in ("push", "merge_group", "workflow_dispatch"):
+            event_path = os.environ.get("GITHUB_EVENT_PATH")
+            payload = current.read_json(Path(event_path)) if event_path else {}
+            validate_generic_ci_context(event_name, payload, os.environ,
+                                        self.cfg["repository"], live_identity[0])
             head = live_identity[0]
             fixture_candidate = True
         elif event_name:
