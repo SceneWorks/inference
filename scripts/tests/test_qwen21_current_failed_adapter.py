@@ -21,6 +21,15 @@ from scripts.ci import qwen21_current_failed_adapter as current
 from scripts.ci import feature_epic_policy
 from scripts.ci.real_weights_workflow import inline_text
 
+PRODUCER_PR = 1203
+PRODUCER_BRANCH = "codex/sc-24163-current-q4-discriminator"
+
+
+def is_known_diagnostic_producer(payload):
+    pull_request = payload.get("pull_request", {})
+    return payload.get("number") == PRODUCER_PR and \
+        pull_request.get("head", {}).get("ref") == PRODUCER_BRANCH
+
 
 def diagnostic_candidate_head(repository, environment, expected_repository):
     """Bind a frozen diagnostic candidate without treating the CI merge as that candidate."""
@@ -63,7 +72,7 @@ def diagnostic_candidate_head(repository, environment, expected_repository):
             base_ref, runner=in_checkout)
         shallow = current.git(repository, "rev-parse", "--is-shallow-repository") == "true"
         fetch = ["git", "fetch", "--no-tags", "--no-recurse-submodules",
-                 "--no-write-fetch-head"]
+                 "--no-write-fetch-head", "--refmap="]
         if shallow:
             fetch.append("--unshallow")
         fetch.extend(("origin", f"refs/heads/{base_ref}"))
@@ -214,6 +223,16 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 current.acquire_source_base(checkout, head, mutant)
 
+    def test_only_exact_diagnostic_pr_uses_the_live_producer_closure(self):
+        payload = {"number": PRODUCER_PR, "pull_request": {"head": {
+            "ref": PRODUCER_BRANCH}}}
+        self.assertTrue(is_known_diagnostic_producer(payload))
+        for mutant in ({**payload, "number": 1204},
+                       {"number": PRODUCER_PR, "pull_request": {"head": {
+                           "ref": "codex/unrelated"}}},
+                       {"number": PRODUCER_PR, "pull_request": {}}):
+            self.assertFalse(is_known_diagnostic_producer(mutant))
+
     def test_pull_request_candidate_binding_preserves_merge_checkout_and_rejects_mutants(self):
         def git(root, *args):
             return current.git(root, *args)
@@ -241,6 +260,16 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             checkout = root / "checkout"
             git(root, "clone", "--depth=1", "--branch", "pr-merge", origin.as_uri(), str(checkout))
             git(checkout, "checkout", "--detach", "HEAD")
+            # Match actions/checkout for a pull-request test merge: the checkout advertises only
+            # GitHub's synthetic merge ref, while both main commits remain absent at depth one.
+            for remote_ref in git(checkout, "for-each-ref", "--format=%(refname)",
+                                  "refs/remotes").splitlines():
+                git(checkout, "update-ref", "-d", remote_ref)
+            git(checkout, "config", "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*")
+            git(checkout, "update-ref", "refs/remotes/pull/1203/merge", merge)
+            self.assertEqual(git(checkout, "for-each-ref", "--format=%(refname)",
+                                 "refs/remotes"), "refs/remotes/pull/1203/merge")
             self.assertEqual(git(checkout, "rev-parse", "--is-shallow-repository"), "true")
             self.assertEqual(git(checkout, "show", "-s", "--format=%P", "HEAD"), "")
             for absent in (advanced, frozen):
@@ -250,9 +279,11 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             repository = self.cfg["repository"]
             canonical_base_policy = "base_branch_resolver" in inspect.signature(
                 feature_epic_policy.validate_event).parameters
-            payload = {"action": "synchronize", "repository": {"full_name": repository},
+            payload = {"action": "synchronize", "number": 1203,
+                       "repository": {"full_name": repository},
                        "pull_request": {"merge_commit_sha": merge,
-                                        "head": {"sha": candidate, "ref": "codex/diagnostic",
+                                        "head": {"sha": candidate,
+                                                 "ref": "codex/sc-24163-current-q4-discriminator",
                                                  "repo": {"full_name": repository}},
                                         "base": {"sha": frozen if canonical_base_policy else advanced,
                                                  "ref": "main",
@@ -261,6 +292,14 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             git(root, "clone", "--depth=1", "--branch", "pr-merge", origin.as_uri(),
                 str(exact_checkout))
             git(exact_checkout, "checkout", "--detach", "HEAD")
+            for remote_ref in git(exact_checkout, "for-each-ref", "--format=%(refname)",
+                                  "refs/remotes").splitlines():
+                git(exact_checkout, "update-ref", "-d", remote_ref)
+            git(exact_checkout, "config", "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*")
+            git(exact_checkout, "update-ref", "refs/remotes/pull/1203/merge", merge)
+            self.assertEqual(git(exact_checkout, "for-each-ref", "--format=%(refname)",
+                                 "refs/remotes"), "refs/remotes/pull/1203/merge")
             self.assertEqual(git(exact_checkout, "rev-parse", "--is-shallow-repository"), "true")
             self.assertNotEqual(subprocess.run(
                 ["git", "cat-file", "-e", advanced + "^{commit}"], cwd=exact_checkout,
@@ -278,6 +317,10 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                             git(exact_checkout, "status", "--porcelain"))
             self.assertEqual(diagnostic_candidate_head(
                 exact_checkout, exact_environment, repository), candidate)
+            if canonical_base_policy:
+                self.assertEqual(subprocess.run(
+                    ["git", "cat-file", "-e", advanced + "^{commit}"], cwd=exact_checkout,
+                    check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode, 0)
             self.assertEqual((git(exact_checkout, "rev-parse", "HEAD"),
                               current.symbolic_head(exact_checkout),
                               git(exact_checkout, "status", "--porcelain")), exact_before)
@@ -344,7 +387,33 @@ class CurrentFailedAdapterTests(unittest.TestCase):
 
         live_identity = checkout_identity(repository)
         self.assertEqual(run(repository, "status", "--porcelain"), "")
-        head = diagnostic_candidate_head(repository, os.environ, self.cfg["repository"])
+        event_name = os.environ.get("GITHUB_EVENT_NAME")
+        fixture_candidate = False
+        if event_name == "pull_request":
+            bound_head = diagnostic_candidate_head(
+                repository, os.environ, self.cfg["repository"])
+            payload = current.read_json(Path(os.environ["GITHUB_EVENT_PATH"]))
+            known_producer = is_known_diagnostic_producer(payload)
+            head = bound_head
+            fixture_candidate = not known_producer
+        elif event_name == "push":
+            current.require(os.environ.get("GITHUB_REPOSITORY") == self.cfg["repository"],
+                            "push repository context changed")
+            push_ref = os.environ.get("GITHUB_REF", "")
+            current.require(push_ref == "refs/heads/main" or
+                            push_ref.startswith("refs/tags/runtime-"),
+                            "source-closure fixture is limited to CI push refs")
+            current.require(os.environ.get("GITHUB_SHA") == live_identity[0],
+                            "main-push active revision differs from checkout")
+            head = live_identity[0]
+            fixture_candidate = True
+        elif event_name:
+            raise ValueError(f"unsupported source-closure test event {event_name!r}")
+        else:
+            head = live_identity[0]
+            changed = set(run(repository, "diff", "--name-only",
+                              self.cfg["source"]["baseCommit"], head).splitlines())
+            fixture_candidate = changed != current.ALLOWED_DIFF
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -358,7 +427,7 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             base = self.cfg["source"]["baseCommit"]
             # CI's shallow merge checkout can lack both immutable objects. Fetch only into the
             # disposable fixture, never move HEAD, refs, FETCH_HEAD or files in the live checkout.
-            for revision in (head, base):
+            for revision in (() if fixture_candidate else (head,)) + (base,):
                 if execute(repository, "cat-file", "-e",
                            revision + "^{commit}", check=False).returncode:
                     run(root, "--git-dir", str(origin), "fetch", "--no-tags",
@@ -368,6 +437,27 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             # merge through alternates during negotiation can expose its missing parent objects.
             alternates.write_bytes((objects.resolve().as_posix() + "\n").encode("utf-8"))
             run(root, "--git-dir", str(origin), "update-ref", "refs/heads/base", base)
+            if fixture_candidate:
+                index = root / "candidate-index"
+                fixture_environment = os.environ.copy()
+                fixture_environment.update({"GIT_INDEX_FILE": str(index),
+                                            "GIT_AUTHOR_NAME": "fixture",
+                                            "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                                            "GIT_COMMITTER_NAME": "fixture",
+                                            "GIT_COMMITTER_EMAIL": "fixture@example.invalid"})
+                run(root, "--git-dir", str(origin), "read-tree", base,
+                    env=fixture_environment)
+                for path in sorted(current.ALLOWED_DIFF):
+                    entry = run(repository, "ls-tree", head, "--", path).split()
+                    self.assertGreaterEqual(len(entry), 3, f"fixture path absent: {path}")
+                    blob = run(repository, "rev-parse", f"{head}:{path}")
+                    run(root, "--git-dir", str(origin), "update-index", "--add", "--cacheinfo",
+                        entry[0], blob, path, env=fixture_environment)
+                tree = run(root, "--git-dir", str(origin), "write-tree",
+                           env=fixture_environment)
+                head = run(root, "--git-dir", str(origin), "commit-tree", tree, "-p", base,
+                           "-m", "isolated reviewed diagnostic fixture",
+                           env=fixture_environment)
             run(root, "--git-dir", str(origin), "update-ref", "refs/heads/head", head)
             environment = os.environ.copy()
             environment.update({"GIT_AUTHOR_NAME": "fixture",
