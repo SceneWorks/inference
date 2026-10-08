@@ -5080,6 +5080,9 @@ jobs:
       # Through env, never interpolated into a script: the materialize step validates its shape.
       QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC: ${{ inputs.qwen_image_2_1_third_party_lora }}
       QWEN_IMAGE_2_1_LORA_PHASE: ${{ inputs.qwen_image_2_1_lora_phase }}
+      # Rust 1.96/LLVM 22 can mis-strip macOS proc-macro dylibs into E0463
+      # (rust-lang/rust#157750); keep this producer's fresh release build unstripped.
+      CARGO_PROFILE_RELEASE_STRIP: "none"
       # Training otherwise derives its physical ceiling from the host census; its 100 GB
       # default applies only before admission/inference. Bind the selected terminal safety
       # ceiling explicitly for this profile, in addition to the existing host reserves.
