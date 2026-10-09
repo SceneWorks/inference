@@ -1,0 +1,71 @@
+{
+  "schema": "sc24163-single-linear-source-fixture-bindings-v1",
+  "acceptance": false,
+  "sourceCurrent": "004cee41f380ff263796ad90277e5f6224d73ae3",
+  "module": "transformer_blocks.0.attn.to_k",
+  "failedDonorSha256": "33ab069111f5a085a2870e9d6ccf7a0f6e2357f2ed1bcb67c590a9561878e354",
+  "originalActivationDtype": "Float32",
+  "replayActivationDtype": "Float32",
+  "originalJointRows": 10583,
+  "originalRowIndices": [
+    0,
+    5291,
+    10582
+  ],
+  "actualExtractionBindingSha256": "069e30ba383e6fa3cc8cfcb6cee099d1f802ff17708dd641454d40cbe95405a4",
+  "files": [
+    {
+      "file": "actual-x-q4-to-k-3x4096.f32",
+      "bytes": 49152,
+      "sha256": "d4ff88129f375a3e3c8941ab48dd8790f5a51b684a6d47679af2b33de4403e4f",
+      "shape": [
+        1,
+        3,
+        4096
+      ],
+      "dtype": "Float32",
+      "role": "input"
+    },
+    {
+      "file": "lokr_w1.f32",
+      "bytes": 16384,
+      "sha256": "62c47e4666a31182040102e449d4a5a0ba7e3b3e864ec475451eb0e040f8d2f0",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "Float32",
+      "role": "w1"
+    },
+    {
+      "file": "lokr_w2_a.f32",
+      "bytes": 4096,
+      "sha256": "9532004d95ed9d88e72f1093e1720764e68a3a6fd8df59a44ac13ce90ed00acd",
+      "shape": [
+        64,
+        16
+      ],
+      "dtype": "Float32",
+      "role": "w2a"
+    },
+    {
+      "file": "lokr_w2_b.f32",
+      "bytes": 4096,
+      "sha256": "a2364370ec2e6125cf10da75718dafeff14b782a7775e08e37c3e009e5026b06",
+      "shape": [
+        16,
+        64
+      ],
+      "dtype": "Float32",
+      "role": "w2b"
+    }
+  ],
+  "sourcePriorCapture": "9b1162b147f21a7ccff101d5966d9fdafb19687f",
+  "inputReceipt": {
+    "path": "C:/evidence/sc-24163-recovery/current-q4-9b11-native-diagnostic-monitor-v1/artifact-extracted/current-q4-velocity-discriminator/receipt.json",
+    "bytes": 36364954,
+    "sha256": "543917a1c6505070f98e748c4ac56b7d0bf6c38bf42dd73d9f4be8567c218a5d",
+    "originalDtypeObservedBeforeExport": "Float32"
+  },
+  "captureScope": "Prior9b11 activation; currentM004 forward functions preserved; same donor33. This is not a newly captured M004 activation."
+}

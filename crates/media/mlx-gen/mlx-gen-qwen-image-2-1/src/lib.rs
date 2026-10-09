@@ -196,5 +196,7 @@ mod conditioning_velocity_diagnostic;
 #[cfg(test)]
 mod q4_diagnostic;
 #[cfg(test)]
+mod single_linear_diagnostic;
+#[cfg(test)]
 #[path = "../tests/lora_real_weights.rs"]
 mod q4_real_weights_support;
