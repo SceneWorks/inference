@@ -6294,10 +6294,21 @@ mod native12_step1_velocity {
             assert!(!fixed(&m, &mc, &r, ss, ns));
             rejected += 1;
         }
+        // CPU-only regression for the actual native14 artificial nested limit.
+        let original = (130_567_005_798usize, 130_567_005_798usize);
+        assert!(independent_phase_limits(original, original));
+        assert!(!independent_phase_limits(
+            (95_212_969_984, 3_184_068_991),
+            original
+        ));
+        assert!(!independent_phase_limits(
+            (original.0, 3_184_068_991),
+            original
+        ));
         evidence::write_json(
             &evidence::out_dir(),
             "native12-step1-cpu-guard",
-            &json!({"contract":contract,"actualCpuRequestMutantsRejected":rejected,"nativeArithmeticExecuted":false,"accepted":false}),
+            &json!({"contract":contract,"actualCpuRequestMutantsRejected":rejected,"scopePolicyMutantsRejected":2,"nativeArithmeticExecuted":false,"accepted":false}),
         );
     }
 
@@ -6307,17 +6318,25 @@ mod native12_step1_velocity {
             crate::q4_diagnostic::retirement_boundary();
         }
     }
+    fn independent_phase_limits(incoming: (usize, usize), original: (usize, usize)) -> bool {
+        incoming == original
+    }
     /// All component lifecycles use the unchanged admission/watchdog/cache grant.
     /// Guards precede native locals, so unwinding releases models before policy restoration.
     fn scoped<T>(
         out: &Path,
         label: &str,
         price: ForwardPrice,
+        original_limits: (usize, usize),
         run: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let dir = out.join(label);
         std::fs::create_dir(&dir)?;
         let before = AllocatorBounds::current();
+        assert!(
+            independent_phase_limits(before, original_limits),
+            "fresh component admission requires restored caller allocator bounds"
+        );
         let guard = evidence::Footprint::start(&dir);
         let cache = guard.admit_numeric_scoped(price.active, price.transient());
         let bounds = AllocatorBounds::enter(price.resident, price.transient());
@@ -6407,10 +6426,31 @@ mod native12_step1_velocity {
         // between the freshly admitted component lifecycles below.
         let original_limits = AllocatorBounds::current();
         let process_guard = evidence::Footprint::start(&out);
-        let process_cache =
-            process_guard.admit_numeric_scoped(forward_price.active, forward_price.transient());
-        let process_bounds =
-            AllocatorBounds::enter(forward_price.resident, forward_price.transient());
+        // Preflight retains the same whole-process physical watchdog ceiling,
+        // but allocator policy must be restored BEFORE independent stage admission.
+        // Otherwise85% of our own already-lowered limit would be reserved again.
+        {
+            let process_cache =
+                process_guard.admit_numeric_scoped(forward_price.active, forward_price.transient());
+            let process_bounds =
+                AllocatorBounds::enter(forward_price.resident, forward_price.transient());
+            let installed = AllocatorBounds::current();
+            drop(process_bounds);
+            drop(process_cache);
+            let restored = AllocatorBounds::current();
+            assert_eq!(
+                original_limits, restored,
+                "outer preflight restores actual caller policy before first component"
+            );
+            evidence::write_json(
+                &out,
+                "outer-resource-preflight",
+                &json!({"actualLimitsBefore":{"memory":original_limits.0,"cache":original_limits.1},
+                "actualLimitsInstalled":{"memory":installed.0,"cache":installed.1},
+                "actualLimitsAfter":{"memory":restored.0,"cache":restored.1},"limitsRestored":true,
+                "noModelWithinPreflight":true,"physicalWatchdogRetained":true,"accepted":false}),
+            );
+        }
         let process_retire = Retire;
         process_guard.begin();
         let tokenizer = loader::load_tokenizer(&dense)?;
@@ -6423,7 +6463,7 @@ mod native12_step1_velocity {
         contract["actualHostTokenizerPreExpansionIds"] = json!(tokens.ids);
         contract["actualInternalExpandedEncoderIds"] = Value::Null;
         contract["internalIdsObservationLimit"]=json!("private trainer helper returns text/layout, not the encoder's expanded IDs; no extra encoding pass");
-        let branch = scoped(&out, "conditioning", caption_price, || {
+        let branch = scoped(&out, "conditioning", caption_price, original_limits, || {
             let encoder =
                 loader::load_text_encoder_from(&dense.join("text_encoder"), Some(&vision))?;
             let (mut branches, prepared) =
@@ -6439,7 +6479,7 @@ mod native12_step1_velocity {
             drop(encoder);
             Ok(branch)
         })?;
-        let (x0, references) = scoped(&out, "vae-cache", vae_price, || {
+        let (x0, references) = scoped(&out, "vae-cache", vae_price, original_limits, || {
             let vae = loader::load_vae(&dense)?;
             let mut targets =
                 encode_item_targets(&vae, &item, &[c.resolution], c.subject_mask_loss.as_ref())?;
@@ -6454,6 +6494,9 @@ mod native12_step1_velocity {
         assert_eq!(x0.shape(), &[1, 784, 64]);
         assert_eq!(branch.text.shape()[1], 87);
         assert!(references.iter().all(|a| a.shape() == [1, 4096, 64]));
+        // Between heavy lifecycles only this one cached batch is live; the
+        // process-wide physical watchdog remains joined on every exit.
+        assert!(mlx_rs::memory::get_active_memory() as u64 <= OWNED_OPERANDS);
         let sigma = sample_sigma(&c.timestep_type, &c.timestep_bias, SIGMA_SEED)?;
         assert!(sigma.is_finite() && (0.001..=0.999).contains(&sigma));
         let noise = random::normal::<f32>(x0.shape(), None, None, Some(&random::key(NOISE_SEED)?))?;
@@ -6513,6 +6556,7 @@ mod native12_step1_velocity {
             &out.join("actual-conditioning-position-ids.json")
         ));
         evidence::write_json(&out, "contract", &contract);
+        assert!(mlx_rs::memory::get_active_memory() as u64 <= OWNED_OPERANDS);
         let donor = r.join(FILES[3].0);
         let mut velocities = Vec::new();
         let mut forwards = 0;
@@ -6521,7 +6565,7 @@ mod native12_step1_velocity {
             "B_saved_factors_checkpointed",
             "C_public_import_ordinary",
         ] {
-            let velocity = scoped(&out, label, forward_price, || {
+            let velocity = scoped(&out, label, forward_price, original_limits, || {
                 let mut dit = loader::load_transformer(&dense)?;
                 assert!(!dit.is_quantized());
                 if dit.compute_dtype() != Dtype::Bfloat16 {
@@ -6599,6 +6643,7 @@ mod native12_step1_velocity {
             assert_eq!(velocity.shape(), teacher.shape());
             velocities.push(capture(&out, label, &velocity)?);
             drop(velocity);
+            assert!(mlx_rs::memory::get_active_memory() as u64 <= OWNED_OPERANDS);
         }
         assert_eq!(forwards, 3);
         assert_eq!(evidence::sha256_file(&donor), DONOR);
@@ -6614,8 +6659,6 @@ mod native12_step1_velocity {
         drop(teacher);
         drop(process_retire);
         let (process_active_peak, process_physical_peak) = process_guard.end();
-        drop(process_bounds);
-        drop(process_cache);
         let final_limits = AllocatorBounds::current();
         drop(process_guard);
         assert_eq!(original_limits, final_limits);
