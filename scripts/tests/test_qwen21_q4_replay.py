@@ -129,6 +129,7 @@ class WiringTests(unittest.TestCase):
                 'export PATH="$FAKE_BIN:$PATH"; source ' + shell_path(script)], cwd=ROOT,
                 env={**os.environ, "FAKE_BIN": shell_path(root), "CALLS": shell_path(calls),
                      "GITHUB_ENV": shell_path(env), "QWEN_IMAGE_2_1_RENDER_OUT": shell_path(root),
+                     "QWEN21_TRANSFER_CACHE_BASE": shell_path(root),
                      "QWEN_IMAGE_2_1_LORA_PHASE": phase, "ZERO_TESTS": "1" if zero else "0"},
                 capture_output=True, text=True, encoding="utf-8", check=False)
             return result, calls.read_text(encoding="utf-8"), env.read_text(encoding="utf-8") if env.exists() else ""
@@ -206,9 +207,44 @@ class WiringTests(unittest.TestCase):
         names = [s.get("name") for s in job["steps"]]
         self.assertLess(names.index("Build the Qwen-Image 2.1 MLX test binary"), names.index("Prove trained velocity survives adapter save and reload"))
         self.assertLess(names.index("Prove trained velocity survives adapter save and reload"), names.index("Materialize and verify immutable snapshots"))
+        cache = next(s for s in job["steps"] if s.get("name") == "Verify the approved transferred-adapter cache")
+        identity = next(s for s in job["steps"] if s.get("name") == "Verify the approved transferred-adapter artifact identity")
+        download = next(s for s in job["steps"] if s.get("name") == "Download and verify the approved transferred-adapter source")
+        stage = next(s for s in job["steps"] if s.get("name") == "Atomically stage the approved transferred-adapter cache")
         transfer = next(s for s in job["steps"] if s.get("name") == "Materialize hash-pinned transferred adapters")
+        self.assertLess(names.index(cache["name"]), names.index(identity["name"]))
+        self.assertLess(names.index(identity["name"]), names.index(download["name"]))
+        self.assertLess(names.index(download["name"]), names.index(stage["name"]))
+        self.assertLess(names.index(stage["name"]), names.index(transfer["name"]))
+        self.assertIn('"$RUNNER_NAME" == "nax-macos-2"', cache["run"])
+        self.assertIn("--cache-status --source-cache-root", cache["run"])
+        self.assertIn("steps.qwen21_transfer_cache.outputs.hit == 'false'", identity["if"])
+        self.assertEqual(identity["env"]["GH_TOKEN"], "${{ github.token }}")
+        self.assertIn("repos/SceneWorks/inference/actions/artifacts/11383988900", identity["run"])
+        self.assertIn("--verify-source-artifact", identity["run"])
+        self.assertEqual(download["env"]["GH_TOKEN"], "${{ github.token }}")
+        self.assertIn("repos/SceneWorks/inference/actions/artifacts/11383988900/zip", download["run"])
+        self.assertIn("--extract-source-archive", download["run"])
+        self.assertIn("--archive-destination", download["run"])
+        self.assertIn("--stage-source", stage["run"])
+        self.assertIn("/imports/adapters", stage["run"])
+        self.assertIn("--source-artifact-metadata", stage["run"])
+        self.assertIn("QWEN21_TRANSFER_CACHE_BASE", stage["run"])
         self.assertEqual(transfer["if"], "inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'")
         self.assertEqual(transfer["env"]["GH_TOKEN"], "${{ github.token }}")
+
+    def test_transfer_cache_workflow_identity_mutant_is_rejected(self):
+        source = (ROOT / ".github/workflows/real-weights.yml").read_text(encoding="utf-8")
+        endpoint = "repos/SceneWorks/inference/actions/artifacts/11383988900/zip"
+        self.assertIn(endpoint, source)
+        mutant = source.replace(endpoint, "repos/SceneWorks/inference/actions/artifacts/1/zip", 1)
+        workflow = yaml.safe_load(mutant)
+        download = next(
+            step for step in workflow["jobs"]["mlx-qwen-image-2-1"]["steps"]
+            if step.get("name") == "Download and verify the approved transferred-adapter source"
+        )
+        with self.assertRaises(AssertionError):
+            self.assertIn(endpoint, download["run"])
 
 
 if __name__ == "__main__":

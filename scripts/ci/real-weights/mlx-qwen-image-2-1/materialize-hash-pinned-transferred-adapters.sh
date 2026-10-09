@@ -1,6 +1,11 @@
+transfer_cache_args=()
+if [[ -n "${QWEN21_TRANSFER_CACHE_BASE:-}" ]]; then
+  transfer_cache_args=(--source-cache-root "$QWEN21_TRANSFER_CACHE_BASE")
+fi
+
 if [[ "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" == direction-protocol ]]; then
   # Immutable original style donor plus separately named FAILED edit donor. No c233 replacement.
-  python3.12 scripts/ci/qwen21_adapter_imports.py --manifest scripts/ci/qwen21_adapter_imports.json --destination "$QWEN_IMAGE_2_1_RENDER_OUT/direction-imports/adapters"
+  python3.12 scripts/ci/qwen21_adapter_imports.py --manifest scripts/ci/qwen21_adapter_imports.json --destination "$QWEN_IMAGE_2_1_RENDER_OUT/direction-imports/adapters" "${transfer_cache_args[@]}"
   echo "QWEN_IMAGE_2_1_IMPORT_MANIFEST=$QWEN_IMAGE_2_1_RENDER_OUT/direction-imports/adapters/adapter-imports-resolved.json" >> "$GITHUB_ENV"
   python3.12 -m scripts.ci.qwen21_velocity_adapter --manifest scripts/ci/qwen21_velocity_adapter.json --destination "$QWEN_IMAGE_2_1_RENDER_OUT/velocity-input/adapters"
   echo "QWEN_IMAGE_2_1_VELOCITY_MANIFEST=$QWEN_IMAGE_2_1_RENDER_OUT/velocity-input/adapters/velocity-adapter-resolved.json" >> "$GITHUB_ENV"
@@ -17,7 +22,7 @@ if [[ "${QWEN_IMAGE_2_1_LORA_PHASE:-full}" == diagnostic || "${QWEN_IMAGE_2_1_LO
   fi
   exit 0
 fi
-python3.12 scripts/ci/qwen21_adapter_imports.py --manifest scripts/ci/qwen21_adapter_imports.json --destination "$QWEN_IMAGE_2_1_RENDER_OUT/imports/adapters"
+python3.12 scripts/ci/qwen21_adapter_imports.py --manifest scripts/ci/qwen21_adapter_imports.json --destination "$QWEN_IMAGE_2_1_RENDER_OUT/imports/adapters" "${transfer_cache_args[@]}"
 echo "QWEN_IMAGE_2_1_IMPORT_MANIFEST=$QWEN_IMAGE_2_1_RENDER_OUT/imports/adapters/adapter-imports-resolved.json" >> "$GITHUB_ENV"
 mkdir -p "$QWEN_IMAGE_2_1_RENDER_OUT/adapters"
 cp "$QWEN_IMAGE_2_1_RENDER_OUT/imports/adapters/qwen21_t2i_lora.safetensors" "$QWEN_IMAGE_2_1_RENDER_OUT/adapters/qwen21_t2i_lora.safetensors"

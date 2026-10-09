@@ -5161,6 +5161,62 @@ jobs:
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
       - name: Materialize and verify immutable snapshots
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
+      - name: Verify the approved transferred-adapter cache
+        id: qwen21_transfer_cache
+        if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
+        shell: bash
+        run: |
+          [[ "$RUNNER_NAME" == "nax-macos-2" ]]
+          cache_base="$HOME/sceneworks-rw-weights"
+          [[ "$cache_base" == /* && -d "$cache_base" && ! -L "$cache_base" ]]
+          status="$(python3.12 scripts/ci/qwen21_adapter_imports.py \
+            --manifest scripts/ci/qwen21_adapter_imports.json \
+            --cache-status --source-cache-root "$cache_base")"
+          printf '%s\n' "$status" >> "$GITHUB_OUTPUT"
+          if [[ "$status" == "hit=true" ]]; then
+            printf 'QWEN21_TRANSFER_CACHE_BASE=%s\n' "$cache_base" >> "$GITHUB_ENV"
+          fi
+      - name: Verify the approved transferred-adapter artifact identity
+        if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory' && steps.qwen21_transfer_cache.outputs.hit == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          metadata="$RUNNER_TEMP/qwen21-transfer-source-37392084691.metadata.json"
+          [[ ! -e "$metadata" ]]
+          gh api --method GET repos/SceneWorks/inference/actions/artifacts/11383988900 > "$metadata"
+          python3.12 scripts/ci/qwen21_adapter_imports.py \
+            --manifest scripts/ci/qwen21_adapter_imports.json \
+            --verify-source-artifact --source-artifact-metadata "$metadata"
+      - name: Download and verify the approved transferred-adapter source
+        if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory' && steps.qwen21_transfer_cache.outputs.hit == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/qwen21-transfer-source-37392084691.zip"
+          source_root="$RUNNER_TEMP/qwen21-transfer-source-37392084691"
+          [[ ! -e "$archive" && ! -e "$source_root" ]]
+          partial="$(mktemp "$RUNNER_TEMP/qwen21-transfer-source-37392084691.XXXXXX.zip")"
+          trap 'rm -f "$partial"' EXIT
+          gh api --method GET repos/SceneWorks/inference/actions/artifacts/11383988900/zip > "$partial"
+          mv "$partial" "$archive"
+          python3.12 scripts/ci/qwen21_adapter_imports.py \
+            --manifest scripts/ci/qwen21_adapter_imports.json \
+            --extract-source-archive "$archive" --archive-destination "$source_root" \
+            --source-artifact-metadata "$RUNNER_TEMP/qwen21-transfer-source-37392084691.metadata.json"
+      - name: Atomically stage the approved transferred-adapter cache
+        if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory' && steps.qwen21_transfer_cache.outputs.hit == 'false'
+        shell: bash
+        run: |
+          [[ "$RUNNER_NAME" == "nax-macos-2" ]]
+          cache_base="$HOME/sceneworks-rw-weights"
+          python3.12 scripts/ci/qwen21_adapter_imports.py \
+            --manifest scripts/ci/qwen21_adapter_imports.json \
+            --stage-source "$RUNNER_TEMP/qwen21-transfer-source-37392084691/imports/adapters" \
+            --source-cache-root "$cache_base" \
+            --source-artifact-metadata "$RUNNER_TEMP/qwen21-transfer-source-37392084691.metadata.json"
+          printf 'QWEN21_TRANSFER_CACHE_BASE=%s\n' "$cache_base" >> "$GITHUB_ENV"
       - name: Materialize hash-pinned transferred adapters
         if: inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
         env:
