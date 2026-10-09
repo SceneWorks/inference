@@ -33,8 +33,6 @@ jobs:
       RUSTC_WRAPPER: ""
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
-      QWEN_SINGLE_LINEAR_ROOT: ${{ runner.temp }}/sc24163-single-linear-${{ github.run_id }}-${{ github.run_attempt }}
-      CARGO_TARGET_DIR: ${{ runner.temp }}/sc24163-single-linear-target-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
@@ -43,6 +41,9 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Compile, bind exact operands, execute two serial typed processes
+        env:
+          QWEN_SINGLE_LINEAR_ROOT: ${{ runner.temp }}/sc24163-single-linear-${{ github.run_id }}-${{ github.run_attempt }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/sc24163-single-linear-target-${{ github.run_id }}-${{ github.run_attempt }}
         shell: bash
         run: bash scripts/ci/real-weights/mlx-qwen-image-2-1/run-single-linear.sh
       - name: Retain complete diagnostic packet
@@ -50,6 +51,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: sc24163-single-linear-diagnostic
-          path: ${{ env.QWEN_SINGLE_LINEAR_ROOT }}
+          path: ${{ runner.temp }}/sc24163-single-linear-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 30
