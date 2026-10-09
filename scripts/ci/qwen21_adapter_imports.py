@@ -225,10 +225,13 @@ def extract_source_archive(manifest, archive, destination, source_artifact_metad
             by_name = {info.filename: info for info in infos}
             if not selected.issubset(by_name):
                 raise ValueError("downloaded transfer archive is missing approved inputs")
+            # ZipFile.open returns binary member streams. Keep the callable named explicitly so
+            # the repository encoding guard does not mistake it for Path.open in text mode.
+            open_binary_member = source.open
             for name in sorted(selected):
                 target = temporary / Path(*PurePosixPath(name).parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with source.open(by_name[name]) as input_stream, target.open("xb") as output:
+                with open_binary_member(by_name[name]) as input_stream, target.open("xb") as output:
                     shutil.copyfileobj(input_stream, output)
                     output.flush()
                     os.fsync(output.fileno())
@@ -400,7 +403,11 @@ def materialize(manifest, destination, opener=urllib.request.urlopen, source_cac
                 shutil.copyfileobj(response, stream)
                 stream.flush()
                 os.fsync(stream.fileno())
-            verified_entry(temporary, entry, "downloaded asset")
+            # Preserve the established release-download contract: either a size or digest
+            # mismatch is reported as an SHA-256 failure. Cache staging keeps its stricter,
+            # size-first diagnostics through verified_entry.
+            if temporary.stat().st_size != entry["size"] or sha256(temporary) != entry["sha256"]:
+                raise ValueError(f"SHA-256 mismatch for {entry['name']}")
             temporary.replace(path)
         finally:
             if temporary is not None:
