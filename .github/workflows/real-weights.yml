@@ -25,7 +25,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: sc24163-native15-step1-velocity-${{ github.ref }}
+  group: sc24163-native16-step1-velocity-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   mlx-qwen-image-2-1:
@@ -56,16 +56,16 @@ jobs:
         [[ "$RUNNER_NAME" == nax-macos-2 && "$GITHUB_RUN_ATTEMPT" == 1 ]]
         [[ "$RUNNER_TEMP" = /* && "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
         [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" && -z "$(git status --porcelain)" ]]
-        owned="$RUNNER_TEMP/sc24163-native15-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        owned="$RUNNER_TEMP/sc24163-native16-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
         [[ ! -e "$owned" ]]
         mkdir "$owned" "$owned/evidence" "$owned/cargo-target" "$owned/download"
         printf '%s\n' "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" > "$owned/OWNER"
-        printf 'SC24163_NATIVE15_OWNED=%s\nCARGO_TARGET_DIR=%s\nQWEN_IMAGE_2_1_RENDER_OUT=%s\nQWEN_IMAGE_2_1_NATIVE12_FIT_INPUT=%s\n' \
+        printf 'SC24163_NATIVE16_OWNED=%s\nCARGO_TARGET_DIR=%s\nQWEN_IMAGE_2_1_RENDER_OUT=%s\nQWEN_IMAGE_2_1_NATIVE12_FIT_INPUT=%s\n' \
           "$owned" "$owned/cargo-target" "$owned/evidence" "$owned/evidence/approved-native12" >> "$GITHUB_ENV"
-        git fetch --no-tags --depth=1 origin 004cee41f380ff263796ad90277e5f6224d73ae3 9353fd981a2b1463548b0215b7045786b39d7795
+        git fetch --no-tags --depth=1 origin 004cee41f380ff263796ad90277e5f6224d73ae3 3a300ff26b49076f5f84c72ce4e30be0d20d4c44
         python3.12 - "$owned/evidence" <<'PY'
         import subprocess,sys,pathlib,json,hashlib,os
-        out=pathlib.Path(sys.argv[1]);base='004cee41f380ff263796ad90277e5f6224d73ae3';parent='9353fd981a2b1463548b0215b7045786b39d7795'
+        out=pathlib.Path(sys.argv[1]);base='004cee41f380ff263796ad90277e5f6224d73ae3';parent='3a300ff26b49076f5f84c72ce4e30be0d20d4c44'
         def git(*a):return subprocess.check_output(['git',*a])
         head=git('rev-parse','HEAD').decode().strip();assert head==os.environ['GITHUB_SHA']
         parents=[l.split()[1] for l in git('cat-file','-p',head).decode().splitlines() if l.startswith('parent ')]
@@ -123,7 +123,7 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        work="$SC24163_NATIVE15_OWNED/download"
+        work="$SC24163_NATIVE16_OWNED/download"
         input="$QWEN_IMAGE_2_1_NATIVE12_FIT_INPUT"
         [[ -d "$work" && ! -e "$input" ]]
         mkdir "$input"
@@ -206,7 +206,7 @@ jobs:
         python3.12 - <<'PY'
         import os,pathlib,shutil,json
         base=pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
-        owned=base/f"sc24163-native15-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+        owned=base/f"sc24163-native16-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
         if not owned.exists():raise SystemExit(0)
         assert not owned.is_symlink() and owned.resolve(strict=True).parent==base
         assert (owned/'OWNER').read_text().strip()==f"{os.environ['GITHUB_RUN_ID']}:{os.environ['GITHUB_RUN_ATTEMPT']}"
@@ -225,6 +225,6 @@ jobs:
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
         name: sc24163-native12-step1-velocity-diagnostic
-        path: ${{ runner.temp }}/sc24163-native15-${{ github.run_id }}-${{ github.run_attempt }}/evidence
+        path: ${{ runner.temp }}/sc24163-native16-${{ github.run_id }}-${{ github.run_attempt }}/evidence
         if-no-files-found: error
         retention-days: 30

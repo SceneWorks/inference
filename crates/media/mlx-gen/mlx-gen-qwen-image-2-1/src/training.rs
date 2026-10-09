@@ -5979,6 +5979,41 @@ mod native12_step1_velocity {
             self.active.checked_sub(self.resident).unwrap()
         }
     }
+    fn forward_retained_bytes(layers: u64, hidden: u64, block: u64) -> u64 {
+        // Production training_footprint prices a forward AND a backward recompute
+        // block. This caller never differentiates: retain every checkpoint input
+        // and one WHOLE forward block; exclude only the never-executed recompute.
+        layers * hidden + block
+    }
+    fn fixed_forward_reserves(reserves: &[u64; 9]) -> bool {
+        *reserves
+            == [
+                14_230_249_472, // dense base
+                13_958_643_712, // complete BF16 delta union
+                26_738_688,     // four F32 factor sets
+                67_108_864,     // owned operands
+                2_375_811_072,  // all 32 checkpoint inputs
+                2_153_078_784,  // one whole forward block
+                58_302_103_552, // unchanged conservative Metal pipeline
+                872_415_232,    // unchanged two-block delta margin
+                1_073_741_824,  // evaluation slack
+            ]
+    }
+    fn reject_forward_reserve_mutants(reserves: &[u64; 9]) -> usize {
+        assert!(fixed_forward_reserves(reserves));
+        for index in 0..reserves.len() {
+            let mut poisoned = *reserves;
+            poisoned[index] -= 1;
+            assert!(!fixed_forward_reserves(&poisoned));
+        }
+        let mut backward_reintroduced = *reserves;
+        backward_reintroduced[5] *= 2;
+        assert!(!fixed_forward_reserves(&backward_reintroduced));
+        let mut forward_dropped = *reserves;
+        forward_dropped[5] = 0;
+        assert!(!fixed_forward_reserves(&forward_dropped));
+        reserves.len() + 2
+    }
     /// Header-only facts plus unchanged production forward counts. No measured-peak fit.
     fn forward_prices(
         dense: &Path,
@@ -6016,7 +6051,8 @@ mod native12_step1_velocity {
             + crate::training_memory::FFN_SAVED_HIDDEN_FIXED
             + crate::training_memory::FFN_SAVED_PER_MLP_RATIO * facts.mlp_ratio)
             * hidden;
-        let retained = facts.num_layers * hidden + 2 * block;
+        let checkpoint_inputs = facts.num_layers * hidden;
+        let retained = forward_retained_bytes(facts.num_layers, hidden, block);
         let pipeline = crate::training_memory::pipelined_bytes(
             facts.heads * (784 * seq).max(33_611_776),
             seq * facts.inner,
@@ -6027,14 +6063,30 @@ mod native12_step1_velocity {
         // All global install delta graphs are lazy and never explicitly evaluated.
         // Each owned checkpoint block replaces those graphs. Reserve the complete
         // materialized union once, PLUS production's two-block rebuilt margin.
-        // Keep production's conservative fallback/pipeline count even without grad;
-        // ONLY the never-executed Softmax VJP working set is absent.
+        // Keep production's conservative fallback/pipeline count even without grad.
+        // Softmax VJP and one backward recompute block are never executed; every
+        // forward reserve, including the two-block rebuilt delta margin, stays.
+        let reserves = [
+            base,
+            deltas,
+            factors,
+            OWNED_OPERANDS,
+            checkpoint_inputs,
+            block,
+            pipeline,
+            rebuilt,
+            MLX_EVAL_SLACK_BYTES,
+        ];
+        let reserve_mutants_rejected = reject_forward_reserve_mutants(&reserves);
         let resident = base + deltas + factors + OWNED_OPERANDS;
         let forward = ForwardPrice {
             active: resident + retained + pipeline + rebuilt + MLX_EVAL_SLACK_BYTES,
             resident,
         };
-        assert_eq!(forward.active, 95_212_969_984);
+        assert_eq!(forward.active, reserves.iter().sum::<u64>());
+        assert_eq!(forward.active, 93_059_891_200);
+        assert_eq!(forward.resident, 28_282_740_736);
+        assert_eq!(forward.transient(), 64_777_150_464);
         let shape = TrainingShape {
             edge: 448,
             target_tokens: 784,
@@ -6072,6 +6124,13 @@ mod native12_step1_velocity {
             "retainedTrainingCacheRequestBytes":RETAINED_TRAINING_CACHE,
             "forwardActiveEnvelopeBytes":forward.active,"forwardResidentBytes":resident,
             "requestedForwardFreeCacheAllowanceBytes":forward.transient(),
+            "forwardRetentionProof":{"allCheckpointInputBytes":checkpoint_inputs,"wholeForwardBlockBytes":block,
+            "checkpointForwardRetainedBytes":retained,"excludedNeverExecutedBackwardRecomputeBlockBytes":block,
+            "priorForwardActiveEnvelopeBytes":95_212_969_984u64,"declaredBackwardCount":0,
+            "callerDifferentiates":false,"formula":"layers*hidden+one_whole_forward_block; no backward recompute",
+            "sourceBasis":"production training_footprint forward/backward block distinction; actual caller has no VJP or differentiation",
+            "actualCpuReserveMutantsRejected":reserve_mutants_rejected,"forwardReserves":reserves,
+            "allOtherReservesUnchanged":true,"numericPriceIsMeasuredPeak":false},
             "components":{"denseBaseBytes":base,"denseBackupBytes":0,"completeBF16DeltaUnionBytes":deltas,
             "fourF32FactorSetsBytes":factors,"oneFactorSetBytes":factor_bytes,"ownedOperandsReserveBytes":OWNED_OPERANDS,
             "checkpointForwardRetainedBytes":retained,"conservativePipelineBytes":pipeline,"twoBlockRebuiltDeltaBytes":rebuilt,
