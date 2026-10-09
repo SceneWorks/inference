@@ -1501,6 +1501,67 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
 
 // ── 2. instruction-edit LoKr on two references ───────────────────────────────────────────────────
 
+// One bounded sampling change; every other actual configuration field remains fixed.
+fn uniform_edit_training_config(steps: u32) -> TrainingConfig {
+    TrainingConfig {
+        rank: 16,
+        alpha: 16.0,
+        learning_rate: TRAIN_LR,
+        steps,
+        gradient_checkpointing: true,
+        resolution: EDIT_TRAIN_EDGE,
+        save_every: 0,
+        seed: 42,
+        optimizer: "adamw".into(),
+        network_type: NetworkType::Lokr,
+        timestep_type: "uniform".into(),
+        ..Default::default()
+    }
+}
+
+fn uniform_edit_training_recipe(cfg: &TrainingConfig) -> Value {
+    // Complete ACTUAL config binding before admission and the production train call.
+    assert_eq!(
+        cfg,
+        &uniform_edit_training_config(120),
+        "uniform120 actual config drift"
+    );
+    let actual = format!("{cfg:?}");
+    let hash = format!("{:x}", Sha256::digest(actual.as_bytes()));
+    json!({"kind":"one_factor_uniform120_training_recipe", "actualTrainingConfigDebug":actual,
+        "actualTrainingConfigDebugSha256":hash, "timestepType":cfg.timestep_type,
+        "timestepBias":cfg.timestep_bias, "trainDtype":cfg.train_dtype,
+        "trainingSeed":cfg.seed, "steps":cfg.steps, "learningRate":cfg.learning_rate,
+        "rank":cfg.rank, "alpha":cfg.alpha, "optimizer":cfg.optimizer,
+        "weightDecay":cfg.weight_decay, "gradientAccumulation":cfg.gradient_accumulation,
+        "evaluationSeed":SEED, "evaluationSteps":RENDER_STEPS,
+        "changedField":"timestep_type", "previousValue":"sigmoid",
+        "donorHeaderRecipeFieldsAdded":false})
+}
+
+#[test]
+fn uniform_edit_training_recipe_rejects_config_and_sampler_label_drift() {
+    let cfg = uniform_edit_training_config(120);
+    let receipt = uniform_edit_training_recipe(&cfg);
+    assert_eq!(receipt["timestepType"], "uniform");
+    assert_eq!(receipt["timestepBias"], "balanced");
+    assert_eq!(receipt["trainingSeed"], 42);
+    assert_eq!(receipt["evaluationSeed"], 24163);
+    let mutations: [fn(&mut TrainingConfig); 6] = [
+        |c: &mut TrainingConfig| c.timestep_type = "sigmoid".into(),
+        |c: &mut TrainingConfig| c.timestep_bias = "high".into(),
+        |c: &mut TrainingConfig| c.seed = 43,
+        |c: &mut TrainingConfig| c.steps = 121,
+        |c: &mut TrainingConfig| c.learning_rate = 5e-5,
+        |c: &mut TrainingConfig| c.gradient_accumulation = 2,
+    ];
+    for mutate in mutations {
+        let mut changed = cfg.clone();
+        mutate(&mut changed);
+        assert!(std::panic::catch_unwind(|| uniform_edit_training_recipe(&changed)).is_err());
+    }
+}
+
 /// A representative short instruction-edit **LoKr** run on six one-reference edit pairs (image 1
 /// is the source; target is the source inverted and posterized), then a held-out
 /// two-reference edit with and without the adapter at bf16, q8 and q4. Asserts, per tier: both
@@ -1549,19 +1610,7 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
     let steps = training_steps("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", 120);
     let req = TrainingRequest {
         items,
-        config: TrainingConfig {
-            rank: 16,
-            alpha: 16.0,
-            learning_rate: TRAIN_LR,
-            steps,
-            gradient_checkpointing: true,
-            resolution: EDIT_TRAIN_EDGE,
-            save_every: 0,
-            seed: 42,
-            optimizer: "adamw".into(),
-            network_type: NetworkType::Lokr,
-            ..Default::default()
-        },
+        config: uniform_edit_training_config(steps),
         output_dir: adapters.clone(),
         file_name: EDIT_ADAPTER.into(),
         trigger_words: Vec::new(),
@@ -1589,7 +1638,9 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
         ),
         "balanced64 training recipe drift refused before admission"
     );
+    let training_recipe = uniform_edit_training_recipe(&req.config);
     let protocol = json!({
+        "trainingRecipe":training_recipe,
         "kind": "representative_one_reference_training_two_reference_evaluation",
         "trainingReferenceCount": 1, "evaluationReferenceCount": 2,
         "trainingCaption": TRAIN_EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
@@ -1614,6 +1665,9 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
     write_json(&out, "edit-training-protocol", &protocol);
     let mut trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
     trained.facts["editProtocol"] = protocol;
+    trained.facts["trainingRecipe"] = uniform_edit_training_recipe(&req.config);
+    trained.facts["trainingProtocolSha256"] =
+        json!(sha256_file(&out.join("edit-training-protocol.json")));
 
     if std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1") {
         assert!(
