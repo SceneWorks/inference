@@ -1038,6 +1038,9 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let predicted_peak_bytes = preflight["peakBytes"]
         .as_u64()
         .expect("exact envelope bytes");
+    if req.config == matched_edit_training_config(120) {
+        assert_matched_edit_preflight(&preflight);
+    }
     // The returned task-owned guard is installed before the first large weight load and retained
     // through `Trainer::train`; its Drop restores the caller's allocator policy on every exit.
     let cache_grant = guard.admit_training(&preflight);
@@ -1501,7 +1504,216 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
 
 // ── 2. instruction-edit LoKr on two references ───────────────────────────────────────────────────
 
-/// A representative short instruction-edit **LoKr** run on six one-reference edit pairs (image 1
+const MATCHED_EDIT_TRAIN_EDGE: u32 = 448;
+const MATCHED_EDIT_DATASET_SHA256: &str =
+    "5fad5cb5cf532dab7906be7b7b91105aa5db4a71e80de890af401c47910739e3";
+const MATCHED_EDIT_KEY_SHA256: &str =
+    "da3be3ca711ec3d0e89df8f1e91bc662365fea188fd513d0108782b6c726189f";
+
+fn matched_edit_training_config(steps: u32) -> TrainingConfig {
+    TrainingConfig {
+        rank: 16,
+        alpha: 16.0,
+        learning_rate: TRAIN_LR,
+        steps,
+        gradient_checkpointing: true,
+        resolution: MATCHED_EDIT_TRAIN_EDGE,
+        save_every: 0,
+        seed: 42,
+        optimizer: "adamw".into(),
+        network_type: NetworkType::Lokr,
+        ..Default::default()
+    }
+}
+
+fn matched_edit_expected_preflight() -> Value {
+    // Source forecast, not an observed tensor/physical peak. Compare the actual
+    // header-only backend preflight before permitting this request's admission.
+    json!({"peakBytes":99826239424_u64,"captionBytes":18224996832_u64,
+        "latentBytes":12513372624_u64,"trainBytes":99826239424_u64,
+        "requestedCacheLimitBytes":85595989952_u64})
+}
+
+fn assert_matched_edit_preflight(actual: &Value) {
+    assert_eq!(
+        actual,
+        &matched_edit_expected_preflight(),
+        "matched448 actual preflight drift"
+    );
+}
+
+fn matched_edit_training_recipe(cfg: &TrainingConfig) -> Value {
+    assert_eq!(
+        cfg,
+        &matched_edit_training_config(120),
+        "matched448 actual config drift"
+    );
+    let actual = format!("{cfg:?}");
+    let hash = format!("{:x}", Sha256::digest(actual.as_bytes()));
+    json!({"kind":"matched_two_reference448_sigmoid120_training_recipe",
+        "actualTrainingConfigDebug":actual, "actualTrainingConfigDebugSha256":hash,
+        "timestepType":cfg.timestep_type,"timestepBias":cfg.timestep_bias,"trainDtype":cfg.train_dtype,
+        "trainingSeed":cfg.seed,"steps":cfg.steps,"learningRate":cfg.learning_rate,
+        "rank":cfg.rank,"alpha":cfg.alpha,"optimizer":cfg.optimizer,
+        "resolution":cfg.resolution,"gradientCheckpointing":cfg.gradient_checkpointing,
+        "weightDecay":cfg.weight_decay,"gradientAccumulation":cfg.gradient_accumulation,
+        "evaluationSeed":SEED,"evaluationSteps":RENDER_STEPS,
+        "nativeDatasetEdge":EDIT_TRAIN_EDGE,"evaluationEdge":RENDER_EDGE,
+        "donorHeaderRecipeFieldsAdded":false})
+}
+
+fn matched_edit_conditioning_receipt(req: &TrainingRequest, data: &Path, key: &Path) -> Value {
+    // Full actual request, not a normalized one-reference assertion. The original pixel
+    // recipe/audit remains unchanged; this explicit conditioning/config contract is separate.
+    let recipe = matched_edit_training_recipe(&req.config);
+    assert_eq!(req.items.len(), 6, "six native768 pairs only");
+    assert_eq!(req.file_name, EDIT_ADAPTER, "unchanged output adapter name");
+    assert!(
+        req.trigger_words.is_empty(),
+        "no new training trigger words"
+    );
+    assert_eq!(key, data.join("key.png"));
+    assert_eq!(
+        sha256_file(key),
+        MATCHED_EDIT_KEY_SHA256,
+        "unchanged512 palette key"
+    );
+    assert_eq!(image::image_dimensions(key).unwrap(), (512, 512));
+    let file = |path: &Path| {
+        let (w, h) = image::image_dimensions(path).unwrap();
+        json!({"path":path.to_string_lossy(),"file":path.file_name().unwrap().to_string_lossy(),
+            "bytes":std::fs::metadata(path).unwrap().len(),"sha256":sha256_file(path),
+            "nativeWidth":w,"nativeHeight":h})
+    };
+    let rows: Vec<Value> = req.items.iter().enumerate().map(|(i, item)| {
+        assert_eq!(item.caption, EDIT_INSTRUCTION, "training/evaluation instruction match");
+        assert_eq!(item.image_path, data.join(format!("tgt_{i}.png")), "no heldout target");
+        assert_eq!(item.reference_image_paths,
+            vec![data.join(format!("src_{i}.png")), key.to_path_buf()],
+            "ordered training source then palette, never source99");
+        assert_eq!(image::image_dimensions(&item.image_path).unwrap(), (768, 768));
+        assert_eq!(image::image_dimensions(&item.reference_image_paths[0]).unwrap(), (768, 768));
+        json!({"index":i,"caption":item.caption,"target":file(&item.image_path),
+            "orderedReferences":[{"role":"training-source","image":file(&item.reference_image_paths[0])},
+                {"role":"RGB-level-palette","image":file(key)}]})
+    }).collect();
+    let dataset = dataset_receipt(&req.items);
+    assert_eq!(
+        dataset["sha256"].as_str().unwrap(),
+        MATCHED_EDIT_DATASET_SHA256,
+        "actual captions/order and all12 native PNG bytes must match the CPU receipt"
+    );
+    json!({"kind":"actual_matched_training_conditioning448_v1","actualRecipe":recipe,
+        "actualOrderedInputs":rows,"actualDataset":dataset,
+        "heldoutSource99UsedForTraining":false,"heldoutExpectedUsedForTraining":false,
+        "sourceExpectedBackendGeometry":{"basis":"M004 source plus retained pinned tokenizer CPU forecast",
+            "source":"004cee41f380ff263796ad90277e5f6224d73ae3",
+            "targetEdge":448,"packedTargetLatentShape":[1,784,64],
+            "referenceFittedEdges":[1024,1024],"packedReferenceLatentShapes":[[1,4096,64],[1,4096,64]],
+            "captionTokens":87,"prefixSegmentLengths":[8,4096,6,4096,73],"jointSequence":9063,
+            "activeForecastBytes":99826239424_u64},
+        "actualBackendTensorShapeObservation":Value::Null,
+        "geometryEvidenceLimit":"source-expected shapes; actual header-only preflight logs/receipt are separate; no new tensor observation",
+        "originalOneReferenceDatasetSha256":edit_training_balanced64::DATASET_PNG_SHA256})
+}
+
+#[test]
+fn matched_edit_training_request_rejects_conditioning_and_config_drift() {
+    // CPU-only native guard exercises the SAME PNG producer and actual request contract.
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path();
+    let key = data.join("key.png");
+    edit_key(TRAIN_EDGE).save(&key).unwrap();
+    let items = (0..6)
+        .map(|i| {
+            let src = image::RgbImage::from_fn(EDIT_TRAIN_EDGE, EDIT_TRAIN_EDGE, |x, y| {
+                image::Rgb(edit_training_balanced64::training_pixel(
+                    i,
+                    x,
+                    y,
+                    EDIT_TRAIN_EDGE,
+                ))
+            });
+            let target = edit_transform(&src);
+            edit_training_balanced64::audit(i, src.as_raw(), target.as_raw());
+            let source = data.join(format!("src_{i}.png"));
+            let target_path = data.join(format!("tgt_{i}.png"));
+            src.save(&source).unwrap();
+            target.save(&target_path).unwrap();
+            TrainingItem::edit_pair(
+                target_path,
+                EDIT_INSTRUCTION.into(),
+                vec![source, key.clone()],
+            )
+        })
+        .collect();
+    let req = TrainingRequest {
+        items,
+        config: matched_edit_training_config(120),
+        output_dir: data.to_path_buf(),
+        file_name: EDIT_ADAPTER.into(),
+        trigger_words: Vec::new(),
+        cancel: Default::default(),
+    };
+    let receipt = matched_edit_conditioning_receipt(&req, data, &key);
+    assert_eq!(receipt["actualRecipe"]["timestepType"], "sigmoid");
+    assert_eq!(
+        receipt["sourceExpectedBackendGeometry"]["jointSequence"],
+        9063
+    );
+    for mutation in 0..14 {
+        let mut changed = req.clone();
+        match mutation {
+            0 => changed.config.timestep_type = "uniform".into(),
+            1 => changed.config.resolution = 480,
+            2 => changed.config.seed = 43,
+            3 => changed.config.steps = 121,
+            4 => changed.config.learning_rate = 5e-5,
+            5 => changed.config.gradient_accumulation = 2,
+            6 => changed.items[0].reference_image_paths.reverse(),
+            7 => changed.items[0].caption = TRAIN_EDIT_INSTRUCTION.into(),
+            8 => changed.items[0].reference_image_paths[0] = data.join("src_99.png"),
+            9 => changed.items[0].image_path = data.join("eval_expected.png"),
+            10 => changed.config.alpha = 8.0,
+            11 => changed.config.weight_noise_sigma = 0.01,
+            12 => changed.config.train_dtype = "f32".into(),
+            _ => changed.config.gradient_checkpointing = false,
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matched_edit_conditioning_receipt(&changed, data, &key)
+        }))
+        .is_err());
+    }
+    let expected = matched_edit_expected_preflight();
+    assert_matched_edit_preflight(&expected);
+    for field in [
+        "peakBytes",
+        "captionBytes",
+        "latentBytes",
+        "trainBytes",
+        "requestedCacheLimitBytes",
+    ] {
+        let mut changed = expected.clone();
+        changed[field] = json!(expected[field].as_u64().unwrap() + 1);
+        assert!(std::panic::catch_unwind(|| assert_matched_edit_preflight(&changed)).is_err());
+    }
+    let original = std::fs::read(&key).unwrap();
+    std::fs::write(&key, [&original[..], &[0]].concat()).unwrap();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        matched_edit_conditioning_receipt(&req, data, &key)
+    }))
+    .is_err());
+    std::fs::write(&key, original).unwrap();
+    let source = &req.items[0].reference_image_paths[0];
+    let original = std::fs::read(source).unwrap();
+    std::fs::write(source, [&original[..], &[0]].concat()).unwrap();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        matched_edit_conditioning_receipt(&req, data, &key)
+    }))
+    .is_err());
+}
+
+/// A matched instruction-edit **LoKr** run on six two-reference edit pairs (image 1
 /// is the source; target is the source inverted and posterized), then a held-out
 /// two-reference edit with and without the adapter at bf16, q8 and q4. Asserts, per tier: both
 /// renders are pictures; the adapter moves the edit by at least [`ADAPTER_MOVES_FLOOR`]; its
@@ -1512,7 +1724,7 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
 ///
 /// `QWEN_IMAGE_2_1_LORA_EDIT_STEPS` (default 120 at [`TRAIN_LR`], ~30 s a step on an M5 Max, ~60
 /// min; 40 historical two-reference steps did not yet move the held-out edit toward the transform)
-/// scales this representative run: each step attends over one 1024-px-fitted reference.
+/// keeps 120 steps; native 768 training PNGs resize to 448 targets, with two 1024-fitted references.
 /// Evaluation, imports and stacking retain their ordered two-reference protocol and thresholds.
 #[test]
 #[ignore]
@@ -1543,57 +1755,26 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
             let tgt_path = data.join(format!("tgt_{i}.png"));
             src.save(&src_path).unwrap();
             target.save(&tgt_path).unwrap();
-            TrainingItem::edit_pair(tgt_path, TRAIN_EDIT_INSTRUCTION.into(), vec![src_path])
+            TrainingItem::edit_pair(tgt_path, EDIT_INSTRUCTION.into(), vec![src_path, key_path.clone()])
         })
         .collect();
     let steps = training_steps("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", 120);
     let req = TrainingRequest {
         items,
-        config: TrainingConfig {
-            rank: 16,
-            alpha: 16.0,
-            learning_rate: TRAIN_LR,
-            steps,
-            gradient_checkpointing: true,
-            resolution: EDIT_TRAIN_EDGE,
-            save_every: 0,
-            seed: 42,
-            optimizer: "adamw".into(),
-            network_type: NetworkType::Lokr,
-            ..Default::default()
-        },
+        config: matched_edit_training_config(steps),
         output_dir: adapters.clone(),
         file_name: EDIT_ADAPTER.into(),
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
-    assert!(req.items.iter().all(
-        |item| item.caption == TRAIN_EDIT_INSTRUCTION && item.reference_image_paths.len() == 1
-    ));
-    assert!(
-        edit_training_balanced64::recipe_is_fixed(
-            edit_training_balanced64::Recipe {
-                items: req.items.len(),
-                rank: req.config.rank,
-                alpha: req.config.alpha,
-                learning_rate: req.config.learning_rate,
-                seed: req.config.seed,
-                checkpointing: req.config.gradient_checkpointing,
-                edge: req.config.resolution,
-                references: req.items[0].reference_image_paths.len(),
-                steps: req.config.steps,
-                lokr: req.config.network_type == NetworkType::Lokr,
-                adamw: req.config.optimizer == "adamw",
-            },
-            std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1")
-        ),
-        "balanced64 training recipe drift refused before admission"
-    );
+    let training_conditioning = matched_edit_conditioning_receipt(&req, &data, &key_path);
+    let training_recipe = matched_edit_training_recipe(&req.config);
     let protocol = json!({
-        "kind": "representative_one_reference_training_two_reference_evaluation",
-        "trainingReferenceCount": 1, "evaluationReferenceCount": 2,
-        "trainingCaption": TRAIN_EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
-        "trainingTargetEdge": EDIT_TRAIN_EDGE, "trainingReferenceNativeEdge": EDIT_TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
+        "kind": "matched_two_reference_training448_evaluation768",
+        "trainingRecipe": training_recipe, "trainingConditioning": training_conditioning,
+        "trainingReferenceCount": 2, "evaluationReferenceCount": 2,
+        "trainingCaption": EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
+        "trainingTargetEdge": req.config.resolution, "trainingNativeTargetEdge": EDIT_TRAIN_EDGE, "trainingReferenceNativeEdge": EDIT_TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
         "evaluationTargetEdge": RENDER_EDGE, "evaluationKeyNativeEdge": TRAIN_EDGE, "stepsRequested": steps,
         "dataset": dataset_receipt(&req.items), "evaluationKeySha256": sha256_file(&key_path),
         "trainingDataRecipe": {"version":edit_training_balanced64::VERSION,"frozenPlanSha256":edit_training_balanced64::PLAN_SHA256,
@@ -1601,19 +1782,36 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
             "itemExposuresAt120RoundRobinSteps":20,"targetAuthority":"unchanged edit_transform(source)",
             "nativeCoordinateMap":"floor(2*x/3), floor(2*y/3) into the fixed logical512 layouts; physical mapping is not bijective",
             "sourceDistribution":"red/green each2304; blue items0/1 2048..2560 and items2..5 1536..3072 pixels/value; all256values covered",
-            "referencePreprocessing":"native768 source is independently Lanczos RGBA fitted to1024 for both vision/VAE; actual fitted content differs from the historical512 source",
-            "scopeLimit":"matching target768 geometry does not remove training-texture/heldout-content, one/two reference or denseBF16/packedQ4 gaps; Q4 cause remains unproven"},
+            "referencePreprocessing":"native768 source and unchanged512 palette each independently fitted to1024 for vision/VAE; native768 targets resize to448 only for training",
+            "conditioningVersion":"matched-two-reference448-v1",
+            "scopeLimit":"native PNGs unchanged; training target tensors are448, evaluation768; denseBF16/packedQ4 and texture generalization gaps remain; no quality cure claimed"},
         "historicalTwoReferenceTrainingEvidence": "retained only at its original source SHA",
     });
     assert_eq!(
         protocol["dataset"]["sha256"].as_str().unwrap(),
-        edit_training_balanced64::DATASET_PNG_SHA256,
+        MATCHED_EDIT_DATASET_SHA256,
         "native768 training PNG dataset must match the frozen CPU receipt before admission"
     );
     // Persist the disclosed protocol before admission, so even an explicit refusal is attributable.
     write_json(&out, "edit-training-protocol", &protocol);
     let mut trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
     trained.facts["editProtocol"] = protocol;
+    trained.facts["trainingRecipe"] = matched_edit_training_recipe(&req.config);
+    trained.facts["trainingConditioning"] =
+        matched_edit_conditioning_receipt(&req, &data, &key_path);
+    trained.facts["trainingProtocolSha256"] =
+        json!(sha256_file(&out.join("edit-training-protocol.json")));
+    let actual_preflight: Value =
+        serde_json::from_slice(&std::fs::read(out.join("training-preflight.json")).unwrap())
+            .unwrap();
+    assert_matched_edit_preflight(&actual_preflight);
+    trained.facts["actualTrainingPreflight"] = actual_preflight;
+    trained.facts["actualTrainingPreflightSha256"] =
+        json!(sha256_file(&out.join("training-preflight.json")));
+    assert_eq!(
+        trained.facts["predictedTrainPhaseBytes"], 99826239424_u64,
+        "actual header-only training preflight must match the bounded source forecast"
+    );
 
     if std::env::var("QWEN_IMAGE_2_1_PROBE_ONLY").as_deref() == Ok("1") {
         assert!(
