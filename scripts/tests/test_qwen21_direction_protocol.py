@@ -207,6 +207,7 @@ class DirectionPhaseTests(phases.PhaseTests):
         result, calls, env = helper.run_script(ROOT / "scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-hash-pinned-transferred-adapters.sh", "direction-protocol")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("qwen21_adapter_imports.py", calls)
+        self.assertIn("--source-cache-root", calls)
         self.assertIn("-m scripts.ci.qwen21_velocity_adapter", calls)
         self.assertNotIn("qwen21_diagnostic_adapter", calls)
         self.assertNotIn("qwen21_q4_replay", calls)
