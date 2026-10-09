@@ -198,15 +198,16 @@ class WiringTests(unittest.TestCase):
         workflow = yaml.safe_load((ROOT / ".github/workflows/real-weights.yml").read_text(encoding="utf-8"))
         inputs = workflow[True]["workflow_dispatch"]["inputs"]
         self.assertEqual(inputs["qwen_image_2_1_lora_phase"]["options"],
-                         ["probe", "diagnostic", "q4-numeric", "direction-protocol", "edit", "imports", "full"])
+                         ["probe", "diagnostic", "q4-numeric", "direction-protocol",
+                          "current-diagnostic", "current-trajectory", "edit", "imports", "full"])
         job = workflow["jobs"]["mlx-qwen-image-2-1"]
         self.assertEqual(job["timeout-minutes"], 300)
-        self.assertEqual(job["permissions"], {"contents": "write"})
+        self.assertEqual(job["permissions"], {"actions": "read", "contents": "read"})
         names = [s.get("name") for s in job["steps"]]
         self.assertLess(names.index("Build the Qwen-Image 2.1 MLX test binary"), names.index("Prove trained velocity survives adapter save and reload"))
         self.assertLess(names.index("Prove trained velocity survives adapter save and reload"), names.index("Materialize and verify immutable snapshots"))
         transfer = next(s for s in job["steps"] if s.get("name") == "Materialize hash-pinned transferred adapters")
-        self.assertEqual(transfer["if"], "inputs.qwen_image_2_1_lora_phase != 'probe'")
+        self.assertEqual(transfer["if"], "inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'")
         self.assertEqual(transfer["env"]["GH_TOKEN"], "${{ github.token }}")
 
 

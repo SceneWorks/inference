@@ -108,6 +108,26 @@ pub fn variability(a: &[f32], b: &[f32]) -> Result<(f64, f64), &'static str> {
     }
     Ok((max, (squared / a.len() as f64).sqrt()))
 }
+
+pub fn difference(a: &[f32], b: &[f32]) -> Result<(f64, f64, f64), &'static str> {
+    if a.is_empty() || a.len() != b.len() {
+        return Err("difference vector size mismatch");
+    }
+    let mut absolute = 0.0_f64;
+    let mut squared = 0.0_f64;
+    let mut maximum = 0.0_f64;
+    for (&a, &b) in a.iter().zip(b) {
+        if !a.is_finite() || !b.is_finite() {
+            return Err("difference vector nonfinite");
+        }
+        let delta = f64::from(a) - f64::from(b);
+        absolute += delta.abs();
+        squared += delta * delta;
+        maximum = maximum.max(delta.abs());
+    }
+    let n = a.len() as f64;
+    Ok((absolute / n, (squared / n).sqrt(), maximum))
+}
 pub fn localization(gains: &[[f64; 2]; 4]) -> &'static str {
     let signs = gains.map(|g| {
         if !g[0].is_finite()
@@ -179,6 +199,12 @@ mod tests {
             variability(&[1.0, 2.0], &[1.0, 4.0]).unwrap(),
             (2.0, 2.0_f64.sqrt())
         );
+        assert_eq!(
+            difference(&[1.0, 4.0], &[3.0, 2.0]).unwrap(),
+            (2.0, 2.0, 2.0)
+        );
+        assert!(difference(&[1.0], &[]).is_err());
+        assert!(difference(&[f32::NAN], &[0.0]).is_err());
     }
     #[test]
     fn cache_refuses_before_copy_and_closure_never_underprices() {

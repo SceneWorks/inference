@@ -407,6 +407,43 @@ pub(crate) fn capture_linear(path: &str, linear: &AdaptableLinear, x: &Array) ->
     })
 }
 
+struct CaptureReset;
+impl Drop for CaptureReset {
+    fn drop(&mut self) {
+        CAPTURE.with(|capture| {
+            capture.borrow_mut().take();
+        });
+    }
+}
+
+/// Run one already-fixed production forward while observing three representative
+/// first-block target modules. Each structured and materialized-direct residual
+/// consumes the same three copied activation rows. This is deliberately a 3/224
+/// sample and never a whole-model equivalence or acceptance claim.
+pub(crate) fn capture_same_activation_residuals<T>(
+    adapter: &Path,
+    forward: impl FnOnce() -> Result<T>,
+) -> Result<(T, BTreeMap<String, Value>)> {
+    assert_owner();
+    let (params, paths) = read_params(adapter)?;
+    assert_eq!(params.len(), 672);
+    assert_eq!(paths.len(), 224);
+    CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        assert!(capture.is_none(), "nested residual capture refused");
+        *capture = Some(Capture {
+            params,
+            rows: BTreeMap::new(),
+        });
+    });
+    let reset = CaptureReset;
+    let output = forward()?;
+    let rows = CAPTURE.with(|capture| capture.borrow_mut().take().unwrap().rows);
+    drop(reset);
+    assert_eq!(rows.len(), 3, "representative 3/224 residual sample");
+    Ok((output, rows))
+}
+
 fn checked_file(path: &Path, bytes: u64, sha: &str) {
     assert_eq!(std::fs::metadata(path).unwrap().len(), bytes);
     assert_eq!(evidence::sha256_file(path), sha);

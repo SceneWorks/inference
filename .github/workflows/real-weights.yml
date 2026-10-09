@@ -144,11 +144,11 @@ on:
         default: rw-mage
         options: [rw-mage, rw-starvector]
       qwen_image_2_1_lora_phase:
-        description: "MLX 2.1 LoRA: probe, diagnostic, q4-numeric, direction-protocol (diagnostics only), edit, imports, or full"
+        description: "MLX 2.1 LoRA: probe, historical diagnostics, current-diagnostic, current-trajectory, edit, imports, or full"
         type: choice
         required: false
         default: full
-        options: [probe, diagnostic, q4-numeric, direction-protocol, edit, imports, full]
+        options: [probe, diagnostic, q4-numeric, direction-protocol, current-diagnostic, current-trajectory, edit, imports, full]
       profile:
         description: Real-weight profile to run
         type: choice
@@ -5068,7 +5068,8 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]
     timeout-minutes: 300
     permissions:
-      contents: write # authenticated GET of hash-pinned unpublished transfer assets
+      actions: read # exact current/historical run, job, log and artifact inputs
+      contents: read # checkout plus authenticated GET of hash-pinned transfer assets
     env:
       # Composed from the ONE `~/`-relative hub-root variable every macOS lane already shares; the
       # resolve step below expands the `~/` against whichever Mac claimed the job. The names on the
@@ -5079,12 +5080,55 @@ jobs:
       # Through env, never interpolated into a script: the materialize step validates its shape.
       QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC: ${{ inputs.qwen_image_2_1_third_party_lora }}
       QWEN_IMAGE_2_1_LORA_PHASE: ${{ inputs.qwen_image_2_1_lora_phase }}
+      # Rust 1.96/LLVM 22 can mis-strip macOS proc-macro dylibs into E0463
+      # (rust-lang/rust#157750); keep this producer's fresh release build unstripped.
+      CARGO_PROFILE_RELEASE_STRIP: "none"
       # Training otherwise derives its physical ceiling from the host census; its 100 GB
       # default applies only before admission/inference. Bind the selected terminal safety
       # ceiling explicitly for this profile, in addition to the existing host reserves.
       QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB: "100"
     steps:
+      - name: Initialize current diagnostic fallback before checkout
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory'
+        shell: bash
+        run: |
+          output="$RUNNER_TEMP/qwen-image-2-1-mlx-evidence"
+          echo "QWEN_IMAGE_2_1_RENDER_OUT=$output" >> "$GITHUB_ENV"
+          python3.12 - "$output" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          output = Path(sys.argv[1])
+          if not output.is_absolute():
+              raise SystemExit("absolute current diagnostic evidence root required")
+          phase = "current-trajectory" if os.environ.get("QWEN_IMAGE_2_1_LORA_PHASE") == "current-trajectory" else "current-diagnostic"
+          receipt = output / phase / "DIAGNOSTIC_ONLY.json"
+          receipt.parent.mkdir(parents=True, exist_ok=True)
+          body = {
+              "schemaVersion": 1, "kind": "DIAGNOSTIC_ONLY",
+              "purpose": "DIAGNOSTIC_ONLY", "accepted": False,
+              "acceptanceEvidence": False, "trainingSteps": 0,
+              "renderCount": 0, "replayCount": 0, "qualityAcceptance": None,
+              "status": "EARLY_INITIALIZED",
+          }
+          temporary = receipt.with_name(".DIAGNOSTIC_ONLY.json.tmp")
+          temporary.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n",
+                               encoding="utf-8")
+          os.replace(temporary, receipt)
+          PY
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Initialize isolated Qwen-Image 2.1 Cargo target
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_TEMP" = /* ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          target="$RUNNER_TEMP/qwen-image-2-1-cargo-target-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$target"
+          printf 'CARGO_TARGET_DIR=%s\n' "$target" >> "$GITHUB_ENV"
       - name: Resolve runner-local snapshot paths
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
@@ -5093,6 +5137,9 @@ jobs:
         run: rustc --version && cargo --version
       - name: Require the resolved snapshot paths and initialize evidence
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/require-the-resolved-snapshot-paths-and-initialize-evidence.sh
+      - name: Initialize the current diagnostic-only receipt
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory'
+        run: python3.12 -m scripts.ci.qwen21_current_failed_adapter init --output "$QWEN_IMAGE_2_1_RENDER_OUT"
       - name: Report runner disk headroom
         continue-on-error: true
         run: >-
@@ -5110,18 +5157,58 @@ jobs:
       - name: Build the Qwen-Image 2.1 MLX test binary
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/build-and-record-mlx-library-identity.sh
       - name: Prove trained velocity survives adapter save and reload
+        if: inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
       - name: Materialize and verify immutable snapshots
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
       - name: Materialize hash-pinned transferred adapters
-        if: inputs.qwen_image_2_1_lora_phase != 'probe'
+        if: inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
         env:
           GH_TOKEN: ${{ github.token }}
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-hash-pinned-transferred-adapters.sh
+      - name: Bind live job and materialize the exact current failed adapter
+        if: inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-current-failed-adapter.sh
       - name: Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates
         run: source scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh
+      - name: Seal a current diagnostic refusal if the selector never started
+        if: ${{ always() && (inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory') }}
+        shell: bash
+        run: |
+          # Repository-independent: this still runs when checkout never made
+          # scripts.ci available. It preserves a completed/failed selector row.
+          python3.12 - "$RUNNER_TEMP/qwen-image-2-1-mlx-evidence" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          output = Path(sys.argv[1])
+          if not output.is_absolute():
+              raise SystemExit("absolute current diagnostic evidence root required")
+          phase = "current-trajectory" if os.environ.get("QWEN_IMAGE_2_1_LORA_PHASE") == "current-trajectory" else "current-diagnostic"
+          receipt = output / phase / "DIAGNOSTIC_ONLY.json"
+          receipt.parent.mkdir(parents=True, exist_ok=True)
+          try:
+              body = json.loads(receipt.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              body = {
+                  "schemaVersion": 1, "kind": "DIAGNOSTIC_ONLY",
+                  "purpose": "DIAGNOSTIC_ONLY", "accepted": False,
+                  "acceptanceEvidence": False, "trainingSteps": 0,
+                  "renderCount": 0, "replayCount": 0, "qualityAcceptance": None,
+              }
+          if body.get("status") not in ("DIAGNOSTIC_COMPLETED", "DIAGNOSTIC_FAILED"):
+              body.update({"status": "REFUSED", "refusal": "selector_not_started"})
+          temporary = receipt.with_name(".DIAGNOSTIC_ONLY.json.tmp")
+          temporary.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n",
+                               encoding="utf-8")
+          os.replace(temporary, receipt)
+          PY
       - name: Keep the Qwen-Image 2.1 MLX evidence
-        if: ${{ !cancelled() }}
+        if: ${{ always() && (inputs.qwen_image_2_1_lora_phase == 'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == 'current-trajectory' || !cancelled()) }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qwen-image-2-1-mlx-evidence

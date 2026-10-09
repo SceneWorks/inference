@@ -18,11 +18,187 @@ use crate::transformer::QwenImage21Transformer;
 #[path = "conditioning_velocity_math.rs"]
 mod math;
 
+#[path = "conditioning_velocity_current_inputs.rs"]
+mod current_inputs;
 #[path = "conditioning_velocity_inputs.rs"]
 mod inputs;
-use inputs::{
-    header, validate_header, validate_manifest, BASE, CAPTION, DONOR, PROTOCOL, SHAPE, TRAINING,
-};
+#[path = "conditioning_velocity_trajectory.rs"]
+mod trajectory;
+use inputs::header;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Binding {
+    Historical,
+    CurrentFailedNative768,
+}
+
+impl Binding {
+    fn manifest_env(self) -> &'static str {
+        match self {
+            Self::Historical => "QWEN_IMAGE_2_1_VELOCITY_MANIFEST",
+            Self::CurrentFailedNative768 => "QWEN_IMAGE_2_1_CURRENT_VELOCITY_MANIFEST",
+        }
+    }
+
+    fn output_dir(self) -> &'static str {
+        match self {
+            Self::Historical => "velocity-discriminator",
+            Self::CurrentFailedNative768 => "current-q4-velocity-discriminator",
+        }
+    }
+
+    fn adapter_file(self) -> &'static str {
+        match self {
+            Self::Historical => "qwen21_edit_lokr_120step_1a853.safetensors",
+            Self::CurrentFailedNative768 => "qwen21_edit_lokr.safetensors",
+        }
+    }
+
+    fn training_file(self) -> &'static str {
+        match self {
+            Self::Historical => "qwen21_edit_lokr_120step_1a853_training.json",
+            Self::CurrentFailedNative768 => "edit_lokr.json",
+        }
+    }
+
+    fn protocol_file(self) -> Option<&'static str> {
+        (self == Self::CurrentFailedNative768).then_some("edit-training-protocol.json")
+    }
+
+    fn adapter_identity(self) -> (&'static str, u64) {
+        match self {
+            Self::Historical => (inputs::DONOR, 6_759_417),
+            Self::CurrentFailedNative768 => (current_inputs::ADAPTER, 6_759_417),
+        }
+    }
+
+    fn training_identity(self) -> (&'static str, u64) {
+        match self {
+            Self::Historical => (inputs::TRAINING, 53_379),
+            Self::CurrentFailedNative768 => (current_inputs::TRAINING_RECEIPT, 156_097),
+        }
+    }
+
+    fn source_base(self) -> &'static str {
+        match self {
+            Self::Historical => inputs::BASE,
+            Self::CurrentFailedNative768 => current_inputs::SOURCE_BASE,
+        }
+    }
+
+    fn protocol_identity(self) -> &'static str {
+        match self {
+            Self::Historical => inputs::PROTOCOL,
+            Self::CurrentFailedNative768 => current_inputs::PROTOCOL_RECEIPT,
+        }
+    }
+
+    fn caption(self) -> &'static str {
+        match self {
+            Self::Historical => inputs::CAPTION,
+            Self::CurrentFailedNative768 => current_inputs::CAPTION,
+        }
+    }
+
+    fn shape(self) -> [i32; 3] {
+        match self {
+            Self::Historical => inputs::SHAPE,
+            Self::CurrentFailedNative768 => current_inputs::SHAPE,
+        }
+    }
+
+    fn target_hash(self) -> &'static str {
+        match self {
+            Self::Historical => "c2a972a40cb8fd33484ba0651ea50f922195992bdbb3fb1d0ad2a743854584f4",
+            Self::CurrentFailedNative768 => current_inputs::TARGET_HASH,
+        }
+    }
+
+    fn reference_hashes(self) -> [&'static str; 2] {
+        match self {
+            Self::Historical => inputs::REFERENCE_HASHES,
+            Self::CurrentFailedNative768 => current_inputs::REFERENCE_HASHES,
+        }
+    }
+
+    fn validate_header(self, value: &Value) {
+        match self {
+            Self::Historical => inputs::validate_header(value),
+            Self::CurrentFailedNative768 => current_inputs::validate_header(value),
+        }
+    }
+
+    fn validate_reference_order(self, hashes: &[String]) {
+        match self {
+            Self::Historical => inputs::validate_reference_order(hashes),
+            Self::CurrentFailedNative768 => current_inputs::validate_reference_order(hashes),
+        }
+    }
+}
+
+struct PreparedBinding {
+    source_candidate: String,
+    manifest_path: PathBuf,
+    manifest: Value,
+    donor: PathBuf,
+    training_path: PathBuf,
+    protocol_path: Option<PathBuf>,
+}
+
+fn prepare_binding(binding: Binding) -> PreparedBinding {
+    let source_candidate =
+        std::env::var("GITHUB_SHA").expect("exact executing source identity required");
+    assert_eq!(source_candidate.len(), 40);
+    assert!(source_candidate
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit()));
+    let manifest_path = PathBuf::from(
+        std::env::var(binding.manifest_env()).expect("strict failed donor manifest required"),
+    );
+    assert!(manifest_path.is_absolute());
+    let manifest = json_file(&manifest_path);
+    let directory = PathBuf::from(
+        manifest["directory"]
+            .as_str()
+            .expect("absolute donor directory"),
+    );
+    assert!(directory.is_absolute());
+    let donor = directory.join(binding.adapter_file());
+    let training_path = directory.join(binding.training_file());
+    let (adapter_sha, adapter_bytes) = binding.adapter_identity();
+    let (training_sha, training_bytes) = binding.training_identity();
+    assert_eq!(std::fs::metadata(&donor).unwrap().len(), adapter_bytes);
+    assert_eq!(evidence::sha256_file(&donor), adapter_sha);
+    assert_eq!(
+        std::fs::metadata(&training_path).unwrap().len(),
+        training_bytes
+    );
+    assert_eq!(evidence::sha256_file(&training_path), training_sha);
+    let adapter_header = header(&donor);
+    binding.validate_header(&adapter_header);
+    let training = json_file(&training_path);
+    let protocol_path = binding.protocol_file().map(|file| directory.join(file));
+    match binding {
+        Binding::Historical => inputs::validate_manifest(&manifest, &training),
+        Binding::CurrentFailedNative768 => {
+            let protocol_path = protocol_path.as_ref().expect("current protocol path");
+            assert_eq!(std::fs::metadata(protocol_path).unwrap().len(), 91_960);
+            assert_eq!(
+                evidence::sha256_file(protocol_path),
+                current_inputs::PROTOCOL_RECEIPT
+            );
+            current_inputs::validate_manifest(&manifest, &training, &json_file(protocol_path));
+        }
+    }
+    PreparedBinding {
+        source_candidate,
+        manifest_path,
+        manifest,
+        donor,
+        training_path,
+        protocol_path,
+    }
+}
 
 /// Declared before all native components, hence dropped after them on success
 /// or unwind. The caller-thread owner remains live until this retirement ends.
@@ -156,7 +332,7 @@ fn header_bytes(
         json!(rows.iter().map(|r| &r.1).collect::<Vec<_>>()),
     )
 }
-fn seal_closure(dense: &Path, q4: &Path, adapter: &Path, out: &Path) -> u64 {
+fn seal_closure(binding: Binding, dense: &Path, q4: &Path, adapter: &Path, out: &Path) -> u64 {
     assert!(
         !crate::quant::needs_load_time_quant(q4, Some(Quant::Q4)).unwrap(),
         "diagnostic requires actual pinned packed snapshot"
@@ -178,7 +354,7 @@ fn seal_closure(dense: &Path, q4: &Path, adapter: &Path, out: &Path) -> u64 {
     let (q4_dit, qd) = header_bytes(q4, "transformer", None, Some(4));
     let (vae, va) = header_bytes(dense, "vae", None, Some(4));
     let h = header(adapter);
-    validate_header(&h);
+    binding.validate_header(&h);
     let mut shapes = Vec::new();
     for (path, row) in h
         .as_object()
@@ -232,6 +408,7 @@ fn seal_closure(dense: &Path, q4: &Path, adapter: &Path, out: &Path) -> u64 {
 fn install_retired(
     host: &mut QwenImage21Transformer,
     path: &Path,
+    expected_sha256: &str,
     cache: &mut math::Cache,
 ) -> Result<()> {
     let w = Weights::from_file(path)?;
@@ -270,7 +447,7 @@ fn install_retired(
     assert_eq!(count, 672);
     assert_eq!(
         evidence::sha256_file(path),
-        DONOR,
+        expected_sha256,
         "file unchanged throughout native read"
     );
     crate::q4_diagnostic::retirement_boundary();
@@ -309,84 +486,28 @@ fn install_retired(
 #[test]
 #[ignore = "fixed real-weight 16-forward diagnostic; DIAGNOSTIC_ONLY, never image acceptance"]
 fn diagnostic_dense_q4_conditioning_velocity() {
-    run().unwrap();
+    run(Binding::Historical).unwrap();
 }
-fn run() -> Result<()> {
-    let _owner = crate::q4_diagnostic::production_owner_scope();
-    assert!(mlx_rs::task_local_default_stream().is_none());
-    assert!(mlx_rs::Stream::new() == mlx_rs::Stream::gpu());
-    let _retire_on_drop = RetireOnDrop;
-    let out = evidence::out_dir().join("velocity-discriminator");
+
+#[test]
+#[ignore = "fixed current-adapter teacher-forced diagnostic; zero renders/training; never acceptance"]
+fn diagnostic_current_failed_adapter_dense_q4_conditioning_velocity() {
+    run(Binding::CurrentFailedNative768).unwrap();
+}
+
+fn run(binding: Binding) -> Result<()> {
+    // Hash, byte, provenance, header, source-base and FBD refusal is tensor-free
+    // and intentionally precedes every MLX stream/model/array construction.
+    let prepared_binding = prepare_binding(binding);
+    let out = evidence::out_dir().join(binding.output_dir());
     std::fs::create_dir_all(&out)?;
-    let source = std::env::var("GITHUB_SHA").expect("exact executing source identity required");
-    assert_eq!(source.len(), 40);
-    assert!(source.bytes().all(|b| b.is_ascii_hexdigit()));
-    let manifest_path = PathBuf::from(
-        std::env::var("QWEN_IMAGE_2_1_VELOCITY_MANIFEST")
-            .expect("strict failed donor manifest required"),
-    );
-    assert!(manifest_path.is_absolute());
-    let manifest = json_file(&manifest_path);
-    let directory = PathBuf::from(manifest["directory"].as_str().unwrap());
-    assert!(directory.is_absolute());
-    let donor = directory.join("qwen21_edit_lokr_120step_1a853.safetensors");
-    let training = directory.join("qwen21_edit_lokr_120step_1a853_training.json");
-    assert_eq!(std::fs::metadata(&donor)?.len(), 6_759_417);
-    assert_eq!(evidence::sha256_file(&donor), DONOR);
-    assert_eq!(std::fs::metadata(&training)?.len(), 53_379);
-    assert_eq!(evidence::sha256_file(&training), TRAINING);
-    validate_manifest(&manifest, &json_file(&training));
-    let dense_spec = evidence::tier_spec("bf16", None);
-    let q4_spec = evidence::tier_spec("q4", Some(Quant::Q4));
-    let dense = crate::loader::snapshot_root(&dense_spec.weights)?;
-    let q4 = crate::loader::snapshot_root(&q4_spec.weights)?;
-    let active_limit = seal_closure(dense, q4, &donor, &out);
-    let guard = evidence::Footprint::start(&out);
-    guard.admit_numeric(active_limit, math::FREE_CACHE); // BEFORE any native model/array construction.
-    guard.begin();
-    let baseline_active = mlx_rs::memory::get_active_memory() as u64;
-    let _bounds = crate::memory_strategy::AllocatorBounds::enter(
-        active_limit - math::FREE_CACHE,
-        math::FREE_CACHE,
-    );
-    let mut cache = math::Cache::default();
-    // Retained masks/layout, serialized metadata, position ids, and small receipt
-    // buffers are charged in addition to every copied full tensor below.
-    cache.reserve(2 * 1024 * 1024)?;
-    let mut trace = Vec::new();
-    let mut receipt = json!({"kind":"DIAGNOSTIC_ONLY","acceptanceEvidence":false,"accepted":false,
-        "sourceCandidate":source,"sourceBase":BASE,"discriminatorProtocolSha256":PROTOCOL,
-        "runId":std::env::var("GITHUB_RUN_ID").expect("native run identity").parse::<u64>().unwrap(),
-        "runAttempt":std::env::var("GITHUB_RUN_ATTEMPT").expect("native attempt identity").parse::<u64>().unwrap(),
-        "inputManifestSha256":evidence::sha256_file(&manifest_path),"trainingProvenance":manifest["trainingProvenance"],
-        "adapterSha256":DONOR,"trainingReceiptSha256":TRAINING,"forwardCount":0,"stateCount":4,"repeatCount":2,
-        "adapterStrength":1,"sigma":0.5,"arithmeticBoundVerdict":math::ARITHMETIC,
-        "nativePrecision":{"MLX_ENABLE_TF32":std::env::var("MLX_ENABLE_TF32").unwrap_or_else(|_|"unset: pinned MLX0.32 default1".to_owned()),
-            "packedCompute":"Float32 with native defaults; relaxed NAX permission does not supply a proven mantissa/rounding bound",
-            "denseCompute":"Bfloat16 intrinsic production compute", "conditioningEncodeRepeats":1,
-            "forwardRepeats":2,"kernelExactnessClaimed":false},
-        "vectors":[],"states":[],"cpuCachePeakBytes":0,
-        "limitations":["fixed teacher-forced midpoint cannot override failed images","DiT representation/dtype/native kernels confounded","CPU f64 aggregation is not a native arithmetic bound"]});
-    evidence::write_json(&out, "receipt", &receipt);
     let src = evidence::edit_source(99, 768);
     let target = evidence::edit_transform(&src);
     let key = evidence::edit_key(512);
     for (name, img, expected) in [
-        (
-            "source99",
-            &src,
-            "a25c4aa67d3eb7c9107d353acc5813c1e3d95aeeb355fb41f137ffd3edc44a60",
-        ),
-        (
-            "expected",
-            &target,
-            "c2a972a40cb8fd33484ba0651ea50f922195992bdbb3fb1d0ad2a743854584f4",
-        ),
-        (
-            "palette",
-            &key,
-            "da3be3ca711ec3d0e89df8f1e91bc662365fea188fd513d0108782b6c726189f",
-        ),
+        ("source99", &src, binding.reference_hashes()[0]),
+        ("expected", &target, binding.target_hash()),
+        ("palette", &key, binding.reference_hashes()[1]),
     ] {
         let path = out.join(format!("{name}.png"));
         img.save(&path).unwrap();
@@ -396,8 +517,82 @@ fn run() -> Result<()> {
             "frozen source bytes"
         );
     }
+    let _owner = crate::q4_diagnostic::production_owner_scope();
+    assert!(mlx_rs::task_local_default_stream().is_none());
+    assert!(mlx_rs::Stream::new() == mlx_rs::Stream::gpu());
+    let source = &prepared_binding.source_candidate;
+    let manifest_path = &prepared_binding.manifest_path;
+    let manifest = &prepared_binding.manifest;
+    let donor = &prepared_binding.donor;
+    let (donor_sha, _) = binding.adapter_identity();
+    let (training_sha, _) = binding.training_identity();
+    let dense_spec = evidence::tier_spec("bf16", None);
+    let q4_spec = evidence::tier_spec("q4", Some(Quant::Q4));
+    let dense = crate::loader::snapshot_root(&dense_spec.weights)?;
+    let q4 = crate::loader::snapshot_root(&q4_spec.weights)?;
+    let active_limit = seal_closure(binding, dense, q4, donor, &out);
+    let guard = evidence::Footprint::start(&out);
+    let _current_cache_grant = if binding == Binding::CurrentFailedNative768 {
+        Some(guard.admit_numeric_scoped(active_limit, math::FREE_CACHE))
+    } else {
+        guard.admit_numeric(active_limit, math::FREE_CACHE);
+        None
+    };
+    guard.begin();
+    let baseline_active = mlx_rs::memory::get_active_memory() as u64;
+    let _bounds = crate::memory_strategy::AllocatorBounds::enter(
+        active_limit - math::FREE_CACHE,
+        math::FREE_CACHE,
+    );
+    // Declared after every admission/policy guard and before all native model/
+    // array locals. Reverse local drop order retires native values first, then
+    // synchronizes/clears on this owner thread while the bounds, cache grant,
+    // and physical watchdog are still active.
+    let _retire_on_drop = RetireOnDrop;
+    let mut cache = math::Cache::default();
+    // Retained masks/layout, serialized metadata, position ids, and small receipt
+    // buffers are charged in addition to every copied full tensor below.
+    cache.reserve(2 * 1024 * 1024)?;
+    let mut trace = Vec::new();
+    let limitations =
+        if binding == Binding::CurrentFailedNative768 {
+            json!(["fixed teacher-forced midpoint cannot override failed images",
+            "same-activation residual capture samples 3 of 224 target modules",
+            "CPU f64 aggregation and relaxed NAX observations are not a native arithmetic bound"])
+        } else {
+            json!([
+                "fixed teacher-forced midpoint cannot override failed images",
+                "DiT representation/dtype/native kernels confounded",
+                "CPU f64 aggregation is not a native arithmetic bound"
+            ])
+        };
+    let mut receipt = json!({"kind":"DIAGNOSTIC_ONLY","acceptanceEvidence":false,"accepted":false,
+        "sourceCandidate":source,"sourceBase":binding.source_base(),
+        "discriminatorProtocolSha256":binding.protocol_identity(),
+        "runId":std::env::var("GITHUB_RUN_ID").expect("native run identity").parse::<u64>().unwrap(),
+        "runAttempt":std::env::var("GITHUB_RUN_ATTEMPT").expect("native attempt identity").parse::<u64>().unwrap(),
+        "inputManifestSha256":evidence::sha256_file(manifest_path),"trainingProvenance":manifest["trainingProvenance"],
+        "adapterSha256":donor_sha,"trainingReceiptSha256":training_sha,
+        "forwardCount":0,"stateCount":4,"repeatCount":2,
+        "adapterStrength":1,"sigma":0.5,"arithmeticBoundVerdict":math::ARITHMETIC,
+        "nativePrecision":{"MLX_ENABLE_TF32":std::env::var("MLX_ENABLE_TF32").unwrap_or_else(|_|"unset: pinned MLX0.32 default1".to_owned()),
+            "packedCompute":"Float32 with native defaults; relaxed NAX permission does not supply a proven mantissa/rounding bound",
+            "denseCompute":"Bfloat16 intrinsic production compute", "conditioningEncodeRepeats":1,
+            "forwardRepeats":2,"kernelExactnessClaimed":false},
+        "vectors":[],"states":[],"cpuCachePeakBytes":0,"limitations":limitations});
+    if binding == Binding::CurrentFailedNative768 {
+        receipt["trainingSteps"] = json!(0);
+        receipt["renderCount"] = json!(0);
+        receipt["sceneWorksFbdCommit"] = manifest["sceneWorksFbdCommit"].clone();
+        receipt["protocolReceiptSha256"] = json!(prepared_binding
+            .protocol_path
+            .as_ref()
+            .map(|path| evidence::sha256_file(path)));
+        receipt["trainingReceiptPath"] = json!(&prepared_binding.training_path);
+    }
+    evidence::write_json(&out, "receipt", &receipt);
     let req = GenerationRequest {
-        prompt: CAPTION.to_owned(),
+        prompt: binding.caption().to_owned(),
         width: 768,
         height: 768,
         steps: Some(8),
@@ -412,7 +607,7 @@ fn run() -> Result<()> {
     let vae = crate::loader::load_vae(dense)?;
     let x0_array = crate::training::diagnostic_encode_latents(&vae, &evidence::to_image(target))?;
     let x0 = copy_tensor(&x0_array, "cpu-tensors/x0", &out, &mut cache)?;
-    assert_eq!(x0.shape, SHAPE);
+    assert_eq!(x0.shape, binding.shape());
     drop(x0_array);
     let mut references = Vec::new();
     let mut reference_hashes = Vec::new();
@@ -420,7 +615,7 @@ fn run() -> Result<()> {
         let source_path = out.join(format!("prepared-source-{index}.png"));
         img.save(&source_path).unwrap();
         reference_hashes.push(evidence::sha256_file(&source_path));
-        assert_eq!(reference_hashes[index], inputs::REFERENCE_HASHES[index]);
+        assert_eq!(reference_hashes[index], binding.reference_hashes()[index]);
         let rgb = evidence::to_image(img);
         let rgba = mlx_gen::RgbaImage {
             width: rgb.width,
@@ -467,7 +662,7 @@ fn run() -> Result<()> {
             &mut trace,
         );
     }
-    inputs::validate_reference_order(&reference_hashes);
+    binding.validate_reference_order(&reference_hashes);
     assert_eq!(references.len(), 2);
     drop(vae);
     cache.release(image_bytes);
@@ -476,7 +671,7 @@ fn run() -> Result<()> {
     phase_trace(&out, "vae-retired", active_limit, &cache, &mut trace);
     let noise_array = crate::pipeline::create_noise(24163, 768, 768, 64)?;
     let noise = copy_tensor(&noise_array, "cpu-tensors/noise", &out, &mut cache)?;
-    assert_eq!(noise.shape, SHAPE);
+    assert_eq!(noise.shape, binding.shape());
     let (xt_array, target_array) =
         crate::training::diagnostic_midpoint_batch(&x0.array(), &noise_array)?;
     let xt = copy_tensor(&xt_array, "cpu-tensors/xt", &out, &mut cache)?;
@@ -501,7 +696,8 @@ fn run() -> Result<()> {
             .iter()
             .map(Reference::prepared)
             .collect::<Vec<_>>();
-        let encoded = te.encode_conditioning(&tokenizer, CAPTION, drop_count, &prepared)?;
+        let encoded =
+            te.encode_conditioning(&tokenizer, binding.caption(), drop_count, &prepared)?;
         let branch = crate::pipeline::joint_branch(&encoded, &prepared, 768, 768)?;
         assert_eq!(branch.text.dtype(), Dtype::Float32);
         conditioning.push(copy_tensor(
@@ -529,13 +725,22 @@ fn run() -> Result<()> {
     assert_eq!(layouts[0], layouts[1]);
     assert_eq!(masks[0], masks[1]);
     assert_eq!(conditioning[0].shape, conditioning[1].shape);
+    let (conditioning_mae, conditioning_rms, conditioning_max) =
+        math::difference(&conditioning[0].values, &conditioning[1].values)?;
     let positions = layouts[0].position_ids();
-    receipt["inputs"] = json!({"caption":CAPTION,"referenceOrder":["source99","palette"],"fit":[[1024,1024],[1024,1024]],
+    receipt["inputs"] = json!({"caption":binding.caption(),"referenceOrder":["source99","palette"],"fit":[[1024,1024],[1024,1024]],
         "x0":x0.facts,"noise":noise.facts,"xt":xt.facts,"targetVelocity":target.facts,
         "references":references.iter().map(|r|json!({"pixels":r.pixels.facts,"latents":r.latents.facts,"grid":r.grid,"size":r.size})).collect::<Vec<_>>(),
         "conditioning":conditioning.iter().map(|c|&c.facts).collect::<Vec<_>>(),"imagePadMask":masks[0],
         "layout":format!("{:?}",layouts[0]),"positionIdsSha256":sha(&serde_json::to_vec(&positions).unwrap()),
         "fixedVisionSource":dense,"fixedVAESource":dense,"conditioningRoots":[dense,q4]});
+    if binding == Binding::CurrentFailedNative768 {
+        receipt["inputs"]["conditioningDenseVsQ4"] = json!({
+            "meanAbsoluteDifference":conditioning_mae,
+            "rootMeanSquareDifference":conditioning_rms,
+            "maxAbsoluteDifference":conditioning_max
+        });
+    }
     for r in &mut references {
         cache.release(r.pixels.bytes());
         r.pixels.values.clear();
@@ -545,6 +750,7 @@ fn run() -> Result<()> {
     let mut state_receipts = Vec::new();
     let mut gains = [[0.0; 2]; 4];
     for (state, (lang, dit)) in [(0, 0), (1, 1), (0, 1), (1, 0)].into_iter().enumerate() {
+        let mut residual_capture = Value::Null;
         let root = if dit == 0 { dense } else { q4 };
         let mut model = crate::loader::load_transformer(root)?;
         for path in model.adaptable_paths() {
@@ -575,11 +781,30 @@ fn run() -> Result<()> {
         let mut actual = Vec::new();
         for adapted in [false, true] {
             if adapted {
-                install_retired(&mut model, &donor, &mut cache)?;
+                install_retired(&mut model, donor, donor_sha, &mut cache)?;
             }
             for repeat in 0..2 {
-                let velocity = model.forward_joint(&text, &images, 0.5, &layouts[lang])?;
-                assert_eq!(velocity.shape(), SHAPE);
+                let velocity = if binding == Binding::CurrentFailedNative768
+                    && dit == 1
+                    && adapted
+                    && repeat == 0
+                {
+                    let (velocity, captures) =
+                        crate::q4_diagnostic::capture_same_activation_residuals(donor, || {
+                            model.forward_joint(&text, &images, 0.5, &layouts[lang])
+                        })?;
+                    residual_capture = json!({
+                        "scope":"same F32 activation rows; representative first-block sample only",
+                        "sampledTargetModules":3,"totalTargetModules":224,
+                        "acceptanceEvidence":false,"numericPassClaim":false,
+                        "conditioning":if lang==0 {"denseBF16"} else {"Q4"},
+                        "dit":"Q4","repeat":repeat,"captures":captures
+                    });
+                    velocity
+                } else {
+                    model.forward_joint(&text, &images, 0.5, &layouts[lang])?
+                };
+                assert_eq!(velocity.shape(), binding.shape());
                 let mut copied = copy_tensor(
                     &velocity,
                     &format!(
@@ -622,10 +847,14 @@ fn run() -> Result<()> {
         }
         let (bm, br) = math::variability(&actual[0].values, &actual[1].values)?;
         let (am, ar) = math::variability(&actual[2].values, &actual[3].values)?;
-        state_receipts.push(json!({"state":state,"conditioning":if lang==0 {"denseBF16"} else {"Q4"},
+        let mut state_receipt = json!({"state":state,"conditioning":if lang==0 {"denseBF16"} else {"Q4"},
             "dit":if dit==0 {"denseBF16"} else {"Q4"},"computeDtype":format!("{:?}",model.compute_dtype()),
             "pairs":pairs,"repeatVariability":{"baseMaxAbs":bm,"baseRms":br,"adaptedMaxAbs":am,"adaptedRms":ar},
-            "gainInterval":[gains[state][0].min(gains[state][1]),gains[state][0].max(gains[state][1])]}));
+            "gainInterval":[gains[state][0].min(gains[state][1]),gains[state][0].max(gains[state][1])]});
+        if binding == Binding::CurrentFailedNative768 {
+            state_receipt["structuredVsDirectResidual"] = residual_capture;
+        }
+        state_receipts.push(state_receipt);
         drop(images);
         drop(text);
         drop(latent_refs);
@@ -653,13 +882,28 @@ fn run() -> Result<()> {
     );
     assert_eq!(vectors.len(), 16);
     assert_eq!(state_receipts.len(), 4);
+    let residual_capture_count = state_receipts
+        .iter()
+        .filter(|state| !state["structuredVsDirectResidual"].is_null())
+        .count();
+    assert_eq!(
+        residual_capture_count,
+        if binding == Binding::CurrentFailedNative768 {
+            2
+        } else {
+            0
+        }
+    );
+    if binding == Binding::CurrentFailedNative768 {
+        receipt["residualCaptureCount"] = json!(residual_capture_count);
+    }
     receipt["localizationObservation"] = json!(math::localization(&gains));
     receipt["cpuCachePeakBytes"] = json!(cache.peak);
     receipt["activePeakBytes"] = json!(peak);
     receipt["physicalPeakBytes"] = json!(physical);
     receipt["activeEnvelopeBytes"] = json!(active_limit);
     receipt["nativeRawMasterReload"] = json!({"verifiedTensorsPerState":[672,672,672,672],
-        "exactRawValuesShapesDtypes":true,"originalFileSha256":DONOR,
+        "exactRawValuesShapesDtypes":true,"originalFileSha256":donor_sha,
         "scope":"all four installs compared to the immutable raw payload; production residual representations differ by tier"});
     receipt["phaseTraceComplete"] = json!(trace.len() == 25);
     assert_eq!(trace.len(), 25);

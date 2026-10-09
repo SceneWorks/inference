@@ -4487,12 +4487,31 @@ class WindowsBashSelectionTests(unittest.TestCase):
             "${{ inputs.qwen_image_2_1_third_party_lora }}"
         ):
             errors.append("the third-party hook must reach the job through env, not interpolation")
+        release_options = {
+            key: value
+            for key, value in job["env"].items()
+            if key.startswith("CARGO_PROFILE_RELEASE_")
+        }
+        if release_options != {"CARGO_PROFILE_RELEASE_STRIP": "none"}:
+            errors.append(f"the release-strip workaround changed: {release_options!r}")
+        if any(key in job["env"] for key in ("RUSTC_WRAPPER", "SCCACHE_DISABLE")):
+            errors.append("the Qwen lane disables or replaces the configured compiler wrapper")
+        for name, other in workflow["jobs"].items():
+            if name != "mlx-qwen-image-2-1" and "CARGO_PROFILE_RELEASE_STRIP" in other.get("env", {}):
+                errors.append(f"the release-strip workaround leaked into {name}")
 
         models = {
             model["key"]: model
             for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
         }
         steps = {step.get("name"): step for step in job["steps"]}
+        target = steps.get("Initialize isolated Qwen-Image 2.1 Cargo target", {})
+        target_run = target.get("run", "")
+        if target.get("shell") != "bash" or target_run.count("CARGO_TARGET_DIR") != 1:
+            errors.append("the isolated Qwen Cargo target initializer changed")
+        commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+        if re.search(r"(?:cargo\s+clean|rm\s+-rf[^\n]*(?:target|cargo))", commands, re.IGNORECASE):
+            errors.append("the Qwen lane clears a Cargo target or cache")
         resolve = steps.get("Resolve runner-local snapshot paths", {}).get("run", "")
         materialize = steps.get("Materialize and verify immutable snapshots", {}).get("run", "")
         for key, variable in (
@@ -4546,7 +4565,11 @@ class WindowsBashSelectionTests(unittest.TestCase):
         upload = steps.get("Keep the Qwen-Image 2.1 MLX evidence", {})
         if upload.get("with", {}).get("name") != "qwen-image-2-1-mlx-evidence":
             errors.append("the evidence artifact is not `qwen-image-2-1-mlx-evidence`")
-        if upload.get("if") != "${{ !cancelled() }}":
+        if upload.get("if") != (
+            "${{ always() && (inputs.qwen_image_2_1_lora_phase == "
+            "'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == "
+            "'current-trajectory' || !cancelled()) }}"
+        ):
             errors.append("the evidence upload must survive a failed gate")
         if upload.get("with", {}).get("if-no-files-found") != "error":
             errors.append("an empty evidence upload must red")
@@ -4587,11 +4610,24 @@ class WindowsBashSelectionTests(unittest.TestCase):
                 {"MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT": "/somewhere/else"}
             ),
             lambda job: job["steps"][-1].pop("if"),
+            lambda job: job["env"].pop("CARGO_PROFILE_RELEASE_STRIP"),
+            lambda job: job["env"].update({"CARGO_PROFILE_RELEASE_STRIP": "symbols"}),
+            lambda job: job["env"].update({"CARGO_PROFILE_RELEASE_LTO": "true"}),
+            lambda job: job["env"].update({"RUSTC_WRAPPER": ""}),
+            lambda job: next(
+                step for step in job["steps"]
+                if step.get("name") == "Initialize isolated Qwen-Image 2.1 Cargo target"
+            ).update({"run": 'rm -rf "$CARGO_TARGET_DIR"'}),
         ):
             mutated = copy.deepcopy(workflow)
             mutate(mutated["jobs"]["mlx-qwen-image-2-1"])
             with self.subTest(mutation=mutate):
                 self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
+        mutated = copy.deepcopy(workflow)
+        mutated["jobs"]["mlx-qwen-image-producers"].setdefault("env", {})[
+            "CARGO_PROFILE_RELEASE_STRIP"
+        ] = "none"
+        self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
 
 
 class WorkflowFileSizeTests(unittest.TestCase):

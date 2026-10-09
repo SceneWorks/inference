@@ -517,6 +517,72 @@ impl Footprint {
         self.ceiling.store(ceiling, Ordering::Relaxed);
     }
 
+    /// The exact-current teacher-forced diagnostic preserves its complete active
+    /// envelope while dynamically clamping only freed-buffer cache retention to
+    /// current host headroom. A typed allocator grant spans every model
+    /// load/forward and restores the prior policy on every exit.
+    #[allow(dead_code)] // Used by the cfg(test) library diagnostic only.
+    pub(crate) fn admit_numeric_scoped(&self, active_envelope: u64, free_cache: u64) -> impl Drop {
+        let (host, census) = host_census();
+        let cap = self.explicit_cap.unwrap_or(100_000_000_000);
+        let result =
+            physical_watchdog::admit_numeric_scoped(host, active_envelope, free_cache, Some(cap));
+        let (ceiling, grant) = result.unwrap_or_else(|error| {
+            let receipt = json!({"kind":"DIAGNOSTIC_ONLY","host":census.clone(),
+                "activeEnvelopeBytes":active_envelope,"frozenFreeCacheAllowanceBytes":free_cache,
+                "actualAllocatorCacheLimitBytes":host.cache_limit,
+                "explicitOrDefaultCapBytes":cap,"refusal":error,
+                "policy":"unchanged_active_envelope_plus_dynamic_free_cache_clamp_and_typed_scoped_grant"});
+            write_json(&self.out, "numeric-physical-admission", &receipt);
+            panic!("numeric diagnostic cannot safely fit; receipt retained");
+        });
+        let cache = physical_watchdog::ScopedCacheGrant::enter(MlxCacheAllocator, grant)
+            .unwrap_or_else(|error| {
+                let receipt = json!({"kind":"DIAGNOSTIC_ONLY","host":census.clone(),
+                    "activeEnvelopeBytes":active_envelope,"frozenFreeCacheAllowanceBytes":free_cache,
+                    "actualAllocatorCacheLimitBytes":host.cache_limit,
+                    "explicitOrDefaultCapBytes":cap,"reservedPhysicalCeilingBytes":ceiling,
+                    "admissionGrant":format!("{grant:?}"),"refusal":error,
+                    "policy":"unchanged_active_envelope_plus_dynamic_free_cache_clamp_and_typed_scoped_grant"});
+                write_json(&self.out, "numeric-physical-admission", &receipt);
+                panic!("numeric cache grant could not be installed; receipt retained");
+            });
+        let effective_cache = u64::try_from(cache.effective()).unwrap();
+        let admitted_cache = grant.effective_cache_limit;
+        let cache_clamp = free_cache
+            .checked_sub(admitted_cache)
+            .expect("numeric cache grant never exceeds its frozen allowance");
+        let predicted_max_full_envelope = active_envelope
+            .checked_add(grant.nonallocator_overhead)
+            .and_then(|bytes| bytes.checked_add(admitted_cache))
+            .expect("predicted numeric envelope stays representable");
+        let installed_full_envelope = active_envelope
+            .checked_add(grant.nonallocator_overhead)
+            .and_then(|bytes| bytes.checked_add(effective_cache))
+            .expect("installed numeric envelope stays representable");
+        assert_eq!(predicted_max_full_envelope, ceiling);
+        assert!(installed_full_envelope <= ceiling);
+        let receipt = json!({"kind":"DIAGNOSTIC_ONLY","host":census,
+            "activeEnvelopeBytes":active_envelope,"frozenFreeCacheAllowanceBytes":free_cache,
+            "actualAllocatorCacheLimitBytes":host.cache_limit,
+            "previousCacheLimitBytes":cache.previous(),
+            "admittedCacheLimitBytes":admitted_cache,
+            "effectiveCacheLimitBytes":effective_cache,
+            "cacheClampBytes":cache_clamp,
+            "nonallocatorOverheadBytes":grant.nonallocator_overhead,
+            "reservedPhysicalCeilingBytes":ceiling,
+            "predictedMaxFullEnvelopeBytes":predicted_max_full_envelope,
+            "installedFullEnvelopeBytes":installed_full_envelope,
+            "explicitOrDefaultCapBytes":cap,"refusal":Value::Null,
+            "activeAndHostReservesUnchanged":true,"cacheGrantReadBack":true,
+            "typedNativeCacheGrantRequired":true,
+            "cacheGrantRestoresOnDrop":true,
+            "policy":"unchanged_active_envelope_plus_dynamic_free_cache_clamp_and_typed_scoped_grant"});
+        write_json(&self.out, "numeric-physical-admission", &receipt);
+        self.ceiling.store(ceiling, Ordering::Relaxed);
+        cache
+    }
+
     pub(crate) fn begin(&self) {
         mlx_rs::memory::reset_peak_memory();
         self.phase_max.store(0, Ordering::Relaxed);
