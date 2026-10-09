@@ -31,6 +31,7 @@ jobs:
     timeout-minutes: 45
     env:
       RUSTC_WRAPPER: ""
+      CARGO_PROFILE_RELEASE_STRIP: "none"
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
     steps:
