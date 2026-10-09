@@ -5949,3 +5949,694 @@ mod depth_anchoring_tests {
         assert!(err.contains("TAEQI2.1"), "{err}");
     }
 }
+
+// ── native12 original-step1 velocity diagnosis (test binary only) ─────────────────────────────
+#[cfg(test)]
+mod native12_step1_velocity {
+    use super::*;
+    use crate::memory_strategy::AllocatorBounds;
+    use crate::q4_real_weights_support as evidence;
+    use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+    use mlx_gen::weights::Weights;
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+
+    const DONOR: &str = "6bc315825dcc8f7748d2bd9df08c7a9f93dd3bd0d31b1221939c46a6111c3c54";
+    const CONFIG_SHA: &str = "31dd6c0d0d49ebccda09b772720a040bd333f909a2aa0ccf5c5d0e063e294ba9";
+    const SIGMA_SEED: u64 = 111486302299;
+    const NOISE_SEED: u64 = 87;
+    // Historical training/backward forecast: informational, never forward admission.
+    const RETAINED_TRAINING_BACKWARD_FORECAST: u64 = 99_826_239_424;
+    const RETAINED_TRAINING_CACHE: u64 = 85_595_989_952;
+    const OWNED_OPERANDS: u64 = 64 << 20;
+    #[derive(Clone, Copy)]
+    struct ForwardPrice {
+        active: u64,
+        resident: u64,
+    }
+    impl ForwardPrice {
+        fn transient(self) -> u64 {
+            self.active.checked_sub(self.resident).unwrap()
+        }
+    }
+    /// Header-only facts plus unchanged production forward counts. No measured-peak fit.
+    fn forward_prices(
+        dense: &Path,
+        root: &Path,
+    ) -> Result<(ForwardPrice, ForwardPrice, ForwardPrice, Value)> {
+        let facts = FootprintFacts::from_snapshot(dense)?;
+        assert_eq!(
+            (facts.num_layers, facts.inner, facts.heads, facts.mlp_ratio),
+            (32, 4096, 32, 3)
+        );
+        assert_eq!(
+            (
+                facts.latent_channels,
+                facts.text_hidden,
+                facts.pixels_per_token
+            ),
+            (64, 4096, 16)
+        );
+        let headers = safetensors_path_tensor_headers(root.join(FILES[3].0))?;
+        assert_eq!(headers.len(), 672);
+        let factor_bytes: u64 = headers.iter().map(|h| h.data_bytes).sum();
+        assert_eq!(factor_bytes, 6_684_672);
+        // Four complete F32 factor sets cover init, saved masters and construction
+        // retirement. Rc/Array block/base clones alias; no dense backup field exists.
+        let factors = 4 * factor_bytes;
+        let base = facts.dit_elements * 2;
+        assert_eq!(base, 14_230_249_472);
+        let deltas = facts.num_layers
+            * (4 * facts.inner * facts.inner + 3 * facts.inner * facts.inner * facts.mlp_ratio)
+            * 2;
+        assert_eq!(deltas, 13_958_643_712);
+        let seq = 784 + 8192 + 87;
+        let hidden = seq * facts.inner * 2;
+        let block = (crate::training_memory::ATTENTION_SAVED_HIDDEN
+            + crate::training_memory::FFN_SAVED_HIDDEN_FIXED
+            + crate::training_memory::FFN_SAVED_PER_MLP_RATIO * facts.mlp_ratio)
+            * hidden;
+        let retained = facts.num_layers * hidden + 2 * block;
+        let pipeline = crate::training_memory::pipelined_bytes(
+            facts.heads * (784 * seq).max(33_611_776),
+            seq * facts.inner,
+            facts.mlp_ratio,
+            2,
+        );
+        let rebuilt = 2 * deltas / facts.num_layers;
+        // All global install delta graphs are lazy and never explicitly evaluated.
+        // Each owned checkpoint block replaces those graphs. Reserve the complete
+        // materialized union once, PLUS production's two-block rebuilt margin.
+        // Keep production's conservative fallback/pipeline count even without grad;
+        // ONLY the never-executed Softmax VJP working set is absent.
+        let resident = base + deltas + factors + OWNED_OPERANDS;
+        let forward = ForwardPrice {
+            active: resident + retained + pipeline + rebuilt + MLX_EVAL_SLACK_BYTES,
+            resident,
+        };
+        assert_eq!(forward.active, 95_212_969_984);
+        let shape = TrainingShape {
+            edge: 448,
+            target_tokens: 784,
+            target_cache_tokens: 784,
+            caption_tokens: 87,
+            reference_tokens: 8192,
+            largest_reference_tokens: 4096,
+            reference_cache_tokens: 8192,
+            prefix_scores: 51_050_851,
+            largest_prefix_call: 33_611_776,
+            items: 1,
+            compute_width: 2,
+            trainable_params: factor_bytes / 4,
+            optimizer_state_per_param: 0,
+            lokr_delta_elements: deltas / 2,
+            checkpointed: true,
+            sampling: false,
+            aux_model_bytes: 0,
+        };
+        let encoders = training_footprint(&facts, &shape);
+        // One existing cached item (64MiB reserve) stays owned between components.
+        let caption = ForwardPrice {
+            active: encoders.caption_phase + OWNED_OPERANDS,
+            resident: facts.text_encoder_bytes + facts.vision_tower_bytes + OWNED_OPERANDS,
+        };
+        let vae = ForwardPrice {
+            active: encoders.latent_phase + OWNED_OPERANDS,
+            resident: facts.vae_encoder_bytes + facts.vae_decoder_bytes + OWNED_OPERANDS,
+        };
+        assert_eq!(caption.active, 18_292_105_696);
+        assert_eq!(vae.active, 12_561_865_168);
+        let receipt = json!({"basis":"header-derived production FootprintFacts/training_footprint and training_memory forward counts; shape expected before tensors",
+            "actualHeaderFactsDebug":format!("{facts:?}"),"sourceExpectedShapeDebug":format!("{shape:?}"),
+            "retainedTrainingBackwardForecastBytes":RETAINED_TRAINING_BACKWARD_FORECAST,
+            "retainedTrainingCacheRequestBytes":RETAINED_TRAINING_CACHE,
+            "forwardActiveEnvelopeBytes":forward.active,"forwardResidentBytes":resident,
+            "requestedForwardFreeCacheAllowanceBytes":forward.transient(),
+            "components":{"denseBaseBytes":base,"denseBackupBytes":0,"completeBF16DeltaUnionBytes":deltas,
+            "fourF32FactorSetsBytes":factors,"oneFactorSetBytes":factor_bytes,"ownedOperandsReserveBytes":OWNED_OPERANDS,
+            "checkpointForwardRetainedBytes":retained,"conservativePipelineBytes":pipeline,"twoBlockRebuiltDeltaBytes":rebuilt,
+            "evaluationSlackBytes":MLX_EVAL_SLACK_BYTES,"backwardBytes":0,"optimizerBytes":0,"rendererBytes":0},
+            "encoderPhases":{"captionActiveBytes":caption.active,"captionResidentBytes":caption.resident,
+            "vaeActiveBytes":vae.active,"vaeResidentBytes":vae.resident},
+            "publicGenerationDitActivationFloorBytes":crate::memory_strategy::derived::dit_activation_bytes(seq),
+            "admission":"unchanged100GB/95percentAvailable/85percentHost/pressure1/scopedCacheClamp/50ms; fresh census can refuse",
+            "numericPriceIsMeasuredPeak":false,"actualTensorShapes":Value::Null,"accepted":false});
+        Ok((caption, vae, forward, receipt))
+    }
+    const CAPTION: &str = "zxq edit: invert each RGB colour channel of image 1 independently, then quantize each channel to the four numeric levels 0, 85, 170, 255; preserve the shapes and keep the result in colour; image 2 is only the RGB level palette; do not copy its layout";
+    const FILES: [(&str, u64, &str); 6] = [
+        (
+            "edit/dataset/src_0.png",
+            420499,
+            "d73f6c0e96e24cbef10c7ccf96858b382139cef11d1d49d53418e261228fa2f4",
+        ),
+        (
+            "edit/dataset/tgt_0.png",
+            10528,
+            "f2a73d842757ad8be8e8119bc1dda3027b13369ca7ddeff16d0ef8bf87e25a8c",
+        ),
+        (
+            "edit/dataset/key.png",
+            5039,
+            "da3be3ca711ec3d0e89df8f1e91bc662365fea188fd513d0108782b6c726189f",
+        ),
+        ("adapters/qwen21_edit_lokr.safetensors", 6759417, DONOR),
+        (
+            "edit/edit-training-protocol.json",
+            115710,
+            "76a782f4daafab7f036c70b5fa7783b171878bfef7f004d76933d17a2660825f",
+        ),
+        (
+            "edit_lokr.json",
+            206306,
+            "be31c7bfdcc769750e1c7d0dffb5c2615301d30a06139f1e9674151d383782e8",
+        ),
+    ];
+
+    fn cfg() -> TrainingConfig {
+        TrainingConfig {
+            rank: 16,
+            alpha: 16.0,
+            learning_rate: 1e-4,
+            steps: 120,
+            gradient_checkpointing: true,
+            resolution: 448,
+            save_every: 0,
+            seed: 42,
+            optimizer: "adamw".into(),
+            network_type: NetworkType::Lokr,
+            ..Default::default()
+        }
+    }
+    fn root() -> PathBuf {
+        let p = PathBuf::from(
+            std::env::var_os("QWEN_IMAGE_2_1_NATIVE12_FIT_INPUT").expect("approved input"),
+        );
+        assert!(p.is_absolute() && p.is_dir());
+        p
+    }
+    fn item(root: &Path) -> TrainingItem {
+        TrainingItem::edit_pair(
+            root.join(FILES[1].0),
+            CAPTION.into(),
+            vec![root.join(FILES[0].0), root.join(FILES[2].0)],
+        )
+    }
+    fn fixed(
+        item: &TrainingItem,
+        actual: &TrainingConfig,
+        root: &Path,
+        sigma_seed: u64,
+        noise_seed: u64,
+    ) -> bool {
+        actual == &cfg()
+            && item.image_path == root.join(FILES[1].0)
+            && item.caption == CAPTION
+            && item.reference_image_paths == [root.join(FILES[0].0), root.join(FILES[2].0)]
+            && sigma_seed == SIGMA_SEED
+            && noise_seed == NOISE_SEED
+    }
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+    fn digest(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+    fn input_contract(root: &Path) -> Value {
+        assert!(fixed(&item(root), &cfg(), root, SIGMA_SEED, NOISE_SEED));
+        assert_eq!(
+            SIGMA_SEED,
+            cfg().seed.wrapping_mul(0x9E37_79B9).wrapping_add(1)
+        );
+        assert_eq!(NOISE_SEED, cfg().seed.wrapping_add(1).wrapping_mul(2) + 1);
+        assert_eq!(digest(format!("{:?}", cfg()).as_bytes()), CONFIG_SHA);
+        let mut files = Vec::new();
+        for (file, bytes, sha) in FILES {
+            let p = root.join(file);
+            assert!(!std::fs::symlink_metadata(&p)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), bytes);
+            assert_eq!(evidence::sha256_file(&p), sha);
+            files.push(json!({"file":file,"bytes":bytes,"sha256":sha}));
+        }
+        let verification = read_json(&root.join("source-artifact-verification.json"));
+        assert_eq!(verification["artifactId"], 11624677663u64);
+        assert_eq!(verification["sourceRunId"], 37934129171u64);
+        assert_eq!(verification["sourceRunAttempt"], 1);
+        assert_eq!(
+            verification["sourceHead"],
+            "89ad519890721ac009d5e0ed095379d7c13cade8"
+        );
+        assert_eq!(verification["sourceRunConclusion"], "failure");
+        assert_eq!(verification["archiveBytes"], 504811549u64);
+        assert_eq!(
+            verification["archiveSha256"],
+            "fa810557ef562f1e4d53a2d0cb73b684e8a8d3ca76c6fb25ab3a15423d3f2e2e"
+        );
+        assert_eq!(verification["fullArchiveAndAllMembersVerified"], true);
+        assert_eq!(verification["memberCount"], 102);
+        assert_eq!(verification["allMembers"].as_array().unwrap().len(), 102);
+        let protocol = read_json(&root.join(FILES[4].0));
+        assert_eq!(
+            protocol["trainingRecipe"]["actualTrainingConfigDebug"],
+            format!("{:?}", cfg())
+        );
+        assert_eq!(
+            protocol["trainingRecipe"]["actualTrainingConfigDebugSha256"],
+            CONFIG_SHA
+        );
+        assert_eq!(protocol["trainingCaption"], CAPTION);
+        let conditioning = &protocol["trainingConditioning"]["actualOrderedInputs"][0];
+        assert_eq!(conditioning["index"], 0);
+        assert_eq!(conditioning["caption"], CAPTION);
+        assert_eq!(conditioning["target"]["sha256"], FILES[1].2);
+        assert_eq!(
+            conditioning["orderedReferences"][0]["image"]["sha256"],
+            FILES[0].2
+        );
+        assert_eq!(
+            conditioning["orderedReferences"][1]["image"]["sha256"],
+            FILES[2].2
+        );
+        let training = read_json(&root.join(FILES[5].0));
+        assert_eq!(training["training"]["adapterSha256"], DONOR);
+        assert_eq!(training["training"]["stepsRun"], 120);
+        assert_eq!(
+            training["training"]["actualTrainingPreflight"],
+            json!({"peakBytes":RETAINED_TRAINING_BACKWARD_FORECAST,"captionBytes":18224996832u64,"latentBytes":12513372624u64,"trainBytes":RETAINED_TRAINING_BACKWARD_FORECAST,"requestedCacheLimitBytes":RETAINED_TRAINING_CACHE})
+        );
+        let headers = safetensors_path_tensor_headers(root.join(FILES[3].0)).unwrap();
+        assert_eq!(headers.len(), 672);
+        assert!(headers
+            .iter()
+            .all(|h| h.dtype == gen_core::weightsmeta::Dtype::F32));
+        let meta = gen_core::weightsmeta::safetensors_file_metadata(root.join(FILES[3].0)).unwrap();
+        for (k, v) in [
+            ("rank", "16"),
+            ("alpha", "16"),
+            ("family", "qwen-image-2-1"),
+            ("networkType", "lokr"),
+            ("trainingMode", "edit"),
+        ] {
+            assert_eq!(meta.get(k).map(String::as_str), Some(v));
+        }
+        json!({"kind":"NATIVE12_ORIGINAL_STEP1_DIAGNOSTIC_ONLY","files":files,
+            "sourceArtifactVerificationSha256":evidence::sha256_file(&root.join("source-artifact-verification.json")),
+            "oldRunId":37934129171u64,"oldAttempt":1,"oldArtifactId":11624677663u64,
+            "oldRootTrainingFitQualificationSha256":"7c4edaedac686697b154d6749ef4ba1ec0884e9629a98fa4406b66e0d0876c05",
+            "oldRootQualificationIsReferenceOnly":true,"oldStep1LossReference":training["training"]["losses"][0],
+            "actualConfigDebug":format!("{:?}",cfg()),"actualConfigDebugSha256":CONFIG_SHA,
+            "sigmaSeed":SIGMA_SEED,"noiseSeed":NOISE_SEED,"itemIndex":0,"caption":CAPTION,
+            "orderedReferenceRoles":["source0","palette-key"],"targetResolution":448,"referenceFitExpected":1024,
+            "fullConservativePreflight":training["training"]["actualTrainingPreflight"],
+            "admissionAllowanceSemantics":"forward-only source-derived price excludes never-executed backward buffers; retained training forecast informational",
+            "availableRamRefusalRisk":"fresh unchanged95%available/85%host/100GB admission can refuse; historical availableRAM is context only",
+            "runtimeAccepted":false,"qualityAccepted":false,"trainingAccepted":false,"donorAccepted":false,"rootAccepted":false,
+            "exactHistoricalTensorReplayClaimed":false,"trainingSteps":0,"backwardCount":0,"optimizerUpdates":0,"renderCount":0,"plannedForwardCount":3})
+    }
+
+    /// Header-only/host guard. No MLX arrays, model loads, native arithmetic or training.
+    #[test]
+    #[ignore]
+    fn rejects_original_step1_request_drift_before_models() {
+        let r = root();
+        let mut contract = input_contract(&r);
+        let dense = PathBuf::from(
+            std::env::var_os("MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT").expect("pinned dense snapshot"),
+        );
+        let (_, _, _, memory_price) = forward_prices(&dense, &r).unwrap();
+        contract["forwardMemoryPriceBeforeModel"] = memory_price;
+        let base = item(&r);
+        let c = cfg();
+        let mut rejected = 0;
+        for k in 0..12 {
+            let mut m = base.clone();
+            let mut mc = c.clone();
+            let (mut ss, mut ns) = (SIGMA_SEED, NOISE_SEED);
+            match k {
+                0 => mc.resolution = 768,
+                1 => mc.seed = 43,
+                2 => mc.alpha = 8.0,
+                3 => mc.rank = 8,
+                4 => mc.timestep_type = "uniform".into(),
+                5 => mc.train_dtype = "f32".into(),
+                6 => m.reference_image_paths.reverse(),
+                7 => {
+                    m.reference_image_paths.pop();
+                }
+                8 => m.caption = "wrong caption".into(),
+                9 => m.image_path = r.join("edit/dataset/src_0.png"),
+                10 => ss += 1,
+                _ => ns += 1,
+            }
+            assert!(!fixed(&m, &mc, &r, ss, ns));
+            rejected += 1;
+        }
+        evidence::write_json(
+            &evidence::out_dir(),
+            "native12-step1-cpu-guard",
+            &json!({"contract":contract,"actualCpuRequestMutantsRejected":rejected,"nativeArithmeticExecuted":false,"accepted":false}),
+        );
+    }
+
+    struct Retire;
+    impl Drop for Retire {
+        fn drop(&mut self) {
+            crate::q4_diagnostic::retirement_boundary();
+        }
+    }
+    /// All component lifecycles use the unchanged admission/watchdog/cache grant.
+    /// Guards precede native locals, so unwinding releases models before policy restoration.
+    fn scoped<T>(
+        out: &Path,
+        label: &str,
+        price: ForwardPrice,
+        run: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let dir = out.join(label);
+        std::fs::create_dir(&dir)?;
+        let before = AllocatorBounds::current();
+        let guard = evidence::Footprint::start(&dir);
+        let cache = guard.admit_numeric_scoped(price.active, price.transient());
+        let bounds = AllocatorBounds::enter(price.resident, price.transient());
+        let installed = AllocatorBounds::current();
+        guard.begin();
+        let baseline_active = mlx_rs::memory::get_active_memory() as u64;
+        let result = {
+            let _retire = Retire;
+            run()
+        };
+        let retired_active = mlx_rs::memory::get_active_memory() as u64;
+        // Returned cached tensors are small; a retained heavy component is refused
+        // before the next lifecycle. This is a measured bound, not perfect deallocation.
+        if result.is_ok() {
+            assert!(
+                retired_active <= baseline_active + (64 << 20),
+                "retired component exceeds owned cached-array allowance"
+            );
+        }
+        let (active_peak, physical_peak) = guard.end();
+        drop(bounds);
+        drop(cache);
+        let after = AllocatorBounds::current();
+        drop(guard); // Physical sampler is joined before final receipt.
+        evidence::write_json(
+            &dir,
+            "lifecycle",
+            &json!({"label":label,"declaredActiveEnvelopeBytes":price.active,"declaredResidentBytes":price.resident,"requestedFreeCacheAllowanceBytes":price.transient(),"actualLimitsBefore":{"memory":before.0,"cache":before.1},
+            "actualLimitsInstalled":{"memory":installed.0,"cache":installed.1},"actualLimitsAfter":{"memory":after.0,"cache":after.1},
+            "observedActivePeakBytes":active_peak,"observedPhysicalPeakBytes":physical_peak,"samplerJoined":true,
+            "baselineActiveBytes":baseline_active,"retiredActiveBytes":retired_active,"retirementAllowanceBytes":64u64<<20,"returnedCachedArraysCharged":true,
+            "limitsRestored":before==after,"resultReturned":result.is_ok(),"accepted":false}),
+        );
+        assert_eq!(before, after, "actual allocator policy restoration");
+        result
+    }
+    /// Save ORIGINAL dtype payload. Hash its actual safetensors operand bytes, not a cast.
+    fn capture(out: &Path, name: &str, a: &Array) -> Result<Value> {
+        eval([a])?;
+        let p = out.join(format!("{name}.safetensors"));
+        Array::save_safetensors(vec![(name.to_owned(), a)], None, &p)?;
+        let b = std::fs::read(&p)?;
+        let n = u64::from_le_bytes(b[..8].try_into().unwrap()) as usize;
+        let h: Value = serde_json::from_slice(&b[8..8 + n]).unwrap();
+        let t = &h[name];
+        let lo = t["data_offsets"][0].as_u64().unwrap() as usize;
+        let hi = t["data_offsets"][1].as_u64().unwrap() as usize;
+        assert_eq!(t["shape"], json!(a.shape()));
+        Ok(
+            json!({"name":name,"file":p.file_name().unwrap().to_string_lossy(),"actualShape":a.shape(),
+            "actualNativeDtype":format!("{:?}",a.dtype()),"storedDtype":t["dtype"],"operandBytes":hi-lo,
+            "operandSha256":digest(&b[8+n+lo..8+n+hi]),"fileBytes":b.len(),"fileSha256":digest(&b),"observation":"actual evaluated tensor, original dtype safetensors payload"}),
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn original_step1_three_serial_bf16_velocity_forwards() -> Result<()> {
+        let r = root();
+        let mut contract = input_contract(&r);
+        let c = cfg();
+        let item = item(&r);
+        let out = evidence::out_dir().join("native12-step1-velocity");
+        std::fs::create_dir(&out)?;
+        assert_eq!(
+            std::env::var("QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB").as_deref(),
+            Ok("100")
+        );
+        assert_eq!(std::env::var("RUNNER_NAME").as_deref(), Ok("nax-macos-2"));
+        contract["sourceBeforeModelSha256"] = json!(evidence::sha256_file(
+            &evidence::out_dir().join("source-before-model.json")
+        ));
+        contract["nativeLibBuildIdentitySha256"] = json!(evidence::sha256_file(
+            &evidence::out_dir().join("mlx-lib-test-build-identity.json")
+        ));
+        let dense = PathBuf::from(
+            std::env::var_os("MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT").expect("pinned dense snapshot"),
+        );
+        assert_eq!(
+            dense.file_name().and_then(|x| x.to_str()),
+            Some("790c92633540aa0cb11d9abf19eb46d861714758")
+        );
+        let (caption_price, vae_price, forward_price, memory_price) = forward_prices(&dense, &r)?;
+        evidence::write_json(&out, "forward-memory-price-before-model", &memory_price);
+        contract["forwardMemoryPrice"] = memory_price;
+        // A joined process-wide guard also covers small cached/noising/capture arrays
+        // between the freshly admitted component lifecycles below.
+        let original_limits = AllocatorBounds::current();
+        let process_guard = evidence::Footprint::start(&out);
+        let process_cache =
+            process_guard.admit_numeric_scoped(forward_price.active, forward_price.transient());
+        let process_bounds =
+            AllocatorBounds::enter(forward_price.resident, forward_price.transient());
+        let process_retire = Retire;
+        process_guard.begin();
+        let tokenizer = loader::load_tokenizer(&dense)?;
+        let drop_count = system_prompt_drop_count(&tokenizer)?;
+        let vision = loader::load_vision_config(&dense)?.expect("production vision");
+        let tokens = tokenizer.tokenize_preformatted(&prompt_template_ti2i(
+            &item.caption,
+            item.reference_image_paths.len(),
+        ))?;
+        contract["actualHostTokenizerPreExpansionIds"] = json!(tokens.ids);
+        contract["actualInternalExpandedEncoderIds"] = Value::Null;
+        contract["internalIdsObservationLimit"]=json!("private trainer helper returns text/layout, not the encoder's expanded IDs; no extra encoding pass");
+        let branch = scoped(&out, "conditioning", caption_price, || {
+            let encoder =
+                loader::load_text_encoder_from(&dense.join("text_encoder"), Some(&vision))?;
+            let (mut branches, prepared) =
+                item_branches(&encoder, &tokenizer, drop_count, &item, &[c.resolution])?;
+            assert_eq!(branches.len(), 1);
+            assert_eq!(prepared.len(), 2);
+            assert!(prepared
+                .iter()
+                .all(|p| p.size == (1024, 1024) && p.latent_tokens() == 4096));
+            contract["actualPreparedReferenceMetadata"]=json!(prepared.iter().enumerate().map(|(i,p)|json!({"orderedIndex":i,"size":p.size,"gridThw":p.grid_thw,"visionSlots":p.vision_slots(),"latentGrid":p.latent_grid()})).collect::<Vec<_>>());
+            let branch = branches.remove(0);
+            drop(prepared);
+            drop(encoder);
+            Ok(branch)
+        })?;
+        let (x0, references) = scoped(&out, "vae-cache", vae_price, || {
+            let vae = loader::load_vae(&dense)?;
+            let mut targets =
+                encode_item_targets(&vae, &item, &[c.resolution], c.subject_mask_loss.as_ref())?;
+            assert_eq!(targets.len(), 1);
+            let (x0, mask) = targets.remove(0);
+            assert!(mask.is_none());
+            let refs = encode_item_references(&vae, Some(&vision), &item)?;
+            eval(std::iter::once(&x0).chain(refs.iter()))?;
+            drop(vae);
+            Ok((x0, refs))
+        })?;
+        assert_eq!(x0.shape(), &[1, 784, 64]);
+        assert_eq!(branch.text.shape()[1], 87);
+        assert!(references.iter().all(|a| a.shape() == [1, 4096, 64]));
+        let sigma = sample_sigma(&c.timestep_type, &c.timestep_bias, SIGMA_SEED)?;
+        assert!(sigma.is_finite() && (0.001..=0.999).contains(&sigma));
+        let noise = random::normal::<f32>(x0.shape(), None, None, Some(&random::key(NOISE_SEED)?))?;
+        let (xt_f32, teacher) = build_batch(&x0, &noise, sigma)?;
+        let xt = xt_f32.as_dtype(resolve_compute_dtype(&c.train_dtype))?;
+        eval([&x0, &noise, &xt_f32, &xt, &teacher, &branch.text])?;
+        let mut captures = Vec::new();
+        for (n, a) in [
+            ("x0", &x0),
+            ("noise", &noise),
+            ("xt_f32", &xt_f32),
+            ("xt_bf16", &xt),
+            ("teacher_velocity", &teacher),
+            ("text_feature", &branch.text),
+        ] {
+            captures.push(capture(&out, n, a)?);
+        }
+        assert_eq!(references.len(), 2);
+        for (i, a) in references.iter().enumerate() {
+            captures.push(capture(&out, &format!("reference_{i}_latent"), a)?);
+        }
+        let positions = branch.layout.position_ids();
+        assert_eq!(positions.len(), 9063);
+        let mut cursor = 0usize;
+        let mut image = 0usize;
+        let segments = branch
+            .layout
+            .segments
+            .iter()
+            .map(|s| {
+                let (len, kind, index) = match s {
+                    crate::transformer::Segment::Text { len } => (*len, "text", None),
+                    crate::transformer::Segment::Image { height, width } => {
+                        let i = image;
+                        image += 1;
+                        (
+                            height * width,
+                            if i < 2 { "reference" } else { "target" },
+                            Some(i),
+                        )
+                    }
+                };
+                let start = cursor;
+                cursor += len;
+                json!({"start":start,"end":cursor,"kind":kind,"imageIndex":index})
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cursor, positions.len());
+        evidence::write_json(
+            &out,
+            "actual-conditioning-position-ids",
+            &json!({"actualSharedLayoutDebug":format!("{:?}",branch.layout),"actualPositionIds":positions,"actualSegmentOwnership":segments,"source":"position_ids() on actual item_branches returned layout","accepted":false}),
+        );
+        contract["actualSigma"] = json!(sigma);
+        contract["actualOperandCaptures"] = json!(captures);
+        contract["actualPositionIdsReceiptSha256"] = json!(evidence::sha256_file(
+            &out.join("actual-conditioning-position-ids.json")
+        ));
+        evidence::write_json(&out, "contract", &contract);
+        let donor = r.join(FILES[3].0);
+        let mut velocities = Vec::new();
+        let mut forwards = 0;
+        for label in [
+            "A_zero_init_checkpointed",
+            "B_saved_factors_checkpointed",
+            "C_public_import_ordinary",
+        ] {
+            let velocity = scoped(&out, label, forward_price, || {
+                let mut dit = loader::load_transformer(&dense)?;
+                assert!(!dit.is_quantized());
+                if dit.compute_dtype() != Dtype::Bfloat16 {
+                    dit.cast_weights(Dtype::Bfloat16)?;
+                }
+                assert_eq!(dit.compute_dtype(), Dtype::Bfloat16);
+                let images = joint_images(&references, &xt);
+                let velocity = if label == "C_public_import_ordinary" {
+                    let report = crate::apply_qwen_image_2_1_adapters(
+                        &mut dit,
+                        &[AdapterSpec::new(donor.clone(), 1.0, AdapterKind::Lokr)],
+                    )?;
+                    assert!(report.unmatched_paths.is_empty());
+                    assert_eq!(report.applied, 224);
+                    dit.forward_joint(&branch.text, &images, sigma, &branch.layout)?
+                } else {
+                    let paths = resolve_target_paths(&dit, &c);
+                    assert_eq!(paths.len(), 224);
+                    let (targets, mut params) = build_lokr_targets(
+                        &mut dit,
+                        &paths,
+                        c.rank as i32,
+                        c.decompose_factor,
+                        c.seed,
+                    )?;
+                    if label == "B_saved_factors_checkpointed" {
+                        let weights = Weights::from_file(&donor)?;
+                        assert_eq!(weights.keys().count(), params.len());
+                        assert_eq!(params.len(), 672);
+                        for (k, a) in &mut params {
+                            let stored = weights.require(k.as_ref())?;
+                            assert_eq!(stored.shape(), a.shape());
+                            assert_eq!(stored.dtype(), Dtype::Float32);
+                            *a = stored.clone();
+                        }
+                    }
+                    eval(params.values())?;
+                    let blocks = block_trainables(&mut dit, &paths, &params, &c)?;
+                    let adapter = TrainAdapter::Lokr { targets };
+                    adapter.install_as(
+                        &mut dit,
+                        &params,
+                        c.alpha,
+                        c.rank as f32,
+                        Some(Dtype::Bfloat16),
+                        LOKR_DTYPE,
+                    )?;
+                    let value = dit.forward_checkpointed_joint(
+                        &branch.text,
+                        &images,
+                        sigma,
+                        &branch.layout,
+                        &CheckpointedTrainables {
+                            params: &params,
+                            blocks: &blocks,
+                            alpha: c.alpha,
+                            rank: c.rank as f32,
+                            lora_dtype: Some(Dtype::Bfloat16),
+                            lokr_dtype: LOKR_DTYPE,
+                        },
+                    )?;
+                    eval([&value])?;
+                    drop(blocks);
+                    drop(adapter);
+                    drop(params);
+                    value
+                };
+                eval([&velocity])?;
+                drop(images);
+                drop(dit);
+                Ok(velocity)
+            })?;
+            forwards += 1;
+            assert_eq!(velocity.dtype(), Dtype::Float32);
+            assert_eq!(velocity.shape(), teacher.shape());
+            velocities.push(capture(&out, label, &velocity)?);
+            drop(velocity);
+        }
+        assert_eq!(forwards, 3);
+        assert_eq!(evidence::sha256_file(&donor), DONOR);
+        // Re-capture immutable teacher operands after all3; physical payload hashes must match.
+        let stable = capture(&out, "teacher_velocity_after", &teacher)?;
+        assert_eq!(stable["operandSha256"], captures[4]["operandSha256"]);
+        drop(references);
+        drop(branch);
+        drop(x0);
+        drop(noise);
+        drop(xt_f32);
+        drop(xt);
+        drop(teacher);
+        drop(process_retire);
+        let (process_active_peak, process_physical_peak) = process_guard.end();
+        drop(process_bounds);
+        drop(process_cache);
+        let final_limits = AllocatorBounds::current();
+        drop(process_guard);
+        assert_eq!(original_limits, final_limits);
+        evidence::write_json(
+            &out,
+            "process-lifecycle",
+            &json!({
+            "originalLimits": {"memory":original_limits.0,"cache":original_limits.1},
+            "finalLimits": {"memory":final_limits.0,"cache":final_limits.1},
+            "limitsRestored":true,"samplerJoined":true,
+            "observedActivePeakBytes":process_active_peak,"observedPhysicalPeakBytes":process_physical_peak,
+            "accepted":false}),
+        );
+        evidence::write_json(
+            &out,
+            "results",
+            &json!({"contractSha256":evidence::sha256_file(&out.join("contract.json")),"actualForwardCount":forwards,
+            "velocityCaptures":velocities,"teacherAfter":stable,"trainingSteps":0,"backwardCount":0,"optimizerUpdates":0,"renderCount":0,
+            "sigma":sigma,"nativeMseComputed":false,"cpuNumericAnalysisPending":true,"parityEpsilon":Value::Null,
+            "originalLossIsReferenceOnly":true,"runtimeAccepted":false,"qualityAccepted":false,"trainingAccepted":false,"donorAccepted":false,"rootAccepted":false}),
+        );
+        Ok(())
+    }
+}
