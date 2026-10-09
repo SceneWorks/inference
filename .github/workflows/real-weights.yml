@@ -1,5 +1,5 @@
-# Isolated manual campaign ref; registered workflow312370029. No product-main transport merge.
-name: '[Mac2] SC-24163 matched-conditioning448 recipe campaign'
+# Isolated diagnostic transport only; registered workflow312370029. No product-main merge.
+name: '[Mac2] SC-24163 native12 training-content diagnostic'
 'on':
   workflow_dispatch:
     inputs:
@@ -18,173 +18,206 @@ name: '[Mac2] SC-24163 matched-conditioning448 recipe campaign'
       qwen_image_2_1_lora_phase:
         type: choice
         required: true
-        default: edit
+        default: training-fit-diagnostic
         options:
-        - edit
-      qwen_image_2_1_third_party_lora:
-        type: choice
-        required: true
-        default: prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA@382d066d079854a86c9513f3c5a4026ada21ddbe:Qwen-Image-2.1-Natural-Exposure-LoRA-4000.safetensors
-        options:
-        - prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA@382d066d079854a86c9513f3c5a4026ada21ddbe:Qwen-Image-2.1-Natural-Exposure-LoRA-4000.safetensors
+        - training-fit-diagnostic
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: sc24163-matched-conditioning448-${{ github.ref }}
+  group: sc24163-native13-training-fit-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   mlx-qwen-image-2-1:
-    name: '[Mac2] SC-24163 matched-conditioning448 dense BF16 campaign'
+    name: '[Mac2] SC-24163 native12 four-render training-content fit'
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx' && inputs.qwen_image_2_1_lora_runner
-      == 'rw-mage' && inputs.qwen_image_2_1_lora_phase == 'edit'
+      == 'rw-mage' && inputs.qwen_image_2_1_lora_phase == 'training-fit-diagnostic'
     runs-on:
     - self-hosted
     - macOS
     - ARM64
     - rw-mage
-    timeout-minutes: 300
-    permissions:
-      actions: read
-      contents: read
+    timeout-minutes: 90
     env:
-      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
-      MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--Qwen--Qwen-Image-2.1/snapshots/790c92633540aa0cb11d9abf19eb46d861714758
-      MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--SceneWorks--qwen-image-2-1-mlx/snapshots/1691de01c24a070131e0a28bf4c065fd027f4fe9
-      QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC: ${{ inputs.qwen_image_2_1_third_party_lora }}
-      QWEN_IMAGE_2_1_LORA_PHASE: ${{ inputs.qwen_image_2_1_lora_phase }}
       CARGO_PROFILE_RELEASE_STRIP: none
       QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB: '100'
-      QWEN_IMAGE_2_1_LORA_EDIT_STEPS: '120'
-      QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS: '1'
+      QWEN_IMAGE_2_1_LORA_PHASE: training-fit-diagnostic
+      HF_HUB_OFFLINE: '1'
+      HF_DATASETS_OFFLINE: '1'
     steps:
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       with:
         fetch-depth: 1
-    - name: Require the one-shot Mac2 edit campaign owner
-      shell: bash
-      run: |
-        [[ "$RUNNER_NAME" == nax-macos-2 && "$GITHUB_RUN_ATTEMPT" == 1 ]]
-        [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" && -z "$(git status --porcelain)" ]]
-    - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-      with:
-        toolchain: 1.96.0
-    - name: Initialize isolated Qwen-Image 2.1 Cargo target
+    - name: Initialize exclusively owned native13 paths and bind source
       shell: bash
       run: |
         set -euo pipefail
-        [[ "$RUNNER_TEMP" = /* ]]
-        [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
-        [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
-        target="$RUNNER_TEMP/qwen-image-2-1-cargo-target-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-        [[ ! -e "$target" ]]
-        mkdir "$target"
-        printf 'CARGO_TARGET_DIR=%s\n' "$target" >> "$GITHUB_ENV"
-    - name: Resolve runner-local snapshot paths
-      run: python3.12 scripts/release/resolve_snapshot_paths.py MLX_GEN_MODELS_ROOT MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT
-    - name: Toolchain versions
-      run: rustc --version && cargo --version
-    - name: Require the resolved snapshot paths and initialize evidence
-      run: source scripts/ci/real-weights/mlx-qwen-image-2-1/require-the-resolved-snapshot-paths-and-initialize-evidence.sh
-    - name: Report runner disk headroom
-      continue-on-error: true
-      run: scripts/ci/report_runner_disk_headroom.sh MLX_GEN_MODELS_ROOT MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT
-    - name: Record the macOS device inventory
-      continue-on-error: true
+        [[ "$RUNNER_NAME" == nax-macos-2 && "$GITHUB_RUN_ATTEMPT" == 1 ]]
+        [[ "$RUNNER_TEMP" = /* && "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+        [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" && -z "$(git status --porcelain)" ]]
+        owned="$RUNNER_TEMP/sc24163-native13-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        [[ ! -e "$owned" ]]
+        mkdir "$owned" "$owned/evidence" "$owned/cargo-target" "$owned/download"
+        printf '%s\n' "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" > "$owned/OWNER"
+        printf 'SC24163_NATIVE13_OWNED=%s\nCARGO_TARGET_DIR=%s\nQWEN_IMAGE_2_1_RENDER_OUT=%s\nQWEN_IMAGE_2_1_NATIVE12_FIT_INPUT=%s\n' \
+          "$owned" "$owned/cargo-target" "$owned/evidence" "$owned/evidence/approved-native12" >> "$GITHUB_ENV"
+        git fetch --no-tags --depth=1 origin 004cee41f380ff263796ad90277e5f6224d73ae3 89ad519890721ac009d5e0ed095379d7c13cade8
+        python3.12 - "$owned/evidence" <<'PY'
+        import subprocess,sys,pathlib,json,hashlib,os
+        out=pathlib.Path(sys.argv[1]);base='004cee41f380ff263796ad90277e5f6224d73ae3';parent='89ad519890721ac009d5e0ed095379d7c13cade8'
+        def git(*a):return subprocess.check_output(['git',*a])
+        head=git('rev-parse','HEAD').decode().strip();assert head==os.environ['GITHUB_SHA']
+        parents=[l.split()[1] for l in git('cat-file','-p',head).decode().splitlines() if l.startswith('parent ')]
+        assert parents==[parent]
+        def tree(ref):
+         return {r.split(b'\t',1)[1].decode():r.split(b'\t',1)[0].split()[2].decode() for r in git('ls-tree','-rz',ref).split(b'\0') if r}
+        a=tree(base);b=tree(head);assert a.keys()==b.keys()
+        changed=sorted(k for k in a if a[k]!=b[k])
+        assert changed==['.github/workflows/real-weights.yml','crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs']
+        protected=['crates/media/mlx-gen/src/adapters.rs','crates/media/mlx-gen/src/quant.rs','crates/media/mlx-gen/src/nn.rs','crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/adapters.rs','crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/transformer.rs','crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs','Cargo.toml','Cargo.lock']
+        rows=[]
+        for f in protected+changed:
+         z=pathlib.Path(f).read_bytes();blob=git('hash-object','--path='+f,f).decode().strip();assert blob==b[f]
+         rows.append({'file':f,'physicalBytes':len(z),'physicalSha256':hashlib.sha256(z).hexdigest(),'canonicalBlob':blob,'canonicalSha256':hashlib.sha256(git('show',head+':'+f)).hexdigest(),'protected':f in protected})
+        (out/'source-before-model.json').write_text(json.dumps({'head':head,'tree':git('rev-parse','HEAD^{tree}').decode().strip(),'parent':parent,'productBase':base,'changed':changed,'unchangedCanonicalBlobCount':len(a)-2,'rows':rows,'accepted':False},indent=2)+'\n')
+        PY
+    - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      with:
+        toolchain: 1.96.0
+    - name: Verify existing internal cache snapshots; never download models
+      shell: bash
       run: |
+        set -euo pipefail
+        lane_root="$HOME/sceneworks-rw-weights"
+        [[ -d "$lane_root" && ! -L "$lane_root" ]]
+        python3.12 scripts/ci/qwen21_weights_root.py "$lane_root"
+        python3.12 - "$lane_root" "$QWEN_IMAGE_2_1_RENDER_OUT" <<'PY'
+        import pathlib,os,subprocess,json,sys
+        root=pathlib.Path(sys.argv[1]).resolve(strict=True);data=pathlib.Path('/System/Volumes/Data')
+        assert data.is_dir() and os.stat(root).st_dev==os.stat(data).st_dev
+        mounts=subprocess.check_output(['/sbin/mount'],text=True).splitlines()
+        line=next(x for x in mounts if ' on /System/Volumes/Data (apfs,' in x)
+        (pathlib.Path(sys.argv[2])/'internal-apfs-cache.json').write_text(json.dumps({'cacheRoot':str(root),'dataVolume':str(data),'sameDevice':True,'deviceId':os.stat(root).st_dev,'mount':line,'readOnlyVerification':True},indent=2)+'\n')
+        PY
+        hub="$lane_root/hub"
+        [[ -d "$hub" && ! -L "$hub" ]]
+        dense="$hub/models--Qwen--Qwen-Image-2.1/snapshots/790c92633540aa0cb11d9abf19eb46d861714758"
+        tiers="$hub/models--SceneWorks--qwen-image-2-1-mlx/snapshots/1691de01c24a070131e0a28bf4c065fd027f4fe9"
+        python3.12 scripts/release/verify_model_snapshot.py --model qwen-image-2-1 --snapshot "$dense"
+        python3.12 scripts/release/verify_model_snapshot.py --model qwen-image-2-1-mlx-tiers --snapshot "$tiers"
+        printf 'MLX_GEN_MODELS_ROOT=%s\nMLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT=%s\nMLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT=%s\n' "$hub" "$dense" "$tiers" >> "$GITHUB_ENV"
+        printf 'existing internal APFS snapshots only: %s\n%s\n' "$dense" "$tiers" > "$QWEN_IMAGE_2_1_RENDER_OUT/snapshot-location.txt"
+    - name: Record macOS inventory
+      shell: bash
+      run: |
+        set -euo pipefail
         sysctl -n hw.model hw.memsize machdep.cpu.brand_string | tee "$QWEN_IMAGE_2_1_RENDER_OUT/device-inventory.txt"
         python3.12 scripts/ci/qwen21_host_census.py --out "$QWEN_IMAGE_2_1_RENDER_OUT/host-census"
-    - name: Build the Qwen-Image 2.1 MLX test binary
-      run: source scripts/ci/real-weights/mlx-qwen-image-2-1/build-and-record-mlx-library-identity.sh
-    - name: Prove the actual matched-conditioning448 configuration binding
+    - name: Import only the exact rejected native12 artifact bytes
+      shell: bash
+      run: |
+        set -euo pipefail
+        work="$SC24163_NATIVE13_OWNED/download"
+        input="$QWEN_IMAGE_2_1_NATIVE12_FIT_INPUT"
+        [[ -d "$work" && ! -e "$input" ]]
+        mkdir "$input"
+        gh api --method GET repos/SceneWorks/inference/actions/artifacts/11624677663 > "$input/source-artifact-metadata.json"
+        gh api --method GET repos/SceneWorks/inference/actions/runs/37934129171/attempts/1 > "$input/source-run-attempt.json"
+        python3.12 - "$input" <<'PY'
+        import pathlib,json,sys
+        p=pathlib.Path(sys.argv[1]);a=json.loads((p/'source-artifact-metadata.json').read_text());r=json.loads((p/'source-run-attempt.json').read_text())
+        assert a['id']==11624677663 and a['name']=='qwen-image-2-1-mlx-evidence' and not a['expired']
+        assert a['size_in_bytes']==504811549 and a['digest']=='sha256:fa810557ef562f1e4d53a2d0cb73b684e8a8d3ca76c6fb25ab3a15423d3f2e2e'
+        assert a['workflow_run']['id']==37934129171 and a['workflow_run']['head_sha']=='89ad519890721ac009d5e0ed095379d7c13cade8'
+        assert r['id']==37934129171 and r['run_attempt']==1 and r['head_sha']=='89ad519890721ac009d5e0ed095379d7c13cade8'
+        assert r['status']=='completed' and r['conclusion']=='failure'
+        PY
+        gh api --method GET repos/SceneWorks/inference/actions/artifacts/11624677663/zip > "$work/native12.zip.partial"
+        mv "$work/native12.zip.partial" "$work/native12.zip"
+        python3.12 - "$work/native12.zip" "$input" <<'PY'
+        import pathlib,json,sys,hashlib,zipfile,stat
+        archive=pathlib.Path(sys.argv[1]);out=pathlib.Path(sys.argv[2]);sha=hashlib.sha256()
+        with archive.open('rb') as f:
+         for b in iter(lambda:f.read(1048576),b''):sha.update(b)
+        actual=sha.hexdigest();assert archive.stat().st_size==504811549
+        assert actual=='fa810557ef562f1e4d53a2d0cb73b684e8a8d3ca76c6fb25ab3a15423d3f2e2e'
+        selected={
+         'edit/dataset/src_0.png':(420499,'d73f6c0e96e24cbef10c7ccf96858b382139cef11d1d49d53418e261228fa2f4'),
+         'edit/dataset/tgt_0.png':(10528,'f2a73d842757ad8be8e8119bc1dda3027b13369ca7ddeff16d0ef8bf87e25a8c'),
+         'edit/dataset/key.png':(5039,'da3be3ca711ec3d0e89df8f1e91bc662365fea188fd513d0108782b6c726189f'),
+         'adapters/qwen21_edit_lokr.safetensors':(6759417,'6bc315825dcc8f7748d2bd9df08c7a9f93dd3bd0d31b1221939c46a6111c3c54'),
+         'edit/edit-training-protocol.json':(115710,'76a782f4daafab7f036c70b5fa7783b171878bfef7f004d76933d17a2660825f'),
+         'edit_lokr.json':(206306,'be31c7bfdcc769750e1c7d0dffb5c2615301d30a06139f1e9674151d383782e8')}
+        rows=[];seen=set()
+        with zipfile.ZipFile(archive) as z:
+         for info in z.infolist():
+          name=info.filename;path=pathlib.PurePosixPath(name)
+          assert name not in seen and '\\' not in name and not path.is_absolute() and '..' not in path.parts and ':' not in name
+          seen.add(name);assert not stat.S_ISLNK(info.external_attr>>16)
+          if info.is_dir():continue
+          h=hashlib.sha256();count=0
+          with z.open(info) as f:
+           for chunk in iter(lambda:f.read(1048576),b''):h.update(chunk);count+=len(chunk)
+          assert count==info.file_size # reading to EOF also validates native ZIP CRC for EVERY member
+          digest=h.hexdigest();rows.append({'file':name,'bytes':count,'sha256':digest,'crc32':f'{info.CRC:08x}'})
+          if name in selected:
+           assert (count,digest)==selected[name]
+           dest=out/name;dest.parent.mkdir(parents=True,exist_ok=True)
+           with z.open(info) as f, dest.open('xb') as g:
+            for chunk in iter(lambda:f.read(1048576),b''):g.write(chunk)
+        assert len(rows)==102 and set(selected).issubset(seen)
+        record={'schema':'native12-training-fit-approved-source-v1','artifactId':11624677663,'sourceRunId':37934129171,'sourceRunAttempt':1,'sourceHead':'89ad519890721ac009d5e0ed095379d7c13cade8','sourceRunConclusion':'failure','archiveSha256':actual,'archiveBytes':archive.stat().st_size,'memberCount':len(rows),'allMembers':rows,'fullArchiveAndAllMembersVerified':True,'selectedInputs':[{'file':k,'bytes':v[0],'sha256':v[1]} for k,v in selected.items()],'runtimeAccepted':False,'qualityAccepted':False,'trainingAccepted':False,'donorAccepted':False,'rootAccepted':False}
+        (out/'source-artifact-verification.json').write_text(json.dumps(record,indent=2)+'\n')
+        PY
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Build and retain exact existing integration binary identity
+      shell: bash
+      run: |
+        set -euo pipefail
+        source scripts/ci/real-weights/mlx-qwen-image-2-1/build-and-record-mlx-library-identity.sh
+    - name: Prove exact imported training item and request before models
       shell: bash
       run: |
         set -euo pipefail
         cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
-          lora_real_weights::matched_edit_training_request_rejects_conditioning_and_config_drift \
-          -- --exact --nocapture --test-threads 1 2>&1 | tee "$QWEN_IMAGE_2_1_RENDER_OUT/matched-conditioning-guard.log"
-        grep -qE 'test result: ok\. 1 passed' "$QWEN_IMAGE_2_1_RENDER_OUT/matched-conditioning-guard.log"
-    - name: Prove trained velocity survives adapter save and reload
-      if: inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
-      run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
-    - name: Materialize and verify immutable snapshots
-      run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-and-verify-immutable-snapshots.sh
-    - name: Verify the approved transferred-adapter cache
-      id: qwen21_transfer_cache
-      if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase
-        != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
+          lora_real_weights::native12_training_fit_rejects_input_and_request_drift \
+          -- --ignored --exact --nocapture --test-threads 1 2>&1 | tee "$QWEN_IMAGE_2_1_RENDER_OUT/native12-fit-guard.log"
+        grep -qE 'test result: ok\. 1 passed' "$QWEN_IMAGE_2_1_RENDER_OUT/native12-fit-guard.log"
+    - name: Run exactly four serial training-content fit renders; no training
       shell: bash
       run: |
-        [[ "$RUNNER_NAME" == "nax-macos-2" ]]
-        cache_base="$HOME/sceneworks-rw-weights"
-        [[ "$cache_base" == /* && -d "$cache_base" && ! -L "$cache_base" ]]
-        status="$(python3.12 scripts/ci/qwen21_adapter_imports.py \
-          --manifest scripts/ci/qwen21_adapter_imports.json \
-          --cache-status --source-cache-root "$cache_base")"
-        printf '%s\n' "$status" >> "$GITHUB_OUTPUT"
-        if [[ "$status" == "hit=true" ]]; then
-          printf 'QWEN21_TRANSFER_CACHE_BASE=%s\n' "$cache_base" >> "$GITHUB_ENV"
-        fi
-    - name: Verify the approved transferred-adapter artifact identity
-      if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase
-        != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory' && steps.qwen21_transfer_cache.outputs.hit
-        == 'false'
-      env:
-        GH_TOKEN: ${{ github.token }}
+        set -euo pipefail
+        cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
+          lora_real_weights::native12_training_content_fit_four_renders \
+          -- --ignored --exact --nocapture --test-threads 1 2>&1 | tee "$QWEN_IMAGE_2_1_RENDER_OUT/native12-fit-render.log"
+        grep -qE 'test result: ok\. 1 passed' "$QWEN_IMAGE_2_1_RENDER_OUT/native12-fit-render.log"
+    - name: Retire only owned Cargo/download directories on every exit
       shell: bash
       run: |
-        metadata="$RUNNER_TEMP/qwen21-transfer-source-37392084691.metadata.json"
-        [[ ! -e "$metadata" ]]
-        gh api --method GET repos/SceneWorks/inference/actions/artifacts/11383988900 > "$metadata"
-        python3.12 scripts/ci/qwen21_adapter_imports.py \
-          --manifest scripts/ci/qwen21_adapter_imports.json \
-          --verify-source-artifact --source-artifact-metadata "$metadata"
-    - name: Download and verify the approved transferred-adapter source
-      if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase
-        != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory' && steps.qwen21_transfer_cache.outputs.hit
-        == 'false'
-      env:
-        GH_TOKEN: ${{ github.token }}
-      shell: bash
-      run: |
-        archive="$RUNNER_TEMP/qwen21-transfer-source-37392084691.zip"
-        source_root="$RUNNER_TEMP/qwen21-transfer-source-37392084691"
-        [[ ! -e "$archive" && ! -e "$source_root" ]]
-        partial="$(mktemp "$RUNNER_TEMP/qwen21-transfer-source-37392084691.XXXXXX.zip")"
-        trap 'rm -f "$partial"' EXIT
-        gh api --method GET repos/SceneWorks/inference/actions/artifacts/11383988900/zip > "$partial"
-        mv "$partial" "$archive"
-        python3.12 scripts/ci/qwen21_adapter_imports.py \
-          --manifest scripts/ci/qwen21_adapter_imports.json \
-          --extract-source-archive "$archive" --archive-destination "$source_root" \
-          --source-artifact-metadata "$RUNNER_TEMP/qwen21-transfer-source-37392084691.metadata.json"
-    - name: Atomically stage the approved transferred-adapter cache
-      if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase
-        != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory' && steps.qwen21_transfer_cache.outputs.hit
-        == 'false'
-      shell: bash
-      run: |
-        [[ "$RUNNER_NAME" == "nax-macos-2" ]]
-        cache_base="$HOME/sceneworks-rw-weights"
-        python3.12 scripts/ci/qwen21_adapter_imports.py \
-          --manifest scripts/ci/qwen21_adapter_imports.json \
-          --stage-source "$RUNNER_TEMP/qwen21-transfer-source-37392084691/imports/adapters" \
-          --source-cache-root "$cache_base" \
-          --source-artifact-metadata "$RUNNER_TEMP/qwen21-transfer-source-37392084691.metadata.json"
-        printf 'QWEN21_TRANSFER_CACHE_BASE=%s\n' "$cache_base" >> "$GITHUB_ENV"
-    - name: Materialize hash-pinned transferred adapters
-      if: inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase
-        != 'current-trajectory'
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: source scripts/ci/real-weights/mlx-qwen-image-2-1/materialize-hash-pinned-transferred-adapters.sh
-    - name: Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates
-      run: source scripts/ci/real-weights/mlx-qwen-image-2-1/run-the-qwen-image-2-1-lora-real-weight-gates.sh
-    - name: Keep the Qwen-Image 2.1 MLX evidence
+        set -euo pipefail
+        python3.12 - <<'PY'
+        import os,pathlib,shutil,json
+        base=pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+        owned=base/f"sc24163-native13-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+        if not owned.exists():raise SystemExit(0)
+        assert not owned.is_symlink() and owned.resolve(strict=True).parent==base
+        assert (owned/'OWNER').read_text().strip()==f"{os.environ['GITHUB_RUN_ID']}:{os.environ['GITHUB_RUN_ATTEMPT']}"
+        retired=[]
+        for name in ('cargo-target','download'):
+         p=owned/name
+         if p.exists():
+          assert not p.is_symlink() and p.resolve(strict=True).parent==owned.resolve(strict=True)
+          shutil.rmtree(p);retired.append(name)
+        evidence=owned/'evidence'
+        (evidence/'owned-cleanup.json').write_text(json.dumps({'retired':retired,'evidencePreserved':True,'modelCacheTouched':False,'nativeAllocatorRestorationMeasuredByCleanup':False,'accepted':False},indent=2)+'\n')
+        PY
+      if: ${{ always() }}
+    - name: Retain complete four-render diagnostic packet
       if: ${{ always() }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
-        name: qwen-image-2-1-mlx-evidence
-        path: ${{ runner.temp }}/qwen-image-2-1-mlx-evidence
+        name: sc24163-native12-training-fit-diagnostic
+        path: ${{ runner.temp }}/sc24163-native13-${{ github.run_id }}-${{ github.run_attempt }}/evidence
         if-no-files-found: error
         retention-days: 30

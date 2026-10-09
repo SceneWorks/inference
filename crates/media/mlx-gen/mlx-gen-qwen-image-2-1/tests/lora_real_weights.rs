@@ -908,6 +908,430 @@ pub(crate) fn edit_transform(src: &image::RgbImage) -> image::RgbImage {
     out
 }
 
+// ── native12 rejected-donor training-content fit (diagnostic only) ─────────────────────────────
+
+const NATIVE12_FIT_ARCHIVE_SHA: &str =
+    "fa810557ef562f1e4d53a2d0cb73b684e8a8d3ca76c6fb25ab3a15423d3f2e2e";
+const NATIVE12_FIT_DONOR_SHA: &str =
+    "6bc315825dcc8f7748d2bd9df08c7a9f93dd3bd0d31b1221939c46a6111c3c54";
+const NATIVE12_FIT_FILES: [(&str, u64, &str); 6] = [
+    (
+        "edit/dataset/src_0.png",
+        420499,
+        "d73f6c0e96e24cbef10c7ccf96858b382139cef11d1d49d53418e261228fa2f4",
+    ),
+    (
+        "edit/dataset/tgt_0.png",
+        10528,
+        "f2a73d842757ad8be8e8119bc1dda3027b13369ca7ddeff16d0ef8bf87e25a8c",
+    ),
+    (
+        "edit/dataset/key.png",
+        5039,
+        "da3be3ca711ec3d0e89df8f1e91bc662365fea188fd513d0108782b6c726189f",
+    ),
+    (
+        "adapters/qwen21_edit_lokr.safetensors",
+        6759417,
+        NATIVE12_FIT_DONOR_SHA,
+    ),
+    (
+        "edit/edit-training-protocol.json",
+        115710,
+        "76a782f4daafab7f036c70b5fa7783b171878bfef7f004d76933d17a2660825f",
+    ),
+    (
+        "edit_lokr.json",
+        206306,
+        "be31c7bfdcc769750e1c7d0dffb5c2615301d30a06139f1e9674151d383782e8",
+    ),
+];
+
+fn native12_fit_root() -> PathBuf {
+    let root = PathBuf::from(
+        std::env::var_os("QWEN_IMAGE_2_1_NATIVE12_FIT_INPUT")
+            .expect("approved native12 input root"),
+    );
+    assert!(root.is_absolute() && root.is_dir());
+    root
+}
+
+fn native12_fit_image(path: &Path) -> Image {
+    let rgb = image::open(path).unwrap().to_rgb8();
+    Image {
+        width: rgb.width(),
+        height: rgb.height(),
+        pixels: rgb.into_raw(),
+    }
+}
+
+fn native12_fit_hash_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn native12_fit_inputs(root: &Path) -> (Image, Image, Image, PathBuf, Value) {
+    let verification: Value = serde_json::from_slice(
+        &std::fs::read(root.join("source-artifact-verification.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(verification["artifactId"], json!(11624677663u64));
+    assert_eq!(verification["sourceRunId"], json!(37934129171u64));
+    assert_eq!(verification["sourceRunAttempt"], 1);
+    assert_eq!(
+        verification["sourceHead"],
+        "89ad519890721ac009d5e0ed095379d7c13cade8"
+    );
+    assert_eq!(verification["sourceRunConclusion"], "failure");
+    assert_eq!(verification["archiveSha256"], NATIVE12_FIT_ARCHIVE_SHA);
+    assert_eq!(verification["archiveBytes"], json!(504811549u64));
+    assert_eq!(verification["memberCount"], 102);
+    assert_eq!(verification["allMembers"].as_array().unwrap().len(), 102);
+    assert_eq!(verification["fullArchiveAndAllMembersVerified"], true);
+    let mut inputs = Vec::new();
+    for (file, bytes, sha) in NATIVE12_FIT_FILES {
+        let path = root.join(file);
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            false
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes, "{file}");
+        assert_eq!(sha256_file(&path), sha, "{file}");
+        inputs.push(json!({"file":file,"path":path,"bytes":bytes,"sha256":sha}));
+    }
+    let protocol: Value = serde_json::from_slice(
+        &std::fs::read(root.join("edit/edit-training-protocol.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        protocol["kind"],
+        "matched_two_reference_training448_evaluation768"
+    );
+    assert_eq!(
+        protocol["trainingRecipe"],
+        matched_edit_training_recipe(&matched_edit_training_config(120))
+    );
+    assert_eq!(protocol["trainingCaption"], EDIT_INSTRUCTION);
+    assert_eq!(protocol["trainingReferenceCount"], 2);
+    assert_eq!(protocol["trainingTargetEdge"], 448);
+    let item = &protocol["trainingConditioning"]["actualOrderedInputs"][0];
+    assert_eq!(item["index"], 0);
+    assert_eq!(item["caption"], EDIT_INSTRUCTION);
+    assert_eq!(item["target"]["sha256"], NATIVE12_FIT_FILES[1].2);
+    assert_eq!(
+        item["orderedReferences"][0]["image"]["sha256"],
+        NATIVE12_FIT_FILES[0].2
+    );
+    assert_eq!(
+        item["orderedReferences"][1]["image"]["sha256"],
+        NATIVE12_FIT_FILES[2].2
+    );
+    let old: Value =
+        serde_json::from_slice(&std::fs::read(root.join("edit_lokr.json")).unwrap()).unwrap();
+    assert_eq!(old["training"]["adapterSha256"], NATIVE12_FIT_DONOR_SHA);
+    assert_eq!(
+        old["training"]["trainingProtocolSha256"],
+        NATIVE12_FIT_FILES[4].2
+    );
+    assert_eq!(old["training"]["stepsRun"], 120);
+    let donor = root.join("adapters/qwen21_edit_lokr.safetensors");
+    let metadata = safetensors_file_metadata(&donor).unwrap();
+    for (key, val) in [
+        ("rank", "16"),
+        ("alpha", "16"),
+        ("networkType", "lokr"),
+        ("family", "qwen-image-2-1"),
+        ("trainingMode", "edit"),
+    ] {
+        assert_eq!(metadata.get(key).map(String::as_str), Some(val));
+    }
+    let source = native12_fit_image(&root.join(NATIVE12_FIT_FILES[0].0));
+    let target = native12_fit_image(&root.join(NATIVE12_FIT_FILES[1].0));
+    let key = native12_fit_image(&root.join(NATIVE12_FIT_FILES[2].0));
+    assert_eq!((source.width, source.height), (768, 768));
+    assert_eq!((target.width, target.height), (768, 768));
+    assert_eq!((key.width, key.height), (512, 512));
+    let contract = json!({"kind":"NATIVE12_REJECTED_INPUT_DIAGNOSTIC_ONLY", "inputs":inputs,
+        "sourceArtifactVerification":verification,"sourceArtifactVerificationSha256":sha256_file(&root.join("source-artifact-verification.json")),
+        "oldFailureRunId":37934129171u64,"oldFailureAttempt":1,"oldFailureArtifactId":11624677663u64,
+        "oldFailureRootCpuQualificationSha256":"9966afc1f346ccadfc5aeb3bc66d1a06d1c0b05add5ca515888c4d30594d277a",
+        "oldFailureRootCpuQualificationIsReferenceOnly":true,"donorDiagnosticInputOnly":true,
+        "sourceBeforeModelReceiptSha256":sha256_file(&out_dir().join("source-before-model.json")),
+        "nativeBuildIdentityReceiptSha256":sha256_file(&out_dir().join("mlx-build-identity.json")),
+        "runtimeAccepted":false,"qualityAccepted":false,"trainingAccepted":false,"donorAccepted":false,"rootAccepted":false,
+        "trainingPerformed":false,"exactNoisyTrainingStepReplay":false,"actualBackendObservedShapes":null,
+        "itemIndex":0,"oldTrainingConfig":protocol["trainingRecipe"],"oldTrainingConditioningItem":item});
+    (source, target, key, donor, contract)
+}
+
+fn native12_fit_request(source: &Image, key: &Image) -> GenerationRequest {
+    GenerationRequest {
+        prompt: EDIT_INSTRUCTION.to_owned(),
+        width: 448,
+        height: 448,
+        steps: Some(RENDER_STEPS),
+        seed: Some(SEED),
+        conditioning: vec![Conditioning::MultiReference {
+            images: vec![source.clone(), key.clone()],
+        }],
+        ..Default::default()
+    }
+}
+
+fn native12_fit_request_receipt(req: &GenerationRequest, source: &Image, key: &Image) -> Value {
+    let expected = native12_fit_request(source, key);
+    // GenerationRequest has no PartialEq/Serialize. Bind and compare EVERY actual field and pixel
+    // through its complete Debug form; store the compact non-conditioning fields and pixel hashes.
+    let actual_debug = format!("{req:?}");
+    assert!(
+        actual_debug == format!("{expected:?}"),
+        "fixed four-render request drift"
+    );
+    let mut fields = req.clone();
+    fields.conditioning.clear();
+    json!({"actualFullGenerationRequestDebugSha256":native12_fit_hash_bytes(actual_debug.as_bytes()),
+        "actualNonConditioningRequestDebug":format!("{fields:?}"),"caption":req.prompt,
+        "width":req.width,"height":req.height,"seed":req.seed,"steps":req.steps,
+        "orderedReferences":[
+            {"role":"training-source0","nativeWidth":source.width,"nativeHeight":source.height,"rgbSha256":native12_fit_hash_bytes(&source.pixels)},
+            {"role":"RGB-level-palette","nativeWidth":key.width,"nativeHeight":key.height,"rgbSha256":native12_fit_hash_bytes(&key.pixels)}],
+        "sampler":"existing default resolution-shifted flow-match Euler","defaultsChanged":false})
+}
+
+fn native12_fit_spec_receipt(spec: &LoadSpec, tier: &str, donor: &Path, adapted: bool) -> Value {
+    let quant = match tier {
+        "bf16" => None,
+        "q4" => Some(Quant::Q4),
+        _ => panic!("only fixed bf16/q4 tiers"),
+    };
+    let expected = tier_spec(tier, quant);
+    let expected = if adapted {
+        expected.with_adapters(vec![adapter(donor, 1.0, AdapterKind::Lokr)])
+    } else {
+        expected
+    };
+    let actual_debug = format!("{spec:?}");
+    assert!(
+        actual_debug == format!("{expected:?}"),
+        "fixed tier/donor/strength load spec drift"
+    );
+    json!({"actualLoadSpecDebug":actual_debug,"tier":tier,"adapted":adapted,
+        "adapterStrength":if adapted { json!(1.0) } else { Value::Null },
+        "adapterSha256":if adapted { json!(NATIVE12_FIT_DONOR_SHA) } else { Value::Null }})
+}
+
+fn native12_fit_target(target: &Image) -> Image {
+    assert_eq!((target.width, target.height), (768, 768));
+    // The actual PURE production helper called by preprocess_init_image. Edit pairs preserve
+    // their full target (no crop); calculate_dimensions(448^2, 1) gives448x448 on the32-pixel grid.
+    let values = mlx_gen::image::resize_lanczos_u8(&target.pixels, 768, 768, 448, 448).unwrap();
+    assert!(values
+        .iter()
+        .all(|v| v.is_finite() && (0.0..=255.0).contains(v) && v.fract() == 0.0));
+    Image {
+        width: 448,
+        height: 448,
+        pixels: values.into_iter().map(|v| v as u8).collect(),
+    }
+}
+
+#[test]
+#[ignore = "approved native12 artifact inputs; CPU-only guard, no model or MLX tensor"]
+fn native12_training_fit_rejects_input_and_request_drift() {
+    let root = native12_fit_root();
+    let (source, target, key, donor, contract) = native12_fit_inputs(&root);
+    let req = native12_fit_request(&source, &key);
+    let mut mutants = Vec::new();
+    let mut m = req.clone();
+    m.width = 768;
+    mutants.push(m);
+    let mut m = req.clone();
+    m.height = 480;
+    mutants.push(m);
+    let mut m = req.clone();
+    m.seed = Some(SEED + 1);
+    mutants.push(m);
+    let mut m = req.clone();
+    m.steps = Some(RENDER_STEPS + 1);
+    mutants.push(m);
+    let mut m = req.clone();
+    m.guidance = Some(2.0);
+    mutants.push(m);
+    let mut m = req.clone();
+    m.count = 2;
+    mutants.push(m);
+    let mut m = req.clone();
+    m.prompt = TRAIN_EDIT_INSTRUCTION.into();
+    mutants.push(m);
+    let mut m = req.clone();
+    m.conditioning = vec![Conditioning::MultiReference {
+        images: vec![key.clone(), source.clone()],
+    }];
+    mutants.push(m);
+    let mut m = req.clone();
+    m.conditioning = vec![Conditioning::MultiReference {
+        images: vec![source.clone()],
+    }];
+    mutants.push(m);
+    let mut m = req.clone();
+    m.conditioning = vec![Conditioning::MultiReference {
+        images: vec![target.clone(), key.clone()],
+    }];
+    mutants.push(m);
+    let mut changed = source.clone();
+    changed.pixels[0] ^= 1;
+    let mut m = req.clone();
+    m.conditioning = vec![Conditioning::MultiReference {
+        images: vec![changed, key.clone()],
+    }];
+    mutants.push(m);
+    for m in mutants {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            native12_fit_request_receipt(&m, &source, &key)
+        }))
+        .is_err());
+    }
+    let bad_strength = tier_spec("q4", Some(Quant::Q4)).with_adapters(vec![adapter(
+        &donor,
+        0.5,
+        AdapterKind::Lokr,
+    )]);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| native12_fit_spec_receipt(
+            &bad_strength,
+            "q4",
+            &donor,
+            true
+        )))
+        .is_err()
+    );
+    let bad_donor = tier_spec("q4", Some(Quant::Q4)).with_adapters(vec![adapter(
+        &root.join("forbidden33.safetensors"),
+        1.0,
+        AdapterKind::Lokr,
+    )]);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| native12_fit_spec_receipt(
+            &bad_donor, "q4", &donor, true
+        )))
+        .is_err()
+    );
+    let fitted = native12_fit_target(&target);
+    assert_eq!(
+        (fitted.width, fitted.height, fitted.pixels.len()),
+        (448, 448, 448 * 448 * 3)
+    );
+    let fit_sha = native12_fit_hash_bytes(&fitted.pixels);
+    let out = out_dir();
+    write_json(
+        &out,
+        "native12-fit-cpu-guard",
+        &json!({"inputs":contract,"request":native12_fit_request_receipt(&req,&source,&key),
+        "requestMutantsRejected":11,"loadSpecMutantsRejected":2,"fittedTargetRgbSha256":fit_sha,"cpuOnly":true,"modelLoads":0,"renders":0,"accepted":false}),
+    );
+}
+
+#[test]
+#[ignore = "Mac2-only fixed four-render native12 rejected-donor content-fit diagnostic; zero training"]
+fn native12_training_content_fit_four_renders() {
+    use mlx_gen_qwen_image_2_1::memory_strategy::{derived, AllocatorBounds};
+    let root = native12_fit_root();
+    let (source, target, key, donor, mut contract) = native12_fit_inputs(&root);
+    let req = native12_fit_request(&source, &key);
+    let actual_request = native12_fit_request_receipt(&req, &source, &key);
+    let out = out_dir().join("native12-training-fit");
+    std::fs::create_dir_all(&out).unwrap();
+    let fitted = native12_fit_target(&target);
+    save_png(&out.join("training-target0-fit448.png"), &fitted);
+    contract["actualGenerationRequest"] = actual_request;
+    contract["exactRequestedRenderCount"] = json!(4);
+    contract["renderOrder"] = json!(["bf16_base", "bf16_lokr", "q4_base", "q4_lokr"]);
+    contract["fittedTarget"] = json!({"width":448,"height":448,"png":"training-target0-fit448.png",
+        "pngSha256":sha256_file(&out.join("training-target0-fit448.png")),"rgbSha256":native12_fit_hash_bytes(&fitted.pixels),
+        "basis":"Actual shared PURE production resize_lanczos_u8, PIL-LANCZOS radius3 fixed-point u8 separable resampling; full edit target, no crop. Same integer RGB values preprocess_init_image normalizes before VAE encode.",
+        "productionCallSites":["mlx-gen-qwen-image-2-1/src/training.rs:1380-1389","mlx-gen-qwen-image-2-1/src/training.rs:1460","mlx-gen/src/img2img.rs:83","gen-core/src/imageops.rs:255-262"],
+        "actualSharedHostPreprocessingCalled":true,"actualVaeOrLatentTargetObserved":false});
+    write_json(&out, "contract", &contract); // complete request/input guard BEFORE any model load
+    let guard = Footprint::start(&out);
+    let mut pairs = Vec::new();
+    let mut count = 0;
+    for (tier, quant) in [("bf16", None), ("q4", Some(Quant::Q4))] {
+        let base = tier_spec(tier, quant);
+        let adapted = base
+            .clone()
+            .with_adapters(vec![adapter(&donor, 1.0, AdapterKind::Lokr)]);
+        let mut images = Vec::new();
+        let mut facts = Vec::new();
+        for (suffix, spec) in [("base", base), ("lokr", adapted)] {
+            let label = format!("{tier}_{suffix}");
+            // Same backend request transient/resident formula, with the unchanged tensor-free
+            // physical admission reserves and scoped cache clamp BEFORE the weight-bearing load.
+            let actual_spec = native12_fit_spec_receipt(&spec, tier, &donor, suffix == "lokr");
+            let mc = memory_strategy_contract(ID, &spec).unwrap();
+            let resident = mc.total_resident_bytes();
+            let transient = derived::request_transient_budget_bytes(
+                448,
+                448,
+                derived::TABLE_CONDITIONING_TOKENS,
+                2,
+                false,
+                None,
+            );
+            let before = AllocatorBounds::current();
+            let cache =
+                guard.admit_numeric_scoped(resident.checked_add(transient).unwrap(), transient);
+            std::fs::copy(
+                out.join("numeric-physical-admission.json"),
+                out.join(format!("{label}-physical-admission.json")),
+            )
+            .unwrap();
+            let bounds = AllocatorBounds::enter(resident, transient);
+            let (image, mut fact) = render(&label, &spec, &req, &guard, &out);
+            count += 1;
+            drop(bounds);
+            drop(cache);
+            let after = AllocatorBounds::current();
+            assert_eq!(
+                before, after,
+                "actual request-scoped allocator limits restored"
+            );
+            fact["actualLoadSpec"] = actual_spec;
+            fact["actualLimitsBefore"] = json!({"memory":before.0,"cache":before.1});
+            fact["actualLimitsAfter"] = json!({"memory":after.0,"cache":after.1});
+            fact["admittedResidentBytes"] = json!(resident);
+            fact["admittedTransientBytes"] = json!(transient);
+            fact["pngSha256"] = json!(sha256_file(&out.join(format!("{label}.png"))));
+            fact["rgbSha256"] = json!(native12_fit_hash_bytes(&image.pixels));
+            images.push(image);
+            facts.push(fact);
+            write_json(&out, &format!("{label}-result"), &facts.last().unwrap());
+        }
+        pairs.push(json!({"tier":tier,"base":facts[0],"adapted":facts[1],
+            "meanAbsDiff":mean_abs_diff(&images[1],&images[0]),
+            "errorToFittedTrainingTargetBase":mean_abs_diff(&images[0],&fitted),
+            "errorToFittedTrainingTargetAdapted":mean_abs_diff(&images[1],&fitted),
+            "gain":mean_abs_diff(&images[0],&fitted)-mean_abs_diff(&images[1],&fitted)}));
+    }
+    assert_eq!(count, 4);
+    drop(guard); // joins the unchanged50ms sampler before successful terminal result
+    assert_eq!(
+        sha256_file(&donor),
+        NATIVE12_FIT_DONOR_SHA,
+        "diagnostic donor remained immutable"
+    );
+    write_json(
+        &out,
+        "results",
+        &json!({"contractSha256":sha256_file(&out.join("contract.json")),"pairs":pairs,
+        "rendersCompleted":count,"trainingSteps":0,"watchdogJoined":true,"nativeOwnerWorkReturned":true,
+        "exactNoisyTrainingStepReplay":false,"generalizationProven":false,"kernelCauseProven":false,
+        "full51RenderQualityGateReplaced":false,"actualBackendObservedShapes":null,
+        "runtimeAccepted":false,"qualityAccepted":false,"trainingAccepted":false,"donorAccepted":false,"rootAccepted":false}),
+    );
+}
+
 // ── shared run helpers ───────────────────────────────────────────────────────────────────────────
 
 /// Load `spec` through the explicit catalog, render `req` once, write `<out>/<label>.png`, and
