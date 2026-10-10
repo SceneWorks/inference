@@ -136,6 +136,10 @@ pub fn load_backbone_with_adapters(
         let Some(array) = weights.remove(&key) else {
             continue;
         };
+        // Read the file bytes on MLX's CPU stream first: a GPU cast over an unread `Load` makes the
+        // Metal command buffer wait on the disk, which on a cold page cache trips the GPU watchdog
+        // (sc-24245).
+        mlx_rs::transforms::eval_pending_loads([&array])?;
         let array = if array.ndim() >= 2 && key != "y_pos_embedding" {
             array.as_dtype(compute)?
         } else {

@@ -250,6 +250,8 @@ pub struct IrisDiT {
     cfg: ModelConfig,
     compute: DType,
     device: Device,
+    /// Channels of `x` (`model.in_channels`, plus the depth task's extra zero channel).
+    input_channels: usize,
     s_embedder: Linear,
     t_mlp0: Linear,
     t_mlp2: Linear,
@@ -281,6 +283,19 @@ impl IrisDiT {
         cfg: &ModelConfig,
         compute: DType,
         device: &Device,
+    ) -> Result<Self> {
+        Self::from_checkpoint_widened(w, cfg, compute, device, cfg.in_channels)
+    }
+
+    /// [`Self::from_checkpoint`] for a backbone whose input projections were widened to
+    /// `input_channels` (`iris3b/downstream/depth.py` `_widen`: the depth task concatenates a zero
+    /// channel after RGB). The output stays `model.in_channels` wide.
+    pub fn from_checkpoint_widened(
+        w: &Checkpoint,
+        cfg: &ModelConfig,
+        compute: DType,
+        device: &Device,
+        input_channels: usize,
     ) -> Result<Self> {
         let l = Loader {
             weights: w,
@@ -414,6 +429,7 @@ impl IrisDiT {
             cfg: cfg.clone(),
             compute,
             device: device.clone(),
+            input_channels,
             s_embedder: l.linear("s_embedder.proj", true)?,
             t_mlp0: l.linear("t_embedder.mlp.0", true)?,
             t_mlp2: l.linear("t_embedder.mlp.2", true)?,
@@ -441,7 +457,12 @@ impl IrisDiT {
         crate::nn::expect_shape(
             "s_embedder.proj.weight",
             dit.s_embedder.weight(),
-            &[cfg.hidden_size, p * p * cfg.in_channels],
+            &[cfg.hidden_size, p * p * input_channels],
+        )?;
+        crate::nn::expect_shape(
+            "pixel_embedder.proj.weight",
+            dit.pixel_proj.weight(),
+            &[cfg.pixel.hidden_size, input_channels],
         )?;
         Ok(dit)
     }
@@ -537,6 +558,12 @@ impl IrisDiT {
         let cfg = &self.cfg;
         let (b, c, h, w) = x.dims4()?;
         let p = cfg.patch_size;
+        if c != self.input_channels {
+            return Err(Error::Msg(format!(
+                "iris: input has {c} channels, the backbone embeds {}",
+                self.input_channels
+            )));
+        }
         if h % p != 0 || w % p != 0 {
             return Err(Error::Msg(format!(
                 "iris: input {h}x{w} is not divisible by patch_size {p}"
@@ -638,12 +665,13 @@ impl IrisDiT {
         let out = self
             .final_linear
             .forward(&self.final_norm.forward(&pixels)?)?;
-        // fold: [B·L, p·p, C] → [B, C, H, W]
+        // fold: [B·L, p·p, C] → [B, C, H, W] (C = model.in_channels, whatever x carried)
+        let c_out = cfg.in_channels;
         Ok(out
-            .reshape((b, hp, wp, p, p, c))?
+            .reshape((b, hp, wp, p, p, c_out))?
             .permute((0, 5, 1, 3, 2, 4))?
             .contiguous()?
-            .reshape((b, c, h, w))?
+            .reshape((b, c_out, h, w))?
             .to_dtype(DType::F32)?)
     }
 

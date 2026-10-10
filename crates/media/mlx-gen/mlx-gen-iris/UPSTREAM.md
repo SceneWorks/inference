@@ -7,7 +7,7 @@ file. Python appears only in the offline oracle (`../tools/dump_iris_*.py`), nev
 | What | Where | Revision |
 | --- | --- | --- |
 | Model / pipeline / text conditioning / solver code | `speridlabs/iris-3b` (GitHub) | `a8d15239dea469aba042cfa56ca3bb4e450d5ebc` |
-| Generation weights + `config.yaml` (also `depth/`, `upscaler/` — later stories) | `speridlabs/iris-3b` (Hugging Face) | `7445443349bc9abe3c96f01ff793e2098ca012b3` |
+| Generation weights + `config.yaml`; the `depth/` export (sc-25682); `upscaler/` (later story) | `speridlabs/iris-3b` (Hugging Face) | `7445443349bc9abe3c96f01ff793e2098ca012b3` |
 | Text encoder: tokenizer, `config.json`, both safetensors shards | `Qwen/Qwen3-VL-4B-Instruct` (Hugging Face) | `ebb281ec70b05090aa6165b016eac8ec08e71b17` |
 | Paper | arXiv 2610.09450v1 | — |
 
@@ -31,6 +31,20 @@ components["text_encoder"] (a directory)       = the Qwen/Qwen3-VL-4B-Instruct s
 ```
 
 A missing/incomplete resource is a typed load error that names the path and the task.
+
+The **depth** task (`iris_3b_depth`, sc-25682) is its own closure — the `depth/` folder only, no text
+encoder (`gen_core::iris::downstream::TaskExport`):
+
+```
+weights (LoadSpec::weights, a directory)      = the HF repo's depth/ folder
+  config.yaml                                  model / text_encoder / flow + `task: {name: depth}`
+  model.safetensors                            `pixel.*` (the widened IrisDiT) + `depth_reducer.*`, FP32
+  empty_prompt.safetensors                     `embeddings` [1, 300, 12, 2560] F32 + `mask` [1, 300] BOOL
+```
+
+Any staged component (e.g. `text_encoder`), `LoadSpec::text_encoder`, the generation checkpoint (a
+`config.yaml` without a `task` section) or another task's export (`task.name != depth`) is a typed
+`Unsupported` refusal naming the wrong-task artifact.
 
 ## Generation coverage table (source → native)
 
@@ -119,6 +133,30 @@ Upstream has no preview; nothing in its semantics makes `x0` misleading — it i
 the solver integrates. Both descriptors advertise `supports_preview: true`; an inert sink costs one
 branch per step.
 
+## Depth coverage table (source → native, sc-25682)
+
+Source: `src/iris3b/downstream/{__init__,depth}.py`, `scripts/depth.py`, `scripts/export_downstream.py`
+at the pinned commit. Host-side steps live once in `gen_core::iris::depth` (both backends call
+`estimate_with`); the tensor forward is `mlx_gen_iris::depth` / `candle_gen_iris::depth`.
+
+| Upstream control / behaviour | Source | MLX (`mlx-gen-iris`) | Candle (`candle-gen-iris`) | Status |
+| --- | --- | --- | --- | --- |
+| Export layout + task identity (`task.name == "depth"`), strict key set (`pixel.*` + `depth_reducer.*`) | `load_export`, `export_downstream.py` | `depth::load_depth` over `gen_core::iris::downstream::TaskExport` | same | ported; wrong-task artifacts are typed refusals; no text encoder in the closure (E4) |
+| Empty-prompt conditioning `[1, T, L, D]` F32 + BOOL mask, shape-checked against the config | `load_export`, `DepthPredictor.__init__` | `EmptyPrompt::read` (shared) | same | ported |
+| Widened input projections (`s_embedder.proj` p²·4, `pixel_embedder.proj` 4 → 16), output stays 3 channels | `IrisDepth._widen` | `IrisDiT::from_weights_widened` | `IrisDiT::from_checkpoint_widened` | ported |
+| Input = RGB ‖ zero channel, t = `flow.num_train_timesteps` (1000), one forward, empty-prompt mask | `IrisDepth.forward` | `IrisDepth::forward` | `IrisDepth::forward` | ported |
+| `depth_reducer` 1×1 conv 3 → 1 (+ bias) | `IrisDepth.depth_reducer` | `addmm` in the compute dtype | `Linear::from_parts` in the compute dtype | ported (autocast runs the conv in bf16; FP32 path in f32) |
+| EXIF orientation (`ImageOps.exif_transpose`) + `convert("RGB")` | `DepthPredictor.__call__` | — | — | the **caller's** job (an `Image` carries no EXIF; the SceneWorks half orients before calling) |
+| `max_side` (default 1024; 0 = native): `scale = min(1, max_side / max(w, h))`, never upscale | `__call__`, `scripts/depth.py --max-side` | `DepthResolution::{Capped(n), Native}` (default `Capped(1024)`; `Capped(0)` refused — use `Native`) | same (shared) | ported |
+| Patch-grid size law `max(p, round(side·scale/p)·p)`, Python round-half-even | `__call__` | `plan_depth_input` | same | ported (`round_ties_even`) |
+| Lanczos resize to the model size (only when it changes), PIL 8-bit fixed-point | `image.resize(LANCZOS)` | `gen_core::imageops::resize_lanczos_u8` | same | ported, **bit-exact** (fixture gate: exact) |
+| `rgb / 255 * 2 - 1` in f32 | `__call__` | `prepare_depth_input` | same | ported, exact |
+| Bilinear resize of the prediction back to the source size (`align_corners=False`, no antialias), only when resized | `F.interpolate` | `interpolate_bilinear` | same | ported |
+| Output: raw `[H, W]` f32 relative log depth, -1 near … +1 far, not clamped/normalized/metric | `__call__` docstring | `DepthMap` + `DepthMetadata` (model/config revision, preprocessing, value convention) | same | ported (E5) |
+| `colorize` (near = bright over the map's own 2nd–98th percentiles, `inferno`) | `colorize` | `near_bright_unit` / `near_bright_control_image` (control adapter) / `colorize_inferno` (preview) — pure, never mutate the map | same (shared) | ported (matplotlib's 256-entry inferno LUT) |
+| `.npy` + `.png` writing, `--out`, batch of paths | `scripts/depth.py` | — | — | consumer (SceneWorks) persistence, not inference |
+| BF16 autocast on CUDA, FP32 elsewhere | `__call__` | `Precision::Bf16` (default) / `Precision::Fp32` | same | ported (the default is the CUDA release policy on both backends) |
+
 ## Precision
 
 Upstream samples on CUDA under `torch.autocast(bfloat16)` over FP32 parameters (and in plain FP32 on
@@ -159,3 +197,30 @@ directory hands an fp32 tower the bf16 null.
 
 `tests/fixtures/iris_tokenizer_ids.json` pins the real Qwen3-VL tokenizer's prefix / suffix / caption
 ids for a prompt battery; the ignored real-weight test checks the loaded tokenizer against it.
+
+### Depth fixtures and tolerances (sc-25682)
+
+`tests/fixtures/tiny-depth/` + `iris_depth_golden.safetensors` come from `../tools/dump_iris_depth.py`
+(upstream's real `DepthPredictor` over a miniature export in the `export_downstream.py` layout; the
+depth modules are sha256-pinned there). Cases: odd non-square native (37×23), capped (50×30 at
+max side 32), below one patch (3×5), already on the grid (24×16), round-half-even ties (10×14), a
+cap that would upscale (20×12 at 1024).
+
+| Gate | Native | Tolerance (of peak) | Measured (MLX) | Measured (Candle CPU) |
+| --- | --- | --- | --- | --- |
+| Size law, Lanczos input, `[-1, 1]` mapping (`depth_parity`) | host f32 | exact | exact | exact |
+| Raw `[1, 1, h, w]` forward, FP32 | MLX CPU stream / Candle CPU | 1e-4 | ≤1.5e-5 | ≤1.5e-5 |
+| Source-size map after the bilinear resize back, FP32 | — | 1e-4 | ≤1.5e-5 | ≤1.5e-5 |
+| Raw forward, release bf16 policy | GPU / CPU bf16 operands | 5e-2 | 1.1e-2 | 1.0e-2 |
+| `colorize_inferno` vs upstream `colorize` | host | ≤ 4 RGB levels | within bound | — |
+
+Real weights (`tests/depth_real_weights.rs`, ignored; `../tools/dump_iris_depth_realweight.py`): the
+repo photo `_vendor/mage_flow/assets/dog.jpg` (1024×2048 → model 512×1024 at the default max side),
+upstream FP32 CPU as the reference. Upstream's OWN bf16-autocast distance on that photo is recorded in
+`iris_depth_real_reference.safetensors`: full-res mean 2.9e-3 / max 0.21; 16×16-pooled mean 2.6e-3 /
+max 4.6e-2 / pearson 0.99999. Native MLX bf16 (Apple GPU): model input exact; full-res mean 2.5e-3 /
+max 0.31 (fur edges) / pearson 0.99999; pooled mean 2.3e-3 / max 4.2e-2; from the `image`-crate JPEG
+decode (not PIL) pooled mean 3.3e-3 / max 7.0e-2. Bounds: pearson ≥ 0.9995, mean ≤ 1e-2, pooled max
+≤ 0.15. The Candle/CUDA job (`iris` profile) checks the same pooled reference: bf16 on `cuda:0`
+(`image`-crate decode) measured pooled mean 2.8e-3 / max 0.11 / pearson 0.99999, 0.4 s estimate,
+8.4 GB VRAM peak (run 38076560406).
