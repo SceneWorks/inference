@@ -224,3 +224,85 @@ decode (not PIL) pooled mean 3.3e-3 / max 7.0e-2. Bounds: pearson ≥ 0.9995, me
 ≤ 0.15. The Candle/CUDA job (`iris` profile) checks the same pooled reference: bf16 on `cuda:0`
 (`image`-crate decode) measured pooled mean 2.8e-3 / max 0.11 / pearson 0.99999, 0.4 s estimate,
 8.4 GB VRAM peak (run 38076560406).
+
+## Restoration (`iris_3b_restore`, sc-25683)
+
+Source: `src/iris3b/downstream/restoration.py`, `src/iris3b/downstream/__init__.py`,
+`scripts/upscale.py`, `scripts/export_downstream.py` (sha256-pinned in
+`../tools/dump_iris_restoration.py`). Registered as a **transform** (`gen_core::Transform`, the
+non-prompt image→image contract) under `iris_3b_restore` on both backends
+(`mlx-gen-iris::restoration`, `candle-gen-iris::restoration`). The host-side pixel path is ONE
+backend-neutral implementation in `gen_core::iris::restoration` (planner + driver); each backend
+supplies only a tile's velocity.
+
+### Resources (E4)
+
+```
+weights (LoadSpec::weights, a directory)   = the `upscaler/` folder of speridlabs/iris-3b
+  config.yaml                               parent model/text_encoder/flow sections + `task:` {name: restoration, sigma: 0.5, tile: 1024}
+  model.safetensors                         the fine-tuned IrisDiT, FP32, upstream key names (strict load)
+  empty_prompt.safetensors                  `embeddings` [1, 300, 12, 2560] F32 + `mask` [1, 300] BOOL
+```
+
+No text encoder is loaded or accepted: a `text_encoder` component (or any other) is a typed refusal,
+as is a generation backbone (no `task` section) or a depth export (`task.name: depth`) staged as the
+weights — upstream `load_export`'s task-name check. A missing file names the path.
+
+### Coverage table (source → native)
+
+| Upstream control / behaviour | Source | Shared (`gen_core::iris::restoration`) | MLX (`mlx-gen-iris`) | Candle (`candle-gen-iris`) | Status |
+| --- | --- | --- | --- | --- | --- |
+| Task identity (`task.name == "restoration"`), `sigma`, `tile` from `config.yaml` | `load_export`, `Restorer.__init__` | `downstream::TaskExport` (S4's shared export closure) + `RestorationSettings::from_task/validate` | `IrisRestorer::load` | `IrisRestorer::load` | ported; tile must be a multiple of the patch; v-prediction required (upstream's check) |
+| Empty-prompt conditioning, no text encoder | `Restorer.__init__` | `downstream::EmptyPrompt::read` (shape-checked against `text_len` / `text_lap_num_layers` / `text_dim`) | `[1, T, L, D]` array, read once | same | ported |
+| One-step forward at `t = sigma · num_train_timesteps` (500), restored = `x − sigma · v` in f32 | `restore_tile` | `restore_detailed` (the subtraction) | `IrisRestorer::velocity` (shared `IrisDiT`) | same | ported; bf16 compute (default) mirrors the CUDA autocast, `Precision::Fp32` = upstream's CPU path |
+| `scale` (default 4.0, any positive float incl. 1×): `F.interpolate(scale_factor, bicubic, align_corners=False)` — output `floor(side · scale)`, coordinate scale `1 / scale`, Keys a = −0.75, clamped taps | `__call__` | `bicubic_scale_factor`, `plan` | shared | shared | ported (`TargetSize::Scale`; `TargetSize::ModelDefault` = 4×); the request's f32 is read as its shortest round-trip decimal (`1.3f32` → the Python float `1.3`), so `floor(1000 · 1.3) = 1300` like torch, not 1299; min-edge / explicit resolution refused (upstream has neither) |
+| Small output (short side ≤ tile): enlarged so the short side is one tile (`round` half-even per side), antialiased bicubic (a = −0.5, clipped renormalized window), resized back afterwards | `__call__` | `plan` (`processing`, `enlarged`), `bicubic_aa_resize` (horizontal pass first, an unchanged axis skipped) | shared | shared | ported |
+| Zero pad of `x · 2 − 1` to the patch grid (bottom / right), crop after | `__call__` | `restore_detailed` | shared | shared | ported |
+| 1024-px tiles, stride `tile // 2` (50 % overlap), last tile flush; one pass when the image fits a tile | `tile_positions`, `tiled` | `tile_positions`, `plan` (`tile_rows` / `tile_cols`) | shared | shared | ported |
+| Gaussian fusion window (variance 0.01, row centre `tile / 2`, column centre `(tile − 1) / 2`), weighted average | `gaussian_window`, `tiled` | `gaussian_window`, `restore_detailed` | shared | shared | ported verbatim incl. the asymmetric centres |
+| Wavelet colour fix (à-trous 3×3 binomial, dilations 1…16, replicate pad): restored high frequencies + bicubic-reference low frequencies | `wavelet_color_fix` | `wavelet_color_fix` | shared | shared | ported; `TransformRequest::color_fix` (default on, `--no-color-fix` = `Some(false)`) |
+| Input budget (`fit_budget`: short ≤ 512, long ≤ 1024, never upscale, PIL Lanczos on RGB8) vs `--no-budget` | `scripts/upscale.py` | `fit_budget_dims`, `fit_budget_image` (bit-exact PIL fixed point) | shared | shared | ported; `InputSizing::Budgeted` (default, the script's) / `InputSizing::Original` — never switched implicitly |
+| Output `clamp(0, 1) · 255`, `round` (half-even) → RGB8 | `__call__` | `Planes::to_rgb8` | shared | shared | ported |
+| Per-tile progress; cancel between tiles | — | `restore` (`Progress::Step` per tile, `Progress::Decoding` for post-processing; `Error::Canceled` and no image) | shared | shared | native addition |
+| Tiles per forward | `restore_tile` takes `[B, …]`; upstream calls it with B = 1 | one tile per forward | — | — | upstream's call pattern |
+| `ImageOps.exif_transpose(...).convert("RGB")` | `__call__` | — | — | — | the consumer's job: the transform receives display-oriented RGB8. For an EXIF-rotated (90°) file the script budgets in storage orientation, so PIL's two 8-bit passes run in the other order — a ±1-level difference on such files only |
+| Seed / strength / step count | — | `RestorationOptions::from_request` | — | — | not upstream controls: refused by name (`steps: 1` accepted) |
+
+### Planner (consumer preview)
+
+`gen_core::iris::restoration::plan_request(req, TileGeometry::RELEASE, MODEL_ID)` (or `plan(dims,
+&options, …)`) returns, before any execution and without weights: source, budgeted input, output
+(`floor(input · scale)`), processing size, whether it was enlarged, padded size, tile rows/columns
+and `forward_count()`. A scale whose output rounds to zero pixels, or whose output, enlarged
+processing size or patch-padded size does not fit `u32` (e.g. a 1×5,000,000 image, whose long side
+the enlarge multiplies by 1024), is a typed refusal;
+the provider plans with the loaded export's geometry, which equals `TileGeometry::RELEASE` for the
+release export.
+
+### Fixtures and tolerances
+
+`tests/fixtures/tiny-snapshot/upscaler/` is a miniature export written by upstream's own
+`export_downstream.py restoration` (the miniature backbone perturbed, a 3-token empty prompt,
+`tile` 32, `sigma` 0.5); `tests/fixtures/iris_restoration_golden.safetensors` holds the op-level and
+end-to-end references (`../tools/dump_iris_restoration.py`).
+
+| Gate | Tolerance | Measured (MLX) | Measured (Candle CPU) |
+| --- | --- | --- | --- |
+| `scale_factor` bicubic (×4, ×2.5 on odd sides, ×1, ×0.75, ×3, non-dyadic ×1.3) | 1e-5 of peak | ≤ 1.4e-6 | shared host code |
+| Antialiased resize (up, down, one axis, odd) | 1e-5 | ≤ 7.2e-7 | shared |
+| Gaussian window (32 full; 1024 centre row / column / subsample) | 1e-6 | ≤ 6.0e-8 | shared |
+| Wavelet colour fix (29×37, smaller than dilation 16) | 1e-5 | 1.8e-7 | shared |
+| Tile positions, budget sizes | exact | exact | shared |
+| `fit_budget` PIL Lanczos bytes (7 shapes) | sha256-exact | exact | shared |
+| End to end FP32 through the request path, 8 cases (enlarge → tile → resize back, multi-tile, 1×, 2.5×, single tile, portrait 3×, budgeted, non-dyadic 1.3×), planned output size and enlarge branch exact: fused tiles / colour-fixed float | 1e-4 of peak | ≤ 1.9e-5 / ≤ 9.2e-6 | ≤ 1.9e-5 / ≤ 8.8e-6 |
+| Same, RGB8 | ≤ 1 level | ≤ 1 (at most 6 of 61 440 values differ) | ≤ 1 |
+
+Real weights (`tests/restoration_real_weights.rs`, `../tools/dump_iris_restoration_realweight.py`):
+the native bf16 path is held to 1.5× upstream's **own** bf16-autocast-vs-FP32 mean RGB8 distance on
+the same input (FP32: 0.5 level mean). `tests/fixtures/iris_restoration_real_small.safetensors` is
+the committed upstream reference of the small case (RGB8 only), so the CUDA job checks parity too.
+
+| Case | Upstream bf16 vs fp32 (the bound's basis) | MLX bf16 vs upstream fp32 | Candle CUDA bf16 vs upstream fp32 |
+| --- | --- | --- | --- |
+| 512×384 → 2048×1536 (6 tiles), machine-local golden | max 68, mean 0.521, PSNR 47.7 dB | max 60, mean 0.423, PSNR 49.0 dB (restore 10.8 s, peak footprint 11.7 GB) | — (no Python oracle on the runner): release-scale render 512×384 → 2048×1536, 6 tiles in 2.6 s, VRAM peak 10.1 GB |
+| 64×48 → 256×192 (enlarged, 2 tiles), committed | max 23, mean 0.522, PSNR 48.1 dB | max 19, mean 0.459, PSNR 48.7 dB | max 23, mean 0.701, PSNR 46.0 dB (bound 0.783; restore 1.0 s, VRAM peak 10.1 GB; run 38085270480) |

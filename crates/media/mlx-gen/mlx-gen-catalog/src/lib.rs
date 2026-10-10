@@ -1810,7 +1810,15 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(registry.transforms().len(), 0);
+        // sc-25683: the Iris-3B restorer is the catalog's first (image) transform.
+        let transforms: Vec<String> = registry
+            .transforms()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(transforms, ["iris_3b_restore"]);
+        assert!(registry
+            .transforms()
+            .all(|r| (r.descriptor)().backend == "mlx"));
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
@@ -1938,11 +1946,13 @@ mod tests {
             .chain(&captioners)
             .chain(&image_embedders)
             .chain(&text_embedders)
+            .chain(&transforms)
             .collect();
         // sc-24108 adds `qwen_image_2_1` (a generator with its own component row): 71 / 61.
         // sc-25679 adds `iris_3b` (a generator with its own complete row): 72 / 62.
-        assert_eq!(distinct.len(), 72);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 62);
+        // sc-25683 adds `iris_3b_restore` (a transform with its own complete row): 73 / 63.
+        assert_eq!(distinct.len(), 73);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 63);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

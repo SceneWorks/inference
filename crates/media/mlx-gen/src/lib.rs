@@ -150,5 +150,6 @@ pub use train::{
     TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 pub use transform::{
-    TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,
+    InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
+    TransformRequest,
 };

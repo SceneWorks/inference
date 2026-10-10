@@ -217,6 +217,12 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "iris_3b",
         components: &["iris_3b", "qwen3_vl_4b_instruct"],
     },
+    // The restoration transform (sc-25683) loads only the same repository's `upscaler/` export —
+    // never the text encoder — so its one component is the repository row.
+    ProviderComponents {
+        provider_id: "iris_3b_restore",
+        components: &["iris_3b"],
+    },
     // --- kolors -----------------------------------------------------------------------------
     // The `Kwai-Kolors/Kolors-diffusers` repository row is an AMBIGUOUS hole (sc-16662 U6), so the
     // UNet, VAE and derived tokenizer contribute nothing. The ChatGLM3-6B text encoder is governed
@@ -513,8 +519,8 @@ mod tests {
     ];
 
     /// Every registered id across every provider kind — the set this mapping is measured against.
-    /// Candle registers generators, trainers, one captioner and two embedders; `transforms` is
-    /// empty here and is still walked so a future registration cannot slip past unmapped.
+    /// Candle registers generators, trainers, one captioner, two embedders and one transform
+    /// (`iris_3b_restore`, sc-25683).
     fn registered_ids() -> BTreeSet<String> {
         let registry = super::super::provider_registry().expect("catalog builds");
         let mut ids: BTreeSet<String> = BTreeSet::new();
@@ -568,7 +574,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 52);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 53);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -600,9 +606,9 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            62,
-            "62 distinct Candle provider ids: 57 generators + 16 trainers (14 of them also \
-             generator ids) + 1 captioner + 2 embedders"
+            63,
+            "63 distinct Candle provider ids: 57 generators + 16 trainers (14 of them also \
+             generator ids) + 1 captioner + 2 embedders + 1 transform (iris_3b_restore, sc-25683)"
         );
 
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
@@ -754,6 +760,7 @@ mod tests {
                 "chroma1_flash",
                 "chroma1_hd",
                 "iris_3b",
+                "iris_3b_restore",
                 "ltx_2_3",
                 "ltx_2_3_distilled",
                 "minimax_h3",
