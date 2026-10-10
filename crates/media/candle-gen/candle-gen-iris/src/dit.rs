@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::ops::sigmoid;
-use candle_gen::gen_core::iris::ModelConfig;
+use candle_gen::gen_core::iris::{self, ModelConfig};
 use candle_gen::{CandleError as Error, Result};
 
 use crate::nn::{
@@ -482,12 +482,8 @@ impl IrisDiT {
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)
     /// → Linear → SiLU → Linear. `t` is model time `[B]` f32 → `[B, 1, D]`.
     fn timestep_embedding(&self, t: &Tensor) -> Result<Tensor> {
-        const FREQ_DIM: usize = 256;
-        let n = FREQ_DIM / 2;
-        let neg_log = -(self.cfg.timestep_max_period.ln()) as f32;
-        let freqs: Vec<f32> = (0..n)
-            .map(|k| (neg_log * k as f32 / n as f32).exp())
-            .collect();
+        let freqs = iris::timestep_freqs(self.cfg.timestep_max_period);
+        let n = freqs.len();
         let b = t.dim(0)?;
         let freqs = Tensor::from_vec(freqs, (1, n), &self.device)?;
         let phase = t
@@ -551,24 +547,7 @@ impl IrisDiT {
             return Ok(table.clone());
         }
         let dim = self.cfg.pixel.hidden_size;
-        let half = dim / 2; // per axis
-        let quarter = half / 2; // frequencies per axis
-        let omega: Vec<f64> = (0..quarter)
-            .map(|k| 1.0 / 10_000f64.powf(k as f64 / (half as f64 / 2.0)))
-            .collect();
-        let mut data = vec![0f32; height * width * dim];
-        for r in 0..height {
-            for c in 0..width {
-                let row = &mut data[(r * width + c) * dim..(r * width + c + 1) * dim];
-                for (k, w) in omega.iter().enumerate() {
-                    let (xc, yr) = (c as f64 * w, r as f64 * w);
-                    row[k] = xc.sin() as f32;
-                    row[quarter + k] = xc.cos() as f32;
-                    row[half + k] = yr.sin() as f32;
-                    row[half + quarter + k] = yr.cos() as f32;
-                }
-            }
-        }
+        let data = iris::pixel_sincos_table(height, width, dim);
         let table = Tensor::from_vec(data, (height, width, dim), &self.device)?;
         cache.insert((height, width), table.clone());
         Ok(table)

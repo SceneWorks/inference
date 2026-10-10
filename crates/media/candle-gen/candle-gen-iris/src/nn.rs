@@ -22,6 +22,7 @@ use std::path::Path;
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::iris;
 use candle_gen::{CandleError as Error, Result};
 
 /// The dtype two operands meet at: themselves when they agree, f32 otherwise (the only two dtypes
@@ -315,38 +316,14 @@ impl Rope {
         scale: f32,
         device: &Device,
     ) -> Result<Self> {
-        let n_pairs = head_dim / 4;
-        let freqs: Vec<f32> = (0..n_pairs)
-            .map(|j| 1.0 / theta.powf((4 * j) as f32 / head_dim as f32))
-            .collect();
-        let step = scale / ((height.max(width) as f32) - 1.0).max(1.0);
-        let mut angles = Vec::with_capacity(height * width * 2 * n_pairs);
-        for r in 0..height {
-            let y = r as f32 * step;
-            for c in 0..width {
-                let x = c as f32 * step;
-                for f in &freqs {
-                    angles.push(x * f);
-                    angles.push(y * f);
-                }
-            }
-        }
-        Self::from_angles(&angles, height * width, 2 * n_pairs, device)
+        let angles = iris::rope_2d_angles(head_dim, height, width, theta, scale);
+        Self::from_angles(&angles, height * width, 2 * (head_dim / 4), device)
     }
 
     /// `rope_1d(head_dim, length, theta)`: standard 1-D RoPE over integer positions.
     pub fn line_1d(head_dim: usize, length: usize, theta: f32, device: &Device) -> Result<Self> {
-        let pairs = head_dim / 2;
-        let freqs: Vec<f32> = (0..pairs)
-            .map(|j| 1.0 / theta.powf((2 * j) as f32 / head_dim as f32))
-            .collect();
-        let mut angles = Vec::with_capacity(length * pairs);
-        for p in 0..length {
-            for f in &freqs {
-                angles.push(p as f32 * f);
-            }
-        }
-        Self::from_angles(&angles, length, pairs, device)
+        let angles = iris::rope_1d_angles(head_dim, length, theta);
+        Self::from_angles(&angles, length, head_dim / 2, device)
     }
 
     /// Rotate `x` `[B, N, H, head_dim]` by complex multiplication over **adjacent** channel pairs
@@ -419,18 +396,12 @@ pub fn attention(
 
 /// `TransformerTextEmbedder`'s key mask: real keys OR the diagonal, additive `[B, 1, T, T]` f32.
 pub fn key_padding_mask(mask: &[Vec<i32>], tokens: usize, device: &Device) -> Result<Tensor> {
-    let b = mask.len();
-    let mut data = vec![0f32; b * tokens * tokens];
-    for (bi, row) in mask.iter().enumerate() {
-        for i in 0..tokens {
-            for j in 0..tokens {
-                if row[j] == 0 && i != j {
-                    data[(bi * tokens + i) * tokens + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-    }
-    Ok(Tensor::from_vec(data, (b, 1, tokens, tokens), device)?)
+    let data = iris::key_padding_additive(mask, tokens);
+    Ok(Tensor::from_vec(
+        data,
+        (mask.len(), 1, tokens, tokens),
+        device,
+    )?)
 }
 
 /// Shape check with a named error (checkpoint/config disagreement surfaces at load, by key).
