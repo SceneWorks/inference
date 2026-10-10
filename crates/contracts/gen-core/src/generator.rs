@@ -335,6 +335,40 @@ pub enum GenerationOutput {
     Audio(AudioTrack),
 }
 
+/// The caption-overflow policy ([`GenerationRequest::caption_overflow`], epic sc-25678): what a
+/// text encoder with a fixed caption budget does with a prompt that tokenizes past it. The three
+/// values are upstream Iris-3B's `text_encoder.on_caption_overflow` vocabulary, verbatim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CaptionOverflowPolicy {
+    /// Truncate the caption to the budget and log a warning (upstream's release default).
+    Warn,
+    /// Refuse the request: a caption that does not fit is an error, never silently truncated.
+    Error,
+    /// Truncate the caption to the budget without logging.
+    Silent,
+}
+
+impl CaptionOverflowPolicy {
+    /// Parse upstream's lowercase spelling (`warn` / `error` / `silent`); anything else is `None`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "warn" => Self::Warn,
+            "error" => Self::Error,
+            "silent" => Self::Silent,
+            _ => return None,
+        })
+    }
+
+    /// The lowercase spelling (round-trips with [`Self::from_name`]).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Silent => "silent",
+        }
+    }
+}
+
 /// How many channels an image generation emits ([`GenerationRequest::output_channels`],
 /// sc-24111).
 ///
@@ -432,6 +466,25 @@ pub struct GenerationRequest {
     /// APG norm-threshold (`apg` only): clamp the guidance delta to `‖diff‖ ≤ norm_threshold`
     /// (`0` disables the clamp). `None` ⇒ the engine default. Ignored by non-APG methods.
     pub guidance_norm_threshold: Option<f32>,
+    /// Classifier-free-guidance **interval** `(lo, hi)` (epic sc-25678): guidance runs only at the
+    /// model-evaluation times `t` (normalized noise level, `1` = pure noise, `0` = clean) strictly
+    /// inside `lo < t < hi`; every other evaluation is a single conditional forward. `None` ⇒ the
+    /// model's own default interval. Gated by [`Capabilities::supports_cfg_interval`]: a model that
+    /// does not advertise it refuses a `Some` on the shared floor rather than ignoring it. Both
+    /// bounds join the finiteness floor and must satisfy `lo < hi`.
+    pub cfg_interval: Option<(f32, f32)>,
+    /// A **prompt batch** (epic sc-25678): when non-empty, these prompts are rendered together as one
+    /// batched denoise (upstream `generate(prompts=[…])`), one image per prompt, repeated `count`
+    /// times — `prompt_batch.len() × count` images in prompt-minor order. `prompt` must then be empty
+    /// (the batch *is* the prompt list, so a second source of truth is refused, never merged). Empty
+    /// (the default) is the ordinary single-prompt request. Gated by
+    /// [`Capabilities::supports_prompt_batch`] and bounded by [`Capabilities::max_count`] on the
+    /// total image count.
+    pub prompt_batch: Vec<String>,
+    /// What to do when a prompt tokenizes past the model's caption budget (epic sc-25678; upstream
+    /// Iris-3B's `text_encoder.on_caption_overflow`). `None` ⇒ the checkpoint's own configured
+    /// policy. Gated by [`Capabilities::supports_caption_overflow_policy`].
+    pub caption_overflow: Option<CaptionOverflowPolicy>,
 
     // --- Conditioning ---
     pub conditioning: Vec<Conditioning>,
@@ -1239,6 +1292,9 @@ impl Default for GenerationRequest {
             guidance_eta: None,
             guidance_momentum: None,
             guidance_norm_threshold: None,
+            cfg_interval: None,
+            prompt_batch: Vec::new(),
+            caption_overflow: None,
             conditioning: Vec::new(),
             strength: None,
             control_scale: None,
@@ -1516,6 +1572,11 @@ impl GenerationRequest {
             sampler: _,
             scheduler: _,
             guidance_method: _,
+            // A string list and a unit enum (sc-25681): no floats to classify. `cfg_interval`'s two
+            // bounds join the float floor below.
+            prompt_batch: _,
+            caption_overflow: _,
+            cfg_interval,
             conditioning,
             frames: _,
             fps: _,
@@ -1594,7 +1655,11 @@ impl GenerationRequest {
             ("pid_capture_sigma", *pid_capture_sigma),
             ("text_style_gain", *text_style_gain),
         ];
-        for (name, v) in floats {
+        let interval: [(&'static str, Option<f32>); 2] = [
+            ("cfg_interval.lo", cfg_interval.map(|(lo, _)| lo)),
+            ("cfg_interval.hi", cfg_interval.map(|(_, hi)| hi)),
+        ];
+        for (name, v) in floats.into_iter().chain(interval) {
             if let Some(x) = v {
                 if !x.is_finite() {
                     return Some((name, x));
@@ -3068,6 +3133,16 @@ pub struct Capabilities {
     /// would return SDR pixels tagged as an HDR render, which is precisely the washed-out-
     /// playback failure the opt-in exists to prevent.
     pub supports_hdr: bool,
+    /// Whether this model honours [`GenerationRequest::cfg_interval`] (epic sc-25678). `Default` is
+    /// `false`, and the shared floor refuses a `Some` interval against such a model rather than
+    /// letting it be accepted and ignored.
+    pub supports_cfg_interval: bool,
+    /// Whether this model renders a [`GenerationRequest::prompt_batch`] as one batched denoise (epic
+    /// sc-25678). `Default` is `false`; the shared floor refuses a non-empty batch otherwise.
+    pub supports_prompt_batch: bool,
+    /// Whether this model honours [`GenerationRequest::caption_overflow`] (epic sc-25678). `Default`
+    /// is `false`; the shared floor refuses a `Some` policy otherwise.
+    pub supports_caption_overflow_policy: bool,
     /// Whether this model can emit **RGBA** images with a straight alpha channel through
     /// [`GenerationRequest::output_channels`] = [`OutputChannels::Rgba`] (sc-24111).
     ///
@@ -3544,6 +3619,49 @@ impl Capabilities {
         // to a caller who asked for transparency, with nothing in the reply to say the alpha was
         // dropped. `Rgb` (the `Default`) validates vacuously, so this is inert for every request
         // that has not opted in.
+        // Guidance interval, prompt batch and caption-overflow policy (epic sc-25678). On the shared
+        // floor for the HDR reason: each is a control a provider that does not read it would accept
+        // and silently ignore. Unset values validate vacuously.
+        if let Some((lo, hi)) = req.cfg_interval {
+            if !self.supports_cfg_interval {
+                return Err(Error::Unsupported(format!(
+                    "{id}: `cfg_interval` is not supported by this model"
+                )));
+            }
+            if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+                return Err(Error::Msg(format!(
+                    "{id}: cfg_interval ({lo}, {hi}) must be finite with lo < hi"
+                )));
+            }
+        }
+        if !req.prompt_batch.is_empty() {
+            if !self.supports_prompt_batch {
+                return Err(Error::Unsupported(format!(
+                    "{id}: a `prompt_batch` is not supported by this model; send one request per \
+                     prompt"
+                )));
+            }
+            if !req.prompt.is_empty() {
+                return Err(Error::Msg(format!(
+                    "{id}: a request carries either `prompt` or a non-empty `prompt_batch`, not both"
+                )));
+            }
+            let images = req.prompt_batch.len() as u64 * req.count as u64;
+            if images > self.max_count as u64 {
+                return Err(Error::Msg(format!(
+                    "{id}: prompt_batch of {} × count {} = {images} images exceeds the {} images \
+                     per request this model renders",
+                    req.prompt_batch.len(),
+                    req.count,
+                    self.max_count
+                )));
+            }
+        }
+        if req.caption_overflow.is_some() && !self.supports_caption_overflow_policy {
+            return Err(Error::Unsupported(format!(
+                "{id}: `caption_overflow` is not supported by this model"
+            )));
+        }
         if req.output_channels == OutputChannels::Rgba && !self.supports_alpha_output {
             return Err(Error::Unsupported(format!(
                 "{id}: RGBA (alpha-channel) output is not supported by this model; it emits RGB \
@@ -6136,6 +6254,79 @@ mod tests {
             matches!(&orphan, Err(Error::Msg(m)) if m.contains("requires audio.artifacts")),
             "{orphan:?}"
         );
+    }
+
+    #[test]
+    fn cfg_interval_prompt_batch_and_caption_overflow_are_gated_on_the_floor() {
+        // sc-25681: each control is refused by a model that does not advertise it, so it can never
+        // be accepted and ignored; an advertising model still gets the shape checks.
+        let plain = Capabilities {
+            min_size: 64,
+            max_size: 2048,
+            max_count: 4,
+            ..Default::default()
+        };
+        let all = Capabilities {
+            supports_cfg_interval: true,
+            supports_prompt_batch: true,
+            supports_caption_overflow_policy: true,
+            ..plain.clone()
+        };
+        let base = || GenerationRequest {
+            prompt: "p".into(),
+            ..Default::default()
+        };
+        let interval = GenerationRequest {
+            cfg_interval: Some((0.1, 0.9)),
+            ..base()
+        };
+        let batch = GenerationRequest {
+            prompt: String::new(),
+            prompt_batch: vec!["a".into(), "b".into()],
+            count: 2,
+            ..Default::default()
+        };
+        let overflow = GenerationRequest {
+            caption_overflow: Some(CaptionOverflowPolicy::Error),
+            ..base()
+        };
+        for req in [&interval, &batch, &overflow] {
+            assert!(matches!(
+                plain.validate_request("m", req),
+                Err(Error::Unsupported(_))
+            ));
+            all.validate_request("m", req).unwrap();
+        }
+        let inverted = GenerationRequest {
+            cfg_interval: Some((0.9, 0.1)),
+            ..base()
+        };
+        assert!(all.validate_request("m", &inverted).is_err());
+        let nan = GenerationRequest {
+            cfg_interval: Some((f32::NAN, 0.5)),
+            ..base()
+        };
+        assert_eq!(
+            nan.first_nonfinite_float().map(|(n, _)| n),
+            Some("cfg_interval.lo")
+        );
+        let both = GenerationRequest {
+            prompt: "p".into(),
+            ..batch.clone()
+        };
+        assert!(all.validate_request("m", &both).is_err());
+        let too_many = GenerationRequest { count: 3, ..batch };
+        assert!(all.validate_request("m", &too_many).is_err());
+        for policy in [
+            CaptionOverflowPolicy::Warn,
+            CaptionOverflowPolicy::Error,
+            CaptionOverflowPolicy::Silent,
+        ] {
+            assert_eq!(
+                CaptionOverflowPolicy::from_name(policy.name()),
+                Some(policy)
+            );
+        }
     }
 
     #[test]

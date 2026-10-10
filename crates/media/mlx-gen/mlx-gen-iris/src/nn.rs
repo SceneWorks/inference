@@ -13,16 +13,52 @@
 //!   residual streams stay f32 where upstream's do and the PiT pixel stream stays in the compute
 //!   dtype where upstream's does.
 
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
-use mlx_rs::ops::{addmm, concatenate_axis, matmul, stack_axis};
+use mlx_rs::ops::{concatenate_axis, stack_axis};
 use mlx_rs::{Array, Dtype};
 
 /// Builds modules from a checkpoint at one compute dtype.
 pub struct Loader<'a> {
     pub weights: &'a Weights,
     pub compute: Dtype,
+    /// The adapted projections of a load that installed LoRA/LoKr adapters (see
+    /// [`AdaptedLinears`]); `None` builds every projection bare from `weights`.
+    pub adapted: Option<&'a AdaptedLinears>,
+}
+
+/// The checkpoint's projections after an adapter install, keyed by upstream module path
+/// (`blocks.3.attn_proj`): each is the [`AdaptableLinear`] the install acted on — the dense base
+/// (with any diff-patch delta folded in) plus its stack of forward-time adapter residuals. The
+/// [`Loader`] hands a projection out of here instead of rebuilding it from the raw tensor, and
+/// records which paths it consumed, so an adapter that landed on a 2-D tensor the graph does not
+/// read as a projection is a load error rather than a silently dropped residual.
+pub struct AdaptedLinears {
+    linears: RefCell<BTreeMap<String, AdaptableLinear>>,
+    adapted: BTreeSet<String>,
+    consumed: RefCell<BTreeSet<String>>,
+}
+
+impl AdaptedLinears {
+    /// `linears` are every projection the install could reach; `adapted` the paths it changed.
+    pub fn new(linears: BTreeMap<String, AdaptableLinear>, adapted: BTreeSet<String>) -> Self {
+        Self {
+            linears: RefCell::new(linears),
+            adapted,
+            consumed: RefCell::new(BTreeSet::new()),
+        }
+    }
+
+    /// Adapted paths no module consumed as a projection — must be empty after a model build.
+    pub fn unconsumed(&self) -> Vec<String> {
+        let consumed = self.consumed.borrow();
+        self.adapted.difference(&consumed).cloned().collect()
+    }
 }
 
 impl Loader<'_> {
@@ -36,6 +72,28 @@ impl Loader<'_> {
     }
 
     pub fn linear(&self, prefix: &str, bias: bool) -> Result<Linear> {
+        if let Some(adapted) = self.adapted {
+            if let Some(inner) = adapted.linears.borrow_mut().remove(prefix) {
+                // Same keys a bare build reads (so the checkpoint's unused-key accounting holds).
+                self.require(&format!("{prefix}.weight"))?;
+                if bias {
+                    self.require(&format!("{prefix}.bias"))?;
+                }
+                if inner.bias().is_some() != bias {
+                    return Err(Error::Msg(format!(
+                        "iris: the projection {prefix} has a bias mismatch after the adapter install"
+                    )));
+                }
+                adapted.consumed.borrow_mut().insert(prefix.to_owned());
+                // Every adapter factor is read and evaluated here, at the load boundary, so no
+                // forward ever waits on a lazy adapter read.
+                inner.materialize_adapters()?;
+                return Ok(Linear {
+                    inner,
+                    compute: self.compute,
+                });
+            }
+        }
         let weight = self
             .require(&format!("{prefix}.weight"))?
             .as_dtype(self.compute)?;
@@ -47,7 +105,10 @@ impl Loader<'_> {
         } else {
             None
         };
-        Ok(Linear { weight, bias })
+        Ok(Linear {
+            inner: AdaptableLinear::dense(weight, bias),
+            compute: self.compute,
+        })
     }
 
     pub fn norm(&self, prefix: &str, eps: f32) -> Result<RmsNorm> {
@@ -58,25 +119,27 @@ impl Loader<'_> {
     }
 }
 
-/// `nn.Linear` (`[out, in]` weight).
+/// `nn.Linear` (`[out, in]` weight, stored in the compute dtype), as the repo's
+/// [`AdaptableLinear`]: the bare forward is `addmm(b, x, Wᵀ)` / `x·Wᵀ` exactly as before adapters
+/// existed, and an installed LoRA/LoKr adds its residual `Σ adapter(x)` on top (LoKr through the
+/// structured Kronecker product, never a materialized `[out, in]` delta).
 pub struct Linear {
-    weight: Array,
-    bias: Option<Array>,
+    inner: AdaptableLinear,
+    compute: Dtype,
 }
 
 impl Linear {
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let x = x.as_dtype(self.weight.dtype())?;
-        Ok(match &self.bias {
-            Some(b) => addmm(b, &x, self.weight.t(), 1.0, 1.0)?,
-            None => matmul(&x, self.weight.t())?,
-        })
+        let x = x.as_dtype(self.compute)?;
+        self.inner.forward(&x)
     }
 
+    /// The dense base parameters (adapter factors are evaluated at load by the [`Loader`]).
     pub fn arrays(&self) -> Vec<&Array> {
-        std::iter::once(&self.weight)
-            .chain(self.bias.as_ref())
-            .collect()
+        match self.inner.dense_weight() {
+            Some((weight, bias)) => std::iter::once(weight).chain(bias).collect(),
+            None => Vec::new(),
+        }
     }
 }
 

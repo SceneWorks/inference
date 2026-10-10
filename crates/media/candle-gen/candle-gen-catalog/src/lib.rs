@@ -618,6 +618,9 @@ mod preview_advertising {
         "sana_sprint_1600m",
         "sensenova_u1_8b",
         "sensenova_u1_8b_fast",
+        // sc-25681: pixel space — the frame is the step's predicted clean image, patch-pooled and
+        // decoded exactly (`(x + 1)/2`), so there is no fit to measure.
+        "iris_3b",
     ];
 
     /// The two SANA rows above, named so `sana_base_and_sprint_are_two_independent_rows` can bind
@@ -874,12 +877,9 @@ mod preview_advertising {
     /// carries the RGBA output surface, and it is where the fit and the wiring belong together.
     /// Its MLX twin (sc-24108) advertises `supports_preview: false` for the same reason.
     ///
-    /// `iris_3b` (sc-25680) is deferred, **not** a no-go: Iris denoises in pixel space, so the
-    /// running solver state already is an RGB image and no latent fit is needed at all. Neither
-    /// backend wires it yet — the MLX twin (sc-25679) advertises `supports_preview: false` too — so
-    /// the preview surface is an epic-level decision (sc-25678), taken once for both backends.
-    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] =
-        &[("qwen_image_2_1", "sc-24111"), ("iris_3b", "sc-25678")];
+    /// `iris_3b` left this class in sc-25681: it is wired on both backends (pixel space, so the
+    /// step's predicted clean image is the frame and no latent fit exists to defer on).
+    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[("qwen_image_2_1", "sc-24111")];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -1376,12 +1376,18 @@ mod preview_advertising {
         },
         ProviderCrate {
             dir: "candle-gen-iris",
-            // sc-25680: the FlowDPM-Solver++ is a bespoke loop (`solver::sample`) — no shared
-            // driver site — and it emits nothing, so the inventory is empty and the route is
-            // carried in PREVIEW_DEFERRED_ROUTE_IDS.
+            // The FlowDPM-Solver++ is a bespoke loop (`solver::sample`) — no shared driver site.
+            // sc-25681 wires it through one direct `emit_preview_at` in `pipeline.rs::denoise`,
+            // the single denoise every Iris generation request runs (prompt batch and `count`
+            // included), emitting the step's patch-pooled predicted clean image.
             register: candle_gen_iris::register_providers,
             denoise: Denoise::Bespoke,
-            routes: &[],
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 0,
+                direct: 1,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-sensenova",

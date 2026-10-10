@@ -2,6 +2,7 @@ call "%VCVARS%"
 set "IRIS_FAILED=0"
 call :run_one real_tokenizer_matches_the_pinned_ids || set "IRIS_FAILED=1"
 call :run_one provider_renders_a_real_image || set "IRIS_FAILED=1"
+call :run_one provider_renders_with_non_default_controls || set "IRIS_FAILED=1"
 if not "%IRIS_FAILED%"=="0" exit /b 1
 exit /b 0
 
