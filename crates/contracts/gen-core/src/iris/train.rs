@@ -19,10 +19,21 @@
 //!
 //! ## Unit conventions (read before wiring a request)
 //!
-//! * [`TrainingConfig::steps`] is upstream's `train.max_steps`: the number of **optimizer
-//!   steps** (one per `gradient_accumulation` micro-batches). [`TrainingConfig::save_every`] and
-//!   [`TrainingConfig::sample_every`] count optimizer steps too (upstream `save_every_steps` /
-//!   `sample_every_steps`). With `gradient_accumulation = 1` they equal micro-steps.
+//! * The shared [`TrainingConfig`] units hold: [`TrainingConfig::steps`],
+//!   [`TrainingConfig::save_every`], [`TrainingConfig::sample_every`] and
+//!   [`TrainingConfig::lr_warmup_steps`] count **micro-steps**, and every `TrainingProgress` /
+//!   `TrainingOutput` step is a micro-step. Upstream counts optimizer steps (`train.max_steps`,
+//!   `save_every_steps`, `sample_every_steps`, `warmup_steps`), one per `gradient_accumulation`
+//!   micro-batches, so [`IrisTrainPlan::resolve`] divides by the accumulation length: `steps`,
+//!   `save_every` and `sample_every` must be multiples of it (refused otherwise — never rounded),
+//!   and the warmup rounds up (as the shared `schedule_updates` does). With
+//!   `gradient_accumulation = 1` the two units coincide. The Iris-only `milestone_steps` /
+//!   `keep_last_checkpoints` options and the checkpoint `state.json` `step` count optimizer steps
+//!   (upstream's checkpoint names).
+//! * Previews follow the shared contract: empty [`TrainingConfig::sample_prompts`] (or
+//!   `sample_every = 0`) renders nothing; at most [`PREVIEW_PROMPT_CAP`] prompts render per cadence;
+//!   no extra render at step 1. Upstream's seven default validation prompts are an explicit opt-in
+//!   (`upstream_validation_prompts`).
 //! * [`TrainingConfig::resolution`] is upstream's fixed-square `data.image_size` (shortest-side
 //!   bicubic resize + center crop); it must be a multiple of the backbone's `patch_size` and is
 //!   never silently changed.
@@ -57,8 +68,9 @@ pub const ITEM_CAPTIONS_KEY: &str = "captions";
 pub const TECHNIQUES: TrainingTechniques = TrainingTechniques::NONE;
 /// `data/samplers.py` `CANONICAL_CHUNKS`: the ranged walk covers `chunks · (n / chunks)` samples.
 pub const CANONICAL_CHUNKS: usize = 640;
-/// `TrainConfig.validation_prompts` default (`DEFAULT_VALIDATION_PROMPTS`), the preview prompts a
-/// run renders when the request names none.
+/// `TrainConfig.validation_prompts` default (`DEFAULT_VALIDATION_PROMPTS`): the preview prompts a
+/// run renders only when the request names none **and** opts in with the
+/// `upstream_validation_prompts` option (they are not capped by [`PREVIEW_PROMPT_CAP`]).
 pub const DEFAULT_VALIDATION_PROMPTS: [&str; 7] = [
     "a golden retriever puppy sitting in a field of tall grass at sunset",
     "close-up portrait of an elderly fisherman with a weathered face, soft window light, shallow depth of field",
@@ -68,6 +80,10 @@ pub const DEFAULT_VALIDATION_PROMPTS: [&str; 7] = [
     "a neon sign above a small night-market stall that reads \u{201c}OPEN LATE\u{201d}",
     "a hand-painted wooden sign in a flower shop window that says \u{201c}Fresh Tulips Today\u{201d}",
 ];
+
+/// The most request prompts a preview cadence renders (the shared family cap; extra prompts are
+/// not rendered, as in every other family trainer).
+pub const PREVIEW_PROMPT_CAP: usize = 4;
 
 // =============================================================================================
 // Positional randomness (`seeding.py`)
@@ -876,6 +892,34 @@ impl DataWalk {
         })
     }
 
+    /// Dataset items the ranged walk never visits (`items − covered`): upstream's
+    /// `chunks · (n / chunks)` coverage drops the tail of a dataset larger than
+    /// [`CANONICAL_CHUNKS`] that is not a multiple of it.
+    pub fn unused_items(&self) -> usize {
+        self.items - self.covered
+    }
+
+    /// The run-start warning a trainer emits when [`Self::unused_items`] is non-zero (`None`
+    /// otherwise), naming how many items — and which index range — no epoch will train on.
+    pub fn unused_tail_warning(&self) -> Option<String> {
+        let unused = self.unused_items();
+        (unused > 0).then(|| {
+            format!(
+                "iris training: warning — {unused} of {} dataset items (indices {}..{}) are never \
+                 trained on: the upstream ranged sampler covers {} · ({} / {}) = {} items; add or \
+                 remove items to a multiple of {} to use them all",
+                self.items,
+                self.covered,
+                self.items,
+                CANONICAL_CHUNKS,
+                self.items,
+                CANONICAL_CHUNKS,
+                self.covered,
+                CANONICAL_CHUNKS
+            )
+        })
+    }
+
     /// Batches per epoch (`len(dataloader)`).
     pub fn batches_per_epoch(&self) -> usize {
         self.covered.div_ceil(self.batch_size)
@@ -1144,7 +1188,7 @@ pub enum ResumeDataPolicy {
 /// Preview rendering (`_render_validation`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreviewPlan {
-    /// Every `every` optimizer steps (and at step 1, as upstream); 0 = off.
+    /// Every `every` optimizer steps (`sample_every / gradient_accumulation`); 0 = off.
     pub every: u32,
     pub prompts: Vec<String>,
     pub steps: usize,
@@ -1180,9 +1224,14 @@ pub struct PreviewPlan {
 /// | `keep_last_checkpoints`, `milestone_steps` | `train.*` | 0, `[]` |
 /// | `resume_from` | `train.resume_from` (path) | unset |
 /// | `resume_data_policy`, `override_lr_on_resume` | `train.*` | `"exact"`, false |
-/// | `preview_weights` | (raw `core`) | `"raw"` (`"ema"`) |
+/// | `preview_weights` | (raw `core`) | the `export_weights` default (`"raw"` / `"ema"`) |
 /// | `preview_negative_prompt` | `sample.negative_prompt` | `""` |
-/// | `export_weights` | `export_checkpoint.py` (EMA when on) | `"ema"` when EMA is on, else `"raw"` |
+/// | `upstream_validation_prompts` | `validation_prompts` default | false (true: render [`DEFAULT_VALIDATION_PROMPTS`] when `sample_prompts` is empty) |
+/// | `export_weights` | `export_checkpoint.py` (EMA when on) | full model: `"ema"` when EMA is on, else `"raw"`; LoRA / LoKr: `"raw"` |
+///
+/// The adapter default is `raw` because upstream ships no adapter EMA/export and an EMA at the
+/// default decay seeded from the adapter's zero delta (LoRA `B = 0`, LoKr `w1 = 0`) stays close to
+/// that zero over a typical 1–3k-step adapter run; `export_weights: "ema"` still selects it.
 /// | `export_dtype` | `--dtype` | `"fp32"` (`"bf16"`) |
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IrisTrainOptions(pub JsonMap<String, JsonValue>);
@@ -1222,7 +1271,7 @@ const OPTION_KEYS: [&str; 33] = [
     "preview_negative_prompt",
     "export_weights",
 ];
-const OPTION_KEYS_EXTRA: [&str; 1] = ["export_dtype"];
+const OPTION_KEYS_EXTRA: [&str; 2] = ["export_dtype", "upstream_validation_prompts"];
 
 impl IrisTrainOptions {
     /// Read the options object from a request (absent = all defaults). Unknown keys are refused.
@@ -1352,7 +1401,7 @@ pub struct IrisTrainPlan {
     pub image_size: usize,
     pub batch_size: usize,
     pub grad_accum: usize,
-    /// Optimizer-step horizon (`train.max_steps` = `TrainingConfig::steps`).
+    /// Optimizer-step horizon (`train.max_steps` = `TrainingConfig::steps / grad_accum`).
     pub max_steps: u32,
     pub num_epochs: Option<u32>,
     pub seed: u64,
@@ -1370,6 +1419,7 @@ pub struct IrisTrainPlan {
     pub caption_fields: Vec<String>,
     pub on_caption_overflow: String,
     pub text_conditioning: TextConditioningMode,
+    /// Checkpoint cadence in optimizer steps (`TrainingConfig::save_every / grad_accum`); 0 = off.
     pub save_every: u32,
     pub keep_last_checkpoints: usize,
     pub milestone_steps: Vec<u64>,
@@ -1463,6 +1513,22 @@ impl IrisTrainPlan {
         }
         let batch_size = cfg.batch_size.max(1) as usize;
         let grad_accum = cfg.gradient_accumulation.max(1) as usize;
+        // The shared contract counts micro-steps; the loop counts optimizer steps. A cadence that
+        // is not a whole number of accumulation windows has no optimizer-step equivalent: refuse.
+        for (field, value) in [
+            ("steps", cfg.steps),
+            ("save_every", cfg.save_every),
+            ("sample_every", cfg.sample_every),
+        ] {
+            if !(value as usize).is_multiple_of(grad_accum) {
+                return Err(Error::Msg(format!(
+                    "iris training: {field} = {value} micro-steps is not a multiple of \
+                     gradient_accumulation = {grad_accum} (Iris steps, checkpoints and previews \
+                     land on optimizer-step boundaries)"
+                )));
+            }
+        }
+        let accum_u32 = grad_accum as u32;
 
         // ---- artifact --------------------------------------------------------------------------
         let artifact = if cfg.full_finetune {
@@ -1675,9 +1741,17 @@ impl IrisTrainPlan {
                 )))
             }
         };
+        // Upstream exports the EMA of a full model (`export_checkpoint.py`); it has no adapter
+        // EMA, and an adapter EMA seeded from the zero delta lags far behind a typical run, so an
+        // adapter exports its raw factors unless the request asks otherwise. Previews show what the
+        // run will export unless `preview_weights` says otherwise.
+        let default_weights = match (&artifact, ema) {
+            (ArtifactPlan::Full, Some(_)) => WeightsSelect::Ema,
+            _ => WeightsSelect::Raw,
+        };
         let preview_weights = match opts.string("preview_weights")? {
             Some(s) => WeightsSelect::parse("preview_weights", &s)?,
-            None => WeightsSelect::Raw,
+            None => default_weights,
         };
         if preview_weights == WeightsSelect::Ema && ema.is_none() {
             return Err(Error::Msg(
@@ -1686,8 +1760,7 @@ impl IrisTrainPlan {
         }
         let export_weights = match opts.string("export_weights")? {
             Some(s) => WeightsSelect::parse("export_weights", &s)?,
-            None if ema.is_some() => WeightsSelect::Ema,
-            None => WeightsSelect::Raw,
+            None => default_weights,
         };
         if export_weights == WeightsSelect::Ema && ema.is_none() {
             return Err(Error::Msg(
@@ -1719,21 +1792,39 @@ impl IrisTrainPlan {
                 )))
             }
         };
-        if cfg.sample_every > 0 && cfg.sample_steps == 0 {
+        let upstream_prompts = opts.bool("upstream_validation_prompts", false)?;
+        let prompts: Vec<String> = match (cfg.sample_prompts.is_empty(), upstream_prompts) {
+            (true, true) => DEFAULT_VALIDATION_PROMPTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            (true, false) => Vec::new(),
+            (false, false) => cfg
+                .sample_prompts
+                .iter()
+                .take(PREVIEW_PROMPT_CAP)
+                .cloned()
+                .collect(),
+            (false, true) => {
+                return Err(Error::Msg(
+                    "iris training: upstream_validation_prompts renders upstream's default \
+                     prompts in place of sample_prompts — set one or the other"
+                        .into(),
+                ))
+            }
+        };
+        if cfg.sample_every > 0 && !prompts.is_empty() && cfg.sample_steps == 0 {
             return Err(Error::Msg(
                 "iris training: sample_steps must be >= 1".into(),
             ));
         }
-        let prompts = if cfg.sample_prompts.is_empty() {
-            DEFAULT_VALIDATION_PROMPTS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            cfg.sample_prompts.clone()
-        };
         let preview = PreviewPlan {
-            every: cfg.sample_every,
+            // Empty prompts disable previews whatever the cadence (the shared contract).
+            every: if prompts.is_empty() {
+                0
+            } else {
+                cfg.sample_every / accum_u32
+            },
             prompts,
             steps: cfg.sample_steps as usize,
             cfg_scale: cfg.sample_guidance_scale,
@@ -1751,14 +1842,14 @@ impl IrisTrainPlan {
             image_size,
             batch_size,
             grad_accum,
-            max_steps: cfg.steps,
+            max_steps: cfg.steps / accum_u32,
             num_epochs,
             seed: cfg.seed,
             mixed_precision,
             flow,
             optimizer,
             schedule,
-            warmup_steps: cfg.lr_warmup_steps as u64,
+            warmup_steps: cfg.lr_warmup_steps.div_ceil(accum_u32) as u64,
             gradient_clip,
             text_dropout,
             ema,
@@ -1767,7 +1858,7 @@ impl IrisTrainPlan {
             caption_fields: opts.strings("caption_fields")?,
             on_caption_overflow,
             text_conditioning,
-            save_every: cfg.save_every,
+            save_every: cfg.save_every / accum_u32,
             keep_last_checkpoints: opts.u64("keep_last_checkpoints")?.unwrap_or(0) as usize,
             milestone_steps,
             preview,
@@ -2366,6 +2457,28 @@ pub fn checkpoint_staging_dir(root: &Path, step: u64) -> PathBuf {
     ))
 }
 
+/// `fsync` every regular file directly inside `dir`, then (best effort, as directory handles are
+/// not syncable on every platform) `dir` itself. [`publish_checkpoint`] runs it on the staging
+/// directory before the publishing rename; a trainer that publishes a directory by other means
+/// calls it the same way.
+pub fn sync_dir_files(dir: &Path) -> Result<()> {
+    let io = |what: &str, p: &Path, e: std::io::Error| {
+        Error::Msg(format!("iris checkpoint: {what} {}: {e}", p.display()))
+    };
+    for entry in std::fs::read_dir(dir).map_err(|e| io("list", dir, e))? {
+        let path = entry.map_err(|e| io("list", dir, e))?.path();
+        if path.is_file() {
+            std::fs::File::open(&path)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| io("sync", &path, e))?;
+        }
+    }
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
 /// Publish a fully written staging directory as `step_XXXXXXXX` (replacing an older copy of the
 /// same step), fsync, then repoint [`CKPT_LATEST`] atomically. A checkpoint is complete exactly
 /// when its directory exists under its final name: readers never see a half-written one.
@@ -2380,6 +2493,9 @@ pub fn publish_checkpoint(root: &Path, staging: &Path, step: u64) -> Result<Path
             staging.display()
         )));
     }
+    // Every staged file reaches the disk before the directory becomes visible under its final
+    // name, so a crash right after the rename can never publish a truncated tensor file.
+    sync_dir_files(staging)?;
     if final_dir.exists() {
         std::fs::remove_dir_all(&final_dir).map_err(|e| io("replace", &final_dir, e))?;
     }

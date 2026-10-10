@@ -126,6 +126,17 @@ fn data_walk_is_the_ranged_sampler() {
     let w = DataWalk::new(1300, 1).unwrap();
     assert_eq!(w.covered, 1280);
     assert!(DataWalk::new(0, 1).is_err());
+    // The dropped tail is named at run start: 641 items cover 640, one is never trained on.
+    let w = DataWalk::new(641, 4).unwrap();
+    assert_eq!((w.covered, w.unused_items()), (640, 1));
+    let msg = w.unused_tail_warning().expect("a dropped tail warns");
+    assert!(msg.contains("1 of 641 dataset items"), "{msg}");
+    assert!(msg.contains("indices 640..641"), "{msg}");
+    for n in [10, 640, 1280] {
+        let w = DataWalk::new(n, 4).unwrap();
+        assert_eq!(w.unused_items(), 0);
+        assert_eq!(w.unused_tail_warning(), None, "{n} items use every item");
+    }
     assert_eq!(total_optimizer_steps(10, 3, Some(2), 100), 8);
     assert_eq!(total_optimizer_steps(10, 3, Some(2), 5), 5);
     assert_eq!(total_optimizer_steps(10, 3, None, 7), 7);
@@ -445,9 +456,10 @@ fn plan_defaults_are_upstreams() {
         }
     );
     assert_eq!(plan.mixed_precision, MixedPrecision::Bf16);
-    assert_eq!(plan.export_weights, WeightsSelect::Ema);
+    assert_eq!(plan.export_weights, WeightsSelect::Raw);
     assert_eq!(plan.init, InitMode::Weights);
-    assert_eq!(plan.preview.prompts.len(), DEFAULT_VALIDATION_PROMPTS.len());
+    assert!(plan.preview.prompts.is_empty());
+    assert_eq!(plan.preview.every, 0);
     assert!(matches!(plan.artifact, ArtifactPlan::Lora { rank: 16, .. }));
     assert_eq!(plan.artifact.targets().len(), 3);
 }
@@ -649,5 +661,98 @@ fn backbone_shapes_enumerate_the_fixture_state_dict_exactly() {
             .and_then(|m| got.iter().find(|(w, _)| *w == format!("{m}.weight")))
             .map(|(_, s)| s[1]);
         let _ = init_kind(k, shape, fan_in, true);
+    }
+}
+
+/// Upstream exports a full model's EMA; an adapter exports its raw factors by default (upstream has
+/// no adapter EMA, and one seeded from the zero delta lags the run). Previews default to what the
+/// run exports.
+#[test]
+fn export_and_preview_weights_default_per_artifact_kind() {
+    let cfg = tiny_config();
+    let resolve = |full: bool, network: NetworkType, opts: serde_json::Value| {
+        let mut c = base_cfg();
+        c.full_finetune = full;
+        c.network_type = network;
+        c.model_options.insert(OPTIONS_KEY.into(), opts);
+        let p = IrisTrainPlan::resolve(&request(c), &cfg, &defaults(), &linears()).unwrap();
+        (p.export_weights, p.preview.weights)
+    };
+    use WeightsSelect::{Ema, Raw};
+    assert_eq!(resolve(false, NetworkType::Lora, json!({})), (Raw, Raw));
+    assert_eq!(resolve(false, NetworkType::Lokr, json!({})), (Raw, Raw));
+    assert_eq!(resolve(true, NetworkType::Lora, json!({})), (Ema, Ema));
+    assert_eq!(
+        resolve(true, NetworkType::Lora, json!({"ema_enabled": false})),
+        (Raw, Raw)
+    );
+    // Explicit choices still win on either kind.
+    assert_eq!(
+        resolve(false, NetworkType::Lokr, json!({"export_weights": "ema"})),
+        (Ema, Raw)
+    );
+    assert_eq!(
+        resolve(true, NetworkType::Lora, json!({"preview_weights": "raw"})),
+        (Ema, Raw)
+    );
+}
+
+/// The shared preview contract: empty `sample_prompts` disables sampling whatever the cadence, at
+/// most `PREVIEW_PROMPT_CAP` prompts render, and upstream's defaults are an explicit opt-in.
+#[test]
+fn previews_follow_the_shared_sample_contract() {
+    let cfg = tiny_config();
+    let resolve = |prompts: Vec<&str>, opts: serde_json::Value| {
+        let mut c = base_cfg();
+        c.sample_every = 2;
+        c.sample_steps = 3;
+        c.sample_prompts = prompts.into_iter().map(str::to_string).collect();
+        c.model_options.insert(OPTIONS_KEY.into(), opts);
+        IrisTrainPlan::resolve(&request(c), &cfg, &defaults(), &linears())
+    };
+    let p = resolve(vec![], json!({})).unwrap();
+    assert_eq!((p.preview.every, p.preview.prompts.len()), (0, 0));
+    let p = resolve(vec!["a", "b", "c", "d", "e", "f"], json!({})).unwrap();
+    assert_eq!(p.preview.every, 2);
+    assert_eq!(p.preview.prompts, ["a", "b", "c", "d"]);
+    let p = resolve(vec![], json!({"upstream_validation_prompts": true})).unwrap();
+    assert_eq!(p.preview.every, 2);
+    assert_eq!(p.preview.prompts, DEFAULT_VALIDATION_PROMPTS.to_vec());
+    let err = resolve(vec!["a"], json!({"upstream_validation_prompts": true})).unwrap_err();
+    assert!(err.to_string().contains("one or the other"), "{err}");
+}
+
+/// `steps`, `save_every`, `sample_every` and `lr_warmup_steps` are the shared contract's
+/// micro-steps: the plan holds optimizer steps, and a cadence that is not a whole number of
+/// accumulation windows is refused rather than rounded.
+#[test]
+fn micro_step_fields_convert_to_optimizer_steps() {
+    let cfg = tiny_config();
+    let resolve = |steps: u32, save: u32, sample: u32, warmup: u32| {
+        let mut c = base_cfg();
+        c.gradient_accumulation = 2;
+        c.steps = steps;
+        c.save_every = save;
+        c.sample_every = sample;
+        c.sample_steps = 2;
+        c.sample_prompts = vec!["a fox".into()];
+        c.lr_warmup_steps = warmup;
+        IrisTrainPlan::resolve(&request(c), &cfg, &defaults(), &linears())
+    };
+    let p = resolve(8, 4, 2, 3).unwrap();
+    assert_eq!(
+        (p.max_steps, p.save_every, p.preview.every, p.warmup_steps),
+        (4, 2, 1, 2)
+    );
+    for (steps, save, sample, field) in [
+        (7, 4, 2, "steps"),
+        (8, 3, 2, "save_every"),
+        (8, 4, 3, "sample_every"),
+    ] {
+        let err = resolve(steps, save, sample, 0).unwrap_err().to_string();
+        assert!(
+            err.contains(field) && err.contains("not a multiple of gradient_accumulation"),
+            "{err}"
+        );
     }
 }

@@ -4,7 +4,7 @@
 //! accumulation), retention, the resume identity checks, cached vs on-the-fly conditioning, random
 //! init + x-prediction, previews from the in-progress state, and the exported artifacts loading back
 //! (the full model through the inference provider; the adapter through the provider's own adapter
-//! loader, rendering the trainer's own preview up to residual-vs-merged rounding).
+//! loader at f32 and bf16, rendering the trainer's own preview up to rounding).
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::iris::train::{
     checkpoint_root, latest_checkpoint, list_checkpoints, read_checkpoint_state, AdapterMetadata,
-    OPTIONS_KEY,
+    WeightsSelect, OPTIONS_KEY,
 };
 use mlx_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
@@ -115,6 +115,19 @@ fn tensors(path: &Path) -> HashMap<String, Vec<f32>> {
         .collect()
 }
 
+/// Every tensor of `path` cast to `dtype`, read back as f32 host values.
+fn tensors_as(path: &Path, dtype: Dtype) -> HashMap<String, Vec<f32>> {
+    Array::load_safetensors(path)
+        .unwrap()
+        .into_iter()
+        .map(|(k, v)| {
+            let v = v.as_dtype(dtype).unwrap().as_dtype(Dtype::Float32).unwrap();
+            let n: i32 = v.shape().iter().product();
+            (k, v.reshape(&[n]).unwrap().as_slice::<f32>().to_vec())
+        })
+        .collect()
+}
+
 fn assert_same_files(a: &Path, b: &Path) {
     let (ta, tb) = (tensors(a), tensors(b));
     assert_eq!(ta.len(), tb.len(), "{} vs {}", a.display(), b.display());
@@ -141,7 +154,8 @@ fn gen_core_trainer_conformance() {
     gen_core_testkit::trainer::check_trainer_registry(&registry, trainer().as_ref()).unwrap();
 }
 
-/// Train `cfg` to completion in `out`, cancelling right after optimizer step `cancel_at` when set.
+/// Train `cfg` to completion in `out`, cancelling right after the `Training` event of micro-step
+/// `cancel_at` when set; returns the micro-steps run.
 fn run(
     items: &[TrainingItem],
     cfg: TrainingConfig,
@@ -233,6 +247,9 @@ fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run() {
     let mut cfg = config();
     cfg.batch_size = 1;
     cfg.gradient_accumulation = 2;
+    // The shared contract's micro-steps: 4 optimizer steps, a checkpoint every 2.
+    cfg.steps = 8;
+    cfg.save_every = 4;
     cfg.network_type = NetworkType::Lora;
     // 3 items, batch 1, accum 2: windows straddle the epoch boundary (accelerate's global count).
     options(
@@ -244,11 +261,18 @@ fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run() {
         let items = dataset(data.path());
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let name = "lora.safetensors";
-        assert_eq!(run(&items, cfg.clone(), a.path(), name, None), 4);
-        assert_eq!(run(&items, cfg.clone(), b.path(), name, Some(2)), 2);
+        assert_eq!(run(&items, cfg.clone(), a.path(), name, None), 8);
+        // Cancelled at micro-step 4 = optimizer step 2 (a published checkpoint).
+        assert_eq!(run(&items, cfg.clone(), b.path(), name, Some(4)), 4);
+        assert_eq!(
+            read_checkpoint_state(&latest_checkpoint(&checkpoint_root(b.path(), name)).unwrap())
+                .unwrap()
+                .step,
+            2
+        );
         let mut resumed = cfg.clone();
         resumed.resume = true;
-        assert_eq!(run(&items, resumed, b.path(), name, None), 4);
+        assert_eq!(run(&items, resumed, b.path(), name, None), 8);
         let (la, lb) = (
             latest_checkpoint(&checkpoint_root(a.path(), name)).unwrap(),
             latest_checkpoint(&checkpoint_root(b.path(), name)).unwrap(),
@@ -341,9 +365,11 @@ fn cached_and_on_the_fly_conditioning_train_identically() {
     });
 }
 
-/// The adapter artifact, merged into the backbone with the documented schema, renders exactly
-/// the image the trainer previewed from its in-progress raw weights at the last step.
-fn adapter_round_trip(network: NetworkType) {
+/// The adapter artifact, installed by the provider's own adapter loader at `compute`, renders the
+/// image the trainer previewed from its in-progress weights at the last step (both apply the
+/// factors as forward-time residuals over the same base). Runs the **default** weights selection:
+/// an adapter exports — and previews — its raw factors.
+fn adapter_round_trip(network: NetworkType, compute: Dtype) {
     on_cpu(|| {
         let data = tempfile::tempdir().unwrap();
         let items = dataset(data.path());
@@ -357,10 +383,10 @@ fn adapter_round_trip(network: NetworkType) {
         cfg.sample_prompts = vec!["a red fox".into()];
         cfg.sample_steps = 3;
         cfg.sample_guidance_scale = 2.0;
-        options(
-            &mut cfg,
-            json!({"export_weights": "raw", "preview_weights": "raw"}),
-        );
+        cfg.train_dtype = match compute {
+            Dtype::Bfloat16 => "bf16".into(),
+            _ => "f32".into(),
+        };
         let req = request(&items, cfg, out.path(), "style.safetensors");
         let mut previews = Vec::new();
         let res = trainer()
@@ -376,14 +402,19 @@ fn adapter_round_trip(network: NetworkType) {
                 }
             })
             .unwrap();
-        // Upstream renders at step 1 and every `sample_every`.
-        assert_eq!(previews.iter().map(|p| p.0).collect::<Vec<_>>(), [1, 2]);
+        // Every `sample_every` micro-steps only (the shared contract; no extra step-1 render).
+        assert_eq!(previews.iter().map(|p| p.0).collect::<Vec<_>>(), [2]);
         let (_, prompt, image) = previews.pop().unwrap();
         assert_eq!((image.width, image.height), (16, 16));
 
         let (_, meta) = Array::load_safetensors_with_metadata(&res.adapter_path).unwrap();
         let meta = AdapterMetadata::from_map(&meta.into_iter().collect()).unwrap();
         assert_eq!(meta.steps, 2);
+        assert_eq!(
+            meta.weights,
+            WeightsSelect::Raw,
+            "an adapter exports raw by default"
+        );
         assert!(!meta.targets.is_empty());
 
         // Load through the provider's adapter path (S3's strict loader: identity stamp checked,
@@ -399,7 +430,7 @@ fn adapter_round_trip(network: NetworkType) {
             let (dit, reports) = load_backbone_with_adapters(
                 &tiny_backbone(),
                 &cfg,
-                Dtype::Float32,
+                compute,
                 adapters,
                 IrisTask::Generation,
                 ID,
@@ -434,10 +465,11 @@ fn adapter_round_trip(network: NetworkType) {
             max_diff(&bare.pixels, &image.pixels),
         );
         eprintln!(
-            "{network:?}: |provider − preview| max {to_preview}, adapter effect max {effect}"
+            "{network:?}/{compute:?}: |provider − preview| max {to_preview}, adapter effect max \
+             {effect}"
         );
-        // The provider applies the factors as residuals (LoKr's factors reconstructed in bf16), the
-        // trainer merges them in f32: a rounding-level difference, far below the adapter's effect.
+        // Both apply the factors as residuals over the same base; the only difference is the f32
+        // run's LoKr delta (the provider reconstructs it in bf16): rounding-level at most.
         assert!(
             effect >= 10,
             "the trained adapter must visibly change the render ({effect})"
@@ -451,12 +483,48 @@ fn adapter_round_trip(network: NetworkType) {
 
 #[test]
 fn lora_adapter_exports_and_loads_through_the_provider() {
-    adapter_round_trip(NetworkType::Lora);
+    adapter_round_trip(NetworkType::Lora, Dtype::Float32);
 }
 
 #[test]
 fn lokr_adapter_exports_and_loads_through_the_provider() {
-    adapter_round_trip(NetworkType::Lokr);
+    adapter_round_trip(NetworkType::Lokr, Dtype::Float32);
+}
+
+/// Under bf16 training the base is bf16: the adapter must still reach the forward as a residual
+/// (a delta merged into the bf16 weight would round away) and match the provider's bf16 install.
+#[test]
+fn bf16_lora_adapter_exports_and_loads_through_the_provider() {
+    adapter_round_trip(NetworkType::Lora, Dtype::Bfloat16);
+}
+
+#[test]
+fn bf16_lokr_adapter_exports_and_loads_through_the_provider() {
+    adapter_round_trip(NetworkType::Lokr, Dtype::Bfloat16);
+}
+
+/// The shared contract: empty `sample_prompts` disables sampling whatever `sample_every` says.
+#[test]
+fn empty_sample_prompts_render_no_previews() {
+    on_cpu(|| {
+        let data = tempfile::tempdir().unwrap();
+        let items = dataset(data.path());
+        let out = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.steps = 2;
+        cfg.sample_every = 1;
+        cfg.sample_steps = 2;
+        let req = request(&items, cfg, out.path(), "quiet.safetensors");
+        let samples = Cell::new(0usize);
+        trainer()
+            .train(&req, &mut |p| {
+                if matches!(p, TrainingProgress::Sample { .. }) {
+                    samples.set(samples.get() + 1);
+                }
+            })
+            .unwrap();
+        assert_eq!(samples.get(), 0);
+    });
 }
 
 #[test]
@@ -468,6 +536,11 @@ fn exported_full_model_loads_and_generates_in_the_provider() {
     cfg.steps = 2;
     cfg.full_finetune = true;
     cfg.train_dtype = "bf16".into();
+    // The EMA updates from the pre-step weights, so it sees step 1's update only at step 2: no
+    // warmup (a zero-lr first step would leave the EMA at the base) and a rate large enough to
+    // visibly move the render through a 0.5-decay EMA.
+    cfg.lr_warmup_steps = 0;
+    cfg.learning_rate = 5e-2;
     options(&mut cfg, json!({"ema_decay": 0.5, "export_dtype": "bf16"}));
     let req = request(&items, cfg, out.path(), "tuned.safetensors");
     let res = trainer().train(&req, &mut |_| {}).unwrap();
@@ -476,29 +549,65 @@ fn exported_full_model_loads_and_generates_in_the_provider() {
     let (_, meta) = Array::load_safetensors_with_metadata(&res.adapter_path).unwrap();
     assert_eq!(meta["irisArtifact"], "full_model");
     assert_eq!(meta["irisWeights"], "ema");
+    // The exported tensors are the run's final EMA (its last checkpoint) at the export dtype.
+    let ckpt = latest_checkpoint(&checkpoint_root(out.path(), "tuned.safetensors")).unwrap();
+    let ema = tensors_as(&ckpt.join("ema.safetensors"), Dtype::Bfloat16);
+    let exported = tensors_as(&res.adapter_path, Dtype::Bfloat16);
+    assert_eq!(exported.len(), ema.len());
+    for (k, v) in &ema {
+        assert_eq!(Some(v), exported.get(k), "{k}: export != EMA cast to bf16");
+    }
     assert_eq!(IrisConfig::from_dir(&dir).unwrap(), tiny_config());
-    let g = mlx_gen_iris::provider_registry()
-        .unwrap()
-        .load(ID, &spec(&dir))
-        .unwrap();
-    let image = match g
-        .generate(
-            &GenerationRequest {
-                prompt: "a red fox".into(),
-                width: 16,
-                height: 16,
-                steps: Some(2),
-                seed: Some(1),
-                ..Default::default()
-            },
-            &mut |_| {},
-        )
-        .unwrap()
-    {
-        GenerationOutput::Images(mut v) => v.remove(0),
-        _ => panic!("expected an image"),
+    let render = |backbone: &Path| {
+        let g = mlx_gen_iris::provider_registry()
+            .unwrap()
+            .load(ID, &spec(backbone))
+            .unwrap();
+        match g
+            .generate(
+                &GenerationRequest {
+                    prompt: "a red fox".into(),
+                    width: 16,
+                    height: 16,
+                    steps: Some(2),
+                    seed: Some(1),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+            .unwrap()
+        {
+            GenerationOutput::Images(mut v) => v.remove(0),
+            _ => panic!("expected an image"),
+        }
     };
+    let image = render(&dir);
     assert_eq!((image.width, image.height), (16, 16));
+    // The untrained reference is the base exported the same way (bf16 tensors, the exported
+    // config), so the only difference left is the training.
+    let untrained = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        dir.join("config.yaml"),
+        untrained.path().join("config.yaml"),
+    )
+    .unwrap();
+    let base: Vec<(String, Array)> =
+        Array::load_safetensors(tiny_backbone().join("model.safetensors"))
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k, v.as_dtype(Dtype::Bfloat16).unwrap()))
+            .collect();
+    Array::save_safetensors(
+        base.iter().map(|(k, v)| (k.as_str(), v)),
+        None::<&HashMap<String, String>>,
+        untrained.path().join("model.safetensors"),
+    )
+    .unwrap();
+    assert_ne!(
+        image.pixels,
+        render(untrained.path()).pixels,
+        "the provider renders the trained backbone, not the base"
+    );
 }
 
 #[test]

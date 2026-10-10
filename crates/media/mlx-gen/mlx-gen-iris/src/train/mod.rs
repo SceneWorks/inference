@@ -562,6 +562,11 @@ impl Run {
         }
 
         let walk = DataWalk::new(req.items.len(), plan.batch_size)?;
+        if let Some(warning) = walk.unused_tail_warning() {
+            // The trainers' warning channel (stderr, as the other family trainers and the caption
+            // overflow / non-finite-loss warnings here use).
+            eprintln!("{warning}");
+        }
         let total_steps = contract::total_optimizer_steps(
             walk.batches_per_epoch(),
             plan.grad_accum,
@@ -784,20 +789,18 @@ impl Run {
                 self.last_loss = mean_loss;
                 boundary = (epoch, pos + 1);
                 on_progress(TrainingProgress::Training {
-                    step: self.step as u32,
-                    total: self.total_steps as u32,
+                    step: self.micro_step(),
+                    total: (self.total_steps * accum as u64) as u32,
                     loss: self.last_loss as f32,
                 });
                 if plan.save_every > 0 && self.step.is_multiple_of(plan.save_every as u64) {
                     self.save_checkpoint(boundary)?;
                     last_saved = Some(self.step);
                     on_progress(TrainingProgress::Checkpoint {
-                        step: self.step as u32,
+                        step: self.micro_step(),
                     });
                 }
-                if plan.preview.every > 0
-                    && (self.step.is_multiple_of(plan.preview.every as u64) || self.step == 1)
-                {
+                if plan.preview.every > 0 && self.step.is_multiple_of(plan.preview.every as u64) {
                     self.render_previews(req, on_progress)?;
                 }
                 if self.step >= plan.max_steps as u64 {
@@ -818,16 +821,21 @@ impl Run {
         if last_saved != Some(self.step) && self.step > 0 {
             self.save_checkpoint(boundary)?;
             on_progress(TrainingProgress::Checkpoint {
-                step: self.step as u32,
+                step: self.micro_step(),
             });
         }
         on_progress(TrainingProgress::Saving);
         let path = self.export(req)?;
         Ok(TrainingOutput {
             adapter_path: path,
-            steps: self.step as u32,
+            steps: self.micro_step(),
             final_loss: self.last_loss as f32,
         })
+    }
+
+    /// The shared contract's step unit: micro-steps through the last completed optimizer step.
+    fn micro_step(&self) -> u32 {
+        (self.step * self.plan.grad_accum as u64) as u32
     }
 
     fn state(&self, boundary: (u32, usize)) -> CheckpointState {
@@ -988,7 +996,7 @@ impl Run {
                 pv.seed.wrapping_add(i as u64),
             )?;
             on_progress(TrainingProgress::Sample {
-                step: self.step as u32,
+                step: self.micro_step(),
                 index: i as u32 + 1,
                 total,
                 prompt: prompt.clone(),

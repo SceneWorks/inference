@@ -2,14 +2,15 @@
 //! factors over frozen Linears), how a step's weights are assembled from them, the rectified-flow
 //! loss and its gradient, random init, and the artifact writers.
 //!
-//! The forward is **the inference forward**: every step rebuilds an [`IrisDiT`] with
-//! [`IrisDiT::from_weights`] from the (traced) trainable tensors inside the autograd trace, exactly
-//! as the provider loads a checkpoint, so training and inference can never disagree about the
-//! graph. Mixed precision is the provider's autocast policy ([`crate::nn`]): f32 master tensors,
+//! The forward is **the inference forward**: every step rebuilds an [`IrisDiT`] inside the autograd
+//! trace exactly as the provider loads a checkpoint ([`IrisDiT::from_weights`] from the traced
+//! tensors of a full run) or installs an exported adapter file (forward-time residuals over the
+//! frozen base, [`IrisDiT::from_weights_adapted`]), so training and inference can never disagree
+//! about the graph. Mixed precision is the provider's autocast policy ([`crate::nn`]): f32 master tensors,
 //! matmuls/attention in the compute dtype (bf16 under `mixed_precision: bf16`), norms/residuals/loss
 //! in f32; the casts are traced, so gradients reach the f32 masters.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -17,18 +18,19 @@ use gen_core::iris::train::{
     backbone_tensor_shapes, init_kind, mix_seed, FlowObjective, InitKind, Prediction,
 };
 use gen_core::iris::ModelConfig;
-use mlx_gen::adapters::reconstruct_lokr_delta;
+use mlx_gen::adapters::{reconstruct_lokr_delta, AdaptableLinear, Adapter};
 use mlx_gen::gen_core;
 use mlx_gen::train::lora::factorization;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::error::Exception;
-use mlx_rs::ops::{matmul, maximum, mean_axes};
+use mlx_rs::ops::{maximum, mean_axes};
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
 use super::optim::Params;
 use crate::dit::{IrisDiT, TextBatch};
+use crate::nn::AdaptedLinears;
 
 /// The adapter parameterization.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -134,96 +136,98 @@ pub fn provider_dtype(key: &str, a: &Array, compute: Dtype) -> Result<Array> {
     })
 }
 
-/// The LoRA delta `(alpha / rank) · B · A` (f32).
-pub fn lora_delta(a: &Array, b: &Array, alpha: f32, rank: usize) -> Result<Array> {
-    Ok(matmul(b, a)?.multiply(Array::from_f32(alpha / rank as f32))?)
-}
-
-/// The LoKr delta `(alpha / rank) · kron(w1, w2)` at `[out, in]` (f32).
-pub fn lokr_delta(
-    factors: &HashMap<&str, &Array>,
-    out_f: i32,
-    in_f: i32,
-    alpha: f32,
-    rank: usize,
-) -> Result<Array> {
-    reconstruct_lokr_delta(
-        alpha,
-        rank as f32,
-        &[out_f, in_f],
-        factors.get("lokr_w1").copied(),
-        None,
-        None,
-        factors.get("lokr_w2").copied(),
-        factors.get("lokr_w2_a").copied(),
-        factors.get("lokr_w2_b").copied(),
-        Dtype::Float32,
-    )
+/// One target's adapter exactly as the provider's strict loader installs the exported file
+/// (`mlx_gen::adapters::loader`): a LoRA as `Adapter::Lora { a: Aᵀ, b: Bᵀ · alpha/rank, scale: 1 }`
+/// (factors at their f32 master dtype, the file's dtype); a LoKr as `Adapter::Lokr` over the
+/// `[out, in]` delta reconstructed at `compute` and `scale = 1`. Under bf16 compute that is exactly
+/// the provider (`apply_lokr` reconstructs in bf16, the residual runs in the bf16 activation dtype);
+/// under f32 compute the delta stays f32 (the provider's bf16 reconstruction would round the
+/// gradient path of an f32 run — a sub-RGB8-level difference in the render). Every op is traced, so
+/// gradients reach the f32 factors.
+pub fn provider_adapter(
+    compute: Dtype,
+    kind: AdapterKind,
+    t: &AdapterTarget,
+    p: &HashMap<Rc<str>, Array>,
+) -> Result<Adapter> {
+    let get = |k: &str| -> Result<&Array> {
+        p.get(k)
+            .ok_or_else(|| Error::Msg(format!("iris adapter: factor {k} missing")))
+    };
+    match kind {
+        AdapterKind::Lora { rank, alpha } => {
+            let a = get(&format!("{}.lora_A.weight", t.path))?.t();
+            let b = get(&format!("{}.lora_B.weight", t.path))?
+                .t()
+                .multiply(Array::from_slice(&[alpha / rank as f32], &[1]))?;
+            Ok(Adapter::Lora { a, b, scale: 1.0 })
+        }
+        AdapterKind::Lokr { rank, alpha, .. } => {
+            let f = |name: &str| p.get(format!("{}.{name}", t.path).as_str());
+            let delta = reconstruct_lokr_delta(
+                alpha,
+                rank as f32,
+                &[t.out_f, t.in_f],
+                f("lokr_w1"),
+                None,
+                None,
+                f("lokr_w2"),
+                f("lokr_w2_a"),
+                f("lokr_w2_b"),
+                compute,
+            )?;
+            Ok(Adapter::Lokr { delta, scale: 1.0 })
+        }
+    }
 }
 
 impl TrainModel {
-    /// The complete backbone tensor map of one step (for [`IrisDiT::from_weights`]).
-    pub fn weights_map(
-        &self,
-        trainable: &HashMap<Rc<str>, Array>,
-    ) -> Result<HashMap<String, Array>> {
+    /// The backbone of one step at the compute dtype.
+    ///
+    /// A full run builds it from the (traced) trainable tensors. An adapter run builds the frozen
+    /// base exactly as the provider does and installs each target's adapter as a **forward-time
+    /// residual** — `y = base(x) + adapter(x)`, narrowed to the projection's output dtype — through
+    /// the provider's own [`AdaptedLinears`] path, never merged into the (bf16) base weight, so a
+    /// delta below the base's bf16 ulp still reaches the forward, the gradient and the previews,
+    /// and a preview renders what the exported file renders in the provider.
+    pub fn dit(&self, trainable: &HashMap<Rc<str>, Array>) -> Result<IrisDiT> {
         match &self.trainable {
-            Trainable::Full => Ok(trainable
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
-                .collect()),
+            Trainable::Full => {
+                let map: HashMap<String, Array> = trainable
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect();
+                IrisDiT::from_weights(&Weights::from_map(map), &self.cfg, self.compute)
+            }
             Trainable::Adapter {
                 kind,
                 targets,
                 base,
             } => {
-                let mut map = base.clone();
+                let mut linears = BTreeMap::new();
+                let mut adapted = BTreeSet::new();
                 for t in targets {
-                    let w = map.get(&format!("{}.weight", t.path)).ok_or_else(|| {
+                    let w = base.get(&format!("{}.weight", t.path)).ok_or_else(|| {
                         Error::Msg(format!("iris adapter: base has no {}.weight", t.path))
                     })?;
-                    let delta = self.target_delta(*kind, t, trainable)?;
-                    let merged = w.add(&delta.as_dtype(w.dtype())?)?;
-                    map.insert(format!("{}.weight", t.path), merged);
+                    let bias = base
+                        .get(&format!("{}.bias", t.path))
+                        .map(|b| b.as_dtype(self.compute))
+                        .transpose()?;
+                    let mut lin = AdaptableLinear::dense(w.as_dtype(self.compute)?, bias);
+                    lin.set_adapters(vec![provider_adapter(self.compute, *kind, t, trainable)?]);
+                    linears.insert(t.path.clone(), lin);
+                    adapted.insert(t.path.clone());
                 }
-                Ok(map)
+                let adapted = AdaptedLinears::new(linears, adapted);
+                IrisDiT::from_weights_adapted(
+                    &Weights::from_map(base.clone()),
+                    &self.cfg,
+                    self.compute,
+                    Some(&adapted),
+                )
             }
         }
-    }
-
-    fn target_delta(
-        &self,
-        kind: AdapterKind,
-        t: &AdapterTarget,
-        p: &HashMap<Rc<str>, Array>,
-    ) -> Result<Array> {
-        let get = |k: &str| -> Result<&Array> {
-            p.get(k)
-                .ok_or_else(|| Error::Msg(format!("iris adapter: factor {k} missing")))
-        };
-        match kind {
-            AdapterKind::Lora { rank, alpha } => lora_delta(
-                get(&format!("{}.lora_A.weight", t.path))?,
-                get(&format!("{}.lora_B.weight", t.path))?,
-                alpha,
-                rank,
-            ),
-            AdapterKind::Lokr { rank, alpha, .. } => {
-                let mut f: HashMap<&str, &Array> = HashMap::new();
-                for name in ["lokr_w1", "lokr_w2", "lokr_w2_a", "lokr_w2_b"] {
-                    if let Some(a) = p.get(format!("{}.{name}", t.path).as_str()) {
-                        f.insert(name, a);
-                    }
-                }
-                lokr_delta(&f, t.out_f, t.in_f, alpha, rank)
-            }
-        }
-    }
-
-    /// The backbone of one step at the compute dtype.
-    pub fn dit(&self, trainable: &HashMap<Rc<str>, Array>) -> Result<IrisDiT> {
-        let w = Weights::from_map(self.weights_map(trainable)?);
-        IrisDiT::from_weights(&w, &self.cfg, self.compute)
     }
 }
 
