@@ -14,7 +14,7 @@ Writes `mlx-gen-iris/tests/fixtures/`:
   `task.sigma` = 0.5 (the release's `model_t = 500`).
 * `iris_restoration_golden.safetensors`:
   - `ops/bicubic/<case>/{in,out}` — `F.interpolate(scale_factor=…, bicubic)` incl. a fractional
-    scale on odd sides and a downscale;
+    scale on odd sides, a downscale and a non-dyadic scale (1.3);
   - `ops/aa/<case>/{in,out}` — `F.interpolate(size=…, bicubic, antialias=True)` up, down and with
     one axis unchanged;
   - `ops/window/32`, `ops/window/1024/{centre_row,centre_col,sub}` — `gaussian_window`;
@@ -123,6 +123,9 @@ def dump_ops(out: dict, meta: dict) -> None:
         ("x1", (6, 10), 1.0),
         ("x0_75", (12, 16), 0.75),
         ("x3", (11, 9), 3.0),
+        # non-dyadic: floor(20 * 1.3) = 26 only with the Python float (f32 1.3 would give 25), and
+        # the coordinate scale is f32(1 / 1.3)
+        ("x1_3_nondyadic", (10, 20), 1.3),
     ]:
         x = torch.rand(1, 3, h, w, generator=g) * 1.2 - 0.1
         out[f"ops/bicubic/{name}/in"] = x
@@ -180,13 +183,15 @@ def dump_e2e(out: dict, meta: dict) -> None:
     g = torch.Generator().manual_seed(2)
     cases = [
         # name, (w, h), scale, colour fix, budgeted
-        ("small_enlarge", (20, 12), 4.0, True, False),
+        ("small_enlarge", (10, 6), 4.0, True, False),  # 40x24 output: short side <= tile
         ("tiled_nofix", (40, 24), 4.0, False, False),
         ("restore_1x", (70, 50), 1.0, True, False),
         ("fractional", (13, 9), 2.5, True, False),
         ("single_tile", (8, 8), 4.0, True, False),
         ("portrait_3x", (11, 23), 3.0, True, False),
         ("budgeted", (1030, 20), 1.0, True, True),
+        # non-dyadic scale through the request path: 26x13 (f32-widened 1.3 would plan 25x12)
+        ("non_dyadic_1_3", (20, 10), 1.3, True, False),
     ]
     for name, (w, h), scale, color_fix, budgeted in cases:
         captured.clear()
@@ -205,7 +210,8 @@ def dump_e2e(out: dict, meta: dict) -> None:
             out[f"e2e/{name}/fixed"] = captured["fixed"][0]
         meta.setdefault("cases", []).append(
             {"name": name, "input": [w, h], "scale": scale, "color_fix": color_fix,
-             "budgeted": budgeted, "output": list(result.size)}
+             "budgeted": budgeted, "output": list(result.size),
+             "enlarged": min(result.size) <= TILE}
         )
         print(f"{name}: {w}x{h} x{scale} -> {result.size}", flush=True)
     restoration.tiled, restoration.wavelet_color_fix = tiled, fix

@@ -2,13 +2,14 @@
 //! committed fixtures (`tools/dump_iris_restoration.py`):
 //!
 //! * the host-side pixel path (shared with the Candle twin through `gen_core::iris::restoration`):
-//!   torch's `scale_factor` bicubic (fractional scale on odd sides, a downscale), the antialiased
-//!   bicubic enlarge/shrink, the Gaussian fusion window (32 and the release 1024), the wavelet colour
-//!   fix on an image smaller than its largest dilation, tile positions, and `fit_budget`'s PIL
-//!   Lanczos (bit-exact, sha256 of the bytes);
+//!   torch's `scale_factor` bicubic (fractional scale on odd sides, a downscale, a non-dyadic 1.3),
+//!   the antialiased bicubic enlarge/shrink, the Gaussian fusion window (32 and the release 1024),
+//!   the wavelet colour fix on an image smaller than its largest dilation, tile positions, and
+//!   `fit_budget`'s PIL Lanczos (bit-exact, sha256 of the bytes);
 //! * the whole restorer on the miniature `upscaler/` export, FP32 on the MLX CPU stream (true f32,
 //!   like the oracle): small-image enlarge → tile → resize back, multi-tile fusion, 1×, a fractional
-//!   scale, a single tile, a portrait 3×, and the budgeted input path; colour fix on and off.
+//!   scale, a single tile, a portrait 3×, the budgeted input path and a non-dyadic 1.3× (planned
+//!   output size and enlarge branch exact); colour fix on and off.
 //!
 //! Tolerances: the pixel ops are f32 on both sides in the same order — 1e-5 of peak (measured in
 //! the assertion output). The end-to-end float images carry the backbone's FP32 summation-order
@@ -249,6 +250,11 @@ fn restoration_matches_upstream_end_to_end_in_fp32() {
                 (plan.output.width as u64, plan.output.height as u64),
                 (out_dims[0].as_u64().unwrap(), out_dims[1].as_u64().unwrap()),
                 "{name}: planned output geometry"
+            );
+            assert_eq!(
+                plan.enlarged,
+                case["enlarged"].as_bool().unwrap(),
+                "{name}: upstream's `min(out_size) <= tile` enlarge branch"
             );
             let mut steps = 0;
             let out = restore_detailed(

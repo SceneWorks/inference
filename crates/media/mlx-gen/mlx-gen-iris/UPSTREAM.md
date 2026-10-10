@@ -255,7 +255,7 @@ weights — upstream `load_export`'s task-name check. A missing file names the p
 | Task identity (`task.name == "restoration"`), `sigma`, `tile` from `config.yaml` | `load_export`, `Restorer.__init__` | `downstream::TaskExport` (S4's shared export closure) + `RestorationSettings::from_task/validate` | `IrisRestorer::load` | `IrisRestorer::load` | ported; tile must be a multiple of the patch; v-prediction required (upstream's check) |
 | Empty-prompt conditioning, no text encoder | `Restorer.__init__` | `downstream::EmptyPrompt::read` (shape-checked against `text_len` / `text_lap_num_layers` / `text_dim`) | `[1, T, L, D]` array, read once | same | ported |
 | One-step forward at `t = sigma · num_train_timesteps` (500), restored = `x − sigma · v` in f32 | `restore_tile` | `restore_detailed` (the subtraction) | `IrisRestorer::velocity` (shared `IrisDiT`) | same | ported; bf16 compute (default) mirrors the CUDA autocast, `Precision::Fp32` = upstream's CPU path |
-| `scale` (default 4.0, any positive float incl. 1×): `F.interpolate(scale_factor, bicubic, align_corners=False)` — output `floor(side · scale)`, coordinate scale `1 / scale`, Keys a = −0.75, clamped taps | `__call__` | `bicubic_scale_factor`, `plan` | shared | shared | ported (`TargetSize::Scale`; `TargetSize::ModelDefault` = 4×); min-edge / explicit resolution refused (upstream has neither) |
+| `scale` (default 4.0, any positive float incl. 1×): `F.interpolate(scale_factor, bicubic, align_corners=False)` — output `floor(side · scale)`, coordinate scale `1 / scale`, Keys a = −0.75, clamped taps | `__call__` | `bicubic_scale_factor`, `plan` | shared | shared | ported (`TargetSize::Scale`; `TargetSize::ModelDefault` = 4×); the request's f32 is read as its shortest round-trip decimal (`1.3f32` → the Python float `1.3`), so `floor(1000 · 1.3) = 1300` like torch, not 1299; min-edge / explicit resolution refused (upstream has neither) |
 | Small output (short side ≤ tile): enlarged so the short side is one tile (`round` half-even per side), antialiased bicubic (a = −0.5, clipped renormalized window), resized back afterwards | `__call__` | `plan` (`processing`, `enlarged`), `bicubic_aa_resize` (horizontal pass first, an unchanged axis skipped) | shared | shared | ported |
 | Zero pad of `x · 2 − 1` to the patch grid (bottom / right), crop after | `__call__` | `restore_detailed` | shared | shared | ported |
 | 1024-px tiles, stride `tile // 2` (50 % overlap), last tile flush; one pass when the image fits a tile | `tile_positions`, `tiled` | `tile_positions`, `plan` (`tile_rows` / `tile_cols`) | shared | shared | ported |
@@ -273,7 +273,9 @@ weights — upstream `load_export`'s task-name check. A missing file names the p
 `gen_core::iris::restoration::plan_request(req, TileGeometry::RELEASE, MODEL_ID)` (or `plan(dims,
 &options, …)`) returns, before any execution and without weights: source, budgeted input, output
 (`floor(input · scale)`), processing size, whether it was enlarged, padded size, tile rows/columns
-and `forward_count()`. A scale whose output rounds to zero pixels (or overflows) is a typed refusal;
+and `forward_count()`. A scale whose output rounds to zero pixels, or whose output, enlarged
+processing size or patch-padded size does not fit `u32` (e.g. a 1×5,000,000 image, whose long side
+the enlarge multiplies by 1024), is a typed refusal;
 the provider plans with the loaded export's geometry, which equals `TileGeometry::RELEASE` for the
 release export.
 
@@ -286,13 +288,13 @@ end-to-end references (`../tools/dump_iris_restoration.py`).
 
 | Gate | Tolerance | Measured (MLX) | Measured (Candle CPU) |
 | --- | --- | --- | --- |
-| `scale_factor` bicubic (×4, ×2.5 on odd sides, ×1, ×0.75, ×3) | 1e-5 of peak | ≤ 1.4e-6 | shared host code |
+| `scale_factor` bicubic (×4, ×2.5 on odd sides, ×1, ×0.75, ×3, non-dyadic ×1.3) | 1e-5 of peak | ≤ 1.4e-6 | shared host code |
 | Antialiased resize (up, down, one axis, odd) | 1e-5 | ≤ 7.2e-7 | shared |
 | Gaussian window (32 full; 1024 centre row / column / subsample) | 1e-6 | ≤ 6.0e-8 | shared |
 | Wavelet colour fix (29×37, smaller than dilation 16) | 1e-5 | 1.8e-7 | shared |
 | Tile positions, budget sizes | exact | exact | shared |
 | `fit_budget` PIL Lanczos bytes (7 shapes) | sha256-exact | exact | shared |
-| End to end FP32, 7 cases (enlarge → resize back, multi-tile, 1×, 2.5×, single tile, portrait 3×, budgeted): fused tiles / colour-fixed float | 1e-4 of peak | ≤ 2.2e-5 / ≤ 7.2e-6 | ≤ 2.1e-5 / ≤ 6.9e-6 |
+| End to end FP32 through the request path, 8 cases (enlarge → tile → resize back, multi-tile, 1×, 2.5×, single tile, portrait 3×, budgeted, non-dyadic 1.3×), planned output size and enlarge branch exact: fused tiles / colour-fixed float | 1e-4 of peak | ≤ 1.9e-5 / ≤ 9.2e-6 | ≤ 1.9e-5 / ≤ 8.8e-6 |
 | Same, RGB8 | ≤ 1 level | ≤ 1 (at most 6 of 61 440 values differ) | ≤ 1 |
 
 Real weights (`tests/restoration_real_weights.rs`, `../tools/dump_iris_restoration_realweight.py`):

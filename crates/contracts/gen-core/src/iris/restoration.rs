@@ -179,6 +179,16 @@ impl Default for RestorationOptions {
     }
 }
 
+/// The f64 scale a [`TargetSize::Scale`] means: the shortest decimal that round-trips the f32
+/// (`1.3f32` → `1.3`), i.e. the Python float a caller of upstream `Restorer(scale=…)` writes.
+/// Widening the f32 directly (`1.2999999523…`) would floor a 1000-px side at ×1.3 to 1299 instead
+/// of torch's `floor(1000 · 1.3) = 1300`, and skew the bicubic coordinate scale `1 / scale`.
+fn request_scale(s: f32) -> f64 {
+    // `f32`'s `Display` is the shortest round-trip decimal; every such string parses as an f64
+    // (incl. `NaN` / `inf`, which `check_scale` then refuses).
+    s.to_string().parse().unwrap_or(f64::NAN)
+}
+
 impl RestorationOptions {
     /// Resolve a [`TransformRequest`], refusing every field the restorer does not honour by name
     /// (it is deterministic and one-step: no seed, strength or step count; its output size is a
@@ -186,7 +196,7 @@ impl RestorationOptions {
     pub fn from_request(req: &TransformRequest, model_id: &str) -> Result<Self> {
         let scale = match req.target {
             TargetSize::ModelDefault => DEFAULT_SCALE,
-            TargetSize::Scale(s) => s as f64,
+            TargetSize::Scale(s) => request_scale(s),
             TargetSize::MinEdge(_) | TargetSize::Resolution { .. } => {
                 return Err(Error::Unsupported(format!(
                     "{model_id}: the Iris-3B restorer sizes its output by a scale factor only \
@@ -401,26 +411,43 @@ pub fn plan(
             options.scale, input.width, input.height
         )));
     }
-    let tile = geometry.tile as u64;
-    let too_big = |side: u64| side > u32::MAX as u64 - tile;
-    if too_big(out_w) || too_big(out_h) {
-        return Err(Error::Unsupported(format!(
-            "{model_id}: scale {} of a {}x{} input overflows the output geometry",
-            options.scale, input.width, input.height
-        )));
-    }
-    let output = Dims::new(out_w as u32, out_h as u32);
+    // Every stage size is computed in u64 and must fit u32: the output, the enlarged processing
+    // size (a 1×N output enlarges its long side by `tile`) and its patch padding.
+    let fits = |stage: &str, w: u64, h: u64| -> Result<Dims> {
+        match (u32::try_from(w), u32::try_from(h)) {
+            (Ok(w), Ok(h)) => Ok(Dims::new(w, h)),
+            _ => Err(Error::Unsupported(format!(
+                "{model_id}: scale {} of a {}x{} input needs a {w}x{h} {stage} — too large",
+                options.scale, input.width, input.height
+            ))),
+        }
+    };
+    let output = fits("output", out_w, out_h)?;
     let short = output.width.min(output.height);
+    let tile = u64::from(geometry.tile);
     let (processing, enlarged) = if short <= geometry.tile {
         // `ratio = tile / min(out_size)`; `max(tile, round(side · ratio))` per side.
         let ratio = geometry.tile as f64 / short as f64;
-        let side = |s: u32| ((s as f64 * ratio).round_ties_even() as u32).max(geometry.tile);
-        (Dims::new(side(output.width), side(output.height)), true)
+        // f64 → u64 saturates; anything near u64::MAX is refused by `fits` anyway.
+        let side = |s: u32| ((s as f64 * ratio).round_ties_even() as u64).max(tile);
+        (
+            fits(
+                "enlarged processing size",
+                side(output.width),
+                side(output.height),
+            )?,
+            true,
+        )
     } else {
         (output, false)
     };
-    let pad = |s: u32| s.div_ceil(geometry.patch) * geometry.patch;
-    let padded = Dims::new(pad(processing.width), pad(processing.height));
+    let patch = u64::from(geometry.patch);
+    let pad = |s: u32| u64::from(s).div_ceil(patch) * patch;
+    let padded = fits(
+        "patch-padded processing size",
+        pad(processing.width),
+        pad(processing.height),
+    )?;
     let stride = geometry.stride();
     let (tile_rows, tile_cols) = if padded.height <= geometry.tile && padded.width <= geometry.tile
     {
@@ -1098,6 +1125,55 @@ mod tests {
             .unwrap();
             assert_eq!(p.output, Dims::new(out.0, out.1), "{src:?} x{scale}");
         }
+    }
+
+    #[test]
+    fn request_scales_are_the_decimal_the_caller_wrote() {
+        // torch's `floor(side · scale_factor)` with the Python float the caller wrote: a widened
+        // `1.3f32` (1.2999999523…) would give 1299×1039 and 6 here.
+        for (src, scale, want_scale, out) in [
+            ((1000, 800), 1.3f32, 1.3f64, (1300, 1040)),
+            ((10, 10), 0.7, 0.7, (7, 7)),
+            ((20, 10), 2.3, 2.3, (46, 23)),
+        ] {
+            let req = TransformRequest {
+                target: TargetSize::Scale(scale),
+                input_sizing: InputSizing::Original,
+                ..Default::default()
+            };
+            let o = RestorationOptions::from_request(&req, MODEL_ID).unwrap();
+            assert_eq!(o.scale, want_scale, "{scale}");
+            let p = plan(Dims::new(src.0, src.1), &o, TileGeometry::RELEASE, MODEL_ID).unwrap();
+            assert_eq!(p.output, Dims::new(out.0, out.1), "{src:?} x{scale}");
+        }
+    }
+
+    #[test]
+    fn oversized_processing_and_padding_are_refused() {
+        // A 1×5,000,000 output enlarges its long side by tile/1 = 1024 → 5.12e9 px (> u32).
+        let err = plan(
+            Dims::new(1, 5_000_000),
+            &opts(1.0, InputSizing::Original),
+            TileGeometry::RELEASE,
+            MODEL_ID,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("enlarged processing size")),
+            "{err:?}"
+        );
+        // An output that fits u32 but whose patch padding does not.
+        let err = plan(
+            Dims::new(u32::MAX - 3, 2000),
+            &opts(1.0, InputSizing::Original),
+            TileGeometry::RELEASE,
+            MODEL_ID,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("patch-padded processing size")),
+            "{err:?}"
+        );
     }
 
     #[test]

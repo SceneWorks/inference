@@ -2,8 +2,9 @@
 //! MLX twin's committed fixtures (`tools/dump_iris_restoration.py`): the whole restorer on the
 //! miniature `upscaler/` export, FP32 on the Candle CPU lane (true f32, like the oracle) — small-image
 //! enlarge → tile → resize back, multi-tile Gaussian fusion, 1×, a fractional scale, a single tile,
-//! a portrait 3×, and the budgeted input path; colour fix on and off. The host-side pixel ops are
-//! shared with the MLX twin (`gen_core::iris::restoration`) and held op by op there.
+//! a portrait 3×, the budgeted input path and a non-dyadic 1.3× (planned output size and enlarge
+//! branch exact); colour fix on and off. The host-side pixel ops are shared with the MLX twin
+//! (`gen_core::iris::restoration`) and held op by op there.
 //!
 //! Tolerances (the MLX twin's): the float images carry the backbone's FP32 summation-order distance
 //! (`dit_parity`) scaled by sigma — 1e-4 of peak; the RGB8 outputs may differ by one level where a
@@ -96,6 +97,17 @@ fn restoration_matches_upstream_end_to_end_in_fp32() {
             ..Default::default()
         };
         let plan = restorer.plan(&req).unwrap();
+        let out_dims = case["output"].as_array().unwrap();
+        assert_eq!(
+            (plan.output.width as u64, plan.output.height as u64),
+            (out_dims[0].as_u64().unwrap(), out_dims[1].as_u64().unwrap()),
+            "{name}: planned output geometry"
+        );
+        assert_eq!(
+            plan.enlarged,
+            case["enlarged"].as_bool().unwrap(),
+            "{name}: upstream's `min(out_size) <= tile` enlarge branch"
+        );
         let mut steps = 0;
         let out = restore_detailed(
             &req.image,
