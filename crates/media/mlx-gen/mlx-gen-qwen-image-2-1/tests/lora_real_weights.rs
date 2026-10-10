@@ -602,8 +602,31 @@ impl Drop for Footprint {
         drop(self.stop.take());
         if let Some(handle) = self.handle.take() {
             handle.join().expect("memory sampler finishes");
+            write_json(
+                &self.out,
+                "memory-owner-lifecycle",
+                &json!({
+                "schema":"sc24163-campaign-memory-owner-lifecycle-v1",
+                "watchdogJoined":true,"samplerJoinObserved":true,
+                "nativeOwnerWorkReturnedObservation":Value::Null,
+                "ownerEvidenceLimit":"join observed after native sampler return; whole test/job result separately proves owner work returned",
+                "physicalCeilingBytes":self.ceiling.load(Ordering::Relaxed),
+                "physicalSamples":"physical-allocator-samples.jsonl"}),
+            );
         }
     }
+}
+
+fn assert_allocator_policy_restored(before: (usize, usize), after: (usize, usize), label: &str) {
+    assert_eq!(
+        after, before,
+        "{label}: original MLX memory/cache pair restored"
+    );
+}
+
+fn allocator_policy_receipt(pair: (usize, usize)) -> Value {
+    json!({"memoryLimitBytes":pair.0,"cacheLimitBytes":pair.1,
+        "readbackMethod":"existing AllocatorBounds::current; cache queried by temporary zero clamp immediately restored; no new grant/eval/sync"})
 }
 
 fn gib(bytes: u64) -> f64 {
@@ -919,6 +942,8 @@ pub(crate) fn render(
     guard: &Footprint,
     out: &Path,
 ) -> (Image, Value) {
+    let policy_before = mlx_gen_qwen_image_2_1::memory_strategy::AllocatorBounds::current();
+    let mut policy_during_step = None;
     let contract = memory_strategy_contract(ID, spec)
         .unwrap_or_else(|e| panic!("{label}: the memory contract refused the spec: {e}"));
     let predicted_overlay = contract.asset_facts.overlay_bytes;
@@ -931,10 +956,31 @@ pub(crate) fn render(
         .unwrap_or_else(|e| panic!("{label}: load failed: {e}"));
     let loaded = started.elapsed().as_secs_f64();
     let output = generator
-        .generate(req, &mut |_| {})
+        .generate(req, &mut |progress| {
+            if policy_during_step.is_none() && matches!(progress, gen_core::Progress::Step { .. }) {
+                policy_during_step =
+                    Some(mlx_gen_qwen_image_2_1::memory_strategy::AllocatorBounds::current());
+            }
+        })
         .unwrap_or_else(|e| panic!("{label}: render failed: {e}"));
     let seconds = started.elapsed().as_secs_f64();
     drop(generator);
+    let policy_after = mlx_gen_qwen_image_2_1::memory_strategy::AllocatorBounds::current();
+    let policy_restored = policy_before == policy_after;
+    write_json(
+        out,
+        &format!("{label}-allocator-lifecycle"),
+        &json!({
+        "schema":"sc24163-campaign-render-allocator-lifecycle-v1","label":label,
+        "requestedQuant":format!("{:?}",spec.quantize),"requestWidth":req.width,"requestHeight":req.height,
+        "before":allocator_policy_receipt(policy_before),
+        "duringFirstDenoisingStep":policy_during_step.map(allocator_policy_receipt),
+        "afterGeneratorDrop":allocator_policy_receipt(policy_after),"restored":policy_restored,
+        "contractResidentBytes":predicted_resident,"contractOverlayBytes":predicted_overlay,
+        "internalTransientBudgetBytes":Value::Null,
+        "budgetEvidenceLimit":"backend contract resident/overlay priced; actual effective memory/cache sampled inside first Step callback; internal transient budget not exposed by this helper"}),
+    );
+    assert_allocator_policy_restored(policy_before, policy_after, label);
     let (mlx_peak, footprint_max) = guard.end();
     mlx_rs::memory::clear_cache();
     let GenerationOutput::Images(mut images) = output else {
@@ -1038,12 +1084,41 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let predicted_peak_bytes = preflight["peakBytes"]
         .as_u64()
         .expect("exact envelope bytes");
-    if req.config == matched_edit_training_config(120) {
-        assert_matched_edit_preflight(&preflight);
+    if req.config == revised_edit_training_config(REVISED_EDIT_STEPS) {
+        assert_revised_edit_preflight(&preflight);
     }
     // The returned task-owned guard is installed before the first large weight load and retained
     // through `Trainer::train`; its Drop restores the caller's allocator policy on every exit.
+    let policy_before = mlx_gen_qwen_image_2_1::memory_strategy::AllocatorBounds::current();
+    let mut policy_lifecycle = json!({"schema":"sc24163-campaign-training-cache-lifecycle-v1",
+        "beforeGrant":allocator_policy_receipt(policy_before),
+        "duringGrant":Value::Null,"afterGrantDrop":Value::Null,"restored":Value::Null,
+        "requestedActiveEnvelopeBytes":predicted_peak_bytes,
+        "requestedCacheLimitBytes":preflight["requestedCacheLimitBytes"],
+        "scope":"cache-only; original MLX memory limit unchanged; failure may leave afterDrop NULL"});
+    write_json(
+        &guard.out,
+        "training-allocator-lifecycle",
+        &policy_lifecycle,
+    );
     let cache_grant = guard.admit_training(&preflight);
+    let policy_during = mlx_gen_qwen_image_2_1::memory_strategy::AllocatorBounds::current();
+    policy_lifecycle["duringGrant"] = allocator_policy_receipt(policy_during);
+    policy_lifecycle["effectiveCacheLimitBytes"] = json!(cache_grant.effective());
+    write_json(
+        &guard.out,
+        "training-allocator-lifecycle",
+        &policy_lifecycle,
+    );
+    assert_eq!(
+        policy_during.0, policy_before.0,
+        "training grant preserves memory limit"
+    );
+    assert_eq!(
+        policy_during.1,
+        cache_grant.effective(),
+        "actual cache grant readback"
+    );
     let predicted_peak_gib = predicted_message
         .split("derived peak memory is ~")
         .nth(1)
@@ -1138,6 +1213,15 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     let installed_cache_limit =
         u64::try_from(cache_grant.effective()).expect("allocator cache limit fits u64");
     drop(cache_grant);
+    let policy_after = mlx_gen_qwen_image_2_1::memory_strategy::AllocatorBounds::current();
+    policy_lifecycle["afterGrantDrop"] = allocator_policy_receipt(policy_after);
+    policy_lifecycle["restored"] = json!(policy_after == policy_before);
+    write_json(
+        &guard.out,
+        "training-allocator-lifecycle",
+        &policy_lifecycle,
+    );
+    assert_allocator_policy_restored(policy_before, policy_after, "training cache grant");
     let (caching_peak, caching_footprint) = caching_peaks.unwrap_or((0, 0));
     let (train_peak, train_footprint) = training_peaks::aggregate_training_peaks(
         (caching_peak, caching_footprint),
@@ -1504,53 +1588,64 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
 
 // ── 2. instruction-edit LoKr on two references ───────────────────────────────────────────────────
 
-const MATCHED_EDIT_TRAIN_EDGE: u32 = 448;
-const MATCHED_EDIT_DATASET_SHA256: &str =
-    "5fad5cb5cf532dab7906be7b7b91105aa5db4a71e80de890af401c47910739e3";
-const MATCHED_EDIT_KEY_SHA256: &str =
+const REVISED_EDIT_TRAIN_EDGE: u32 = 384;
+const REVISED_EDIT_DATASET_SHA256: &str =
+    "62d762a977a23d6df0a8435e73ee2abcc026909e3558c6a1f20bfb17e091ef9c";
+const REVISED_EDIT_KEY_SHA256: &str =
     "da3be3ca711ec3d0e89df8f1e91bc662365fea188fd513d0108782b6c726189f";
 
-fn matched_edit_training_config(steps: u32) -> TrainingConfig {
+const REVISED_EDIT_STEPS: u32 = 1200;
+const REVISED_EDIT_RECIPE_SHA256: &str =
+    "796c437a8d75a4938b36a282ea2d3bc2c69fc9577e31918ad5890f07745c004b";
+
+fn revised_edit_training_config(steps: u32) -> TrainingConfig {
     TrainingConfig {
         rank: 16,
         alpha: 16.0,
-        learning_rate: TRAIN_LR,
+        learning_rate: 5e-5,
         steps,
         gradient_checkpointing: true,
-        resolution: MATCHED_EDIT_TRAIN_EDGE,
+        resolution: REVISED_EDIT_TRAIN_EDGE,
         save_every: 0,
         seed: 42,
         optimizer: "adamw".into(),
         network_type: NetworkType::Lokr,
+        lr_scheduler: gen_core::train::LrSchedule::Cosine,
+        lr_warmup_steps: 60,
+        timestep_type: "sigmoid".into(),
+        timestep_bias: "high_noise".into(),
+        lora_target_modules: ["attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0"]
+            .map(str::to_owned)
+            .to_vec(),
         ..Default::default()
     }
 }
 
-fn matched_edit_expected_preflight() -> Value {
+fn revised_edit_expected_preflight() -> Value {
     // Source forecast, not an observed tensor/physical peak. Compare the actual
     // header-only backend preflight before permitting this request's admission.
-    json!({"peakBytes":99826239424_u64,"captionBytes":18224996832_u64,
-        "latentBytes":12513372624_u64,"trainBytes":99826239424_u64,
-        "requestedCacheLimitBytes":85595989952_u64})
+    json!({"peakBytes":55389738816_u64,"captionBytes":17950794208_u64,
+        "latentBytes":12504598992_u64,"trainBytes":55389738816_u64,
+        "requestedCacheLimitBytes":41159489344_u64})
 }
 
-fn assert_matched_edit_preflight(actual: &Value) {
+fn assert_revised_edit_preflight(actual: &Value) {
     assert_eq!(
         actual,
-        &matched_edit_expected_preflight(),
-        "matched448 actual preflight drift"
+        &revised_edit_expected_preflight(),
+        "revised384 actual preflight drift"
     );
 }
 
-fn matched_edit_training_recipe(cfg: &TrainingConfig) -> Value {
+fn revised_edit_training_recipe(cfg: &TrainingConfig) -> Value {
     assert_eq!(
         cfg,
-        &matched_edit_training_config(120),
-        "matched448 actual config drift"
+        &revised_edit_training_config(REVISED_EDIT_STEPS),
+        "revised384 actual config drift"
     );
     let actual = format!("{cfg:?}");
     let hash = format!("{:x}", Sha256::digest(actual.as_bytes()));
-    json!({"kind":"matched_two_reference448_sigmoid120_training_recipe",
+    json!({"kind":"one_reference384_attention_lokr1200_high_noise_cosine_training_recipe",
         "actualTrainingConfigDebug":actual, "actualTrainingConfigDebugSha256":hash,
         "timestepType":cfg.timestep_type,"timestepBias":cfg.timestep_bias,"trainDtype":cfg.train_dtype,
         "trainingSeed":cfg.seed,"steps":cfg.steps,"learningRate":cfg.learning_rate,
@@ -1559,13 +1654,81 @@ fn matched_edit_training_recipe(cfg: &TrainingConfig) -> Value {
         "weightDecay":cfg.weight_decay,"gradientAccumulation":cfg.gradient_accumulation,
         "evaluationSeed":SEED,"evaluationSteps":RENDER_STEPS,
         "nativeDatasetEdge":EDIT_TRAIN_EDGE,"evaluationEdge":RENDER_EDGE,
+        "lrScheduler":format!("{:?}",cfg.lr_scheduler),"lrWarmupSteps":cfg.lr_warmup_steps,
+        "targetModules":cfg.lora_target_modules,"selectedProposalSha256":REVISED_EDIT_RECIPE_SHA256,
         "donorHeaderRecipeFieldsAdded":false})
 }
 
-fn matched_edit_conditioning_receipt(req: &TrainingRequest, data: &Path, key: &Path) -> Value {
-    // Full actual request, not a normalized one-reference assertion. The original pixel
-    // recipe/audit remains unchanged; this explicit conditioning/config contract is separate.
-    let recipe = matched_edit_training_recipe(&req.config);
+fn assert_revised_edit_payload_fresh(fingerprint: &str) {
+    for rejected in [
+        "2c10ef6f04742f6700a47da2c7797432abe08d3bf378e42c8f520ee46fcef566",
+        "20dfea5c578efdf832a9039528c7a5dd430c91883282ba7e3e4128904cc9ae0d",
+        "8f3257c38a0cfbc365896be90df524685e01ffebdb521b63e67ecc5a559ca773",
+        // The exact128 attention targets projected from each rejected672-factor file.
+        // Removing FFN tensors from an old file cannot qualify as freshly trained numerics.
+        "073349c43d04f98af821fd53d8f4c6ad119b89cc158a47625277da5e7c965397",
+        "f57308e7287dbd092750f56a1f2b2c9967a92afd4725166fc72aad94ac744fbc",
+        "3af32c051423b1a5e343b01ea2d1b5ad283730e31322a6877107c4ecce98364b",
+    ] {
+        assert_ne!(fingerprint, rejected, "rejected historical numerical donor");
+    }
+}
+
+fn revised_edit_donor_receipt(path: &Path) -> Value {
+    // CPU byte validation only: no tensor load, header stamp, or metadata-based freshness.
+    let layout = gen_core::weightsmeta::safetensors_file_tensor_locations(path).unwrap();
+    let payloads =
+        gen_core::weightsmeta::read_safetensors_tensor_payloads(path, |_| true, 16384).unwrap();
+    assert_eq!(
+        layout.tensors.len(),
+        384,
+        "128 attention targets, three F32 factors each"
+    );
+    let mut rows = Vec::new();
+    let mut bytes = 0_u64;
+    for block in 0..32 {
+        for module in ["attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0"] {
+            for (factor, shape) in [
+                ("lokr_w1", [64, 64]),
+                ("lokr_w2_a", [64, 16]),
+                ("lokr_w2_b", [16, 64]),
+            ] {
+                let name = format!("transformer_blocks.{block}.{module}.{factor}");
+                let tensor = layout
+                    .tensors
+                    .iter()
+                    .find(|t| t.header.name == name)
+                    .expect("every selected factor");
+                assert_eq!(format!("{:?}", tensor.header.dtype), "F32");
+                assert_eq!(tensor.header.shape, shape);
+                let payload = &payloads[&name];
+                assert_eq!(payload.len(), shape.iter().product::<usize>() * 4);
+                assert!(payload
+                    .chunks_exact(4)
+                    .all(|v| f32::from_le_bytes(v.try_into().unwrap()).is_finite()));
+                bytes += payload.len() as u64;
+                rows.push(json!({"name":name,"dtype":"F32","shape":shape,
+                    "payloadSha256":format!("{:x}",Sha256::digest(payload)),"payloadBytes":payload.len()}));
+            }
+        }
+    }
+    assert_eq!(bytes, 3145728);
+    rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    // Canonicalize keys explicitly: workspace feature unification enables preserve_order.
+    let mut rows = Value::Array(rows);
+    rows.sort_all_objects();
+    let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&rows).unwrap()));
+    assert_revised_edit_payload_fresh(&fingerprint);
+    json!({"tensorCount":384,"factorMasterElements":786432,"tensorPayloadBytes":bytes,
+        "canonicalTensorPayloadFingerprintSha256":fingerprint,"tensorRows":rows,
+        "wholeSha256":sha256_file(path),"differentFromAllThreeRejectedPayloads":true,
+        "headerOnlyChangeCannotQualify":true,"donorHeaderRecipeFieldsAdded":false})
+}
+
+fn revised_edit_conditioning_receipt(req: &TrainingRequest, data: &Path, key: &Path) -> Value {
+    // Bind the actual one-reference training request; evaluation deliberately remains two-reference.
+    // Native source/target bytes and the independent-channel transform remain unchanged.
+    let recipe = revised_edit_training_recipe(&req.config);
     assert_eq!(req.items.len(), 6, "six native768 pairs only");
     assert_eq!(req.file_name, EDIT_ADAPTER, "unchanged output adapter name");
     assert!(
@@ -1575,7 +1738,7 @@ fn matched_edit_conditioning_receipt(req: &TrainingRequest, data: &Path, key: &P
     assert_eq!(key, data.join("key.png"));
     assert_eq!(
         sha256_file(key),
-        MATCHED_EDIT_KEY_SHA256,
+        REVISED_EDIT_KEY_SHA256,
         "unchanged512 palette key"
     );
     assert_eq!(image::image_dimensions(key).unwrap(), (512, 512));
@@ -1586,40 +1749,50 @@ fn matched_edit_conditioning_receipt(req: &TrainingRequest, data: &Path, key: &P
             "nativeWidth":w,"nativeHeight":h})
     };
     let rows: Vec<Value> = req.items.iter().enumerate().map(|(i, item)| {
-        assert_eq!(item.caption, EDIT_INSTRUCTION, "training/evaluation instruction match");
+        assert_eq!(item.caption, TRAIN_EDIT_INSTRUCTION, "one-reference core training instruction");
         assert_eq!(item.image_path, data.join(format!("tgt_{i}.png")), "no heldout target");
         assert_eq!(item.reference_image_paths,
-            vec![data.join(format!("src_{i}.png")), key.to_path_buf()],
-            "ordered training source then palette, never source99");
+            vec![data.join(format!("src_{i}.png"))],
+            "training source only, never palette or source99");
         assert_eq!(image::image_dimensions(&item.image_path).unwrap(), (768, 768));
         assert_eq!(image::image_dimensions(&item.reference_image_paths[0]).unwrap(), (768, 768));
         json!({"index":i,"caption":item.caption,"target":file(&item.image_path),
-            "orderedReferences":[{"role":"training-source","image":file(&item.reference_image_paths[0])},
-                {"role":"RGB-level-palette","image":file(key)}]})
+            "orderedReferences":[{"role":"training-source","image":file(&item.reference_image_paths[0])}]})
     }).collect();
     let dataset = dataset_receipt(&req.items);
     assert_eq!(
         dataset["sha256"].as_str().unwrap(),
-        MATCHED_EDIT_DATASET_SHA256,
+        REVISED_EDIT_DATASET_SHA256,
         "actual captions/order and all12 native PNG bytes must match the CPU receipt"
     );
-    json!({"kind":"actual_matched_training_conditioning448_v1","actualRecipe":recipe,
+    json!({"kind":"actual_one_reference384_training_conditioning_v1","actualRecipe":recipe,
         "actualOrderedInputs":rows,"actualDataset":dataset,
         "heldoutSource99UsedForTraining":false,"heldoutExpectedUsedForTraining":false,
         "sourceExpectedBackendGeometry":{"basis":"M004 source plus retained pinned tokenizer CPU forecast",
             "source":"004cee41f380ff263796ad90277e5f6224d73ae3",
-            "targetEdge":448,"packedTargetLatentShape":[1,784,64],
-            "referenceFittedEdges":[1024,1024],"packedReferenceLatentShapes":[[1,4096,64],[1,4096,64]],
-            "captionTokens":87,"prefixSegmentLengths":[8,4096,6,4096,73],"jointSequence":9063,
-            "activeForecastBytes":99826239424_u64},
+            "targetEdge":384,"packedTargetLatentShape":[1,576,64],
+            "referenceFittedEdges":[1024],"packedReferenceLatentShapes":[[1,4096,64]],
+            "captionTokens":65,"prefixSegmentLengths":[8,4096,57],"jointSequence":4737,
+            "activeForecastBytes":55389738816_u64},
         "actualBackendTensorShapeObservation":Value::Null,
         "geometryEvidenceLimit":"source-expected shapes; actual header-only preflight logs/receipt are separate; no new tensor observation",
         "originalOneReferenceDatasetSha256":edit_training_balanced64::DATASET_PNG_SHA256})
 }
 
 #[test]
-fn matched_edit_training_request_rejects_conditioning_and_config_drift() {
+fn revised_edit_training_request_rejects_conditioning_and_config_drift() {
     // CPU-only native guard exercises the SAME PNG producer and actual request contract.
+    assert_allocator_policy_restored((100, 50), (100, 50), "CPU fixture");
+    for changed in [(99, 50), (100, 49), (101, 51)] {
+        assert!(
+            std::panic::catch_unwind(|| assert_allocator_policy_restored(
+                (100, 50),
+                changed,
+                "CPU mutant"
+            ))
+            .is_err()
+        );
+    }
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path();
     let key = data.join("key.png");
@@ -1640,52 +1813,59 @@ fn matched_edit_training_request_rejects_conditioning_and_config_drift() {
             let target_path = data.join(format!("tgt_{i}.png"));
             src.save(&source).unwrap();
             target.save(&target_path).unwrap();
-            TrainingItem::edit_pair(
-                target_path,
-                EDIT_INSTRUCTION.into(),
-                vec![source, key.clone()],
-            )
+            TrainingItem::edit_pair(target_path, TRAIN_EDIT_INSTRUCTION.into(), vec![source])
         })
         .collect();
     let req = TrainingRequest {
         items,
-        config: matched_edit_training_config(120),
+        config: revised_edit_training_config(REVISED_EDIT_STEPS),
         output_dir: data.to_path_buf(),
         file_name: EDIT_ADAPTER.into(),
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
-    let receipt = matched_edit_conditioning_receipt(&req, data, &key);
+    let receipt = revised_edit_conditioning_receipt(&req, data, &key);
     assert_eq!(receipt["actualRecipe"]["timestepType"], "sigmoid");
     assert_eq!(
         receipt["sourceExpectedBackendGeometry"]["jointSequence"],
-        9063
+        4737
     );
-    for mutation in 0..14 {
+    for mutation in 0..22 {
         let mut changed = req.clone();
         match mutation {
             0 => changed.config.timestep_type = "uniform".into(),
             1 => changed.config.resolution = 480,
             2 => changed.config.seed = 43,
-            3 => changed.config.steps = 121,
-            4 => changed.config.learning_rate = 5e-5,
+            3 => changed.config.steps = 120,
+            4 => changed.config.learning_rate = TRAIN_LR,
             5 => changed.config.gradient_accumulation = 2,
-            6 => changed.items[0].reference_image_paths.reverse(),
-            7 => changed.items[0].caption = TRAIN_EDIT_INSTRUCTION.into(),
+            6 => changed.items[0].reference_image_paths.push(key.clone()),
+            7 => changed.items[0].caption = EDIT_INSTRUCTION.into(),
             8 => changed.items[0].reference_image_paths[0] = data.join("src_99.png"),
             9 => changed.items[0].image_path = data.join("eval_expected.png"),
             10 => changed.config.alpha = 8.0,
             11 => changed.config.weight_noise_sigma = 0.01,
             12 => changed.config.train_dtype = "f32".into(),
-            _ => changed.config.gradient_checkpointing = false,
+            13 => changed.config.gradient_checkpointing = false,
+            14 => changed.config.lora_target_modules.clear(),
+            15 => changed.config.lr_scheduler = gen_core::train::LrSchedule::Constant,
+            16 => changed.config.lr_warmup_steps = 0,
+            17 => changed.config.timestep_bias = "balanced".into(),
+            18 => changed.config.resolution = 448,
+            19 => changed
+                .config
+                .lora_target_modules
+                .push("ff.net.0.proj".into()),
+            20 => changed.config.sample_every = 100,
+            _ => changed.config.save_every = 100,
         }
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            matched_edit_conditioning_receipt(&changed, data, &key)
+            revised_edit_conditioning_receipt(&changed, data, &key)
         }))
         .is_err());
     }
-    let expected = matched_edit_expected_preflight();
-    assert_matched_edit_preflight(&expected);
+    let expected = revised_edit_expected_preflight();
+    assert_revised_edit_preflight(&expected);
     for field in [
         "peakBytes",
         "captionBytes",
@@ -1695,12 +1875,12 @@ fn matched_edit_training_request_rejects_conditioning_and_config_drift() {
     ] {
         let mut changed = expected.clone();
         changed[field] = json!(expected[field].as_u64().unwrap() + 1);
-        assert!(std::panic::catch_unwind(|| assert_matched_edit_preflight(&changed)).is_err());
+        assert!(std::panic::catch_unwind(|| assert_revised_edit_preflight(&changed)).is_err());
     }
     let original = std::fs::read(&key).unwrap();
     std::fs::write(&key, [&original[..], &[0]].concat()).unwrap();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        matched_edit_conditioning_receipt(&req, data, &key)
+        revised_edit_conditioning_receipt(&req, data, &key)
     }))
     .is_err());
     std::fs::write(&key, original).unwrap();
@@ -1708,12 +1888,81 @@ fn matched_edit_training_request_rejects_conditioning_and_config_drift() {
     let original = std::fs::read(source).unwrap();
     std::fs::write(source, [&original[..], &[0]].concat()).unwrap();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        matched_edit_conditioning_receipt(&req, data, &key)
+        revised_edit_conditioning_receipt(&req, data, &key)
     }))
     .is_err());
+
+    // Exercise the SAME returned-donor validator before this workflow can load models.
+    let donor = data.join("synthetic-factor-contract.safetensors");
+    let mut header = serde_json::Map::new();
+    let mut payload = Vec::new();
+    for block in 0..32 {
+        for module in ["attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0"] {
+            for (factor, shape) in [
+                ("lokr_w1", [64, 64]),
+                ("lokr_w2_a", [64, 16]),
+                ("lokr_w2_b", [16, 64]),
+            ] {
+                let start = payload.len();
+                payload.resize(start + shape.iter().product::<usize>() * 4, 0);
+                header.insert(
+                    format!("transformer_blocks.{block}.{module}.{factor}"),
+                    json!({"dtype":"F32","shape":shape,"data_offsets":[start,payload.len()]}),
+                );
+            }
+        }
+    }
+    let write = |h: &serde_json::Map<String, Value>, p: &[u8]| {
+        let h = serde_json::to_vec(h).unwrap();
+        let mut raw = (h.len() as u64).to_le_bytes().to_vec();
+        raw.extend(h);
+        raw.extend(p);
+        std::fs::write(&donor, raw).unwrap();
+    };
+    write(&header, &payload);
+    let original = revised_edit_donor_receipt(&donor);
+    for rejected in [
+        "073349c43d04f98af821fd53d8f4c6ad119b89cc158a47625277da5e7c965397",
+        "f57308e7287dbd092750f56a1f2b2c9967a92afd4725166fc72aad94ac744fbc",
+        "3af32c051423b1a5e343b01ea2d1b5ad283730e31322a6877107c4ecce98364b",
+    ] {
+        assert!(std::panic::catch_unwind(|| assert_revised_edit_payload_fresh(rejected)).is_err());
+    }
+    let first = "transformer_blocks.0.attn.to_q.lokr_w1";
+    for mutation in 0..6 {
+        let mut h = header.clone();
+        let mut p = payload.clone();
+        match mutation {
+            0 => {
+                h.remove(first);
+            }
+            1 => {
+                let v = h.remove(first).unwrap();
+                h.insert("transformer_blocks.0.ff.net.0.proj.lokr_w1".into(), v);
+            }
+            2 => h[first]["dtype"] = json!("BF16"),
+            3 => h[first]["shape"] = json!([32, 128]),
+            4 => p[..4].copy_from_slice(&f32::NAN.to_le_bytes()),
+            _ => {
+                p.push(0);
+            }
+        }
+        write(&h, &p);
+        assert!(std::panic::catch_unwind(|| revised_edit_donor_receipt(&donor)).is_err());
+    }
+    header.insert(
+        "__metadata__".into(),
+        json!({"testOnly":"header-only change"}),
+    );
+    write(&header, &payload);
+    assert_eq!(
+        revised_edit_donor_receipt(&donor)["canonicalTensorPayloadFingerprintSha256"],
+        original["canonicalTensorPayloadFingerprintSha256"],
+        "header cannot change numerical fingerprint"
+    );
 }
 
-/// A matched instruction-edit **LoKr** run on six two-reference edit pairs (image 1
+/// One fixed revised instruction-edit **LoKr** run on six one-reference edit pairs (image 1
 /// is the source; target is the source inverted and posterized), then a held-out
 /// two-reference edit with and without the adapter at bf16, q8 and q4. Asserts, per tier: both
 /// renders are pictures; the adapter moves the edit by at least [`ADAPTER_MOVES_FLOOR`]; its
@@ -1722,10 +1971,11 @@ fn matched_edit_training_request_rejects_conditioning_and_config_drift() {
 /// does not exceed the priced one. The run must carry the edit marker and peak inside its own
 /// preflight.
 ///
-/// `QWEN_IMAGE_2_1_LORA_EDIT_STEPS` (default 120 at [`TRAIN_LR`], ~30 s a step on an M5 Max, ~60
-/// min; 40 historical two-reference steps did not yet move the held-out edit toward the transform)
-/// keeps 120 steps; native 768 training PNGs resize to 448 targets, with two 1024-fitted references.
-/// Evaluation, imports and stacking retain their ordered two-reference protocol and thresholds.
+/// The selected recipe fixes 1200 updates, seed42, attention-only rank/alpha16 LoKr,
+/// AdamW5e-5 with60-update warmup/Cosine decay and sigmoid/high-noise sampling.
+/// Native768 training pairs fit384 targets and one1024 reference. The unchanged held-out
+/// evaluation retains TWO references at768 and every original quality/stack/import gate.
+/// This is a generalization experiment, not a promised quality cure; no checkpoint selection.
 #[test]
 #[ignore]
 fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
@@ -1755,61 +2005,66 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
             let tgt_path = data.join(format!("tgt_{i}.png"));
             src.save(&src_path).unwrap();
             target.save(&tgt_path).unwrap();
-            TrainingItem::edit_pair(tgt_path, EDIT_INSTRUCTION.into(), vec![src_path, key_path.clone()])
+            TrainingItem::edit_pair(tgt_path, TRAIN_EDIT_INSTRUCTION.into(), vec![src_path])
         })
         .collect();
-    let steps = training_steps("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", 120);
+    let steps = training_steps("QWEN_IMAGE_2_1_LORA_EDIT_STEPS", REVISED_EDIT_STEPS);
+    assert_eq!(
+        steps, REVISED_EDIT_STEPS,
+        "the selected candidate has exactly1200 steps"
+    );
     let req = TrainingRequest {
         items,
-        config: matched_edit_training_config(steps),
+        config: revised_edit_training_config(steps),
         output_dir: adapters.clone(),
         file_name: EDIT_ADAPTER.into(),
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
-    let training_conditioning = matched_edit_conditioning_receipt(&req, &data, &key_path);
-    let training_recipe = matched_edit_training_recipe(&req.config);
+    let training_conditioning = revised_edit_conditioning_receipt(&req, &data, &key_path);
+    let training_recipe = revised_edit_training_recipe(&req.config);
     let protocol = json!({
-        "kind": "matched_two_reference_training448_evaluation768",
+        "kind": "one_reference_training384_evaluation_two_reference768",
         "trainingRecipe": training_recipe, "trainingConditioning": training_conditioning,
-        "trainingReferenceCount": 2, "evaluationReferenceCount": 2,
-        "trainingCaption": EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
+        "trainingReferenceCount": 1, "evaluationReferenceCount": 2,
+        "trainingCaption": TRAIN_EDIT_INSTRUCTION, "evaluationCaption": EDIT_INSTRUCTION,
         "trainingTargetEdge": req.config.resolution, "trainingNativeTargetEdge": EDIT_TRAIN_EDGE, "trainingReferenceNativeEdge": EDIT_TRAIN_EDGE, "trainingReferenceFittedEdge": 1024,
         "evaluationTargetEdge": RENDER_EDGE, "evaluationKeyNativeEdge": TRAIN_EDGE, "stepsRequested": steps,
         "dataset": dataset_receipt(&req.items), "evaluationKeySha256": sha256_file(&key_path),
         "trainingDataRecipe": {"version":edit_training_balanced64::VERSION,"frozenPlanSha256":edit_training_balanced64::PLAN_SHA256,
             "rawRgbAudits":raw_rgb_audits,"heldoutSource99UsedForTraining":false,
-            "itemExposuresAt120RoundRobinSteps":20,"targetAuthority":"unchanged edit_transform(source)",
+            "itemExposuresAt1200RoundRobinSteps":200,"targetAuthority":"unchanged edit_transform(source)",
             "nativeCoordinateMap":"floor(2*x/3), floor(2*y/3) into the fixed logical512 layouts; physical mapping is not bijective",
             "sourceDistribution":"red/green each2304; blue items0/1 2048..2560 and items2..5 1536..3072 pixels/value; all256values covered",
-            "referencePreprocessing":"native768 source and unchanged512 palette each independently fitted to1024 for vision/VAE; native768 targets resize to448 only for training",
-            "conditioningVersion":"matched-two-reference448-v1",
-            "scopeLimit":"native PNGs unchanged; training target tensors are448, evaluation768; denseBF16/packedQ4 and texture generalization gaps remain; no quality cure claimed"},
+            "referencePreprocessing":"native768 source fitted to1024 for vision/VAE; native768 targets resize to384 only for training; palette excluded from training and retained in evaluation",
+            "conditioningVersion":"one-reference384-attention1200-v1",
+            "scopeLimit":"native PNGs unchanged; training target tensors are384 with one reference, evaluation768 with two references; conditioning/denseBF16/packedQ4/texture generalization remains unproved; no quality cure claimed"},
         "historicalTwoReferenceTrainingEvidence": "retained only at its original source SHA",
     });
     assert_eq!(
         protocol["dataset"]["sha256"].as_str().unwrap(),
-        MATCHED_EDIT_DATASET_SHA256,
+        REVISED_EDIT_DATASET_SHA256,
         "native768 training PNG dataset must match the frozen CPU receipt before admission"
     );
     // Persist the disclosed protocol before admission, so even an explicit refusal is attributable.
     write_json(&out, "edit-training-protocol", &protocol);
     let mut trained = train(&req, &guard, &adapters.join(EDIT_ADAPTER), 1);
     trained.facts["editProtocol"] = protocol;
-    trained.facts["trainingRecipe"] = matched_edit_training_recipe(&req.config);
+    trained.facts["trainingRecipe"] = revised_edit_training_recipe(&req.config);
     trained.facts["trainingConditioning"] =
-        matched_edit_conditioning_receipt(&req, &data, &key_path);
+        revised_edit_conditioning_receipt(&req, &data, &key_path);
     trained.facts["trainingProtocolSha256"] =
         json!(sha256_file(&out.join("edit-training-protocol.json")));
+    trained.facts["actualDonorNumericalReceipt"] = revised_edit_donor_receipt(&trained.adapter);
     let actual_preflight: Value =
         serde_json::from_slice(&std::fs::read(out.join("training-preflight.json")).unwrap())
             .unwrap();
-    assert_matched_edit_preflight(&actual_preflight);
+    assert_revised_edit_preflight(&actual_preflight);
     trained.facts["actualTrainingPreflight"] = actual_preflight;
     trained.facts["actualTrainingPreflightSha256"] =
         json!(sha256_file(&out.join("training-preflight.json")));
     assert_eq!(
-        trained.facts["predictedTrainPhaseBytes"], 99826239424_u64,
+        trained.facts["predictedTrainPhaseBytes"], 55389738816_u64,
         "actual header-only training preflight must match the bounded source forecast"
     );
 

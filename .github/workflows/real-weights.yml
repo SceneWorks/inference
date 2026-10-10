@@ -1,5 +1,5 @@
 # Isolated manual campaign ref; registered workflow312370029. No product-main transport merge.
-name: '[Mac2] SC-24163 matched-conditioning448 recipe campaign'
+name: '[Mac2] SC-24163 revised-one-reference384-1200 recipe campaign'
 'on':
   workflow_dispatch:
     inputs:
@@ -31,11 +31,11 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: sc24163-matched-conditioning448-${{ github.ref }}
+  group: sc24163-revised-one-reference384-1200-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   mlx-qwen-image-2-1:
-    name: '[Mac2] SC-24163 matched-conditioning448 dense BF16 campaign'
+    name: '[Mac2] SC-24163 revised-one-reference384-1200 dense BF16 campaign'
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx' && inputs.qwen_image_2_1_lora_runner
       == 'rw-mage' && inputs.qwen_image_2_1_lora_phase == 'edit'
     runs-on:
@@ -43,7 +43,7 @@ jobs:
     - macOS
     - ARM64
     - rw-mage
-    timeout-minutes: 300
+    timeout-minutes: 600
     permissions:
       actions: read
       contents: read
@@ -55,7 +55,7 @@ jobs:
       QWEN_IMAGE_2_1_LORA_PHASE: ${{ inputs.qwen_image_2_1_lora_phase }}
       CARGO_PROFILE_RELEASE_STRIP: none
       QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB: '100'
-      QWEN_IMAGE_2_1_LORA_EDIT_STEPS: '120'
+      QWEN_IMAGE_2_1_LORA_EDIT_STEPS: '1200'
       QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS: '1'
     steps:
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -66,6 +66,7 @@ jobs:
       run: |
         [[ "$RUNNER_NAME" == nax-macos-2 && "$GITHUB_RUN_ATTEMPT" == 1 ]]
         [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" && -z "$(git status --porcelain)" ]]
+        [[ "$(git cat-file -p HEAD | sed -n 's/^parent //p')" == 89ad519890721ac009d5e0ed095379d7c13cade8 ]]
     - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       with:
         toolchain: 1.96.0
@@ -96,14 +97,14 @@ jobs:
         python3.12 scripts/ci/qwen21_host_census.py --out "$QWEN_IMAGE_2_1_RENDER_OUT/host-census"
     - name: Build the Qwen-Image 2.1 MLX test binary
       run: source scripts/ci/real-weights/mlx-qwen-image-2-1/build-and-record-mlx-library-identity.sh
-    - name: Prove the actual matched-conditioning448 configuration binding
+    - name: Prove the actual revised-one-reference384-1200 configuration binding
       shell: bash
       run: |
         set -euo pipefail
         cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
-          lora_real_weights::matched_edit_training_request_rejects_conditioning_and_config_drift \
-          -- --exact --nocapture --test-threads 1 2>&1 | tee "$QWEN_IMAGE_2_1_RENDER_OUT/matched-conditioning-guard.log"
-        grep -qE 'test result: ok\. 1 passed' "$QWEN_IMAGE_2_1_RENDER_OUT/matched-conditioning-guard.log"
+          lora_real_weights::revised_edit_training_request_rejects_conditioning_and_config_drift \
+          -- --exact --nocapture --test-threads 1 2>&1 | tee "$QWEN_IMAGE_2_1_RENDER_OUT/revised-recipe-guard.log"
+        grep -qE 'test result: ok\. 1 passed' "$QWEN_IMAGE_2_1_RENDER_OUT/revised-recipe-guard.log"
     - name: Prove trained velocity survives adapter save and reload
       if: inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
       run: source scripts/ci/real-weights/mlx-qwen-image-2-1/prove-trained-velocity-survives-save-and-reload.sh
