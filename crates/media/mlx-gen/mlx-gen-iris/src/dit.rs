@@ -17,7 +17,8 @@ use mlx_rs::nn::{gelu, sigmoid, silu};
 use mlx_rs::{Array, Dtype};
 
 use crate::nn::{
-    attention, cat, chunk_last, key_padding_mask, modulate, Linear, Loader, RmsNorm, Rope,
+    attention, cat, chunk_last, key_padding_mask, modulate, AdaptedLinears, Linear, Loader,
+    RmsNorm, Rope,
 };
 
 /// `SwiGLU`: `w2(silu(w1 x) · w3 x)`, bias-free.
@@ -116,6 +117,9 @@ impl SelfAttention {
 }
 
 /// Q/K/V projections of one stream: fused under full MHA, separate under GQA.
+// Built once per block at load and never moved on the forward path, so the variant size (three
+// adaptable projections vs one) costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 enum Qkv {
     Fused(Linear),
     Split { q: Linear, k: Linear, v: Linear },
@@ -302,9 +306,40 @@ impl IrisDiT {
     /// Build from the backbone's `model.safetensors` (upstream key names) at `compute` dtype.
     /// Every source key must be consumed; a leftover or missing key is a load error.
     pub fn from_weights(w: &Weights, cfg: &ModelConfig, compute: Dtype) -> Result<Self> {
+        Self::from_weights_adapted(w, cfg, compute, None)
+    }
+
+    /// [`from_weights`](Self::from_weights) with the projections of an adapter install
+    /// ([`AdaptedLinears`]): every adapted projection must be one the graph reads, or the build
+    /// fails naming it.
+    pub fn from_weights_adapted(
+        w: &Weights,
+        cfg: &ModelConfig,
+        compute: Dtype,
+        adapted: Option<&AdaptedLinears>,
+    ) -> Result<Self> {
+        let dit = Self::build(w, cfg, compute, adapted)?;
+        if let Some(adapted) = adapted {
+            let orphans = adapted.unconsumed();
+            if !orphans.is_empty() {
+                return Err(Error::Msg(format!(
+                    "iris: adapter targets {orphans:?} are not projections of the backbone graph"
+                )));
+            }
+        }
+        Ok(dit)
+    }
+
+    fn build(
+        w: &Weights,
+        cfg: &ModelConfig,
+        compute: Dtype,
+        adapted: Option<&AdaptedLinears>,
+    ) -> Result<Self> {
         let l = Loader {
             weights: w,
             compute,
+            adapted,
         };
         let eps = cfg.norm_eps as f32;
         let gqa = cfg.num_kv_heads.is_some_and(|kv| kv != cfg.num_heads);

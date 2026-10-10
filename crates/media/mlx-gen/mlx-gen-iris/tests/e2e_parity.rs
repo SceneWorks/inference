@@ -10,7 +10,7 @@
 //! held to 1e-4 / 1e-5 by `dit_parity` / `solver_parity`.
 
 use mlx_gen::gen_core::iris::GenerationParams;
-use mlx_gen::{CancelFlag, GenerationRequest};
+use mlx_gen::{CancelFlag, GenerationRequest, PreviewSink};
 use mlx_gen_iris::{denoise, encode, load_backbone, IrisTextEncoder};
 use mlx_rs::Dtype;
 
@@ -35,8 +35,8 @@ fn run() {
         seed: Some(0),
         ..Default::default()
     };
-    let params = GenerationParams::resolve(&req, 0);
-    let conditioning = encode(&te, &req.prompt, &params).unwrap();
+    let params = GenerationParams::resolve(&req, 0, &config).unwrap();
+    let conditioning = encode(&te, &params).unwrap();
     assert!(
         conditioning.uncond.is_some(),
         "CFG 3 encodes the empty-negative null"
@@ -50,6 +50,7 @@ fn run() {
         &params,
         &CancelFlag::new(),
         |i| steps.push(i),
+        &PreviewSink::default(),
     )
     .unwrap();
     assert_eq!(steps, [1, 2, 3, 4, 5, 6]);

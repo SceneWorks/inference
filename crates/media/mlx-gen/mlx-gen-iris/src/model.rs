@@ -2,21 +2,24 @@
 //! staged generate (text encoder → backbone), registered as [`MODEL_ID`].
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use gen_core::iris::{
-    reject_unhonored_generation_controls, GenerationParams, GenerationResources, IrisConfig,
-    FAMILY, GENERATION_MODEL_ID,
+    validate_generation_request, GenerationParams, GenerationResources, IrisConfig, IrisTask,
+    FAMILY, GENERATION_MODEL_ID, SAMPLERS,
 };
+use gen_core::GenerationReport;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Residency, Result, SizeFloor,
+    default_seed, gen_core, AdapterApplyReport, AdapterSpec, Capabilities, Error, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Residency, Result, SizeFloor,
 };
 use mlx_rs::transforms::eval;
 use mlx_rs::Dtype;
 
 use crate::dit::IrisDiT;
-use crate::pipeline::{denoise, encode, noise, to_image, Conditioning};
+use crate::pipeline::{denoise, encode, noise_batch, to_images, Conditioning};
 use crate::text_encoder::IrisTextEncoder;
 
 /// Registry id (the SceneWorks worker's `payload.model`).
@@ -38,7 +41,9 @@ pub fn descriptor() -> ModelDescriptor {
         // Pixel space: there is no latent and no VAE.
         denoiser_output_latent_space: None,
         control_kinds: None,
-        required_components: &[],
+        // The Qwen3-VL text encoder is a load-time component (`components["text_encoder"]`);
+        // `load` refuses without it.
+        required_components: &[gen_core::iris::TEXT_ENCODER_COMPONENT],
         id: MODEL_ID,
         family: FAMILY,
         backend: "mlx",
@@ -49,10 +54,22 @@ pub fn descriptor() -> ModelDescriptor {
             // `guidance` is upstream's `cfg_scale` (default 3.0; 1.0 = CFG off).
             supports_guidance: true,
             supports_true_cfg: false,
-            // The FlowDPM-Solver++ (order 2, lower-order final) is the only integrator; no
-            // sampler/scheduler names are advertised, so any requested one is refused.
-            samplers: Vec::new(),
+            // The FlowDPM-Solver++ in its two upstream orders: `dpmpp_2m` (order 2, the default)
+            // and `euler` (order 1 — the first-order DPM-Solver++ step IS the flow Euler step).
+            // There is one schedule (the shifted linear grid), so no scheduler name is advertised;
+            // `scheduler_shift` is upstream's `shift`.
+            samplers: SAMPLERS.to_vec(),
             schedulers: Vec::new(),
+            // upstream `cfg_interval`, a prompt list, and `text_encoder.on_caption_overflow`.
+            supports_cfg_interval: true,
+            supports_prompt_batch: true,
+            supports_caption_overflow_policy: true,
+            // LoRA / LoKr (and LyCORIS-layout LoHa) residuals on the backbone projections; every
+            // file must carry the Iris `family` / `irisTask` stamps.
+            supports_lora: true,
+            supports_lokr: true,
+            // Pixel space: every step's predicted clean image is the preview, decoded exactly.
+            supports_preview: true,
             min_size: MIN_SIZE,
             max_size: MAX_SIZE,
             max_count: MAX_COUNT,
@@ -77,6 +94,8 @@ pub struct Iris3b {
     descriptor: ModelDescriptor,
     config: IrisConfig,
     residency: Residency<IrisTextEncoder, Heavy>,
+    /// One report per installed adapter file, from the most recent backbone load.
+    adapter_reports: Arc<Mutex<Vec<AdapterApplyReport>>>,
 }
 
 /// The compute dtype a load spec selects: the release's bf16 autocast by default, upstream's FP32
@@ -91,6 +110,19 @@ pub fn compute_dtype(spec: &LoadSpec) -> Dtype {
 /// Load the backbone from its directory (`config.yaml` already parsed) and evaluate every
 /// parameter before returning, so no forward ever reads a weight lazily.
 pub fn load_backbone(dir: &Path, config: &IrisConfig, compute: Dtype) -> Result<IrisDiT> {
+    Ok(load_backbone_with_adapters(dir, config, compute, &[], IrisTask::Generation, MODEL_ID)?.0)
+}
+
+/// [`load_backbone`] with `adapters` installed (in order) on its projections for `task` on
+/// `base_model` (see [`crate::adapters`]); returns one report per adapter file.
+pub fn load_backbone_with_adapters(
+    dir: &Path,
+    config: &IrisConfig,
+    compute: Dtype,
+    adapters: &[AdapterSpec],
+    task: IrisTask,
+    base_model: &str,
+) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
     let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
     let mut weights = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
@@ -112,20 +144,25 @@ pub fn load_backbone(dir: &Path, config: &IrisConfig, compute: Dtype) -> Result<
         eval([&array])?;
         weights.insert(key, array);
     }
-    let dit = IrisDiT::from_weights(&weights, &config.model, compute)?;
+    let installed = crate::adapters::install(&weights, compute, adapters, task, base_model)?;
+    let (adapted, reports) = match installed {
+        Some((adapted, reports)) => (Some(adapted), reports),
+        None => (None, Vec::new()),
+    };
+    let dit = IrisDiT::from_weights_adapted(&weights, &config.model, compute, adapted.as_ref())?;
+    drop(adapted);
     // Every derived parameter is evaluated before any forward can read it.
     let arrays = dit.arrays();
     for group in arrays.chunks(64) {
         eval(group.iter().copied())?;
     }
     drop(weights);
-    Ok(dit)
+    Ok((dit, reports))
 }
 
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
-    let refusals: [(&str, bool); 8] = [
+    let refusals: [(&str, bool); 7] = [
         ("quantize", spec.quantize.is_some()),
-        ("adapters", !spec.adapters.is_empty()),
         ("text_encoder", spec.text_encoder.is_some()),
         ("control", spec.control.is_some()),
         ("extra_controls", !spec.extra_controls.is_empty()),
@@ -159,19 +196,32 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let te_cfg = config.text_encoder.clone();
     let bb_dir = resources.backbone_dir.clone();
     let bb_cfg = config.clone();
+    let adapters = spec.adapters.clone();
+    let adapter_reports = Arc::new(Mutex::new(Vec::new()));
+    let reports_sink = Arc::clone(&adapter_reports);
     let residency = Residency::from_policy(
         spec.offload_policy,
         move || IrisTextEncoder::load(&te_dir, &te_cfg),
         move |_use_pid| {
-            Ok(Heavy {
-                dit: load_backbone(&bb_dir, &bb_cfg, compute)?,
-            })
+            let (dit, reports) = load_backbone_with_adapters(
+                &bb_dir,
+                &bb_cfg,
+                compute,
+                &adapters,
+                IrisTask::Generation,
+                MODEL_ID,
+            )?;
+            if let Ok(mut sink) = reports_sink.lock() {
+                *sink = reports;
+            }
+            Ok(Heavy { dit })
         },
     )?;
     Ok(Box::new(Iris3b {
         descriptor: descriptor(),
         config,
         residency,
+        adapter_reports,
     }))
 }
 
@@ -180,27 +230,29 @@ impl Iris3b {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
-        let params = GenerationParams::resolve(req, default_seed());
+        let params = GenerationParams::resolve(req, default_seed(), &self.config)?;
+        let rows = params.prompts.len() as u32;
         let total = (params.steps as u32) * req.count;
         let flow = self.config.flow.clone();
-        self.residency.run(
+        let (images, warnings) = self.residency.run(
             &req.cancel,
             false,
             on_progress,
-            |te: &IrisTextEncoder| -> Result<Conditioning> {
-                let conditioning = encode(te, &req.prompt, &params)?;
-                Ok(conditioning)
-            },
+            |te: &IrisTextEncoder| -> Result<Conditioning> { encode(te, &params) },
             |_| Ok(()),
             |heavy: &Heavy, conditioning: Conditioning, on_progress| {
                 let channels = heavy.dit.config().in_channels;
-                let mut samples = Vec::with_capacity(req.count as usize);
-                for i in 0..req.count {
-                    let seed = params.seed.wrapping_add(i as u64);
-                    let z = noise(seed, channels, params.width, params.height)?;
-                    let done = i * params.steps as u32;
+                let mut images = Vec::with_capacity((rows * req.count) as usize);
+                // One batched solve over the whole prompt batch per `count` repetition; image
+                // `k = c·rows + j` draws its noise from `seed + k`.
+                for c in 0..req.count {
+                    let seeds: Vec<u64> = (0..rows)
+                        .map(|j| params.seed.wrapping_add((c * rows + j) as u64))
+                        .collect();
+                    let z = noise_batch(&seeds, channels, params.width, params.height)?;
+                    let done = c * params.steps as u32;
                     let x = denoise(
                         &heavy.dit,
                         &flow,
@@ -214,26 +266,41 @@ impl Iris3b {
                                 total,
                             })
                         },
+                        &req.preview,
                     )?;
-                    samples.push(x);
+                    images.push(x);
                 }
                 // Pixel space: the "decode" is only the [−1, 1] → RGB8 conversion.
                 on_progress(Progress::Decoding);
                 if req.cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
-                let images = samples.iter().map(to_image).collect::<Result<Vec<_>>>()?;
+                let mut out = Vec::with_capacity((rows * req.count) as usize);
+                for x in &images {
+                    out.extend(to_images(x)?);
+                }
                 mlx_rs::memory::clear_cache();
-                Ok(GenerationOutput::Images(images))
+                Ok((out, conditioning.warnings))
             },
-        )
+        )?;
+        Ok(GenerationReport {
+            output: Some(GenerationOutput::Images(images)),
+            artifacts: None,
+            warnings: warnings
+                .into_iter()
+                .map(|message| gen_core::GenerationWarning {
+                    code: "caption_truncated".into(),
+                    message,
+                })
+                .collect(),
+        })
     }
 
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
-        reject_unhonored_generation_controls(MODEL_ID, req)?;
+        validate_generation_request(MODEL_ID, req, &self.config)?;
         Ok(())
     }
 }
@@ -241,6 +308,13 @@ impl Iris3b {
 impl Generator for Iris3b {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        self.adapter_reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default()
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -252,6 +326,17 @@ impl Generator for Iris3b {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        let report = self.generate_impl(req, on_progress)?;
+        report
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("iris: the render produced no output".into()))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -271,8 +356,12 @@ mod tests {
         assert_eq!(d.id, "iris_3b");
         assert_eq!(d.family, "iris");
         assert!(d.denoiser_output_latent_space.is_none());
-        assert!(d.capabilities.samplers.is_empty());
+        assert_eq!(d.capabilities.samplers, ["dpmpp_2m", "euler"]);
+        assert!(d.capabilities.schedulers.is_empty());
         assert!(!d.capabilities.supports_true_cfg);
+        assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
+        assert!(d.capabilities.supports_preview);
+        assert_eq!(d.required_components, ["text_encoder"]);
     }
 
     #[test]

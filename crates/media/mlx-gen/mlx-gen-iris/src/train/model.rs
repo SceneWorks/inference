@@ -261,8 +261,8 @@ pub fn flow_loss(dit: &IrisDiT, b: &StepBatch, obj: &FlowObjective) -> Result<Ar
     )?;
     let target = b.noise.subtract(&b.x0)?;
     let pred = match obj.prediction {
-        Prediction::V => out,
-        Prediction::X => {
+        Prediction::Velocity => out,
+        Prediction::Clean => {
             let floor = Array::from_f32(obj.x_pred_sigma_min as f32);
             x_t.subtract(&out)?.divide(&maximum(&b.sigma, &floor)?)?
         }
@@ -424,55 +424,4 @@ pub fn adapter_tensors(
         ));
     }
     Ok(out)
-}
-
-/// Merge an Iris adapter artifact into a backbone tensor map in place at `strength`
-/// (`W ← W + strength · ΔW`, ΔW per [`gen_core::iris::train::AdapterMetadata`]'s schema). The
-/// merged matrix keeps the base tensor's dtype. Returns the adapted module paths.
-pub fn merge_adapter_file(
-    base: &mut HashMap<String, Array>,
-    path: &Path,
-    strength: f32,
-) -> Result<Vec<String>> {
-    let (tensors, meta) = Array::load_safetensors_with_metadata(path)
-        .map_err(|e| Error::Msg(format!("iris adapter: read {}: {e}", path.display())))?;
-    let meta: BTreeMap<String, String> = meta.into_iter().collect();
-    let m = gen_core::iris::train::AdapterMetadata::from_map(&meta)?;
-    for target in &m.targets {
-        let wkey = format!("{target}.weight");
-        let w = base
-            .get(&wkey)
-            .ok_or_else(|| Error::Msg(format!("iris adapter: backbone has no {wkey}")))?;
-        let (out_f, in_f) = (w.shape()[0], w.shape()[1]);
-        let delta = match m.network_type.as_str() {
-            "lora" => {
-                let a = tensors.get(&format!("{target}.lora_A.weight"));
-                let b = tensors.get(&format!("{target}.lora_B.weight"));
-                match (a, b) {
-                    (Some(a), Some(b)) => lora_delta(a, b, m.alpha, m.rank)?,
-                    _ => {
-                        return Err(Error::Msg(format!(
-                            "iris adapter: {target} lacks its lora_A/lora_B factors"
-                        )))
-                    }
-                }
-            }
-            _ => {
-                let mut f: HashMap<&str, &Array> = HashMap::new();
-                for name in ["lokr_w1", "lokr_w2", "lokr_w2_a", "lokr_w2_b"] {
-                    if let Some(a) = tensors.get(&format!("{target}.{name}")) {
-                        f.insert(name, a);
-                    }
-                }
-                lokr_delta(&f, out_f, in_f, m.alpha, m.rank)?
-            }
-        };
-        let merged = w
-            .as_dtype(Dtype::Float32)?
-            .add(&delta.multiply(Array::from_f32(strength))?)?
-            .as_dtype(w.dtype())?;
-        eval([&merged])?;
-        base.insert(wkey, merged);
-    }
-    Ok(m.targets)
 }

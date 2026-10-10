@@ -3,8 +3,8 @@
 //! resume reproducing the uninterrupted run bit for bit (full + Muon, LoRA + AdamW with
 //! accumulation), retention, the resume identity checks, cached vs on-the-fly conditioning, random
 //! init + x-prediction, previews from the in-progress state, and the exported artifacts loading back
-//! (the full model through the inference provider; the adapter merged into the backbone renders
-//! exactly the trainer's own preview).
+//! (the full model through the inference provider; the adapter through the provider's own adapter
+//! loader, rendering the trainer's own preview up to residual-vs-merged rounding).
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -14,16 +14,17 @@ use mlx_gen::gen_core::iris::train::{
     checkpoint_root, latest_checkpoint, list_checkpoints, read_checkpoint_state, AdapterMetadata,
     OPTIONS_KEY,
 };
-use mlx_gen::gen_core::iris::{IrisConfig, TEXT_ENCODER_COMPONENT};
+use mlx_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
-    Error as CoreError, LrSchedule, NetworkType, Trainer, TrainingConfig, TrainingItem,
-    TrainingProgress, TrainingRequest,
+    LrSchedule, NetworkType, Trainer, TrainingConfig, TrainingItem, TrainingProgress,
+    TrainingRequest,
 };
 use mlx_gen::weights::Weights;
-use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
-use mlx_gen_iris::train::model::merge_adapter_file;
+use mlx_gen::{
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource,
+};
 use mlx_gen_iris::train::render_preview_with;
-use mlx_gen_iris::{IrisDiT, IrisTextEncoder};
+use mlx_gen_iris::{load_backbone_with_adapters, IrisDiT, IrisTextEncoder};
 use mlx_rs::{Array, Dtype};
 use serde_json::json;
 
@@ -350,6 +351,8 @@ fn adapter_round_trip(network: NetworkType) {
         let mut cfg = config();
         cfg.steps = 2;
         cfg.network_type = network;
+        // A large rate so two steps visibly move the render (the comparison below needs an effect).
+        cfg.learning_rate = 5e-2;
         cfg.sample_every = 2;
         cfg.sample_prompts = vec!["a red fox".into()];
         cfg.sample_steps = 3;
@@ -383,47 +386,76 @@ fn adapter_round_trip(network: NetworkType) {
         assert_eq!(meta.steps, 2);
         assert!(!meta.targets.is_empty());
 
+        // Load through the provider's adapter path (S3's strict loader: identity stamp checked,
+        // forward-time residuals) and render with the same sampler, prompt and seed.
         let cfg = tiny_config();
-        let mut base: HashMap<String, Array> =
-            Weights::from_file(tiny_backbone().join("model.safetensors"))
-                .unwrap()
-                .into_tensors()
-                .into_iter()
-                .map(|(k, v)| (k, v.as_dtype(Dtype::Float32).unwrap()))
-                .collect();
-        let merged = merge_adapter_file(&mut base, &res.adapter_path, 1.0).unwrap();
-        assert_eq!(merged, meta.targets);
-        let dit =
-            IrisDiT::from_weights(&Weights::from_map(base), &cfg.model, Dtype::Float32).unwrap();
+        let kind = match network {
+            NetworkType::Lora => AdapterKind::Lora,
+            NetworkType::Lokr => AdapterKind::Lokr,
+        };
         let te = IrisTextEncoder::load(&tiny_text_encoder(), &cfg.text_encoder).unwrap();
         let (c, u) = (te.encode(&prompt).unwrap(), te.encode("").unwrap());
-        let again = render_preview_with(
-            &dit,
-            3,
-            2.0,
-            cfg.flow.shift,
-            1000,
-            mlx_gen::gen_core::iris::train::Prediction::V,
-            16,
-            (&c.states, &c.mask),
-            Some((&u.states, &u.mask)),
-            9,
-        )
-        .unwrap();
-        assert_eq!(
-            again.pixels, image.pixels,
-            "merged adapter == the trainer's preview"
+        let render = |adapters: &[AdapterSpec]| {
+            let (dit, reports) = load_backbone_with_adapters(
+                &tiny_backbone(),
+                &cfg,
+                Dtype::Float32,
+                adapters,
+                IrisTask::Generation,
+                ID,
+            )
+            .unwrap();
+            assert_eq!(reports.len(), adapters.len());
+            render_preview_with(
+                &dit,
+                3,
+                2.0,
+                cfg.flow.shift,
+                1000,
+                mlx_gen::gen_core::iris::train::Prediction::Velocity,
+                16,
+                (&c.states, &c.mask),
+                Some((&u.states, &u.mask)),
+                9,
+            )
+            .unwrap()
+        };
+        let loaded = render(&[AdapterSpec::new(res.adapter_path.clone(), 1.0, kind)]);
+        let bare = render(&[]);
+        let max_diff = |a: &[u8], b: &[u8]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (*x as i32 - *y as i32).abs())
+                .max()
+                .unwrap()
+        };
+        let (to_preview, effect) = (
+            max_diff(&loaded.pixels, &image.pixels),
+            max_diff(&bare.pixels, &image.pixels),
+        );
+        eprintln!(
+            "{network:?}: |provider − preview| max {to_preview}, adapter effect max {effect}"
+        );
+        // The provider applies the factors as residuals (LoKr's factors reconstructed in bf16), the
+        // trainer merges them in f32: a rounding-level difference, far below the adapter's effect.
+        assert!(
+            effect >= 10,
+            "the trained adapter must visibly change the render ({effect})"
+        );
+        assert!(
+            to_preview <= 2,
+            "provider-loaded adapter vs preview: {to_preview}"
         );
     });
 }
 
 #[test]
-fn lora_adapter_exports_and_merges_into_the_backbone() {
+fn lora_adapter_exports_and_loads_through_the_provider() {
     adapter_round_trip(NetworkType::Lora);
 }
 
 #[test]
-fn lokr_adapter_exports_and_merges_into_the_backbone() {
+fn lokr_adapter_exports_and_loads_through_the_provider() {
     adapter_round_trip(NetworkType::Lokr);
 }
 
@@ -499,16 +531,70 @@ fn random_init_x_prediction_trains_and_its_export_records_the_objective() {
     // Random init: the zero-initialised head moved off zero after two steps.
     let w = tensors(&res.adapter_path);
     assert!(w["final_layer.linear.weight"].iter().any(|v| *v != 0.0));
-    // The inference route serves v-prediction only: an x-prediction backbone is a typed refusal,
-    // never a mis-render.
-    match mlx_gen_iris::provider_registry()
+    // The exported x-prediction backbone loads in the provider, which reads `prediction: x` from
+    // its config: its render equals the trainer's own clean-image sampler on the same weights,
+    // and differs from treating the output as a velocity.
+    let g = mlx_gen_iris::provider_registry()
         .unwrap()
         .load(ID, &spec(dir))
+        .expect("the provider serves an x-prediction backbone");
+    let provider = match g
+        .generate(
+            &GenerationRequest {
+                prompt: "a red fox".into(),
+                width: 16,
+                height: 16,
+                steps: Some(3),
+                guidance: Some(2.0),
+                seed: Some(4),
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap()
     {
-        Err(CoreError::Unsupported(m)) => assert!(m.contains("flow.prediction"), "{m}"),
-        Err(other) => panic!("expected a typed refusal, got {other:?}"),
-        Ok(_) => panic!("an x-prediction backbone must not load on the v-prediction route"),
-    }
+        GenerationOutput::Images(mut v) => v.remove(0),
+        _ => panic!("expected an image"),
+    };
+    let cfg = IrisConfig::from_dir(dir).unwrap();
+    let dit = mlx_gen_iris::load_backbone(dir, &cfg, Dtype::Bfloat16).unwrap();
+    let te = IrisTextEncoder::load(&tiny_text_encoder(), &cfg.text_encoder).unwrap();
+    let (c, u) = (te.encode("a red fox").unwrap(), te.encode("").unwrap());
+    let ours = |p| {
+        render_preview_with(
+            &dit,
+            3,
+            2.0,
+            cfg.flow.shift,
+            1000,
+            p,
+            16,
+            (&c.states, &c.mask),
+            Some((&u.states, &u.mask)),
+            4,
+        )
+        .unwrap()
+    };
+    use mlx_gen::gen_core::iris::train::Prediction;
+    assert_eq!(ours(Prediction::Clean).pixels, provider.pixels);
+    assert_ne!(ours(Prediction::Velocity).pixels, provider.pixels);
+}
+
+/// The generation trainer needs its frozen text encoder: a load without the `text_encoder`
+/// component (or with a file in its place) is a load-time error naming it.
+#[test]
+fn a_trainer_load_without_the_text_encoder_is_refused() {
+    let registry = mlx_gen_iris::provider_registry().unwrap();
+    let bare = LoadSpec::new(WeightsSource::Dir(tiny_backbone()));
+    let err = registry.load_trainer(ID, &bare).err().expect("refused");
+    assert!(err.to_string().contains(TEXT_ENCODER_COMPONENT), "{err}");
+    let mut file = bare.clone();
+    file.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        WeightsSource::File(tiny_text_encoder().join("model.safetensors")),
+    );
+    let err = registry.load_trainer(ID, &file).err().expect("refused");
+    assert!(err.to_string().contains(TEXT_ENCODER_COMPONENT), "{err}");
 }
 
 /// `text_dropout` substitutes the CFG null for the dropped rows: at probability 1 every row is the
@@ -611,7 +697,7 @@ fn preview_renderer_matches_the_provider() {
         2.0,
         cfg.flow.shift,
         1000,
-        mlx_gen::gen_core::iris::train::Prediction::V,
+        mlx_gen::gen_core::iris::train::Prediction::Velocity,
         16,
         (&c.states, &c.mask),
         Some((&u.states, &u.mask)),

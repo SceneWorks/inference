@@ -15,7 +15,9 @@ use std::path::PathBuf;
 
 use mlx_gen::gen_core::iris::{GenerationParams, IrisConfig, TEXT_ENCODER_COMPONENT};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
+use mlx_gen::{
+    CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, PreviewSink, Progress, WeightsSource,
+};
 use mlx_gen_iris::{
     denoise, encode, load_backbone, Conditioning, IrisTextEncoder, TextBatch, TextConditioning,
 };
@@ -82,28 +84,33 @@ fn real_conditioning_and_forward_match_upstream() {
     let golden = Weights::from_file(env_dir("IRIS_REAL_GOLDEN")).unwrap();
     let config = IrisConfig::from_dir(&backbone).unwrap();
     config.validate_supported().unwrap();
-    let prompt = golden.metadata("prompt").unwrap().to_owned();
 
     let te =
         IrisTextEncoder::load(&env_dir("IRIS_TEXT_ENCODER_DIR"), &config.text_encoder).unwrap();
-    let params = GenerationParams {
-        steps: golden.metadata("steps").unwrap().parse().unwrap(),
-        cfg_scale: golden.metadata("cfg_scale").unwrap().parse().unwrap(),
-        negative_prompt: String::new(),
-        seed: 0,
-        width: 256,
-        height: 256,
-    };
-    let conditioning = encode(&te, &prompt, &params).unwrap();
+    let params = GenerationParams::resolve(
+        &GenerationRequest {
+            prompt: golden.metadata("prompt").unwrap().to_owned(),
+            steps: Some(golden.metadata("steps").unwrap().parse().unwrap()),
+            guidance: Some(golden.metadata("cfg_scale").unwrap().parse().unwrap()),
+            seed: Some(0),
+            width: 256,
+            height: 256,
+            ..Default::default()
+        },
+        0,
+        &config,
+    )
+    .unwrap();
+    let conditioning = encode(&te, &params).unwrap();
     drop(te);
     assert_eq!(
-        conditioning.cond.mask,
+        conditioning.cond[0].mask,
         host_i32(golden.require("cond/mask").unwrap())
     );
     // bf16 tower on both sides (MLX GPU vs torch CPU): bf16-ulp scale.
     assert_close(
         "real cond/embeddings",
-        &conditioning.cond.states.squeeze_axes(&[0]).unwrap(),
+        &conditioning.cond[0].states.squeeze_axes(&[0]).unwrap(),
         golden.require("cond/embeddings").unwrap(),
         2e-2,
     );
@@ -125,13 +132,13 @@ fn real_conditioning_and_forward_match_upstream() {
         Dtype::Bfloat16
     };
     let dit = load_backbone(&backbone, &config, compute).unwrap();
-    let mask = vec![conditioning.cond.mask.clone()];
+    let mask = vec![conditioning.cond[0].mask.clone()];
     let velocity = dit
         .forward(
             golden.require("forward/x").unwrap(),
             golden.require("forward/t").unwrap(),
             &TextBatch {
-                states: &conditioning.cond.states,
+                states: &conditioning.cond[0].states,
                 mask: &mask,
             },
         )
@@ -206,17 +213,24 @@ fn real_backbone_matches_upstream_in_fp32_on_cpu() {
             truncated_tokens: 0,
         };
         let conditioning = Conditioning {
-            cond: text("cond"),
+            cond: vec![text("cond")],
             uncond: Some(text("null")),
+            warnings: Vec::new(),
         };
-        let params = GenerationParams {
-            steps: golden.metadata("steps").unwrap().parse().unwrap(),
-            cfg_scale: golden.metadata("cfg_scale").unwrap().parse().unwrap(),
-            negative_prompt: String::new(),
-            seed: 0,
-            width: 256,
-            height: 256,
-        };
+        let params = GenerationParams::resolve(
+            &GenerationRequest {
+                prompt: golden.metadata("prompt").unwrap().to_owned(),
+                steps: Some(golden.metadata("steps").unwrap().parse().unwrap()),
+                guidance: Some(golden.metadata("cfg_scale").unwrap().parse().unwrap()),
+                seed: Some(0),
+                width: 256,
+                height: 256,
+                ..Default::default()
+            },
+            0,
+            &config,
+        )
+        .unwrap();
         let start = std::time::Instant::now();
         let image = denoise(
             &dit,
@@ -226,6 +240,7 @@ fn real_backbone_matches_upstream_in_fp32_on_cpu() {
             &params,
             &CancelFlag::new(),
             |_| {},
+            &PreviewSink::default(),
         )
         .unwrap();
         eprintln!("cpu fp32 generate: {:.1}s", start.elapsed().as_secs_f32());
@@ -304,14 +319,13 @@ fn save_png(img: &mlx_gen::Image, path: &std::path::Path) {
 /// A bounded real-weight LoRA run (sc-25685): `IRIS_TRAIN_DATA` (a directory of PNGs, one shared
 /// caption) at 256², batch 1, a few AdamW steps through the catalog trainer (bf16 mixed precision,
 /// cached Qwen3-VL conditioning, EMA, a preview from the in-progress EMA weights) → the adapter
-/// artifact → merged into the real backbone with the documented schema → a render through the
-/// provider's own pipeline, beside the unadapted base render. Writes PNGs into `IRIS_OUT`.
+/// artifact → loaded onto the real backbone through the provider's adapter loader → a render beside
+/// the unadapted base render. Writes PNGs into `IRIS_OUT`.
 #[test]
 #[ignore = "needs the real weights (IRIS_WEIGHTS_DIR, IRIS_TEXT_ENCODER_DIR), IRIS_TRAIN_DATA and IRIS_OUT"]
 fn real_lora_trains_exports_and_renders() {
     use mlx_gen::gen_core::iris::train::{AdapterMetadata, OPTIONS_KEY};
     use mlx_gen::gen_core::{TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest};
-    use mlx_gen_iris::train::model::{merge_adapter_file, provider_dtype};
     use mlx_gen_iris::train::render_preview_with;
 
     let weights = env_dir("IRIS_WEIGHTS_DIR");
@@ -407,22 +421,14 @@ fn real_lora_trains_exports_and_renders() {
     let (c, u) = (te.encode(prompt).unwrap(), te.encode("").unwrap());
     drop(te);
     mlx_rs::memory::clear_cache();
-    let mut base: std::collections::HashMap<String, mlx_rs::Array> =
-        Weights::from_file(weights.join("model.safetensors"))
-            .unwrap()
-            .into_tensors()
-            .into_iter()
-            .map(|(k, v)| {
-                let v = provider_dtype(&k, &v, Dtype::Bfloat16).unwrap();
-                mlx_rs::transforms::eval([&v]).unwrap();
-                (k, v)
-            })
-            .collect();
-    let render = |map: &std::collections::HashMap<String, mlx_rs::Array>| {
-        let dit = mlx_gen_iris::IrisDiT::from_weights(
-            &Weights::from_map(map.clone()),
-            &cfg.model,
+    let render = |adapters: &[mlx_gen::AdapterSpec]| {
+        let (dit, _) = mlx_gen_iris::load_backbone_with_adapters(
+            &weights,
+            &cfg,
             Dtype::Bfloat16,
+            adapters,
+            mlx_gen::gen_core::iris::IrisTask::Generation,
+            "iris_3b",
         )
         .unwrap();
         render_preview_with(
@@ -431,7 +437,7 @@ fn real_lora_trains_exports_and_renders() {
             3.0,
             cfg.flow.shift,
             1000,
-            mlx_gen::gen_core::iris::train::Prediction::V,
+            mlx_gen::gen_core::iris::train::Prediction::Velocity,
             256,
             (&c.states, &c.mask),
             Some((&u.states, &u.mask)),
@@ -440,11 +446,15 @@ fn real_lora_trains_exports_and_renders() {
         .unwrap()
     };
     let t = std::time::Instant::now();
-    let before = render(&base);
+    let before = render(&[]);
     save_png(&before, &out.join("base_256.png"));
-    merge_adapter_file(&mut base, &res.adapter_path, 1.0).unwrap();
-    let after = render(&base);
-    save_png(&after, &out.join("lora_merged_256.png"));
+    mlx_rs::memory::clear_cache();
+    let after = render(&[mlx_gen::AdapterSpec::new(
+        res.adapter_path.clone(),
+        1.0,
+        mlx_gen::AdapterKind::Lora,
+    )]);
+    save_png(&after, &out.join("lora_adapted_256.png"));
     let diff = before
         .pixels
         .iter()
@@ -457,4 +467,119 @@ fn real_lora_trains_exports_and_renders() {
         t.elapsed().as_secs_f32()
     );
     assert!(diff > 0.0, "the adapter changed nothing");
+}
+
+/// sc-25681: the production path with every non-default upstream control at once — a two-prompt
+/// batch, order 1 (`euler`), shift 3, CFG 4.5 gated to `cfg_interval` (0.05, 0.95), a negative
+/// prompt, a portrait canvas, and the per-step preview sink — one PNG per prompt.
+/// `IRIS_CONTROLS_SIZE` (default 512) is the short side; `IRIS_CONTROLS_STEPS` (default 30) the step
+/// count.
+#[test]
+#[ignore = "needs the real weights (IRIS_WEIGHTS_DIR, IRIS_TEXT_ENCODER_DIR) and IRIS_OUT"]
+fn provider_renders_with_non_default_controls() {
+    use std::sync::{Arc, Mutex};
+
+    let mut spec = LoadSpec::new(WeightsSource::Dir(env_dir("IRIS_WEIGHTS_DIR")));
+    spec.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        WeightsSource::Dir(env_dir("IRIS_TEXT_ENCODER_DIR")),
+    );
+    let short: u32 = std::env::var("IRIS_CONTROLS_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    let steps: u32 = std::env::var("IRIS_CONTROLS_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let (width, height) = (short, short / 16 * 20);
+    let start = std::time::Instant::now();
+    let g = mlx_gen_iris::provider_registry()
+        .unwrap()
+        .load("iris_3b", &spec)
+        .unwrap();
+    eprintln!(
+        "[[IRIS_CONTROLS]] load: {:.1}s",
+        start.elapsed().as_secs_f32()
+    );
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&frames);
+    let req = GenerationRequest {
+        prompt_batch: vec![
+            "a red fox sleeping in fresh snow, golden hour".into(),
+            "a lighthouse on a rocky coast at dusk, oil painting".into(),
+        ],
+        width,
+        height,
+        steps: Some(steps),
+        sampler: Some("euler".into()),
+        scheduler_shift: Some(3.0),
+        guidance: Some(4.5),
+        cfg_interval: Some((0.05, 0.95)),
+        negative_prompt: Some("blurry, low quality".into()),
+        seed: Some(7),
+        preview: PreviewSink::new(move |frame| {
+            sink.lock().unwrap().push((
+                frame.current,
+                frame.total,
+                frame.image.width,
+                frame.image.height,
+            ))
+        }),
+        ..Default::default()
+    };
+    g.validate(&req).unwrap();
+    let start = std::time::Instant::now();
+    let mut last = (0, 0);
+    let out = g
+        .generate(&req, &mut |p| {
+            if let Progress::Step { current, total } = p {
+                last = (current, total);
+            }
+        })
+        .unwrap();
+    let secs = start.elapsed().as_secs_f32();
+    eprintln!(
+        "[[IRIS_CONTROLS]] generate 2 x {width}x{height} steps={steps} euler shift=3 cfg=4.5 \
+         interval=(0.05,0.95): {secs:.1}s ({:.2}s/step)",
+        secs / steps as f32
+    );
+    assert_eq!(last, (steps, steps));
+    let frames = frames.lock().unwrap().clone();
+    assert_eq!(frames.len(), steps as usize, "one preview frame per step");
+    assert_eq!(frames[0].2, width / 16);
+    assert_eq!(frames[0].3, height / 16);
+    let GenerationOutput::Images(images) = out else {
+        panic!("expected images")
+    };
+    assert_eq!(images.len(), 2, "one image per prompt of the batch");
+    for (i, img) in images.iter().enumerate() {
+        assert_eq!((img.width, img.height), (width, height));
+        let path = env_dir("IRIS_OUT").join(format!("iris_3b_mlx_controls_{i}.png"));
+        image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
+            .unwrap()
+            .save(&path)
+            .unwrap();
+        let mean = img.pixels.iter().map(|&p| p as f32).sum::<f32>() / img.pixels.len() as f32;
+        let var = img
+            .pixels
+            .iter()
+            .map(|&p| (p as f32 - mean).powi(2))
+            .sum::<f32>()
+            / img.pixels.len() as f32;
+        eprintln!(
+            "[[IRIS_CONTROLS]] wrote {} (mean pixel {mean:.1}, std {:.1})",
+            path.display(),
+            var.sqrt()
+        );
+        assert!(
+            mean > 5.0 && mean < 250.0,
+            "degenerate image {i} (mean {mean})"
+        );
+        assert!(var.sqrt() > 5.0, "flat image {i} (std {})", var.sqrt());
+    }
+    assert_ne!(
+        images[0].pixels, images[1].pixels,
+        "the two prompts rendered the same image"
+    );
 }

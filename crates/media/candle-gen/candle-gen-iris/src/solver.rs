@@ -6,7 +6,7 @@
 //! [`gen_core::iris::dpm_solver_plan`]: candle_gen::gen_core::iris::dpm_solver_plan
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::iris::{DpmStep, DpmUpdate};
+use candle_gen::gen_core::iris::{DpmStep, DpmUpdate, Prediction};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError as Error, Result};
 
@@ -18,15 +18,17 @@ fn scale(x: &Tensor, c: f32) -> Result<Tensor> {
 }
 
 /// Integrate `z` along `plan`. `model_out(x, step)` returns the raw (CFG-combined) network output
-/// at `step.s`; `on_step(i)` fires after step `i` (1-based) completes. Cancellation is checked before
-/// every network evaluation and surfaces as [`Error::Canceled`] — the partial state is dropped,
-/// never returned.
+/// at `step.s`, read as `prediction` (`_pred_x0`: velocity `x0 = x − s·out`, or the clean image
+/// `x0 = out`); `on_step(i, x0)` fires after step `i` (1-based) completes with that step's predicted
+/// clean image. Cancellation is checked before every network evaluation and surfaces as
+/// [`Error::Canceled`] — the partial state is dropped, never returned.
 pub fn sample(
     z: &Tensor,
     plan: &[DpmStep],
+    prediction: Prediction,
     cancel: &CancelFlag,
     mut model_out: impl FnMut(&Tensor, &DpmStep) -> Result<Tensor>,
-    mut on_step: impl FnMut(usize),
+    mut on_step: impl FnMut(usize, &Tensor),
 ) -> Result<Tensor> {
     let mut x = z.to_dtype(DType::F32)?;
     let mut prev_x0: Option<Tensor> = None;
@@ -35,8 +37,11 @@ pub fn sample(
             return Err(Error::Canceled);
         }
         let out = model_out(&x, step)?.to_dtype(DType::F32)?;
-        // v-prediction: x0 = x − s·v
-        let x0 = x.sub(&scale(&out, step.s_f32())?)?;
+        let x0 = match prediction {
+            // v-prediction: x0 = x − s·v
+            Prediction::Velocity => x.sub(&scale(&out, step.s_f32())?)?,
+            Prediction::Clean => out,
+        };
         x = match step.update {
             DpmUpdate::First { cx, c0 } => scale(&x, cx)?.sub(&scale(&x0, c0)?)?,
             DpmUpdate::Second { cx, c0, c1, r0 } => {
@@ -49,8 +54,8 @@ pub fn sample(
                 scale(&x, cx)?.sub(&scale(&x0, c0)?)?.sub(&scale(&d, c1)?)?
             }
         };
+        on_step(i + 1, &x0);
         prev_x0 = Some(x0);
-        on_step(i + 1);
     }
     Ok(x)
 }

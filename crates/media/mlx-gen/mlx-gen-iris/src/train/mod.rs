@@ -1103,9 +1103,8 @@ fn load_tensors(path: &Path) -> Result<HashMap<String, Array>> {
 }
 
 /// One preview image: the release sampler (FlowDPM-Solver++ order 2, the run's resolved shift,
-/// CFG against the negative prompt) from `seed`'s noise. An x-prediction model's clean-image output
-/// is converted to the equivalent velocity `(x − x̂0)/s` so the solver's `x0 = x − s·v` recovers it
-/// (upstream's `_pred_x0` for `prediction="x"`).
+/// CFG against the negative prompt) from `seed`'s noise, through the provider's prediction-aware
+/// solver (`x0 = x − s·v` for v, `x0 = out` for x — upstream's `_pred_x0`).
 #[allow(clippy::too_many_arguments)]
 pub fn render_preview_with(
     dit: &IrisDiT,
@@ -1141,15 +1140,10 @@ pub fn render_preview_with(
         _ => None,
     };
     let never = mlx_gen::CancelFlag::default();
-    let to_v = |raw: Array, x: &Array, s: f64| -> Result<Array> {
-        Ok(match prediction {
-            Prediction::V => raw,
-            Prediction::X => x.subtract(&raw)?.divide(Array::from_f32(s as f32))?,
-        })
-    };
     let x = sample(
         &z,
         &plan,
+        prediction,
         &never,
         |x, step| {
             let t = step.model_time(num_timesteps);
@@ -1165,16 +1159,12 @@ pub fn render_preview_with(
                     let tb = Array::from_slice(&[t, t], &[2]);
                     let out = dit.forward(&xb, &tb, batch)?;
                     let halves = out.split(2, 0)?;
-                    let raw = cfg_combine(&halves[0], &halves[1], cfg_scale)?;
-                    to_v(raw, x, step.s)
+                    cfg_combine(&halves[0], &halves[1], cfg_scale)
                 }
-                _ => {
-                    let raw = dit.forward(x, &Array::from_slice(&[t], &[1]), &cond_batch)?;
-                    to_v(raw, x, step.s)
-                }
+                _ => dit.forward(x, &Array::from_slice(&[t], &[1]), &cond_batch),
             }
         },
-        |_| {},
+        |_, _| {},
     )?;
     let x = mlx_rs::ops::clip(&x, (-1.0f32, 1.0f32))?;
     crate::pipeline::to_image(&x)

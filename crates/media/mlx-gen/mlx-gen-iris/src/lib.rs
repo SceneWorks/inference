@@ -23,6 +23,7 @@
 //!
 //! [`gen_core::iris`]: mlx_gen::gen_core::iris
 
+pub mod adapters;
 pub mod dit;
 pub mod model;
 pub mod nn;
@@ -36,8 +37,12 @@ pub use mlx_gen::gen_core::iris::{
     IrisTask, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_REPO, TEXT_ENCODER_REVISION,
     UPSTREAM_CODE_REVISION, UPSTREAM_WEIGHTS_REPO, UPSTREAM_WEIGHTS_REVISION,
 };
-pub use model::{compute_dtype, descriptor, load, load_backbone, Iris3b, MODEL_ID};
-pub use pipeline::{denoise, encode, noise, to_image, Conditioning};
+pub use model::{
+    compute_dtype, descriptor, load, load_backbone, load_backbone_with_adapters, Iris3b, MODEL_ID,
+};
+pub use pipeline::{
+    denoise, encode, noise, noise_batch, preview_image, to_image, to_images, Conditioning,
+};
 pub use text_encoder::{IrisTextEncoder, TextConditioning};
 
 /// Add the MLX Iris-3B generator to an explicit media registry builder.

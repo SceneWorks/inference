@@ -198,31 +198,24 @@ pub fn draw_batch(
 // Rectified-flow objective (`flow/transport.py`, `flow/schedule.py`, `flow/timesteps.py`)
 // =============================================================================================
 
-/// `flow.prediction`: what the network outputs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Prediction {
-    /// Velocity `v = eps − x0` (the release).
-    V,
-    /// The clean image; the loss stays in velocity space via
-    /// `v̂ = (x_t − x̂0) / max(σ, x_pred_sigma_min)`.
-    X,
+/// `flow.prediction` is the shared [`super::Prediction`] (`Velocity` = `v`, the release; `Clean` =
+/// `x`: the loss stays in velocity space via `v̂ = (x_t − x̂0) / max(σ, x_pred_sigma_min)`).
+pub use super::Prediction;
+
+/// Parse upstream's `flow.prediction` spelling, refusing anything else by name.
+pub fn parse_prediction(s: &str) -> Result<Prediction> {
+    Prediction::from_name(s).ok_or_else(|| {
+        Error::Msg(format!(
+            "iris training: flow.prediction must be v or x, got {s:?}"
+        ))
+    })
 }
 
-impl Prediction {
-    pub fn parse(s: &str) -> Result<Self> {
-        match s {
-            "v" => Ok(Prediction::V),
-            "x" => Ok(Prediction::X),
-            other => Err(Error::Msg(format!(
-                "iris training: flow.prediction must be v or x, got {other:?}"
-            ))),
-        }
-    }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Prediction::V => "v",
-            Prediction::X => "x",
-        }
+/// Upstream's spelling of a prediction type (`v` / `x`).
+pub fn prediction_name(p: Prediction) -> &'static str {
+    match p {
+        Prediction::Velocity => "v",
+        Prediction::Clean => "x",
     }
 }
 
@@ -1528,8 +1521,8 @@ impl IrisTrainPlan {
 
         // ---- flow ------------------------------------------------------------------------------
         let prediction = match opts.string("prediction")? {
-            Some(p) => Prediction::parse(&p)?,
-            None => Prediction::parse(&config.flow.prediction)?,
+            Some(p) => parse_prediction(&p)?,
+            None => parse_prediction(&config.flow.prediction)?,
         };
         let base_shift = opts.f64("flow_shift", config.flow.shift)?;
         if base_shift <= 0.0 {
@@ -1832,7 +1825,7 @@ impl IrisTrainPlan {
             self.caption_fields,
             self.text_dropout,
             self.flow.sampler,
-            self.flow.prediction.as_str(),
+            prediction_name(self.flow.prediction),
             self.flow.shift
         )
     }
@@ -1925,7 +1918,7 @@ pub fn select_adapter_targets(
 /// `__metadata__` key: what an Iris training artifact is (`"adapter"` | `"full_model"`).
 pub const META_ARTIFACT: &str = "irisArtifact";
 /// `__metadata__` key: the task the artifact belongs to ([`super::IrisTask::name`]).
-pub const META_TASK: &str = "irisTask";
+pub const META_TASK: &str = super::ADAPTER_TASK_KEY;
 /// `__metadata__` key: whether the exported tensors are the EMA or the raw weights.
 pub const META_WEIGHTS: &str = "irisWeights";
 /// `__metadata__` key: optimizer steps trained.
@@ -1981,14 +1974,18 @@ impl AdapterMetadata {
         if let Some(f) = self.decompose_factor {
             m.insert("decomposeFactor".into(), f.to_string());
         }
-        m.insert("family".into(), super::FAMILY.into());
-        m.insert("baseModel".into(), GENERATION_MODEL_ID.into());
+        // The adapter identity stamp the providers check (`check_adapter_identity`).
+        for (k, v) in super::adapter_provenance(super::IrisTask::Generation, GENERATION_MODEL_ID) {
+            m.insert(k.into(), v);
+        }
         m.insert(META_ARTIFACT.into(), "adapter".into());
-        m.insert(META_TASK.into(), super::IrisTask::Generation.name().into());
         m.insert(META_WEIGHTS.into(), self.weights.as_str().into());
         m.insert(META_STEPS.into(), self.steps.to_string());
         m.insert(META_BASE.into(), self.base_identity.clone());
-        m.insert(META_PREDICTION.into(), self.prediction.as_str().into());
+        m.insert(
+            META_PREDICTION.into(),
+            prediction_name(self.prediction).into(),
+        );
         m.insert(META_SHIFT.into(), self.shift.to_string());
         m.insert(META_UPSTREAM.into(), super::UPSTREAM_CODE_REVISION.into());
         m.insert(
@@ -2042,7 +2039,7 @@ impl AdapterMetadata {
             weights: WeightsSelect::parse(META_WEIGHTS, get(META_WEIGHTS)?)?,
             steps: num(META_STEPS)? as u64,
             base_identity: get(META_BASE)?.clone(),
-            prediction: Prediction::parse(get(META_PREDICTION)?)?,
+            prediction: parse_prediction(get(META_PREDICTION)?)?,
             shift: num(META_SHIFT)?,
             targets,
         })
@@ -2202,7 +2199,10 @@ pub fn export_config_yaml(cfg: &IrisConfig, flow: &FlowObjective, adaln_zero_ini
     };
     line(format!("  logit_mean: {}", fl(mean)));
     line(format!("  logit_std: {}", fl(std)));
-    line(format!("  prediction: {}", flow.prediction.as_str()));
+    line(format!(
+        "  prediction: {}",
+        prediction_name(flow.prediction)
+    ));
     line(format!("  x_pred_sigma_min: {}", fl(flow.x_pred_sigma_min)));
     line(format!("  shift_law: {}", flow.shift_law));
     line(format!("  shift_base_tokens: {}", flow.shift_base_tokens));

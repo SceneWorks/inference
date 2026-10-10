@@ -109,7 +109,7 @@ fn run_steps(
     opt: &mut IrisOptimizer,
     g: &Weights,
 ) -> (Vec<f32>, Vec<f32>, Params) {
-    let obj = objective(Prediction::V);
+    let obj = objective(Prediction::Velocity);
     let mut ema = params.clone();
     let (mut losses, mut norms) = (Vec::new(), Vec::new());
     // The trainer's own accumulation window (grad_accum = 2, clip 0.5, EMA 0.9, lr 1e-3).
@@ -163,7 +163,10 @@ fn flow_loss_matches_rectified_flow() {
         let g = golden();
         let (model, params) = full_model();
         let dit = model.dit(&params).unwrap();
-        for (pred, key) in [(Prediction::V, "loss_v"), (Prediction::X, "loss_x")] {
+        for (pred, key) in [
+            (Prediction::Velocity, "loss_v"),
+            (Prediction::Clean, "loss_x"),
+        ] {
             let got = flow_loss(&dit, &batch(&g, 0), &objective(pred)).unwrap();
             assert_close(
                 key,

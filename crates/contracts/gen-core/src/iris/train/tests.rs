@@ -401,7 +401,7 @@ fn adapter_metadata_round_trips() {
         weights: WeightsSelect::Ema,
         steps: 12,
         base_identity: "abc".into(),
-        prediction: Prediction::V,
+        prediction: Prediction::Velocity,
         shift: 4.0,
         targets: vec!["blocks.0.mlp_x.w1".into()],
     };
@@ -436,7 +436,7 @@ fn plan_defaults_are_upstreams() {
     assert_eq!(plan.optimizer.betas, (0.9, 0.95));
     assert_eq!(plan.optimizer.muon_adjust_lr, MuonAdjustLr::RmsNorm);
     assert!(plan.optimizer.muon_nesterov);
-    assert_eq!(plan.flow.prediction, Prediction::V);
+    assert_eq!(plan.flow.prediction, Prediction::Velocity);
     assert_eq!(
         plan.flow.sampler,
         TimestepSampler::LogitNormal {
@@ -469,7 +469,7 @@ fn plan_honours_options_and_refuses_what_it_cannot_honour() {
     );
     let p = resolve(c).unwrap();
     assert_eq!(p.init, InitMode::Random);
-    assert_eq!(p.flow.prediction, Prediction::X);
+    assert_eq!(p.flow.prediction, Prediction::Clean);
     // 16px / patch 4 = 16 tokens; sd3 law anchored at 256 tokens.
     assert!((p.flow.shift - 0.25).abs() < 1e-12);
     assert_eq!(p.export_weights, WeightsSelect::Raw);
