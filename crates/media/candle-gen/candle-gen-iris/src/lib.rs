@@ -34,6 +34,7 @@
 //! [`gen_core::iris`]: candle_gen::gen_core::iris
 
 pub mod adapters;
+pub mod depth;
 pub mod dit;
 pub mod model;
 pub mod nn;

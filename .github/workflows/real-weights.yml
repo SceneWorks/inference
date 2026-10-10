@@ -4928,7 +4928,8 @@ jobs:
   #
   # WHAT IT PROVISIONS. Two pinned snapshots through `ensure_model_snapshot.py` INTO the runner's
   # persistent hub cache (`vars.CANDLE_GEN_MODELS_ROOT`), fetched once and only verified after:
-  #   * `iris-3b-cuda`               speridlabs/iris-3b @ 74454433…  generation backbone only (~12 GB)
+  #   * `iris-3b-cuda`               speridlabs/iris-3b @ 74454433…  generation backbone + the
+  #                                  `depth/` export (sc-25682; ~12 GB each)
   #   * `qwen3-vl-4b-instruct-cuda`  Qwen/Qwen3-VL-4B-Instruct @ ebb281ec…             (~9 GB)
   #
   # WHAT IT RUNS. The pinned-tokenizer check; real-weight parity vs upstream on the GPU
@@ -4936,9 +4937,11 @@ jobs:
   # backbone forward against the COMMITTED compact golden `iris_real_golden_256.safetensors`, so no
   # machine-local file and no network at test time); the miniature bf16 DiT and Qwen3-VL fixture
   # parity on the device's real kernels (`dit_parity::bf16_compute_stays_within_bf16_distance_of_fp32`,
-  # `text_parity::windows_masks_and_layer_states_match_upstream`); and ONE production-path render
-  # through the catalog (`iris_3b` at the release defaults: 1024², 100 steps, CFG 3). Each runs
-  # `--exact` with a run-count assertion, writing the PNG + logs + a report-only `nvidia-smi` VRAM
+  # `text_parity::windows_masks_and_layer_states_match_upstream`); ONE production-path render
+  # through the catalog (`iris_3b` at the release defaults: 1024², 100 steps, CFG 3); and ONE depth
+  # estimate (`iris_3b_depth`, sc-25682) of the repo photo at the default max side, checked against
+  # the committed upstream FP32 reference. Each runs `--exact` with a run-count assertion, writing
+  # the PNG + logs + a report-only `nvidia-smi` VRAM
   # line into the evidence artifact. No memory/VRAM campaign: the probe reports the one render's peak, nothing is gated
   # on it. Same box, labels, toolchain and sccache rule as `candle-qwen-image-2-1` above.
   candle-iris:

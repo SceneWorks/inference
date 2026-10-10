@@ -22,6 +22,12 @@ mod controls_contract;
 #[path = "controls_parity.rs"]
 mod controls_parity;
 
+#[path = "depth_parity.rs"]
+mod depth_parity;
+
+#[path = "depth_real_weights.rs"]
+mod depth_real_weights;
+
 #[path = "dit_parity.rs"]
 mod dit_parity;
 
