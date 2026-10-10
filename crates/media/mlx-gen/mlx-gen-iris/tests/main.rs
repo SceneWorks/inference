@@ -40,6 +40,12 @@ mod generator_contract;
 #[path = "real_weights.rs"]
 mod real_weights;
 
+#[path = "restoration_parity.rs"]
+mod restoration_parity;
+
+#[path = "restoration_real_weights.rs"]
+mod restoration_real_weights;
+
 #[path = "solver_parity.rs"]
 mod solver_parity;
 

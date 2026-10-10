@@ -542,8 +542,8 @@ expected_files = [
 # materializes it on the Windows CUDA runner under `CANDLE_GEN_MODELS_ROOT` and runs
 # `candle-gen-iris/tests/real_weights.rs`. sc-25682 adds the monocular-depth task's `depth/` export
 # (`config.yaml` + FP32 `model.safetensors` ~12 GB + `empty_prompt.safetensors`), read by
-# `candle-gen-iris/tests/depth_real_weights.rs` from the same snapshot root. `upscaler/` is a later
-# story's backbone.
+# `candle-gen-iris/tests/depth_real_weights.rs` from the same snapshot root. sc-25683 adds the restoration
+# export (`upscaler/`, same three files) for `candle-gen-iris/tests/restoration_real_weights.rs`.
 key = "iris-3b-cuda"
 repository = "speridlabs/iris-3b"
 revision = "7445443349bc9abe3c96f01ff793e2098ca012b3"
@@ -557,6 +557,9 @@ download_files = [
     "depth/config.yaml",
     "depth/model.safetensors",
     "depth/empty_prompt.safetensors",
+    "upscaler/config.yaml",
+    "upscaler/model.safetensors",
+    "upscaler/empty_prompt.safetensors",
 ]
 expected_files = [
     "config.yaml",
@@ -564,6 +567,9 @@ expected_files = [
     "depth/config.yaml",
     "depth/model.safetensors",
     "depth/empty_prompt.safetensors",
+    "upscaler/config.yaml",
+    "upscaler/model.safetensors",
+    "upscaler/empty_prompt.safetensors",
 ]
 
 [[models]]

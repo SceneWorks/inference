@@ -39,6 +39,7 @@ pub mod dit;
 pub mod model;
 pub mod nn;
 pub mod pipeline;
+pub mod restoration;
 pub mod solver;
 pub mod text_encoder;
 
@@ -53,13 +54,17 @@ pub use model::{
 pub use pipeline::{
     denoise, encode, noise, noise_batch, preview_image, to_image, to_images, Conditioning,
 };
+pub use restoration::IrisRestorer;
 pub use text_encoder::{IrisTextEncoder, TextConditioning};
 
-/// Add the Candle Iris-3B generator to an explicit media registry builder.
+/// Add the Candle Iris-3B generator and restoration transform to an explicit media registry
+/// builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_transform(restoration::REGISTRATION)
 }
 
 /// Build the complete explicit Candle Iris provider catalog.
@@ -95,6 +100,11 @@ mod tests {
             .map(|registration| (registration.descriptor)().id)
             .collect();
         assert_eq!(ids, ["iris_3b"]);
+        let transforms: Vec<_> = registry
+            .transforms()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(transforms, ["iris_3b_restore"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }

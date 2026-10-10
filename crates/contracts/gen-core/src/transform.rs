@@ -29,24 +29,51 @@ pub struct TransformRequest {
     pub strength: Option<f32>,
     /// SeedVR2 is 1-step; override only if the model allows it.
     pub steps: Option<u32>,
+    /// How the input is sized before the transform runs (sc-25683). [`InputSizing::Budgeted`] (the
+    /// default) applies the provider's declared [`TransformCapabilities::input_budget`];
+    /// [`InputSizing::Original`] processes the input at its own size. A provider never switches
+    /// between the two on its own.
+    pub input_sizing: InputSizing,
+    /// Model-defined colour correction (Iris-3B: the wavelet colour fix). `None` ⇒ the provider's
+    /// declared default; a provider without the knob refuses `Some(_)`
+    /// ([`TransformCapabilities::supports_color_fix`]).
+    pub color_fix: Option<bool>,
     pub cancel: CancelFlag,
 }
 
+/// Whether a transform first fits its input into the provider's declared input budget
+/// ([`TransformCapabilities::input_budget`]) or processes it at its original size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum InputSizing {
+    /// Downscale (never upscale) the input into the provider's declared budget first. A provider
+    /// whose `input_budget` is `None` has no budget, so this is its original-size path.
+    #[default]
+    Budgeted,
+    /// Process the input at its original size (compute grows with the output area).
+    Original,
+}
+
+/// A transform's declared input budget: inputs are downscaled (never upscaled) so the short side is
+/// at most `short_side` and the long side at most `long_side`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InputBudget {
+    pub short_side: u32,
+    pub long_side: u32,
+}
+
 /// How big to make the output.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum TargetSize {
+    /// The provider's declared default ([`TransformCapabilities::default_scale`]) — so an omitted
+    /// target is never silently a different scale than the model's own default (sc-25683).
+    #[default]
+    ModelDefault,
     /// ESRGAN-style factor × the min edge (SeedVR2 "2x"/"3x").
     Scale(f32),
     /// Target for `min(w, h)` (SeedVR2 `resolution: int`).
     MinEdge(u32),
     /// Explicit output resolution.
     Resolution { width: u32, height: u32 },
-}
-
-impl Default for TargetSize {
-    fn default() -> Self {
-        TargetSize::Scale(2.0)
-    }
 }
 
 /// A transform's stable identity + advertised capabilities.
@@ -71,4 +98,10 @@ pub struct TransformCapabilities {
     pub is_diffusion: bool,
     pub supports_strength: bool,
     pub mac_only: bool,
+    /// The scale [`TargetSize::ModelDefault`] resolves to.
+    pub default_scale: f32,
+    /// The budget [`InputSizing::Budgeted`] applies; `None` = no budget (inputs run as given).
+    pub input_budget: Option<InputBudget>,
+    /// Honours [`TransformRequest::color_fix`].
+    pub supports_color_fix: bool,
 }

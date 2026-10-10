@@ -19,6 +19,7 @@ use crate::{Error, Result};
 
 pub mod depth;
 pub mod downstream;
+pub mod restoration;
 mod tables;
 pub mod train;
 pub use tables::{

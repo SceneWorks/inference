@@ -235,6 +235,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "iris_3b",
         components: &["iris_3b", "qwen3_vl_4b_instruct"],
     },
+    // The restoration transform (sc-25683) loads only the same repository's `upscaler/` export —
+    // never the text encoder — so its one component is the repository row.
+    ProviderComponents {
+        provider_id: "iris_3b_restore",
+        components: &["iris_3b"],
+    },
     // --- kolors ------------------------------------------------------------------------------
     // The shortest row relative to what the id loads: the `Kwai-Kolors/Kolors-diffusers` repository
     // that supplies the U-Net and the VAE is itself an AMBIGUOUS hole (sc-16662 U6), as are the
@@ -646,6 +652,13 @@ mod tests {
                 .text_embedders()
                 .map(|r| (r.descriptor)().id.to_string()),
         );
+        // sc-25683: transforms are walked too (the Iris-3B restorer is the first), so one cannot
+        // register unmapped.
+        ids.extend(
+            registry
+                .transforms()
+                .map(|r| (r.descriptor)().id.to_string()),
+        );
         ids
     }
 
@@ -904,8 +917,9 @@ mod tests {
 
         // sc-24108: `qwen_image_2_1` registers with its own complete row (71 / 61).
         // sc-25679: `iris_3b` registers with its own complete row (72 / 62).
-        assert_eq!(registered.len(), 72, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 62);
+        // sc-25683: the `iris_3b_restore` transform registers with its own complete row (73 / 63).
+        assert_eq!(registered.len(), 73, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 63);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -972,9 +986,10 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            23,
+            24,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
-             (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679)"
+             (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
+             iris_3b_restore in sc-25683)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -1151,7 +1166,7 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 62);
+        assert_eq!(value["providers"].as_array().unwrap().len(), 63);
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

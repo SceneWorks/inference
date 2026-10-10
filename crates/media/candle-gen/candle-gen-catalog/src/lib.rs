@@ -5823,7 +5823,15 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(registry.transforms().len(), 0);
+        // sc-25683: the Iris-3B restorer is the catalog's first (image) transform.
+        let transforms: Vec<String> = registry
+            .transforms()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(transforms, ["iris_3b_restore"]);
+        assert!(registry
+            .transforms()
+            .all(|r| (r.descriptor)().backend == "candle"));
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
@@ -5929,9 +5937,10 @@ mod tests {
         // also generator ids (`krea_2_control` and `ltx_2_3` are trainer-only), which is why 57
         // generators + 2 trainer-only ids + 1 captioner + 2 embedders are 62 distinct ids (sc-24109
         // adds `qwen_image_2_1`, a generator with its own component row; its sc-24160 trainer
-        // reuses that row; sc-25680 adds `iris_3b`, a generator with its own complete row).
+        // reuses that row; sc-25680 adds `iris_3b`, a generator with its own complete row; sc-25683
+        // adds the `iris_3b_restore` transform with its own complete row: 63 / 53).
         //
-        // Registration is never conditioned on the mapping: 52 < 62 because ten ids load nothing
+        // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which ten and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -5941,9 +5950,10 @@ mod tests {
             .chain(&captioners)
             .chain(&image_embedders)
             .chain(&text_embedders)
+            .chain(&transforms)
             .collect();
-        assert_eq!(distinct.len(), 62);
-        assert_eq!(super::provider_components().len(), 52);
+        assert_eq!(distinct.len(), 63);
+        assert_eq!(super::provider_components().len(), 53);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is
