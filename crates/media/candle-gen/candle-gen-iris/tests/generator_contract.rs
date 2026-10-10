@@ -54,6 +54,20 @@ fn request() -> GenerationRequest {
     }
 }
 
+/// The load gate on the catalog's production path: with the declared `text_encoder` component
+/// removed, `load` fails naming it; an unrecognized component key is refused. The miniature spec
+/// otherwise loads, so neither half can pass on an unrelated load error.
+#[test]
+fn missing_or_unknown_component_fails_at_load() {
+    let registry = candle_gen_iris::provider_registry().unwrap();
+    gen_core_testkit::check_component_load_gate(
+        |spec| registry.load(ID, spec),
+        &spec(OffloadPolicy::Resident),
+        candle_gen_iris::model::descriptor().required_components,
+    )
+    .expect("Iris load must gate on every declared required component");
+}
+
 #[test]
 fn gen_core_conformance_resident() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Resident), &profile());

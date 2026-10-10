@@ -9,11 +9,14 @@
 //! Upstream Iris-3B ships no adapter code, so the surface is the repo's, the same one the MLX twin
 //! installs: PEFT/diffusers LoRA (`transformer.` / `diffusion_model.` prefixes or bare, `lora_A/B`
 //! or `lora_down/up`, per-target `.alpha` or the `lora_adapter_metadata` blob), kohya flattened
-//! (`lora_unet_…`), PEFT-stamped LoKr (`networkType=lokr`), and untagged third-party LyCORIS
-//! LoKr/LoHa — keyed by the upstream `IrisDiT` module path, which is also the checkpoint key stem.
+//! (`lora_unet_…`), PEFT-stamped LoKr (`networkType=lokr`), and LyCORIS-layout LoKr/LoHa factors
+//! (no `networkType` stamp) — keyed by the upstream `IrisDiT` module path, which is also the
+//! checkpoint key stem.
 //!
 //! **Identity first** ([`check_adapter_identity`]): the file must name the Iris family and this
-//! route's task, because the three task backbones share one architecture. **Strict:** a target
+//! route's task, because the three task backbones share one architecture. This holds for **every**
+//! key layout above: a file exported by a third-party trainer (kohya, LyCORIS) carries no `family`
+//! / `irisTask` stamps and is refused until it is re-stamped; unstamped files are never installed. **Strict:** a target
 //! that resolves to no 2-D projection, a factor whose delta does not match its base shape, a file
 //! that merges nothing, and a diff-patch file are typed errors — never a partially adapted render.
 

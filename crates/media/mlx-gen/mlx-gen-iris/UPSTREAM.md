@@ -59,6 +59,8 @@ and is held to the same fixtures.
 | FlowDPM-Solver++ multistep, lower-order warm-up and final (terminal step = exact x0 projection) | `flow/solver.py` | `solver.rs` | `solver.rs` (shared plan; FP32 state) | ported; FP32 integration state |
 | `prediction`: `v` (`x0 = x − t·out`) or `x` (`x0 = out`) — a checkpoint property | `FlowConfig.prediction`, `_pred_x0` | `config.yaml` `flow.prediction` → `gen_core::iris::Prediction` → `solver::sample` | same | ported (sc-25681); any other value is refused at load (upstream raises) |
 | CFG on the raw model output, `uncond + s·(cond − uncond)`, gated strictly inside `cfg_interval` | `_model_out` | `solver.rs` `cfg_combine`, `GenerationParams::cfg_at` | same | ported |
+| Output `clamp(−1, 1)` → `[0, 255]` (torchvision `save_image(normalize, value_range=(−1,1))`) | `generate`, `sample.py` | `pipeline.rs` `to_image` | `pipeline.rs` `to_image` (nearest-even rounding) | ported (`round(255·(x+1)/2)`) |
+| Noise `torch.randn` on the generator device | `generate` | seeded MLX normal (repo convention) | launch-portable CPU `StdRng` (`candle_gen::seed`) — not bit-reproducible with torch or MLX; parity uses injected noise | **not bit-reproducible** with torch RNG; parity is measured with injected noise |
 
 ### Generation control surface (sc-25681)
 
@@ -74,7 +76,7 @@ backends, against `iris_controls_golden.safetensors`) and the provider-level che
 | `steps` (100) | `steps` | `dpm_solver_plan(steps, …)` | same | every case (5 steps) | |
 | `order` (2) | `sampler`: `dpmpp_2m` = order 2 (default), `euler` = order 1 | `GenerationParams::order` → plan | same | `order1` | order 1 is the first-order DPM-Solver++ update `x ← (t/s)·x + ((s−t)/s)·x0` on every step — exactly the flow Euler (= DDIM) step (`gen_core::iris` `the_order_one_plan_is_the_euler_step`). Upstream runs the 2M update for every `order ≥ 2`, so 3+ is not a distinct solver and has no name; any other sampler name is refused |
 | `cfg_scale` (3.0) | `guidance` | `cfg_combine`; `1.0` skips the unconditional branch and its encode | same | `negative` (4.0), `cfg_off` (1.0) | |
-| `cfg_interval` ((0, 1)) | `cfg_interval: Option<(f32, f32)>` | `GenerationParams::cfg_at` | same | `interval` (0.3, 0.8) | `0 ≤ lo < hi ≤ 1` (model time `t` ∈ (0, 1)); an interval holding none of the plan's evaluation times while guidance ≠ 1 is refused (the guidance would be accepted and never run) |
+| `cfg_interval` ((0, 1)) | `cfg_interval: Option<(f32, f32)>` | `GenerationParams::cfg_at` | same | `interval` (0.3, 0.8) | `0 ≤ lo < hi ≤ 1` (model time `t` ∈ (0, 1)); an interval holding none of the plan's evaluation times while guidance ≠ 1 is refused (the guidance would be accepted and never run), and any interval at guidance 1.0 is refused (CFG is off, so the interval would do nothing) |
 | `shift` (checkpoint `flow.shift`) | `scheduler_shift` | `time_grid(steps, shift)` | same | `shift2` | `> 0`; default is the checkpoint's own `flow.shift` |
 | `negative_prompt` ("") | `negative_prompt` | encoded through the same template as the unconditional | same | `negative` | refused at guidance 1.0 (never evaluated) |
 | `generator` seed | `seed` | MLX seeded normal | `candle_gen::seed` CPU `StdRng` | `every_advertised_control_changes_the_render` | not bit-compatible with `torch.randn` (parity runs on injected noise) |
@@ -97,8 +99,8 @@ the upstream `IrisDiT` module path (the checkpoint key stem, e.g. `blocks.3.attn
 | Concern | MLX (`src/adapters.rs`) | Candle (`src/adapters.rs`) |
 | --- | --- | --- |
 | Application | forward-time residual on the projection (`mlx_gen::adapters::AdaptableLinear`, `apply_adapters_strict`), base never mutated; LoKr via the structured Kronecker product `w1·X·w2ᵀ` | `W += δ` folded into the f32 weight at the safetensors-key level before the compute-dtype cast (`candle_gen::train::merge` convention); LoKr `δ = scale·(alpha/rank)·kron(w1, w2)` |
-| Formats | PEFT/diffusers LoRA (`transformer.` / `diffusion_model.` / bare; `lora_A/B`, `lora_down/up`; per-target `.alpha` or `lora_adapter_metadata`), kohya `lora_unet_…`, PEFT-stamped LoKr (`networkType=lokr`), third-party LyCORIS LoKr/LoHa | same set |
-| Identity | `gen_core::iris::check_adapter_identity`: `family=iris` and `irisTask=<task>` **required**, `baseModel` must match when present — the task backbones share one architecture, so only the stamp tells a depth adapter from a generation one | same |
+| Formats | PEFT/diffusers LoRA (`transformer.` / `diffusion_model.` / bare; `lora_A/B`, `lora_down/up`; per-target `.alpha` or `lora_adapter_metadata`), kohya `lora_unet_…`, PEFT-stamped LoKr (`networkType=lokr`), LyCORIS-layout LoKr/LoHa factors — key layouts only: every one of them must also carry the identity stamps below | same set |
+| Identity | `gen_core::iris::check_adapter_identity`: `family=iris` and `irisTask=<task>` **required**, `baseModel` must match when present — the task backbones share one architecture, so only the stamp tells a depth adapter from a generation one. Required for **every** format: a file exported by a third-party trainer (kohya, LyCORIS) carries neither stamp and is refused until it is re-stamped; unstamped third-party files are not supported | same |
 | Strictness | a target that resolves to no projection, a file that lands nothing, a diff-patch (`.diff`/`.diff_b`) file, per-pass scales / MoE expert → typed error | same, plus a delta whose shape differs from its projection |
 | Provenance | `Generator::adapter_apply_reports()` — one `AdapterApplyReport { adapter_path, applied, skipped }` per file, from the most recent backbone load | same |
 
@@ -116,8 +118,6 @@ for exactness). The last frame is the output (the terminal update is the exact x
 Upstream has no preview; nothing in its semantics makes `x0` misleading — it is the same estimate
 the solver integrates. Both descriptors advertise `supports_preview: true`; an inert sink costs one
 branch per step.
-| Output `clamp(−1, 1)` → `[0, 255]` (torchvision `save_image(normalize, value_range=(−1,1))`) | `generate`, `sample.py` | `pipeline.rs` `to_image` | `pipeline.rs` `to_image` (nearest-even rounding) | ported (`round(255·(x+1)/2)`) |
-| Noise `torch.randn` on the generator device | `generate` | seeded MLX normal (repo convention) | launch-portable CPU `StdRng` (`candle_gen::seed`) — not bit-reproducible with torch or MLX; parity uses injected noise | **not bit-reproducible** with torch RNG; parity is measured with injected noise |
 
 ## Precision
 

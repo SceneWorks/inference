@@ -3614,11 +3614,6 @@ impl Capabilities {
                 "{id}: HDR output is not supported by this model"
             )));
         }
-        // RGBA opt-in (sc-24111). On the shared floor for the same reason HDR is: a per-provider
-        // check is a check a provider can forget, and a forgotten one returns an opaque RGB image
-        // to a caller who asked for transparency, with nothing in the reply to say the alpha was
-        // dropped. `Rgb` (the `Default`) validates vacuously, so this is inert for every request
-        // that has not opted in.
         // Guidance interval, prompt batch and caption-overflow policy (epic sc-25678). On the shared
         // floor for the HDR reason: each is a control a provider that does not read it would accept
         // and silently ignore. Unset values validate vacuously.
@@ -3662,6 +3657,11 @@ impl Capabilities {
                 "{id}: `caption_overflow` is not supported by this model"
             )));
         }
+        // RGBA opt-in (sc-24111). On the shared floor for the same reason HDR is: a per-provider
+        // check is a check a provider can forget, and a forgotten one returns an opaque RGB image
+        // to a caller who asked for transparency, with nothing in the reply to say the alpha was
+        // dropped. `Rgb` (the `Default`) validates vacuously, so this is inert for every request
+        // that has not opted in.
         if req.output_channels == OutputChannels::Rgba && !self.supports_alpha_output {
             return Err(Error::Unsupported(format!(
                 "{id}: RGBA (alpha-channel) output is not supported by this model; it emits RGB \

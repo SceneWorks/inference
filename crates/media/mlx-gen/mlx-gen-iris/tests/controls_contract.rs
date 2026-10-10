@@ -421,6 +421,14 @@ fn controls_the_route_does_not_have_are_refused() {
                 ..request()
             },
         ),
+        (
+            "interval with CFG off",
+            GenerationRequest {
+                guidance: Some(1.0),
+                cfg_interval: Some((0.25, 0.75)),
+                ..request()
+            },
+        ),
     ] {
         assert!(
             matches!(g.validate(&req), Err(CoreError::Unsupported(_))),

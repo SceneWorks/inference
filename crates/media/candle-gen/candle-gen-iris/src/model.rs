@@ -42,7 +42,9 @@ pub fn descriptor() -> ModelDescriptor {
         // Pixel space: there is no latent and no VAE.
         denoiser_output_latent_space: None,
         control_kinds: None,
-        required_components: &[],
+        // The Qwen3-VL text encoder is a load-time component (`components["text_encoder"]`);
+        // `load` refuses without it.
+        required_components: &[TEXT_ENCODER_COMPONENT],
         id: MODEL_ID,
         family: FAMILY,
         backend: "candle",
@@ -63,7 +65,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_cfg_interval: true,
             supports_prompt_batch: true,
             supports_caption_overflow_policy: true,
-            // LoRA / LoKr (and third-party LyCORIS) deltas merged into the backbone projections.
+            // LoRA / LoKr (and LyCORIS-layout LoHa) deltas merged into the backbone projections;
+            // every file must carry the Iris `family` / `irisTask` stamps.
             supports_lora: true,
             supports_lokr: true,
             // Pixel space: every step's predicted clean image is the preview, decoded exactly.
@@ -369,6 +372,7 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
         assert!(d.capabilities.supports_preview);
+        assert_eq!(d.required_components, ["text_encoder"]);
     }
 
     #[test]

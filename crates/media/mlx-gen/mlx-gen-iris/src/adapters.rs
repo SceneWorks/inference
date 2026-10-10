@@ -5,15 +5,18 @@
 //! LoKr applies through the structured Kronecker product (`Y = w1 · X · w2ᵀ`, never a materialized
 //! `[out, in]` delta); a LoRA as `scale · (x·Aᵀ)·Bᵀ`.
 //!
-//! Upstream Iris-3B ships no adapter code, so the surface is the repo's: PEFT/diffusers LoRA
-//! (`transformer.` / `diffusion_model.` prefixes or bare), kohya flattened LoRA, PEFT-stamped LoKr
-//! (`networkType=lokr`), third-party LyCORIS LoKr/LoHa — keyed by the upstream `IrisDiT` module
-//! path (`blocks.3.attn_proj`, `y_embedder.refiner.proj`, …), which is also the checkpoint key stem.
+//! Upstream Iris-3B ships no adapter code, so the surface is the repo's key layouts: PEFT/diffusers
+//! LoRA (`transformer.` / `diffusion_model.` prefixes or bare), kohya flattened LoRA, PEFT-stamped
+//! LoKr (`networkType=lokr`), LyCORIS-layout LoKr/LoHa factors — keyed by the upstream `IrisDiT`
+//! module path (`blocks.3.attn_proj`, `y_embedder.refiner.proj`, …), which is also the checkpoint
+//! key stem.
 //!
 //! **Identity first.** Before a tensor is read, the file's `__metadata__` must name the Iris family
 //! and this route's task ([`check_adapter_identity`]): the three Iris task backbones share one
 //! architecture, so a depth or restoration adapter would otherwise resolve onto the generation
-//! backbone without complaint. **Strict install:** an adapter target that resolves to no
+//! backbone without complaint. This holds for **every** key layout above: a file exported by a
+//! third-party trainer (kohya, LyCORIS) carries no `family` / `irisTask` stamps and is refused until
+//! it is re-stamped; unstamped files are never installed. **Strict install:** an adapter target that resolves to no
 //! projection, a file that lands nothing, and a ComfyUI diff-patch file (`.diff` / `.diff_b`, which
 //! this residual path does not fold) are typed errors — never a partially adapted render. Each file's
 //! outcome is returned as an [`AdapterApplyReport`] (the provider's provenance surface).

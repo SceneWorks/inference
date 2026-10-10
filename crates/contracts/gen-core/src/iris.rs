@@ -1241,6 +1241,14 @@ pub fn validate_generation_request(
     reject_unhonored_generation_controls(model_id, req)?;
     let params =
         GenerationParams::resolve(req, 0, config).map_err(|e| prefix_error(model_id, e))?;
+    // At guidance 1.0 no step evaluates the unconditional branch, so an interval would be
+    // accepted and silently dropped (the same reasoning as the `negative_prompt` refusal).
+    if req.cfg_interval.is_some() && !params.uses_cfg() {
+        return Err(Error::Unsupported(format!(
+            "{model_id}: `cfg_interval` has no effect at guidance 1.0 (classifier-free guidance is \
+             off); raise guidance or drop the interval"
+        )));
+    }
     let plan = params.plan().map_err(|e| prefix_error(model_id, e))?;
     if params.uses_cfg() && !plan.iter().any(|step| params.cfg_at(step)) {
         return Err(Error::Unsupported(format!(
@@ -1648,14 +1656,19 @@ flow:
             let err = validate_generation_request("iris_3b", &req, &cfg).unwrap_err();
             assert!(err.to_string().contains(needle), "{needle}: {err}");
         }
-        // The same narrow interval is legal with guidance off (no guidance to drop).
+        // Any interval with guidance off is refused: no step runs the unconditional branch, so
+        // the interval would be accepted and do nothing.
         let off = GenerationRequest {
             steps: Some(4),
             guidance: Some(1.0),
-            cfg_interval: Some((0.9999, 1.0)),
+            cfg_interval: Some((0.25, 0.75)),
             ..Default::default()
         };
-        validate_generation_request("iris_3b", &off, &cfg).unwrap();
+        let err = validate_generation_request("iris_3b", &off, &cfg).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)) && err.to_string().contains("`cfg_interval`"),
+            "{err}"
+        );
     }
 
     #[test]
