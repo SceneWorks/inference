@@ -537,6 +537,51 @@ expected_files = [
 ]
 
 [[models]]
+# sc-25680 — Iris-3B's generation backbone (the repo root: `config.yaml` + FP32 `model.safetensors`,
+# ~12 GB) for the candle real-weight lane: the dispatch-only `iris` profile's `candle-iris` job
+# materializes it on the Windows CUDA runner under `CANDLE_GEN_MODELS_ROOT` and runs
+# `candle-gen-iris/tests/real_weights.rs`. Only the generation task is fetched — `depth/` and
+# `upscaler/` are later stories' backbones.
+key = "iris-3b-cuda"
+repository = "speridlabs/iris-3b"
+revision = "7445443349bc9abe3c96f01ff793e2098ca012b3"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["iris"]
+environment = ["IRIS_WEIGHTS_DIR"]
+download_files = ["config.yaml", "model.safetensors"]
+expected_files = ["config.yaml", "model.safetensors"]
+
+[[models]]
+# sc-25680 — the Qwen/Qwen3-VL-4B-Instruct text encoder Iris-3B's generation task conditions on
+# (~9 GB bf16), the `text_encoder` component of the `candle-iris` job above. The language tower is
+# read from both shards; the vision-processor files are not fetched.
+key = "qwen3-vl-4b-instruct-cuda"
+repository = "Qwen/Qwen3-VL-4B-Instruct"
+revision = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["iris"]
+environment = ["IRIS_TEXT_ENCODER_DIR"]
+download_files = [
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+]
+expected_files = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+]
+
+[[models]]
 # sc-24114 — the published Q8/Q4 tiers of Qwen-Image 2.1 (sc-24112's converter output), ~33 GB for
 # both. Each tier directory is a COMPLETE snapshot (packed `model.safetensors` for the DiT and the
 # Qwen3-VL tower, dense `vae/`, `processor/`, `scheduler/`), which the candle loader reads natively;

@@ -3,21 +3,21 @@
 //! hybrid dual-/single-stream trunk with shared-bias adaLN → timestep re-fusion → PiT pixel head →
 //! `fold` back to an RGB velocity. No VAE.
 //!
-//! Every module mirrors its upstream class one-to-one under the upstream state-dict key names, so
-//! the released `model.safetensors` loads unchanged. Precision: see [`crate::nn`].
+//! Every module mirrors its upstream class one-to-one under the upstream state-dict key names (and
+//! the MLX twin `mlx_gen_iris::dit` op for op), so the released `model.safetensors` loads unchanged.
+//! Precision: see [`crate::nn`].
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use gen_core::iris::{self, ModelConfig};
-use mlx_gen::gen_core;
-use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
-use mlx_rs::nn::{gelu, sigmoid, silu};
-use mlx_rs::{Array, Dtype};
+use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::gen_core::iris::{self, ModelConfig};
+use candle_gen::{CandleError as Error, Result};
 
 use crate::nn::{
-    attention, cat, chunk_last, key_padding_mask, modulate, Linear, Loader, RmsNorm, Rope,
+    add, attention, cat, chunk_last, key_padding_mask, modulate, mul, split_at, Checkpoint, Linear,
+    Loader, RmsNorm, Rope,
 };
 
 /// `SwiGLU`: `w2(silu(w1 x) · w3 x)`, bias-free.
@@ -35,15 +35,9 @@ impl SwiGlu {
             w3: l.linear(&format!("{prefix}.w3"), false)?,
         })
     }
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let gate = silu(self.w1.forward(x)?)?;
-        self.w2.forward(&gate.multiply(&self.w3.forward(x)?)?)
-    }
-    fn arrays(&self) -> Vec<&Array> {
-        [&self.w1, &self.w2, &self.w3]
-            .into_iter()
-            .flat_map(Linear::arrays)
-            .collect()
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.w1.forward(x)?.silu()?;
+        self.w2.forward(&(gate * self.w3.forward(x)?)?)
     }
 }
 
@@ -53,7 +47,7 @@ struct SelfAttention {
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     proj: Linear,
-    heads: i32,
+    heads: usize,
 }
 
 impl SelfAttention {
@@ -68,31 +62,25 @@ impl SelfAttention {
             q_norm: norm("q_norm")?,
             k_norm: norm("k_norm")?,
             proj: l.linear(&format!("{prefix}.proj"), true)?,
-            heads: heads as i32,
+            heads,
         })
     }
 
     fn forward(
         &self,
-        x: &Array,
+        x: &Tensor,
         rope: Option<&Rope>,
-        mask: Option<&Array>,
-        compute: Dtype,
-    ) -> Result<Array> {
-        let sh = x.shape();
-        let (b, n, dim) = (sh[0], sh[1], sh[2]);
+        mask: Option<&Tensor>,
+        compute: DType,
+    ) -> Result<Tensor> {
+        let (b, n, dim) = x.dims3()?;
         let head_dim = dim / self.heads;
         let qkv = self
             .qkv
             .forward(x)?
-            .reshape(&[b, n, 3, self.heads, head_dim])?;
-        let parts = qkv.split(3, 2)?;
-        let squeeze = |a: &Array| -> Result<Array> { Ok(a.squeeze_axes(&[2])?) };
-        let (mut q, mut k, v) = (
-            squeeze(&parts[0])?,
-            squeeze(&parts[1])?,
-            squeeze(&parts[2])?,
-        );
+            .reshape((b, n, 3, self.heads, head_dim))?;
+        let part = |i: usize| -> Result<Tensor> { Ok(qkv.narrow(2, i, 1)?.squeeze(2)?) };
+        let (mut q, mut k, v) = (part(0)?, part(1)?, part(2)?);
         if let Some(norm) = &self.q_norm {
             q = norm.forward(&q)?;
         }
@@ -104,14 +92,6 @@ impl SelfAttention {
             k = rope.apply(&k)?;
         }
         self.proj.forward(&attention(&q, &k, &v, compute, mask)?)
-    }
-
-    fn arrays(&self) -> Vec<&Array> {
-        let mut out = self.qkv.arrays();
-        out.extend(self.q_norm.iter().flat_map(RmsNorm::arrays));
-        out.extend(self.k_norm.iter().flat_map(RmsNorm::arrays));
-        out.extend(self.proj.arrays());
-        out
     }
 }
 
@@ -135,36 +115,30 @@ impl Qkv {
     }
 
     /// `[B, N, D]` → q `[B, N, H, hd]`, k/v `[B, N, KV, hd]`.
-    fn project(&self, x: &Array, heads: i32, kv_heads: i32) -> Result<(Array, Array, Array)> {
-        let sh = x.shape();
-        let (b, n) = (sh[0], sh[1]);
+    fn project(
+        &self,
+        x: &Tensor,
+        heads: usize,
+        kv_heads: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (b, n, _) = x.dims3()?;
         match self {
             Qkv::Fused(qkv) => {
                 let out = qkv.forward(x)?;
-                let head_dim = out.shape()[2] / (3 * heads);
-                let parts = out.reshape(&[b, n, 3, heads, head_dim])?.split(3, 2)?;
-                Ok((
-                    parts[0].squeeze_axes(&[2])?,
-                    parts[1].squeeze_axes(&[2])?,
-                    parts[2].squeeze_axes(&[2])?,
-                ))
+                let head_dim = out.dim(2)? / (3 * heads);
+                let out = out.reshape((b, n, 3, heads, head_dim))?;
+                let part = |i: usize| -> Result<Tensor> { Ok(out.narrow(2, i, 1)?.squeeze(2)?) };
+                Ok((part(0)?, part(1)?, part(2)?))
             }
             Qkv::Split { q, k, v } => {
                 let qo = q.forward(x)?;
-                let head_dim = qo.shape()[2] / heads;
+                let head_dim = qo.dim(2)? / heads;
                 Ok((
-                    qo.reshape(&[b, n, heads, head_dim])?,
-                    k.forward(x)?.reshape(&[b, n, kv_heads, head_dim])?,
-                    v.forward(x)?.reshape(&[b, n, kv_heads, head_dim])?,
+                    qo.reshape((b, n, heads, head_dim))?,
+                    k.forward(x)?.reshape((b, n, kv_heads, head_dim))?,
+                    v.forward(x)?.reshape((b, n, kv_heads, head_dim))?,
                 ))
             }
-        }
-    }
-
-    fn arrays(&self) -> Vec<&Array> {
-        match self {
-            Qkv::Fused(l) => l.arrays(),
-            Qkv::Split { q, k, v } => [q, k, v].into_iter().flat_map(Linear::arrays).collect(),
         }
     }
 }
@@ -172,12 +146,12 @@ impl Qkv {
 /// One stream's adaLN: the model-owned shared core output plus this block's learned bias
 /// (`SharedCoreBias`), split as (shift1, scale1, gate1, shift2, scale2, gate2).
 struct Modulation {
-    bias: Array,
+    bias: Tensor,
 }
 
 impl Modulation {
-    fn chunks(&self, core_out: &Array) -> Result<Vec<Array>> {
-        chunk_last(&core_out.add(&self.bias)?, 6)
+    fn chunks(&self, core_out: &Tensor) -> Result<Vec<Tensor>> {
+        chunk_last(&add(core_out, &self.bias)?, 6)
     }
 }
 
@@ -274,12 +248,13 @@ struct TextAdapter {
 /// The loaded Iris backbone.
 pub struct IrisDiT {
     cfg: ModelConfig,
-    compute: Dtype,
+    compute: DType,
+    device: Device,
     s_embedder: Linear,
     t_mlp0: Linear,
     t_mlp2: Linear,
     y_embedder: TextAdapter,
-    y_pos_embedding: Array,
+    y_pos_embedding: Tensor,
     core_img: Linear,
     core_txt: Option<Linear>,
     blocks: Vec<Block>,
@@ -287,21 +262,26 @@ pub struct IrisDiT {
     pixel_blocks: Vec<PitBlock>,
     final_norm: RmsNorm,
     final_linear: Linear,
-    pos_cache: Mutex<HashMap<(usize, usize), Array>>,
+    pos_cache: Mutex<HashMap<(usize, usize), Tensor>>,
 }
 
 /// Shape of one forward's text conditioning.
 pub struct TextBatch<'a> {
     /// `[B, T, L, text_dim]` selected-layer states (pad rows zero).
-    pub states: &'a Array,
+    pub states: &'a Tensor,
     /// `B` rows of `T` 0/1 flags.
     pub mask: &'a [Vec<i32>],
 }
 
 impl IrisDiT {
-    /// Build from the backbone's `model.safetensors` (upstream key names) at `compute` dtype.
-    /// Every source key must be consumed; a leftover or missing key is a load error.
-    pub fn from_weights(w: &Weights, cfg: &ModelConfig, compute: Dtype) -> Result<Self> {
+    /// Build from the backbone's `model.safetensors` (upstream key names) at `compute` dtype on
+    /// `device`. Every source key must be consumed; a leftover or missing key is a load error.
+    pub fn from_checkpoint(
+        w: &Checkpoint,
+        cfg: &ModelConfig,
+        compute: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let l = Loader {
             weights: w,
             compute,
@@ -433,6 +413,7 @@ impl IrisDiT {
         let dit = Self {
             cfg: cfg.clone(),
             compute,
+            device: device.clone(),
             s_embedder: l.linear("s_embedder.proj", true)?,
             t_mlp0: l.linear("t_embedder.mlp.0", true)?,
             t_mlp2: l.linear("t_embedder.mlp.2", true)?,
@@ -447,8 +428,7 @@ impl IrisDiT {
             final_linear: l.linear("final_layer.linear", true)?,
             pos_cache: Mutex::new(HashMap::new()),
         };
-        let mut unused = w.unused_keys();
-        unused.sort_unstable();
+        let unused = w.unused_keys();
         if !unused.is_empty() {
             return Err(Error::Msg(format!(
                 "iris: the backbone checkpoint carries {} key(s) the configured architecture does \
@@ -457,11 +437,11 @@ impl IrisDiT {
                 unused[0]
             )));
         }
-        let p = cfg.patch_size as i32;
+        let p = cfg.patch_size;
         crate::nn::expect_shape(
             "s_embedder.proj.weight",
-            &dit.s_embedder.arrays()[0].clone(),
-            &[cfg.hidden_size as i32, p * p * cfg.in_channels as i32],
+            dit.s_embedder.weight(),
+            &[cfg.hidden_size, p * p * cfg.in_channels],
         )?;
         Ok(dit)
     }
@@ -470,150 +450,61 @@ impl IrisDiT {
         &self.cfg
     }
 
-    pub fn compute_dtype(&self) -> Dtype {
+    pub fn compute_dtype(&self) -> DType {
         self.compute
     }
 
-    /// Every parameter array, for an eager evaluation at load (never inside a forward).
-    pub fn arrays(&self) -> Vec<&Array> {
-        let mut out: Vec<&Array> = Vec::new();
-        out.extend(self.s_embedder.arrays());
-        out.extend(self.t_mlp0.arrays());
-        out.extend(self.t_mlp2.arrays());
-        let y = &self.y_embedder;
-        for b in &y.layer_blocks {
-            out.extend(b.norm1.arrays());
-            out.extend(b.attn.arrays());
-            out.extend(b.norm2.arrays());
-            out.extend(b.mlp0.arrays());
-            out.extend(b.mlp2.arrays());
-        }
-        out.extend(y.layer_pool.arrays());
-        out.extend(y.proj.arrays());
-        for b in &y.blocks {
-            out.extend(b.norm1.arrays());
-            out.extend(b.attn.arrays());
-            out.extend(b.norm2.arrays());
-            out.extend(b.mlp.arrays());
-        }
-        out.extend(y.norm.arrays());
-        out.push(&self.y_pos_embedding);
-        out.extend(self.core_img.arrays());
-        out.extend(self.core_txt.iter().flat_map(Linear::arrays));
-        for block in &self.blocks {
-            match block {
-                Block::Dual(b) => {
-                    for n in [
-                        &b.norm_x1,
-                        &b.norm_x2,
-                        &b.norm_y1,
-                        &b.q_norm_x,
-                        &b.k_norm_x,
-                        &b.q_norm_y,
-                        &b.k_norm_y,
-                        &b.attn_post_norm_x,
-                        &b.mlp_post_norm_x,
-                    ] {
-                        out.extend(n.arrays());
-                    }
-                    out.extend(b.qkv_x.arrays());
-                    out.extend(b.qkv_y.arrays());
-                    out.extend(b.proj_x.arrays());
-                    out.extend(b.gate_x.arrays());
-                    out.extend(b.mlp_x.arrays());
-                    if let Some(t) = &b.text {
-                        out.extend(t.norm2.arrays());
-                        out.extend(t.proj.arrays());
-                        out.extend(t.gate.arrays());
-                        out.extend(t.attn_post_norm.arrays());
-                        out.extend(t.mlp.arrays());
-                        out.extend(t.mlp_post_norm.arrays());
-                    }
-                    out.push(&b.mod_img.bias);
-                    out.push(&b.mod_txt.bias);
-                }
-                Block::Single(b) => {
-                    for n in [
-                        &b.norm1,
-                        &b.norm2,
-                        &b.q_norm,
-                        &b.k_norm,
-                        &b.attn_post_norm,
-                        &b.mlp_post_norm,
-                    ] {
-                        out.extend(n.arrays());
-                    }
-                    out.extend(b.qkv.arrays());
-                    out.extend(b.attn_gate.arrays());
-                    out.extend(b.attn_proj.arrays());
-                    out.extend(b.mlp.arrays());
-                    out.push(&b.modulation.bias);
-                }
-            }
-        }
-        out.extend(self.pixel_proj.arrays());
-        for b in &self.pixel_blocks {
-            out.extend(b.norm1.arrays());
-            out.extend(b.norm2.arrays());
-            out.extend(b.adaln.arrays());
-            out.extend(b.compress.arrays());
-            out.extend(b.expand.arrays());
-            out.extend(b.attn.arrays());
-            out.extend(b.fc1.arrays());
-            out.extend(b.fc2.arrays());
-        }
-        out.extend(self.final_norm.arrays());
-        out.extend(self.final_linear.arrays());
-        out
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)
     /// → Linear → SiLU → Linear. `t` is model time `[B]` f32 → `[B, 1, D]`.
-    fn timestep_embedding(&self, t: &Array) -> Result<Array> {
+    fn timestep_embedding(&self, t: &Tensor) -> Result<Tensor> {
         let freqs = iris::timestep_freqs(self.cfg.timestep_max_period);
         let n = freqs.len();
-        let b = t.shape()[0];
-        let freqs = Array::from_slice(&freqs, &[1, n as i32]);
+        let b = t.dim(0)?;
+        let freqs = Tensor::from_vec(freqs, (1, n), &self.device)?;
         let phase = t
-            .as_dtype(Dtype::Float32)?
-            .reshape(&[b, 1])?
-            .multiply(&freqs)?;
-        let emb = cat(&[&phase.cos()?, &phase.sin()?], -1)?;
-        let h = self.t_mlp2.forward(&silu(self.t_mlp0.forward(&emb)?)?)?;
-        Ok(h.reshape(&[b, 1, -1])?)
+            .to_dtype(DType::F32)?
+            .reshape((b, 1))?
+            .broadcast_mul(&freqs)?;
+        let emb = Tensor::cat(&[phase.cos()?, phase.sin()?], 1)?;
+        let h = self.t_mlp2.forward(&self.t_mlp0.forward(&emb)?.silu()?)?;
+        Ok(h.reshape((b, 1, ()))?)
     }
 
     /// `LayerwiseTextEmbedder.forward(y, mask)` (`y` `[B, T, L, Dt]`) → `[B, T, D]` f32.
-    pub fn text_adapter(&self, text: &TextBatch) -> Result<Array> {
-        let sh = text.states.shape();
-        let (b, t, layers, dt) = (sh[0], sh[1], sh[2], sh[3]);
-        if text.mask.len() != b as usize || text.mask.iter().any(|m| m.len() != t as usize) {
+    pub fn text_adapter(&self, text: &TextBatch) -> Result<Tensor> {
+        let (b, t, layers, dt) = text.states.dims4()?;
+        if text.mask.len() != b || text.mask.iter().any(|m| m.len() != t) {
             return Err(Error::Msg(format!(
-                "iris: text mask must be [{b}, {t}] for states {sh:?}"
+                "iris: text mask must be [{b}, {t}] for states {:?}",
+                text.states.dims()
             )));
         }
         let y_ad = &self.y_embedder;
         let mut y = text
             .states
-            .as_dtype(Dtype::Float32)?
-            .reshape(&[b * t, layers, dt])?;
+            .to_dtype(DType::F32)?
+            .reshape((b * t, layers, dt))?;
         for block in &y_ad.layer_blocks {
             let h = block
                 .attn
                 .forward(&block.norm1.forward(&y)?, None, None, self.compute)?;
-            y = y.add(&h)?;
+            y = add(&y, &h)?;
             let m = block
                 .mlp2
-                .forward(&silu(block.mlp0.forward(&block.norm2.forward(&y)?)?)?)?;
-            y = y.add(&m)?;
+                .forward(&block.mlp0.forward(&block.norm2.forward(&y)?)?.silu()?)?;
+            y = add(&y, &m)?;
         }
         // layer_pool: Linear(L → 1) over the layer axis.
         let pooled = y_ad
             .layer_pool
-            .forward(&y.transpose_axes(&[0, 2, 1])?)?
-            .reshape(&[b, t, dt])?;
+            .forward(&y.transpose(1, 2)?.contiguous()?)?
+            .reshape((b, t, dt))?;
         // refiner (TransformerTextEmbedder): keys masked, every query keeps its own position.
-        let key_mask = key_padding_mask(text.mask, t as usize);
+        let key_mask = key_padding_mask(text.mask, t, &self.device)?;
         let mut y = y_ad.proj.forward(&pooled)?;
         for block in &y_ad.blocks {
             let h = block.attn.forward(
@@ -622,34 +513,30 @@ impl IrisDiT {
                 Some(&key_mask),
                 self.compute,
             )?;
-            y = y.add(&h)?;
-            y = y.add(&block.mlp.forward(&block.norm2.forward(&y)?)?)?;
+            y = add(&y, &h)?;
+            y = add(&y, &block.mlp.forward(&block.norm2.forward(&y)?)?)?;
         }
         y_ad.norm.forward(&y)
     }
 
     /// The fixed full-resolution 2D sincos table of `PixelEmbedder` (`[H, W, hidden]` f32), cached.
-    fn pixel_pos(&self, height: usize, width: usize) -> Result<Array> {
-        let mut cache = self
-            .pos_cache
-            .lock()
-            .map_err(|_| Error::Msg("iris: pixel position cache poisoned".into()))?;
+    fn pixel_pos(&self, height: usize, width: usize) -> Result<Tensor> {
+        let mut cache = candle_gen::lock_recover(&self.pos_cache);
         if let Some(table) = cache.get(&(height, width)) {
             return Ok(table.clone());
         }
         let dim = self.cfg.pixel.hidden_size;
         let data = iris::pixel_sincos_table(height, width, dim);
-        let table = Array::from_slice(&data, &[height as i32, width as i32, dim as i32]);
+        let table = Tensor::from_vec(data, (height, width, dim), &self.device)?;
         cache.insert((height, width), table.clone());
         Ok(table)
     }
 
     /// Predict the flow velocity `[B, C, H, W]` (f32) for noisy pixels `x` at model time `t` `[B]`.
-    pub fn forward(&self, x: &Array, t: &Array, text: &TextBatch) -> Result<Array> {
+    pub fn forward(&self, x: &Tensor, t: &Tensor, text: &TextBatch) -> Result<Tensor> {
         let cfg = &self.cfg;
-        let sh = x.shape();
-        let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
-        let p = cfg.patch_size as i32;
+        let (b, c, h, w) = x.dims4()?;
+        let p = cfg.patch_size;
         if h % p != 0 || w % p != 0 {
             return Err(Error::Msg(format!(
                 "iris: input {h}x{w} is not divisible by patch_size {p}"
@@ -657,8 +544,8 @@ impl IrisDiT {
         }
         let (hp, wp) = (h / p, w / p);
         let n_patches = hp * wp;
-        let ts = text.states.shape();
-        if ts[0] != b || ts[1] as usize != cfg.text_len {
+        let ts = text.states.dims();
+        if ts[0] != b || ts[1] != cfg.text_len {
             return Err(Error::Msg(format!(
                 "iris: text states {ts:?} do not match batch {b} / text_len {}",
                 cfg.text_len
@@ -667,31 +554,32 @@ impl IrisDiT {
 
         // F.unfold(x, p, stride=p).transpose(1, 2): channel-major patch vectors, row-major patches.
         let patches = x
-            .reshape(&[b, c, hp, p, wp, p])?
-            .transpose_axes(&[0, 2, 4, 1, 3, 5])?
-            .reshape(&[b, n_patches, c * p * p])?;
+            .reshape((b, c, hp, p, wp, p))?
+            .permute((0, 2, 4, 1, 3, 5))?
+            .contiguous()?
+            .reshape((b, n_patches, c * p * p))?;
         let mut s = self.s_embedder.forward(&patches)?;
         let t_emb = self.timestep_embedding(t)?;
-        let cond = silu(&t_emb)?;
+        let cond = t_emb.silu()?;
 
-        let mut y = self.text_adapter(text)?;
-        let n_txt = y.shape()[1];
+        let y = self.text_adapter(text)?;
+        let n_txt = y.dim(1)?;
         let pos = self
             .y_pos_embedding
-            .reshape(&[1, -1, cfg.hidden_size as i32])?
-            .split_axis(&[n_txt], 1)?
-            .swap_remove(0);
-        y = y.add(&pos)?;
+            .reshape((1, (), cfg.hidden_size))?
+            .narrow(1, 0, n_txt)?;
+        let mut y = add(&y, &pos)?;
 
         let head_dim = cfg.hidden_size / cfg.num_heads;
         let rope_img = Rope::grid_2d(
             head_dim,
-            hp as usize,
-            wp as usize,
+            hp,
+            wp,
             cfg.rope_theta as f32,
             cfg.rope_scale as f32,
-        );
-        let rope_txt = Rope::line_1d(head_dim, n_txt as usize, cfg.text_rope_theta as f32);
+            &self.device,
+        )?;
+        let rope_txt = Rope::line_1d(head_dim, n_txt, cfg.text_rope_theta as f32, &self.device)?;
 
         let core_img = self.core_img.forward(&cond)?;
         let core_txt = self
@@ -699,21 +587,20 @@ impl IrisDiT {
             .as_ref()
             .map(|core| core.forward(&cond))
             .transpose()?;
-        let heads = cfg.num_heads as i32;
-        let kv_heads = cfg.num_kv_heads.unwrap_or(cfg.num_heads) as i32;
+        let heads = cfg.num_heads;
+        let kv_heads = cfg.num_kv_heads.unwrap_or(cfg.num_heads);
         for block in &self.blocks {
             (s, y) = match block {
-                Block::Dual(blk) => self.dual(
-                    blk,
-                    &s,
-                    &y,
-                    &core_img,
-                    core_txt.as_ref().expect("dual blocks carry a text core"),
-                    &rope_img,
-                    &rope_txt,
-                    heads,
-                    kv_heads,
-                )?,
+                Block::Dual(blk) => {
+                    let core_txt = core_txt.as_ref().ok_or_else(|| {
+                        Error::Msg(
+                            "iris: a dual-stream block needs the text modulation core".into(),
+                        )
+                    })?;
+                    self.dual(
+                        blk, &s, &y, &core_img, core_txt, &rope_img, &rope_txt, heads, kv_heads,
+                    )?
+                }
                 Block::Single(blk) => self.single(
                     blk, &s, &y, &core_img, &rope_img, &rope_txt, heads, kv_heads,
                 )?,
@@ -721,29 +608,30 @@ impl IrisDiT {
         }
 
         // timestep re-fused into every patch token
-        let s = silu(&t_emb.add(&s)?)?;
-        let s_cond = s.reshape(&[b * n_patches, -1])?;
+        let s = add(&t_emb, &s)?.silu()?;
+        let s_cond = s.reshape((b * n_patches, ()))?;
 
         // PixelEmbedder: per-pixel Linear + full-resolution sincos, grouped per patch.
-        let tokens = self.pixel_proj.forward(&x.transpose_axes(&[0, 2, 3, 1])?)?;
-        let tokens = tokens.add(
-            &self
-                .pixel_pos(h as usize, w as usize)?
-                .as_dtype(tokens.dtype())?,
-        )?;
-        let pix = cfg.pixel.hidden_size as i32;
+        let tokens = self
+            .pixel_proj
+            .forward(&x.permute((0, 2, 3, 1))?.contiguous()?)?;
+        let pos = self.pixel_pos(h, w)?.to_dtype(tokens.dtype())?;
+        let tokens = tokens.broadcast_add(&pos)?;
+        let pix = cfg.pixel.hidden_size;
         let mut pixels = tokens
-            .reshape(&[b, hp, p, wp, p, pix])?
-            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-            .reshape(&[b * n_patches, p * p, pix])?;
+            .reshape((b, hp, p, wp, p, pix))?
+            .permute((0, 1, 3, 2, 4, 5))?
+            .contiguous()?
+            .reshape((b * n_patches, p * p, pix))?;
         let pix_head = cfg.pixel.attn_hidden_size / cfg.pixel.num_heads;
         let rope_pix = Rope::grid_2d(
             pix_head,
-            hp as usize,
-            wp as usize,
+            hp,
+            wp,
             cfg.rope_theta as f32,
             cfg.rope_scale as f32,
-        );
+            &self.device,
+        )?;
         for block in &self.pixel_blocks {
             pixels = self.pit(block, &pixels, &s_cond, &rope_pix, b, n_patches)?;
         }
@@ -752,25 +640,26 @@ impl IrisDiT {
             .forward(&self.final_norm.forward(&pixels)?)?;
         // fold: [B·L, p·p, C] → [B, C, H, W]
         Ok(out
-            .reshape(&[b, hp, wp, p, p, c])?
-            .transpose_axes(&[0, 5, 1, 3, 2, 4])?
-            .reshape(&[b, c, h, w])?
-            .as_dtype(Dtype::Float32)?)
+            .reshape((b, hp, wp, p, p, c))?
+            .permute((0, 5, 1, 3, 2, 4))?
+            .contiguous()?
+            .reshape((b, c, h, w))?
+            .to_dtype(DType::F32)?)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn dual(
         &self,
         blk: &DualBlock,
-        x: &Array,
-        y: &Array,
-        core_img: &Array,
-        core_txt: &Array,
+        x: &Tensor,
+        y: &Tensor,
+        core_img: &Tensor,
+        core_txt: &Tensor,
         rope_img: &Rope,
         rope_txt: &Rope,
-        heads: i32,
-        kv_heads: i32,
-    ) -> Result<(Array, Array)> {
+        heads: usize,
+        kv_heads: usize,
+    ) -> Result<(Tensor, Tensor)> {
         let mx = blk.mod_img.chunks(core_img)?;
         let my = blk.mod_txt.chunks(core_txt)?;
         let hx = modulate(&blk.norm_x1.forward(x)?, &mx[0], &mx[1])?;
@@ -785,24 +674,34 @@ impl IrisDiT {
         let k = cat(&[&ky, &kx], 1)?;
         let v = cat(&[&vy, &vx], 1)?;
         let out = attention(&q, &k, &v, self.compute, None)?;
-        let n_txt = y.shape()[1];
-        let mut halves = out.split_axis(&[n_txt], 1)?;
-        let out_x = halves.swap_remove(1);
-        let out_y = halves.swap_remove(0);
+        let n_txt = y.dim(1)?;
+        let (out_y, out_x) = split_at(&out, 1, n_txt)?;
 
-        let out_x = out_x.multiply(&sigmoid(blk.gate_x.forward(&hx)?)?)?;
+        let out_x = mul(&out_x, &sigmoid(&blk.gate_x.forward(&hx)?)?)?;
         let attn_x = blk.proj_x.forward(&out_x)?;
-        let mut x = x.add(&mx[2].multiply(&blk.attn_post_norm_x.forward(&attn_x)?)?)?;
+        let mut x = add(x, &mul(&mx[2], &blk.attn_post_norm_x.forward(&attn_x)?)?)?;
         let mlp_in = modulate(&blk.norm_x2.forward(&x)?, &mx[3], &mx[4])?;
-        x = x.add(&mx[5].multiply(&blk.mlp_post_norm_x.forward(&blk.mlp_x.forward(&mlp_in)?)?)?)?;
+        x = add(
+            &x,
+            &mul(
+                &mx[5],
+                &blk.mlp_post_norm_x.forward(&blk.mlp_x.forward(&mlp_in)?)?,
+            )?,
+        )?;
         let Some(text) = &blk.text else {
             return Ok((x, y.clone()));
         };
-        let out_y = out_y.multiply(&sigmoid(text.gate.forward(&hy)?)?)?;
+        let out_y = mul(&out_y, &sigmoid(&text.gate.forward(&hy)?)?)?;
         let attn_y = text.proj.forward(&out_y)?;
-        let mut y = y.add(&my[2].multiply(&text.attn_post_norm.forward(&attn_y)?)?)?;
+        let mut y = add(y, &mul(&my[2], &text.attn_post_norm.forward(&attn_y)?)?)?;
         let mlp_in = modulate(&text.norm2.forward(&y)?, &my[3], &my[4])?;
-        y = y.add(&my[5].multiply(&text.mlp_post_norm.forward(&text.mlp.forward(&mlp_in)?)?)?)?;
+        y = add(
+            &y,
+            &mul(
+                &my[5],
+                &text.mlp_post_norm.forward(&text.mlp.forward(&mlp_in)?)?,
+            )?,
+        )?;
         Ok((x, y))
     }
 
@@ -810,81 +709,76 @@ impl IrisDiT {
     fn single(
         &self,
         blk: &SingleBlock,
-        x: &Array,
-        y: &Array,
-        core: &Array,
+        x: &Tensor,
+        y: &Tensor,
+        core: &Tensor,
         rope_img: &Rope,
         rope_txt: &Rope,
-        heads: i32,
-        kv_heads: i32,
-    ) -> Result<(Array, Array)> {
+        heads: usize,
+        kv_heads: usize,
+    ) -> Result<(Tensor, Tensor)> {
         let m = blk.modulation.chunks(core)?;
-        let n_txt = y.shape()[1];
+        let n_txt = y.dim(1)?;
         let tokens = cat(&[y, x], 1)?;
         let h = modulate(&blk.norm1.forward(&tokens)?, &m[0], &m[1])?;
         let (q, k, v) = blk.qkv.project(&h, heads, kv_heads)?;
         let q = blk.q_norm.forward(&q)?;
         let k = blk.k_norm.forward(&k)?;
-        let mut qs = q.split_axis(&[n_txt], 1)?;
-        let mut ks = k.split_axis(&[n_txt], 1)?;
-        let (qx, qy) = (qs.swap_remove(1), qs.swap_remove(0));
-        let (kx, ky) = (ks.swap_remove(1), ks.swap_remove(0));
+        let (qy, qx) = split_at(&q, 1, n_txt)?;
+        let (ky, kx) = split_at(&k, 1, n_txt)?;
         let q = cat(&[&rope_txt.apply(&qy)?, &rope_img.apply(&qx)?], 1)?;
         let k = cat(&[&rope_txt.apply(&ky)?, &rope_img.apply(&kx)?], 1)?;
         let mut attn = attention(&q, &k, &v, self.compute, None)?;
         let (mut h, mut tokens) = (h, tokens);
         if !blk.text_out {
-            attn = attn.split_axis(&[n_txt], 1)?.swap_remove(1);
-            h = h.split_axis(&[n_txt], 1)?.swap_remove(1);
+            attn = split_at(&attn, 1, n_txt)?.1;
+            h = split_at(&h, 1, n_txt)?.1;
             tokens = x.clone();
         }
-        let attn = attn.multiply(&sigmoid(blk.attn_gate.forward(&h)?)?)?;
+        let attn = mul(&attn, &sigmoid(&blk.attn_gate.forward(&h)?)?)?;
         let attn = blk.attn_post_norm.forward(&blk.attn_proj.forward(&attn)?)?;
-        let tokens = tokens.add(&m[2].multiply(&attn)?)?;
+        let tokens = add(&tokens, &mul(&m[2], &attn)?)?;
         let mlp = blk
             .mlp
             .forward(&modulate(&blk.norm2.forward(&tokens)?, &m[3], &m[4])?)?;
-        let tokens = tokens.add(&m[5].multiply(&blk.mlp_post_norm.forward(&mlp)?)?)?;
+        let tokens = add(&tokens, &mul(&m[5], &blk.mlp_post_norm.forward(&mlp)?)?)?;
         if !blk.text_out {
             return Ok((tokens, y.clone()));
         }
-        let mut parts = tokens.split_axis(&[n_txt], 1)?;
-        let x = parts.swap_remove(1);
-        let y = parts.swap_remove(0);
+        let (y, x) = split_at(&tokens, 1, n_txt)?;
         Ok((x, y))
     }
 
     fn pit(
         &self,
         blk: &PitBlock,
-        x: &Array,
-        cond: &Array,
+        x: &Tensor,
+        cond: &Tensor,
         rope: &Rope,
-        batch: i32,
-        n_patches: i32,
-    ) -> Result<Array> {
-        let sh = x.shape();
-        let (rows, ppp, pix) = (sh[0], sh[1], sh[2]);
-        let mods = blk.adaln.forward(cond)?.reshape(&[rows, ppp, -1])?;
+        batch: usize,
+        n_patches: usize,
+    ) -> Result<Tensor> {
+        let (rows, ppp, pix) = x.dims3()?;
+        let mods = blk.adaln.forward(cond)?.reshape((rows, ppp, ()))?;
         let m = chunk_last(&mods, 4)?; // post: (scale1, shift1, scale2, shift2)
                                        // global attention at patch granularity
         let compact = blk
             .compress
-            .forward(&blk.norm1.forward(x)?.reshape(&[rows, ppp * pix])?)?;
+            .forward(&blk.norm1.forward(x)?.reshape((rows, ppp * pix))?)?;
         let attn = blk.attn.forward(
-            &compact.reshape(&[batch, n_patches, -1])?,
+            &compact.reshape((batch, n_patches, ()))?,
             Some(rope),
             None,
             self.compute,
         )?;
         let expanded = blk
             .expand
-            .forward(&attn.reshape(&[rows, -1])?)?
-            .reshape(&[rows, ppp, pix])?;
-        let x = x.add(&modulate(&expanded, &m[1], &m[0])?)?;
+            .forward(&attn.reshape((rows, ()))?)?
+            .reshape((rows, ppp, pix))?;
+        let x = add(x, &modulate(&expanded, &m[1], &m[0])?)?;
         let mlp = blk
             .fc2
-            .forward(&gelu(blk.fc1.forward(&blk.norm2.forward(&x)?)?)?)?;
-        Ok(x.add(&modulate(&mlp, &m[3], &m[2])?)?)
+            .forward(&blk.fc1.forward(&blk.norm2.forward(&x)?)?.gelu_erf()?)?;
+        add(&x, &modulate(&mlp, &m[3], &m[2])?)
     }
 }

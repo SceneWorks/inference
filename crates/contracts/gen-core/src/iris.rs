@@ -15,6 +15,12 @@ use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
+mod tables;
+pub use tables::{
+    key_padding_additive, pixel_sincos_table, rope_1d_angles, rope_2d_angles, timestep_freqs,
+    TIMESTEP_FREQUENCY_DIM,
+};
+
 /// GitHub `speridlabs/iris-3b` commit the port mirrors (model, pipeline, text conditioning, solver).
 pub const UPSTREAM_CODE_REVISION: &str = "a8d15239dea469aba042cfa56ca3bb4e450d5ebc";
 /// Hugging Face `speridlabs/iris-3b` revision (weights + `config.yaml` for every task).
@@ -804,6 +810,24 @@ pub fn assemble_window(
     })
 }
 
+/// The `on_caption_overflow: warn` message for one window (upstream logs every truncation under
+/// the release policy), or `None` when the caption fit its budget.
+pub fn caption_overflow_warning(
+    window: &TextWindow,
+    max_length: usize,
+    suffix_len: usize,
+) -> Option<String> {
+    (window.truncated_tokens > 0).then(|| {
+        let budget = max_length.saturating_sub(suffix_len);
+        format!(
+            "iris: caption overflow — {} caption tokens dropped (caption {} tokens, budget {budget}; \
+             text_encoder.on_caption_overflow = warn)",
+            window.truncated_tokens,
+            budget + window.truncated_tokens
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // FlowDPM-Solver++
 // ---------------------------------------------------------------------------------------------
@@ -1169,9 +1193,15 @@ flow:
         assert_eq!(w.mask, [1, 1, 1, 1, 1]);
         assert_eq!(w.truncated_tokens, 2);
         assert_eq!(w.window_tokens(), 5);
+        let msg = caption_overflow_warning(&w, 5, 2).expect("an overflow is warned");
+        assert!(
+            msg.contains("2 caption tokens dropped (caption 5 tokens, budget 3"),
+            "{msg}"
+        );
         let empty = assemble_window(&[1, 2], &[], &[8, 9], 5).unwrap();
         assert_eq!(empty.input_ids, [1, 2, 8, 9]);
         assert_eq!(empty.mask, [1, 1, 0, 0, 0]);
+        assert_eq!(caption_overflow_warning(&empty, 5, 2), None);
         assert!(assemble_window(&[1], &[3], &[8, 9], 2).is_err());
     }
 

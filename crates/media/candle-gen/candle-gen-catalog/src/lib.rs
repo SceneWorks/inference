@@ -25,6 +25,7 @@ pub mod providers {
     pub use candle_gen_flux2 as flux2;
     pub use candle_gen_ideogram as ideogram;
     pub use candle_gen_instantid as instantid;
+    pub use candle_gen_iris as iris;
     pub use candle_gen_joycaption as joycaption;
     pub use candle_gen_kolors as kolors;
     pub use candle_gen_krea as krea;
@@ -101,6 +102,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_flux::register_providers(registry);
     let registry = candle_gen_flux2::register_providers(registry);
     let registry = candle_gen_ideogram::register_providers(registry);
+    let registry = candle_gen_iris::register_providers(registry);
     let registry = candle_gen_joycaption::register_providers(registry);
     let registry = candle_gen_kolors::register_providers(registry);
     let registry = candle_gen_krea::register_providers(registry);
@@ -871,7 +873,18 @@ mod preview_advertising {
     /// so the projection and the preview surface are the same question. sc-24111 is the story that
     /// carries the RGBA output surface, and it is where the fit and the wiring belong together.
     /// Its MLX twin (sc-24108) advertises `supports_preview: false` for the same reason.
-    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[("qwen_image_2_1", "sc-24111")];
+    ///
+    /// `iris_3b` (sc-25680) is deferred, **not** a no-go: Iris denoises in pixel space, so the
+    /// running solver state already is an RGB image and no latent fit is needed at all. Neither
+    /// backend wires it yet — the MLX twin (sc-25679) advertises `supports_preview: false` too.
+    /// S3 (sc-25681) is the story that wires previews for both backends at once.
+    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] =
+        &[("qwen_image_2_1", "sc-24111"), ("iris_3b", "sc-25681")];
+
+    /// The epics that own the deferred routes above. An epic is a container, not the unit of work
+    /// that wires a preview, so a deferred route that names one of these instead of a story has
+    /// not actually recorded who wires it.
+    const PREVIEW_DEFERRED_ROUTE_EPICS: &[&str] = &["sc-24107", "sc-25678"];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -1363,6 +1376,15 @@ mod preview_advertising {
         ProviderCrate {
             dir: "candle-gen-seedvr2",
             register: candle_gen_seedvr2::register_providers,
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        ProviderCrate {
+            dir: "candle-gen-iris",
+            // sc-25680: the FlowDPM-Solver++ is a bespoke loop (`solver::sample`) — no shared
+            // driver site — and it emits nothing, so the inventory is empty and the route is
+            // carried in PREVIEW_DEFERRED_ROUTE_IDS.
+            register: candle_gen_iris::register_providers,
             denoise: Denoise::Bespoke,
             routes: &[],
         },
@@ -4073,6 +4095,10 @@ mod preview_advertising {
                 "{id} is deferred rather than rejected, so it must name the story that wires it — \
                  got {story:?}"
             );
+            assert!(
+                !PREVIEW_DEFERRED_ROUTE_EPICS.contains(story),
+                "{id} names {story}, which is an epic, not the story that wires the preview"
+            );
         }
 
         for (label, class, declared) in [
@@ -5134,6 +5160,8 @@ mod tests {
                 "svd" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
+                // Iris-3B generates RGB pixels directly (patch DiT + PiT pixel head, no VAE).
+                "iris" => None,
                 // MiniMax-H3's denoiser emits a 24-channel joint audio+video latent on the
                 // 17-frame clip lattice (token-dropped, seam-blended dual decode — see the crate's
                 // `chunking` module). No `LatentTemporalLaw` variant expresses that mapping and no
@@ -5820,6 +5848,7 @@ mod tests {
                 "flux2_dev",
                 "ideogram_4",
                 "ideogram_4_turbo",
+                "iris_3b",
                 "kolors",
                 "krea_2_turbo",
                 "krea_2_raw",
@@ -5891,12 +5920,12 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Fourteen of the sixteen trainer ids are
-        // also generator ids (`krea_2_control` and `ltx_2_3` are trainer-only), which is why 56
-        // generators + 2 trainer-only ids + 1 captioner + 2 embedders are 61 distinct ids (sc-24109
+        // also generator ids (`krea_2_control` and `ltx_2_3` are trainer-only), which is why 57
+        // generators + 2 trainer-only ids + 1 captioner + 2 embedders are 62 distinct ids (sc-24109
         // adds `qwen_image_2_1`, a generator with its own component row; its sc-24160 trainer
-        // reuses that row).
+        // reuses that row; sc-25680 adds `iris_3b`, a generator with its own complete row).
         //
-        // Registration is never conditioned on the mapping: 51 < 61 because ten ids load nothing
+        // Registration is never conditioned on the mapping: 52 < 62 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which ten and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -5907,8 +5936,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 61);
-        assert_eq!(super::provider_components().len(), 51);
+        assert_eq!(distinct.len(), 62);
+        assert_eq!(super::provider_components().len(), 52);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is
