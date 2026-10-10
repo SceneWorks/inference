@@ -8,7 +8,7 @@
 //! * raw `[1, 1, h, w]` output, FP32 on the MLX CPU stream: 1e-4 (summation order only, the
 //!   generation `dit_parity` gate);
 //! * `[H, W]` map after the bilinear resize back: 1e-4;
-//! * presentation adapters: `colorize_inferno` vs upstream `colorize` within one colormap index.
+//! * presentation adapters: `colorize_inferno` vs upstream `colorize` within ≤ 4 RGB levels.
 //!
 //! The bf16 release policy (upstream's CUDA autocast) is held to 5e-2 on the GPU stream.
 
