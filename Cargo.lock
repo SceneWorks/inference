@@ -577,6 +577,7 @@ dependencies = [
  "candle-gen-flux2",
  "candle-gen-ideogram",
  "candle-gen-instantid",
+ "candle-gen-iris",
  "candle-gen-joycaption",
  "candle-gen-kolors",
  "candle-gen-krea",
@@ -726,6 +727,20 @@ dependencies = [
  "candle-gen-sdxl",
  "rand",
  "sceneworks-gen-core-testkit",
+ "tempfile",
+]
+
+[[package]]
+name = "candle-gen-iris"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-llm",
+ "image",
+ "rand",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
  "tempfile",
 ]
 

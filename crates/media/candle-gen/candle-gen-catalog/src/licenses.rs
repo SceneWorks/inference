@@ -209,6 +209,14 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "ideogram_4_turbo",
         components: &["ideogram_4_fp8", "ideogram_4_turbotime_lora"],
     },
+    // --- iris -------------------------------------------------------------------------------
+    // The generation task loads the repo-root backbone and the upstream Qwen3-VL-4B-Instruct
+    // repository (pinned revision) as its text encoder; both are rowed, because both are loaded.
+    // The same complete row the MLX twin's catalog names (sc-25679 / sc-25680).
+    ProviderComponents {
+        provider_id: "iris_3b",
+        components: &["iris_3b", "qwen3_vl_4b_instruct"],
+    },
     // --- kolors -----------------------------------------------------------------------------
     // The `Kwai-Kolors/Kolors-diffusers` repository row is an AMBIGUOUS hole (sc-16662 U6), so the
     // UNet, VAE and derived tokenizer contribute nothing. The ChatGLM3-6B text encoder is governed
@@ -560,7 +568,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 51);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 52);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -592,8 +600,8 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            61,
-            "61 distinct Candle provider ids: 56 generators + 16 trainers (14 of them also \
+            62,
+            "62 distinct Candle provider ids: 57 generators + 16 trainers (14 of them also \
              generator ids) + 1 captioner + 2 embedders"
         );
 
@@ -745,6 +753,7 @@ mod tests {
                 "chroma1_base",
                 "chroma1_flash",
                 "chroma1_hd",
+                "iris_3b",
                 "ltx_2_3",
                 "ltx_2_3_distilled",
                 "minimax_h3",
@@ -820,9 +829,6 @@ mod tests {
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
-            // Iris-3B (sc-25679) is MLX-first; its Candle twin is epic sc-25678's S2.
-            "iris_3b",
-            "qwen3_vl_4b_instruct",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.

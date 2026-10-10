@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -4920,6 +4920,91 @@ jobs:
         with:
           name: qwen-image-2-1-cuda-evidence
           path: ${{ runner.temp }}/qwen-image-2-1-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-25680 — Iris-3B real-weight evidence on candle/CUDA. DISPATCH-ONLY (`iris` profile; never
+  # `all`, never the schedule): one bounded render, not a sweep.
+  #
+  # WHAT IT PROVISIONS. Two pinned snapshots through `ensure_model_snapshot.py` INTO the runner's
+  # persistent hub cache (`vars.CANDLE_GEN_MODELS_ROOT`), fetched once and only verified after:
+  #   * `iris-3b-cuda`               speridlabs/iris-3b @ 74454433…  generation backbone only (~12 GB)
+  #   * `qwen3-vl-4b-instruct-cuda`  Qwen/Qwen3-VL-4B-Instruct @ ebb281ec…             (~9 GB)
+  #
+  # WHAT IT RUNS. The pinned-tokenizer check and ONE production-path render through the catalog
+  # (`iris_3b` at the release defaults: 1024², 100 steps, CFG 3), each `--exact` with a run-count
+  # assertion, writing the PNG + log + a report-only `nvidia-smi` VRAM line into the evidence
+  # artifact. No memory/VRAM campaign: the probe reports the one render's peak, nothing is gated
+  # on it. Same box, labels, toolchain and sccache rule as `candle-qwen-image-2-1` above.
+  candle-iris:
+    name: Candle Iris-3B real weights (CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      IRIS_WEIGHTS_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--speridlabs--iris-3b\snapshots\7445443349bc9abe3c96f01ff793e2098ca012b3
+      IRIS_TEXT_ENCODER_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--Qwen--Qwen3-VL-4B-Instruct\snapshots\ebb281ec70b05090aa6165b016eac8ec08e71b17
+      IRIS_SIZE: "1024"
+      IRIS_STEPS: "100"
+      IRIS_VRAM_PROBE: "1"
+      # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-iris\install-reviewed-cpython-3-12.cmd
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # The runner service exports RUSTC_WRAPPER=sccache, whose daemon resets mid-build on heavy
+      # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Require operator-provided models root and initialize evidence
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-iris\require-operator-provided-models-root-and-initialize-evidenc.cmd
+      # Report-only, like the same step on `candle-qwen-image-2-1`.
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%IRIS_OUT%\cuda-device-inventory.csv"
+          type "%IRIS_OUT%\cuda-device-inventory.csv"
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-iris\materialize-and-verify-immutable-snapshots.cmd
+      - name: Build the Iris CUDA test binary
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-gen-iris --features cuda --test integration --no-run || exit /b 1
+      - name: Run the Iris real-weight checks
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-iris\run-the-iris-real-weight-checks.cmd
+      - name: Keep the Iris CUDA evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iris-cuda-evidence
+          path: ${{ runner.temp }}/iris-cuda-evidence
           if-no-files-found: error
           retention-days: 30
 
