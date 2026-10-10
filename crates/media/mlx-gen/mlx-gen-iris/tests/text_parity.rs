@@ -5,11 +5,13 @@
 //!
 //! Tolerance: the tower runs in bf16 on both sides (the release's `text_encoder.dtype`), with the
 //! miniature weights pre-rounded to bf16 so only activation rounding differs; MLX and torch-CPU bf16
-//! kernels round differently. Measured: max |Δ| = 0.125–0.156 at peak ≈ 10.6, i.e. 1–2 bf16 ulps
-//! at that magnitude (mean ≈ 2e-2), identical on the MLX CPU and GPU streams — so the bound is
-//! bf16-scale, 2e-2 of peak (≈ 3 ulps). A structural error (wrong layer, template, RoPE or mask)
-//! is O(peak). Ids and masks are exact.
+//! kernels round differently, and over the full 36-block depth that rounding compounds. Upstream's
+//! own bf16-vs-fp32 tower on this snapshot differs by max |Δ| = 0.123 at peak 5.6 (2.2 % of peak);
+//! MLX vs torch bf16 measures max |Δ| = 0.094–0.141 at peak ≈ 5.5 (≤ 2.5 %, mean ≈ 1.5e-2). The
+//! bound is 4e-2 of peak; a structural error (wrong layer, template, RoPE or mask) is O(peak). Ids
+//! and masks are exact.
 
+use mlx_gen_iris::text_encoder::caption_overflow_warning;
 use mlx_gen_iris::IrisTextEncoder;
 use mlx_rs::Array;
 
@@ -73,8 +75,12 @@ fn windows_masks_and_layer_states_match_upstream() {
             "{name}: mask"
         );
         let want: &Array = golden.require(&format!("{name}/embeddings")).unwrap();
+        // The miniature tower is 36 blocks deep and selects the release's 12 post-block states
+        // ([2, 5, …, 35]), so the stacking law under test is the shipped one.
+        assert_eq!(want.shape()[1], 12, "{name}: golden selected layers");
         let got = out.states.squeeze_axes(&[0]).unwrap();
-        assert_close(&format!("{name}/embeddings"), &got, want, 2e-2);
+        assert_eq!(got.shape(), want.shape(), "{name}: conditioning shape");
+        assert_close(&format!("{name}/embeddings"), &got, want, 4e-2);
         // pad rows are exactly zero
         let real = out.mask.iter().filter(|m| **m == 1).count();
         if real < out.mask.len() {
@@ -97,6 +103,24 @@ fn empty_negative_prompt_is_the_training_null() {
         "null/embeddings",
         &null.states.squeeze_axes(&[0]).unwrap(),
         golden.require("null/embeddings").unwrap(),
-        2e-2,
+        4e-2,
+    );
+}
+
+#[test]
+fn caption_overflow_is_warned_under_the_release_policy() {
+    let te = encoder();
+    // Upstream's oracle log for this prompt: "longest 14 tokens, budget 7".
+    let overflow = te.window(PROMPTS[1].1).unwrap();
+    let msg = caption_overflow_warning(&overflow, overflow.mask.len(), te.suffix_ids().len())
+        .expect("an overflowing caption is warned");
+    assert!(
+        msg.contains("7 caption tokens dropped (caption 14 tokens, budget 7"),
+        "{msg}"
+    );
+    let short = te.window(PROMPTS[0].1).unwrap();
+    assert_eq!(
+        caption_overflow_warning(&short, short.mask.len(), te.suffix_ids().len()),
+        None
     );
 }

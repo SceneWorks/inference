@@ -69,8 +69,14 @@ ENCODER_DIR = SNAPSHOT / "text_encoder"
 # ---- miniature geometry --------------------------------------------------------------------------
 TEXT_DIM = 32
 TEXT_LEN = 10  # == text_encoder.max_length (300 in the release)
-HIDDEN_LAYERS = [2, 4, 5]  # 1-based post-block states, like the release's [2, 5, ..., 35]
-TEXT_LAYERS = 6
+# The release's exact 1-based post-block selection (`text_encoder.hidden_layers`, 12 of the 36
+# Qwen3-VL-4B blocks -> `text_lap_num_layers: 12`), on a full-depth 36-layer miniature tower, so the
+# fixture exercises the real 12-layer stacking law rather than a subset.
+HIDDEN_LAYERS = [2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35]
+TEXT_LAYERS = 36
+# Perturbation scale of the miniature tower's weights: small enough that 36 random blocks stay
+# contractive, so bf16 activation rounding does not compound into O(1) drift with depth.
+TOWER_SCALE = 0.1
 
 TINY_DIT = ModelConfig(
     block="single_stream",
@@ -200,7 +206,7 @@ def write_encoder_snapshot() -> None:
             if name.endswith("norm.weight"):
                 p.copy_(1.0 + 0.1 * torch.randn_like(p))
             else:
-                p.copy_(0.2 * torch.randn_like(p))
+                p.copy_(TOWER_SCALE * torch.randn_like(p))
     bf16_round_(model)
     model.save_pretrained(str(ENCODER_DIR), safe_serialization=True)
 

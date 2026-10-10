@@ -48,6 +48,9 @@ pub const DEFAULT_CFG_SCALE: f32 = 3.0;
 pub const DEFAULT_CFG_INTERVAL: (f64, f64) = (0.0, 1.0);
 /// Default output side (`--height` / `--width`).
 pub const DEFAULT_SIZE: u32 = 1024;
+/// Output sides are admitted on this pixel grid (the release's `model.patch_size`). A backbone
+/// whose patch does not divide it is refused at load, so an admitted size always patchifies.
+pub const SIZE_MULTIPLE: u32 = 16;
 
 /// The three tasks of the release. Each is its own backbone checkpoint; only generation conditions
 /// on text, so only generation names the text encoder as a resource (E4).
@@ -370,12 +373,19 @@ impl IrisConfig {
     /// and depth is read from the file.
     pub fn validate_supported(&self) -> Result<()> {
         let m = &self.model;
-        let checks: [(&str, bool, String); 22] = [
+        let checks: [(&str, bool, String); 25] = [
             ("model.block", m.block == "single_stream", m.block.clone()),
             (
+                // `dual_depth: 0` renames the shared modulation core (`adaln_shared`); the native
+                // graph implements the hybrid dual → single-stream trunk only.
                 "model.dual_depth",
-                m.dual_depth <= m.depth,
+                1 <= m.dual_depth && m.dual_depth <= m.depth,
                 m.dual_depth.to_string(),
+            ),
+            (
+                "model.patch_size",
+                m.patch_size > 0 && (SIZE_MULTIPLE as usize).is_multiple_of(m.patch_size),
+                m.patch_size.to_string(),
             ),
             (
                 "model.final_block_text",
@@ -449,6 +459,18 @@ impl IrisConfig {
                 "text_encoder.name",
                 self.text_encoder.name == "qwen3_vl",
                 self.text_encoder.name.clone(),
+            ),
+            (
+                // The Qwen3-VL tower always computes in bf16 (the release's dtype).
+                "text_encoder.dtype",
+                self.text_encoder.dtype == "bfloat16",
+                self.text_encoder.dtype.clone(),
+            ),
+            (
+                // The DiT reads exactly the window the encoder produces.
+                "text_encoder.max_length",
+                self.text_encoder.max_length == m.text_len,
+                self.text_encoder.max_length.to_string(),
             ),
             (
                 "text_encoder.on_caption_overflow",
@@ -983,6 +1005,18 @@ pub fn reject_unhonored_generation_controls(model_id: &str, req: &GenerationRequ
             )));
         }
     }
+    // At `cfg_scale == 1` the unconditional branch is never evaluated, so a negative prompt would
+    // be accepted and silently dropped.
+    let negative = req
+        .negative_prompt
+        .as_deref()
+        .is_some_and(|p| !p.is_empty());
+    if negative && req.guidance.unwrap_or(DEFAULT_CFG_SCALE) == 1.0 {
+        return Err(Error::Unsupported(format!(
+            "{model_id}: `negative_prompt` has no effect at guidance 1.0 (classifier-free guidance \
+             is off); raise guidance or drop the negative prompt"
+        )));
+    }
     Ok(())
 }
 
@@ -1096,6 +1130,27 @@ flow:
             .validate_supported()
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(m) if m.contains("flow.prediction")));
+        for (from, to, key) in [
+            ("dtype: bfloat16", "dtype: float16", "text_encoder.dtype"),
+            (
+                "max_length: 300",
+                "max_length: 256",
+                "text_encoder.max_length",
+            ),
+            ("dual_depth: 8", "dual_depth: 0", "model.dual_depth"),
+            ("patch_size: 16", "patch_size: 32", "model.patch_size"),
+        ] {
+            let text = RELEASE_CONFIG.replace(from, to);
+            assert_ne!(text, RELEASE_CONFIG, "{from}");
+            let err = IrisConfig::parse(&text)
+                .unwrap()
+                .validate_supported()
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Unsupported(m) if m.contains(key)),
+                "{key}: {err:?}"
+            );
+        }
     }
 
     #[test]

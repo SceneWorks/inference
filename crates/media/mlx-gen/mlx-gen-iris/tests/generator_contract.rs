@@ -151,6 +151,15 @@ fn controls_the_route_does_not_honour_are_refused() {
     let mut req = request();
     req.width = 40; // not a multiple of the 16-px patch
     assert!(g.validate(&req).is_err());
+    // CFG off: the negative prompt would never be evaluated.
+    let mut req = request();
+    req.guidance = Some(1.0);
+    req.negative_prompt = Some("blurry".into());
+    assert!(
+        matches!(g.validate(&req), Err(CoreError::Unsupported(m)) if m.contains("negative_prompt"))
+    );
+    req.negative_prompt = Some(String::new());
+    g.validate(&req).unwrap();
 }
 
 #[test]

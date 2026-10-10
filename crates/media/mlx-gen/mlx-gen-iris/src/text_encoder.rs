@@ -38,7 +38,7 @@ pub struct TextConditioning {
     pub states: Array,
     /// `[max_length]` 0/1 flags.
     pub mask: Vec<i32>,
-    /// Caption tokens dropped by the budget (upstream warns; the release default truncates).
+    /// Caption tokens dropped by the budget (warned at encode under `on_caption_overflow: warn`).
     pub truncated_tokens: usize,
 }
 
@@ -51,6 +51,26 @@ pub struct IrisTextEncoder {
     hidden_layers: Vec<usize>,
     max_length: usize,
     dim: usize,
+    /// `text_encoder.on_caption_overflow == "warn"` (the release policy).
+    warn_on_overflow: bool,
+}
+
+/// The `on_caption_overflow: warn` message for one window (upstream logs every truncation under
+/// the release policy), or `None` when the caption fit its budget.
+pub fn caption_overflow_warning(
+    window: &TextWindow,
+    max_length: usize,
+    suffix_len: usize,
+) -> Option<String> {
+    (window.truncated_tokens > 0).then(|| {
+        let budget = max_length.saturating_sub(suffix_len);
+        format!(
+            "iris: caption overflow — {} caption tokens dropped (caption {} tokens, budget {budget}; \
+             text_encoder.on_caption_overflow = warn)",
+            window.truncated_tokens,
+            budget + window.truncated_tokens
+        )
+    })
 }
 
 fn from_llm(e: mlx_llm::Error) -> Error {
@@ -146,6 +166,7 @@ impl IrisTextEncoder {
             hidden_layers: cfg.hidden_layers.clone(),
             max_length: cfg.max_length,
             dim: cfg.dim,
+            warn_on_overflow: cfg.on_caption_overflow == "warn",
         })
     }
 
@@ -175,6 +196,13 @@ impl IrisTextEncoder {
     /// `encode([prompt])` (and `null(negative_prompt)`, which is the same computation).
     pub fn encode(&self, prompt: &str) -> Result<TextConditioning> {
         let window = self.window(prompt)?;
+        if self.warn_on_overflow {
+            if let Some(msg) =
+                caption_overflow_warning(&window, self.max_length, self.suffix_ids.len())
+            {
+                eprintln!("{msg}");
+            }
+        }
         self.encode_window(&window)
     }
 

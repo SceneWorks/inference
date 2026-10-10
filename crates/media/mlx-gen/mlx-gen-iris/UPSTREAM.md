@@ -80,12 +80,12 @@ which is also the snapshot the generator-contract test loads through the catalog
 | Gate | Native | Tolerance (of peak) | Measured | Why |
 | --- | --- | --- | --- | --- |
 | Template ids, window, truncation, masks | — | exact | exact | integer logic |
-| 3 selected layers, pad rows zeroed (`text_parity`) | bf16 tower | 2e-2 | 1.2e-2–1.5e-2 (1–2 bf16 ulps) | both sides bf16; MLX vs torch-CPU rounding |
+| Release 12-of-36 selected layers, pad rows zeroed (`text_parity`) | bf16 tower | 4e-2 | 1.7e-2–2.5e-2 | both sides bf16; MLX vs torch-CPU rounding compounded over 36 blocks (upstream's own bf16-vs-fp32 tower: 2.2e-2) |
 | Layerwise adapter + backbone + pixel head (`dit_parity`) | FP32, MLX CPU stream | 1e-4 | 5.5e-7 / 2.8e-5 | summation order only (Metal f32 GEMM is reduced precision, so the f32 gate runs on the CPU stream) |
 | Same, release bf16 autocast policy | bf16, GPU | 5e-2 | 2.7e-2 | bf16 matmul/attention |
 | Solver trajectory, 7 steps, CFG, shift (`solver_parity`) | f32 | 1e-5 | 8.8e-8 | identical f32 coefficients |
 | 100-step default grid | f64 | 1e-15 abs | exact | f64 on both sides |
-| End to end, 6 steps, CFG 3 (`e2e_parity`) | bf16 tower + FP32 backbone | 2e-2 | 1.5e-2 | tower ulps amplified by CFG |
+| End to end, 6 steps, CFG 3 (`e2e_parity`) | bf16 tower + FP32 backbone | 6e-2 | 3.1e-2 | tower rounding amplified by CFG (upstream's own bf16-vs-fp32 tower: 4.0e-2) |
 
 `tests/fixtures/iris_tokenizer_ids.json` pins the real Qwen3-VL tokenizer's prefix / suffix / caption
 ids for a prompt battery; the ignored real-weight test checks the loaded tokenizer against it.

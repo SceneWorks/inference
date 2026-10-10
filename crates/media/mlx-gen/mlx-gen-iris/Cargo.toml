@@ -19,9 +19,9 @@ mlx-rs = { workspace = true }
 # `mlx-gen-* -> mlx-llm` direction is the documented one (see `mlx-gen-ltx`); the pin lives in the
 # root workspace so cargo unifies ONE mlx-llm across the worker graph.
 mlx-llm = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }
 image = { workspace = true }

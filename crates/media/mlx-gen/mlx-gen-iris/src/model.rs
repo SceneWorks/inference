@@ -21,8 +21,8 @@ use crate::text_encoder::IrisTextEncoder;
 
 /// Registry id (the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = GENERATION_MODEL_ID;
-/// Output sides must be multiples of the patch size.
-pub const SIZE_MULTIPLE: u32 = 16;
+/// Output sides must be multiples of the patch size (load refuses a patch that does not divide it).
+pub const SIZE_MULTIPLE: u32 = gen_core::iris::SIZE_MULTIPLE;
 /// Smallest side: one patch.
 pub const MIN_SIZE: u32 = 16;
 /// Largest side served (the release renders ~1 MP; 2048² is the pixel-space attention ceiling

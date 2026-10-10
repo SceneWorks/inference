@@ -30,7 +30,7 @@ model:
   text_dim: 32
   text_len: 10
   text_adapter: lap_blocks2
-  text_lap_num_layers: 3
+  text_lap_num_layers: 12
   text_lap_num_heads: 4
   text_lap_mlp_ratio: 1.3
   repa_layer: 0
@@ -52,8 +52,17 @@ text_encoder:
   attn_implementation: sdpa
   hidden_layers:
   - 2
-  - 4
   - 5
+  - 8
+  - 11
+  - 14
+  - 17
+  - 20
+  - 23
+  - 26
+  - 29
+  - 32
+  - 35
   compile: false
   on_caption_overflow: warn
 flow:
