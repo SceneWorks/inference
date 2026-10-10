@@ -51,13 +51,15 @@ pub struct IrisTextEncoder {
     hidden_layers: Vec<usize>,
     max_length: usize,
     dim: usize,
-    /// `text_encoder.on_caption_overflow == "warn"` (the release policy).
-    warn_on_overflow: bool,
+    /// The checkpoint's `text_encoder.on_caption_overflow` policy (the release's is `warn`).
+    overflow: CaptionOverflowPolicy,
 }
 
+use gen_core::iris::apply_caption_overflow_policy;
 /// The `on_caption_overflow: warn` message for one window — backend-neutral, shared with the
 /// Candle twin through [`gen_core::iris`].
 pub use gen_core::iris::caption_overflow_warning;
+use gen_core::CaptionOverflowPolicy;
 
 fn from_llm(e: mlx_llm::Error) -> Error {
     match e {
@@ -152,7 +154,14 @@ impl IrisTextEncoder {
             hidden_layers: cfg.hidden_layers.clone(),
             max_length: cfg.max_length,
             dim: cfg.dim,
-            warn_on_overflow: cfg.on_caption_overflow == "warn",
+            overflow: CaptionOverflowPolicy::from_name(&cfg.on_caption_overflow).ok_or_else(
+                || {
+                    Error::Unsupported(format!(
+                        "iris: text_encoder.on_caption_overflow = {} is not warn, error or silent",
+                        cfg.on_caption_overflow
+                    ))
+                },
+            )?,
         })
     }
 
@@ -179,17 +188,28 @@ impl IrisTextEncoder {
         .map_err(Error::from)
     }
 
-    /// `encode([prompt])` (and `null(negative_prompt)`, which is the same computation).
+    /// `encode([prompt])` (and `null(negative_prompt)`, which is the same computation) under the
+    /// checkpoint's own caption-overflow policy; a `warn` is logged.
     pub fn encode(&self, prompt: &str) -> Result<TextConditioning> {
+        Ok(self.encode_with_policy(prompt, self.overflow)?.0)
+    }
+
+    /// [`encode`](Self::encode) under an explicit caption-overflow `policy` (upstream
+    /// `_tokenize_captions`): `error` refuses an overflowing caption before the tower runs, `warn`
+    /// logs and returns the warning, `silent` truncates without a word.
+    pub fn encode_with_policy(
+        &self,
+        prompt: &str,
+        policy: CaptionOverflowPolicy,
+    ) -> Result<(TextConditioning, Option<String>)> {
         let window = self.window(prompt)?;
-        if self.warn_on_overflow {
-            if let Some(msg) =
-                caption_overflow_warning(&window, self.max_length, self.suffix_ids.len())
-            {
-                eprintln!("{msg}");
-            }
+        let warning =
+            apply_caption_overflow_policy(&window, self.max_length, self.suffix_ids.len(), policy)
+                .map_err(Error::from)?;
+        if let Some(msg) = &warning {
+            eprintln!("{msg}");
         }
-        self.encode_window(&window)
+        Ok((self.encode_window(&window)?, warning))
     }
 
     /// Run the tower over an assembled window.

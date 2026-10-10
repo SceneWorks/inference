@@ -16,7 +16,7 @@
 //!   upstream's do and the PiT pixel stream stays in the compute dtype where upstream's does.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
@@ -98,6 +98,8 @@ pub struct Checkpoint {
     vb: VarBuilder<'static>,
     keys: BTreeSet<String>,
     used: RefCell<BTreeSet<String>>,
+    /// f32 adapter deltas folded into their weight as it is read (`W += δ`), keyed by checkpoint key.
+    deltas: HashMap<String, Tensor>,
 }
 
 impl Checkpoint {
@@ -109,10 +111,23 @@ impl Checkpoint {
             vb,
             keys,
             used: RefCell::new(BTreeSet::new()),
+            deltas: HashMap::new(),
         })
     }
 
-    /// Read one tensor (as f32), recording the key as consumed.
+    /// Fold adapter `deltas` (f32 `[out, in]`, keyed by checkpoint key) into their weights as they
+    /// are read. Every key must exist in the checkpoint.
+    pub fn with_deltas(mut self, deltas: HashMap<String, Tensor>) -> Result<Self> {
+        if let Some(key) = deltas.keys().find(|k| !self.keys.contains(*k)) {
+            return Err(Error::Msg(format!(
+                "iris: an adapter delta targets `{key}`, which the backbone checkpoint does not carry"
+            )));
+        }
+        self.deltas = deltas;
+        Ok(self)
+    }
+
+    /// Read one tensor (as f32, with any adapter delta folded in), recording the key as consumed.
     pub fn take(&self, key: &str) -> Result<Tensor> {
         if !self.keys.contains(key) {
             return Err(Error::Msg(format!(
@@ -121,7 +136,12 @@ impl Checkpoint {
             )));
         }
         self.used.borrow_mut().insert(key.to_owned());
-        Ok(self.vb.get_unchecked(key)?)
+        let tensor = self.vb.get_unchecked(key)?;
+        Ok(match self.deltas.get(key) {
+            // The merge in f32, before the caller's cast to the compute dtype (`W += δ`).
+            Some(delta) => (tensor + delta.to_device(self.vb.device())?)?,
+            None => tensor,
+        })
     }
 
     /// Keys the checkpoint carries that no module consumed, sorted.
@@ -134,6 +154,12 @@ impl Checkpoint {
 /// The tensor names in a `.safetensors` header (`__metadata__` excluded), read without touching the
 /// tensor bytes.
 pub fn safetensors_keys(file: &Path) -> Result<BTreeSet<String>> {
+    Ok(safetensors_shapes(file)?.into_keys().collect())
+}
+
+/// The tensor names and shapes in a `.safetensors` header (`__metadata__` excluded), read without
+/// touching the tensor bytes.
+pub fn safetensors_shapes(file: &Path) -> Result<BTreeMap<String, Vec<usize>>> {
     use std::io::Read;
     let read_err = |e: std::io::Error| Error::Msg(format!("iris: reading {}: {e}", file.display()));
     let mut f = std::fs::File::open(file).map_err(read_err)?;
@@ -160,11 +186,26 @@ pub fn safetensors_keys(file: &Path) -> Result<BTreeSet<String>> {
             file.display()
         ))
     })?;
-    Ok(map
-        .keys()
-        .filter(|k| k.as_str() != "__metadata__")
-        .cloned()
-        .collect())
+    map.iter()
+        .filter(|(k, _)| k.as_str() != "__metadata__")
+        .map(|(k, v)| {
+            let shape = v
+                .get("shape")
+                .and_then(|s| s.as_array())
+                .and_then(|dims| {
+                    dims.iter()
+                        .map(|d| d.as_u64().map(|d| d as usize))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "iris: {} header entry `{k}` has no valid shape",
+                        file.display()
+                    ))
+                })?;
+            Ok((k.clone(), shape))
+        })
+        .collect()
 }
 
 /// Builds modules from a checkpoint at one compute dtype.

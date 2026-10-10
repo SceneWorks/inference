@@ -13,6 +13,15 @@
 
 mod common;
 
+#[path = "adapter_parity.rs"]
+mod adapter_parity;
+
+#[path = "controls_contract.rs"]
+mod controls_contract;
+
+#[path = "controls_parity.rs"]
+mod controls_parity;
+
 #[path = "dit_parity.rs"]
 mod dit_parity;
 

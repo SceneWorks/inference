@@ -791,7 +791,7 @@ mod tests {
         }
     }
 
-    const PREVIEW_PROVIDER_IDS: [&str; 38] = [
+    const PREVIEW_PROVIDER_IDS: [&str; 39] = [
         "anima_base",
         "anima_aesthetic",
         "anima_turbo",
@@ -830,6 +830,8 @@ mod tests {
         "z_image_control",
         "z_image_turbo",
         "z_image_turbo_control",
+        // sc-25681: pixel space — the step's predicted clean image, patch-pooled, decoded exactly.
+        "iris_3b",
     ];
 
     #[test]
